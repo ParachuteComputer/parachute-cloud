@@ -1,0 +1,29 @@
+{
+  "name": "@openparachute/cloud",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Hosted Parachute Vault on Cloudflare (Workers for Platforms + DO SQLite + R2).",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "main": "src/dispatcher.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "d1:migrate": "wrangler d1 migrations apply accounts",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@openparachute/vault-core": "workspace:*",
+    "@clerk/backend": "^1.0.0",
+    "stripe": "^17.0.0",
+    "hono": "^4.6.0",
+    "drizzle-orm": "^0.36.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260101.0",
+    "drizzle-kit": "^0.28.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.90.0"
+  }
+}

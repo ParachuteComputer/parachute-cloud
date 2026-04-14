@@ -1,0 +1,64 @@
+# Parachute Cloud — dispatcher + VaultDO
+#
+# Deployment is a single Worker (the dispatcher) bound to:
+#   - a Durable Object namespace (VaultDO, one instance per vault)
+#   - an R2 bucket (attachments)
+#   - a D1 database (accounts: users, vaults, subscriptions, custom hostnames)
+#   - a KV namespace (hot-path cache for hostname → vault lookup)
+#   - Clerk + Stripe secrets (set via `wrangler secret put`)
+#
+# Workers for Platforms (for subdomain dispatch + Custom Hostnames) is configured
+# on the Cloudflare account side; this file pins the bindings. Custom Hostnames
+# are created at signup via the CF API, not declared here.
+
+name = "parachute-cloud"
+main = "src/dispatcher.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Routes onto *.parachute.computer are attached via Workers for Platforms /
+# Custom Hostnames at the account level, not via `[[routes]]` here.
+
+# -------- Durable Objects --------
+
+[[durable_objects.bindings]]
+name = "VAULT_DO"
+class_name = "VaultDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VaultDO"]
+
+# -------- R2 (attachments) --------
+
+[[r2_buckets]]
+binding = "ATTACHMENTS"
+bucket_name = "parachute-cloud-attachments"
+
+# -------- D1 (accounts DB) --------
+
+[[d1_databases]]
+binding = "ACCOUNTS_DB"
+database_name = "parachute-cloud-accounts"
+database_id = "TODO-set-after-wrangler-d1-create"
+migrations_dir = "drizzle"
+
+# -------- KV (dispatcher cache) --------
+
+[[kv_namespaces]]
+binding = "ACCOUNTS_CACHE"
+id = "TODO-set-after-wrangler-kv-namespace-create"
+
+# -------- Vars (non-secret) --------
+
+[vars]
+ROOT_DOMAIN = "parachute.computer"
+ENVIRONMENT = "development"
+
+# Secrets to configure out-of-band:
+#   wrangler secret put CLERK_SECRET_KEY
+#   wrangler secret put CLERK_PUBLISHABLE_KEY
+#   wrangler secret put STRIPE_SECRET_KEY
+#   wrangler secret put STRIPE_WEBHOOK_SECRET
+#   wrangler secret put CF_API_TOKEN        # for Custom Hostname provisioning
+#   wrangler secret put CF_ZONE_ID          # parachute.computer zone
