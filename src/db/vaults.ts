@@ -47,6 +47,14 @@ export async function getVaultByHostname(
   return r ?? null;
 }
 
+export async function getVaultById(db: D1Database, id: string): Promise<VaultRow | null> {
+  const r = await db
+    .prepare("SELECT * FROM vaults WHERE id = ? AND deleted_at IS NULL")
+    .bind(id)
+    .first<VaultRow>();
+  return r ?? null;
+}
+
 export async function hostnameExists(db: D1Database, hostname: string): Promise<boolean> {
   const r = await db.prepare("SELECT 1 AS x FROM hostnames WHERE hostname = ?").bind(hostname).first();
   return r !== null;

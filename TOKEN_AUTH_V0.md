@@ -72,13 +72,22 @@ CREATE TABLE vault_tokens (
   reach a VaultDO (they can't, unless they're running this Worker) mint
   tokens. Treat it like any Worker secret.
 
+## Token management UI (v0.2)
+
+`GET /dashboard/vaults/:vaultId/tokens` lists a vault's tokens (name,
+id-prefix, created, last-used, revoke action). `POST` to the same path
+creates a new token with a user-supplied name; the raw value is rendered
+once on the redirect target via `?token=&name=`, then never again.
+`POST .../tokens/:tokenId/revoke` flips `revoked_at`. All three routes
+load the vault row and 404 on ownership mismatch (returning 404 not 403
+to avoid leaking which vault IDs exist).
+
+Revoking the last remaining token is allowed — we don't block it, we
+just warn on the page that the user should create a new token first if
+they still need API access.
+
 ## What this does NOT solve yet
 
-- **Token management UI.** v0 shows the token once at create time. The
-  dashboard has no list/revoke view yet. Users who lose the token must
-  wait for v1 (planned: subpage listing tokens by name/created/last-used
-  with a revoke button, plus a "create new token" action that re-reveals
-  once).
 - **Scopes.** Every token is read-write for the whole vault. No
   read-only, no per-MCP-tool scoping.
 - **Rate limiting.** No per-token buckets.

@@ -31,9 +31,11 @@
 import { Hono } from "hono";
 import type { DurableObjectState, R2Bucket } from "@cloudflare/workers-types";
 import { DoSqliteStore } from "@openparachute/core/do";
+import { R2BlobStore } from "@openparachute/core/blob-r2";
 import {
   assertCanCreateNote,
   TierLimitError,
+  tierOf,
   type TierId,
 } from "./billing/tiers.js";
 
@@ -71,8 +73,16 @@ export class VaultDO {
 
   private getStore(): DoSqliteStore {
     if (!this.store) {
+      // R2 is wired whenever the ATTACHMENTS bucket is bound. Blob ops throw
+      // if called without a blobStore, but addAttachment (metadata-only) works
+      // either way — so leaving blobStore unset in a misconfigured env fails
+      // loudly on first blob write rather than silently.
+      const blobStore = this.env.ATTACHMENTS
+        ? new R2BlobStore(this.env.ATTACHMENTS as unknown as ConstructorParameters<typeof R2BlobStore>[0])
+        : undefined;
       this.store = new DoSqliteStore(
         this.ctx.storage as unknown as ConstructorParameters<typeof DoSqliteStore>[0],
+        { blobStore },
       );
     }
     this.ensureTokenTable();
@@ -234,6 +244,93 @@ export class VaultDO {
       return c.json({ note }, 201);
     });
 
+    // ---- Attachments ----
+    // Attachments hang off notes. Upload is multipart/form-data with the file
+    // under `file` and optional `metadata` as a JSON string. The blob key is
+    // the attachment id; metadata lives in SQLite via addAttachment.
+
+    app.post("/api/notes/:noteId/attachments", async (c) => {
+      const tier = c.get("tier");
+      const noteId = c.req.param("noteId");
+      const note = await this.getStore().getNote(noteId);
+      if (!note) return c.json({ error: "note_not_found" }, 404);
+
+      const form = await c.req.formData().catch(() => null);
+      const fileEntry = form?.get("file");
+      if (!form || !isFileLike(fileEntry)) {
+        return c.json({ error: "file required (multipart field 'file')" }, 400);
+      }
+      const file = fileEntry;
+
+      // Per-tier upload cap. storagePerVaultMb is the vault-level quota, but
+      // we don't track used-bytes in D1 yet. For v0.2 treat it as a per-upload
+      // ceiling — good enough to keep someone from posting a 1GB file on a
+      // free vault. True accounting lands with usage_events.
+      const tierLimits = tierOf(tier);
+      const capBytes = tierLimits.storagePerVaultMb * 1024 * 1024;
+      if (file.size > capBytes) {
+        return c.json(
+          {
+            error: `attachment exceeds ${tierLimits.storagePerVaultMb} MB tier limit`,
+            limit: "attachment_size",
+            tier,
+          },
+          413,
+        );
+      }
+
+      const metaRaw = form.get("metadata");
+      let metadata: Record<string, unknown> | undefined;
+      if (typeof metaRaw === "string" && metaRaw.length > 0) {
+        try { metadata = JSON.parse(metaRaw); } catch { /* ignore malformed */ }
+      }
+
+      const mime = file.type || "application/octet-stream";
+      const store = this.getStore();
+      // Generate the blob key ourselves so we can putBlob → addAttachment in
+      // the right order: bytes land in R2 first, then the SQLite row points
+      // at a key that already exists. If putBlob fails, no orphan row.
+      const blobKey = `att/${crypto.randomUUID()}`;
+      await store.putBlob(blobKey, await file.arrayBuffer(), { mimeType: mime });
+      const attachment = await store.addAttachment(noteId, blobKey, mime, metadata);
+
+      return c.json(
+        {
+          attachment: {
+            id: attachment.id,
+            noteId: attachment.noteId,
+            mimeType: mime,
+            size: file.size,
+            createdAt: attachment.createdAt,
+            metadata,
+          },
+        },
+        201,
+      );
+    });
+
+    app.get("/api/notes/:noteId/attachments", async (c) => {
+      const atts = await this.getStore().getAttachments(c.req.param("noteId"));
+      return c.json({ attachments: atts });
+    });
+
+    app.get("/api/notes/:noteId/attachments/:id", async (c) => {
+      const noteId = c.req.param("noteId");
+      const id = c.req.param("id");
+      const atts = await this.getStore().getAttachments(noteId);
+      const att = atts.find((a) => a.id === id);
+      if (!att) return c.json({ error: "not_found" }, 404);
+      const blob = await this.getStore().getBlob(att.path);
+      if (!blob) return c.json({ error: "blob_missing" }, 404);
+      return new Response(blob.body as unknown as BodyInit, {
+        status: 200,
+        headers: {
+          "Content-Type": blob.mimeType ?? att.mimeType ?? "application/octet-stream",
+          ...(blob.size != null ? { "Content-Length": String(blob.size) } : {}),
+        },
+      });
+    });
+
     app.notFound((c) => c.json({ error: "not_found", path: c.req.path }, 404));
     return app;
   }
@@ -255,6 +352,26 @@ export class VaultDO {
     );
     return true;
   }
+}
+
+// ---- File helpers ----
+
+interface FileLike {
+  name: string;
+  size: number;
+  type: string;
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+// @cloudflare/workers-types and the global DOM `File` clash under our
+// tsconfig (no DOM lib). Structural check avoids both.
+function isFileLike(v: unknown): v is FileLike {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    typeof (v as FileLike).arrayBuffer === "function" &&
+    typeof (v as FileLike).size === "number"
+  );
 }
 
 // ---- Token helpers ----

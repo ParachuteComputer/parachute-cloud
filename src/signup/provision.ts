@@ -116,26 +116,13 @@ export async function provisionVault(
 }
 
 async function issueInitialToken(env: Env, vaultId: string, tier: TierId): Promise<string> {
-  if (!env.DO_INTERNAL_SECRET) {
-    throw new ProvisionError(
-      "DO_INTERNAL_SECRET not configured; cannot issue vault token",
-      "missing_internal_secret",
-    );
-  }
-  const doId = env.VAULT_DO.idFromName(vaultId);
-  const stub = env.VAULT_DO.get(doId);
-  const req = new Request("https://do/_internal/tokens", {
+  const { callVaultInternal } = await import("../vault-internal.js");
+  const res = await callVaultInternal(env, vaultId, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Internal-Secret": env.DO_INTERNAL_SECRET,
-      "X-Parachute-Tier": tier,
-    },
-    body: JSON.stringify({ name: "default" }),
+    path: "/_internal/tokens",
+    body: { name: "default" },
+    tier,
   });
-  const res = (await stub.fetch(
-    req as unknown as import("@cloudflare/workers-types").Request,
-  )) as unknown as Response;
   if (!res.ok) {
     throw new ProvisionError(
       `failed to issue initial vault token: ${res.status}`,
