@@ -11,6 +11,13 @@
  *   - POST /dashboard/tokens            — issue user or vault-scoped token
  *   - POST /dashboard/tokens/:id/revoke — revoke one token
  *
+ * Security:
+ *   - Token reveal goes through KV + HttpOnly cookie (see ./security.ts).
+ *     The raw `pvt_…` token never appears in a redirect URL, so it can't
+ *     leak into Worker access logs, Cloudflare logs, or browser history.
+ *   - All POSTs are CSRF-checked via double-submit (cookie + hidden form
+ *     field). 403 on mismatch.
+ *
  * All `/dashboard/*` routes redirect to `/onboarding/choose-hostname` when
  * the user hasn't picked a hostname yet. Onboarding routes redirect the
  * other way once hostname is set.
@@ -43,6 +50,15 @@ import {
   revokeUserToken,
 } from "../auth/tokens.js";
 import type { TokenRow } from "../db/tokens.js";
+import {
+  stashReveal,
+  popReveal,
+  ensureCsrfToken,
+  csrfInput,
+  csrfMiddleware,
+  appendSetCookie,
+  type RevealPayload,
+} from "./security.js";
 
 type Vars = {
   session: { clerkUserId: string; email: string };
@@ -52,6 +68,8 @@ type Vars = {
 export const dashboardApp = new Hono<{ Bindings: Env; Variables: Vars }>();
 
 dashboardApp.use("*", clerkMiddleware());
+// CSRF on every POST inside this router. GETs pass through.
+dashboardApp.use("*", csrfMiddleware());
 
 // Onboarding / dashboard guard: users without a hostname land on onboarding;
 // users with one skip past it.
@@ -73,7 +91,9 @@ dashboardApp.use("*", async (c, next) => {
 dashboardApp.get("/choose-hostname", async (c: AuthedContext) => {
   const user = c.get("user");
   const err = new URL(c.req.url).searchParams.get("err");
-  return c.html(onboardingPage(user.email, c.env.ROOT_DOMAIN, err));
+  const csrf = ensureCsrfToken(c.req.header("Cookie") ?? null);
+  if (csrf.setCookie) appendSetCookie(c, csrf.setCookie);
+  return c.html(onboardingPage(user.email, c.env.ROOT_DOMAIN, err, csrf.token));
 });
 
 dashboardApp.post("/choose-hostname", async (c: AuthedContext) => {
@@ -82,9 +102,13 @@ dashboardApp.post("/choose-hostname", async (c: AuthedContext) => {
   const subdomain = String(form.get("subdomain") ?? "");
   try {
     const result = await onboardUser(c.env, user, subdomain);
-    return c.redirect(
-      `/dashboard?welcome=1&token=${encodeURIComponent(result.apiToken)}&hostname=${encodeURIComponent(result.hostname)}`,
-    );
+    const cookie = await stashReveal(c.env, {
+      kind: "welcome",
+      token: result.apiToken,
+      hostname: result.hostname,
+    });
+    appendSetCookie(c, cookie);
+    return c.redirect("/dashboard");
   } catch (err) {
     const msg = err instanceof ProvisionError ? err.message : "error";
     return c.redirect(`/onboarding/choose-hostname?err=${encodeURIComponent(msg)}`);
@@ -98,6 +122,14 @@ dashboardApp.get("/", async (c: AuthedContext) => {
   const hostname = user.hostname!; // guard guarantees non-null
   const db = c.env.ACCOUNTS_DB;
 
+  const csrf = ensureCsrfToken(c.req.header("Cookie") ?? null);
+  if (csrf.setCookie) appendSetCookie(c, csrf.setCookie);
+
+  // One-shot reveal (welcome banner OR new-token banner).
+  const revealResult = await popReveal(c.env, c.req.header("Cookie") ?? null);
+  if (revealResult) appendSetCookie(c, revealResult.clearCookie);
+  const reveal = revealResult?.payload ?? null;
+
   const [vaults, sub, tokens] = await Promise.all([
     listVaultsByUser(db, user.id),
     getActiveSubscription(db, user.id),
@@ -107,37 +139,20 @@ dashboardApp.get("/", async (c: AuthedContext) => {
   const limits = tierOf(tier);
 
   const url = new URL(c.req.url);
-  const welcome = url.searchParams.get("welcome") === "1";
-  const revealToken = url.searchParams.get("token");
-  const revealHostname = url.searchParams.get("hostname");
-
-  const banner = welcome && revealToken
-    ? `<div class="banner">
-        <h2>Welcome — your parachute is ready</h2>
-        <p>Your hostname: <code>${esc(revealHostname ?? hostname)}</code></p>
-        <p><strong>Save this API token now — it will not be shown again:</strong></p>
-        <div class="token-reveal">${esc(revealToken)}</div>
-        <p style="color:var(--text-dim);font-size:12.5px">Send as <code>Authorization: Bearer &lt;token&gt;</code>. This token works for every vault you own.</p>
-        <script>try { history.replaceState(null, "", "/dashboard"); } catch {}</script>
-      </div>`
-    : "";
-
-  const newTokenName = url.searchParams.get("newTokenName");
-  const newTokenValue = url.searchParams.get("newToken");
-  const tokenBanner = newTokenValue
-    ? `<div class="banner">
-        <h2>New token: ${esc(newTokenName ?? "")}</h2>
-        <p><strong>Save this token now — you won't see it again:</strong></p>
-        <div class="token-reveal">${esc(newTokenValue)}</div>
-        <script>try { history.replaceState(null, "", "/dashboard"); } catch {}</script>
-      </div>`
-    : "";
-
   const deleted = url.searchParams.get("deleted");
-  const deletedBanner = deleted
-    ? `<div class="banner banner-warn"><p>Deleted vault <code>${esc(deleted)}</code>.</p>
-       <script>try { history.replaceState(null, "", "/dashboard"); } catch {}</script></div>`
-    : "";
+  const errMsg = url.searchParams.get("err");
+
+  const banners = [
+    reveal ? revealBanner(reveal) : "",
+    deleted
+      ? `<div class="banner banner-warn"><p>Deleted vault <code>${esc(deleted)}</code>.</p>
+         <script>try { history.replaceState(null, "", "/dashboard"); } catch {}</script></div>`
+      : "",
+    errMsg
+      ? `<div class="banner banner-warn"><p>${esc(errMsg)}</p>
+         <script>try { history.replaceState(null, "", "/dashboard"); } catch {}</script></div>`
+      : "",
+  ].join("");
 
   // Vault cards
   const vaultCards = vaults.map((v) => {
@@ -150,21 +165,21 @@ dashboardApp.get("/", async (c: AuthedContext) => {
         <div class="meta">Created ${created}</div>
         <div class="actions">
           <a class="btn" href="#rename-${esc(v.id)}">Rename</a>
-          <a class="btn btn-ghost" href="${esc(vaultUrl)}/mcp">MCP</a>
+          <a class="btn btn-ghost" href="${esc(vaultUrl)}/mcp" title="MCP endpoint — coming in v0.5">MCP</a>
           <a class="btn btn-danger" href="#delete-${esc(v.id)}">Delete</a>
         </div>
       </div>
-      ${renameModal(v.id, v.name)}
-      ${deleteModal(v.id, v.name, v.slug)}
+      ${renameModal(v.id, v.name, csrf.token)}
+      ${deleteModal(v.id, v.name, v.slug, csrf.token)}
     `;
   }).join("");
 
   const vaultsSection = vaults.length > 0
     ? `<div class="grid">${vaultCards}</div>`
-    : `<div class="empty"><p>No vaults yet.</p></div>`;
+    : emptyVaultsState();
 
   // Tokens table
-  const tokenRows = tokens.map((t) => tokenRow(t)).join("");
+  const tokenRows = tokens.map((t) => tokenRow(t, csrf.token)).join("");
   const tokensSection = tokens.length > 0
     ? `<table>
         <thead><tr><th>Name</th><th>Scope</th><th>Created</th><th>Last used</th><th></th></tr></thead>
@@ -175,9 +190,7 @@ dashboardApp.get("/", async (c: AuthedContext) => {
   const vaultOpts = vaults.map((v) => `<option value="${esc(v.slug)}">${esc(v.name)} (/v/${esc(v.slug)})</option>`).join("");
 
   return c.html(layout(user.email, hostname, tier, `
-    ${banner}
-    ${tokenBanner}
-    ${deletedBanner}
+    ${banners}
 
     <section class="hero">
       <h1>${esc(hostname)}</h1>
@@ -218,8 +231,8 @@ dashboardApp.get("/", async (c: AuthedContext) => {
       </div>
     </section>
 
-    ${newVaultModal()}
-    ${newTokenModal(vaultOpts)}
+    ${newVaultModal(csrf.token)}
+    ${newTokenModal(vaultOpts, csrf.token)}
   `));
 });
 
@@ -268,7 +281,23 @@ dashboardApp.post("/vaults/:id/delete", async (c: AuthedContext) => {
   const sub = await getActiveSubscription(c.env.ACCOUNTS_DB, user.id);
   const tier = (sub?.tier ?? "free") as TierId;
 
-  // D1 first (stops routing), then R2 wipe via DO.
+  // Order:
+  //  1. Revoke any vault-scoped tokens for this slug. Otherwise the dashboard
+  //     would keep showing them as "active" even though the vault row is
+  //     gone — confusing for the user, and the next vault re-using the slug
+  //     would inherit them.
+  //  2. Hard-delete the D1 row. This stops `/v/<slug>/api/*` routing
+  //     immediately, closing the window for concurrent writes.
+  //  3. Wipe R2 via the DO. Reachable even after the D1 row is gone because
+  //     the DO id is derived from `${userId}:${slug}`.
+  const now = Math.floor(Date.now() / 1000);
+  await c.env.ACCOUNTS_DB
+    .prepare(
+      "UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND vault_slug = ? AND revoked_at IS NULL",
+    )
+    .bind(now, user.id, vault.slug)
+    .run();
+
   await hardDeleteVault(c.env.ACCOUNTS_DB, vault.id);
   const wipe = await callVaultInternal(c.env, doIdName(user.id, vault.slug), {
     method: "POST",
@@ -300,9 +329,9 @@ dashboardApp.post("/tokens", async (c: AuthedContext) => {
     name,
     vaultSlug,
   });
-  return c.redirect(
-    `/dashboard?newToken=${encodeURIComponent(token)}&newTokenName=${encodeURIComponent(name)}`,
-  );
+  const cookie = await stashReveal(c.env, { kind: "token", token, name });
+  appendSetCookie(c, cookie);
+  return c.redirect("/dashboard");
 });
 
 dashboardApp.post("/tokens/:id/revoke", async (c: AuthedContext) => {
@@ -337,7 +366,7 @@ ${body}
 </body></html>`;
 }
 
-function onboardingPage(email: string, rootDomain: string, err: string | null): string {
+function onboardingPage(email: string, rootDomain: string, err: string | null, csrf: string): string {
   return `<!doctype html>
 <html><head>
 <meta charset="utf-8" />
@@ -356,6 +385,7 @@ function onboardingPage(email: string, rootDomain: string, err: string | null): 
   <p class="lead">Your vaults will live at <code>&lt;hostname&gt;.${esc(rootDomain)}/v/&lt;slug&gt;/…</code></p>
   ${err ? `<div class="banner banner-warn"><p>${esc(err)}</p></div>` : ""}
   <form method="POST" action="/onboarding/choose-hostname" id="onboard-form">
+    ${csrfInput(csrf)}
     <div class="field-row">
       <div style="flex:1">
         <label>Subdomain</label>
@@ -398,12 +428,46 @@ function onboardingPage(email: string, rootDomain: string, err: string | null): 
 </body></html>`;
 }
 
-function renameModal(vaultId: string, currentName: string): string {
+function revealBanner(p: RevealPayload): string {
+  if (p.kind === "welcome") {
+    return `<div class="banner">
+      <h2>Welcome — your parachute is ready</h2>
+      <p>Your hostname: <code>${esc(p.hostname ?? "")}</code></p>
+      <p><strong>Save this API token now — it will not be shown again:</strong></p>
+      <div class="token-reveal">${esc(p.token)}</div>
+      <p style="color:var(--text-dim);font-size:12.5px">Send as <code>Authorization: Bearer &lt;token&gt;</code>. This token works for every vault you own.</p>
+    </div>`;
+  }
+  return `<div class="banner">
+    <h2>New token: ${esc(p.name ?? "")}</h2>
+    <p><strong>Save this token now — you won't see it again:</strong></p>
+    <div class="token-reveal">${esc(p.token)}</div>
+  </div>`;
+}
+
+function emptyVaultsState(): string {
+  // Inline parachute glyph + Fraunces italic — first-impression for users
+  // who haven't yet created anything past the default vault that onboarding
+  // gives them. Shouldn't normally trigger (onboarding seeds /v/default),
+  // so this is mostly a defensive render for an unusual state.
+  return `<div class="empty" style="padding:3.5rem 1rem">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="56" height="56" style="opacity:0.85;margin-bottom:0.8rem">
+      <circle cx="32" cy="26" r="14" fill="#7AB09D"/>
+      <path d="M18 30 Q12 44 10 54 M26 34 Q22 48 20 58 M32 36 Q32 50 32 60 M38 34 Q42 48 44 58 M46 30 Q52 44 54 54" stroke="#8CCFCE" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+    </svg>
+    <p style="font-family:var(--display);font-style:italic;font-size:18px;color:var(--forest);margin:0 0 0.3rem">An empty parachute.</p>
+    <p>No vaults yet — start with one.</p>
+    <p style="margin-top:1rem"><a class="btn btn-primary" href="#new-vault">Create your first vault</a></p>
+  </div>`;
+}
+
+function renameModal(vaultId: string, currentName: string, csrf: string): string {
   const id = `rename-${vaultId}`;
   return `<div class="modal" id="${esc(id)}">
     <div class="modal-body">
       <h3>Rename vault</h3>
       <form method="POST" action="/dashboard/vaults/${esc(vaultId)}/rename">
+        ${csrfInput(csrf)}
         <div class="field">
           <label>New name</label>
           <input name="name" required maxlength="80" value="${esc(currentName)}" />
@@ -417,13 +481,14 @@ function renameModal(vaultId: string, currentName: string): string {
   </div>`;
 }
 
-function deleteModal(vaultId: string, name: string, slug: string): string {
+function deleteModal(vaultId: string, name: string, slug: string, csrf: string): string {
   const id = `delete-${vaultId}`;
   return `<div class="modal" id="${esc(id)}">
     <div class="modal-body">
       <h3 style="color:var(--err)">Delete ${esc(name)}</h3>
-      <p style="color:var(--text-dim);font-size:13px">This deletes all notes, attachments, and the slug mapping for <code>/v/${esc(slug)}</code>. Cannot be undone.</p>
+      <p style="color:var(--text-dim);font-size:13px">This deletes all notes, attachments, and the slug mapping for <code>/v/${esc(slug)}</code>. Vault-scoped tokens for this slug are revoked. Cannot be undone.</p>
       <form method="POST" action="/dashboard/vaults/${esc(vaultId)}/delete">
+        ${csrfInput(csrf)}
         <div class="field">
           <label>Type the slug <code>${esc(slug)}</code> to confirm</label>
           <input name="confirm" required autocomplete="off" />
@@ -437,11 +502,12 @@ function deleteModal(vaultId: string, name: string, slug: string): string {
   </div>`;
 }
 
-function newVaultModal(): string {
+function newVaultModal(csrf: string): string {
   return `<div class="modal" id="new-vault">
     <div class="modal-body">
       <h3>New vault</h3>
       <form method="POST" action="/dashboard/vaults">
+        ${csrfInput(csrf)}
         <div class="field">
           <label>Name</label>
           <input name="name" required maxlength="80" placeholder="Work" />
@@ -459,11 +525,12 @@ function newVaultModal(): string {
   </div>`;
 }
 
-function newTokenModal(vaultOpts: string): string {
+function newTokenModal(vaultOpts: string, csrf: string): string {
   return `<div class="modal" id="new-token">
     <div class="modal-body">
       <h3>New API token</h3>
       <form method="POST" action="/dashboard/tokens">
+        ${csrfInput(csrf)}
         <div class="field">
           <label>Name</label>
           <input name="name" required maxlength="60" placeholder="laptop" />
@@ -489,7 +556,7 @@ function newTokenModal(vaultOpts: string): string {
   </div>`;
 }
 
-function tokenRow(t: TokenRow): string {
+function tokenRow(t: TokenRow, csrf: string): string {
   const scope = t.vault_slug
     ? `<span class="pill">/v/${esc(t.vault_slug)}</span>`
     : `<span class="pill pill-turquoise">all vaults</span>`;
@@ -498,6 +565,7 @@ function tokenRow(t: TokenRow): string {
   const action = t.revoked_at
     ? `<span style="color:var(--text-muted);font-size:12px">revoked ${dateStr(t.revoked_at)}</span>`
     : `<form method="POST" action="/dashboard/tokens/${esc(t.id)}/revoke" style="display:inline">
+         ${csrfInput(csrf)}
          <button class="btn btn-ghost" type="submit" onclick="return confirm('Revoke &quot;${esc(t.name)}&quot;?')">Revoke</button>
        </form>`;
   return `<tr>

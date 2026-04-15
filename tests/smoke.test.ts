@@ -31,6 +31,92 @@ async function asUser(
   return fetch(`${BASE}${path}`, { ...init, headers });
 }
 
+/**
+ * Per-user cookie jar: we need to persist the `pcs_csrf` cookie across a
+ * GET/POST pair, and the `pcr` reveal cookie from a POST into the following
+ * GET that actually surfaces the token in HTML.
+ *
+ * Deliberately tiny — we just track name→value, no attribute parsing.
+ */
+function newJar(): {
+  read: () => string;
+  absorb: (res: Response) => void;
+} {
+  const store = new Map<string, string>();
+  return {
+    read: () =>
+      [...store.entries()].map(([k, v]) => `${k}=${v}`).join("; "),
+    absorb: (res: Response) => {
+      // Bun/undici: use getSetCookie() to grab all Set-Cookie lines.
+      const lines = (res.headers as unknown as {
+        getSetCookie?: () => string[];
+      }).getSetCookie?.() ?? [];
+      for (const line of lines) {
+        const [pair] = line.split(";");
+        if (!pair) continue;
+        const eq = pair.indexOf("=");
+        if (eq === -1) continue;
+        const name = pair.slice(0, eq).trim();
+        const value = pair.slice(eq + 1).trim();
+        if (value === "" || name === "") store.delete(name);
+        else store.set(name, value);
+      }
+    },
+  };
+}
+
+/**
+ * GET /dashboard (or /onboarding/choose-hostname) to pick up the CSRF
+ * cookie, then POST the form with the matching `csrf` field injected. The
+ * jar absorbs any Set-Cookie lines along the way so the same caller can
+ * chain follow-up GETs and read the reveal cookie.
+ */
+async function csrfPost(
+  devUser: string,
+  jar: ReturnType<typeof newJar>,
+  path: string,
+  fields: Record<string, string>,
+  primePath = "/dashboard",
+): Promise<Response> {
+  // Prime the jar + learn the token if we don't have one yet.
+  if (!jar.read().includes("pcs_csrf=")) {
+    const primed = await asUser(devUser, primePath, {
+      headers: { Cookie: jar.read() },
+      redirect: "manual",
+    });
+    jar.absorb(primed);
+  }
+  const token = /pcs_csrf=([a-f0-9-]{36})/.exec(jar.read())?.[1];
+  if (!token) throw new Error("csrf cookie never set by prime request");
+  const body = new URLSearchParams({ ...fields, csrf: token });
+  const res = await asUser(devUser, path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Cookie: jar.read(),
+    },
+    body: body.toString(),
+    redirect: "manual",
+  });
+  jar.absorb(res);
+  return res;
+}
+
+/** Fetch /dashboard, read the reveal banner, return the raw pvt_ token. */
+async function readRevealedToken(
+  devUser: string,
+  jar: ReturnType<typeof newJar>,
+): Promise<string> {
+  const res = await asUser(devUser, "/dashboard", {
+    headers: { Cookie: jar.read() },
+  });
+  jar.absorb(res);
+  const html = await res.text();
+  const m = /class="token-reveal">\s*(pvt_[A-Za-z0-9_-]+)\s*</.exec(html);
+  if (!m) throw new Error("no token-reveal banner found on /dashboard");
+  return m[1]!;
+}
+
 /** Hit a user subdomain by Host header. `wrangler dev` serves any host. */
 async function onHost(
   hostname: string,
@@ -137,13 +223,11 @@ describe("parachute-cloud v0.4 smoke", () => {
     const { devUser, sub } = uniq("multi");
     const s = await signup(devUser, sub);
 
-    // Create a second vault.
-    const form = new URLSearchParams({ name: "Work", slug: "work" });
-    const add = await asUser(devUser, "/dashboard/vaults", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: form.toString(),
-      redirect: "manual",
+    // Create a second vault via the dashboard (CSRF-guarded).
+    const jar = newJar();
+    const add = await csrfPost(devUser, jar, "/dashboard/vaults", {
+      name: "Work",
+      slug: "work",
     });
     expect([302, 303]).toContain(add.status);
 
@@ -162,29 +246,22 @@ describe("parachute-cloud v0.4 smoke", () => {
     const { devUser, sub } = uniq("scope");
     const s = await signup(devUser, sub);
 
+    const jar = newJar();
     // Create a second vault.
-    await asUser(devUser, "/dashboard/vaults", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ name: "Work", slug: "work" }).toString(),
-      redirect: "manual",
+    await csrfPost(devUser, jar, "/dashboard/vaults", {
+      name: "Work",
+      slug: "work",
     });
 
     // Issue a vault-scoped token for /v/work.
-    const body = new URLSearchParams({
+    const issued = await csrfPost(devUser, jar, "/dashboard/tokens", {
       name: "work-only",
       scope: "vault",
       vault_slug: "work",
     });
-    const issued = await asUser(devUser, "/dashboard/tokens", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString(),
-      redirect: "manual",
-    });
     expect([302, 303]).toContain(issued.status);
-    const loc = new URL(issued.headers.get("Location") ?? "/", BASE);
-    const vaultToken = loc.searchParams.get("newToken");
+    // Token reveal now rides a `pcr` HttpOnly cookie + /dashboard render.
+    const vaultToken = await readRevealedToken(devUser, jar);
     expect(vaultToken).toMatch(/^pvt_/);
 
     // Works on /v/work.
@@ -204,18 +281,21 @@ describe("parachute-cloud v0.4 smoke", () => {
     const { devUser, sub } = uniq("rev");
     const s = await signup(devUser, sub);
 
+    const jar = newJar();
     // Issue a fresh token to revoke.
-    const issued = await asUser(devUser, "/dashboard/tokens", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ name: "throwaway", scope: "user" }).toString(),
-      redirect: "manual",
+    const issued = await csrfPost(devUser, jar, "/dashboard/tokens", {
+      name: "throwaway",
+      scope: "user",
     });
-    const loc = new URL(issued.headers.get("Location") ?? "/", BASE);
-    const throwaway = loc.searchParams.get("newToken")!;
+    expect([302, 303]).toContain(issued.status);
+    const throwaway = await readRevealedToken(devUser, jar);
 
-    // List tokens on dashboard to find the id for "throwaway".
-    const page = await asUser(devUser, "/dashboard");
+    // List tokens on dashboard to find the id for "throwaway". Note: the
+    // readRevealedToken call above also re-fetched /dashboard, so we re-GET
+    // here without relying on that previous body.
+    const page = await asUser(devUser, "/dashboard", {
+      headers: { Cookie: jar.read() },
+    });
     const html = await page.text();
     const rowRe = /\/dashboard\/tokens\/([a-f0-9-]{36})\/revoke/g;
     const ids = [...html.matchAll(rowRe)].map((m) => m[1]);
@@ -223,11 +303,8 @@ describe("parachute-cloud v0.4 smoke", () => {
     const id = ids[0];
     expect(id).toBeTruthy();
 
-    // Revoke it.
-    const revoke = await asUser(devUser, `/dashboard/tokens/${id}/revoke`, {
-      method: "POST",
-      redirect: "manual",
-    });
+    // Revoke it (CSRF-guarded like every dashboard POST).
+    const revoke = await csrfPost(devUser, jar, `/dashboard/tokens/${id}/revoke`, {});
     expect([302, 303]).toContain(revoke.status);
 
     // Throwaway no longer works.

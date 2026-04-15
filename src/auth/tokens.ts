@@ -63,22 +63,27 @@ export interface VerifiedToken {
 }
 
 /**
- * Verify a raw bearer token against the requested vault slug.
+ * Verify a raw bearer token against the requested vault slug AND owning
+ * user.
  *
  * Returns null (→ 401) when the token is missing the prefix, unknown,
- * revoked, or scoped to a different vault. Touches `last_used_at` on
- * success as a side effect; failures never write.
+ * revoked, scoped to a different vault, or belongs to a different user.
+ * Order matters: the user-id check happens BEFORE `touchToken`, so a
+ * cross-user attempt with a real-but-foreign token cannot show up as
+ * activity on the legitimate owner's row.
  */
 export async function verifyToken(
   db: D1Database,
   rawToken: string | null,
   requiredVaultSlug: string,
+  requiredUserId: string,
 ): Promise<VerifiedToken | null> {
   if (!rawToken || !rawToken.startsWith(TOKEN_PREFIX)) return null;
   const hash = await sha256Hex(rawToken);
   const row = await getTokenByHash(db, hash);
   if (!row) return null;
   if (row.revoked_at !== null) return null;
+  if (row.user_id !== requiredUserId) return null;
   // Vault-scoped tokens only match their own slug; user-scoped tokens
   // (vault_slug null) match any slug under their owner.
   if (row.vault_slug !== null && row.vault_slug !== requiredVaultSlug) return null;

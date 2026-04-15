@@ -6,8 +6,9 @@
  * (`vault_slug IS NULL`, granting access to every vault the user owns) or
  * vault-scoped (grants access to exactly one slug).
  *
- * Verify lookup is O(1) by hash. Scope-match is done in SQL so the check
- * itself is one round-trip.
+ * Verify lookup is O(1) by hash. Scope-match (user_id, vault_slug) is done
+ * in JS by `auth/tokens.verifyToken` after the row comes back — keeps the
+ * SQL trivially indexed and the conditional close to its caller.
  */
 
 import type { D1Database } from "@cloudflare/workers-types";

@@ -133,7 +133,12 @@ app.all("*", async (c) => handleVaultRequest(c.req.raw, c.env));
 
 async function handleVaultRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  const host = ((request.headers.get("Host") ?? url.host).toLowerCase().split(":")[0]) ?? "";
+  // Hosts may legitimately arrive with a trailing dot (FQDN). Normalize so
+  // `aaron.parachute.computer` and `aaron.parachute.computer.` route to the
+  // same user row.
+  const host =
+    ((request.headers.get("Host") ?? url.host).toLowerCase().split(":")[0] ?? "")
+      .replace(/\.$/, "");
 
   if (isRootDomain(host, env.ROOT_DOMAIN)) {
     return new Response("not found", { status: 404 });
@@ -164,11 +169,13 @@ async function handleVaultRequest(request: Request, env: Env): Promise<Response>
     return new Response("not found", { status: 404 });
   }
 
-  // Token auth — `Authorization: Bearer pvt_...`.
+  // Token auth — `Authorization: Bearer pvt_...`. The user-id check happens
+  // inside verifyToken, before the last_used_at write, so a cross-user probe
+  // can't surface as activity on the legitimate owner's token.
   const auth = request.headers.get("Authorization");
   const bearer = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
-  const verified = await verifyToken(env.ACCOUNTS_DB, bearer, slug);
-  if (!verified || verified.userId !== user.id) {
+  const verified = await verifyToken(env.ACCOUNTS_DB, bearer, slug, user.id);
+  if (!verified) {
     return new Response(JSON.stringify({ error: "unauthorized" }), {
       status: 401,
       headers: { "Content-Type": "application/json" },

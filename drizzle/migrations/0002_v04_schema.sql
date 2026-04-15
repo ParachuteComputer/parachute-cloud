@@ -1,9 +1,23 @@
--- Parachute Cloud — initial accounts schema (v0.4: user-per-subdomain).
+-- Parachute Cloud — v0.4 user-per-subdomain schema.
 --
 -- Identity shape: one hostname per user, many vaults under that hostname
 -- addressed by slug (`<user>.parachute.computer/v/<slug>/...`). Tokens live
 -- in D1 and are either user-scoped (access every vault the user owns) or
 -- vault-scoped (just one slug). See Uni/Decisions/2026-04-15-parachute-cloud-user-per-subdomain.
+--
+-- Named 0002 rather than 0001 so `wrangler d1 migrations apply --local` still
+-- runs on machines that executed the v0.3 0001_init.sql: wrangler's tracker
+-- has already marked 0001_init done, so re-editing that file in place would
+-- be skipped. A fresh filename fires the DROPs + re-creates below once and
+-- settles on the v0.4 shape. On pristine machines the DROPs are harmless.
+
+DROP TABLE IF EXISTS usage_events;
+DROP TABLE IF EXISTS subscriptions;
+DROP TABLE IF EXISTS tokens;
+DROP TABLE IF EXISTS vaults;
+DROP TABLE IF EXISTS hostnames;
+DROP TABLE IF EXISTS custom_hostnames;  -- v0.3 only, gone in v0.4
+DROP TABLE IF EXISTS users;
 
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,

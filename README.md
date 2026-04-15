@@ -171,7 +171,12 @@ Smoke tests (`bun test tests/smoke.test.ts`) assume `wrangler dev` is already ru
 
 ## Using a hosted vault with `parachute-agent`
 
-Every vault is reachable at `https://<you>.parachute.computer/v/<slug>/mcp`
+> ⚠️ **MCP endpoint coming in v0.5.** The `/v/<slug>/mcp` path is reserved but
+> not yet implemented — currently returns a stub. The REST API at
+> `/v/<slug>/api/*` is fully functional and what agents should target today.
+> The example below shows the shape you'll configure once v0.5 lands.
+
+Every vault will be reachable at `https://<you>.parachute.computer/v/<slug>/mcp`
 with an API token (`pvt_…`) as the bearer. User-scope tokens work on every
 vault you own, so one token can fan a single agent across several vaults:
 

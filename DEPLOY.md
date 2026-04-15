@@ -5,11 +5,18 @@ that can sign up users, provision their subdomain, and serve `/v/<slug>/api/*`
 per-tenant vault routes. Assumes production Cloudflare, Clerk, and Stripe
 accounts.
 
-**v0.4 note:** the schema is a clean break from v0.3. If there is any v0.3
-production data it must be migrated/dropped separately — `0001_init.sql`
-assumes a blank database. Custom Hostnames are now registered once per user
-(not once per vault), so the existing wildcard plan is sufficient and less
-API churn hits Cloudflare during onboarding.
+**v0.4 note:** the schema is a clean break from v0.3. The migration file is
+named `0002_v04_schema.sql` (not `0002_v04_schema.sql`) so `wrangler d1 migrations
+apply` still runs on machines that already executed a v0.3 `0002_v04_schema.sql` —
+the file leads with `DROP TABLE IF EXISTS` for the old tables and re-creates
+the v0.4 shape. Any v0.3 production data is blown away; migrate or back up
+first if you have real tenants. Custom Hostnames are now registered once per
+user (not once per vault), so the existing wildcard plan is sufficient and
+less API churn hits Cloudflare during onboarding.
+
+> ⚠️ **MCP endpoint is a v0.5 feature.** The `/v/<slug>/mcp` path is wired in
+> the dispatcher but returns a stub. Production clients should target the REST
+> API at `/v/<slug>/api/*` until v0.5 ships the real MCP handler.
 
 Nothing here is automated; every command is something you run.
 
@@ -47,7 +54,7 @@ wrangler kv namespace create RATE_LIMIT_KV
 
 ```sh
 wrangler d1 execute parachute-cloud-accounts \
-  --file=drizzle/migrations/0001_init.sql --remote
+  --file=drizzle/migrations/0002_v04_schema.sql --remote
 ```
 
 Re-run the same command for each additional migration file as they appear

@@ -12,8 +12,7 @@
 
 import type { Env } from "../env.js";
 import type { UserRow } from "../db/users.js";
-import { setUserHostname } from "../db/users.js";
-import { hostnameExists, insertHostname } from "../db/hostnames.js";
+import { hostnameExists } from "../db/hostnames.js";
 import { insertVault } from "../db/vaults.js";
 import { issueToken } from "../auth/tokens.js";
 
@@ -123,8 +122,10 @@ export async function onboardUser(
     name: "default",
   });
 
-  // Keep the in-memory user consistent with D1 for callers that reuse it.
-  await setUserHostname(env.ACCOUNTS_DB, user.id, hostname);
+  // The D1 batch above already set users.hostname. Sync the caller's
+  // in-memory copy so the dashboard guard sees the new value on this same
+  // request without a re-fetch.
+  user.hostname = hostname;
 
   return { hostname, vaultId, vaultSlug, apiToken };
 }
