@@ -41,17 +41,23 @@ export const hostnames = sqliteTable("hostnames", {
   status: text("status").notNull().default("pending"),
 });
 
-export const subscriptions = sqliteTable("subscriptions", {
-  id: text("id").primaryKey(),
-  userId: text("user_id")
-    .notNull()
-    .references(() => users.id),
-  stripeCustomerId: text("stripe_customer_id").notNull(),
-  stripeSubscriptionId: text("stripe_subscription_id"),
-  status: text("status").notNull(),
-  tier: text("tier").notNull(),
-  currentPeriodEnd: integer("current_period_end"),
-});
+export const subscriptions = sqliteTable(
+  "subscriptions",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    stripeCustomerId: text("stripe_customer_id").notNull().unique(),
+    stripeSubscriptionId: text("stripe_subscription_id"),
+    status: text("status").notNull(),
+    tier: text("tier").notNull(),
+    currentPeriodEnd: integer("current_period_end"),
+  },
+  (t) => ({
+    userIdx: index("subs_user_idx").on(t.userId),
+  }),
+);
 
 export const usageEvents = sqliteTable(
   "usage_events",

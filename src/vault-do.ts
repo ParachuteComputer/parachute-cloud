@@ -21,7 +21,7 @@
 import { Hono } from "hono";
 import type { DurableObjectState, R2Bucket } from "@cloudflare/workers-types";
 import { DoSqliteStore } from "@openparachute/core/do";
-import { assertCanCreateNote, TierLimitError, tierOf, type TierId } from "./billing/tiers.js";
+import { assertCanCreateNote, TierLimitError, type TierId } from "./billing/tiers.js";
 
 export interface VaultDOEnv {
   ATTACHMENTS: R2Bucket;
@@ -40,7 +40,6 @@ export class VaultDO {
     private readonly ctx: DurableObjectState,
     private readonly env: VaultDOEnv,
   ) {
-    void this.env;
     this.app = this.buildApp();
   }
 
@@ -80,11 +79,14 @@ export class VaultDO {
 
     app.get("/api/notes", async (c) => {
       const url = new URL(c.req.url);
-      const limit = Number(url.searchParams.get("limit") ?? "50");
+      const rawLimit = Number(url.searchParams.get("limit") ?? "50");
+      const limit = Number.isFinite(rawLimit)
+        ? Math.min(500, Math.max(1, Math.floor(rawLimit)))
+        : 50;
       const tag = url.searchParams.get("tag");
       const notes = await this.getStore().queryNotes({
         tags: tag ? [tag] : undefined,
-        limit: Number.isFinite(limit) ? limit : 50,
+        limit,
         sort: "desc",
       });
       return c.json({ notes });
@@ -98,7 +100,6 @@ export class VaultDO {
 
     app.post("/api/notes", async (c) => {
       const tier = c.get("tier");
-      const limits = tierOf(tier);
       const stats = await this.getStore().getVaultStats();
       try {
         assertCanCreateNote(tier, stats.totalNotes);
@@ -118,7 +119,6 @@ export class VaultDO {
       if (!body || typeof body.content !== "string") {
         return c.json({ error: "content required" }, 400);
       }
-      void limits;
 
       const note = await this.getStore().createNote(body.content, {
         path: body.path,

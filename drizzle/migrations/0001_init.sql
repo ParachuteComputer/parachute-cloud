@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS hostnames (
 CREATE TABLE IF NOT EXISTS subscriptions (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id),
-  stripe_customer_id TEXT NOT NULL,
+  stripe_customer_id TEXT NOT NULL UNIQUE,
   stripe_subscription_id TEXT,
   status TEXT NOT NULL,
   tier TEXT NOT NULL,

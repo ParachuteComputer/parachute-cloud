@@ -15,12 +15,7 @@
 
 import type { Env } from "../env.js";
 import type { UserRow } from "../db/users.js";
-import {
-  countVaultsByOwner,
-  hostnameExists,
-  insertHostname,
-  insertVault,
-} from "../db/vaults.js";
+import { countVaultsByOwner, hostnameExists } from "../db/vaults.js";
 import { assertCanCreateVault, type TierId } from "../billing/tiers.js";
 
 const RESERVED = new Set([
@@ -29,7 +24,7 @@ const RESERVED = new Set([
   "parachute", "vault", "cloud",
 ]);
 
-const NAME_RE = /^[a-z0-9]([a-z0-9-]{1,30}[a-z0-9])?$/;
+const NAME_RE = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
 
 export class ProvisionError extends Error {
   constructor(message: string, public readonly code: string) {
@@ -68,22 +63,30 @@ export async function provisionVault(
   const vaultId = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
 
-  await insertVault(env.ACCOUNTS_DB, {
-    id: vaultId,
-    owner_user_id: user.id,
-    name: lower,
-    hostname,
-    created_at: now,
-    deleted_at: null,
-  });
-
+  // Register CF custom hostname FIRST so any API failure happens before we
+  // touch D1. If the CF call throws, no D1 state is written; on success, we
+  // atomically insert both the vault and hostname rows via `db.batch`.
+  //
+  // Hostname-status vocabulary:
+  //   pending    — CF custom-hostname record created, SSL provisioning
+  //   dev_local  — no CF API configured; local dev only
   const cfId = await registerCustomHostname(env, hostname);
-  await insertHostname(env.ACCOUNTS_DB, {
-    hostname,
-    vault_id: vaultId,
-    cf_custom_hostname_id: cfId,
-    status: cfId ? "pending" : "dev_local",
-  });
+  const status = cfId ? "pending" : "dev_local";
+
+  await env.ACCOUNTS_DB.batch([
+    env.ACCOUNTS_DB
+      .prepare(
+        `INSERT INTO vaults (id, owner_user_id, name, hostname, created_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(vaultId, user.id, lower, hostname, now, null),
+    env.ACCOUNTS_DB
+      .prepare(
+        `INSERT INTO hostnames (hostname, vault_id, cf_custom_hostname_id, status)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .bind(hostname, vaultId, cfId, status),
+  ]);
 
   return { vaultId, hostname };
 }
