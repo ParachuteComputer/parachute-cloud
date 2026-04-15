@@ -72,5 +72,45 @@ declare module "@openparachute/core/do" {
     deleteTag(name: string): Promise<{ deleted: boolean; notes_untagged: number }>;
 
     getVaultStats(opts?: { topTagsLimit?: number }): Promise<VaultStatsSummary>;
+
+    addAttachment(
+      noteId: string,
+      path: string,
+      mimeType: string,
+      metadata?: Record<string, unknown>,
+    ): Promise<AttachmentLike>;
+    getAttachments(noteId: string): Promise<AttachmentLike[]>;
+
+    putBlob(
+      key: string,
+      data: ArrayBuffer | Uint8Array | Blob,
+      opts?: { mimeType?: string },
+    ): Promise<void>;
+    getBlob(key: string): Promise<{
+      body: ReadableStream<Uint8Array>;
+      mimeType?: string;
+      size?: number;
+    } | null>;
+    deleteBlob(key: string): Promise<void>;
+  }
+
+  export interface AttachmentLike {
+    id: string;
+    noteId: string;
+    path: string;
+    mimeType: string;
+    createdAt: string;
+    metadata?: Record<string, unknown>;
+  }
+}
+
+declare module "@openparachute/core/blob-r2" {
+  export interface R2BucketLike {
+    put(key: string, value: ArrayBuffer | ReadableStream | Uint8Array | Blob, opts?: unknown): Promise<unknown>;
+    get(key: string): Promise<unknown>;
+    delete(key: string): Promise<void>;
+  }
+  export class R2BlobStore {
+    constructor(bucket: R2BucketLike, prefix?: string);
   }
 }

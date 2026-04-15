@@ -78,4 +78,186 @@ describe("parachute-cloud smoke", () => {
     const { note } = (await create.json()) as { note: { id: string; content: string } };
     expect(note.content).toBe("hello from smoke");
   });
+
+  it("token management: list + create + revoke cycle, revoked token gets 401", async () => {
+    // Signup a vault.
+    const name = `tok${Date.now().toString(36)}`;
+    const signup = await dev("/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    expect(signup.status).toBe(201);
+    const { vaultId, hostname, apiToken } =
+      (await signup.json()) as { vaultId: string; hostname: string; apiToken: string };
+
+    // Verify initial token works.
+    const initialCheck = await fetch(`${BASE}/api/notes`, {
+      headers: { Host: hostname, Authorization: `Bearer ${apiToken}` },
+    });
+    expect(initialCheck.status).toBe(200);
+
+    // Create a second token via dashboard route.
+    const form = new URLSearchParams({ name: "laptop" });
+    const create = await dev(`/dashboard/vaults/${vaultId}/tokens`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form.toString(),
+      redirect: "manual",
+    });
+    // Hono redirects on success (302/303).
+    expect([302, 303]).toContain(create.status);
+    const loc = create.headers.get("Location") ?? "";
+    const newToken = new URL(loc, BASE).searchParams.get("token");
+    expect(newToken).toMatch(/^pvt_/);
+
+    // New token works against the API.
+    const useNew = await fetch(`${BASE}/api/notes`, {
+      headers: { Host: hostname, Authorization: `Bearer ${newToken}` },
+    });
+    expect(useNew.status).toBe(200);
+
+    // List tokens — should have default + laptop.
+    const listPage = await dev(`/dashboard/vaults/${vaultId}/tokens`);
+    expect(listPage.status).toBe(200);
+    const html = await listPage.text();
+    expect(html).toContain("laptop");
+    expect(html).toContain("default");
+
+    // Find the laptop token's id by asking the DO's internal list via a
+    // second dev-authenticated create (we only need any non-default id for
+    // the revoke test — scrape from HTML).
+    const idMatch = html.match(/\/tokens\/([a-f0-9-]{36})\/revoke/);
+    expect(idMatch).toBeTruthy();
+    const tokenIdToRevoke = idMatch![1];
+
+    // Revoke it.
+    const revoke = await dev(
+      `/dashboard/vaults/${vaultId}/tokens/${tokenIdToRevoke}/revoke`,
+      { method: "POST", redirect: "manual" },
+    );
+    expect([302, 303]).toContain(revoke.status);
+
+    // Which token did we revoke? The scraper grabs whichever row renders
+    // first (newest = laptop token we just created). Confirm by hitting
+    // the API with newToken — expect 401.
+    const afterRevoke = await fetch(`${BASE}/api/notes`, {
+      headers: { Host: hostname, Authorization: `Bearer ${newToken}` },
+    });
+    expect(afterRevoke.status).toBe(401);
+
+    // Default token still works.
+    const defaultStillWorks = await fetch(`${BASE}/api/notes`, {
+      headers: { Host: hostname, Authorization: `Bearer ${apiToken}` },
+    });
+    expect(defaultStillWorks.status).toBe(200);
+  });
+
+  it("attachment upload + download round-trip (R2)", async () => {
+    const name = `att${Date.now().toString(36)}`;
+    const signup = await dev("/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    expect(signup.status).toBe(201);
+    const { hostname, apiToken } =
+      (await signup.json()) as { hostname: string; apiToken: string };
+
+    const noteRes = await fetch(`${BASE}/api/notes`, {
+      method: "POST",
+      headers: {
+        Host: hostname,
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiToken}`,
+      },
+      body: JSON.stringify({ content: "note with attachment" }),
+    });
+    expect(noteRes.status).toBe(201);
+    const { note } = (await noteRes.json()) as { note: { id: string } };
+
+    const payload = new Uint8Array([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x02]);
+    const form = new FormData();
+    form.append("file", new Blob([payload], { type: "application/octet-stream" }), "evidence.bin");
+
+    const up = await fetch(`${BASE}/api/notes/${note.id}/attachments`, {
+      method: "POST",
+      headers: { Host: hostname, Authorization: `Bearer ${apiToken}` },
+      body: form,
+    });
+    expect(up.status).toBe(201);
+    const { attachment } = (await up.json()) as {
+      attachment: { id: string; size: number };
+    };
+    expect(attachment.size).toBe(payload.length);
+
+    const down = await fetch(`${BASE}/api/notes/${note.id}/attachments/${attachment.id}`, {
+      headers: { Host: hostname, Authorization: `Bearer ${apiToken}` },
+    });
+    expect(down.status).toBe(200);
+    // Content-Type is forced to octet-stream regardless of upload MIME.
+    expect(down.headers.get("Content-Type")).toBe("application/octet-stream");
+    expect(down.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    const cd = down.headers.get("Content-Disposition") ?? "";
+    expect(cd).toContain("attachment;");
+    expect(cd).toContain("evidence.bin");
+    const bytes = new Uint8Array(await down.arrayBuffer());
+    expect(Array.from(bytes)).toEqual(Array.from(payload));
+  });
+
+  it("attachment download force-downloads even when uploaded as text/html (XSS defense)", async () => {
+    const name = `xss${Date.now().toString(36)}`;
+    const signup = await dev("/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const { hostname, apiToken } =
+      (await signup.json()) as { hostname: string; apiToken: string };
+
+    const noteRes = await fetch(`${BASE}/api/notes`, {
+      method: "POST",
+      headers: { Host: hostname, "Content-Type": "application/json", Authorization: `Bearer ${apiToken}` },
+      body: JSON.stringify({ content: "xss test" }),
+    });
+    const { note } = (await noteRes.json()) as { note: { id: string } };
+
+    const form = new FormData();
+    form.append("file", new Blob(["<script>alert(1)</script>"], { type: "text/html" }), "../etc/passwd.html");
+    const up = await fetch(`${BASE}/api/notes/${note.id}/attachments`, {
+      method: "POST",
+      headers: { Host: hostname, Authorization: `Bearer ${apiToken}` },
+      body: form,
+    });
+    expect(up.status).toBe(201);
+    const { attachment } = (await up.json()) as { attachment: { id: string } };
+
+    const down = await fetch(`${BASE}/api/notes/${note.id}/attachments/${attachment.id}`, {
+      headers: { Host: hostname, Authorization: `Bearer ${apiToken}` },
+    });
+    expect(down.headers.get("Content-Type")).toBe("application/octet-stream");
+    // Sanitizer strips "../" — only the basename remains, non-safe chars → _.
+    const cd = down.headers.get("Content-Disposition") ?? "";
+    expect(cd).not.toContain("../");
+    expect(cd).toMatch(/filename="passwd\.html"/);
+  });
+
+  it("token management ownership: second user gets 404 on another user's tokens page", async () => {
+    const name = `own${Date.now().toString(36)}`;
+    const signup = await dev("/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    expect(signup.status).toBe(201);
+    const { vaultId } = (await signup.json()) as { vaultId: string };
+
+    // Hit the tokens page as a different dev user.
+    const otherHeaders = new Headers({ "X-Dev-User": "other-user:other@dev.local" });
+    const intruder = await fetch(`${BASE}/dashboard/vaults/${vaultId}/tokens`, {
+      headers: otherHeaders,
+    });
+    // Ownership mismatch returns 404 (not 403) to avoid leaking vault IDs.
+    expect(intruder.status).toBe(404);
+  });
 });
