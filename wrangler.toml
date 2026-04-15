@@ -1,23 +1,21 @@
 # Parachute Cloud — dispatcher + VaultDO
 #
-# Deployment is a single Worker (the dispatcher) bound to:
+# Single Worker (the dispatcher) bound to:
 #   - a Durable Object namespace (VaultDO, one instance per vault)
 #   - an R2 bucket (attachments)
-#   - a D1 database (accounts: users, vaults, subscriptions, custom hostnames)
+#   - a D1 database (accounts: users, vaults, subscriptions, hostnames)
 #   - a KV namespace (hot-path cache for hostname → vault lookup)
 #   - Clerk + Stripe secrets (set via `wrangler secret put`)
 #
-# Workers for Platforms (for subdomain dispatch + Custom Hostnames) is configured
-# on the Cloudflare account side; this file pins the bindings. Custom Hostnames
-# are created at signup via the CF API, not declared here.
+# Custom Hostnames for `<name>.parachute.computer` are provisioned at
+# signup via the CF API (see src/signup/provision.ts), not declared here.
 
 name = "parachute-cloud"
 main = "src/dispatcher.ts"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Routes onto *.parachute.computer are attached via Workers for Platforms /
-# Custom Hostnames at the account level, not via `[[routes]]` here.
+workers_dev = true
 
 # -------- Durable Objects --------
 
@@ -40,14 +38,14 @@ bucket_name = "parachute-cloud-attachments"
 [[d1_databases]]
 binding = "ACCOUNTS_DB"
 database_name = "parachute-cloud-accounts"
-database_id = "TODO-set-after-wrangler-d1-create"
-migrations_dir = "drizzle"
+database_id = "00000000-0000-0000-0000-000000000000"  # set via `wrangler d1 create` after first bootstrap
+migrations_dir = "drizzle/migrations"
 
 # -------- KV (dispatcher cache) --------
 
 [[kv_namespaces]]
 binding = "ACCOUNTS_CACHE"
-id = "TODO-set-after-wrangler-kv-namespace-create"
+id = "0000000000000000000000000000000000000000000000000000000000000000"  # set via `wrangler kv namespace create ACCOUNTS_CACHE`
 
 # -------- Vars (non-secret) --------
 
@@ -55,7 +53,7 @@ id = "TODO-set-after-wrangler-kv-namespace-create"
 ROOT_DOMAIN = "parachute.computer"
 ENVIRONMENT = "development"
 
-# Secrets to configure out-of-band:
+# Secrets configured out-of-band:
 #   wrangler secret put CLERK_SECRET_KEY
 #   wrangler secret put CLERK_PUBLISHABLE_KEY
 #   wrangler secret put STRIPE_SECRET_KEY

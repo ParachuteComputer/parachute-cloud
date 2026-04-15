@@ -69,7 +69,8 @@ Tier enforcement happens in the dispatcher + in the vault DO on write.
 
 Parachute Cloud **does not fork** parachute-vault. It imports it.
 
-- `@openparachute/vault-core` — published from the vault repo. Exposes the async `Store` interface, `DoSqliteStore`, MCP tool definitions, wikilinks, schema, path normalization.
+- `@openparachute/core` — the vault engine. Exposes the async `Store` interface, `DoSqliteStore`, MCP tool definitions, wikilinks, schema, path normalization.
+  - **v0 dev wiring:** consumed as a file dep (`file:../parachute-vault/core`) because upstream hasn't published the core package to npm yet. Type-check uses a local `.d.ts` shim at `src/vendor/core-do.d.ts`; bundler resolves the real TS at build. Upstream issue: unprivate + publish `@openparachute/core`, then swap the dep + delete the shim.
 - Everything in `src/` here is SaaS plumbing: dispatch, billing, signup, dashboard, multi-tenancy glue.
 - Bug fixes and feature work on the core engine happen upstream in parachute-vault, never here. This repo pins a version.
 
@@ -105,7 +106,7 @@ Parachute Cloud **does not fork** parachute-vault. It imports it.
 parachute-cloud/
 ├── README.md               ← this file
 ├── CLAUDE.md               ← for tentacles working in this repo
-├── package.json            ← pins @openparachute/vault-core, Clerk, Stripe, Hono
+├── package.json            ← pins @openparachute/core (file dep), Clerk, Stripe, Hono
 ├── wrangler.toml           ← Workers for Platforms dispatcher config
 ├── tsconfig.json
 ├── src/
@@ -124,7 +125,46 @@ parachute-cloud/
     └── schema.ts           ← D1 schema (users, vaults, subscriptions, custom_hostnames)
 ```
 
+## Local development
+
+Everything runs against `wrangler dev`'s local simulation — D1, DO SQLite, KV, and R2 all work offline.
+
+```bash
+# 1. Install (requires the parachute-vault repo as a sibling directory)
+bun install
+
+# 2. Create the local D1 database and apply the schema
+wrangler d1 migrations apply accounts --local
+
+# 3. Start the dev server (binds http://127.0.0.1:8787)
+wrangler dev
+```
+
+In dev mode, Clerk session verification is replaced by an `X-Dev-User: <clerk-id>:<email>` header so you don't need a real Clerk tenant. Example:
+
+```bash
+# Provision a vault as a pretend user
+curl -X POST http://127.0.0.1:8787/signup \
+  -H 'Content-Type: application/json' \
+  -H 'X-Dev-User: dev-user:me@dev.local' \
+  -d '{"name":"alice"}'
+# → { "vaultId": "…", "hostname": "alice.parachute.computer" }
+
+# Round-trip through the VaultDO (dispatcher uses Host header for routing)
+curl http://127.0.0.1:8787/api/notes \
+  -H 'Host: alice.parachute.computer'
+
+curl -X POST http://127.0.0.1:8787/api/notes \
+  -H 'Host: alice.parachute.computer' \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"hello"}'
+```
+
+Smoke tests (`bun test tests/smoke.test.ts`) assume `wrangler dev` is already running on the default port. Set `CLOUD_BASE_URL` to point elsewhere.
+
 ## Deployment model
+
+**Single Worker + Custom Hostnames**, not Workers for Platforms. Workers for Platforms requires Enterprise billing and we don't need user-uploaded Workers for v0 — one Worker can dispatch to any DO by name, and Custom Hostnames gives us wildcard SSL under `*.parachute.computer`. We revisit WfP only if we let tenants ship their own code.
 
 One Worker (the dispatcher) fronts the whole system. It binds:
 
