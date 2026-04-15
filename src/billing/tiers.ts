@@ -1,11 +1,8 @@
 /**
  * Tier definitions + limit checks.
  *
- * Prices are the ones marketed in README.md. Stripe Price IDs are environment-
- * specific and loaded from env vars at runtime (not hardcoded here).
- *
  * Enforcement split:
- *   - Dispatcher: request-rate + subscription-active checks on the hot path.
+ *   - Dispatcher: subscription-active checks on the hot path.
  *   - VaultDO:    hard storage cap on write.
  *   - Signup:     vault-count cap when provisioning a new vault.
  */
@@ -17,17 +14,56 @@ export interface TierLimits {
   label: string;
   priceUsdPerMonth: number;
   maxVaults: number;
+  maxNotesPerVault: number;
   storagePerVaultMb: number;
   mcpRequestsPerDay: number;
 }
 
 export const TIERS: Record<TierId, TierLimits> = {
-  free:          { id: "free",          label: "Free",       priceUsdPerMonth: 0,  maxVaults: 1,  storagePerVaultMb: 100,    mcpRequestsPerDay: 1_000 },
-  trial:         { id: "trial",         label: "Trial",      priceUsdPerMonth: 1,  maxVaults: 1,  storagePerVaultMb: 500,    mcpRequestsPerDay: 5_000 },
-  personal:      { id: "personal",      label: "Personal",   priceUsdPerMonth: 3,  maxVaults: 1,  storagePerVaultMb: 2_000,  mcpRequestsPerDay: 20_000 },
-  personal_plus: { id: "personal_plus", label: "Personal+",  priceUsdPerMonth: 8,  maxVaults: 3,  storagePerVaultMb: 2_000,  mcpRequestsPerDay: 50_000 },
-  pro:           { id: "pro",           label: "Pro",        priceUsdPerMonth: 20, maxVaults: 10, storagePerVaultMb: 10_000, mcpRequestsPerDay: 500_000 },
+  free:          { id: "free",          label: "Free",      priceUsdPerMonth: 0,  maxVaults: 1,  maxNotesPerVault: 1_000,   storagePerVaultMb: 100,    mcpRequestsPerDay: 1_000 },
+  trial:         { id: "trial",         label: "Trial",     priceUsdPerMonth: 1,  maxVaults: 1,  maxNotesPerVault: 5_000,   storagePerVaultMb: 500,    mcpRequestsPerDay: 5_000 },
+  personal:      { id: "personal",      label: "Personal",  priceUsdPerMonth: 3,  maxVaults: 1,  maxNotesPerVault: 20_000,  storagePerVaultMb: 2_000,  mcpRequestsPerDay: 20_000 },
+  personal_plus: { id: "personal_plus", label: "Personal+", priceUsdPerMonth: 8,  maxVaults: 3,  maxNotesPerVault: 50_000,  storagePerVaultMb: 2_000,  mcpRequestsPerDay: 50_000 },
+  pro:           { id: "pro",           label: "Pro",       priceUsdPerMonth: 20, maxVaults: 10, maxNotesPerVault: 500_000, storagePerVaultMb: 10_000, mcpRequestsPerDay: 500_000 },
 };
 
-// TODO: helpers like `assertCanCreateVault(tier, currentVaultCount)` and
-// `assertCanWrite(tier, currentStorageBytes)` once the data model is real.
+export function isTierId(v: unknown): v is TierId {
+  return typeof v === "string" && v in TIERS;
+}
+
+export function tierOf(id: string, fallback: TierId = "free"): TierLimits {
+  return isTierId(id) ? TIERS[id] : TIERS[fallback];
+}
+
+export class TierLimitError extends Error {
+  constructor(
+    message: string,
+    public readonly limit: string,
+    public readonly tier: TierId,
+  ) {
+    super(message);
+    this.name = "TierLimitError";
+  }
+}
+
+export function assertCanCreateVault(tier: TierId, currentVaultCount: number): void {
+  const t = TIERS[tier];
+  if (currentVaultCount >= t.maxVaults) {
+    throw new TierLimitError(
+      `${t.label} allows ${t.maxVaults} vault(s); you already have ${currentVaultCount}.`,
+      "vault_count",
+      tier,
+    );
+  }
+}
+
+export function assertCanCreateNote(tier: TierId, currentNoteCount: number): void {
+  const t = TIERS[tier];
+  if (currentNoteCount >= t.maxNotesPerVault) {
+    throw new TierLimitError(
+      `${t.label} allows ${t.maxNotesPerVault} notes per vault; already at ${currentNoteCount}.`,
+      "note_count",
+      tier,
+    );
+  }
+}

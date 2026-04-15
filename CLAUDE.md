@@ -8,9 +8,9 @@ Read `README.md` for the product + architecture overview. This file is for the a
 
 - **Runtime:** Cloudflare Workers (ES modules), Durable Objects with SQLite storage.
 - **Language:** TypeScript. No Bun here — Workers runtime.
-- **Vault engine:** `@openparachute/vault-core` (imported from parachute-vault). Specifically `DoSqliteStore` + the async `Store` interface.
+- **Vault engine:** `@openparachute/core` (imported from parachute-vault). Specifically `DoSqliteStore` + the async `Store` interface. Consumed as a file dep until upstream publishes the core package to npm.
 - **Routing:** Hono inside the Worker.
-- **Auth:** Clerk (session) + vault-core scoped tokens (per-vault API access).
+- **Auth:** Clerk (session) + per-vault scoped tokens from `@openparachute/core` (vault API access).
 - **Billing:** Stripe (subscriptions + webhooks).
 - **Storage:** Durable Object SQLite (per-vault) + R2 (attachments) + D1 (accounts).
 - **Deploy:** `wrangler deploy`. Workers for Platforms + Custom Hostnames for subdomain routing.
@@ -32,7 +32,7 @@ Read `README.md` for the product + architecture overview. This file is for the a
 
 ## Critical rule: do not touch vault core here
 
-The notes/tags/links/MCP engine lives in `parachute-vault`. This repo **imports** it as `@openparachute/vault-core`.
+The notes/tags/links/MCP engine lives in `parachute-vault`. This repo **imports** it as `@openparachute/core`.
 
 - If you find a bug in note creation, wikilink resolution, schema, etc. — fix it **upstream in parachute-vault** and bump the pinned version here.
 - If you need a new capability in the core store, open a PR against `parachute-vault` first.
