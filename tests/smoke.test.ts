@@ -153,6 +153,95 @@ describe("parachute-cloud smoke", () => {
     expect(defaultStillWorks.status).toBe(200);
   });
 
+  it("attachment upload + download round-trip (R2)", async () => {
+    const name = `att${Date.now().toString(36)}`;
+    const signup = await dev("/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    expect(signup.status).toBe(201);
+    const { hostname, apiToken } =
+      (await signup.json()) as { hostname: string; apiToken: string };
+
+    const noteRes = await fetch(`${BASE}/api/notes`, {
+      method: "POST",
+      headers: {
+        Host: hostname,
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiToken}`,
+      },
+      body: JSON.stringify({ content: "note with attachment" }),
+    });
+    expect(noteRes.status).toBe(201);
+    const { note } = (await noteRes.json()) as { note: { id: string } };
+
+    const payload = new Uint8Array([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x02]);
+    const form = new FormData();
+    form.append("file", new Blob([payload], { type: "application/octet-stream" }), "evidence.bin");
+
+    const up = await fetch(`${BASE}/api/notes/${note.id}/attachments`, {
+      method: "POST",
+      headers: { Host: hostname, Authorization: `Bearer ${apiToken}` },
+      body: form,
+    });
+    expect(up.status).toBe(201);
+    const { attachment } = (await up.json()) as {
+      attachment: { id: string; size: number };
+    };
+    expect(attachment.size).toBe(payload.length);
+
+    const down = await fetch(`${BASE}/api/notes/${note.id}/attachments/${attachment.id}`, {
+      headers: { Host: hostname, Authorization: `Bearer ${apiToken}` },
+    });
+    expect(down.status).toBe(200);
+    // Content-Type is forced to octet-stream regardless of upload MIME.
+    expect(down.headers.get("Content-Type")).toBe("application/octet-stream");
+    expect(down.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    const cd = down.headers.get("Content-Disposition") ?? "";
+    expect(cd).toContain("attachment;");
+    expect(cd).toContain("evidence.bin");
+    const bytes = new Uint8Array(await down.arrayBuffer());
+    expect(Array.from(bytes)).toEqual(Array.from(payload));
+  });
+
+  it("attachment download force-downloads even when uploaded as text/html (XSS defense)", async () => {
+    const name = `xss${Date.now().toString(36)}`;
+    const signup = await dev("/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const { hostname, apiToken } =
+      (await signup.json()) as { hostname: string; apiToken: string };
+
+    const noteRes = await fetch(`${BASE}/api/notes`, {
+      method: "POST",
+      headers: { Host: hostname, "Content-Type": "application/json", Authorization: `Bearer ${apiToken}` },
+      body: JSON.stringify({ content: "xss test" }),
+    });
+    const { note } = (await noteRes.json()) as { note: { id: string } };
+
+    const form = new FormData();
+    form.append("file", new Blob(["<script>alert(1)</script>"], { type: "text/html" }), "../etc/passwd.html");
+    const up = await fetch(`${BASE}/api/notes/${note.id}/attachments`, {
+      method: "POST",
+      headers: { Host: hostname, Authorization: `Bearer ${apiToken}` },
+      body: form,
+    });
+    expect(up.status).toBe(201);
+    const { attachment } = (await up.json()) as { attachment: { id: string } };
+
+    const down = await fetch(`${BASE}/api/notes/${note.id}/attachments/${attachment.id}`, {
+      headers: { Host: hostname, Authorization: `Bearer ${apiToken}` },
+    });
+    expect(down.headers.get("Content-Type")).toBe("application/octet-stream");
+    // Sanitizer strips "../" — only the basename remains, non-safe chars → _.
+    const cd = down.headers.get("Content-Disposition") ?? "";
+    expect(cd).not.toContain("../");
+    expect(cd).toMatch(/filename="passwd\.html"/);
+  });
+
   it("token management ownership: second user gets 404 on another user's tokens page", async () => {
     const name = `own${Date.now().toString(36)}`;
     const signup = await dev("/signup", {

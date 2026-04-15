@@ -40,7 +40,9 @@ import {
 } from "./billing/tiers.js";
 
 export interface VaultDOEnv {
-  ATTACHMENTS: R2Bucket;
+  // Optional: local dev can run without an R2 binding. Attachment routes
+  // return 500 on blob ops if unset; notes still work.
+  ATTACHMENTS?: R2Bucket;
   DO_INTERNAL_SECRET?: string;
 }
 
@@ -77,8 +79,16 @@ export class VaultDO {
       // if called without a blobStore, but addAttachment (metadata-only) works
       // either way — so leaving blobStore unset in a misconfigured env fails
       // loudly on first blob write rather than silently.
+      //
+      // Prefix every blob key with the DO's opaque id. This makes
+      // cross-tenant reads impossible by construction: even if a leaked
+      // attachment UUID crossed tenants, the underlying R2 object lives
+      // under a different prefix.
       const blobStore = this.env.ATTACHMENTS
-        ? new R2BlobStore(this.env.ATTACHMENTS as unknown as ConstructorParameters<typeof R2BlobStore>[0])
+        ? new R2BlobStore(
+            this.env.ATTACHMENTS as unknown as ConstructorParameters<typeof R2BlobStore>[0],
+            this.ctx.id.toString(),
+          )
         : undefined;
       this.store = new DoSqliteStore(
         this.ctx.storage as unknown as ConstructorParameters<typeof DoSqliteStore>[0],
@@ -284,6 +294,12 @@ export class VaultDO {
       if (typeof metaRaw === "string" && metaRaw.length > 0) {
         try { metadata = JSON.parse(metaRaw); } catch { /* ignore malformed */ }
       }
+      // Record the original client-supplied filename in metadata so downloads
+      // can render a reasonable Content-Disposition. Never trust this string
+      // on the serve path — sanitize at download time.
+      if (typeof file.name === "string" && file.name.length > 0) {
+        metadata = { ...(metadata ?? {}), filename: file.name };
+      }
 
       const mime = file.type || "application/octet-stream";
       const store = this.getStore();
@@ -322,10 +338,20 @@ export class VaultDO {
       if (!att) return c.json({ error: "not_found" }, 404);
       const blob = await this.getStore().getBlob(att.path);
       if (!blob) return c.json({ error: "blob_missing" }, 404);
+      // Force a download-style response. We NEVER echo the uploader-supplied
+      // MIME on the serve path — doing so would let a tenant upload
+      // `text/html` and get it executed as first-party code on their
+      // subdomain (stored XSS). Callers that need a specific render MIME
+      // must set it themselves in a context they control; the original
+      // type is still exposed via GET /api/notes/:id/attachments.
+      const rawName = (att.metadata?.filename as string | undefined) ?? "attachment";
+      const filename = sanitizeFilename(rawName);
       return new Response(blob.body as unknown as BodyInit, {
         status: 200,
         headers: {
-          "Content-Type": blob.mimeType ?? att.mimeType ?? "application/octet-stream",
+          "Content-Type": "application/octet-stream",
+          "Content-Disposition": `attachment; filename="${filename}"`,
+          "X-Content-Type-Options": "nosniff",
           ...(blob.size != null ? { "Content-Length": String(blob.size) } : {}),
         },
       });
@@ -357,10 +383,19 @@ export class VaultDO {
 // ---- File helpers ----
 
 interface FileLike {
-  name: string;
+  name?: string;
   size: number;
   type: string;
   arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+// Keep only the printable basename characters — anything else becomes `_`.
+// Strip directory traversal; cap at 100 chars. Returns a safe filename for
+// use in Content-Disposition.
+function sanitizeFilename(raw: string): string {
+  const base = raw.split(/[\\/]/).pop() ?? "";
+  const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100);
+  return cleaned.length > 0 ? cleaned : "attachment";
 }
 
 // @cloudflare/workers-types and the global DOM `File` clash under our

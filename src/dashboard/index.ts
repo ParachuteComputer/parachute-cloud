@@ -39,8 +39,11 @@ dashboardApp.get("/", async (c: AuthedContext) => {
         <p><strong>Save this API token now — it will not be shown again:</strong></p>
         <p><code style="font-size:1.1em; word-break:break-all;">${esc(apiToken)}</code></p>
         <p style="color:#666">Use with <code>Authorization: Bearer &lt;token&gt;</code>.
-          If you lose it, create a new one from the token management page (coming soon).</p>
-      </section>`
+          Manage tokens from the vault's Tokens page.</p>
+      </section>
+      <script>
+        try { history.replaceState(null, "", location.pathname); } catch {}
+      </script>`
     : "";
 
   const rows = vaults
@@ -154,7 +157,14 @@ dashboardApp.get("/vaults/:vaultId/tokens", async (c: AuthedContext) => {
         <p><strong>Save this token now — you won't see it again:</strong></p>
         <p><code style="font-size:1.1em; word-break:break-all;">${esc(revealedToken)}</code></p>
         <p>Use with <code>Authorization: Bearer &lt;token&gt;</code>.</p>
-      </section>`
+      </section>
+      <script>
+        // Strip token + name from the URL so they don't sit in the user's
+        // local browser history. This doesn't help upstream logs (CF, any
+        // intermediary), but the &lt;meta referrer=no-referrer&gt; in the
+        // layout prevents leakage to outbound links from this page.
+        try { history.replaceState(null, "", location.pathname); } catch {}
+      </script>`
     : "";
 
   const rows = tokens
@@ -254,6 +264,7 @@ function layout(email: string, body: string): string {
   return `<!doctype html>
 <html><head>
 <meta charset="utf-8" />
+<meta name="referrer" content="no-referrer" />
 <title>Parachute Cloud</title>
 <style>
   body { font: 14px/1.5 system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #222; }

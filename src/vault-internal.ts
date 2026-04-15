@@ -39,6 +39,9 @@ export async function callVaultInternal(
     method: opts.method ?? "GET",
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    // Hard cap so a wedged DO can never hang the dashboard. 10s is generous
+    // for any of the internal RPC calls (all small SQLite writes).
+    signal: AbortSignal.timeout(10_000),
   });
   return (await stub.fetch(
     req as unknown as import("@cloudflare/workers-types").Request,
