@@ -1,8 +1,22 @@
 # Deploying parachute-cloud
 
 This runbook takes a freshly-checked-out repo to a live `parachute.computer`
-that can sign up users, provision vaults, and serve `/api/*` on per-tenant
-subdomains. Assumes production Cloudflare, Clerk, and Stripe accounts.
+that can sign up users, provision their subdomain, and serve `/v/<slug>/api/*`
+per-tenant vault routes. Assumes production Cloudflare, Clerk, and Stripe
+accounts.
+
+**v0.4 note:** the schema is a clean break from v0.3. The migration file is
+named `0002_v04_schema.sql` (not `0002_v04_schema.sql`) so `wrangler d1 migrations
+apply` still runs on machines that already executed a v0.3 `0002_v04_schema.sql` —
+the file leads with `DROP TABLE IF EXISTS` for the old tables and re-creates
+the v0.4 shape. Any v0.3 production data is blown away; migrate or back up
+first if you have real tenants. Custom Hostnames are now registered once per
+user (not once per vault), so the existing wildcard plan is sufficient and
+less API churn hits Cloudflare during onboarding.
+
+> ⚠️ **MCP endpoint is a v0.5 feature.** The `/v/<slug>/mcp` path is wired in
+> the dispatcher but returns a stub. Production clients should target the REST
+> API at `/v/<slug>/api/*` until v0.5 ships the real MCP handler.
 
 Nothing here is automated; every command is something you run.
 
@@ -40,7 +54,7 @@ wrangler kv namespace create RATE_LIMIT_KV
 
 ```sh
 wrangler d1 execute parachute-cloud-accounts \
-  --file=drizzle/migrations/0001_init.sql --remote
+  --file=drizzle/migrations/0002_v04_schema.sql --remote
 ```
 
 Re-run the same command for each additional migration file as they appear
@@ -80,7 +94,7 @@ back to the default workers.dev route).
 
 ```sh
 curl https://parachute.computer/health
-# {"ok":true,"service":"parachute-cloud","version":"0.3.0","timestamp":...,"checks":{"d1":true,"r2":true}}
+# {"ok":true,"service":"parachute-cloud","version":"0.4.0","timestamp":...,"checks":{"d1":true,"r2":true}}
 ```
 
 If `ok` is false, inspect `checks` — a `d1:false` usually means the migration
@@ -121,13 +135,20 @@ D1 data, and R2 objects are untouched. If a deploy introduced a breaking
 migration, roll back the Worker first, then manually reverse the migration
 via `wrangler d1 execute ... --remote` against a corrective SQL file.
 
-## 9. Vault lifecycle in production
+## 9. Lifecycle in production (v0.4)
 
-- **Provisioning** is atomic from the user's point of view: `POST /signup`
-  registers the CF custom hostname, writes D1 rows in a batch, and issues an
-  initial `pvt_` API token. Any step failing rolls back the CF registration.
-- **Deletion** from the dashboard's "Danger zone" hard-deletes D1 rows, wipes
-  all R2 objects under the vault's DO-id prefix, and unregisters the CF
-  custom hostname. The Durable Object's own SQLite storage persists (CF has
-  no public delete API for DO storage) but is unreachable without the D1
-  mapping.
+- **Onboarding** is atomic from the user's point of view: `POST /signup`
+  registers the CF custom hostname, writes the `hostnames`/`users`/`vaults`
+  rows in a single D1 batch, and issues an initial user-scope `pvt_` API
+  token. CF registration is rolled back if the D1 batch fails.
+- **Adding a vault** from the dashboard (`POST /dashboard/vaults`) inserts a
+  new `vaults` row. No CF hostname call — all of a user's vaults live under
+  the single hostname already registered at onboarding.
+- **Deleting a vault** from the dashboard hard-deletes the `vaults` row
+  (D1 first, to stop routing immediately), then POSTs `/_internal/wipe-r2`
+  to the DO to remove every attachment under its R2 prefix. The Durable
+  Object's own SQLite storage persists (CF has no public delete API), but
+  it is unreachable once the D1 row is gone.
+- **Account deletion** is not yet exposed as a dashboard flow; removing a
+  user requires operator-side SQL (delete tokens → delete vaults → delete
+  hostname row → unregister CF custom hostname → delete user).

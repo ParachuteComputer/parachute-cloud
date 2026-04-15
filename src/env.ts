@@ -17,6 +17,10 @@ export interface Env {
 
   ROOT_DOMAIN: string;
   ENVIRONMENT: string;
+  // If truthy and ENVIRONMENT !== "production", the Clerk middleware
+  // auto-signs-in as a fixed dev user (`dev-aaron`). Lets a tablet browser
+  // use the dashboard without a Clerk tenant or X-Dev-User header extension.
+  DEV_AUTO_USER?: string;
 
   CLERK_SECRET_KEY?: string;
   CLERK_PUBLISHABLE_KEY?: string;

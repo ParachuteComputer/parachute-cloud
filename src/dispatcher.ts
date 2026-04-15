@@ -1,41 +1,56 @@
 /**
- * Parachute Cloud — top-level dispatcher Worker.
+ * Parachute Cloud dispatcher — v0.4 user-per-subdomain.
  *
- * Responsibilities:
- *   - Admin routes (`/signup`, `/dashboard/*`, `/billing/webhook`).
- *   - Hostname resolution: `<name>.parachute.computer` → vault_id → VaultDO.
- *   - Tier metadata forwarded to the DO via `X-Parachute-Tier`.
+ *   Root (`parachute.computer`)
+ *     - /                   → /dashboard (if signed in) or landing
+ *     - /dashboard/*        → admin UI
+ *     - /onboarding/*       → first-login hostname picker
+ *     - /signup             → JSON provisioning (CLI/MCP clients)
+ *     - /billing/*          → Stripe webhook
+ *     - /health             → structured health probe
+ *     - /api/check-hostname → onboarding live availability check
  *
- * Vault-scoped API token auth happens inside the DO (or will, once we
- * wire the vault-core token table on the DO side). The dispatcher only
- * checks ownership mapping from D1.
+ *   User subdomain (`<user>.parachute.computer`)
+ *     - /                   → user splash
+ *     - /v/<slug>/api/*     → VaultDO public API (Bearer token required)
+ *     - /v/<slug>/mcp       → VaultDO MCP endpoint (Bearer token required)
+ *     - /v/<slug>/          → 404 (reserved for future vault-info page)
+ *     - /health             → DO health (dispatched through)
  */
 
 import { Hono, type MiddlewareHandler } from "hono";
 import type { Env } from "./env.js";
 import { dashboardApp } from "./dashboard/index.js";
 import { handleStripeWebhook } from "./billing/stripe.js";
-import { provisionVault, ProvisionError } from "./signup/provision.js";
+import {
+  onboardUser,
+  ProvisionError,
+  hostnameAvailable,
+  validateSubdomain,
+} from "./signup/provision.js";
 import { clerkMiddleware } from "./auth/clerk.js";
 import type { SessionUser } from "./auth/clerk.js";
 import type { UserRow } from "./db/users.js";
-import { getVaultByHostname } from "./db/vaults.js";
+import { getUserByHostname } from "./db/users.js";
+import { getVaultBySlug, doIdName } from "./db/vaults.js";
 import { getActiveSubscription } from "./db/subscriptions.js";
 import { TIER_HEADER, INTERNAL_SECRET_HEADER } from "./vault-do.js";
-import { isTierId, tierOf, type TierId } from "./billing/tiers.js";
+import { tierOf, type TierId } from "./billing/tiers.js";
+import { verifyToken } from "./auth/tokens.js";
 import { checkAndIncrement, rateLimitHeaders } from "./rate-limit.js";
-
-const VERSION = "0.3.0";
+import { assetsApp } from "./dashboard/assets.js";
 
 export { VaultDO } from "./vault-do.js";
 export type { Env } from "./env.js";
+
+const VERSION = "0.4.0";
 
 type Vars = { session: SessionUser; user: UserRow };
 
 const app = new Hono<{ Bindings: Env; Variables: Vars }>();
 
-// Admin routes are only valid on the root domain. Anything else with the
-// same path on a vault subdomain is forwarded to the tenant's VaultDO.
+// Admin routes are only valid on the root domain. On any other host, the
+// request is a vault request and goes through `handleVaultRequest`.
 const onRoot: MiddlewareHandler<{ Bindings: Env; Variables: Vars }> = async (c, next) => {
   const host = (c.req.header("Host") ?? "").toLowerCase();
   if (!isRootDomain(host, c.env.ROOT_DOMAIN)) {
@@ -45,13 +60,7 @@ const onRoot: MiddlewareHandler<{ Bindings: Env; Variables: Vars }> = async (c, 
 };
 
 app.get("/health", onRoot, async (c) => {
-  // Probe the backing services the hot path depends on. Each check is
-  // wrapped so one failure doesn't mask the others. Shape is frozen —
-  // external monitors key off `checks.d1` / `checks.r2`.
-  const checks = {
-    d1: await probeD1(c.env),
-    r2: await probeR2(c.env),
-  };
+  const checks = { d1: await probeD1(c.env), r2: await probeR2(c.env) };
   const ok = checks.d1 && checks.r2;
   return c.json(
     {
@@ -65,46 +74,40 @@ app.get("/health", onRoot, async (c) => {
   );
 });
 
-async function probeD1(env: Env): Promise<boolean> {
-  try {
-    const r = await env.ACCOUNTS_DB.prepare("SELECT 1 AS ok").first<{ ok: number }>();
-    return r?.ok === 1;
-  } catch {
-    return false;
-  }
-}
-
-async function probeR2(env: Env): Promise<boolean> {
-  try {
-    // HEAD on a key we don't expect to exist; a null return is still a
-    // successful round-trip. We only care that the binding is reachable.
-    await env.ATTACHMENTS.head("__health_probe__");
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 app.get("/", onRoot, (c) => c.redirect("/dashboard"));
 
-// --- Admin API (root domain only) ---
+// Static brand assets (CSS, favicon) live here.
+app.route("/assets", assetsApp);
+
+// ---- Onboarding availability check ----
+
+app.get("/api/check-hostname", onRoot, async (c) => {
+  const name = c.req.query("name") ?? "";
+  try {
+    validateSubdomain(name);
+  } catch (err) {
+    const msg = err instanceof ProvisionError ? err.message : "invalid";
+    return c.json({ available: false, reason: msg });
+  }
+  const available = await hostnameAvailable(c.env, name);
+  return c.json({ available, hostname: `${name.toLowerCase()}.${c.env.ROOT_DOMAIN}` });
+});
+
+// ---- Admin API (root domain only) ----
 
 app.post("/signup", onRoot, clerkMiddleware(), async (c) => {
   const user = c.get("user");
-  const body = await c.req.json<{ name?: string; tier?: TierId }>().catch(() => null);
-  if (!body?.name) return c.json({ error: "name required" }, 400);
-  // Tier resolution order: explicit request → active Stripe subscription → "free".
-  // Never trust user.tier (there isn't one anymore — keeping this explicit).
-  const sub = await getActiveSubscription(c.env.ACCOUNTS_DB, user.id);
-  const requested = body.tier ?? sub?.tier;
-  const tier: TierId = isTierId(requested) ? requested : "free";
+  const body = await c.req.json<{ subdomain?: string }>().catch(() => null);
+  if (!body?.subdomain) return c.json({ error: "subdomain required" }, 400);
   try {
-    const result = await provisionVault(c.env, user, body.name, tier);
+    const result = await onboardUser(c.env, user, body.subdomain);
     return c.json(
       {
-        vaultId: result.vaultId,
         hostname: result.hostname,
-        vaultUrl: `https://${result.hostname}`,
+        vaultId: result.vaultId,
+        vaultSlug: result.vaultSlug,
+        vaultUrl: `https://${result.hostname}/v/${result.vaultSlug}`,
+        mcpUrl: `https://${result.hostname}/v/${result.vaultSlug}/mcp`,
         apiToken: result.apiToken,
         note: "apiToken is shown once. Save it now — it cannot be retrieved later.",
       },
@@ -119,37 +122,72 @@ app.post("/signup", onRoot, clerkMiddleware(), async (c) => {
 });
 
 app.use("/dashboard/*", onRoot);
+app.use("/onboarding/*", onRoot);
 app.route("/dashboard", dashboardApp);
+app.route("/onboarding", dashboardApp);
 
 app.post("/billing/stripe/webhook", onRoot, (c) => handleStripeWebhook(c.req.raw, c.env));
 
 // --- Vault subdomain routing ---
-// Anything that lands on a non-root hostname is routed to its VaultDO.
-app.all("*", async (c) => {
-  return handleVaultRequest(c.req.raw, c.env);
-});
+app.all("*", async (c) => handleVaultRequest(c.req.raw, c.env));
 
 async function handleVaultRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  const host = (request.headers.get("Host") ?? url.host).toLowerCase();
+  // Hosts may legitimately arrive with a trailing dot (FQDN). Normalize so
+  // `aaron.parachute.computer` and `aaron.parachute.computer.` route to the
+  // same user row.
+  const host =
+    ((request.headers.get("Host") ?? url.host).toLowerCase().split(":")[0] ?? "")
+      .replace(/\.$/, "");
 
   if (isRootDomain(host, env.ROOT_DOMAIN)) {
     return new Response("not found", { status: 404 });
   }
 
-  const vault = await lookupVaultByHostname(env, host);
-  if (!vault) return new Response(`no vault for ${host}`, { status: 404 });
+  const user = await lookupUserByHostname(env, host);
+  if (!user) return new Response(`no user for ${host}`, { status: 404 });
 
-  const sub = await getActiveSubscription(env.ACCOUNTS_DB, vault.owner_user_id);
+  if (url.pathname === "/" || url.pathname === "") {
+    return userSplash(host);
+  }
+  if (url.pathname === "/health") {
+    return new Response(JSON.stringify({ ok: true, host }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const match = /^\/v\/([a-z0-9][a-z0-9-]{0,39})(\/.*)?$/.exec(url.pathname);
+  if (!match) return new Response("not found", { status: 404 });
+  const slug = match[1]!;
+  const rest = match[2] ?? "/";
+
+  const vault = await getVaultBySlug(env.ACCOUNTS_DB, user.id, slug);
+  if (!vault) return new Response(`no vault /v/${slug}`, { status: 404 });
+
+  if (rest !== "/mcp" && !rest.startsWith("/api/")) {
+    return new Response("not found", { status: 404 });
+  }
+
+  // Token auth — `Authorization: Bearer pvt_...`. The user-id check happens
+  // inside verifyToken, before the last_used_at write, so a cross-user probe
+  // can't surface as activity on the legitimate owner's token.
+  const auth = request.headers.get("Authorization");
+  const bearer = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
+  const verified = await verifyToken(env.ACCOUNTS_DB, bearer, slug, user.id);
+  if (!verified) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const sub = await getActiveSubscription(env.ACCOUNTS_DB, user.id);
   const tier = (sub?.tier ?? "free") as TierId;
-  void tierOf(tier); // validate
+  void tierOf(tier);
 
-  // Per-vault per-day rate limit, applied only to the public API surface.
-  // Internal DO routes and the DO's own `/health` aren't rate-limited here —
-  // /_internal/* is only reachable via the dispatcher anyway, and /health
-  // is used by external monitors.
-  if (url.pathname.startsWith("/api/")) {
-    const rl = await checkAndIncrement(env, vault.id, tier);
+  if (rest.startsWith("/api/")) {
+    const rl = await checkAndIncrement(env, `${user.id}:${slug}`, tier);
     if (!rl.allowed) {
       return new Response(
         JSON.stringify({
@@ -166,28 +204,51 @@ async function handleVaultRequest(request: Request, env: Env): Promise<Response>
     }
   }
 
-  const doId = env.VAULT_DO.idFromName(vault.id);
+  // Drop the /v/<slug> prefix before forwarding — the DO only sees the
+  // vault-local path.
+  const fwdUrl = new URL(url);
+  fwdUrl.pathname = rest;
+
+  const doId = env.VAULT_DO.idFromName(doIdName(user.id, slug));
   const stub = env.VAULT_DO.get(doId);
   const headers = new Headers(request.headers);
-  // Defense in depth: any client that sends X-Internal-Secret must have that
-  // value stripped before we forward. Only code inside this Worker (e.g.
-  // provisionVault) may attach it to a DO request — never a tenant.
   headers.delete(INTERNAL_SECRET_HEADER);
-  const fwd = new Request(request, { headers });
+  const init: RequestInit = {
+    method: request.method,
+    headers,
+    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+  };
+  // Streaming request bodies through Request require `duplex: "half"` on CF.
+  if (init.body) {
+    (init as unknown as { duplex?: string }).duplex = "half";
+  }
+  const fwd = new Request(fwdUrl.toString(), init);
   fwd.headers.set(TIER_HEADER, tier);
-  // Workers' DurableObjectStub#fetch returns CF's Response type; cast to the
-  // global Response type expected by Hono's handler signature.
-  return stub.fetch(fwd as unknown as import("@cloudflare/workers-types").Request) as unknown as Response;
+  return stub.fetch(
+    fwd as unknown as import("@cloudflare/workers-types").Request,
+  ) as unknown as Response;
 }
 
-async function lookupVaultByHostname(env: Env, hostname: string) {
+function userSplash(host: string): Response {
+  const body = `<!doctype html><html><head><meta charset="utf-8"><title>${host}</title>
+<style>
+  body{background:#0f1715;color:#E8E5E1;font:14px/1.5 system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:1rem}
+  a{color:#8CCFCE;text-decoration:none}
+  h1{font-family:"Fraunces",Georgia,serif;font-style:italic;font-weight:500;color:#7AB09D;margin:0 0 0.5rem;font-size:28px;letter-spacing:-0.015em}
+  code{background:#192823;padding:2px 6px;border-radius:4px;font-family:"JetBrains Mono",ui-monospace,monospace;font-size:12.5px}
+</style>
+</head><body><div><h1>${host}</h1><p style="color:#A09B95">A Parachute. Vaults live at <code>/v/&lt;slug&gt;/…</code></p><p style="color:#7a7570;font-size:12px;margin-top:2rem">Admin at <a href="https://parachute.computer/dashboard">parachute.computer</a></p></div></body></html>`;
+  return new Response(body, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+async function lookupUserByHostname(env: Env, hostname: string): Promise<UserRow | null> {
   const cacheKey = `host:${hostname}`;
   try {
     const cached = await env.ACCOUNTS_CACHE.get(cacheKey, "json");
-    if (cached) return cached as Awaited<ReturnType<typeof getVaultByHostname>>;
+    if (cached) return cached as UserRow;
   } catch { /* cache optional */ }
 
-  const row = await getVaultByHostname(env.ACCOUNTS_DB, hostname);
+  const row = await getUserByHostname(env.ACCOUNTS_DB, hostname);
   if (row) {
     try { await env.ACCOUNTS_CACHE.put(cacheKey, JSON.stringify(row), { expirationTtl: 60 }); } catch {}
   }
@@ -198,9 +259,27 @@ function isRootDomain(host: string, root: string): boolean {
   const h = host.toLowerCase().split(":")[0] ?? "";
   const r = root.toLowerCase();
   if (h === r || h === `www.${r}`) return true;
-  // Treat bare `localhost` / `127.0.0.1` as root for local dev. A hostname like
-  // `alice.localhost` should NOT match — that's how we route to a vault in dev.
+  // Bare localhost / 127.0.0.1 are root for dev. `<anything>.localhost`
+  // routes through the vault path so subdomains can be exercised locally.
   return h === "localhost" || h === "127.0.0.1";
+}
+
+async function probeD1(env: Env): Promise<boolean> {
+  try {
+    const r = await env.ACCOUNTS_DB.prepare("SELECT 1 AS ok").first<{ ok: number }>();
+    return r?.ok === 1;
+  } catch {
+    return false;
+  }
+}
+
+async function probeR2(env: Env): Promise<boolean> {
+  try {
+    await env.ATTACHMENTS.head("__health_probe__");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export default app;

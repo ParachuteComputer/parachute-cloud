@@ -1,31 +1,26 @@
 /**
- * VaultDO — one Durable Object per hosted vault.
+ * VaultDO — one Durable Object per (user, vault-slug) pair.
  *
- * Wraps `DoSqliteStore` from `@openparachute/core/do`. Exposes two classes
- * of routes:
+ * Wraps `DoSqliteStore` from `@openparachute/core/do`. Two classes of
+ * routes:
  *
- *  1. **Public `/api/*`** — requires `Authorization: Bearer pvt_<token>`.
- *     Tokens live in this DO's own SQLite (`vault_tokens` table), keyed by
- *     sha256 hash. Missing/unknown/revoked → 401. See `TOKEN_AUTH_V0.md`.
+ *  1. **Public `/api/*`** — token auth is performed UPSTREAM by the
+ *     dispatcher (tokens live in D1 now). By the time a request reaches
+ *     the DO, the dispatcher has already verified. The DO trusts anything
+ *     it sees on `/api/*` — defense in depth comes from the CF network
+ *     topology (no public ingress hits a DO directly).
  *
- *  2. **Internal `/_internal/*`** — dispatcher-only RPC for token issuance,
- *     listing, and revocation. Gated by a shared-secret header
- *     `X-Internal-Secret` matching `env.DO_INTERNAL_SECRET`. The dispatcher
- *     strips any incoming `X-Internal-Secret` from client requests before
- *     forwarding, so a browser can't impersonate an internal call.
+ *  2. **Internal `/_internal/*`** — dispatcher-only RPC gated by a
+ *     shared-secret header `X-Internal-Secret` matching `env.DO_INTERNAL_SECRET`.
+ *     Used for R2 wipe during vault delete and tier setup.
  *
  * **Serialization.** Durable Objects process requests sequentially per
- * instance, so the `getVaultStats()` → `assertCanCreateNote()` →
- * `createNote()` sequence inside `POST /api/notes` can't race with another
- * writer — the next request waits until this one returns. That's the
- * guarantee the tier cap relies on.
+ * instance, so `getVaultStats()` → `assertCanCreateNote()` → `createNote()`
+ * cannot race. That's the guarantee the tier cap relies on.
  *
- * Tenancy: a VaultDO only ever sees its own storage. The dispatcher owns
- * the hostname → vault mapping.
- *
- * TODO: port the rest of the vault REST surface (links, find-path, storage,
- * /view), expose MCP at /mcp, R2-backed attachments when upstream
- * `DoSqliteStore` supports them.
+ * R2 keying: every blob is prefixed with `this.ctx.id.toString()`. Cross-
+ * tenant R2 reads are impossible by construction — even a leaked
+ * attachment id from another tenant points at a different prefix.
  */
 
 import { Hono } from "hono";
@@ -49,8 +44,6 @@ export interface VaultDOEnv {
 export const TIER_HEADER = "X-Parachute-Tier";
 export const INTERNAL_SECRET_HEADER = "X-Internal-Secret";
 
-const TOKEN_PREFIX = "pvt_";
-
 type Storage = {
   sql: {
     exec<T = Record<string, unknown>>(q: string, ...b: unknown[]): { toArray(): T[] };
@@ -59,7 +52,6 @@ type Storage = {
 
 export class VaultDO {
   private store?: DoSqliteStore;
-  private tokenTableReady = false;
   private readonly app: Hono<{ Variables: { tier: TierId } }>;
 
   constructor(
@@ -75,15 +67,6 @@ export class VaultDO {
 
   private getStore(): DoSqliteStore {
     if (!this.store) {
-      // R2 is wired whenever the ATTACHMENTS bucket is bound. Blob ops throw
-      // if called without a blobStore, but addAttachment (metadata-only) works
-      // either way — so leaving blobStore unset in a misconfigured env fails
-      // loudly on first blob write rather than silently.
-      //
-      // Prefix every blob key with the DO's opaque id. This makes
-      // cross-tenant reads impossible by construction: even if a leaked
-      // attachment UUID crossed tenants, the underlying R2 object lives
-      // under a different prefix.
       const blobStore = this.env.ATTACHMENTS
         ? new R2BlobStore(
             this.env.ATTACHMENTS as unknown as ConstructorParameters<typeof R2BlobStore>[0],
@@ -95,23 +78,7 @@ export class VaultDO {
         { blobStore },
       );
     }
-    this.ensureTokenTable();
     return this.store;
-  }
-
-  private ensureTokenTable(): void {
-    if (this.tokenTableReady) return;
-    this.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS vault_tokens (
-        id TEXT PRIMARY KEY,
-        token_hash TEXT NOT NULL UNIQUE,
-        name TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        last_used_at INTEGER,
-        revoked_at INTEGER
-      )
-    `);
-    this.tokenTableReady = true;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -141,54 +108,21 @@ export class VaultDO {
       return next();
     });
 
-    app.post("/_internal/tokens", async (c) => {
-      // Force DoSqliteStore init + token table before issuing — otherwise a
-      // first-time vault's initial API request could race initSchema.
+    // Lazy-init the store so first-request paths don't race initSchema.
+    app.post("/_internal/init", async (c) => {
       this.getStore();
-      const body = await c.req.json<{ name?: string }>().catch(() => ({} as { name?: string }));
-      const name = ((body.name ?? "default").trim() || "default").slice(0, 60);
-      const token = generateToken();
-      const hash = await sha256Hex(token);
-      const id = crypto.randomUUID();
-      const now = nowSec();
-      this.storage.sql.exec(
-        `INSERT INTO vault_tokens (id, token_hash, name, created_at) VALUES (?, ?, ?, ?)`,
-        id, hash, name, now,
-      );
-      return c.json({ id, name, token, createdAt: now });
+      return c.json({ ok: true, doId: this.ctx.id.toString() });
     });
 
-    app.get("/_internal/tokens", async (c) => {
-      this.getStore();
-      const rows = this.storage.sql
-        .exec<{ id: string; name: string; created_at: number; last_used_at: number | null; revoked_at: number | null }>(
-          `SELECT id, name, created_at, last_used_at, revoked_at
-             FROM vault_tokens ORDER BY created_at DESC`,
-        )
-        .toArray();
-      return c.json({ tokens: rows });
-    });
-
-    app.post("/_internal/tokens/:id/revoke", async (c) => {
-      this.getStore();
-      this.storage.sql.exec(
-        `UPDATE vault_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
-        nowSec(), c.req.param("id"),
-      );
-      return c.json({ ok: true });
-    });
-
-    // Wipe every R2 object under this DO's prefix. Called from the dashboard's
-    // delete-vault flow after the D1 rows are gone. We don't touch SQLite —
-    // CF provides no public "delete DO storage" API, and the D1 unmapping
-    // already makes the DO unreachable.
+    // Wipe all R2 objects under this DO's prefix. Called by the dashboard
+    // delete-vault flow after D1 rows are gone.
     app.post("/_internal/wipe-r2", async (c) => {
-      if (!this.env.ATTACHMENTS) return c.json({ ok: true, deleted: 0, note: "no ATTACHMENTS binding" });
+      if (!this.env.ATTACHMENTS) {
+        return c.json({ ok: true, deleted: 0, note: "no ATTACHMENTS binding" });
+      }
       const prefix = `${this.ctx.id.toString()}/`;
       let cursor: string | undefined;
       let deleted = 0;
-      // R2's list pages at 1000; loop until truncated = false. Each page's
-      // keys are deleted in one batch call.
       for (;;) {
         const page = await this.env.ATTACHMENTS.list({ prefix, cursor });
         const keys = page.objects.map((o) => o.key);
@@ -202,18 +136,9 @@ export class VaultDO {
       return c.json({ ok: true, deleted });
     });
 
-    // ---- Public API — requires Bearer token ----
-
-    app.use("/api/*", async (c, next) => {
-      const auth = c.req.header("Authorization");
-      const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
-      if (!token || !token.startsWith(TOKEN_PREFIX)) {
-        return c.json({ error: "unauthorized" }, 401);
-      }
-      const ok = await this.verifyAndTouchToken(token);
-      if (!ok) return c.json({ error: "unauthorized" }, 401);
-      return next();
-    });
+    // ---- Public API ----
+    // Auth is enforced by the dispatcher (tokens live in D1). The DO trusts
+    // anything that reaches `/api/*`.
 
     app.get("/health", (c) => c.json({ ok: true }));
 
@@ -279,9 +204,6 @@ export class VaultDO {
     });
 
     // ---- Attachments ----
-    // Attachments hang off notes. Upload is multipart/form-data with the file
-    // under `file` and optional `metadata` as a JSON string. The blob key is
-    // the attachment id; metadata lives in SQLite via addAttachment.
 
     app.post("/api/notes/:noteId/attachments", async (c) => {
       const tier = c.get("tier");
@@ -296,10 +218,6 @@ export class VaultDO {
       }
       const file = fileEntry;
 
-      // Per-tier upload cap. storagePerVaultMb is the vault-level quota, but
-      // we don't track used-bytes in D1 yet. For v0.2 treat it as a per-upload
-      // ceiling — good enough to keep someone from posting a 1GB file on a
-      // free vault. True accounting lands with usage_events.
       const tierLimits = tierOf(tier);
       const capBytes = tierLimits.storagePerVaultMb * 1024 * 1024;
       if (file.size > capBytes) {
@@ -318,18 +236,12 @@ export class VaultDO {
       if (typeof metaRaw === "string" && metaRaw.length > 0) {
         try { metadata = JSON.parse(metaRaw); } catch { /* ignore malformed */ }
       }
-      // Record the original client-supplied filename in metadata so downloads
-      // can render a reasonable Content-Disposition. Never trust this string
-      // on the serve path — sanitize at download time.
       if (typeof file.name === "string" && file.name.length > 0) {
         metadata = { ...(metadata ?? {}), filename: file.name };
       }
 
       const mime = file.type || "application/octet-stream";
       const store = this.getStore();
-      // Generate the blob key ourselves so we can putBlob → addAttachment in
-      // the right order: bytes land in R2 first, then the SQLite row points
-      // at a key that already exists. If putBlob fails, no orphan row.
       const blobKey = `att/${crypto.randomUUID()}`;
       await store.putBlob(blobKey, await file.arrayBuffer(), { mimeType: mime });
       const attachment = await store.addAttachment(noteId, blobKey, mime, metadata);
@@ -362,12 +274,8 @@ export class VaultDO {
       if (!att) return c.json({ error: "not_found" }, 404);
       const blob = await this.getStore().getBlob(att.path);
       if (!blob) return c.json({ error: "blob_missing" }, 404);
-      // Force a download-style response. We NEVER echo the uploader-supplied
-      // MIME on the serve path — doing so would let a tenant upload
-      // `text/html` and get it executed as first-party code on their
-      // subdomain (stored XSS). Callers that need a specific render MIME
-      // must set it themselves in a context they control; the original
-      // type is still exposed via GET /api/notes/:id/attachments.
+      // Force download — never echo uploader-supplied MIME on the serve
+      // path (stored-XSS defense). See TOKEN_AUTH_V0.md / PR #2.
       const rawName = (att.metadata?.filename as string | undefined) ?? "attachment";
       const filename = sanitizeFilename(rawName);
       return new Response(blob.body as unknown as BodyInit, {
@@ -381,26 +289,16 @@ export class VaultDO {
       });
     });
 
+    // ---- MCP (stub) ----
+    // TODO: port the real MCP Streamable HTTP surface from `@openparachute/core`.
+    // For now the endpoint is reachable (so token auth + routing can be
+    // validated end-to-end) but returns a 501 body.
+    app.all("/mcp", async (c) => {
+      return c.json({ error: "mcp_not_yet_implemented", doId: this.ctx.id.toString() }, 501);
+    });
+
     app.notFound((c) => c.json({ error: "not_found", path: c.req.path }, 404));
     return app;
-  }
-
-  private async verifyAndTouchToken(token: string): Promise<boolean> {
-    this.ensureTokenTable();
-    const hash = await sha256Hex(token);
-    const rows = this.storage.sql
-      .exec<{ id: string; revoked_at: number | null }>(
-        `SELECT id, revoked_at FROM vault_tokens WHERE token_hash = ?`,
-        hash,
-      )
-      .toArray();
-    const row = rows[0];
-    if (!row || row.revoked_at !== null) return false;
-    this.storage.sql.exec(
-      `UPDATE vault_tokens SET last_used_at = ? WHERE id = ?`,
-      nowSec(), row.id,
-    );
-    return true;
   }
 }
 
@@ -413,17 +311,12 @@ interface FileLike {
   arrayBuffer(): Promise<ArrayBuffer>;
 }
 
-// Keep only the printable basename characters — anything else becomes `_`.
-// Strip directory traversal; cap at 100 chars. Returns a safe filename for
-// use in Content-Disposition.
 function sanitizeFilename(raw: string): string {
   const base = raw.split(/[\\/]/).pop() ?? "";
   const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100);
   return cleaned.length > 0 ? cleaned : "attachment";
 }
 
-// @cloudflare/workers-types and the global DOM `File` clash under our
-// tsconfig (no DOM lib). Structural check avoids both.
 function isFileLike(v: unknown): v is FileLike {
   return (
     typeof v === "object" &&
@@ -431,28 +324,4 @@ function isFileLike(v: unknown): v is FileLike {
     typeof (v as FileLike).arrayBuffer === "function" &&
     typeof (v as FileLike).size === "number"
   );
-}
-
-// ---- Token helpers ----
-
-function nowSec(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
-function generateToken(): string {
-  const bytes = new Uint8Array(24);
-  crypto.getRandomValues(bytes);
-  const b64 = btoa(String.fromCharCode(...bytes))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-  return `${TOKEN_PREFIX}${b64}`;
-}
-
-async function sha256Hex(s: string): Promise<string> {
-  const data = new TextEncoder().encode(s);
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  return Array.from(new Uint8Array(hash))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
 }
