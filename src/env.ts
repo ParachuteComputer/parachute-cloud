@@ -20,4 +20,11 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET?: string;
   CF_API_TOKEN?: string;
   CF_ZONE_ID?: string;
+
+  // Shared secret between dispatcher and VaultDO. The dispatcher attaches this
+  // on `X-Internal-Secret` when calling a VaultDO's `/_internal/*` routes
+  // (token issuance, listing, revocation). The DO rejects any internal request
+  // whose header doesn't match. Dispatcher also strips this header from
+  // incoming client requests so a browser can never impersonate it.
+  DO_INTERNAL_SECRET?: string;
 }

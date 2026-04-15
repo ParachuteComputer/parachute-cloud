@@ -51,7 +51,10 @@ id = "0000000000000000000000000000000000000000000000000000000000000000"  # set v
 
 [vars]
 ROOT_DOMAIN = "parachute.computer"
-ENVIRONMENT = "development"
+# Default to "production" so prod-sensitive behavior (Clerk required, X-Dev-User
+# rejected) is the default posture. Override to "development" via a dev env
+# section or `--var ENVIRONMENT:development` when running `wrangler dev`.
+ENVIRONMENT = "production"
 
 # Secrets configured out-of-band:
 #   wrangler secret put CLERK_SECRET_KEY
@@ -60,3 +63,10 @@ ENVIRONMENT = "development"
 #   wrangler secret put STRIPE_WEBHOOK_SECRET
 #   wrangler secret put CF_API_TOKEN        # for Custom Hostname provisioning
 #   wrangler secret put CF_ZONE_ID          # parachute.computer zone
+#   wrangler secret put DO_INTERNAL_SECRET  # dispatcher↔VaultDO shared secret
+#                                           # (any high-entropy string, rotate to revoke)
+
+# Local dev uses `.dev.vars` for secrets. The required minimum for smoke tests is:
+#   ENVIRONMENT=development
+#   DO_INTERNAL_SECRET=<any-string>
+# When ENVIRONMENT=development, the X-Dev-User header bypasses Clerk.

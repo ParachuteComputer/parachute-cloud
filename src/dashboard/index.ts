@@ -22,9 +22,25 @@ dashboardApp.use("*", clerkMiddleware());
 dashboardApp.get("/", async (c: AuthedContext) => {
   const user = c.get("user");
   const vaults = await listVaultsByOwner(c.env.ACCOUNTS_DB, user.id);
+  // Tier is sourced from the active Stripe subscription, NOT `users.tier`.
+  // `users.tier` exists only as a legacy column and is ignored by the
+  // authorization path; pay events flow through Stripe webhooks → `subscriptions`.
   const sub = await getActiveSubscription(c.env.ACCOUNTS_DB, user.id);
-  const tier = (sub?.tier ?? user.tier) as TierId;
+  const tier = (sub?.tier ?? "free") as TierId;
   const limits = tierOf(tier);
+
+  const url = new URL(c.req.url);
+  const createdHost = url.searchParams.get("created");
+  const apiToken = url.searchParams.get("token");
+  const tokenBanner = createdHost && apiToken
+    ? `<section style="border:2px solid #c30; padding:0.8rem 1rem; background:#fff6f4;">
+        <h2 style="margin-top:0">New vault: ${esc(createdHost)}</h2>
+        <p><strong>Save this API token now — it will not be shown again:</strong></p>
+        <p><code style="font-size:1.1em; word-break:break-all;">${esc(apiToken)}</code></p>
+        <p style="color:#666">Use with <code>Authorization: Bearer &lt;token&gt;</code>.
+          If you lose it, create a new one from the token management page (coming soon).</p>
+      </section>`
+    : "";
 
   const rows = vaults
     .map(
@@ -40,6 +56,7 @@ dashboardApp.get("/", async (c: AuthedContext) => {
   return c.html(layout(
     user.email,
     `
+    ${tokenBanner}
     <section>
       <h2>Your vaults <small>(${vaults.length} / ${limits.maxVaults})</small></h2>
       <table>
@@ -70,10 +87,13 @@ dashboardApp.post("/vaults", async (c: AuthedContext) => {
   const user = c.get("user");
   const form = await c.req.formData();
   const name = String(form.get("name") ?? "");
-  const tier = (user.tier as TierId) ?? "free";
+  const sub = await getActiveSubscription(c.env.ACCOUNTS_DB, user.id);
+  const tier = (sub?.tier ?? "free") as TierId;
   try {
-    const { hostname } = await provisionVault(c.env, user, name, tier);
-    return c.redirect(`/dashboard?created=${encodeURIComponent(hostname)}`);
+    const { hostname, apiToken } = await provisionVault(c.env, user, name, tier);
+    return c.redirect(
+      `/dashboard?created=${encodeURIComponent(hostname)}&token=${encodeURIComponent(apiToken)}`,
+    );
   } catch (err) {
     if (err instanceof ProvisionError) {
       return c.html(layout(user.email, `<p style="color:crimson">Error: ${esc(err.message)}</p><p><a href="/dashboard">Back</a></p>`), 400);

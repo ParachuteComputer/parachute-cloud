@@ -47,27 +47,19 @@ export async function getVaultByHostname(
   return r ?? null;
 }
 
-export async function insertVault(db: D1Database, v: VaultRow): Promise<void> {
-  await db
-    .prepare(
-      `INSERT INTO vaults (id, owner_user_id, name, hostname, created_at, deleted_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(v.id, v.owner_user_id, v.name, v.hostname, v.created_at, v.deleted_at)
-    .run();
-}
-
-export async function insertHostname(db: D1Database, h: HostnameRow): Promise<void> {
-  await db
-    .prepare(
-      `INSERT INTO hostnames (hostname, vault_id, cf_custom_hostname_id, status)
-       VALUES (?, ?, ?, ?)`,
-    )
-    .bind(h.hostname, h.vault_id, h.cf_custom_hostname_id, h.status)
-    .run();
-}
-
 export async function hostnameExists(db: D1Database, hostname: string): Promise<boolean> {
   const r = await db.prepare("SELECT 1 AS x FROM hostnames WHERE hostname = ?").bind(hostname).first();
   return r !== null;
+}
+
+// Soft-delete: mark the vault row tombstoned AND drop the hostname row so
+// `getVaultByHostname` stops resolving it and the subdomain can be reused
+// later. Keep both writes in a single D1 batch so we never end up with a
+// half-deleted state where the hostname points at a dead vault.
+export async function softDeleteVault(db: D1Database, vaultId: string, hostname: string): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  await db.batch([
+    db.prepare(`UPDATE vaults SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`).bind(now, vaultId),
+    db.prepare(`DELETE FROM hostnames WHERE hostname = ? AND vault_id = ?`).bind(hostname, vaultId),
+  ]);
 }

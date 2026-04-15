@@ -13,7 +13,7 @@
  */
 
 import type { Env } from "../env.js";
-import { upsertSubscription } from "../db/subscriptions.js";
+import { getActiveSubscription, upsertSubscription } from "../db/subscriptions.js";
 import { isTierId, type TierId } from "./tiers.js";
 
 export async function handleStripeWebhook(request: Request, env: Env): Promise<Response> {
@@ -45,8 +45,15 @@ export async function handleStripeWebhook(request: Request, env: Env): Promise<R
     case "checkout.session.completed": {
       const s = event.data.object as import("stripe").Stripe.Checkout.Session;
       const userId = s.metadata?.user_id;
-      const tier = pickTier(s.metadata?.tier);
-      if (userId && s.customer) {
+      if (!userId) {
+        console.warn(
+          `stripe:checkout.session.completed missing user_id metadata — session=${s.id} customer=${typeof s.customer === "string" ? s.customer : s.customer?.id ?? "?"}`,
+        );
+        break;
+      }
+      const existing = await getActiveSubscription(env.ACCOUNTS_DB, userId);
+      const tier = pickTier(s.metadata?.tier, (existing?.tier as TierId | undefined) ?? "free");
+      if (s.customer) {
         await upsertSubscription(env.ACCOUNTS_DB, {
           stripeCustomerId: typeof s.customer === "string" ? s.customer : s.customer.id,
           stripeSubscriptionId: typeof s.subscription === "string" ? s.subscription : s.subscription?.id ?? null,
@@ -61,24 +68,35 @@ export async function handleStripeWebhook(request: Request, env: Env): Promise<R
     case "customer.subscription.updated":
     case "customer.subscription.created": {
       const sub = event.data.object as import("stripe").Stripe.Subscription;
-      const tier = pickTier(sub.metadata?.tier);
       const userId = sub.metadata?.user_id;
-      if (userId) {
-        await upsertSubscription(env.ACCOUNTS_DB, {
-          stripeCustomerId: typeof sub.customer === "string" ? sub.customer : sub.customer.id,
-          stripeSubscriptionId: sub.id,
-          userId,
-          tier,
-          status: sub.status,
-          currentPeriodEnd: sub.current_period_end ?? null,
-        });
+      if (!userId) {
+        console.warn(
+          `stripe:${event.type} missing user_id metadata — subscription=${sub.id} customer=${typeof sub.customer === "string" ? sub.customer : sub.customer.id}`,
+        );
+        break;
       }
+      const existing = await getActiveSubscription(env.ACCOUNTS_DB, userId);
+      const tier = pickTier(sub.metadata?.tier, (existing?.tier as TierId | undefined) ?? "free");
+      await upsertSubscription(env.ACCOUNTS_DB, {
+        stripeCustomerId: typeof sub.customer === "string" ? sub.customer : sub.customer.id,
+        stripeSubscriptionId: sub.id,
+        userId,
+        tier,
+        status: sub.status,
+        currentPeriodEnd: sub.current_period_end ?? null,
+      });
       break;
     }
     case "customer.subscription.deleted": {
       const sub = event.data.object as import("stripe").Stripe.Subscription;
       const userId = sub.metadata?.user_id;
-      if (userId) {
+      if (!userId) {
+        console.warn(
+          `stripe:customer.subscription.deleted missing user_id metadata — subscription=${sub.id}`,
+        );
+        break;
+      }
+      {
         await upsertSubscription(env.ACCOUNTS_DB, {
           stripeCustomerId: typeof sub.customer === "string" ? sub.customer : sub.customer.id,
           stripeSubscriptionId: sub.id,
@@ -101,6 +119,6 @@ export async function handleStripeWebhook(request: Request, env: Env): Promise<R
   });
 }
 
-function pickTier(raw: string | null | undefined): TierId {
-  return raw && isTierId(raw) ? raw : "free";
+function pickTier(raw: string | null | undefined, fallback: TierId): TierId {
+  return raw && isTierId(raw) ? raw : fallback;
 }

@@ -21,8 +21,7 @@
     "@clerk/backend": "^1.0.0",
     "stripe": "^17.0.0",
     "hono": "^4.6.0",
-    "drizzle-orm": "^0.36.0",
-    "zod": "^3.23.0"
+    "drizzle-orm": "^0.36.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260101.0",

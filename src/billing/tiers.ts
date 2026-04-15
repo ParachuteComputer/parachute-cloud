@@ -31,8 +31,8 @@ export function isTierId(v: unknown): v is TierId {
   return typeof v === "string" && v in TIERS;
 }
 
-export function tierOf(id: string): TierLimits {
-  return isTierId(id) ? TIERS[id] : TIERS.free;
+export function tierOf(id: string, fallback: TierId = "free"): TierLimits {
+  return isTierId(id) ? TIERS[id] : TIERS[fallback];
 }
 
 export class TierLimitError extends Error {

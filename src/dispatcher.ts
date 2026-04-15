@@ -21,7 +21,7 @@ import type { SessionUser } from "./auth/clerk.js";
 import type { UserRow } from "./db/users.js";
 import { getVaultByHostname } from "./db/vaults.js";
 import { getActiveSubscription } from "./db/subscriptions.js";
-import { TIER_HEADER } from "./vault-do.js";
+import { TIER_HEADER, INTERNAL_SECRET_HEADER } from "./vault-do.js";
 import { isTierId, tierOf, type TierId } from "./billing/tiers.js";
 
 export { VaultDO } from "./vault-do.js";
@@ -51,11 +51,23 @@ app.post("/signup", onRoot, clerkMiddleware(), async (c) => {
   const user = c.get("user");
   const body = await c.req.json<{ name?: string; tier?: TierId }>().catch(() => null);
   if (!body?.name) return c.json({ error: "name required" }, 400);
-  const requested = body.tier ?? user.tier;
+  // Tier resolution order: explicit request → active Stripe subscription → "free".
+  // Never trust user.tier (there isn't one anymore — keeping this explicit).
+  const sub = await getActiveSubscription(c.env.ACCOUNTS_DB, user.id);
+  const requested = body.tier ?? sub?.tier;
   const tier: TierId = isTierId(requested) ? requested : "free";
   try {
     const result = await provisionVault(c.env, user, body.name, tier);
-    return c.json(result, 201);
+    return c.json(
+      {
+        vaultId: result.vaultId,
+        hostname: result.hostname,
+        vaultUrl: `https://${result.hostname}`,
+        apiToken: result.apiToken,
+        note: "apiToken is shown once. Save it now — it cannot be retrieved later.",
+      },
+      201,
+    );
   } catch (err) {
     if (err instanceof ProvisionError) {
       return c.json({ error: err.message, code: err.code }, 400);
@@ -92,7 +104,12 @@ async function handleVaultRequest(request: Request, env: Env): Promise<Response>
 
   const doId = env.VAULT_DO.idFromName(vault.id);
   const stub = env.VAULT_DO.get(doId);
-  const fwd = new Request(request, { headers: new Headers(request.headers) });
+  const headers = new Headers(request.headers);
+  // Defense in depth: any client that sends X-Internal-Secret must have that
+  // value stripped before we forward. Only code inside this Worker (e.g.
+  // provisionVault) may attach it to a DO request — never a tenant.
+  headers.delete(INTERNAL_SECRET_HEADER);
+  const fwd = new Request(request, { headers });
   fwd.headers.set(TIER_HEADER, tier);
   // Workers' DurableObjectStub#fetch returns CF's Response type; cast to the
   // global Response type expected by Hono's handler signature.

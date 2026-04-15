@@ -22,6 +22,8 @@ const RESERVED = new Set([
   "www", "api", "app", "admin", "dashboard", "billing", "signup", "login",
   "docs", "blog", "help", "support", "status", "mail", "root", "staff",
   "parachute", "vault", "cloud",
+  "dev", "staging", "test", "cdn", "static", "assets", "store", "pay",
+  "account", "accounts", "health", "auth", "logout", "register", "ws",
 ]);
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
@@ -36,6 +38,7 @@ export class ProvisionError extends Error {
 export interface ProvisionResult {
   vaultId: string;
   hostname: string;
+  apiToken: string;
 }
 
 export async function provisionVault(
@@ -73,22 +76,88 @@ export async function provisionVault(
   const cfId = await registerCustomHostname(env, hostname);
   const status = cfId ? "pending" : "dev_local";
 
-  await env.ACCOUNTS_DB.batch([
-    env.ACCOUNTS_DB
-      .prepare(
-        `INSERT INTO vaults (id, owner_user_id, name, hostname, created_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(vaultId, user.id, lower, hostname, now, null),
-    env.ACCOUNTS_DB
-      .prepare(
-        `INSERT INTO hostnames (hostname, vault_id, cf_custom_hostname_id, status)
-         VALUES (?, ?, ?, ?)`,
-      )
-      .bind(hostname, vaultId, cfId, status),
-  ]);
+  try {
+    await env.ACCOUNTS_DB.batch([
+      env.ACCOUNTS_DB
+        .prepare(
+          `INSERT INTO vaults (id, owner_user_id, name, hostname, created_at, deleted_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(vaultId, user.id, lower, hostname, now, null),
+      env.ACCOUNTS_DB
+        .prepare(
+          `INSERT INTO hostnames (hostname, vault_id, cf_custom_hostname_id, status)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .bind(hostname, vaultId, cfId, status),
+    ]);
+  } catch (err) {
+    // D1 writes failed after we already registered the hostname with CF.
+    // Best-effort rollback so we don't leak the CF custom-hostname record.
+    if (cfId) {
+      try {
+        await deleteCustomHostname(env, cfId);
+      } catch (rollbackErr) {
+        console.error(
+          `provisionVault: D1 insert failed and CF hostname rollback ALSO failed — cfId=${cfId} hostname=${hostname}`,
+          rollbackErr,
+        );
+      }
+    }
+    throw err;
+  }
 
-  return { vaultId, hostname };
+  // Issue the first API token. The DO's /_internal/tokens is reachable only
+  // with DO_INTERNAL_SECRET; the dispatcher strips any incoming copy of that
+  // header, so this call path is internal-only.
+  const apiToken = await issueInitialToken(env, vaultId, tier);
+
+  return { vaultId, hostname, apiToken };
+}
+
+async function issueInitialToken(env: Env, vaultId: string, tier: TierId): Promise<string> {
+  if (!env.DO_INTERNAL_SECRET) {
+    throw new ProvisionError(
+      "DO_INTERNAL_SECRET not configured; cannot issue vault token",
+      "missing_internal_secret",
+    );
+  }
+  const doId = env.VAULT_DO.idFromName(vaultId);
+  const stub = env.VAULT_DO.get(doId);
+  const req = new Request("https://do/_internal/tokens", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Internal-Secret": env.DO_INTERNAL_SECRET,
+      "X-Parachute-Tier": tier,
+    },
+    body: JSON.stringify({ name: "default" }),
+  });
+  const res = (await stub.fetch(
+    req as unknown as import("@cloudflare/workers-types").Request,
+  )) as unknown as Response;
+  if (!res.ok) {
+    throw new ProvisionError(
+      `failed to issue initial vault token: ${res.status}`,
+      "token_issue_failed",
+    );
+  }
+  const data = (await res.json()) as { token?: string };
+  if (!data.token) {
+    throw new ProvisionError("token issuance returned no token", "token_issue_failed");
+  }
+  return data.token;
+}
+
+async function deleteCustomHostname(env: Env, cfId: string): Promise<void> {
+  if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) return;
+  await fetch(
+    `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/custom_hostnames/${cfId}`,
+    {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${env.CF_API_TOKEN}` },
+    },
+  );
 }
 
 async function registerCustomHostname(env: Env, hostname: string): Promise<string | null> {
