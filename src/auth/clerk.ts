@@ -71,6 +71,20 @@ export function clerkMiddleware(): MiddlewareHandler<{ Bindings: Env; Variables:
           session = { clerkUserId, email: email ?? `${clerkUserId}@dev.local` };
         }
       }
+      // Dev-only auto-user: when DEV_AUTO_USER is set and we're not in
+      // production, auto-sign-in as a fixed identity. Lets a tablet browser
+      // reach the dashboard without a header extension. Value is the
+      // `<clerk-id>:<email>` pair (matching X-Dev-User format); if the
+      // value is just `1` or `true`, default to `dev-aaron:aaron@dev.local`.
+      if (!session && env.DEV_AUTO_USER) {
+        const raw = env.DEV_AUTO_USER === "1" || env.DEV_AUTO_USER === "true"
+          ? "dev-aaron:aaron@dev.local"
+          : env.DEV_AUTO_USER;
+        const [clerkUserId, email] = raw.split(":");
+        if (clerkUserId) {
+          session = { clerkUserId, email: email ?? `${clerkUserId}@dev.local` };
+        }
+      }
     }
 
     if (!session) return c.text("unauthorized", 401);

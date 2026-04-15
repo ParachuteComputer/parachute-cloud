@@ -28,6 +28,8 @@ export async function callVaultInternal(
   if (!env.DO_INTERNAL_SECRET) {
     throw new Error("DO_INTERNAL_SECRET not configured");
   }
+  // `vaultId` here is the DO-name key, i.e. `${userId}:${slug}`. See
+  // src/db/vaults.ts `doIdName()`.
   const doId = env.VAULT_DO.idFromName(vaultId);
   const stub = env.VAULT_DO.get(doId);
   const headers: Record<string, string> = {

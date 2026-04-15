@@ -1,17 +1,18 @@
 # Parachute Cloud
 
-Hosted [Parachute Vault](https://github.com/ParachuteComputer/parachute-vault) on `*.parachute.computer`. Sign up, get your own vault at `<you>.parachute.computer`, connect any AI over MCP, pay monthly via Stripe.
+Hosted [Parachute Vault](https://github.com/ParachuteComputer/parachute-vault) on `*.parachute.computer`. Sign up, get your own subdomain at `<you>.parachute.computer`, run one or more vaults under it at `/v/<slug>/…`, connect any AI over MCP, pay monthly via Stripe.
 
 > **Status:** scaffold. Architecture and skeleton only — nothing is deployed.
 
 ## The product
 
-A hosted, per-tenant knowledge vault for AI agents. Every signup gets:
+A hosted, per-tenant knowledge vault platform for AI agents. Every signup gets:
 
-- A subdomain (`<name>.parachute.computer`) with HTTPS, ready for Claude Desktop / Claude Code / any MCP client.
-- A fully isolated SQLite database (one Durable Object per vault) with the exact same MCP tools, REST API, wikilinks, tags, and graph as self-hosted Parachute Vault.
+- **One subdomain per user** (`<you>.parachute.computer`) with HTTPS.
+- **Many vaults under that subdomain**, each at `/v/<slug>/…` — `/v/default`, `/v/work`, `/v/journal`, etc. One Durable Object per `(user, slug)` pair, fully isolated SQLite.
+- Same MCP tools, REST API, wikilinks, tags, and graph as self-hosted Parachute Vault.
 - Attachments backed by R2.
-- Per-vault scoped API tokens, plus account-level management via a simple dashboard.
+- D1-backed API tokens. A token is either **user-scoped** (works on every vault the user owns) or **vault-scoped** (pinned to one slug). Manage them all from one dashboard.
 
 Self-hosted Parachute Vault stays free and AGPL forever. Parachute Cloud is the paid, zero-setup version for people who don't want to run a server.
 
@@ -76,23 +77,24 @@ Parachute Cloud **does not fork** parachute-vault. It imports it.
 
 ### Request flow
 
-1. Request arrives at `aaron.parachute.computer/mcp`.
-2. Dispatcher worker reads the `Host` header, looks up `(user_id, vault_id, tier)` in D1 (cached in Workers KV for ~60s).
-3. Dispatcher checks tier limits (request rate, storage, whether subscription is active).
-4. Dispatcher `env.VAULT_DO.get(idFromName(vault_id))` and forwards the request.
+1. Request arrives at `aaron.parachute.computer/v/work/api/notes`.
+2. Dispatcher Worker reads `Host`, finds the owning user in D1 (cached in KV ~60s).
+3. Dispatcher parses `/v/<slug>/…`, verifies the bearer token in D1 (`tokens` table, sha256-keyed), checks scope against the slug, enforces rate limit.
+4. Dispatcher strips the `/v/<slug>` prefix and forwards the request to `env.VAULT_DO.get(idFromName("${userId}:${slug}"))`.
 5. VaultDO handles it with `DoSqliteStore` — same MCP tool handlers as self-hosted.
-6. Attachment requests hit R2 via the DO or (later) pre-signed URLs.
+6. Attachments hit R2, keyed by DO id — cross-tenant reads impossible by construction.
 
-### Signup flow
+### Signup / onboarding
 
-1. User hits `parachute.computer` marketing site → "Sign up".
-2. Clerk handles auth. On first login, `/signup/provision` creates:
-   - A `users` row in D1 (Clerk ID → internal user ID).
-   - A `vaults` row (`<chosen-subdomain>`, free tier).
-   - A VaultDO instance (lazy — created on first request).
-   - A Cloudflare Custom Hostname record for `<chosen-subdomain>.parachute.computer`.
-3. User picks a paid tier → Stripe Checkout → webhook updates `subscriptions` row.
-4. User issues scoped API tokens from the dashboard and plugs them into Claude Desktop / Code.
+1. User hits `parachute.computer` → Clerk auth.
+2. First login → `/onboarding/choose-hostname`. Picks a subdomain; live availability via `/api/check-hostname?name=…`.
+3. Server calls `onboardUser()`:
+   - Inserts `hostnames` row + sets `users.hostname`.
+   - Registers a Cloudflare Custom Hostname record for `<subdomain>.parachute.computer`.
+   - Creates a default vault (`slug=default`, `name=Default`).
+   - Issues a user-scope API token named `default`; shows it to the user **once**.
+4. Dashboard: create more vaults, issue more tokens (user-scope or vault-scope), rename, delete.
+5. Paid tier → Stripe Checkout → webhook updates `subscriptions`.
 
 ### Tenancy boundaries
 
@@ -143,19 +145,24 @@ wrangler dev
 In dev mode, Clerk session verification is replaced by an `X-Dev-User: <clerk-id>:<email>` header so you don't need a real Clerk tenant. Example:
 
 ```bash
-# Provision a vault as a pretend user
+# Onboard a pretend user (picks hostname + creates /v/default)
 curl -X POST http://127.0.0.1:8787/signup \
   -H 'Content-Type: application/json' \
-  -H 'X-Dev-User: dev-user:me@dev.local' \
-  -d '{"name":"alice"}'
-# → { "vaultId": "…", "hostname": "alice.parachute.computer" }
+  -H 'X-Dev-User: dev-alice:alice@dev.local' \
+  -d '{"subdomain":"alice"}'
+# → {"hostname":"alice.parachute.computer","vaultSlug":"default",
+#    "vaultUrl":"https://alice.parachute.computer/v/default",
+#    "mcpUrl":"https://alice.parachute.computer/v/default/mcp",
+#    "apiToken":"pvt_..."}
 
-# Round-trip through the VaultDO (dispatcher uses Host header for routing)
-curl http://127.0.0.1:8787/api/notes \
-  -H 'Host: alice.parachute.computer'
-
-curl -X POST http://127.0.0.1:8787/api/notes \
+# Round-trip: vault requests live on the user's subdomain under /v/<slug>/
+curl http://127.0.0.1:8787/v/default/api/notes \
   -H 'Host: alice.parachute.computer' \
+  -H 'Authorization: Bearer pvt_...'
+
+curl -X POST http://127.0.0.1:8787/v/default/api/notes \
+  -H 'Host: alice.parachute.computer' \
+  -H 'Authorization: Bearer pvt_...' \
   -H 'Content-Type: application/json' \
   -d '{"content":"hello"}'
 ```
@@ -164,23 +171,22 @@ Smoke tests (`bun test tests/smoke.test.ts`) assume `wrangler dev` is already ru
 
 ## Using a hosted vault with `parachute-agent`
 
-Every provisioned vault ships a per-vault API token (`pvt_…`) and an MCP
-endpoint at `https://<name>.parachute.computer/mcp`. Point a `parachute-agent`
-config straight at them:
+Every vault is reachable at `https://<you>.parachute.computer/v/<slug>/mcp`
+with an API token (`pvt_…`) as the bearer. User-scope tokens work on every
+vault you own, so one token can fan a single agent across several vaults:
 
 ```ts
 export default {
   vault: {
-    url: "https://aaron.parachute.computer/mcp",
+    url: "https://aaron.parachute.computer/v/work/mcp",
     token: "pvt_XXXXXXXXXXXXXXXXXXXXXXXX",
   },
   // ... agents, triggers, etc.
 };
 ```
 
-Revoke the token from the dashboard's Tokens page; issuing a new one is
-instant. Agents talking to the vault will see `401` on the revoked token and
-stop — rotate before revoking if the agent needs uninterrupted access.
+Revoke tokens from the dashboard. Agents will see `401` the moment a token is
+revoked — rotate first if you need zero downtime.
 
 ## Deployment
 
