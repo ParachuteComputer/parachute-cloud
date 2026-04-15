@@ -10,6 +10,10 @@ export interface Env {
   ATTACHMENTS: R2Bucket;
   ACCOUNTS_DB: D1Database;
   ACCOUNTS_CACHE: KVNamespace;
+  // Per-vault per-day API request counters. Key: `rl:<vaultId>:<YYYY-MM-DD>`,
+  // value: integer count (UTF-8 decimal). TTL is one day. Reads and writes
+  // race at the KV layer — acceptable at low volume, the cap is soft.
+  RATE_LIMIT_KV: KVNamespace;
 
   ROOT_DOMAIN: string;
   ENVIRONMENT: string;

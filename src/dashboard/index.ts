@@ -12,6 +12,7 @@ import { getActiveSubscription } from "../db/subscriptions.js";
 import { provisionVault, ProvisionError } from "../signup/provision.js";
 import { tierOf, type TierId } from "../billing/tiers.js";
 import { callVaultInternal } from "../vault-internal.js";
+import { hardDeleteVault } from "../db/vaults.js";
 
 export const dashboardApp = new Hono<{
   Bindings: Env;
@@ -33,6 +34,13 @@ dashboardApp.get("/", async (c: AuthedContext) => {
   const url = new URL(c.req.url);
   const createdHost = url.searchParams.get("created");
   const apiToken = url.searchParams.get("token");
+  const deletedHost = url.searchParams.get("deleted");
+  const deletedBanner = deletedHost
+    ? `<section style="border:1px solid #888; padding:0.6rem 1rem; background:#f4f4f4;">
+        <p style="margin:0">Vault <code>${esc(deletedHost)}</code> deleted.</p>
+      </section>
+      <script>try { history.replaceState(null, "", location.pathname); } catch {}</script>`
+    : "";
   const tokenBanner = createdHost && apiToken
     ? `<section style="border:2px solid #c30; padding:0.8rem 1rem; background:#fff6f4;">
         <h2 style="margin-top:0">New vault: ${esc(createdHost)}</h2>
@@ -61,6 +69,7 @@ dashboardApp.get("/", async (c: AuthedContext) => {
   return c.html(layout(
     user.email,
     `
+    ${deletedBanner}
     ${tokenBanner}
     <section>
       <h2>Your vaults <small>(${vaults.length} / ${limits.maxVaults})</small></h2>
@@ -210,8 +219,74 @@ dashboardApp.get("/vaults/:vaultId/tokens", async (c: AuthedContext) => {
       </form>
       <p style="color:#666">The token value is shown once. Revoke it if you lose the device — revoking the last token won't lock you out (create a new one first if you still need access).</p>
     </section>
+    <section>
+      <h3 style="color:#c30">Danger zone</h3>
+      <p>Deleting this vault removes all notes, attachments, tokens, and the subdomain mapping. This cannot be undone.</p>
+      <form method="POST" action="/dashboard/vaults/${esc(vault.id)}/delete"
+            onsubmit="return document.getElementById('confirm-${esc(vault.id)}').value === ${JSON.stringify(vault.name)};">
+        <label>Type the vault name <code>${esc(vault.name)}</code> to confirm:
+          <input id="confirm-${esc(vault.id)}" name="confirm" required autocomplete="off" />
+        </label>
+        <button type="submit" style="background:#c30;color:#fff">Delete vault</button>
+      </form>
+    </section>
     `,
   ));
+});
+
+dashboardApp.post("/vaults/:vaultId/delete", async (c: AuthedContext) => {
+  const user = c.get("user");
+  const vault = await loadOwnedVault(c, c.req.param("vaultId") ?? "");
+  if (!vault) return c.html(layout(user.email, `<p>Not found.</p>`), 404);
+
+  const form = await c.req.formData();
+  const confirm = String(form.get("confirm") ?? "");
+  if (confirm !== vault.name) {
+    return c.html(
+      layout(user.email, `<p style="color:crimson">Confirmation text did not match vault name.</p><p><a href="/dashboard/vaults/${esc(vault.id)}/tokens">Back</a></p>`),
+      400,
+    );
+  }
+
+  // Order matters. Delete D1 rows FIRST: that immediately stops the
+  // dispatcher from routing `/api/*` to the vault DO, closing the window
+  // where a concurrent write could land in R2 after we've already wiped.
+  // Then wipe R2 (DO id is derived from vaultId — reachable even after D1
+  // rows are gone). Then unregister the CF custom hostname (best-effort;
+  // a leftover CF record blocks subdomain reuse but doesn't route anywhere
+  // since D1 resolution is already gone).
+  const sub = await getActiveSubscription(c.env.ACCOUNTS_DB, user.id);
+  const tier = (sub?.tier ?? "free") as TierId;
+
+  const hostnameRow = await c.env.ACCOUNTS_DB
+    .prepare("SELECT cf_custom_hostname_id FROM hostnames WHERE hostname = ? AND vault_id = ?")
+    .bind(vault.hostname, vault.id)
+    .first<{ cf_custom_hostname_id: string | null }>();
+
+  await hardDeleteVault(c.env.ACCOUNTS_DB, vault.id, vault.hostname);
+  // Invalidate dispatcher cache so a re-registered subdomain isn't shadowed.
+  try { await c.env.ACCOUNTS_CACHE.delete(`host:${vault.hostname}`); } catch {}
+
+  const wipe = await callVaultInternal(c.env, vault.id, {
+    method: "POST",
+    path: "/_internal/wipe-r2",
+    tier,
+  });
+  if (!wipe.ok) {
+    console.error(`delete-vault: R2 wipe returned ${wipe.status} for vault=${vault.id}; objects may be orphaned under prefix`);
+  }
+
+  if (hostnameRow?.cf_custom_hostname_id && c.env.CF_API_TOKEN && c.env.CF_ZONE_ID) {
+    const cf = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${c.env.CF_ZONE_ID}/custom_hostnames/${hostnameRow.cf_custom_hostname_id}`,
+      { method: "DELETE", headers: { Authorization: `Bearer ${c.env.CF_API_TOKEN}` } },
+    );
+    if (!cf.ok && cf.status !== 404) {
+      console.error(`delete-vault: CF hostname delete returned ${cf.status} for ${vault.hostname} (cfId=${hostnameRow.cf_custom_hostname_id})`);
+    }
+  }
+
+  return c.redirect("/dashboard?deleted=" + encodeURIComponent(vault.hostname));
 });
 
 dashboardApp.post("/vaults/:vaultId/tokens", async (c: AuthedContext) => {

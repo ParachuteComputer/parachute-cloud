@@ -47,6 +47,10 @@ migrations_dir = "drizzle/migrations"
 binding = "ACCOUNTS_CACHE"
 id = "0000000000000000000000000000000000000000000000000000000000000000"  # set via `wrangler kv namespace create ACCOUNTS_CACHE`
 
+[[kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "0000000000000000000000000000000000000000000000000000000000000000"  # set via `wrangler kv namespace create RATE_LIMIT_KV`
+
 # -------- Vars (non-secret) --------
 
 [vars]

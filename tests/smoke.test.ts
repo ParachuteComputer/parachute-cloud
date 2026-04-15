@@ -32,11 +32,22 @@ async function dev(path: string, init: RequestInit = {}): Promise<Response> {
 }
 
 describe("parachute-cloud smoke", () => {
-  it("dispatcher health responds", async () => {
+  it("dispatcher health returns structured check shape", async () => {
     const res = await fetch(`${BASE}/health`);
-    expect(res.status).toBe(200);
-    const json = (await res.json()) as { ok: boolean };
-    expect(json.ok).toBe(true);
+    expect([200, 503]).toContain(res.status);
+    const json = (await res.json()) as {
+      ok: boolean;
+      service: string;
+      version: string;
+      timestamp: number;
+      checks: { d1: boolean; r2: boolean };
+    };
+    expect(json.service).toBe("parachute-cloud");
+    expect(typeof json.version).toBe("string");
+    expect(typeof json.timestamp).toBe("number");
+    expect(typeof json.checks.d1).toBe("boolean");
+    expect(typeof json.checks.r2).toBe("boolean");
+    expect(json.ok).toBe(json.checks.d1 && json.checks.r2);
   });
 
   it("signup provisions a vault; returned apiToken round-trips /api/notes", async () => {

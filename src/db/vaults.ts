@@ -60,6 +60,22 @@ export async function hostnameExists(db: D1Database, hostname: string): Promise<
   return r !== null;
 }
 
+// Hard-delete: remove both rows outright. Used by the dashboard's explicit
+// "Delete vault" action, which also instructs the DO to wipe its R2 objects
+// and unregisters the CF custom hostname. The underlying Durable Object's
+// SQLite storage will continue to exist (CF has no public delete API for DO
+// storage), but with the D1 mapping gone the dispatcher can never route to
+// it again and the subdomain becomes reusable.
+export async function hardDeleteVault(db: D1Database, vaultId: string, hostname: string): Promise<void> {
+  // D1 doesn't enforce FK cascades by default, so delete child rows
+  // explicitly in dependency order before the parent `vaults` row.
+  await db.batch([
+    db.prepare(`DELETE FROM usage_events WHERE vault_id = ?`).bind(vaultId),
+    db.prepare(`DELETE FROM hostnames WHERE hostname = ? AND vault_id = ?`).bind(hostname, vaultId),
+    db.prepare(`DELETE FROM vaults WHERE id = ?`).bind(vaultId),
+  ]);
+}
+
 // Soft-delete: mark the vault row tombstoned AND drop the hostname row so
 // `getVaultByHostname` stops resolving it and the subdomain can be reused
 // later. Keep both writes in a single D1 batch so we never end up with a

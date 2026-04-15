@@ -23,6 +23,9 @@ import { getVaultByHostname } from "./db/vaults.js";
 import { getActiveSubscription } from "./db/subscriptions.js";
 import { TIER_HEADER, INTERNAL_SECRET_HEADER } from "./vault-do.js";
 import { isTierId, tierOf, type TierId } from "./billing/tiers.js";
+import { checkAndIncrement, rateLimitHeaders } from "./rate-limit.js";
+
+const VERSION = "0.3.0";
 
 export { VaultDO } from "./vault-do.js";
 export type { Env } from "./env.js";
@@ -41,7 +44,46 @@ const onRoot: MiddlewareHandler<{ Bindings: Env; Variables: Vars }> = async (c, 
   return next();
 };
 
-app.get("/health", onRoot, (c) => c.json({ ok: true, service: "parachute-cloud" }));
+app.get("/health", onRoot, async (c) => {
+  // Probe the backing services the hot path depends on. Each check is
+  // wrapped so one failure doesn't mask the others. Shape is frozen —
+  // external monitors key off `checks.d1` / `checks.r2`.
+  const checks = {
+    d1: await probeD1(c.env),
+    r2: await probeR2(c.env),
+  };
+  const ok = checks.d1 && checks.r2;
+  return c.json(
+    {
+      ok,
+      service: "parachute-cloud",
+      version: VERSION,
+      timestamp: Date.now(),
+      checks,
+    },
+    ok ? 200 : 503,
+  );
+});
+
+async function probeD1(env: Env): Promise<boolean> {
+  try {
+    const r = await env.ACCOUNTS_DB.prepare("SELECT 1 AS ok").first<{ ok: number }>();
+    return r?.ok === 1;
+  } catch {
+    return false;
+  }
+}
+
+async function probeR2(env: Env): Promise<boolean> {
+  try {
+    // HEAD on a key we don't expect to exist; a null return is still a
+    // successful round-trip. We only care that the binding is reachable.
+    await env.ATTACHMENTS.head("__health_probe__");
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 app.get("/", onRoot, (c) => c.redirect("/dashboard"));
 
@@ -101,6 +143,28 @@ async function handleVaultRequest(request: Request, env: Env): Promise<Response>
   const sub = await getActiveSubscription(env.ACCOUNTS_DB, vault.owner_user_id);
   const tier = (sub?.tier ?? "free") as TierId;
   void tierOf(tier); // validate
+
+  // Per-vault per-day rate limit, applied only to the public API surface.
+  // Internal DO routes and the DO's own `/health` aren't rate-limited here —
+  // /_internal/* is only reachable via the dispatcher anyway, and /health
+  // is used by external monitors.
+  if (url.pathname.startsWith("/api/")) {
+    const rl = await checkAndIncrement(env, vault.id, tier);
+    if (!rl.allowed) {
+      return new Response(
+        JSON.stringify({
+          error: "rate_limited",
+          limit: rl.limit,
+          retryAfter: rl.retryAfter,
+          tier,
+        }),
+        {
+          status: 429,
+          headers: { "Content-Type": "application/json", ...rateLimitHeaders(rl) },
+        },
+      );
+    }
+  }
 
   const doId = env.VAULT_DO.idFromName(vault.id);
   const stub = env.VAULT_DO.get(doId);

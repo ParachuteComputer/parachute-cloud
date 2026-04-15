@@ -162,6 +162,31 @@ curl -X POST http://127.0.0.1:8787/api/notes \
 
 Smoke tests (`bun test tests/smoke.test.ts`) assume `wrangler dev` is already running on the default port. Set `CLOUD_BASE_URL` to point elsewhere.
 
+## Using a hosted vault with `parachute-agent`
+
+Every provisioned vault ships a per-vault API token (`pvt_…`) and an MCP
+endpoint at `https://<name>.parachute.computer/mcp`. Point a `parachute-agent`
+config straight at them:
+
+```ts
+export default {
+  vault: {
+    url: "https://aaron.parachute.computer/mcp",
+    token: "pvt_XXXXXXXXXXXXXXXXXXXXXXXX",
+  },
+  // ... agents, triggers, etc.
+};
+```
+
+Revoke the token from the dashboard's Tokens page; issuing a new one is
+instant. Agents talking to the vault will see `401` on the revoked token and
+stop — rotate before revoking if the agent needs uninterrupted access.
+
+## Deployment
+
+Production deploy steps live in [`DEPLOY.md`](./DEPLOY.md) — prereqs,
+secrets, D1 migration, smoke checks, rollback.
+
 ## Deployment model
 
 **Single Worker + Custom Hostnames**, not Workers for Platforms. Workers for Platforms requires Enterprise billing and we don't need user-uploaded Workers for v0 — one Worker can dispatch to any DO by name, and Custom Hostnames gives us wildcard SSL under `*.parachute.computer`. We revisit WfP only if we let tenants ship their own code.
