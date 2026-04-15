@@ -178,6 +178,30 @@ export class VaultDO {
       return c.json({ ok: true });
     });
 
+    // Wipe every R2 object under this DO's prefix. Called from the dashboard's
+    // delete-vault flow after the D1 rows are gone. We don't touch SQLite —
+    // CF provides no public "delete DO storage" API, and the D1 unmapping
+    // already makes the DO unreachable.
+    app.post("/_internal/wipe-r2", async (c) => {
+      if (!this.env.ATTACHMENTS) return c.json({ ok: true, deleted: 0, note: "no ATTACHMENTS binding" });
+      const prefix = `${this.ctx.id.toString()}/`;
+      let cursor: string | undefined;
+      let deleted = 0;
+      // R2's list pages at 1000; loop until truncated = false. Each page's
+      // keys are deleted in one batch call.
+      for (;;) {
+        const page = await this.env.ATTACHMENTS.list({ prefix, cursor });
+        const keys = page.objects.map((o) => o.key);
+        if (keys.length > 0) {
+          await this.env.ATTACHMENTS.delete(keys);
+          deleted += keys.length;
+        }
+        if (!page.truncated) break;
+        cursor = page.cursor;
+      }
+      return c.json({ ok: true, deleted });
+    });
+
     // ---- Public API — requires Bearer token ----
 
     app.use("/api/*", async (c, next) => {
