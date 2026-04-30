@@ -4,8 +4,11 @@
 // for migration drills. Per cloud-shape doc §8.5 the user never sees the
 // provider name, so swapping is purely an internal lift. Stub here just
 // pins the shape so a future RenderClient slot exists in the codebase.
-import type { ProviderClient } from "./provider-client.ts";
+//
+// Not declared `implements ProviderClient` yet — that would force stub
+// methods on every interface change. Add the implements clause when the
+// real class lands.
 
-export class RenderClient implements ProviderClient {
+export class RenderClient {
   // TODO(phase-4+): implement against the Render REST API when needed.
 }
