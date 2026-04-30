@@ -63,6 +63,9 @@ class StubProvider implements ProviderClient {
     if (this.result instanceof Error) throw this.result;
     return this.result;
   }
+  updateMachineSize(): Promise<void> {
+    return Promise.resolve();
+  }
   destroyMachine(): Promise<void> {
     return Promise.resolve();
   }
