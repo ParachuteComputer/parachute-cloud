@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/cloud",
-  "version": "0.0.1",
+  "version": "0.0.2-rc.1",
   "private": true,
   "description": "Open Parachute PBC's managed cloud control plane — provisions Fly Machines per user, runs hub + Tier 1 spokes, bills via Stripe.",
   "license": "AGPL-3.0",
