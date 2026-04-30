@@ -1,0 +1,45 @@
+# Cloudflare Workers configuration for the parachute-cloud control plane.
+#
+# This is the *control plane* only — signup, account state, tenant→VM mapping,
+# Stripe checkout creation, and the VM-to-control-plane provisioning callback.
+# The user runtime (hub + Tier 1 spokes) lives elsewhere — one Fly Machine per
+# user, see CLAUDE.md.
+#
+# D1 binding: a single shared database holds all tenant rows. Tenant data lives
+# on the user's Fly volume, never here. Phase 0 wiped Workers/DOs/R2; Phase 2
+# re-introduces a *narrower* CF surface (no DOs, no R2, no per-tenant Workers).
+
+name = "parachute-cloud"
+main = "src/server.ts"
+compatibility_date = "2026-04-30"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 database binding. The local dev DB is created automatically by
+# `wrangler dev` and lives under .wrangler/state/v3/d1/. The production
+# database id is filled in once the D1 instance is provisioned via
+# `wrangler d1 create parachute-cloud-control` (out of Phase 2 scope —
+# placeholder uuid here so the binding parses; replace before deploy).
+[[d1_databases]]
+binding = "DB"
+database_name = "parachute-cloud-control"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+# Public-facing routes are wired post-deploy with `wrangler deploy --routes`;
+# leaving the [routes] block out keeps `wrangler dev` purely local.
+
+[vars]
+# Non-secret defaults. Secrets — set via `wrangler secret put <name>`,
+# never committed:
+#   FLY_API_TOKEN, FLY_ORG_SLUG, PROVISION_CALLBACK_BASE_URL,
+#   ADMIN_BEARER_SECRET, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
+#   STRIPE_PRICE_TIER_STARTER, STRIPE_PRICE_TIER_PRO.
+# Phase-3 customer-portal + lifecycle-webhook secrets land later.
+# PARACHUTE_DEPLOY_IMAGE is overridable per environment — see CLAUDE.md.
+PARACHUTE_DEFAULT_DOMAIN = "parachute.computer"
+PARACHUTE_DEFAULT_REGION = "ord"
+PARACHUTE_DEPLOY_IMAGE = "registry.fly.io/parachute-deploy:latest"
+# Checkout success/cancel URLs are non-secret but environment-specific;
+# operators override per-env (e.g. https://staging.parachute.computer/...).
+STRIPE_CHECKOUT_SUCCESS_URL = "https://parachute.computer/welcome?session_id={CHECKOUT_SESSION_ID}"
+STRIPE_CHECKOUT_CANCEL_URL = "https://parachute.computer/?checkout=cancelled"

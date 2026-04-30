@@ -34,6 +34,13 @@ export interface DeploymentRecord {
   status: DeploymentStatus;
   /** ISO 8601. Empty if the provider hasn't reported it yet. */
   createdAt: string;
+  /**
+   * Inner-instance id within the app (Fly: machine id; Render: deploy id).
+   * Optional because list-derived records may not carry it on every provider.
+   * Persisted on the tenant row so destroy / status calls can target the
+   * specific instance without an extra round trip.
+   */
+  instanceId?: string;
 }
 
 export interface ProvisionOpts {

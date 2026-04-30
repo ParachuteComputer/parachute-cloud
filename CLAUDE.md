@@ -47,14 +47,17 @@ paraclaw is **Tier 2** — separate machine, opt-in, runs on the user's own dev 
    └─────────────────────────────────────────────────────────────────────┘
 ```
 
-The signup → working URL flow:
+The signup → working URL flow (Phase 2-(a) — Stripe Checkout in front of provision):
 
-1. User signs up at `parachute.computer/cloud` (separate repo: `parachute.computer` site). Stripe Checkout collects payment.
-2. Stripe webhook hits this control plane's `/signup/webhook` with the new subscription.
-3. Control plane calls the provider abstraction (`createInstance`) to provision a Fly Machine on the pre-baked Parachute image.
-4. First boot runs `bootstrap.ts` (lifted from `parachute-hub/src/deploy/bootstrap.ts` in Phase 1) — installs the configured modules onto `/data`, drops a marker, hub comes up.
-5. DNS is updated: `<chosen-subdomain>.parachute.computer` → Fly machine.
-6. User receives an email with their URL + first-boot setup link.
+1. User signs up at `parachute.computer/cloud` (separate repo: `parachute.computer` site). Site POSTs `{email, tier?}` to control-plane `POST /api/signup`.
+2. `signup/handler.ts` inserts an `accounts` row as `pending_provision` and mints a Stripe Checkout session via `billing/checkout.ts`. `client_reference_id = tenantId` carries the row across the Stripe round-trip; `subscription_data.metadata.tenant_id` carries it onto the subscription for future lifecycle webhooks. Response is `{tenantId, checkoutUrl, checkoutSessionId}`. **Signup never touches Fly.**
+3. The user pays in the hosted Checkout. Stripe sends `checkout.session.completed` to `POST /api/billing/webhook` (signature-verified against the raw body via `webhooks.constructEventAsync` + subtle-crypto).
+4. `billing/webhook.ts` looks up the row by `client_reference_id`, persists `stripe_customer_id` + `stripe_subscription_id`, then calls `orchestrateProvision` — which talks to the provider abstraction to provision a Fly Machine on the pre-baked Parachute image.
+5. First boot runs `bootstrap.ts` — installs the configured modules onto `/data`, drops a marker, hub comes up, calls `POST /api/internal/provision-complete` with the per-tenant secret embedded at machine-create time.
+6. DNS is updated: `<chosen-subdomain>.parachute.computer` → Fly machine.
+7. User receives an email with their URL + first-boot setup link.
+
+Phase 3 expands `billing/webhook.ts` to also handle subscription-lifecycle events (renewal, payment_failed, customer.subscription.deleted, dunning) by switching on `event.type`. The Phase-2 webhook ignores those (acks 200) so Stripe stops retrying them while we're not listening.
 
 ## Tier 1 vs Tier 2
 
@@ -97,13 +100,16 @@ No Clerk. Identity lives in the user's own hub-as-OAuth-issuer; the hub is the I
 
 ```ts
 interface ProviderClient {
-  createInstance(opts: ProvisionOpts): Promise<DeploymentRecord>;
-  destroyInstance(handle: string): Promise<void>;
-  status(handle: string): Promise<DeploymentStatus>;
-  tailLogs(handle: string): AsyncIterable<LogLine>;
-  // ...
+  validateToken(): Promise<TokenValidation>;
+  provisionMachine(opts: ProvisionOpts): Promise<DeploymentRecord>;
+  destroyMachine(name: string): Promise<void>;
+  listMachines(): Promise<DeploymentRecord[]>;
+  tailLogs(name: string, opts?: { follow?: boolean }): AsyncIterable<LogLine>;
+  sshExec(name: string, command: string): Promise<ExecResult>;
 }
 ```
+
+(`DeploymentRecord` carries `name`, `provider`, `region`, `url`, `status`, `createdAt`, and an optional `instanceId` — the control plane persists `flyAppName` (= `name`) and `flyMachineId` (= `instanceId`) on the accounts row.)
 
 Implementations:
 
@@ -121,12 +127,14 @@ src/
 │   ├── fly-client.ts         Fly Machines API impl (lifted in Phase 1)
 │   └── render-client.ts      stub for later
 ├── billing/
-│   ├── checkout.ts           Stripe Checkout session creation
-│   ├── webhook.ts            Stripe webhook handler
-│   └── tiers.ts              tier definitions + lifecycle policy
+│   ├── stripe-client.ts      Workers-compat factory (fetch http + subtle-crypto)
+│   ├── checkout.ts           Stripe Checkout session creation (called from signup)
+│   ├── webhook.ts            POST /api/billing/webhook (sig-verify + checkout.session.completed → orchestrate)
+│   └── tiers.ts              tier definitions + lifecycle policy (Phase 3)
 ├── signup/
-│   ├── handler.ts            POST /signup/webhook (Stripe → provision)
-│   └── orchestrate.ts        provision + DNS + bootstrap-env wiring
+│   ├── handler.ts            POST /api/signup (validate + insert row + mint checkout)
+│   ├── orchestrate.ts        called from billing/webhook.ts: provision + bootstrap-env wiring
+│   └── provision-complete.ts POST /api/internal/provision-complete (VM callback)
 ├── dashboard/
 │   └── index.ts              operator dashboard (per-VM status)
 ├── cli/
@@ -144,9 +152,14 @@ Skeleton stubs land in this Phase 0 PR. Concrete implementations land in Phases 
 - **Phase 3** — Stripe billing + tier enforcement.
 - **Phase 4** — web sign-up surface at `parachute.computer/cloud` (separate repo).
 
-## Bun-native
+## Hybrid runtime
 
-Bun everywhere. No Node.js, no Workers runtime. `Bun.serve` for the control plane HTTP surface; `Bun.spawn` for any provider CLI shell-outs we keep. `bun test` for tests; types via `tsc --noEmit`.
+Two runtimes, deliberately:
+
+- **Cloudflare Worker (control plane)** — the HTTP surface (`src/server.ts` and friends) runs on Workers. Hono for routing, D1 for tenant state, Drizzle for the schema. `wrangler dev` locally, `wrangler deploy` to ship. This is what answers `POST /api/signup`, the Stripe webhook, the `provision-complete` callback from the VM, and the operator dashboard.
+- **Bun on the Fly Machine (per-tenant runtime)** — `src/bootstrap.ts` is the first-boot script that lands inside the deploy image and runs on Bun on the user's VM. It uses `node:fs` / `node:os` and never gets imported by the Worker. Tests for it run in `bun test` on a dev machine.
+
+Don't mix them: Worker code can't import bootstrap, bootstrap can't import Worker handlers. Per-tenant state lives on the Fly volume; control-plane state lives in D1. The control plane never reads user data — only metadata (tenant id, VM handle, plan, lifecycle status).
 
 ## Reference: cloud-shape doc
 
