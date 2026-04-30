@@ -48,16 +48,23 @@ export async function handleProvisionComplete(
   const row = await db.query.provisioningSecrets.findFirst({
     where: eq(provisioningSecrets.tenantId, tenantId),
   });
-  if (!row || !constantTimeEqual(row.secret, secret)) {
-    // Same response for missing row and bad secret so a probe can't
-    // distinguish "wrong tenant" from "wrong secret".
+  // Single 401 body for every auth failure — missing row, bad secret,
+  // or correct-but-expired secret all collapse to the same response so a
+  // probe can't distinguish "wrong tenant" from "wrong secret" from
+  // "expired" by reading the body. (A timing oracle still exists between
+  // "row found, expiry checked" and "no row at all"; that's a deeper fix
+  // — for now the constant-time-compare path runs unconditionally when
+  // the row exists, so the only timing signal is row-existence, which is
+  // already implied by tenant_id being a UUID we minted.)
+  const expired = row ? Date.parse(row.expiresAt) < Date.now() : false;
+  const matches = row ? constantTimeEqual(row.secret, secret) : false;
+  if (!row || !matches || expired) {
+    if (row && expired) {
+      await db
+        .delete(provisioningSecrets)
+        .where(eq(provisioningSecrets.tenantId, tenantId));
+    }
     return c.json({ error: "unauthorized" }, 401);
-  }
-  if (Date.parse(row.expiresAt) < Date.now()) {
-    await db
-      .delete(provisioningSecrets)
-      .where(eq(provisioningSecrets.tenantId, tenantId));
-    return c.json({ error: "expired" }, 401);
   }
 
   await db

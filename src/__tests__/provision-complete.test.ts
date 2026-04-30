@@ -123,6 +123,45 @@ describe("POST /api/internal/provision-complete", () => {
     expect(remaining).toBeUndefined();
   });
 
+  test("identical 401 body across unknown-tenant / wrong-secret / expired (no oracle)", async () => {
+    // Reviewer flagged that the old code returned `error: "expired"` for
+    // expiry while wrong-secret/missing-row returned `error: "unauthorized"`,
+    // letting an attacker tell "right secret, just stale" apart from "wrong
+    // secret entirely". All three paths should now collapse to the same body.
+    const { db } = makeTestDb();
+    const validTenant = "11111111-aaaa-bbbb-cccc-222222222222";
+    const expiredTenant = "33333333-aaaa-bbbb-cccc-444444444444";
+    await seedActiveProvisioning(db, validTenant, "right-secret", FAR_FUTURE);
+    await seedActiveProvisioning(db, expiredTenant, "stale-secret", "2000-01-01T00:00:00.000Z");
+    const handler = makeApp({}, db);
+
+    const fire = (tenantId: string, secret: string) =>
+      handler(
+        new Request("http://x/api/internal/provision-complete", {
+          method: "POST",
+          body: JSON.stringify({ tenant_id: tenantId, secret }),
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+    const unknown = await fire("00000000-dead-beef-cafe-000000000000", "anything");
+    const wrong = await fire(validTenant, "wrong-secret");
+    const expired = await fire(expiredTenant, "stale-secret");
+
+    expect(unknown.status).toBe(401);
+    expect(wrong.status).toBe(401);
+    expect(expired.status).toBe(401);
+
+    const [unknownBody, wrongBody, expiredBody] = await Promise.all([
+      unknown.json(),
+      wrong.json(),
+      expired.json(),
+    ]);
+    expect(unknownBody).toEqual({ error: "unauthorized" });
+    expect(wrongBody).toEqual({ error: "unauthorized" });
+    expect(expiredBody).toEqual({ error: "unauthorized" });
+  });
+
   test("missing fields → 400", async () => {
     const { db } = makeTestDb();
     const handler = makeApp({}, db);

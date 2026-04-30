@@ -20,6 +20,11 @@ const MIGRATIONS_DIR = new URL("../../migrations", import.meta.url).pathname;
 
 export function makeTestDb(): { db: Db; raw: Database } {
   const raw = new Database(":memory:");
+  // bun:sqlite ships with FKs *off* by default — D1 enforces them, so
+  // turn them on here too. Without this, the cascade-on-delete from
+  // `provisioning_secrets → accounts` is silently a no-op in tests, and
+  // FK violations that would 4xx in prod pass.
+  raw.exec("PRAGMA foreign_keys = ON;");
   const files = readdirSync(MIGRATIONS_DIR)
     .filter((f) => f.endsWith(".sql"))
     .sort();

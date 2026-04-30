@@ -83,6 +83,11 @@ export async function handleSignup(
     });
     return c.json({ tenantId, checkoutUrl: url, checkoutSessionId: sessionId }, 201);
   } catch (err) {
+    // TODO: when the public web signup surface lands (Phase 4),
+    // strip `detail` from the response — it's currently the raw Stripe
+    // SDK error string, fine for the internal /api/signup caller but
+    // user-visible-leaky once a browser hits this. Log server-side and
+    // return a generic "checkout_failed" instead.
     return c.json(
       {
         tenantId,
