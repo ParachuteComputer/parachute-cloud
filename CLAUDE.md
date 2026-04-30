@@ -100,16 +100,16 @@ No Clerk. Identity lives in the user's own hub-as-OAuth-issuer; the hub is the I
 
 ```ts
 interface ProviderClient {
-  validateToken(): Promise<void>;
-  provisionMachine(opts: ProvisionOpts): Promise<ProvisionResult>;
-  destroyMachine(handle: MachineHandle): Promise<void>;
-  listMachines(appName: string): Promise<MachineSummary[]>;
-  tailLogs(handle: MachineHandle): AsyncIterable<LogLine>;
-  sshExec(handle: MachineHandle, cmd: string[]): Promise<SshResult>;
+  validateToken(): Promise<TokenValidation>;
+  provisionMachine(opts: ProvisionOpts): Promise<DeploymentRecord>;
+  destroyMachine(name: string): Promise<void>;
+  listMachines(): Promise<DeploymentRecord[]>;
+  tailLogs(name: string, opts?: { follow?: boolean }): AsyncIterable<LogLine>;
+  sshExec(name: string, command: string): Promise<ExecResult>;
 }
 ```
 
-(`ProvisionResult` includes `flyAppName`, `instanceId`, and the volume id; the control plane persists `flyAppName` + `flyMachineId` on the accounts row.)
+(`DeploymentRecord` carries `name`, `provider`, `region`, `url`, `status`, `createdAt`, and an optional `instanceId` — the control plane persists `flyAppName` (= `name`) and `flyMachineId` (= `instanceId`) on the accounts row.)
 
 Implementations:
 

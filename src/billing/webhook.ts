@@ -102,6 +102,12 @@ export async function handleStripeWebhook(
     // first one already kicked orchestrate. No-op + 200.
     return c.json({ ok: true, idempotent: true, status: account.status });
   }
+  // TODO(cloud#13): status-based idempotency closes the time-separated
+  // retry window but two simultaneous deliveries can both pass this guard
+  // before either commits the status flip → double provision. Phase 3 fix
+  // = event-id dedup table (insert event.id with a UNIQUE constraint up
+  // front; UNIQUE-violation → ack 200). Tracked separately so this PR
+  // doesn't grow further.
 
   const stripeCustomerId = typeof session.customer === "string" ? session.customer : null;
   const stripeSubscriptionId = typeof session.subscription === "string" ? session.subscription : null;
