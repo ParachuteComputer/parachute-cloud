@@ -40,19 +40,65 @@ describe("GET /api/dashboard", () => {
         id: string;
         email: string;
         tier: string;
+        pendingTier: string | null;
         status: string;
         flyAppName: string | null;
         flyMachineId: string | null;
+        lastInvoicePaidAt: string | null;
+        paymentFailedAt: string | null;
+        paymentFailedCount: number;
+        terminatingAt: string | null;
       }>;
     };
     expect(body.accounts).toHaveLength(1);
     expect(body.accounts[0]?.id).toBe("11111111-1111-1111-1111-111111111111");
     expect(body.accounts[0]?.email).toBe("user@example.com");
     expect(body.accounts[0]?.flyAppName).toBe("parachute-11111111");
+    // Defaults for a fresh active row — no payments yet, no pending changes.
+    expect(body.accounts[0]?.pendingTier).toBeNull();
+    expect(body.accounts[0]?.paymentFailedCount).toBe(0);
+    expect(body.accounts[0]?.paymentFailedAt).toBeNull();
+    expect(body.accounts[0]?.terminatingAt).toBeNull();
     // Stripe ids and provisioning secrets aren't in the projection — guard
     // against accidental leakage as the schema grows.
     expect(body.accounts[0]).not.toHaveProperty("stripeCustomerId");
     expect(body.accounts[0]).not.toHaveProperty("stripeSubscriptionId");
+  });
+
+  test("dunning + pending tier surfaces on the row", async () => {
+    const { db } = makeTestDb();
+    await db.insert(accounts).values({
+      id: "22222222-2222-2222-2222-222222222222",
+      email: "dunning@example.com",
+      tier: "starter",
+      pendingTier: "pro",
+      status: "active",
+      flyAppName: "parachute-dunning",
+      flyMachineId: "deadbeefcafe01",
+      paymentFailedAt: "2026-04-28T12:00:00.000Z",
+      paymentFailedCount: 2,
+      lastInvoicePaidAt: "2026-03-28T12:00:00.000Z",
+    });
+
+    const handler = makeApp(TEST_ENV, db);
+    const res = await handler(
+      new Request("http://x/api/dashboard", {
+        headers: { authorization: "Bearer operator_only_shh" },
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      accounts: Array<{
+        pendingTier: string | null;
+        paymentFailedAt: string | null;
+        paymentFailedCount: number;
+        lastInvoicePaidAt: string | null;
+      }>;
+    };
+    expect(body.accounts[0]?.pendingTier).toBe("pro");
+    expect(body.accounts[0]?.paymentFailedAt).toBe("2026-04-28T12:00:00.000Z");
+    expect(body.accounts[0]?.paymentFailedCount).toBe(2);
+    expect(body.accounts[0]?.lastInvoicePaidAt).toBe("2026-03-28T12:00:00.000Z");
   });
 
   test("missing bearer → 401", async () => {

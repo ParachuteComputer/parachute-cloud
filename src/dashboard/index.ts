@@ -30,9 +30,20 @@ export async function handleDashboard(
       id: row.id,
       email: row.email,
       tier: row.tier,
+      // Set when the user changes plan; cleared once 3-(b)'s reconciler
+      // resizes the VM and commits the new tier. UI surfaces this as a
+      // "tier change pending" badge so operators can see the queue.
+      pendingTier: row.pendingTier,
       status: row.status,
       flyAppName: row.flyAppName,
       flyMachineId: row.flyMachineId,
+      // Phase 3-(a) lifecycle metadata. The dashboard renders dunning /
+      // termination banners off these — control plane doesn't act on
+      // them automatically (3-(b) owns the reconciler).
+      lastInvoicePaidAt: row.lastInvoicePaidAt,
+      paymentFailedAt: row.paymentFailedAt,
+      paymentFailedCount: row.paymentFailedCount,
+      terminatingAt: row.terminatingAt,
       createdAt: row.createdAt,
     })),
   });
