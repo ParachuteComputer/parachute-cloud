@@ -40,12 +40,16 @@ import { accounts } from "../db/schema.ts";
 import { FlyClient } from "../provider/fly-client.ts";
 import type { ProviderClient } from "../provider/provider-client.ts";
 import { orchestrateProvision } from "../signup/orchestrate.ts";
-import { makeStripe, makeSubtleCryptoProvider } from "./stripe-client.ts";
+import {
+  makeStripe,
+  makeSubtleCryptoProvider,
+  type StripeCryptoProvider,
+} from "./stripe-client.ts";
 
 export interface WebhookOverrides {
   db?: Db;
   stripe?: Stripe;
-  cryptoProvider?: Stripe.CryptoProvider;
+  cryptoProvider?: StripeCryptoProvider;
   provider?: ProviderClient;
 }
 

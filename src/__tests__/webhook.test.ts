@@ -5,6 +5,7 @@ import Stripe from "stripe";
 import type { Env } from "../env.ts";
 import { accounts, provisioningSecrets } from "../db/schema.ts";
 import { handleStripeWebhook } from "../billing/webhook.ts";
+import type { StripeCryptoProvider } from "../billing/stripe-client.ts";
 import type {
   ProviderClient,
   ProvisionOpts,
@@ -91,7 +92,7 @@ function makeOkRecord(): DeploymentRecord {
 function makeApp(
   env: Partial<Env>,
   db: ReturnType<typeof makeTestDb>["db"],
-  cryptoProvider: Stripe.CryptoProvider,
+  cryptoProvider: StripeCryptoProvider,
   provider?: ProviderClient,
 ) {
   const app = new Hono<{ Bindings: Env }>();
