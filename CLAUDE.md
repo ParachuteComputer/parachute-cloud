@@ -144,9 +144,14 @@ Skeleton stubs land in this Phase 0 PR. Concrete implementations land in Phases 
 - **Phase 3** — Stripe billing + tier enforcement.
 - **Phase 4** — web sign-up surface at `parachute.computer/cloud` (separate repo).
 
-## Bun-native
+## Hybrid runtime
 
-Bun everywhere. No Node.js, no Workers runtime. `Bun.serve` for the control plane HTTP surface; `Bun.spawn` for any provider CLI shell-outs we keep. `bun test` for tests; types via `tsc --noEmit`.
+Two runtimes, deliberately:
+
+- **Cloudflare Worker (control plane)** — the HTTP surface (`src/server.ts` and friends) runs on Workers. Hono for routing, D1 for tenant state, Drizzle for the schema. `wrangler dev` locally, `wrangler deploy` to ship. This is what answers `POST /api/signup`, the Stripe webhook, the `provision-complete` callback from the VM, and the operator dashboard.
+- **Bun on the Fly Machine (per-tenant runtime)** — `src/bootstrap.ts` is the first-boot script that lands inside the deploy image and runs on Bun on the user's VM. It uses `node:fs` / `node:os` and never gets imported by the Worker. Tests for it run in `bun test` on a dev machine.
+
+Don't mix them: Worker code can't import bootstrap, bootstrap can't import Worker handlers. Per-tenant state lives on the Fly volume; control-plane state lives in D1. The control plane never reads user data — only metadata (tenant id, VM handle, plan, lifecycle status).
 
 ## Reference: cloud-shape doc
 

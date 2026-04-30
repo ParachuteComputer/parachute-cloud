@@ -1,21 +1,30 @@
 {
   "name": "@openparachute/cloud",
-  "version": "0.0.2-rc.1",
+  "version": "0.0.3-rc.1",
   "private": true,
   "description": "Open Parachute PBC's managed cloud control plane — provisions Fly Machines per user, runs hub + Tier 1 spokes, bills via Stripe.",
   "license": "AGPL-3.0",
   "type": "module",
   "main": "src/server.ts",
   "scripts": {
-    "dev": "bun run src/server.ts",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate:local": "wrangler d1 migrations apply parachute-cloud-control --local",
+    "db:migrate:remote": "wrangler d1 migrations apply parachute-cloud-control --remote"
   },
   "dependencies": {
+    "drizzle-orm": "^0.36.0",
+    "hono": "^4.6.0",
     "stripe": "^17.0.0"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260101.0",
     "@types/bun": "latest",
-    "typescript": "^5.6.0"
+    "drizzle-kit": "^0.28.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.90.0"
   }
 }
