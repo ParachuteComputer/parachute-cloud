@@ -1,21 +1,30 @@
-// Control-plane HTTP entry point.
-//
-// TODO(phase-2/3): Bun.serve mounting:
-//   POST /signup/webhook    → signup/handler.ts (Stripe → provision)
-//   POST /billing/webhook   → billing/webhook.ts (subscription lifecycle)
-//   GET  /admin/dashboard   → dashboard/index.ts (operator view)
-//
-// Auth: signup/billing webhooks verify Stripe signatures; admin dashboard
-// behind shared-secret bearer for v1 (see dashboard/index.ts).
+/**
+ * Cloudflare Worker entry — Hono-routed control plane.
+ *
+ * Phase 2 surface:
+ *   POST /api/signup                      → signup/handler.ts
+ *   POST /api/internal/provision-complete → signup/provision-complete.ts (VM callback)
+ *   GET  /api/dashboard                   → dashboard/index.ts (operator)
+ *
+ * Phase 3 will add:
+ *   POST /api/billing/webhook             → billing/webhook.ts (Stripe)
+ *
+ * Auth posture per route is documented in each handler — there's no
+ * cross-cutting middleware here. Hono is just routing + JSON helpers.
+ */
 
-import { handleSignupWebhook } from "./signup/handler.ts";
-import { handleStripeWebhook } from "./billing/webhook.ts";
-import { handleDashboardRequest } from "./dashboard/index.ts";
+import { Hono } from "hono";
+import type { Env } from "./env.ts";
+import { handleSignup } from "./signup/handler.ts";
+import { handleProvisionComplete } from "./signup/provision-complete.ts";
+import { handleDashboard } from "./dashboard/index.ts";
 
-export async function fetch(req: Request): Promise<Response> {
-  const url = new URL(req.url);
-  if (url.pathname === "/signup/webhook") return handleSignupWebhook(req);
-  if (url.pathname === "/billing/webhook") return handleStripeWebhook(req);
-  if (url.pathname.startsWith("/admin/")) return handleDashboardRequest(req);
-  return new Response("Not Found", { status: 404 });
-}
+const app = new Hono<{ Bindings: Env }>();
+
+app.post("/api/signup", handleSignup);
+app.post("/api/internal/provision-complete", handleProvisionComplete);
+app.get("/api/dashboard", handleDashboard);
+
+app.get("/", (c) => c.text("parachute-cloud control plane\n"));
+
+export default app;

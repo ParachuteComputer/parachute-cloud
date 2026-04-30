@@ -29,8 +29,12 @@ migrations_dir = "migrations"
 # leaving the [routes] block out keeps `wrangler dev` purely local.
 
 [vars]
-# Non-secret defaults. Secrets (FLY_API_TOKEN, FLY_ORG_SLUG, STRIPE_SECRET_KEY,
-# STRIPE_WEBHOOK_SECRET, PROVISION_CALLBACK_BASE_URL) are set via
-# `wrangler secret put <name>` and never committed.
+# Non-secret defaults. Secrets (FLY_API_TOKEN, FLY_ORG_SLUG,
+# PROVISION_CALLBACK_BASE_URL, ADMIN_BEARER_SECRET, and Phase-3
+# Stripe keys) are set via `wrangler secret put <name>` and never
+# committed. PARACHUTE_DEPLOY_IMAGE is left unset here so deploys
+# pin a real OCI ref via `wrangler deploy --var PARACHUTE_DEPLOY_IMAGE=...`
+# or per-environment overrides — see CLAUDE.md.
 PARACHUTE_DEFAULT_DOMAIN = "parachute.computer"
 PARACHUTE_DEFAULT_REGION = "ord"
+PARACHUTE_DEPLOY_IMAGE = "registry.fly.io/parachute-deploy:latest"

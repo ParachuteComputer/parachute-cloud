@@ -201,6 +201,7 @@ export class FlyClient implements ProviderClient {
         url: `https://${opts.name}.fly.dev`,
         status: mapFlyStatus(machine.state),
         createdAt: machine.created_at || new Date().toISOString(),
+        instanceId: machine.id,
       };
     } catch (err) {
       if (appCreated) {
@@ -322,6 +323,7 @@ export class FlyClient implements ProviderClient {
       url: `https://${app.name}.fly.dev`,
       status: mapFlyStatus(first.state),
       createdAt: first.created_at,
+      instanceId: first.id,
     };
   }
 }
