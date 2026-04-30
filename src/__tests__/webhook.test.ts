@@ -234,19 +234,20 @@ describe("POST /api/billing/webhook", () => {
     expect(res.status).toBe(400);
   });
 
-  test("non-checkout event → 200 ignored (Phase 3 will fill in)", async () => {
+  test("unhandled event type → 200 ignored", async () => {
     const { db } = makeTestDb();
     const handler = makeApp(TEST_ENV, db, Stripe.createSubtleCryptoProvider());
 
+    // `customer.created` is real but we don't act on it.
     const event = {
-      id: "evt_x",
-      type: "customer.subscription.updated",
+      id: "evt_unhandled_1",
+      type: "customer.created",
       api_version: "2025-02-24.acacia",
       created: Math.floor(Date.now() / 1000),
       livemode: false,
       pending_webhooks: 0,
       request: { id: null, idempotency_key: null },
-      data: { object: {} },
+      data: { object: { id: "cus_x", object: "customer" } },
     };
     const payload = JSON.stringify(event);
     const sig = await signStripePayload(payload, WEBHOOK_SECRET, Math.floor(Date.now() / 1000));
@@ -261,7 +262,7 @@ describe("POST /api/billing/webhook", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { ok: boolean; ignored: string };
     expect(body.ok).toBe(true);
-    expect(body.ignored).toBe("customer.subscription.updated");
+    expect(body.ignored).toBe("customer.created");
   });
 
   test("missing client_reference_id → 400 (we can't route the session)", async () => {

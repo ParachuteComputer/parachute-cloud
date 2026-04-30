@@ -1,10 +1,19 @@
 /**
  * POST /api/billing/webhook — Stripe webhook router.
  *
- * Phase 2 surface: only `checkout.session.completed`. Other event types
- * are accepted (200) and ignored — Stripe will mark them delivered, and
- * Phase 3 fills in subscription-lifecycle handlers (renewal, cancellation,
- * dunning) by switching on `event.type`.
+ * Surface (Phase 3-(a)):
+ *   - `checkout.session.completed` — orchestrate the user's first VM.
+ *   - `invoice.paid` — clear dunning state (renewal succeeded).
+ *   - `invoice.payment_failed` — flag dunning; no auto-suspend.
+ *   - `customer.subscription.deleted` — flip status to `terminating`;
+ *     async reaper (Phase 3-(b)) destroys the Fly machine.
+ *   - `customer.subscription.updated` — record `pending_tier` when the
+ *     user changes plan; the reconciler in 3-(b) resizes the VM and
+ *     commits the tier flip.
+ *   - All other event types are accepted (200) and ignored.
+ *
+ * Lifecycle handlers live in ./lifecycle.ts so this file stays a router,
+ * not a switch-statement-shaped god module.
  *
  * Verification: `Stripe-Signature` header is validated against the raw
  * request body using the SDK's `webhooks.constructEventAsync` with the
@@ -52,6 +61,12 @@ import {
   makeSubtleCryptoProvider,
   type StripeCryptoProvider,
 } from "./stripe-client.ts";
+import {
+  handleInvoicePaid,
+  handleInvoicePaymentFailed,
+  handleSubscriptionDeleted,
+  handleSubscriptionUpdated,
+} from "./lifecycle.ts";
 
 export interface WebhookOverrides {
   db?: Db;
@@ -106,10 +121,22 @@ export async function handleStripeWebhook(
     return c.json({ ok: true, deduped: event.id });
   }
 
-  if (event.type !== "checkout.session.completed") {
-    // Acknowledge — Phase 3-(a) routes lifecycle events here in a
-    // follow-up commit on this branch.
-    return c.json({ ok: true, ignored: event.type });
+  // Phase 3-(a) lifecycle events: pure DB mutations dispatched to
+  // ./lifecycle. Tier/Fly enforcement is Phase 3-(b)'s reconciler.
+  switch (event.type) {
+    case "invoice.paid":
+      return c.json(await handleInvoicePaid(db, event));
+    case "invoice.payment_failed":
+      return c.json(await handleInvoicePaymentFailed(db, event));
+    case "customer.subscription.deleted":
+      return c.json(await handleSubscriptionDeleted(db, event));
+    case "customer.subscription.updated":
+      return c.json(await handleSubscriptionUpdated(db, event, c.env));
+    case "checkout.session.completed":
+      // Falls through to the orchestrate-on-checkout path below.
+      break;
+    default:
+      return c.json({ ok: true, ignored: event.type });
   }
 
   const session = event.data.object as Stripe.Checkout.Session;
