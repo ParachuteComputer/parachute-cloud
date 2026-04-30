@@ -10,17 +10,20 @@
 
 import type { Context } from "hono";
 import type { Env } from "../env.ts";
-import { db as makeDb } from "../db/client.ts";
+import { type Db, db as makeDb } from "../db/client.ts";
 import { accounts } from "../db/schema.ts";
 
-export async function handleDashboard(c: Context<{ Bindings: Env }>): Promise<Response> {
+export async function handleDashboard(
+  c: Context<{ Bindings: Env }>,
+  dbOverride?: Db,
+): Promise<Response> {
   const auth = c.req.header("authorization") ?? "";
   const expected = `Bearer ${c.env.ADMIN_BEARER_SECRET}`;
   if (auth.length === 0 || !constantTimeEqual(auth, expected)) {
     return c.json({ error: "unauthorized" }, 401);
   }
 
-  const db = makeDb(c.env.DB);
+  const db = dbOverride ?? makeDb(c.env.DB);
   const rows = await db.select().from(accounts);
   return c.json({
     accounts: rows.map((row) => ({

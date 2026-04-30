@@ -23,6 +23,17 @@
  *                                  Anthropic-backed scribe provider, paraclaw later).
  *                                  Tier 1 (vault/scribe/notes) does not require it
  *                                  — hub#133 dropped the hard requirement.
+ *   - PARACHUTE_PROVISION_CALLBACK_URL — control-plane callback endpoint. When set
+ *                                  *together with* PARACHUTE_PROVISION_SECRET +
+ *                                  PARACHUTE_TENANT_ID, bootstrap POSTs a single-use
+ *                                  completion webhook after the marker is written so
+ *                                  the control plane can flip the tenant row from
+ *                                  `provisioning` → `active`. Failures are logged
+ *                                  but DO NOT fail bootstrap — the marker still
+ *                                  reflects local success; an operator (or a future
+ *                                  drift-reconciler) can replay.
+ *   - PARACHUTE_PROVISION_SECRET — pairs with the URL above. Single-use.
+ *   - PARACHUTE_TENANT_ID        — pairs with the URL above. UUID from accounts.id.
  *
  * Idempotency: the marker at `<configDir>/bootstrap.json` short-circuits a
  * re-run on machine restart. A failed install does NOT write the marker, so
@@ -99,6 +110,12 @@ export interface BootstrapOpts {
   now?: () => Date;
   /** Override the version stamped into the marker. Tests pin it. */
   parachuteVersion?: string;
+  /**
+   * HTTP fetch override for the control-plane callback. Tests inject a stub
+   * that records the request and returns a synthetic Response. Production
+   * uses the global `fetch`.
+   */
+  fetchFn?: typeof fetch;
 }
 
 export interface BootstrapResult {
@@ -209,7 +226,46 @@ export async function bootstrap(opts: BootstrapOpts): Promise<BootstrapResult> {
   };
   writeMarkerAtomic(markerPath, marker);
   log(`bootstrap: ✓ complete — marker written to ${markerPath}`);
+
+  await postProvisionComplete(env, opts.fetchFn ?? fetch, log);
   return { exitCode: 0, marker };
+}
+
+/**
+ * Push completion to the control plane when the env trio is set.
+ *
+ * All three of CALLBACK_URL + SECRET + TENANT_ID must be present; a partial
+ * trio is treated as "not configured" so a stale fragment from manual
+ * tinkering can't accidentally call the wrong endpoint. Failures here are
+ * logged but never propagate — the marker is the source of truth for local
+ * success, and a control-plane drift reconciler can fill the gap later.
+ */
+async function postProvisionComplete(
+  env: NodeJS.ProcessEnv,
+  fetchFn: typeof fetch,
+  log: (line: string) => void,
+): Promise<void> {
+  const url = (env.PARACHUTE_PROVISION_CALLBACK_URL ?? "").trim();
+  const secret = (env.PARACHUTE_PROVISION_SECRET ?? "").trim();
+  const tenantId = (env.PARACHUTE_TENANT_ID ?? "").trim();
+  if (url.length === 0 || secret.length === 0 || tenantId.length === 0) {
+    return;
+  }
+  try {
+    const res = await fetchFn(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tenant_id: tenantId, secret }),
+    });
+    if (res.ok) {
+      log(`bootstrap: ✓ control-plane callback acknowledged (${res.status})`);
+    } else {
+      log(`bootstrap: ⚠ control-plane callback returned ${res.status} — leaving for reconcile.`);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(`bootstrap: ⚠ control-plane callback failed: ${msg} — leaving for reconcile.`);
+  }
 }
 
 /**

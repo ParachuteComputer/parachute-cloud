@@ -190,6 +190,7 @@ describe("FlyClient.provisionMachine — happy path", () => {
       url: "https://parachute-aaron.fly.dev",
       status: "starting",
       createdAt: "2026-04-29T12:00:00Z",
+      instanceId: "m_123",
     });
   });
 

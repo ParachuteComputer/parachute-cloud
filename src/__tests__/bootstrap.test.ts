@@ -334,6 +334,126 @@ describe("bootstrap — CLAUDE_API_TOKEN is optional (hub#133)", () => {
   });
 });
 
+describe("bootstrap — control-plane callback hook", () => {
+  function captureFetch() {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchFn = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: typeof url === "string" ? url : url.toString(), init });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) as unknown as typeof fetch;
+    return { calls, fetchFn };
+  }
+
+  test("env trio set → POST callback with {tenant_id, secret} after marker write", async () => {
+    const h = harness();
+    try {
+      const { calls, fetchFn } = captureFetch();
+      const result = await bootstrap({
+        env: {
+          PARACHUTE_HOME: h.dir,
+          PARACHUTE_PROVISION_CALLBACK_URL: "https://cloud.parachute.computer/api/internal/provision-complete",
+          PARACHUTE_PROVISION_SECRET: "deadbeef",
+          PARACHUTE_TENANT_ID: "tenant-uuid-xxxx",
+        },
+        configDir: h.dir,
+        log: () => {},
+        installFn: async () => 0,
+        now: FROZEN_NOW,
+        fetchFn,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.url).toBe(
+        "https://cloud.parachute.computer/api/internal/provision-complete",
+      );
+      expect(calls[0]?.init?.method).toBe("POST");
+      const body = JSON.parse(String(calls[0]?.init?.body));
+      expect(body).toEqual({ tenant_id: "tenant-uuid-xxxx", secret: "deadbeef" });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("partial env trio (missing tenant_id) → no callback fired", async () => {
+    const h = harness();
+    try {
+      const { calls, fetchFn } = captureFetch();
+      const result = await bootstrap({
+        env: {
+          PARACHUTE_HOME: h.dir,
+          PARACHUTE_PROVISION_CALLBACK_URL: "https://cloud.parachute.computer/cb",
+          PARACHUTE_PROVISION_SECRET: "deadbeef",
+        },
+        configDir: h.dir,
+        log: () => {},
+        installFn: async () => 0,
+        now: FROZEN_NOW,
+        fetchFn,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(calls).toHaveLength(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("callback fetch failure does NOT fail bootstrap — logs warn, marker stands", async () => {
+    const h = harness();
+    try {
+      const logs: string[] = [];
+      const failingFetch = (async () => {
+        throw new Error("ECONNREFUSED");
+      }) as unknown as typeof fetch;
+      const result = await bootstrap({
+        env: {
+          PARACHUTE_HOME: h.dir,
+          PARACHUTE_PROVISION_CALLBACK_URL: "https://cloud.parachute.computer/cb",
+          PARACHUTE_PROVISION_SECRET: "deadbeef",
+          PARACHUTE_TENANT_ID: "tenant-uuid-xxxx",
+        },
+        configDir: h.dir,
+        log: (l) => logs.push(l),
+        installFn: async () => 0,
+        now: FROZEN_NOW,
+        fetchFn: failingFetch,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.marker).toBeDefined();
+      expect(existsSync(join(h.dir, "bootstrap.json"))).toBe(true);
+      expect(logs.find((l) => l.includes("control-plane callback failed"))).toBeDefined();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("callback non-2xx response → logs warn, bootstrap still succeeds", async () => {
+    const h = harness();
+    try {
+      const logs: string[] = [];
+      const fiveHundred = (async () =>
+        new Response("upstream broken", { status: 503 })) as unknown as typeof fetch;
+      const result = await bootstrap({
+        env: {
+          PARACHUTE_HOME: h.dir,
+          PARACHUTE_PROVISION_CALLBACK_URL: "https://cloud.parachute.computer/cb",
+          PARACHUTE_PROVISION_SECRET: "deadbeef",
+          PARACHUTE_TENANT_ID: "tenant-uuid-xxxx",
+        },
+        configDir: h.dir,
+        log: (l) => logs.push(l),
+        installFn: async () => 0,
+        now: FROZEN_NOW,
+        fetchFn: fiveHundred,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.marker).toBeDefined();
+      expect(logs.find((l) => l.includes("returned 503"))).toBeDefined();
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 describe("bootstrap — error paths", () => {
   test("paraclaw in PARACHUTE_MODULES → exit 1 with Tier 2 message, no installs", async () => {
     const h = harness();

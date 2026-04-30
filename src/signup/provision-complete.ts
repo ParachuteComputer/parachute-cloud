@@ -19,7 +19,7 @@
 import type { Context } from "hono";
 import { eq } from "drizzle-orm";
 import type { Env } from "../env.ts";
-import { db as makeDb } from "../db/client.ts";
+import { type Db, db as makeDb } from "../db/client.ts";
 import { accounts, provisioningSecrets } from "../db/schema.ts";
 
 interface ProvisionCompleteBody {
@@ -29,6 +29,7 @@ interface ProvisionCompleteBody {
 
 export async function handleProvisionComplete(
   c: Context<{ Bindings: Env }>,
+  dbOverride?: Db,
 ): Promise<Response> {
   let body: ProvisionCompleteBody;
   try {
@@ -43,7 +44,7 @@ export async function handleProvisionComplete(
     return c.json({ error: "missing_fields" }, 400);
   }
 
-  const db = makeDb(c.env.DB);
+  const db = dbOverride ?? makeDb(c.env.DB);
   const row = await db.query.provisioningSecrets.findFirst({
     where: eq(provisioningSecrets.tenantId, tenantId),
   });

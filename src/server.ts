@@ -21,9 +21,12 @@ import { handleDashboard } from "./dashboard/index.ts";
 
 const app = new Hono<{ Bindings: Env }>();
 
-app.post("/api/signup", handleSignup);
-app.post("/api/internal/provision-complete", handleProvisionComplete);
-app.get("/api/dashboard", handleDashboard);
+// Handlers take an optional db override for tests; the route wrappers
+// strip the second arg Hono would otherwise pass (`next`), which would
+// otherwise narrow the override slot to `Next`.
+app.post("/api/signup", (c) => handleSignup(c));
+app.post("/api/internal/provision-complete", (c) => handleProvisionComplete(c));
+app.get("/api/dashboard", (c) => handleDashboard(c));
 
 app.get("/", (c) => c.text("parachute-cloud control plane\n"));
 
