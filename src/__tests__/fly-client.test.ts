@@ -417,6 +417,40 @@ describe("FlyClient.destroyMachine", () => {
   });
 });
 
+describe("FlyClient.updateMachineSize", () => {
+  test("200 → resolves; POST machine path with guest-only config (medium)", async () => {
+    fake.handler = () => new Response("{}", { status: 200 });
+    await client.updateMachineSize("parachute-aaron", "m_resize_1", "medium");
+    expect(fake.requests).toEqual([
+      {
+        method: "POST",
+        path: "/v1/apps/parachute-aaron/machines/m_resize_1",
+        authorization: "Bearer fly_test_token_xyz",
+        contentType: "application/json",
+        body: { config: { guest: { cpu_kind: "shared", cpus: 1, memory_mb: 2048 } } },
+      },
+    ]);
+  });
+
+  test("small size → 1024 mb", async () => {
+    fake.handler = () => new Response("{}", { status: 200 });
+    await client.updateMachineSize("parachute-aaron", "m_id", "small");
+    expect(fake.requests[0]?.body).toEqual({
+      config: { guest: { cpu_kind: "shared", cpus: 1, memory_mb: 1024 } },
+    });
+  });
+
+  test("4xx → ProviderError surfaces status", async () => {
+    fake.handler = () => new Response("nope", { status: 422 });
+    await expect(
+      client.updateMachineSize("parachute-aaron", "m_id", "medium"),
+    ).rejects.toMatchObject({
+      name: "ProviderError",
+      statusCode: 422,
+    });
+  });
+});
+
 describe("FlyClient.listMachines", () => {
   test("filters apps by parachute- prefix and enriches with machine state", async () => {
     fake.handler = (_req, url) => {

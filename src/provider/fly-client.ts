@@ -214,6 +214,36 @@ export class FlyClient implements ProviderClient {
     }
   }
 
+  /**
+   * Resize a Parachute machine in-place. Fly's machine-update endpoint
+   * (`POST /v1/apps/{app}/machines/{id}`) merges the supplied config onto
+   * the live machine; we send only the `guest` block so the rest of the
+   * machine config (image, env, mounts, services, checks) stays untouched.
+   *
+   * Fly accepts the update synchronously and reschedules the machine in
+   * the background. The reconciler treats a 200 as "size committed" and
+   * flips `tier = pendingTier`; if Fly later fails to land the new guest,
+   * the machine self-heals or surfaces as unhealthy — out of scope here.
+   */
+  async updateMachineSize(name: string, instanceId: string, size: DeploymentSize): Promise<void> {
+    const res = await this.request(
+      `/${API_VERSION}/apps/${encodeURIComponent(name)}/machines/${encodeURIComponent(instanceId)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          config: { guest: sizeToFlyGuest(size) },
+        }),
+      },
+    );
+    if (!res.ok) {
+      throw new ProviderError(
+        `Fly machine resize failed (${res.status}): ${await this.safeText(res)}`,
+        "fly",
+        res.status,
+      );
+    }
+  }
+
   async destroyMachine(name: string): Promise<void> {
     const res = await this.request(`/${API_VERSION}/apps/${encodeURIComponent(name)}?force=true`, {
       method: "DELETE",

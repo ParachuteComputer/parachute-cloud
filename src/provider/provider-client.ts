@@ -85,6 +85,19 @@ export interface ProviderClient {
   /** Create app + volume + machine. Returns a record once provisioning starts. */
   provisionMachine(opts: ProvisionOpts): Promise<DeploymentRecord>;
 
+  /**
+   * Resize an existing machine in-place to the given size. The 3-(b)
+   * tier-change reconciler calls this to commit `pendingTier` transitions.
+   * Idempotent — if the machine is already at the requested size, providers
+   * may no-op or perform a redundant update; both are valid.
+   *
+   * The `instanceId` is the provider-specific machine identifier (Fly:
+   * machine id; Render: deploy id), persisted on the tenant row at provision
+   * time. We pass both `name` and `instanceId` so providers that key updates
+   * by either don't have to do an extra lookup.
+   */
+  updateMachineSize(name: string, instanceId: string, size: DeploymentSize): Promise<void>;
+
   /** Destroy app + volume + machine. Idempotent — already-gone is a success. */
   destroyMachine(name: string): Promise<void>;
 

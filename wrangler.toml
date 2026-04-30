@@ -28,6 +28,15 @@ migrations_dir = "migrations"
 # Public-facing routes are wired post-deploy with `wrangler deploy --routes`;
 # leaving the [routes] block out keeps `wrangler dev` purely local.
 
+# Cron trigger drives the Phase 3-(b) reconciler. Every 15 min the
+# `scheduled` handler in src/server.ts runs `reconcileAll` against the
+# bound D1 + a fresh FlyClient — same code path admin endpoints expose
+# for manual kick. 15 min is a balance between "tier change feels
+# eventually-consistent" and "Fly API isn't pounded by retries on a
+# stuck row" (TIER_CHANGE_MAX_RETRIES = 5 → ~75 min retry headroom).
+[triggers]
+crons = ["*/15 * * * *"]
+
 [vars]
 # Non-secret defaults. Secrets — set via `wrangler secret put <name>`,
 # never committed:

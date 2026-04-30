@@ -35,9 +35,13 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
  * Lifecycle states for a tenant's VM. Transitions:
  *   pending_provision → provisioning → active
  *                                   ↘ failed (terminal until manual retry)
- *   active → terminating → deleted             (subscription cancelled;
- *                                                async reaper destroys VM)
- *   active → suspended → active                (reserved; not used in 3-a —
+ *   active → terminating → terminated → (deleted | reactivated)
+ *     - terminating set by `customer.subscription.deleted` webhook
+ *     - reconciler waits TERMINATION_GRACE_PERIOD_MS, then destroys VM
+ *       and flips status → terminated; row retained TERMINATED_RETENTION_MS
+ *       so a re-subscribe can re-provision
+ *     - GC pass deletes terminated rows past retention
+ *   active → suspended → active                (reserved; not used in 3 —
  *                                                payment_failed only flags,
  *                                                doesn't suspend)
  */
@@ -47,6 +51,7 @@ export type AccountStatus =
   | "active"
   | "failed"
   | "terminating"
+  | "terminated"
   | "suspended"
   | "deleted";
 
@@ -89,10 +94,31 @@ export const accounts = sqliteTable("accounts", {
   paymentFailedCount: integer("payment_failed_count").notNull().default(0),
   /**
    * ISO 8601 timestamp set when `customer.subscription.deleted` fires.
-   * Status flips to `terminating`; an async reaper (Phase 3-(b)) destroys
-   * the Fly machine and flips `deleted`.
+   * Phase 3-(b)'s reconciler waits TERMINATION_GRACE_PERIOD past this
+   * before destroying the Fly machine and flipping status → `terminated`.
    */
   terminatingAt: text("terminating_at"),
+  /**
+   * ISO 8601 timestamp set when Phase 3-(b)'s reconciler successfully
+   * destroys the Fly machine. Row is retained TERMINATED_RETENTION_MS
+   * past this so a re-subscribe in that window can re-provision.
+   */
+  terminatedAt: text("terminated_at"),
+  /**
+   * Count of consecutive failed reconcile attempts on a `pendingTier`
+   * change. Reset to 0 on success. Caps at TIER_CHANGE_MAX_RETRIES; once
+   * the cap is hit, `tierChangeBlockedError` is set and the reconciler
+   * stops retrying until an operator clears the field. Surfaces on the
+   * dashboard as `tier_change_blocked` so the row is visible.
+   */
+  tierChangeRetries: integer("tier_change_retries").notNull().default(0),
+  /**
+   * Last error message from a failed tier-change reconcile attempt, or
+   * null when the row is healthy / has never failed. Cleared on success.
+   * Bounded length (sliced upstream) so a chatty provider error can't
+   * blow up D1 row size — see reconcileTierChanges.
+   */
+  tierChangeBlockedError: text("tier_change_blocked_error"),
   /** ISO 8601 timestamp of row creation. */
   createdAt: text("created_at")
     .notNull()
