@@ -52,12 +52,14 @@ async function signStripePayload(payload: string, secret: string, timestamp: num
 
 class StubProvider implements ProviderClient {
   public lastOpts?: ProvisionOpts;
+  public provisionCalls = 0;
   constructor(private readonly result: DeploymentRecord | Error = makeOkRecord()) {}
   validateToken(): Promise<TokenValidation> {
     return Promise.resolve({ valid: true, orgSlug: "stub" });
   }
   async provisionMachine(opts: ProvisionOpts): Promise<DeploymentRecord> {
     this.lastOpts = opts;
+    this.provisionCalls += 1;
     if (this.result instanceof Error) throw this.result;
     return this.result;
   }
@@ -375,5 +377,41 @@ describe("POST /api/billing/webhook", () => {
     // Stripe ids should still be persisted before the orchestrate attempt.
     expect(row?.stripeCustomerId).toBe("cus_test_1");
     expect(row?.stripeSubscriptionId).toBe("sub_test_1");
+  });
+
+  test("event-id dedup: replay of same event.id → 200 deduped, orchestrate runs once (cloud#13)", async () => {
+    const { db } = makeTestDb();
+    const tenantId = "cccccccc-dddd-eeee-ffff-000000000000";
+    await seedPendingAccount(db, tenantId);
+    const provider = new StubProvider();
+    const handler = makeApp(TEST_ENV, db, Stripe.createSubtleCryptoProvider(), provider);
+
+    // Same payload (so event.id is the constant `evt_test_1`) sent twice.
+    const payload = makeCheckoutCompletedPayload({ tenantId });
+    const sig1 = await signStripePayload(payload, WEBHOOK_SECRET, Math.floor(Date.now() / 1000));
+    const res1 = await handler(
+      new Request("http://x/api/billing/webhook", {
+        method: "POST",
+        body: payload,
+        headers: { "stripe-signature": sig1, "content-type": "application/json" },
+      }),
+    );
+    expect(res1.status).toBe(200);
+    expect(provider.provisionCalls).toBe(1);
+
+    // Replay — same event id, fresh signature timestamp.
+    const sig2 = await signStripePayload(payload, WEBHOOK_SECRET, Math.floor(Date.now() / 1000));
+    const res2 = await handler(
+      new Request("http://x/api/billing/webhook", {
+        method: "POST",
+        body: payload,
+        headers: { "stripe-signature": sig2, "content-type": "application/json" },
+      }),
+    );
+    expect(res2.status).toBe(200);
+    const body2 = (await res2.json()) as { ok: boolean; deduped?: string };
+    expect(body2.ok).toBe(true);
+    expect(body2.deduped).toBe("evt_test_1");
+    expect(provider.provisionCalls).toBe(1);
   });
 });

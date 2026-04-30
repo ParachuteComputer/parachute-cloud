@@ -13,11 +13,18 @@
  * the right behavior since a 4xx that loses the event is much worse
  * than a duplicate.
  *
- * Idempotency: orchestration is keyed on `tenantId`. The accounts row
- * lives in D1; a duplicate `checkout.session.completed` for the same
- * tenant short-circuits when the row's status is already past
- * `pending_provision` (provisioning / active). That covers Stripe's
- * "at-least-once" delivery without us tracking event ids separately.
+ * Idempotency: two layers, intentionally redundant.
+ *   1. Event-id dedup (cloud#13). Right after signature verification we
+ *      `INSERT OR IGNORE` into `processed_stripe_events` keyed on
+ *      `event.id`. If the row didn't insert (rowsAffected === 0), a
+ *      concurrent delivery already won the race or we already processed
+ *      this event id in a prior delivery — either way, ack 200 and exit.
+ *      This is the load-bearing guard against Stripe's at-least-once
+ *      delivery causing double work.
+ *   2. Status-based short-circuit (defense in depth). For
+ *      `checkout.session.completed`, if the accounts row is already past
+ *      `pending_provision`, no-op. Catches anomalies like hand-replayed
+ *      events that bypass the dedup table.
  *
  * On `checkout.session.completed`:
  *   1. Pull `client_reference_id` (tenantId), `customer`, `subscription`.
@@ -36,7 +43,7 @@ import { eq } from "drizzle-orm";
 import type { Env } from "../env.ts";
 import type { Db } from "../db/client.ts";
 import { db as makeDb } from "../db/client.ts";
-import { accounts } from "../db/schema.ts";
+import { accounts, processedStripeEvents } from "../db/schema.ts";
 import { FlyClient } from "../provider/fly-client.ts";
 import type { ProviderClient } from "../provider/provider-client.ts";
 import { orchestrateProvision } from "../signup/orchestrate.ts";
@@ -84,8 +91,24 @@ export async function handleStripeWebhook(
     );
   }
 
+  const db = overrides?.db ?? makeDb(c.env.DB);
+
+  // cloud#13: event-id dedup. INSERT OR IGNORE on event.id; if it didn't
+  // insert, a concurrent delivery already won the race (or we already
+  // processed this event id) — ack 200 and exit. Must run before any state
+  // mutation so concurrent deliveries can't both pass downstream guards.
+  const dedup = await db
+    .insert(processedStripeEvents)
+    .values({ eventId: event.id })
+    .onConflictDoNothing()
+    .returning({ eventId: processedStripeEvents.eventId });
+  if (dedup.length === 0) {
+    return c.json({ ok: true, deduped: event.id });
+  }
+
   if (event.type !== "checkout.session.completed") {
-    // Acknowledge — Phase 3 will route additional event types here.
+    // Acknowledge — Phase 3-(a) routes lifecycle events here in a
+    // follow-up commit on this branch.
     return c.json({ ok: true, ignored: event.type });
   }
 
@@ -95,23 +118,16 @@ export async function handleStripeWebhook(
     return c.json({ error: "missing_tenant_id" }, 400);
   }
 
-  const db = overrides?.db ?? makeDb(c.env.DB);
   const account = await db.query.accounts.findFirst({ where: eq(accounts.id, tenantId) });
   if (!account) {
     // Row was rolled back or never inserted; let Stripe stop retrying.
     return c.json({ ok: true, error: "unknown_tenant" });
   }
   if (account.status !== "pending_provision") {
-    // Idempotent short-circuit: a retried webhook re-arrives after the
-    // first one already kicked orchestrate. No-op + 200.
+    // Defense in depth — dedup above is the primary guard; this catches
+    // hand-replayed events that bypass the dedup table.
     return c.json({ ok: true, idempotent: true, status: account.status });
   }
-  // TODO(cloud#13): status-based idempotency closes the time-separated
-  // retry window but two simultaneous deliveries can both pass this guard
-  // before either commits the status flip → double provision. Phase 3 fix
-  // = event-id dedup table (insert event.id with a UNIQUE constraint up
-  // front; UNIQUE-violation → ack 200). Tracked separately so this PR
-  // doesn't grow further.
 
   const stripeCustomerId = typeof session.customer === "string" ? session.customer : null;
   const stripeSubscriptionId = typeof session.subscription === "string" ? session.subscription : null;
