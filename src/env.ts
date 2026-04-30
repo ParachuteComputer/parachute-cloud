@@ -22,14 +22,26 @@ export interface Env {
   PARACHUTE_DEFAULT_REGION: string;
   /** OCI image reference for the Parachute deploy image (set per environment). */
   PARACHUTE_DEPLOY_IMAGE: string;
+  /** Where Stripe redirects on successful checkout. May contain `{CHECKOUT_SESSION_ID}`. */
+  STRIPE_CHECKOUT_SUCCESS_URL: string;
+  /** Where Stripe redirects on cancelled checkout. */
+  STRIPE_CHECKOUT_CANCEL_URL: string;
 
   // ─── secrets (wrangler secret put <name>) ─────────────────────────────
-  /** Fly personal access token. Required at signup time. */
+  /** Fly personal access token. Required at provision time. */
   FLY_API_TOKEN: string;
-  /** Fly org slug. Required at signup time. */
+  /** Fly org slug. Required at provision time. */
   FLY_ORG_SLUG: string;
   /** Public-origin base URL the VM uses to call back to /api/internal/*. */
   PROVISION_CALLBACK_BASE_URL: string;
   /** Bearer secret for the operator dashboard. v1-only; rotate by re-setting. */
   ADMIN_BEARER_SECRET: string;
+  /** Stripe secret key (`sk_live_...` / `sk_test_...`). Used by the SDK. */
+  STRIPE_SECRET_KEY: string;
+  /** Stripe webhook signing secret (`whsec_...`). Verified per request. */
+  STRIPE_WEBHOOK_SECRET: string;
+  /** Stripe Price id for the Starter tier subscription. */
+  STRIPE_PRICE_TIER_STARTER: string;
+  /** Stripe Price id for the Pro tier subscription. */
+  STRIPE_PRICE_TIER_PRO: string;
 }

@@ -1,32 +1,51 @@
 /**
- * POST /api/signup — direct provisioning entry point for Phase 2.
+ * POST /api/signup — checkout-mint entry point.
  *
- * Phase 3 will wrap this with a Stripe Checkout layer; for now the body
- * carries the email + tier, the row is inserted, and orchestration kicks
- * synchronously so callers know whether provisioning at least *started*.
+ * Phase 2-(a) flow:
+ *   1. Validate email + tier; insert account row as `pending_provision`.
+ *   2. Mint a Stripe Checkout session whose `client_reference_id` is the
+ *      tenantId; return the hosted-checkout URL to the caller.
+ *   3. The user pays. Stripe sends `checkout.session.completed` to
+ *      /api/billing/webhook → that's where orchestrate is triggered, not
+ *      here. Signup itself never touches Fly.
  *
- * Body shape: `{ "email": "...", "tier": "starter" | "pro" }`. Tier is
- * optional and defaults to "starter".
+ * Body shape: `{ "email": "...", "tier"?: "starter" | "pro" }`.
+ *   - tier defaults to "starter".
  *
- * Response: 201 with `{ tenantId, flyAppName }` on success; 4xx with a
- * single-line `error` field on validation problems; 5xx with `error`
- * when the provider call fails (the row stays as `failed` for retry).
+ * Response: 201 with `{ tenantId, checkoutUrl }` on success; 4xx with a
+ * single-line `error` field on validation problems; 502 with `error` if
+ * Stripe is unreachable. The accounts row stays as `pending_provision`
+ * even on a 502 — operators can retry by re-issuing checkout against
+ * the same tenantId without recreating the row.
  */
 
 import type { Context } from "hono";
-import { FlyClient } from "../provider/fly-client.ts";
 import type { Env } from "../env.ts";
 import type { Db } from "../db/client.ts";
 import { db as makeDb } from "../db/client.ts";
 import { accounts } from "../db/schema.ts";
-import { orchestrateProvision } from "./orchestrate.ts";
+import { createCheckoutSession } from "../billing/checkout.ts";
+import { makeStripe } from "../billing/stripe-client.ts";
+import type Stripe from "stripe";
 
 interface SignupBody {
   email?: unknown;
   tier?: unknown;
 }
 
-export async function handleSignup(c: Context<{ Bindings: Env }>): Promise<Response> {
+/**
+ * Optional override seam — tests pass a stub `Db` and a stub Stripe so
+ * they exercise the handler without hitting D1 or the live API.
+ */
+export interface SignupOverrides {
+  db?: Db;
+  stripe?: Stripe;
+}
+
+export async function handleSignup(
+  c: Context<{ Bindings: Env }>,
+  overrides?: SignupOverrides,
+): Promise<Response> {
   let body: SignupBody;
   try {
     body = (await c.req.json()) as SignupBody;
@@ -41,7 +60,7 @@ export async function handleSignup(c: Context<{ Bindings: Env }>): Promise<Respo
   const tier = body.tier === "pro" ? "pro" : "starter";
 
   const tenantId = crypto.randomUUID();
-  const db = makeDb(c.env.DB);
+  const db = overrides?.db ?? makeDb(c.env.DB);
 
   await db.insert(accounts).values({
     id: tenantId,
@@ -51,24 +70,23 @@ export async function handleSignup(c: Context<{ Bindings: Env }>): Promise<Respo
   });
 
   try {
-    const provider = new FlyClient({
-      token: c.env.FLY_API_TOKEN,
-      orgSlug: c.env.FLY_ORG_SLUG,
-    });
-    const { flyAppName } = await orchestrateProvision({
-      db,
-      provider,
+    const stripe = overrides?.stripe ?? makeStripe(c.env.STRIPE_SECRET_KEY);
+    const { url, sessionId } = await createCheckoutSession({
+      stripe,
       tenantId,
-      region: c.env.PARACHUTE_DEFAULT_REGION,
-      image: c.env.PARACHUTE_DEPLOY_IMAGE,
-      callbackBaseUrl: c.env.PROVISION_CALLBACK_BASE_URL,
+      email,
+      tier,
+      priceTierStarter: c.env.STRIPE_PRICE_TIER_STARTER,
+      priceTierPro: c.env.STRIPE_PRICE_TIER_PRO,
+      successUrl: c.env.STRIPE_CHECKOUT_SUCCESS_URL,
+      cancelUrl: c.env.STRIPE_CHECKOUT_CANCEL_URL,
     });
-    return c.json({ tenantId, flyAppName }, 201);
+    return c.json({ tenantId, checkoutUrl: url, checkoutSessionId: sessionId }, 201);
   } catch (err) {
     return c.json(
       {
         tenantId,
-        error: "provision_failed",
+        error: "checkout_failed",
         detail: err instanceof Error ? err.message : String(err),
       },
       502,
@@ -76,8 +94,5 @@ export async function handleSignup(c: Context<{ Bindings: Env }>): Promise<Respo
   }
 }
 
-/**
- * Re-exported so tests can drive the orchestrator directly without the
- * Hono envelope. Production callers go through `handleSignup`.
- */
+/** Re-exported for tests that drive the orchestrator directly. */
 export type SignupDb = Db;
