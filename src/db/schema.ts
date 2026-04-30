@@ -14,9 +14,10 @@
  * tenants) the time-ordered scan ULID buys us is irrelevant; UUIDv4 keeps
  * the schema dialect-portable if we ever swap providers.
  *
- * Stripe-billing wiring (price IDs, subscription state, invoice history)
- * lands in Phase 3 — the `stripe_customer_id` column is the only forward
- * hook this Phase 2 schema cuts.
+ * Stripe checkout + completion webhook are in Phase 2 scope; the
+ * `stripe_customer_id` and `stripe_subscription_id` columns are populated
+ * when `checkout.session.completed` fires. Subscription-lifecycle
+ * webhooks (renewal, cancellation, dunning) are Phase 3.
  */
 
 import { sql } from "drizzle-orm";
@@ -42,8 +43,10 @@ export const accounts = sqliteTable("accounts", {
   id: text("id").primaryKey(),
   /** Customer email — sourced from Stripe Checkout. */
   email: text("email").notNull(),
-  /** Stripe customer id — set when checkout completes (Phase 2 → Phase 3 hook). */
+  /** Stripe customer id — set when `checkout.session.completed` fires. */
   stripeCustomerId: text("stripe_customer_id"),
+  /** Stripe subscription id from the same checkout session. */
+  stripeSubscriptionId: text("stripe_subscription_id"),
   /** Fly app name (`parachute-<slug>`). Set when provisioning starts. */
   flyAppName: text("fly_app_name"),
   /** Fly machine id within the app. Set when provisioning starts. */
