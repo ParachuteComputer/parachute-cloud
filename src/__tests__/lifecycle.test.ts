@@ -117,6 +117,27 @@ describe("invoice.payment_failed", () => {
     // Status doesn't change — no auto-suspend in 3-(a).
     expect(row?.status).toBe("active");
   });
+
+  test("unknown customer → no-op + tagged", async () => {
+    const { db } = makeTestDb();
+    const evt = {
+      ...invoiceEvent("cus_does_not_exist"),
+      type: "invoice.payment_failed",
+    } as Stripe.Event;
+
+    const result = await handleInvoicePaymentFailed(db, evt);
+    expect(result.action).toBe("payment_failed_unknown_tenant");
+    expect(result.tenantId).toBeNull();
+  });
+
+  test("missing customer field → no-op", async () => {
+    const { db } = makeTestDb();
+    const evt = { ...invoiceEvent(null), type: "invoice.payment_failed" } as Stripe.Event;
+
+    const result = await handleInvoicePaymentFailed(db, evt);
+    expect(result.action).toBe("payment_failed_no_customer");
+    expect(result.tenantId).toBeNull();
+  });
 });
 
 describe("customer.subscription.deleted", () => {
