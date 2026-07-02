@@ -43,13 +43,21 @@ const RESERVED_SUBDOMAINS = new Set(["id", "www", "api", "app", "admin", "notes"
  * Resolve the vault name + the path relative to the vault root.
  *   - `/vault/<name>/...`            → name from path (works on any host).
  *   - `<name>.<domain>` + bare path  → name from subdomain, whole path is rel.
+ *
+ * The name is LOWERCASED to the canonical form: vault names are created
+ * lowercase (identity `vaults.ts`) and tokens are minted with a lowercase
+ * `aud=vault.<name>`, so `/vault/MyVault/…` must resolve to the SAME DO as
+ * `/vault/myvault/…` — otherwise a mixed-case URL silently lands on a new empty
+ * DO (owner self-lockout) whose token would also fail the aud check. Exported
+ * for the router unit test.
  */
-function resolveVault(url: URL, env: Env): { name: string; rel: string } | null {
+export function resolveVault(url: URL, env: { VAULT_BASE_DOMAIN?: string }): { name: string; rel: string } | null {
   const pathMatch = /^\/vault\/([^/]+)(\/.*|)$/.exec(url.pathname);
-  if (pathMatch) return { name: decodeURIComponent(pathMatch[1]!), rel: pathMatch[2] || "" };
+  if (pathMatch) return { name: decodeURIComponent(pathMatch[1]!).toLowerCase(), rel: pathMatch[2] || "" };
 
-  const host = url.hostname;
-  const base = env.VAULT_BASE_DOMAIN;
+  // Hostnames are already lowercased by URL parsing; fold again defensively.
+  const host = url.hostname.toLowerCase();
+  const base = env.VAULT_BASE_DOMAIN?.toLowerCase();
   if (base && host.endsWith(`.${base}`)) {
     const sub = host.slice(0, host.length - base.length - 1);
     if (sub && !sub.includes(".") && !RESERVED_SUBDOMAINS.has(sub)) {

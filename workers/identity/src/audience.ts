@@ -66,7 +66,10 @@ function decodeVaultName(segment: string): string | null {
   } catch {
     return null;
   }
-  return VAULT_NAME_RE.test(decoded) ? decoded : null;
+  // Canonicalize to lowercase: vault names are stored lowercase, so a resource
+  // like `…/vault/MyVault/mcp` must narrow to `vault:myvault:*` (matching the DO
+  // the router resolves) rather than mint an aud the vault can't accept.
+  return VAULT_NAME_RE.test(decoded) ? decoded.toLowerCase() : null;
 }
 
 export interface ResolveResourceOpts {

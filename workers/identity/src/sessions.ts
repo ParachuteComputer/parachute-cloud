@@ -41,6 +41,16 @@ export async function findActiveSession(db: D1Database, id: string, now: Date = 
   return { id: row.id, userId: row.user_id, createdAt: row.created_at, expiresAt: row.expires_at };
 }
 
+/** Delete a session row (logout). Idempotent. */
+export async function deleteSession(db: D1Database, id: string): Promise<void> {
+  await db.prepare("DELETE FROM sessions WHERE id = ?").bind(id).run();
+}
+
+/** A cookie value that clears the session cookie (logout). */
+export function clearSessionCookie(): string {
+  return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
+}
+
 /** Parse the session id out of a Cookie header. */
 export function parseSessionCookie(cookieHeader: string | null): string | null {
   if (!cookieHeader) return null;

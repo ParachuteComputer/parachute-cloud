@@ -22,8 +22,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity.unforced.workers.dev").replace(/\/$/, "");
-const VAULT = (process.env.VAULT ?? "https://parachute-vault-do.unforced.workers.dev").replace(/\/$/, "");
+const IDENTITY = (process.env.IDENTITY ?? "https://cloud.parachute.computer").replace(/\/$/, "");
+const VAULT = (process.env.VAULT ?? "https://u.parachute.computer").replace(/\/$/, "");
 const VAULT_NAME = process.env.VAULT_NAME ?? "demo";
 const REDIRECT_URI = "http://localhost:8976/callback";
 const MARKER = `smoke-${Date.now()}`;
@@ -265,10 +265,136 @@ async function main() {
     assert(hasMarker, "export tarball contains the smoke notes", names.filter((n) => n.endsWith(".md")).slice(0, 3).join(", "));
   }
 
+  // 9. Console: fresh user signs up → creates a vault → mints a token via the
+  //    real authorize flow → writes a note in THEIR vault. Then the DEV user is
+  //    REFUSED a token for that vault (ownership enforcement).
+  {
+    const newEmail = `smoke+${Date.now()}@example.com`;
+    const newPassword = b64url(crypto.getRandomValues(new Uint8Array(18)));
+    const newVault = `box-${Date.now()}`;
+
+    // Signup (GET for CSRF, then POST).
+    const suGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
+    const suCsrf = cookieVal(suGet.headers.getSetCookie(), "parachute_id_csrf");
+    const suRes = await fetch(`${IDENTITY}/signup`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${suCsrf}` },
+      redirect: "manual",
+      body: form({ __csrf: suCsrf!, email: newEmail, password: newPassword }),
+    });
+    const newSession = cookieVal(suRes.headers.getSetCookie(), "parachute_id_session");
+    assert(suRes.status === 302 && suRes.headers.get("location") === "/console" && !!newSession, "signup → session + /console", `status ${suRes.status}`);
+
+    // Create a vault (GET /console for CSRF, then POST).
+    const conGet = await fetch(`${IDENTITY}/console`, { headers: { cookie: `parachute_id_session=${newSession}` }, redirect: "manual" });
+    const conCsrf = cookieVal(conGet.headers.getSetCookie(), "parachute_id_csrf") ?? suCsrf;
+    const cvRes = await fetch(`${IDENTITY}/console/vaults`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${newSession}; parachute_id_csrf=${conCsrf}` },
+      redirect: "manual",
+      body: form({ __csrf: conCsrf!, name: newVault }),
+    });
+    assert(cvRes.status === 302 && (cvRes.headers.get("location") ?? "").includes(`created=${newVault}`), "console create vault → claimed", `status ${cvRes.status}`);
+
+    // The console page shows the connect card with the reachable URL shape.
+    const conPage = await fetch(`${IDENTITY}/console`, { headers: { cookie: `parachute_id_session=${newSession}` } });
+    const conHtml = await conPage.text();
+    assert(conHtml.includes(newVault) && conHtml.includes(`parachute-${newVault}`), "console shows the vault + connect card", "");
+
+    // New user mints a token for THEIR vault via the real authorize flow.
+    const owner = await authorizeFor(newEmail, newPassword, newVault);
+    assert(!!owner.token, "new user mints a token for their own vault", owner.error ? `error=${owner.error}` : "ok");
+
+    if (owner.token) {
+      const OWN_AUTH = { authorization: `Bearer ${owner.token}` };
+      const w = await fetch(`${VAULT}/vault/${newVault}/api/notes`, {
+        method: "POST",
+        headers: { ...OWN_AUTH, "content-type": "application/json" },
+        body: JSON.stringify({ content: `owner note ${MARKER} in ${newVault}`, tags: ["smoke"] }),
+      });
+      const wj = (await w.json()) as { id?: string };
+      assert(w.status === 201 && !!wj.id, "new user writes a note in their vault", `status ${w.status}`);
+    }
+
+    // The DEV user is REFUSED a token for the new user's vault.
+    const intruder = await authorizeFor(email, password, newVault);
+    assert(!intruder.token && intruder.error === "invalid_scope", "dev user CANNOT mint for another user's vault", intruder.error ? `error=${intruder.error}` : "unexpectedly minted");
+
+    // Login brute-force fence: hammering a throwaway email is locked out. The
+    // per-(ip,email) key means this never touches the dev or new-user accounts.
+    const victim = `throttle+${Date.now()}@example.com`;
+    const oneLogin = async (): Promise<string> => {
+      const g = await fetch(`${IDENTITY}/login`, { redirect: "manual" });
+      const c = cookieVal(g.headers.getSetCookie(), "parachute_id_csrf");
+      const r = await fetch(`${IDENTITY}/login`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${c}` },
+        redirect: "manual",
+        body: form({ __csrf: c!, email: victim, password: "definitely-wrong" }),
+      });
+      return r.text();
+    };
+    let lastLogin = "";
+    for (let i = 0; i < 6; i++) lastLogin = await oneLogin();
+    assert(/too many attempts/i.test(lastLogin), "login throttle locks a hammered account", "");
+  }
+
   // --- summary ---
   console.log(`\n${"=".repeat(60)}\nSMOKE ${failures === 0 ? "PASSED" : "FAILED"} — ${results.filter((r) => r.includes("PASS")).length} pass, ${failures} fail\n${"=".repeat(60)}`);
   console.log(results.join("\n"));
   process.exit(failures === 0 ? 0 : 1);
+}
+
+/**
+ * Run the full DCR → login → consent → token dance for `email`/`password`
+ * against `vaultName`, returning the access token or the OAuth error. Ownership
+ * refusal surfaces as a 302 error redirect at the post-login authorize step.
+ */
+async function authorizeFor(email: string, password: string, vaultName: string): Promise<{ token?: string; error?: string }> {
+  const scope = `vault:${vaultName}:read vault:${vaultName}:write`;
+  const reg = await (
+    await fetch(`${IDENTITY}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris: [REDIRECT_URI], client_name: "smoke-console", scope }),
+    })
+  ).json();
+  const clientId: string = reg.client_id;
+  const { verifier, challenge } = await pkce();
+  const shared = { client_id: clientId, redirect_uri: REDIRECT_URI, response_type: "code", scope, code_challenge: challenge, code_challenge_method: "S256" };
+  const authQ = form(shared);
+  const loginPage = await fetch(`${IDENTITY}/oauth/authorize?${authQ}`, { redirect: "manual" });
+  const csrf = cookieVal(loginPage.headers.getSetCookie(), "parachute_id_csrf");
+  const loginRes = await fetch(`${IDENTITY}/oauth/authorize`, {
+    method: "POST",
+    headers: { ...FORM, cookie: `parachute_id_csrf=${csrf}`, origin: IDENTITY },
+    redirect: "manual",
+    body: form({ __action: "login", __csrf: csrf!, email, password, ...shared }),
+  });
+  if (loginRes.status === 302) {
+    try { return { error: new URL(loginRes.headers.get("location") ?? "").searchParams.get("error") ?? "redirect" }; }
+    catch { return { error: "redirect" }; }
+  }
+  if (loginRes.status !== 200) return { error: `login status ${loginRes.status}` };
+  const session = cookieVal(loginRes.headers.getSetCookie(), "parachute_id_session");
+  const consentRes = await fetch(`${IDENTITY}/oauth/authorize`, {
+    method: "POST",
+    headers: { ...FORM, cookie: `parachute_id_session=${session}; parachute_id_csrf=${csrf}`, origin: IDENTITY },
+    redirect: "manual",
+    body: form({ __action: "consent", __csrf: csrf!, decision: "approve", ...shared }),
+  });
+  if (consentRes.status !== 302) return { error: `consent status ${consentRes.status}` };
+  const u = new URL(consentRes.headers.get("location") ?? "");
+  const code = u.searchParams.get("code");
+  if (!code) return { error: u.searchParams.get("error") ?? "no-code" };
+  const tokenRes = await fetch(`${IDENTITY}/oauth/token`, {
+    method: "POST",
+    headers: FORM,
+    body: form({ grant_type: "authorization_code", code, client_id: clientId, redirect_uri: REDIRECT_URI, code_verifier: verifier }),
+  });
+  if (tokenRes.status !== 200) return { error: `token status ${tokenRes.status}` };
+  const tok = (await tokenRes.json()) as { access_token: string };
+  return { token: tok.access_token };
 }
 
 // Minimal POSIX ustar reader (mirror of export.ts toTar): 512-byte blocks.

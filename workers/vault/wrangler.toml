@@ -17,6 +17,21 @@ main = "src/index.ts"
 compatibility_date = "2025-07-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Keep the workers.dev URL live alongside the custom domain (a fallback; path
+# routing works on any host). Declaring a route otherwise disables workers.dev.
+workers_dev = true
+
+# Branded vault host: u.parachute.computer serves the vault worker via PATH
+# routing (/vault/<name>/*) — one Custom Domain, every vault under it. The design
+# calls for per-vault subdomains (<name>.u.parachute.computer), but proxied
+# wildcard DNS is Enterprise-gated + the current token lacks dns-edit, so path
+# routing on the branded host is the shipped shape (the router already serves the
+# subdomain form too, for when the wildcard lands). Declared so `wrangler deploy`
+# adopts (never strips) it; workers.dev stays enabled as a fallback.
+[[routes]]
+pattern = "u.parachute.computer"
+custom_domain = true
+
 # Deploy-bundle mirror of the vitest `bun:sqlite` alias (vitest.config.ts). Core
 # value-imports `Database` from bun:sqlite only in type positions (erased at
 # transpile), so today this is a no-op — but if a future core change makes the
@@ -44,9 +59,13 @@ binding = "ATTACHMENTS"
 bucket_name = "parachute-vault-dev"
 
 [vars]
-# The Identity Worker origin — used to validate token `iss` and fetch its JWKS
-# + revocation list (scope-guard). Overridden per-environment on deploy.
-ISSUER_ORIGIN = "https://id.parachute.computer"
+# The Identity Worker origin — validates token `iss` + fetches its JWKS +
+# revocation list (scope-guard). This is the LIVE value so the deployed config is
+# self-contained: it MUST match the identity worker's ISSUER, else every token's
+# `iss` fails validation. A bare `wrangler deploy` now sets it correctly (no
+# deploy-time `--var` to forget). Tests use TEST_JWKS (gated on ENVIRONMENT=test),
+# so this value doesn't affect the vault vitest suite.
+ISSUER_ORIGIN = "https://cloud.parachute.computer"
 # Subdomain base for hostname routing: <name>.u.parachute.computer → DO(name).
 VAULT_BASE_DOMAIN = "u.parachute.computer"
 # Default per-tenant storage cap (bytes). 1 GiB. Overridable per-DO in config.

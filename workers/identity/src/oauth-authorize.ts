@@ -15,8 +15,10 @@ import {
 } from "./audience.ts";
 import { approveClient, getClient, requireRegisteredRedirectUri } from "./clients.ts";
 import { isCoveredByGrant, recordGrant } from "./grants.ts";
+import { unownedNamedVaults } from "./vaults.ts";
 import { SESSION_COOKIE, buildSessionCookie, createSession, findActiveSession, parseSessionCookie } from "./sessions.ts";
 import { getUserByEmail, verifyPassword } from "./users.ts";
+import { clearLoginFailures, clientIp, isLoginLocked, loginKey, recordLoginFailure } from "./rate-limit.ts";
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { type AuthorizeParams, describeScopes, renderConsent, renderError, renderLogin } from "./ui.ts";
 import {
@@ -33,6 +35,28 @@ const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 
 function htmlError(title: string, message: string, status: number): Response {
   return htmlResponse(renderError({ title, message }), status);
+}
+
+/**
+ * Vault-ownership gate: a user may only authorize a vault they OWN. Returns an
+ * `invalid_scope` error redirect naming the unowned vault(s), or null when every
+ * named vault in `scopes` is owned (or none is named). Called before consent for
+ * already-named vaults and at consent submit once the pick has been resolved.
+ */
+async function denyUnownedVaults(
+  db: D1Database,
+  userId: string,
+  scopes: readonly string[],
+  params: AuthorizeParams,
+): Promise<Response | null> {
+  const unowned = await unownedNamedVaults(db, userId, scopes);
+  if (unowned.length === 0) return null;
+  return oauthErrorRedirect(
+    params.redirectUri,
+    "invalid_scope",
+    `you do not own ${unowned.length > 1 ? "these vaults" : "the vault"}: ${unowned.join(", ")}`,
+    params.state,
+  );
 }
 
 function buildParams(get: (k: string) => string | null): AuthorizeParams | { error: string } {
@@ -159,6 +183,13 @@ async function authorizeCore(
 
   if (!session) return renderLoginPage(req, params);
 
+  // Ownership gate for ALREADY-named vaults (resource-bound or directly-scoped)
+  // — refuse before consent so the user never approves a vault they can't get.
+  // The unnamed `vault:<verb>` + pick case is gated at consent submit; the token
+  // endpoint re-checks as defense-in-depth.
+  const ownershipDenied = await denyUnownedVaults(db, session.userId, requestedScopes, params);
+  if (ownershipDenied) return ownershipDenied;
+
   // Skip-consent when a prior grant covers the request. Unnamed vault verbs
   // always render consent (the vault choice isn't recorded literally).
   const hasUnnamedVault = unnamedVaultVerbs(requestedScopes).length > 0;
@@ -209,11 +240,20 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   if (!verifyCsrfToken(req, form)) return htmlError("Invalid request", "CSRF token mismatch.", 403);
   const email = String(form.get("email") ?? "");
   const password = String(form.get("password") ?? "");
+  const now = deps.now?.() ?? new Date();
+  // Same brute-force fence as the console /login (this is the other public
+  // login-submit path). Check lockout BEFORE the expensive password verify.
+  const key = loginKey(clientIp(req), email);
+  if ((await isLoginLocked(db, key, now)).locked) {
+    return renderLoginPage(req, params, "Too many attempts. Please wait a few minutes and try again.");
+  }
   const user = email ? await getUserByEmail(db, email) : null;
   if (!user || !(await verifyPassword(user, password))) {
+    await recordLoginFailure(db, key, now);
     return renderLoginPage(req, params, "Incorrect email or password.");
   }
-  const session = await createSession(db, user.id, deps.now?.() ?? new Date());
+  await clearLoginFailures(db, key);
+  const session = await createSession(db, user.id, now);
   // Re-enter the flow WITH the session cookie; attach it to the response.
   const carrier = new Request(`${deps.issuer}/oauth/authorize`, {
     headers: { cookie: `${SESSION_COOKIE}=${session.id}` },
@@ -273,6 +313,11 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
     }
     scopes = narrowVaultScopes(scopes, picked);
   }
+
+  // Ownership gate — now that any pick is resolved, every named vault must be
+  // owned before we record consent or issue a code.
+  const ownershipDenied = await denyUnownedVaults(db, session.userId, scopes, params);
+  if (ownershipDenied) return ownershipDenied;
 
   await recordGrant(db, session.userId, client.clientId, scopes, deps.now?.() ?? new Date());
   return issueAuthCodeRedirect(db, { ...params, scope: scopes.join(" ") }, scopes, session.userId, deps);

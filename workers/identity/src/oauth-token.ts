@@ -32,6 +32,27 @@ import {
   signRefreshToken,
 } from "./tokens.ts";
 import { type OAuthDeps, buildServicesCatalog, jsonResponse } from "./oauth-shared.ts";
+import { unownedNamedVaults } from "./vaults.ts";
+
+/**
+ * Token-mint ownership gate (defense-in-depth). A vault-audience access token is
+ * signed only for a subject that owns every named vault in its scope. The
+ * authorize flow already refuses to ISSUE an unowned auth code; this closes any
+ * path (future code, a pre-ownership refresh token) that reaches signing with a
+ * vault the subject doesn't own. Returns a 400 `invalid_scope`, or null to pass.
+ */
+async function denyUnownedVaultMint(
+  db: D1Database,
+  userId: string,
+  scopes: readonly string[],
+): Promise<Response | null> {
+  const unowned = await unownedNamedVaults(db, userId, scopes);
+  if (unowned.length === 0) return null;
+  return jsonResponse(
+    { error: "invalid_scope", error_description: `subject does not own vault(s): ${unowned.join(", ")}` },
+    400,
+  );
+}
 
 function extractClientCredentials(
   req: Request,
@@ -138,6 +159,8 @@ async function handleTokenAuthorizationCode(
   } catch (err) {
     return mapAuthCodeError(err);
   }
+  const ownershipDenied = await denyUnownedVaultMint(db, redeemed.userId, redeemed.scopes);
+  if (ownershipDenied) return ownershipDenied;
   const audience = inferAudience(redeemed.scopes);
   const access = await signAccessToken(db, {
     sub: redeemed.userId,
@@ -238,6 +261,8 @@ async function rotateAndRespond(
   now: Date,
 ): Promise<Response> {
   const refreshUserId = row.userId ?? "";
+  const ownershipDenied = await denyUnownedVaultMint(db, refreshUserId, row.scopes);
+  if (ownershipDenied) return ownershipDenied;
   const audience = inferAudience(row.scopes);
   const access = await signAccessToken(db, {
     sub: refreshUserId,

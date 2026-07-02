@@ -7,6 +7,21 @@ main = "src/index.ts"
 compatibility_date = "2025-07-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Keep the workers.dev URL live alongside the custom domain (a fallback + the
+# OAuth wire endpoints work cross-origin regardless of front door). Declaring a
+# route otherwise disables workers.dev by default.
+workers_dev = true
+
+# Branded front door: the console + OAuth issuer serve at cloud.parachute.computer
+# (zone parachute.computer, in the Unforced Development account). Declared here so
+# `wrangler deploy` adopts (never strips) the custom domain; workers.dev stays
+# enabled as a fallback. Custom Domains can't be wildcards — per-vault subdomains
+# (*.u.parachute.computer) need proxied wildcard DNS (Enterprise); see TRYIT for
+# the enable-later steps.
+[[routes]]
+pattern = "cloud.parachute.computer"
+custom_domain = true
+
 # Control-plane state: users, clients, auth_codes, tokens, grants, sessions,
 # signing_keys. The revocation list is DERIVED from the tokens table (exactly
 # like the hub) — no separate KV needed. database_id is the real D1 in the
@@ -20,12 +35,19 @@ database_id = "893b353e-697a-407b-8fd9-5e1ce440135a"
 migrations_dir = "migrations"
 
 [vars]
-# The issuer origin — every token's `iss`, and the base for the discovery
-# endpoints. This is the prod DEFAULT; the conformance corpus pins md.issuer to
-# it, so it stays fixed here. The dev deploy OVERRIDES it to the worker's own
-# workers.dev URL at deploy time via `--var ISSUER:<url>` (scripts/deploy-dev.sh)
-# — a cloud vault has no hub, so `iss` must equal the deployed issuer's origin.
-ISSUER = "https://id.parachute.computer"
-# Cloud addressing: a `vault:<name>:<verb>` scope resolves its service-catalog
-# URL to `https://<name>.<VAULT_BASE_DOMAIN>` (design §3.2 / §3.4).
+# These are the LIVE values, so the deployed config is SELF-CONTAINED: a bare
+# `wrangler deploy` sets the correct `iss` and can't silently revert it (the prior
+# id.parachute.computer placeholder + deploy-time `--var` meant a bare deploy broke
+# every new token). The conformance corpus reads these dynamically (it compares
+# md.issuer to env.ISSUER), so the value can change here without breaking tests.
+#
+# ISSUER — every token's `iss` + the discovery-doc base. A cloud vault has no hub,
+# so `iss` must equal a real, reachable origin: the branded console host.
+ISSUER = "https://cloud.parachute.computer"
+# Cloud addressing base. With VAULT_ORIGIN set (below) the service-catalog +
+# console cards use the path form; unset it to fall back to `https://<name>.<base>`.
 VAULT_BASE_DOMAIN = "u.parachute.computer"
+# The vault worker's origin — vaults route by PATH (`<origin>/vault/<name>/…`) on
+# the single branded host (no wildcard subdomain cert yet). Drives the services
+# catalog + the console connect cards.
+VAULT_ORIGIN = "https://u.parachute.computer"
