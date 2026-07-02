@@ -146,6 +146,8 @@ export interface TokenPair {
   refresh_token: string;
   scope: string;
   services: Record<string, { url: string; version: string }>;
+  /** app-client TokenResponse extension: present when scopes name exactly one vault. */
+  vault?: string;
 }
 
 /**
