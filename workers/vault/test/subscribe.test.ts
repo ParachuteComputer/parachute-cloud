@@ -92,6 +92,37 @@ describe("subscribe — live push (single-writer fan-out)", () => {
     await sse.cancel();
   });
 
+  it("a write via MCP tools/call is pushed to an open SSE subscription (single-writer, cross-surface)", async () => {
+    const v = freshVault();
+    const res = await sub(v, "?tag=cross");
+    const sse = sseReader(res);
+    expect((await sse.next()).event).toBe("snapshot");
+
+    // Write through the MCP surface (not REST) — same DO, same in-object hook
+    // dispatcher feeds the open stream. Exercises the single-writer claim
+    // end-to-end across two surfaces (MCP write → SSE read).
+    const call = await SELF.fetch(`${base(v)}/mcp`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OP}`,
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "create-note", arguments: { content: "via mcp live", tags: ["cross"] } },
+      }),
+    });
+    expect(call.status).toBe(200);
+
+    const up = await sse.next();
+    expect(up.event).toBe("upsert");
+    expect(up.data.note.content).toBe("via mcp live");
+    await sse.cancel();
+  });
+
   it("a delete is pushed as remove{id}", async () => {
     const v = freshVault();
     const n = await createNote(v, { content: "doomed", tags: ["watch"] });

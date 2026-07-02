@@ -80,6 +80,26 @@ describe("MCP — transport rules", () => {
     expect(await res.text()).toBe("");
   });
 
+  it("a non-initialize POST with an unsupported Mcp-Protocol-Version → 400 (-32000)", async () => {
+    const v = freshVault();
+    const res = await mcpPost(v, OP, { jsonrpc: "2.0", id: 7, method: "tools/list" }, {
+      "Mcp-Protocol-Version": "1999-01-01",
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json() as any).error.code).toBe(-32000);
+  });
+
+  it("a supported Mcp-Protocol-Version header is accepted; initialize is exempt", async () => {
+    const v = freshVault();
+    const ok = await mcpPost(v, OP, { jsonrpc: "2.0", id: 8, method: "tools/list" }, {
+      "Mcp-Protocol-Version": "2025-06-18",
+    });
+    expect(ok.status).toBe(200);
+    // initialize negotiates in-body → a bogus header must NOT reject it.
+    const init = await mcpPost(v, OP, initBody, { "Mcp-Protocol-Version": "1999-01-01" });
+    expect(init.status).toBe(200);
+  });
+
   it("GET /mcp → 405 (no server-push stream in v1)", async () => {
     const v = freshVault();
     const res = await SELF.fetch(`${base(v)}/mcp`, { headers: { Authorization: `Bearer ${OP}`, Accept: BOTH_ACCEPT } });

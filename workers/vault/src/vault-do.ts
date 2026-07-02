@@ -376,6 +376,10 @@ export class VaultDO extends DurableObject {
     const { entries } = await collectExportEntries(this.store, this.exportOpts(vaultName, { since, exportedAt }));
     const tar = toTar(entries);
     const ts = (exportedAt ?? new Date().toISOString()).replace(/[:.]/g, "-");
+    // Every export writes a new tarball under vault-<name>/exports/ and nothing
+    // prunes them — they ACCUMULATE. Pre-deploy TODO: an R2 lifecycle rule (or a
+    // GC alarm) capping retention (e.g. keep N days / last K), so on-demand +
+    // nightly exports don't grow storage/COGS unbounded. Tracked for Phase 5 ops.
     await this.env.ATTACHMENTS.put(`vault-${vaultName}/exports/${ts}.tar`, tar);
     return new Response(tar, {
       status: 200,

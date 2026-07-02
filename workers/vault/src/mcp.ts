@@ -281,6 +281,22 @@ export async function handleMcp(
     messages.push(m);
   }
 
+  // Mcp-Protocol-Version validation (SDK's validateProtocolVersion rule): on any
+  // POST that is NOT an initialize, an *unsupported* version header → 400. An
+  // absent header is fine (the client defaults to the negotiated version).
+  // Initialize negotiates the version in-body, so it is exempt.
+  const isInit = messages.some((m) => m.method === "initialize");
+  if (!isInit) {
+    const pv = req.headers.get("mcp-protocol-version");
+    if (pv !== null && !SUPPORTED_PROTOCOL_VERSIONS.includes(pv)) {
+      return jsonRpcHttpError(
+        400,
+        -32000,
+        `Bad Request: Unsupported protocol version: ${pv} (supported versions: ${SUPPORTED_PROTOCOL_VERSIONS.join(", ")})`,
+      );
+    }
+  }
+
   const requests = messages.filter(isRequest);
   if (requests.length === 0) {
     // Notifications / responses only — nothing to answer.
