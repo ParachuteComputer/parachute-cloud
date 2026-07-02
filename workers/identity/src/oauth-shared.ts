@@ -25,6 +25,12 @@ export interface OAuthDeps {
   now?: () => Date;
   /** Origins the issuer answers on (same-origin + resource resolution). Default `[issuer]`. */
   boundOrigins?: () => readonly string[];
+  /**
+   * DEV ONLY: when true, the magic-link send echoes the link back in an
+   * `x-parachute-dev-magic-link` response header so the flow is testable without
+   * real email. Set from ENVIRONMENT !== "production"; MUST be false in prod.
+   */
+  exposeDevLinks?: boolean;
 }
 
 /**

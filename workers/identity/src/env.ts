@@ -1,3 +1,5 @@
+import type { SendEmailBinding } from "./email.ts";
+
 /**
  * Worker bindings + config. `DB` is the control-plane D1; `ISSUER` and
  * `VAULT_BASE_DOMAIN` are the per-environment vars from wrangler.toml.
@@ -15,4 +17,19 @@ export interface Env {
    * Consumed by the services catalog + the console connect cards.
    */
   VAULT_ORIGIN?: string;
+  /**
+   * Deployment environment. When NOT "production", the magic-link send echoes the
+   * link back in an `X-Parachute-Dev-Magic-Link` response header (so the flow is
+   * testable without real email). MUST be "production" on any public deploy.
+   */
+  ENVIRONMENT?: string;
+  /** FROM address for outbound email. Its domain must be onboarded to Email Sending. */
+  EMAIL_FROM?: string;
+  /**
+   * The Cloudflare `send_email` binding, when declared in wrangler.toml AND the
+   * sending domain is onboarded. Absent → the magic-link flow uses the dev-log
+   * sender. Optional so a bare deploy (binding commented out) still type-checks
+   * and runs.
+   */
+  EMAIL?: SendEmailBinding;
 }

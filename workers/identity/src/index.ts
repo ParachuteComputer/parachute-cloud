@@ -17,6 +17,15 @@ import {
   handleSignupGet,
   handleSignupPost,
 } from "./console.ts";
+import {
+  handleLogin2faGet,
+  handleLogin2faPost,
+  handleMagicRequestPost,
+  handleMagicVerifyGet,
+  handleSecurityGet,
+  handleSecurityPost,
+} from "./auth-handlers.ts";
+import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
 import {
   authorizationServerMetadata,
@@ -37,7 +46,14 @@ function depsFor(env: Env): OAuthDeps {
     vaultBaseDomain: env.VAULT_BASE_DOMAIN,
     vaultOrigin: env.VAULT_ORIGIN,
     boundOrigins: () => [issuer],
+    exposeDevLinks: env.ENVIRONMENT !== "production",
   };
+}
+
+/** The email sender: the Cloudflare binding when bound + configured, else dev-log. */
+function senderFor(env: Env): EmailSender {
+  if (env.EMAIL) return bindingSender(env.EMAIL, env.EMAIL_FROM ?? "noreply@parachute.computer");
+  return devLogSender();
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -64,6 +80,14 @@ app.post("/login", (c) => handleLoginPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/logout", (c) => handleLogoutPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/console", (c) => handleConsoleGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/vaults", (c) => handleCreateVaultPost(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/console/security", (c) => handleSecurityGet(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/console/security", (c) => handleSecurityPost(c.env.DB, c.req.raw, depsFor(c.env)));
+
+// --- magic-link sign-in + second factor ---
+app.post("/auth/magic", (c) => handleMagicRequestPost(c.env.DB, c.req.raw, depsFor(c.env), senderFor(c.env)));
+app.get("/auth/verify", (c) => handleMagicVerifyGet(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/login/2fa", (c) => handleLogin2faGet(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/login/2fa", (c) => handleLogin2faPost(c.env.DB, c.req.raw, depsFor(c.env)));
 
 // Root → the console (which redirects to /login when signed out).
 app.get("/", (c) => c.redirect("/console", 302));

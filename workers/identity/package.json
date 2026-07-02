@@ -11,6 +11,7 @@
     "seed:dev": "bun scripts/seed-dev-user.ts && wrangler d1 execute parachute-identity --local --file=./scripts/seed-dev-user.sql"
   },
   "dependencies": {
+    "@paulmillr/qr": "^0.3.0",
     "hono": "^4.6.0",
     "jose": "^5.9.0"
   },

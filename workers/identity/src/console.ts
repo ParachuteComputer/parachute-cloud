@@ -26,14 +26,14 @@ import {
 } from "./rate-limit.ts";
 import {
   SESSION_COOKIE,
-  buildSessionCookie,
   clearSessionCookie,
-  createSession,
   deleteSession,
-  findActiveSession,
   parseSessionCookie,
 } from "./sessions.ts";
-import { createUser, getUserByEmail, getUserById, verifyPassword, type User } from "./users.ts";
+import { sessionUser } from "./session-user.ts";
+import { finishPrimaryAuth } from "./auth-handlers.ts";
+import { EMAIL_RE, PASSWORD_MIN } from "./validation.ts";
+import { createUser, getUserByEmail, verifyPassword, type User } from "./users.ts";
 import {
   VaultNameInvalidError,
   VaultNameTakenError,
@@ -55,22 +55,8 @@ import {
   vaultInstanceUrl,
 } from "./oauth-shared.ts";
 
-// Deliberately permissive, structural email check — a real MX/verification step
-// is Phase 5. Rejects the obvious non-addresses (no @, spaces, no dot in host).
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const PASSWORD_MIN = 8;
-
 function csrfExtra(setCookie?: string): Record<string, string> {
   return setCookie ? { "set-cookie": setCookie } : {};
-}
-
-/** The logged-in user for this request, or null. */
-async function sessionUser(db: D1Database, req: Request, deps: OAuthDeps): Promise<User | null> {
-  const sessionId = parseSessionCookie(req.headers.get("cookie"));
-  if (!sessionId) return null;
-  const session = await findActiveSession(db, sessionId, deps.now?.() ?? new Date());
-  if (!session) return null;
-  return getUserById(db, session.userId);
 }
 
 // --- signup ----------------------------------------------------------------
@@ -100,8 +86,9 @@ export async function handleSignupPost(db: D1Database, req: Request, deps: OAuth
     return signupError(req, "An account with that email already exists.", email);
   }
   const user = await createUser(db, email, password, deps.now?.() ?? new Date());
-  const session = await createSession(db, user.id, deps.now?.() ?? new Date());
-  return redirectResponse("/console", { "set-cookie": buildSessionCookie(session.id) });
+  // A brand-new user has no 2FA, so this mints a session directly; funnel through
+  // the shared fork anyway for one primary-auth path.
+  return finishPrimaryAuth(db, deps, user.id, "/console");
 }
 
 function signupError(req: Request, message: string, email: string): Response {
@@ -136,8 +123,8 @@ export async function handleLoginPost(db: D1Database, req: Request, deps: OAuthD
     return loginError(req, "Incorrect email or password.", email);
   }
   await clearLoginFailures(db, key);
-  const session = await createSession(db, user.id, now);
-  return redirectResponse("/console", { "set-cookie": buildSessionCookie(session.id) });
+  // 2FA on → this diverts to the code prompt; otherwise it mints the session.
+  return finishPrimaryAuth(db, deps, user.id, "/console");
 }
 
 function loginError(req: Request, message: string, email: string): Response {

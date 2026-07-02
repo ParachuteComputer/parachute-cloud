@@ -62,3 +62,53 @@ export function timingSafeEqualString(a: string, b: string): boolean {
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
+
+// --- generic salted secret hashing -----------------------------------------
+// Same PBKDF2-SHA256 verifier format as the password store (`users.ts`), exposed
+// generically for hashing TOTP backup codes. workerd caps PBKDF2 at 100k
+// iterations at runtime, so this MUST NOT exceed it (a higher count writes a hash
+// that can never be verified on the deployed worker — see users.ts).
+const SECRET_PBKDF2_ITERATIONS = 100_000;
+
+function base64urlToBytes(s: string): Uint8Array {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+async function pbkdf2(secret: string, salt: Uint8Array, iterations: number): Promise<string> {
+  const keyMaterial = await crypto.subtle.importKey("raw", encoder.encode(secret), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: salt as BufferSource, iterations, hash: "SHA-256" },
+    keyMaterial,
+    256,
+  );
+  return bytesToBase64url(new Uint8Array(bits));
+}
+
+/** `pbkdf2$sha256$<iterations>$<salt-b64url>$<derived-b64url>` — a salted hash of an arbitrary secret. */
+export async function hashSecret(secret: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const derived = await pbkdf2(secret, salt, SECRET_PBKDF2_ITERATIONS);
+  return `pbkdf2$sha256$${SECRET_PBKDF2_ITERATIONS}$${bytesToBase64url(salt)}$${derived}`;
+}
+
+/** Verify a secret against a {@link hashSecret} output. Any parse/crypto failure is a non-match, never a throw. */
+export async function verifySecret(secret: string, stored: string): Promise<boolean> {
+  const parts = stored.split("$");
+  if (parts.length !== 5 || parts[0] !== "pbkdf2" || parts[1] !== "sha256") return false;
+  const iterations = Number(parts[2]);
+  const saltB64 = parts[3];
+  const expected = parts[4];
+  if (!Number.isFinite(iterations) || iterations < 1 || iterations > SECRET_PBKDF2_ITERATIONS || !saltB64 || !expected) {
+    return false;
+  }
+  try {
+    const derived = await pbkdf2(secret, base64urlToBytes(saltB64), iterations);
+    return timingSafeEqualString(derived, expected);
+  } catch {
+    return false;
+  }
+}

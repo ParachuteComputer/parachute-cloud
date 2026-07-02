@@ -26,8 +26,11 @@ const PBKDF2_MAX_ITERATIONS = 100_000;
 export interface User {
   id: string;
   email: string;
+  /** PBKDF2 verifier, or "" for a passwordless (magic-link) account. */
   passwordHash: string;
   createdAt: string;
+  /** True once a magic link to this address has been consumed (or seeded). */
+  emailVerified: boolean;
 }
 
 interface Row {
@@ -35,10 +38,22 @@ interface Row {
   email: string;
   password_hash: string;
   created_at: string;
+  email_verified: number;
 }
 
 function rowToUser(r: Row): User {
-  return { id: r.id, email: r.email, passwordHash: r.password_hash, createdAt: r.created_at };
+  return {
+    id: r.id,
+    email: r.email,
+    passwordHash: r.password_hash,
+    createdAt: r.created_at,
+    emailVerified: r.email_verified === 1,
+  };
+}
+
+/** Whether this account can log in with a password (magic-link signups can't, until they set one). */
+export function hasPassword(user: User): boolean {
+  return user.passwordHash.length > 0;
 }
 
 async function pbkdf2(password: string, salt: Uint8Array, iterations: number): Promise<string> {
@@ -88,15 +103,42 @@ function base64urlToBytes(s: string): Uint8Array {
   return out;
 }
 
-export async function createUser(db: D1Database, email: string, password: string, now: Date = new Date()): Promise<User> {
+/**
+ * Create a user. An empty `password` produces a passwordless (magic-link)
+ * account — stored as an empty hash, which `verifyPassword` rejects, so password
+ * login fails until one is set via {@link setPassword}. `emailVerified` starts
+ * true for a magic-link signup (the link proves the address).
+ */
+export async function createUser(
+  db: D1Database,
+  email: string,
+  password: string,
+  now: Date = new Date(),
+  opts: { emailVerified?: boolean } = {},
+): Promise<User> {
   const id = randomUUID();
-  const passwordHash = await hashPassword(password);
+  // NEVER hash an empty password — an empty hash means "no password", which
+  // verifyPassword refuses. Hashing "" would produce a hash the empty string
+  // verifies against.
+  const passwordHash = password.length > 0 ? await hashPassword(password) : "";
+  const emailVerified = opts.emailVerified ?? false;
   const createdAt = now.toISOString();
   await db
-    .prepare("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)")
-    .bind(id, email, passwordHash, createdAt)
+    .prepare("INSERT INTO users (id, email, password_hash, created_at, email_verified) VALUES (?, ?, ?, ?, ?)")
+    .bind(id, email, passwordHash, createdAt, emailVerified ? 1 : 0)
     .run();
-  return { id, email, passwordHash, createdAt };
+  return { id, email, passwordHash, createdAt, emailVerified };
+}
+
+/** Mark an account's email verified (idempotent). */
+export async function markEmailVerified(db: D1Database, userId: string): Promise<void> {
+  await db.prepare("UPDATE users SET email_verified = 1 WHERE id = ?").bind(userId).run();
+}
+
+/** Set (or change) an account's password — the optional secondary factor. */
+export async function setPassword(db: D1Database, userId: string, password: string): Promise<void> {
+  const passwordHash = await hashPassword(password);
+  await db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(passwordHash, userId).run();
 }
 
 export async function getUserByEmail(db: D1Database, email: string): Promise<User | null> {
