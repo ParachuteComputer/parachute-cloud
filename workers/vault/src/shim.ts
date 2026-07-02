@@ -133,6 +133,17 @@ export class DatabaseShim {
 
   exec(sql: string): void {
     if (TXN_RE.test(sql)) {
+      // TODO(vault#521 integration): transaction control is a COUNTED NO-OP.
+      // DO's sql.exec throws on explicit BEGIN/COMMIT, so core's
+      // `transaction()` / `transactionAsync()` currently run their callback
+      // WITHOUT a real transaction — a mid-batch failure (path conflict, etc.)
+      // leaves prior inserts committed instead of rolling back. This is NOT
+      // atomic. The real fix lands when vault#521 (store.transaction seam)
+      // merges: this file's `@openparachute/core` dep still sees OLD core with
+      // raw BEGIN/COMMIT. A follow-up integration commit swaps a
+      // `DoSqliteStore` that overrides `store.transaction` with
+      // `ctx.storage.transactionSync`. The `.todo` conformance test
+      // ("POST batch is atomic") pins the gap until then.
       this.txnIntercepts.push({ kind: "transaction", stmt: sql.trim(), caller: coreCaller() });
       return;
     }

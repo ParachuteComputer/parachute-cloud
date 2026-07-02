@@ -1,31 +1,43 @@
 /**
- * VaultDO — the Phase-0 spike Durable Object.
+ * VaultDO — one Durable Object per tenant vault.
  *
- * Boots `@openparachute/core`'s `BunSqliteStore` against DO SQLite through the
- * `DatabaseShim`, then exposes RPC methods that exercise the boot path and the
- * four gating unknowns (generated columns, ALTER ADD/DROP COLUMN, RETURNING,
- * introspection PRAGMAs), plus FTS5 MATCH/rank timing and `databaseSize`
- * accounting. This is throwaway measurement scaffolding, not the eventual
- * production DO.
+ * The single-writer keystone (design §3): every write, hook, and (later) live
+ * stream for a vault co-locate in one object; isolation is structural (the DO
+ * holds a handle only to its own SqlStorage). `@openparachute/core`'s
+ * `BunSqliteStore` boots against DO SQLite through the `DatabaseShim` and serves
+ * the REST wire contract via the ported handlers in `./rest/*`.
+ *
+ * This class also retains the Phase-0 spike's measurement RPC methods (boot,
+ * sqlProbe, introspect, crud, indexedField, returningOC, renameTagReturning,
+ * fts) so the spike conformance suite (test/spike.test.ts) keeps passing — they
+ * exercise the shim + the four DO SQLite unknowns and are cheap to keep.
  */
 import { DurableObject } from "cloudflare:workers";
 import { BunSqliteStore } from "@openparachute/core/src/store.js";
 import { SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 import { DatabaseShim } from "./shim.js";
+import type { Env } from "./env.js";
+import { authenticateVaultRequest, verbForMethod, insufficientScope } from "./auth.js";
+import { NO_TAG_SCOPE } from "./rest/parse.js";
+import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
+import { handleTags, handleFindPath } from "./rest/tags.js";
+import { handleVault, type VaultConfigLike } from "./rest/vault.js";
+import { R2_METER_KEY, capExceededResponse, resolveCap, usedBytes } from "./caps.js";
+import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./rest/storage-constants.js";
 
 function errText(e: unknown): string {
   if (e instanceof Error) return `${e.name}: ${e.message}`;
   return String(e);
 }
 
-// `detail` is heterogeneous measurement payload. It is `any` (not `unknown`)
-// deliberately: these types are the return values of Durable Object RPC
-// methods, which must satisfy `Rpc.Serializable` — `unknown` fails that
-// constraint and collapses the whole method's stub type to `never`.
-type StepResult = { step: string; ok: boolean; detail?: any; error?: string };
+function json(data: unknown, status = 200): Response {
+  return Response.json(data, { status });
+}
 
-// Concrete (all-optional) shape for the introspection probe — see the note in
-// `introspect()` on why this is not a `Record<string, any>`.
+// `detail` is heterogeneous measurement payload — see the note in the Phase-0
+// spike history: `any` is required so DO RPC's `Rpc.Serializable` transform
+// doesn't collapse the method stub to `never`.
+type StepResult = { step: string; ok: boolean; detail?: any; error?: string };
 type IntrospectResult = {
   table_info_rows?: number;
   table_info_columns?: string[];
@@ -40,17 +52,35 @@ type IntrospectResult = {
   foreign_keys_set_error?: string;
 };
 
+/** Persisted per-vault config (DO storage key "config"). */
+type VaultConfigState = {
+  name: string;
+  description: string | null;
+  createdAt: string;
+  audio_retention: "keep" | "until_transcribed" | "never";
+  auto_transcribe: { enabled: boolean };
+  cap_bytes?: number;
+};
+
 export class VaultDO extends DurableObject {
   private shim: DatabaseShim;
   private store!: BunSqliteStore;
   private bootError: string | null = null;
+  protected env: Env;
 
-  constructor(ctx: DurableObjectState, env: unknown) {
-    super(ctx, env as never);
+  // In-memory caches of DO-storage state (a warm DO keeps these across
+  // requests; loaded lazily on first fetch).
+  private config: VaultConfigState | null = null;
+  private r2Bytes = 0;
+  private stateLoaded = false;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.env = env;
     this.shim = new DatabaseShim(ctx.storage.sql);
     try {
-      // BunSqliteStore's constructor runs initSchema(db) synchronously — this
-      // IS the boot test (SCHEMA_SQL v23 + all migrateToVN steps).
+      // BunSqliteStore's constructor runs initSchema(db) synchronously (idempotent
+      // across DO wakes): SCHEMA v23 + all migrateToVN steps.
       this.store = new BunSqliteStore(this.shim as never);
     } catch (e) {
       this.bootError = errText(e);
@@ -61,7 +91,203 @@ export class VaultDO extends DurableObject {
     return this.ctx.storage.sql;
   }
 
-  // --- Probe: what does DO's sql.exec tolerate? (multi-statement, comments) ---
+  // -------------------------------------------------------------------------
+  // Production REST surface
+  // -------------------------------------------------------------------------
+
+  async fetch(request: Request): Promise<Response> {
+    if (this.bootError) return json({ error: "Internal server error", detail: this.bootError }, 500);
+
+    const url = new URL(request.url);
+    const m = /^\/vault\/([^/]+)(\/.*)?$/.exec(url.pathname);
+    if (!m) return json({ error: "Not found" }, 404);
+    const vaultName = decodeURIComponent(m[1]!);
+    const rest = m[2] ?? "";
+
+    await this.ensureState(vaultName);
+
+    // Bare landing — GET /vault/<name>. Read-scoped.
+    if (rest === "" || rest === "/") {
+      if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+      const auth = await authenticateVaultRequest(request, this.env, vaultName);
+      if ("error" in auth) return auth.error;
+      return json({
+        name: this.config!.name,
+        description: this.config!.description,
+        createdAt: this.config!.createdAt,
+        stats: await this.store.getVaultStats(),
+      });
+    }
+
+    if (!rest.startsWith("/api/") && rest !== "/api") {
+      return json({ error: "Not found" }, 404);
+    }
+    const apiPath = rest.slice(4); // "/api/notes" → "/notes"
+
+    // Health is read-only + cheap; still requires read scope like the bun vault.
+    const auth = await authenticateVaultRequest(request, this.env, vaultName);
+    if ("error" in auth) return auth.error;
+
+    const verb = verbForMethod(request.method);
+    if (verb === "write" && auth.permission !== "full") {
+      return insufficientScope("write", vaultName, auth.scopes);
+    }
+
+    const writeCtx = { actor: auth.actor, via: auth.via };
+    const deps: RestDeps = { vaultName, attachments: this.env.ATTACHMENTS };
+
+    // Cap gate for byte-growing writes (POST/PATCH/PUT). DELETE is exempt so a
+    // tenant at the cap can always delete their way back under it. Storage
+    // upload runs its own precise (file-size-aware) check.
+    if (
+      (request.method === "POST" || request.method === "PATCH" || request.method === "PUT") &&
+      !apiPath.startsWith("/storage")
+    ) {
+      const over = this.capBlockIfFull();
+      if (over) return over;
+    }
+
+    if (apiPath.startsWith("/notes")) {
+      return handleNotes(request, this.store, apiPath.slice(6), deps, NO_TAG_SCOPE, writeCtx);
+    }
+    if (apiPath.startsWith("/tags")) {
+      return handleTags(request, this.store, apiPath.slice(5), NO_TAG_SCOPE);
+    }
+    if (apiPath === "/find-path") {
+      return handleFindPath(request, this.store, NO_TAG_SCOPE);
+    }
+    if (apiPath === "/vault") {
+      const cfg: VaultConfigLike = {
+        name: this.config!.name,
+        description: this.config!.description ?? undefined,
+        audio_retention: this.config!.audio_retention,
+        auto_transcribe: this.config!.auto_transcribe,
+      };
+      const res = await handleVault(request, this.store, cfg, () => {
+        this.config!.description = cfg.description ?? null;
+        this.config!.audio_retention = cfg.audio_retention ?? "keep";
+        this.config!.auto_transcribe = { enabled: cfg.auto_transcribe?.enabled ?? false };
+        void this.ctx.storage.put("config", this.config);
+      });
+      return res;
+    }
+    if (apiPath.startsWith("/storage")) {
+      return this.handleStorage(request, apiPath.slice(8), vaultName);
+    }
+    if (apiPath === "/health") {
+      return json({ status: "ok", vault: vaultName });
+    }
+    return json({ error: "Not found" }, 404);
+  }
+
+  /** Load persisted config + R2 meter into memory (once per warm DO). */
+  private async ensureState(vaultName: string): Promise<void> {
+    if (this.stateLoaded) {
+      // A DO id is 1:1 with a name, but keep config.name honest if the first
+      // request arrived before any config existed.
+      if (this.config && this.config.name !== vaultName) {
+        this.config.name = vaultName;
+        void this.ctx.storage.put("config", this.config);
+      }
+      return;
+    }
+    const stored = (await this.ctx.storage.get<VaultConfigState>("config")) ?? null;
+    this.config = stored ?? {
+      name: vaultName,
+      description: null,
+      createdAt: new Date().toISOString(),
+      audio_retention: "keep",
+      auto_transcribe: { enabled: false },
+    };
+    if (!stored) await this.ctx.storage.put("config", this.config);
+    this.r2Bytes = (await this.ctx.storage.get<number>(R2_METER_KEY)) ?? 0;
+    this.stateLoaded = true;
+  }
+
+  private capBytes(): number {
+    return resolveCap(this.config?.cap_bytes, this.env.CAP_BYTES);
+  }
+
+  /** 413 when the tenant is already at/over its cap (blocks growth writes). */
+  private capBlockIfFull(): Response | null {
+    const used = usedBytes(Number(this.raw().databaseSize), this.r2Bytes);
+    const cap = this.capBytes();
+    if (used >= cap) return capExceededResponse(used, cap, 0);
+    return null;
+  }
+
+  private async meterAdd(bytes: number): Promise<void> {
+    this.r2Bytes += bytes;
+    await this.ctx.storage.put(R2_METER_KEY, this.r2Bytes);
+  }
+
+  private async meterSub(bytes: number): Promise<void> {
+    this.r2Bytes = Math.max(0, this.r2Bytes - bytes);
+    await this.ctx.storage.put(R2_METER_KEY, this.r2Bytes);
+  }
+
+  /** POST /api/storage/upload · GET /api/storage/<date>/<file> — R2-backed. */
+  private async handleStorage(req: Request, subpath: string, vaultName: string): Promise<Response> {
+    if (req.method === "POST" && subpath === "/upload") {
+      const form = await req.formData();
+      const file = form.get("file");
+      if (!(file instanceof File)) return json({ error: "file is required" }, 400);
+      if (file.size > MAX_UPLOAD_BYTES) {
+        return json({ error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB` }, 413);
+      }
+      const ext = extLower(file.name);
+      if (BLOCKED_EXTENSIONS.has(ext)) {
+        return json({ error: `File type ${ext} not allowed (active/executable content)` }, 400);
+      }
+      // Precise cap check (SQLite size + R2 meter + this file).
+      const used = usedBytes(Number(this.raw().databaseSize), this.r2Bytes);
+      const cap = this.capBytes();
+      if (used + file.size > cap) return capExceededResponse(used, cap, file.size);
+
+      const date = new Date().toISOString().split("T")[0]!;
+      const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
+      const relativePath = `${date}/${filename}`;
+      const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
+      const bytes = await file.arrayBuffer();
+      await this.env.ATTACHMENTS.put(r2Key(vaultName, relativePath), bytes, {
+        httpMetadata: { contentType: mimeType },
+      });
+      await this.meterAdd(bytes.byteLength);
+      return json({ path: relativePath, size: bytes.byteLength, mimeType }, 201);
+    }
+
+    // GET /<date>/<filename> — accept literal or %2F-encoded slash.
+    let decodedPath: string;
+    try {
+      decodedPath = decodeURIComponent(subpath);
+    } catch {
+      return json({ error: "Not found" }, 404);
+    }
+    const fileMatch = decodedPath.match(/^\/([^/]+)\/(.+)$/);
+    if (req.method === "GET" && fileMatch) {
+      const reqPath = `${fileMatch[1]}/${fileMatch[2]}`;
+      // Traversal guard (R2 keys are flat, but reject `..` segments for parity).
+      if (reqPath.split("/").some((seg) => seg === "..")) return json({ error: "Invalid path" }, 403);
+      const obj = await this.env.ATTACHMENTS.get(r2Key(vaultName, reqPath));
+      if (!obj) return json({ error: "Not found" }, 404);
+      const ext = extLower(reqPath);
+      const contentType = obj.httpMetadata?.contentType ?? MIME_TYPES[ext] ?? "application/octet-stream";
+      return new Response(obj.body, {
+        headers: {
+          "Content-Type": contentType,
+          "Content-Length": String(obj.size),
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    }
+
+    return json({ error: "Not found" }, 404);
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase-0 spike measurement RPC (retained so test/spike.test.ts stays green)
+  // -------------------------------------------------------------------------
+
   async sqlProbe() {
     const sql = this.raw();
     const out: Record<string, string> = {};
@@ -90,7 +316,6 @@ export class VaultDO extends DurableObject {
     return out;
   }
 
-  // --- Unknown-agnostic: report boot outcome + intercept ledger ---
   async boot() {
     return {
       ok: this.bootError === null,
@@ -108,11 +333,7 @@ export class VaultDO extends DurableObject {
     };
   }
 
-  // --- Unknown #4: introspection PRAGMAs (table_info / table_xinfo) ---
   async introspect(): Promise<IntrospectResult> {
-    // A concrete result type (not `Record<string, any>`): the DO RPC stub
-    // wraps every return in `Rpc.Serializable`, and an open `any`-valued
-    // record makes that transform recurse without a fixed point (TS2589).
     const out: IntrospectResult = {};
     try {
       const tableInfo = this.raw().exec("PRAGMA table_info(notes)").toArray();
@@ -131,7 +352,6 @@ export class VaultDO extends DurableObject {
       out.table_xinfo_ok = false;
       out.table_xinfo_error = errText(e);
     }
-    // foreign_keys behavior (passed through — not in the no-op set)
     try {
       const fk = this.raw().exec("PRAGMA foreign_keys").toArray();
       out.foreign_keys_read = fk[0] ?? null;
@@ -148,7 +368,6 @@ export class VaultDO extends DurableObject {
     return out;
   }
 
-  // --- CRUD round-trip through core, incl. FK cascade on delete ---
   async crud() {
     const steps: StepResult[] = [];
     try {
@@ -165,7 +384,6 @@ export class VaultDO extends DurableObject {
       const updated = await this.store.updateNote(created.id, { content: "goodbye", metadata: { mood: "cool" } });
       steps.push({ step: "update", ok: updated.content === "goodbye" && (updated.metadata as { mood?: string })?.mood === "cool" });
 
-      // note_tags has ON DELETE CASCADE → after delete the join row should be gone iff FK cascade is enforced.
       const tagRowsBefore = this.raw().exec("SELECT COUNT(*) AS n FROM note_tags WHERE note_id = ?", created.id).one().n;
       await this.store.deleteNote(created.id);
       const gone = (await this.store.getNote(created.id)) === null;
@@ -181,25 +399,17 @@ export class VaultDO extends DurableObject {
     return { ok: steps.every((s) => s.ok), steps };
   }
 
-  // --- Unknowns #1 (generated columns), #2 (ADD/DROP COLUMN), #4 (table_xinfo) ---
   async indexedField() {
     const steps: StepResult[] = [];
     const colPresent = () =>
       (this.raw().exec("PRAGMA table_xinfo(notes)").toArray() as { name: string }[]).some((r) => r.name === "meta_priority");
     try {
-      // Declares field via the store chokepoint: BEGIN IMMEDIATE (intercepted)
-      // + declareField → table_xinfo probe + ALTER TABLE ADD COLUMN ... GENERATED
-      // ALWAYS AS (json_extract(...)) VIRTUAL + CREATE INDEX.
-      await this.store.upsertTagRecord("meeting", {
-        fields: { priority: { type: "integer", indexed: true } },
-      });
+      await this.store.upsertTagRecord("meeting", { fields: { priority: { type: "integer", indexed: true } } });
       steps.push({ step: "declare-indexed-field", ok: colPresent(), detail: { generatedColumnCreated: colPresent() } });
 
-      // A note whose metadata populates the generated column.
       const n = await this.store.createNote("standup", { tags: ["meeting"], metadata: { priority: 5 } });
       await this.store.createNote("retro", { tags: ["meeting"], metadata: { priority: 1 } });
 
-      // Operator query routes through the generated column + its index.
       const hi = await this.store.queryNotes({ tags: ["meeting"], metadata: { priority: { gte: 3 } } });
       steps.push({
         step: "operator-query-via-generated-column",
@@ -207,11 +417,9 @@ export class VaultDO extends DurableObject {
         detail: { matched: hi.length },
       });
 
-      // Confirm the generated column actually computes from metadata JSON.
       const rawVal = this.raw().exec("SELECT meta_priority FROM notes WHERE id = ?", n.id).one();
       steps.push({ step: "generated-column-computes", ok: (rawVal as { meta_priority: number }).meta_priority === 5, detail: rawVal });
 
-      // Release → DROP INDEX + ALTER TABLE DROP COLUMN (unknown #2, drop side).
       await this.store.upsertTagRecord("meeting", { fields: {} });
       steps.push({ step: "drop-column-on-release", ok: !colPresent(), detail: { columnStillPresent: colPresent() } });
     } catch (e) {
@@ -220,22 +428,18 @@ export class VaultDO extends DurableObject {
     return { ok: steps.every((s) => s.ok), steps };
   }
 
-  // --- Unknown #3: RETURNING (optimistic-concurrency update paths) ---
   async returningOC() {
     const steps: StepResult[] = [];
     try {
       const n = await this.store.createNote("v1");
       const stamp = n.updatedAt ?? n.createdAt;
 
-      // sets.length===0 + if_updated_at → the no-op RETURNING id probe (notes.ts:563).
       await this.store.updateNote(n.id, { skipUpdatedAt: true, if_updated_at: stamp });
       steps.push({ step: "noop-oc-probe(RETURNING id)", ok: true });
 
-      // Conditional update → `${sql} RETURNING id` .get() (notes.ts:595), matched.
       const okUpd = await this.store.updateNote(n.id, { content: "v2", if_updated_at: stamp });
       steps.push({ step: "conditional-update-matched(RETURNING id)", ok: okUpd.content === "v2" });
 
-      // Stale precondition → RETURNING id yields null → ConflictError.
       let conflict = false;
       let conflictText = "";
       try {
@@ -251,7 +455,6 @@ export class VaultDO extends DurableObject {
     return { ok: steps.every((s) => s.ok), steps };
   }
 
-  // --- Unknown #3 (second RETURNING site): renameTag repoint (notes.ts:1461) ---
   async renameTagReturning() {
     const steps: StepResult[] = [];
     try {
@@ -272,7 +475,6 @@ export class VaultDO extends DurableObject {
     return { ok: steps.every((s) => s.ok), steps };
   }
 
-  // --- FTS5 external-content MATCH/rank timing + databaseSize accounting ---
   async fts(count: number) {
     const sql = this.raw();
     const vocab = [
@@ -282,9 +484,6 @@ export class VaultDO extends DurableObject {
     const now = new Date().toISOString();
     const sizeBefore = sql.databaseSize;
 
-    // Raw inserts (the notes_fts insert trigger maintains the FTS index) — the
-    // corpus build deliberately bypasses store overhead (wikilink sync, hooks,
-    // read-back) to isolate FTS write + query cost.
     const stmt = this.shim.prepare(
       "INSERT INTO notes (id, content, path, metadata, created_at, updated_at, extension) VALUES (?,?,?,?,?,?, 'md')",
     );
@@ -303,7 +502,6 @@ export class VaultDO extends DurableObject {
       return { q, ms: Date.now() - t, hits: rows.length };
     };
 
-    // Warm once, then measure (parse/plan caching).
     await this.store.searchNotes("parachute", { limit: 20 });
     const searches = [await time("parachute"), await time("meeting"), await time("parachute cloud"), await time("nonexistentzzz")];
 
