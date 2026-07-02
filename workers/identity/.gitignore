@@ -1,0 +1,3 @@
+# DEV-ONLY seed credential + the SQL it generates (contains the hash). Never committed.
+.dev-secrets
+scripts/seed-dev-user.sql
