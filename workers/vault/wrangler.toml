@@ -1,10 +1,29 @@
 # Vault DO + edge router — the wire contract on Durable Objects (Phase 2).
-# Not deployed by this PR (integration + deploy land after merge). Tests drive
-# it via @cloudflare/vitest-pool-workers inside workerd; typecheck via tsc.
+# Tests drive it via @cloudflare/vitest-pool-workers inside workerd; typecheck
+# via tsc. Deployed to the Unforced Development CF account (dev) via
+# scripts/deploy-dev.sh — see that script + workers/vault/README.md.
+#
+# BUNDLING (the `.js`→`.ts` question): `@openparachute/core` is raw TypeScript
+# whose internal imports use `.js` specifiers pointing at sibling `.ts` files
+# (NodeNext). `wrangler deploy`'s built-in esbuild resolves those natively — when
+# a TypeScript importer imports `./x.js` and only `./x.ts` exists, esbuild
+# rewrites the specifier. So NO custom prebuild/plugin is needed to bundle core;
+# the vitest jsToTsResolver (vitest.config.ts) exists only because Vite lacks
+# that esbuild behavior. `npm run verify:bundle` emits the bundle and asserts
+# core is inlined with zero residual `bun:sqlite`/`bun:` imports, catching any
+# regression. The `[alias]` below mirrors the vitest bun:sqlite alias as depth.
 name = "parachute-vault-do"
 main = "src/index.ts"
 compatibility_date = "2025-07-01"
 compatibility_flags = ["nodejs_compat"]
+
+# Deploy-bundle mirror of the vitest `bun:sqlite` alias (vitest.config.ts). Core
+# value-imports `Database` from bun:sqlite only in type positions (erased at
+# transpile), so today this is a no-op — but if a future core change makes the
+# import non-type-only, wrangler resolves it to the stub instead of failing on a
+# module workerd can't provide. vitest is unaffected (it uses its own Vite alias).
+[alias]
+"bun:sqlite" = "./src/deploy-stub-bun-sqlite.ts"
 
 # One Durable Object per vault. The router maps <name> → idFromName(name) → DO.
 [[durable_objects.bindings]]
@@ -17,9 +36,12 @@ tag = "v1"
 new_sqlite_classes = ["VaultDO"]
 
 # Attachment bytes + (later) export tarballs. Keys: vault-<name>/attachments/...
+# Dev bucket in the Unforced Development account (created via `wrangler r2 bucket
+# create parachute-vault-dev`). vitest ignores bucket_name (local R2 sim by
+# binding). A real prod deploy adds an [env.production] with its own bucket.
 [[r2_buckets]]
 binding = "ATTACHMENTS"
-bucket_name = "parachute-vault-attachments"
+bucket_name = "parachute-vault-dev"
 
 [vars]
 # The Identity Worker origin — used to validate token `iss` and fetch its JWKS

@@ -16,7 +16,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const PBKDF2_ITERATIONS = 210_000;
+// MUST match src/users.ts — workerd caps PBKDF2 at 100k iterations (a higher
+// count writes an unverifiable hash on the deployed worker). See users.ts.
+const PBKDF2_ITERATIONS = 100_000;
 
 function b64url(bytes: Uint8Array): string {
   let binary = "";

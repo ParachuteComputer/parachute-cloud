@@ -59,3 +59,32 @@ Additional findings:
 
 **Verdict: all four unknowns green → the Durable-Object design is real.** No
 Fly-fallback conversation needed.
+
+## Deploy (dev) + bundling
+
+Phase 2+ shipped the production DO (REST + MCP + SSE + export) — the spike RPC
+methods above are retained so `test/spike.test.ts` stays green. The worker
+deploys to the **Unforced Development** CF account (workers.dev + path routing);
+`scripts/deploy-dev.sh` at the repo root is the reproducible command, and
+`TRYIT-2026-07-02.md` is the live-deploy report.
+
+**How the bundle works.** `wrangler deploy` bundles with its built-in esbuild.
+`@openparachute/core` is raw TypeScript that imports sibling files with `.js`
+specifiers (NodeNext); **esbuild resolves those to the `.ts` files natively** —
+a TypeScript importer that imports `./x.js` when only `./x.ts` exists is rewritten
+by esbuild. So core is bundled with **no custom prebuild or plugin**. (The vitest
+`jsToTsResolver` in `vitest.config.ts` exists only because Vite lacks that esbuild
+behavior; it is a test-only concern, not a deploy one.) The type-only
+`bun:sqlite` value-import in core erases at transpile; `wrangler.toml`'s `[alias]`
+mirrors the vitest bun:sqlite alias as depth in case that ever changes.
+
+**Regression guard.** `bun run verify:bundle` emits the deploy bundle and asserts
+(1) `@openparachute/core` is inlined and (2) there is **zero** residual `bun:`
+import in the output. Run it after any core bump or bundler change.
+
+```sh
+cd workers/vault
+bun run test            # vitest (workerd) — the wire-contract conformance suite
+bun run typecheck       # tsc --noEmit
+bun run verify:bundle   # emit + assert the deploy bundle is clean
+```
