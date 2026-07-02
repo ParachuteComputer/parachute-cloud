@@ -16,8 +16,11 @@ workers/vault/      the Vault DO + edge router — REST wire contract, MCP endpo
                     tarballs, caps. Conformance suite runs under real workerd
                     (@cloudflare/vitest-pool-workers).
 workers/identity/   the OAuth issuer (authorize/token/DCR/JWKS/revocation on D1) —
-                    reproduces the hub's issuer contract EXACTLY (42-test
-                    conformance corpus; rotation/replay/30s-grace/family-revocation).
+                    reproduces the hub's issuer contract EXACTLY (conformance
+                    corpus; rotation/replay/30s-grace/family-revocation). ALSO the
+                    self-serve console (accounts + vaults, server-rendered) and
+                    vault-OWNERSHIP enforcement (vaults table). 63 tests (42
+                    issuer conformance + 21 console/ownership).
 src/                the OLD control plane (Worker + D1 + Stripe). Dormant; billing
                     lifecycle design gets harvested into the control-plane revival.
 scripts/            deploy-dev.sh (reproducible dev deploy) + smoke-dev.ts (22-step
@@ -31,7 +34,7 @@ bun install                         # ALSO refreshes the copied core dep (see go
 bun run test                        # control-plane tests (src/) — 123
 bun run typecheck                   # root tsc
 cd workers/vault && bun run typecheck && bun x vitest run    # 82+1 todo under workerd
-cd workers/identity && bun run typecheck && bun x vitest run # 42
+cd workers/identity && bun run typecheck && bun x vitest run # 63
 bash scripts/deploy-dev.sh          # deploy both workers (dev account) + seed
 bun scripts/smoke-dev.ts            # live smoke vs the deployed workers
 ```
@@ -42,7 +45,7 @@ bun scripts/smoke-dev.ts            # live smoke vs the deployed workers
 - **Transactions**: DO SQLite rejects `BEGIN/COMMIT`. Core's `transaction()` duck-types the shim's `transactionSync` (→ `ctx.storage.transactionSync`) since vault 0.6.5-rc.2. The conformance suite pins a GLOBAL-zero interception count; the sole residual is the async-batch path (cloud#25 — close or accept before real clients batch-write).
 - **workerd ≠ vitest-workerd exactly**: workerd caps PBKDF2 at 100k iterations at runtime but vitest's pool does NOT enforce it (42/42 green while every live login 500'd). Live-smoke after deploy, always (`scripts/smoke-dev.ts`).
 - **TEST_JWKS** in workers/vault auth is double-gated on `ENVIRONMENT="test"` — never set that in a deployed config.
-- Dev deploy state: both workers live in the **Unforced Development** CF account (workers.dev, PATH routing `/vault/<name>/*`); the real parachute.computer account + `*.u.parachute.computer` wildcard routing come later. Dev login: `dev@parachute.computer`, password in `workers/identity/.dev-secrets` (gitignored).
+- Dev deploy state: both workers live in the **Unforced Development** CF account on **branded Custom Domains** (the `parachute.computer` zone is in this account). **Console + OAuth issuer: `https://cloud.parachute.computer`** (`iss` = this origin); **vaults: `https://u.parachute.computer/vault/<name>/…`** (path routing — per-vault subdomains need proxied wildcard DNS, Enterprise-gated + a dns-edit token; see TRYIT). workers.dev URLs still resolve as a fallback. A **self-serve console** (`/signup`, `/login`, `/console`) creates accounts + vaults; **vault ownership is enforced at the issuer** (`vaults` table in D1 — a user mints `vault:<name>:*` only for a vault they own). Dev login: `dev@parachute.computer` (owns the grandfathered `demo` vault), password in `workers/identity/.dev-secrets` (gitignored).
 
 ## Critical rule: shared core + shared wire contract, forked runtime
 

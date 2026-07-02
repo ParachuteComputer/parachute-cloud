@@ -15,10 +15,28 @@ export interface OAuthDeps {
   issuer: string;
   /** Cloud vault addressing base: `vault:<name>` → `https://<name>.<base>`. */
   vaultBaseDomain: string;
+  /**
+   * When set, the vault worker is reached by PATH on this origin
+   * (`<vaultOrigin>/vault/<name>`) instead of the subdomain form — the dev
+   * (workers.dev) mode where there's no wildcard cert. Unset → subdomain form.
+   */
+  vaultOrigin?: string;
   /** Deterministic clock for tests. */
   now?: () => Date;
   /** Origins the issuer answers on (same-origin + resource resolution). Default `[issuer]`. */
   boundOrigins?: () => readonly string[];
+}
+
+/**
+ * The public base URL a client uses to reach a vault instance. Path form when
+ * `vaultOrigin` is configured (dev/workers.dev), subdomain form otherwise
+ * (prod). The single source of truth for both the services catalog and the
+ * console's connect cards, so they never disagree about where a vault lives.
+ */
+export function vaultInstanceUrl(name: string, deps: OAuthDeps): string {
+  if (deps.vaultOrigin) return `${deps.vaultOrigin.replace(/\/$/, "")}/vault/${name}`;
+  const base = deps.vaultBaseDomain.replace(/^\.+/, "");
+  return `https://${name}.${base}`;
 }
 
 export function resolveBoundOrigins(deps: OAuthDeps): readonly string[] {
@@ -116,9 +134,8 @@ export function buildServicesCatalog(scopes: readonly string[], deps: OAuthDeps)
     }
   }
   const catalog: ServicesCatalog = {};
-  const base = deps.vaultBaseDomain.replace(/^\.+/, "");
   for (const name of namedVaults) {
-    const url = `https://${name}.${base}`;
+    const url = vaultInstanceUrl(name, deps);
     catalog[`vault:${name}`] = { url, version: "cloud" };
     if (!catalog.vault) catalog.vault = { url, version: "cloud" };
   }

@@ -8,6 +8,7 @@ import { randomBase64url, sha256Base64url, sha256Hex } from "../src/crypto.ts";
 import { registerClient } from "../src/clients.ts";
 import { issueAuthCode } from "../src/auth-codes.ts";
 import { createUser } from "../src/users.ts";
+import { namedVaultsInScopes } from "../src/vaults.ts";
 import { SESSION_COOKIE, createSession } from "../src/sessions.ts";
 import { handleToken } from "../src/oauth-token.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
@@ -109,6 +110,18 @@ export async function seedUser(email = "owner@example.com", password = "correct 
   return { id: user.id };
 }
 
+/**
+ * Grant `ownerUserId` ownership of vault `name` directly (bypassing the
+ * slug/reserved validation in createVault — tests exercise arbitrary names).
+ * Idempotent. Ownership is now a precondition for minting a `vault:<name>:*`
+ * token, so the mint helpers + authorize tests seed it for the user.
+ */
+export async function seedVault(name: string, ownerUserId: string): Promise<void> {
+  await env.DB.prepare("INSERT OR IGNORE INTO vaults (name, owner_user_id, created_at) VALUES (?, ?, ?)")
+    .bind(name.toLowerCase(), ownerUserId, new Date().toISOString())
+    .run();
+}
+
 export async function seedApprovedClient(
   opts: { redirectUris?: string[]; confidential?: boolean; clientName?: string } = {},
 ): Promise<{ clientId: string; clientSecret: string | null }> {
@@ -146,6 +159,9 @@ export async function mintInitialPair(
   opts: { scope?: string; extra?: Record<string, string>; now?: () => Date } = {},
 ): Promise<TokenPair> {
   const scope = opts.scope ?? "vault:default:read";
+  // Minting now requires the subject to own each named vault in the scope; a
+  // legitimate mint implies ownership, so seed it for the user.
+  for (const vname of namedVaultsInScopes(scope.split(" "))) await seedVault(vname, userId);
   const { verifier, challenge } = await makePkce();
   const code = await issueAuthCode(env.DB, {
     clientId,

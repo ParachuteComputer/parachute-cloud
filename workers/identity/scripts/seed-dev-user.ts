@@ -54,15 +54,26 @@ function readSecrets(): { email: string; password: string } {
   return { email, password };
 }
 
+// A STABLE dev-user id (not randomUUID): re-seeding must not change the id, or
+// it orphans the grandfathered `demo` vault ownership + any dev tokens/sessions.
+const DEV_USER_ID = "0de1d1de-c0de-4000-8000-000000000001";
+
 const { email, password } = readSecrets();
 const passwordHash = await hashPassword(password);
-const id = crypto.randomUUID();
 const createdAt = new Date().toISOString();
 const esc = (s: string) => s.replace(/'/g, "''");
 
+// Grandfather the existing `demo` vault (used by scripts/smoke-dev.ts + TRYIT)
+// to the dev user. `demo` is a RESERVED name (vaults.ts) so it can't be claimed
+// via the console — this seed is the only way it gets an owner, which keeps the
+// dev smoke's demo vault mintable now that ownership is enforced. A migration
+// can't do this: the dev user's id isn't known at migration time (migrations run
+// before this seed on the deployed D1).
 const sql = `-- DEV-ONLY generated seed — do not commit. Regenerate with \`bun run seed:dev\`.
 INSERT OR REPLACE INTO users (id, email, password_hash, created_at)
-VALUES ('${esc(id)}', '${esc(email)}', '${esc(passwordHash)}', '${esc(createdAt)}');
+VALUES ('${esc(DEV_USER_ID)}', '${esc(email)}', '${esc(passwordHash)}', '${esc(createdAt)}');
+INSERT OR REPLACE INTO vaults (name, owner_user_id, created_at)
+VALUES ('demo', '${esc(DEV_USER_ID)}', '${esc(createdAt)}');
 `;
 writeFileSync(join(HERE, "seed-dev-user.sql"), sql);
-console.log(`Wrote scripts/seed-dev-user.sql for user ${email}`);
+console.log(`Wrote scripts/seed-dev-user.sql for user ${email} (owns vault "demo")`);

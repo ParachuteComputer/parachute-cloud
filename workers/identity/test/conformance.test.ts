@@ -32,6 +32,7 @@ import {
   seedApprovedClient,
   seedSession,
   seedUser,
+  seedVault,
   tokenReq,
 } from "./helpers.ts";
 
@@ -151,6 +152,7 @@ describe("token — authorization_code grant", () => {
 
   test("auth code is single-use (replay → invalid_grant)", async () => {
     const { id: userId } = await seedUser();
+    await seedVault("default", userId);
     const { clientId } = await seedApprovedClient();
     const { verifier, challenge } = await makePkce();
     const { issueAuthCode } = await import("../src/auth-codes.ts");
@@ -386,6 +388,7 @@ describe("aud narrowing", () => {
 
   test("broad scope + vault= hint narrows through consent to vault:<name>:<verb>, aud vault.<name>", async () => {
     const { id: userId } = await seedUser();
+    await seedVault("work", userId);
     const { clientId } = await seedApprovedClient();
     const sessionId = await seedSession(userId);
     const { verifier, challenge } = await makePkce();
@@ -420,6 +423,7 @@ describe("aud narrowing", () => {
 
   test("resource= subdomain narrows to that vault", async () => {
     const { id: userId } = await seedUser();
+    await seedVault("jon", userId);
     const { clientId } = await seedApprovedClient();
     const sessionId = await seedSession(userId);
     const { verifier, challenge } = await makePkce();
@@ -587,7 +591,8 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
   });
 
   test("login submit with correct credentials proceeds to consent", async () => {
-    await seedUser("login@example.com", "hunter2");
+    const { id: loginUserId } = await seedUser("login@example.com", "hunter2");
+    await seedVault("default", loginUserId);
     const { clientId } = await seedApprovedClient({ clientName: "Claude" });
     const { challenge } = await makePkce();
     const res = await handleAuthorizePost(
@@ -636,6 +641,7 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
 
   test("consent approve → 302 with code; deny → 302 access_denied", async () => {
     const { id: userId } = await seedUser();
+    await seedVault("default", userId);
     const { clientId } = await seedApprovedClient();
     const sessionId = await seedSession(userId);
     const { challenge } = await makePkce();
@@ -658,6 +664,7 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
 
   test("prior grant skips consent (302 with code directly on GET)", async () => {
     const { id: userId } = await seedUser();
+    await seedVault("default", userId);
     const { clientId } = await seedApprovedClient();
     const sessionId = await seedSession(userId);
     const { challenge } = await makePkce();
@@ -768,6 +775,7 @@ describe("E2E through the router: DCR → authorize → consent → token", () =
     await approveClient(env.DB, reg.client_id);
 
     const userId = await userIdFor("e2e@example.com");
+    await seedVault("default", userId);
     const sessionId = await seedSession(userId);
     const { verifier, challenge } = await makePkce();
     // 2. Consent → code.

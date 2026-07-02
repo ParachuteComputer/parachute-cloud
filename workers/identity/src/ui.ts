@@ -42,25 +42,48 @@ function hiddenParams(p: AuthorizeParams): string {
   return fields.map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`).join("\n");
 }
 
+// Brand basics: Instrument Serif display headings, DM Sans body, a calm sage
+// palette. Fonts load from Google with a system fallback stack, so the page is
+// fully usable if the font request is blocked (the OAuth surfaces stay robust).
+const FONT_LINK =
+  '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=Instrument+Serif&display=swap" rel="stylesheet">';
+
 const STYLE = `
-  body{font-family:system-ui,-apple-system,sans-serif;max-width:26rem;margin:4rem auto;padding:0 1.25rem;color:#1a1a1a;line-height:1.5}
-  h1{font-size:1.35rem;margin:0 0 1rem}
-  .card{border:1px solid #e3e3e3;border-radius:12px;padding:1.5rem}
-  label{display:block;font-size:.85rem;font-weight:600;margin:.75rem 0 .25rem}
-  input[type=email],input[type=password],input[type=text]{width:100%;padding:.55rem .65rem;border:1px solid #ccc;border-radius:8px;font-size:1rem;box-sizing:border-box}
-  button{font-size:1rem;padding:.6rem 1rem;border-radius:8px;border:0;cursor:pointer}
-  .primary{background:#111;color:#fff;width:100%;margin-top:1rem}
-  .row{display:flex;gap:.5rem;margin-top:1rem}
+  :root{--bg:#f4f6f1;--card:#fff;--ink:#2b332a;--muted:#6a7566;--line:#dde3d6;--sage:#5f7a57;--sage-dark:#4c6547;--danger:#a5372b}
+  *{box-sizing:border-box}
+  body{font-family:"DM Sans",system-ui,-apple-system,sans-serif;background:var(--bg);max-width:30rem;margin:0 auto;padding:3.5rem 1.25rem;color:var(--ink);line-height:1.55}
+  a{color:var(--sage-dark)}
+  .brand{font-family:"Instrument Serif",Georgia,serif;font-size:1.15rem;color:var(--sage-dark);letter-spacing:.01em;margin:0 0 1.5rem;text-align:center}
+  h1{font-family:"Instrument Serif",Georgia,serif;font-weight:400;font-size:1.9rem;line-height:1.15;margin:0 0 .35rem}
+  h2{font-family:"Instrument Serif",Georgia,serif;font-weight:400;font-size:1.3rem;margin:0 0 .5rem}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1.6rem;margin-bottom:1.1rem}
+  label{display:block;font-size:.82rem;font-weight:600;margin:.85rem 0 .3rem;color:var(--ink)}
+  input[type=email],input[type=password],input[type=text]{width:100%;padding:.6rem .7rem;border:1px solid var(--line);border-radius:9px;font-size:1rem;background:#fcfdfb;font-family:inherit}
+  input:focus{outline:2px solid var(--sage);outline-offset:0;border-color:var(--sage)}
+  button{font-size:1rem;font-family:inherit;padding:.62rem 1rem;border-radius:9px;border:0;cursor:pointer}
+  .primary{background:var(--sage);color:#fff;width:100%;margin-top:1.1rem;font-weight:600}
+  .primary:hover{background:var(--sage-dark)}
+  .row{display:flex;gap:.6rem;margin-top:1.1rem}
   .row button{flex:1}
-  .deny{background:#f2f2f2;color:#333}
+  .deny{background:#eef0ea;color:var(--ink)}
   .scopes{list-style:none;padding:0;margin:1rem 0}
-  .scopes li{padding:.4rem .6rem;background:#f6f6f6;border-radius:6px;margin-bottom:.35rem;font-size:.9rem}
-  .muted{color:#666;font-size:.85rem}
-  .err{color:#b00020;font-size:.9rem;margin-top:.5rem}
+  .scopes li{padding:.5rem .7rem;background:#eff3ea;border-radius:8px;margin-bottom:.4rem;font-size:.92rem}
+  .muted{color:var(--muted);font-size:.86rem}
+  .err{color:var(--danger);font-size:.9rem;margin-top:.6rem}
+  .notice{background:#eaf2e6;border:1px solid #cfe0c4;color:var(--sage-dark);padding:.7rem .9rem;border-radius:9px;font-size:.9rem;margin-bottom:1rem}
+  .vault{border:1px solid var(--line);border-radius:11px;padding:1rem 1.1rem;margin-bottom:.9rem;background:#fcfdfb}
+  .vault h3{margin:0 0 .5rem;font-size:1.05rem;font-family:"DM Sans",sans-serif;font-weight:600}
+  .field{margin:.55rem 0}
+  .field .k{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:.15rem}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem}
+  pre{background:#eef1ea;border:1px solid var(--line);border-radius:8px;padding:.6rem .7rem;overflow-x:auto;margin:.15rem 0 0;white-space:pre-wrap;word-break:break-all}
+  .foot{margin-top:1.4rem;text-align:center}
+  .linkbtn{background:none;border:0;color:var(--sage-dark);text-decoration:underline;cursor:pointer;font-size:.9rem;padding:0}
+  form.inline{display:inline}
 `;
 
 function page(title: string, inner: string): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${STYLE}</style></head><body>${inner}</body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>${FONT_LINK}<style>${STYLE}</style></head><body><div class="brand">Parachute</div>${inner}</body></html>`;
 }
 
 export function renderLogin(opts: { params: AuthorizeParams; csrfToken: string; error?: string }): string {
@@ -143,5 +166,105 @@ export function renderError(opts: { title: string; message: string }): string {
   return page(
     opts.title,
     `<h1>${esc(opts.title)}</h1><div class="card"><p>${esc(opts.message)}</p></div>`,
+  );
+}
+
+// --- console (accounts + vaults) ------------------------------------------
+
+/** Signup — create a cloud account. Posts to /signup. */
+export function renderSignup(opts: { csrfToken: string; error?: string; email?: string }): string {
+  const { csrfToken, error, email } = opts;
+  return page(
+    "Create your account — Parachute",
+    `<h1>Create your account</h1>
+     <p class="muted" style="margin:0 0 1.1rem">A vault of your own, hosted. Free while in beta — no card needed.</p>
+     <div class="card">
+       <form method="post" action="/signup">
+         <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+         <label for="email">Email</label>
+         <input id="email" name="email" type="email" autocomplete="username" value="${esc(email ?? "")}" required autofocus>
+         <label for="password">Password</label>
+         <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+         <p class="muted" style="margin:.35rem 0 0">At least 8 characters.</p>
+         ${error ? `<div class="err">${esc(error)}</div>` : ""}
+         <button class="primary" type="submit">Create account</button>
+       </form>
+     </div>
+     <div class="foot"><span class="muted">Already have an account?</span> <a href="/login">Sign in</a></div>`,
+  );
+}
+
+/** Console login (standalone, distinct from the OAuth authorize login). */
+export function renderConsoleLogin(opts: { csrfToken: string; error?: string; email?: string }): string {
+  const { csrfToken, error, email } = opts;
+  return page(
+    "Sign in — Parachute",
+    `<h1>Sign in</h1>
+     <div class="card">
+       <form method="post" action="/login">
+         <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+         <label for="email">Email</label>
+         <input id="email" name="email" type="email" autocomplete="username" value="${esc(email ?? "")}" required autofocus>
+         <label for="password">Password</label>
+         <input id="password" name="password" type="password" autocomplete="current-password" required>
+         ${error ? `<div class="err">${esc(error)}</div>` : ""}
+         <button class="primary" type="submit">Sign in</button>
+       </form>
+     </div>
+     <div class="foot"><span class="muted">New here?</span> <a href="/signup">Create an account</a></div>`,
+  );
+}
+
+export interface ConsoleVaultCard {
+  name: string;
+  mcpUrl: string;
+  restUrl: string;
+  connectCmd: string;
+}
+
+export interface ConsoleProps {
+  email: string;
+  vaults: ConsoleVaultCard[];
+  csrfToken: string;
+  error?: string;
+  notice?: string;
+}
+
+function vaultCard(v: ConsoleVaultCard): string {
+  return `<div class="vault">
+    <h3>${esc(v.name)}</h3>
+    <div class="field"><div class="k">Connect Claude Code</div><pre>${esc(v.connectCmd)}</pre></div>
+    <div class="field"><div class="k">MCP endpoint</div><pre>${esc(v.mcpUrl)}</pre></div>
+    <div class="field"><div class="k">REST base</div><pre>${esc(v.restUrl)}</pre></div>
+  </div>`;
+}
+
+/** The console: my vaults + a create form + per-vault connect cards. */
+export function renderConsole(props: ConsoleProps): string {
+  const { email, vaults, csrfToken, error, notice } = props;
+  const list =
+    vaults.length > 0
+      ? vaults.map(vaultCard).join("\n")
+      : `<p class="muted">No vaults yet. Create your first one below.</p>`;
+  return page(
+    "Console — Parachute",
+    `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">
+       <h1 style="margin:0">Your vaults</h1>
+       <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}"><button class="linkbtn" type="submit">Sign out</button></form>
+     </div>
+     <p class="muted" style="margin:.15rem 0 1.2rem">${esc(email)}</p>
+     ${notice ? `<div class="notice">${esc(notice)}</div>` : ""}
+     ${list}
+     <div class="card">
+       <h2>Create a vault</h2>
+       <form method="post" action="/console/vaults">
+         <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+         <label for="name">Vault name</label>
+         <input id="name" name="name" type="text" placeholder="e.g. field-notes" pattern="[a-z0-9][a-z0-9-]{1,62}" required>
+         <p class="muted" style="margin:.35rem 0 0">Lowercase letters, numbers, and hyphens. 2–63 characters.</p>
+         ${error ? `<div class="err">${esc(error)}</div>` : ""}
+         <button class="primary" type="submit">Create vault</button>
+       </form>
+     </div>`,
   );
 }

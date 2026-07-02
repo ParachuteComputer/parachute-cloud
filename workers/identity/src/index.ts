@@ -8,6 +8,15 @@
  */
 import { Hono } from "hono";
 import type { Env } from "./env.ts";
+import {
+  handleConsoleGet,
+  handleCreateVaultPost,
+  handleLoginGet,
+  handleLoginPost,
+  handleLogoutPost,
+  handleSignupGet,
+  handleSignupPost,
+} from "./console.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
 import {
   authorizationServerMetadata,
@@ -26,6 +35,7 @@ function depsFor(env: Env): OAuthDeps {
   return {
     issuer,
     vaultBaseDomain: env.VAULT_BASE_DOMAIN,
+    vaultOrigin: env.VAULT_ORIGIN,
     boundOrigins: () => [issuer],
   };
 }
@@ -46,6 +56,16 @@ app.post("/oauth/token", (c) => handleToken(c.env.DB, c.req.raw, depsFor(c.env))
 app.post("/oauth/register", (c) => handleRegister(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/oauth/revoke", (c) => handleRevoke(c.env.DB, c.req.raw, depsFor(c.env)));
 
-app.get("/", (c) => c.text("parachute-identity — cloud OAuth issuer", 200));
+// --- console (accounts + vaults) ---
+app.get("/signup", (c) => handleSignupGet(c.req.raw));
+app.post("/signup", (c) => handleSignupPost(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/login", (c) => handleLoginGet(c.req.raw));
+app.post("/login", (c) => handleLoginPost(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/logout", (c) => handleLogoutPost(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/console", (c) => handleConsoleGet(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/console/vaults", (c) => handleCreateVaultPost(c.env.DB, c.req.raw, depsFor(c.env)));
+
+// Root → the console (which redirects to /login when signed out).
+app.get("/", (c) => c.redirect("/console", 302));
 
 export default app;
