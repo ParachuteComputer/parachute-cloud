@@ -299,6 +299,34 @@ describe("token — refresh rotation, replay, grace, family revocation", () => {
     expect(await liveRefreshCount(family)).toBe(0);
   });
 
+  test("grace: an already-forked family (multiple live tips) does NOT take the grace path — family revoked", async () => {
+    const { signRefreshToken } = await import("../src/tokens.ts");
+    const { id: userId } = await seedUser();
+    const { clientId } = await seedApprovedClient();
+    const pair = await mintInitialPair(clientId, userId);
+    const family = await familyIdFor(pair.refresh_token);
+    const t0 = new Date("2026-06-24T00:00:00Z");
+    const r1 = await refreshAt(clientId, pair.refresh_token, t0);
+    expect(r1.status).toBe(200);
+    expect(await liveRefreshCount(family)).toBe(1);
+    // Inject a SECOND live refresh row into the same family (a family already
+    // forked into multiple live lineages — a compromised state). Now the single-
+    // live-tip check fails, so the immediate-predecessor grace can't apply.
+    await signRefreshToken(env.DB, {
+      jti: "injected-fork-jti",
+      userId,
+      clientId,
+      scopes: ["vault:default:read"],
+      familyId: family,
+      now: () => t0,
+    });
+    expect(await liveRefreshCount(family)).toBe(2);
+    const replay = await refreshAt(clientId, pair.refresh_token, new Date(t0.getTime() + 1_000));
+    expect(replay.status).toBe(400);
+    expect(((await replay.json()) as Record<string, unknown>).error).toBe("invalid_grant");
+    expect(await liveRefreshCount(family)).toBe(0);
+  });
+
   test("refresh: client_id mismatch → invalid_grant; unknown refresh_token → invalid_grant", async () => {
     const { id: userId } = await seedUser();
     const { clientId } = await seedApprovedClient();
