@@ -1,0 +1,22 @@
+{
+  "name": "@openparachute/vault-do",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Phase-0 spike: @openparachute/core (vault-core) on Durable Object SQLite behind a Database-shaped shim.",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@openparachute/core": "file:../../../parachute-vault/core"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.8.57",
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "typescript": "^5.6.0",
+    "vitest": "~3.2.0",
+    "wrangler": "^4.26.0"
+  }
+}

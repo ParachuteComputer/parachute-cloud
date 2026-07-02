@@ -1,0 +1,22 @@
+# Phase-0 spike Worker: vault-core on Durable Object SQLite.
+# Not deployed — driven by @cloudflare/vitest-pool-workers inside workerd.
+name = "parachute-vault-do-spike"
+main = "src/index.ts"
+compatibility_date = "2025-07-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name = "VAULT"
+class_name = "VaultDO"
+
+# SQLite-backed DO — required for ctx.storage.sql.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VaultDO"]
+
+# The spike's 100k-note FTS corpus can exceed the default 30s CPU budget in a
+# single message; raise the ceiling so the measurement completes. (In prod the
+# budget resets per incoming message — chunked imports need neither this nor
+# alarms; see design §8 risk 4.)
+[limits]
+cpu_ms = 300000
