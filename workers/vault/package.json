@@ -7,7 +7,8 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:bundle": "bun scripts/verify-bundle.mjs"
   },
   "dependencies": {
     "@openparachute/core": "file:../../../parachute-vault/core",

@@ -1,7 +1,7 @@
 # Cloud Identity Worker — the authorization server for cloud vaults.
 # Reproduces the hub's OAuth issuer contract (authorize / token / register /
-# revoke / JWKS / revocation-list) on Workers + D1. Not deployed by this PR —
-# integration + deploy happen after the spike PR merges (Phase 3 → 5).
+# revoke / JWKS / revocation-list) on Workers + D1. DEPLOYED to the Unforced
+# Development account (Phase 5a, 2026-07-02) — see scripts/deploy-dev.sh + TRYIT-2026-07-02.md.
 name = "parachute-identity"
 main = "src/index.ts"
 compatibility_date = "2025-07-01"
@@ -9,16 +9,22 @@ compatibility_flags = ["nodejs_compat"]
 
 # Control-plane state: users, clients, auth_codes, tokens, grants, sessions,
 # signing_keys. The revocation list is DERIVED from the tokens table (exactly
-# like the hub) — no separate KV needed.
+# like the hub) — no separate KV needed. database_id is the real D1 in the
+# Unforced Development CF account (`wrangler d1 create parachute-cloud-identity`
+# → database_name parachute-identity). vitest ignores it (local D1 simulation by
+# binding name); the real deploy connects to it.
 [[d1_databases]]
 binding = "DB"
 database_name = "parachute-identity"
-database_id = "00000000-0000-0000-0000-000000000000" # placeholder; real id on deploy
+database_id = "893b353e-697a-407b-8fd9-5e1ce440135a"
 migrations_dir = "migrations"
 
 [vars]
 # The issuer origin — every token's `iss`, and the base for the discovery
-# endpoints. Overridden per-environment on deploy.
+# endpoints. This is the prod DEFAULT; the conformance corpus pins md.issuer to
+# it, so it stays fixed here. The dev deploy OVERRIDES it to the worker's own
+# workers.dev URL at deploy time via `--var ISSUER:<url>` (scripts/deploy-dev.sh)
+# — a cloud vault has no hub, so `iss` must equal the deployed issuer's origin.
 ISSUER = "https://id.parachute.computer"
 # Cloud addressing: a `vault:<name>:<verb>` scope resolves its service-catalog
 # URL to `https://<name>.<VAULT_BASE_DOMAIN>` (design §3.2 / §3.4).
