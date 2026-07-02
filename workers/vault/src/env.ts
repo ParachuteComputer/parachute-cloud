@@ -16,6 +16,9 @@ export interface Env {
   /** Default per-tenant storage cap in bytes (string in wrangler vars). */
   CAP_BYTES?: string;
 
+  /** Deploy environment. TEST_JWKS is honored only when this is "test". */
+  ENVIRONMENT?: string;
+
   /**
    * Server-wide operator bearer (optional). Mirrors bun-vault's
    * VAULT_AUTH_TOKEN: a matching bearer authenticates as admin against any

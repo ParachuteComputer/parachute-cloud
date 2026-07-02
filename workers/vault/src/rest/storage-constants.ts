@@ -64,11 +64,17 @@ export const MIME_TYPES: Record<string, string> = {
   ".zip": "application/zip",
 };
 
-/** Lowercased extension of a filename (incl. leading dot), or "". */
+/**
+ * Lowercased extension of a filename (incl. leading dot), or "". Matches
+ * node:path `extname` semantics on the trailing-dot-stripped name (routes.ts
+ * does `extname(name.replace(/[.\s]+$/, ""))`): a dot at position 0 of the
+ * basename (a dotfile like `.html`) yields "" — NOT a blocked extension —
+ * exactly as the bun vault treats it.
+ */
 export function extLower(name: string): string {
   const base = name.replace(/[.\s]+$/, "");
   const slash = base.lastIndexOf("/");
   const dot = base.lastIndexOf(".");
-  if (dot <= slash || dot < 0) return "";
+  if (dot <= slash + 1) return ""; // no dot, or a dotfile (dot leads the basename)
   return base.slice(dot).toLowerCase();
 }

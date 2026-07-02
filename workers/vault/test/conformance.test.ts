@@ -425,6 +425,48 @@ describe("storage — R2 round-trip + caps", () => {
     expect(res.status).toBe(413);
     expect((await res.json() as any).error_type).toBe("storage_cap_exceeded");
   });
+
+  it("orphan attachment delete frees the storage meter (cap 413 clears)", async () => {
+    const v = freshVault();
+    // Upload a ~1.5MB object, attach it to a note, then delete the attachment.
+    // The orphan-delete must decrement the meter — otherwise a second ~1.5MB
+    // upload would push the (phantom) total over the 2MB cap.
+    const oneAndHalf = new Uint8Array(Math.floor(1.5 * 1024 * 1024));
+    const form1 = new FormData();
+    form1.set("file", new File([oneAndHalf], "a.pdf", { type: "application/pdf" }));
+    const up1 = (await (await op(v, "/api/storage/upload", { method: "POST", body: form1 })).json()) as any;
+
+    const note = await createNote(v, { content: "carries an attachment" });
+    const attRes = await op(v, `/api/notes/${note.id}/attachments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: up1.path, mimeType: "application/pdf" }),
+    });
+    expect(attRes.status).toBe(201);
+    const att = (await attRes.json()) as any;
+
+    const del = await op(v, `/api/notes/${note.id}/attachments/${att.id}`, { method: "DELETE" });
+    expect(del.status).toBe(204);
+
+    // Meter should be back near baseline → a second 1.5MB upload succeeds.
+    const form2 = new FormData();
+    form2.set("file", new File([oneAndHalf], "b.pdf", { type: "application/pdf" }));
+    const up2 = await op(v, "/api/storage/upload", { method: "POST", body: form2 });
+    expect(up2.status).toBe(201);
+  });
+});
+
+describe("delete paths", () => {
+  it("DELETE /api/notes/{id} → { deleted:true, id }", async () => {
+    const v = freshVault();
+    const n = await createNote(v, { content: "to delete" });
+    const res = await op(v, `/api/notes/${n.id}`, { method: "DELETE" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body).toEqual({ deleted: true, id: n.id });
+    const check = await op(v, `/api/notes/${n.id}`);
+    expect(check.status).toBe(404);
+  });
 });
 
 describe("routing", () => {

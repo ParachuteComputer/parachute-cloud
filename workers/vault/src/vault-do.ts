@@ -134,7 +134,7 @@ export class VaultDO extends DurableObject {
     }
 
     const writeCtx = { actor: auth.actor, via: auth.via };
-    const deps: RestDeps = { vaultName, attachments: this.env.ATTACHMENTS };
+    const deps: RestDeps = { vaultName, deleteObject: (rel) => this.deleteObject(vaultName, rel) };
 
     // Cap gate for byte-growing writes (POST/PATCH/PUT). DELETE is exempt so a
     // tenant at the cap can always delete their way back under it. Storage
@@ -180,7 +180,14 @@ export class VaultDO extends DurableObject {
     return json({ error: "Not found" }, 404);
   }
 
-  /** Load persisted config + R2 meter into memory (once per warm DO). */
+  /**
+   * Load persisted config + R2 meter into memory (once per warm DO). A benign
+   * double-cold-start race exists — two concurrent first-requests can each write
+   * a default config, last write winning on `createdAt`. Harmless for a
+   * single-tenant DO (both defaults are equivalent bar a millisecond); a real
+   * write only lands via the config `put` after this, and note/meter state is
+   * authoritative in SQLite/the meter row regardless.
+   */
   private async ensureState(vaultName: string): Promise<void> {
     if (this.stateLoaded) {
       // A DO id is 1:1 with a name, but keep config.name honest if the first
@@ -224,6 +231,19 @@ export class VaultDO extends DurableObject {
   private async meterSub(bytes: number): Promise<void> {
     this.r2Bytes = Math.max(0, this.r2Bytes - bytes);
     await this.ctx.storage.put(R2_METER_KEY, this.r2Bytes);
+  }
+
+  /**
+   * Delete an attachment's R2 object and decrement the storage meter by its
+   * actual size. Called from the notes handler's orphan-delete path. `head`
+   * first so the meter tracks freed bytes; both operations live here so the
+   * meter is never mutated from outside the DO.
+   */
+  private async deleteObject(vaultName: string, relativePath: string): Promise<void> {
+    const key = r2Key(vaultName, relativePath);
+    const head = await this.env.ATTACHMENTS.head(key);
+    await this.env.ATTACHMENTS.delete(key);
+    if (head) await this.meterSub(head.size);
   }
 
   /** POST /api/storage/upload · GET /api/storage/<date>/<file> — R2-backed. */

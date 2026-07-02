@@ -106,15 +106,20 @@ let cachedGuard: { key: string; guard: ReturnType<typeof createScopeGuard> } | u
 
 function getGuard(env: Env) {
   const issuer = (env.ISSUER_ORIGIN ?? "").replace(/\/$/, "");
-  const key = `${issuer}::${env.TEST_JWKS ? "test" : "prod"}`;
+  // TEST_JWKS is honored ONLY under ENVIRONMENT="test". Gating on presence alone
+  // would make a stray production var a silent auth bypass (the private key is
+  // in git) — so a prod deploy that never sets ENVIRONMENT ignores TEST_JWKS and
+  // always fetches real keys from ISSUER_ORIGIN.
+  const testMode = !!env.TEST_JWKS && env.ENVIRONMENT === "test";
+  const key = `${issuer}::${testMode ? "test" : "prod"}`;
   if (cachedGuard && cachedGuard.key === key) return cachedGuard.guard;
-  const guard = env.TEST_JWKS
+  const guard = testMode
     ? createScopeGuard({
         hubOrigin: issuer,
         // Static key set + empty revocation list — the auth matrix runs without
         // a live Identity Worker. createLocalJWKSet lacks jose's remote `.reload`
         // escape hatch; scope-guard's forced-reload no-ops when it's absent.
-        jwksGetter: createLocalJWKSet(JSON.parse(env.TEST_JWKS)) as unknown as JwksGetter,
+        jwksGetter: createLocalJWKSet(JSON.parse(env.TEST_JWKS!)) as unknown as JwksGetter,
         revocationFetcher: async () => ({ generated_at: new Date().toISOString(), jtis: [] }),
       })
     : createScopeGuard({ hubOrigin: issuer, jwksOrigin: issuer });

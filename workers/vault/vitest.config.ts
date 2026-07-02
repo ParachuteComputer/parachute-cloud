@@ -47,6 +47,7 @@ export default defineWorkersConfig({
           // shape/R2/caps tests use; CAP_BYTES is deliberately small so the
           // caps 413 is reachable with a modest upload.
           bindings: {
+            ENVIRONMENT: "test",
             ISSUER_ORIGIN: "https://id.test.example",
             VAULT_BASE_DOMAIN: "u.parachute.computer",
             CAP_BYTES: "2000000",

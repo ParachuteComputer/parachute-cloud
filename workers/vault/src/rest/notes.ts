@@ -57,8 +57,12 @@ import {
 } from "./tag-scope.js";
 import { logStrictBypass } from "./shims.js";
 
-/** Runtime deps a handler needs beyond the store (R2 for attachment bytes). */
-export type RestDeps = { vaultName: string; attachments: R2Bucket };
+/**
+ * Runtime deps a handler needs beyond the store. `deleteObject` is provided by
+ * the DO so the R2 delete AND the storage-meter decrement stay together in the
+ * one place that owns the meter (see VaultDO.deleteObject).
+ */
+export type RestDeps = { vaultName: string; deleteObject: (relativePath: string) => Promise<void> };
 
 /** Strict-schema gate — mirrors routes.ts:gateStrictWrite (bun#299). */
 function gateStrictWrite(
@@ -497,9 +501,10 @@ async function handleNotesInner(
       const result = await store.deleteAttachment(note.id, attId);
       if (!result.deleted) return json({ error: "Not found" }, 404);
       // Orphan-delete the R2 object only when no other attachment references it
-      // (bun unlinks the fs file here; cloud deletes the R2 key).
+      // (bun unlinks the fs file here; cloud deletes the R2 key AND decrements
+      // the storage meter — deleteObject owns both, see VaultDO.deleteObject).
       if (result.path && result.orphaned) {
-        try { await deps.attachments.delete(r2Key(deps.vaultName, result.path)); } catch {}
+        try { await deps.deleteObject(result.path); } catch {}
       }
       return new Response(null, { status: 204 });
     }
