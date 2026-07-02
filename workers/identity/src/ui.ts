@@ -396,6 +396,8 @@ export function renderSecurity(props: SecurityProps): string {
 
 export interface ConsoleVaultCard {
   name: string;
+  /** Notes-PWA deep link (`/?add=<vault URL>`) — the card's primary action. */
+  notesUrl: string;
   mcpUrl: string;
   restUrl: string;
   connectCmd: string;
@@ -410,13 +412,28 @@ export interface ConsoleProps {
 }
 
 function vaultCard(v: ConsoleVaultCard): string {
+  // Primary door: the Notes PWA connect deep-link. The CLI/MCP coordinates
+  // stay one disclosure below — demoted from the headline, not removed.
   return `<div class="vault">
     <h3>${esc(v.name)}</h3>
-    <div class="field"><div class="k">Connect Claude Code</div><pre>${esc(v.connectCmd)}</pre></div>
-    <div class="field"><div class="k">MCP endpoint</div><pre>${esc(v.mcpUrl)}</pre></div>
-    <div class="field"><div class="k">REST base</div><pre>${esc(v.restUrl)}</pre></div>
+    <a class="primary" href="${esc(v.notesUrl)}" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none;padding:.62rem 1rem;margin-top:.6rem">Open your notes &rarr;</a>
+    <details>
+      <summary>Connect your AI</summary>
+      <div class="field"><div class="k">Connect Claude Code</div><pre>${esc(v.connectCmd)}</pre></div>
+      <div class="field"><div class="k">MCP endpoint</div><pre>${esc(v.mcpUrl)}</pre></div>
+      <div class="field"><div class="k">REST base</div><pre>${esc(v.restUrl)}</pre></div>
+    </details>
   </div>`;
 }
+
+/**
+ * Browser-hint pattern for the vault-name input. Chrome compiles `pattern`
+ * with the RegExp `v` flag, which REJECTS an unescaped hyphen inside a
+ * character class — `[a-z0-9-]` throws at compile time and the attribute is
+ * silently ignored (console error). The `\\` here emits a literal `\-` into
+ * the HTML. Cosmetic only: vaults.ts server validation is the real gate.
+ */
+const VAULT_NAME_PATTERN = "[a-z0-9][a-z0-9\\-]{1,62}";
 
 /** The console: my vaults + a create form + per-vault connect cards. */
 export function renderConsole(props: ConsoleProps): string {
@@ -440,7 +457,7 @@ export function renderConsole(props: ConsoleProps): string {
        <form method="post" action="/console/vaults">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
          <label for="name">Vault name</label>
-         <input id="name" name="name" type="text" placeholder="e.g. field-notes" pattern="[a-z0-9][a-z0-9-]{1,62}" required>
+         <input id="name" name="name" type="text" placeholder="e.g. field-notes" pattern="${VAULT_NAME_PATTERN}" required>
          <p class="muted" style="margin:.35rem 0 0">Lowercase letters, numbers, and hyphens. 2–63 characters.</p>
          ${error ? `<div class="err">${esc(error)}</div>` : ""}
          <button class="primary" type="submit">Create vault</button>

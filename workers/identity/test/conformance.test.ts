@@ -105,6 +105,21 @@ describe("token — authorization_code grant", () => {
     // Cloud services catalog: vault → https://<name>.u.parachute.computer.
     expect(pair.services.vault?.url).toBe("https://default.u.parachute.computer");
     expect(pair.services["vault:default"]?.url).toBe("https://default.u.parachute.computer");
+    // Single named vault → top-level `vault` (app-client TokenResponse
+    // extension; notes-ui names the connected vault from it and prefers the
+    // per-vault `services["vault:<name>"]` catalog key it selects).
+    expect(pair.vault).toBe("default");
+  });
+
+  test("`vault` field is emitted only when the scopes name exactly one vault", async () => {
+    const { id: userId } = await seedUser();
+    const { clientId } = await seedApprovedClient();
+    // Two named vaults → ambiguous → omitted (matches the field's optionality).
+    const two = await mintInitialPair(clientId, userId, { scope: "vault:alpha:read vault:beta:read" });
+    expect(two.vault).toBeUndefined();
+    // No named vault at all (service scope) → omitted.
+    const none = await mintInitialPair(clientId, userId, { scope: "scribe:transcribe" });
+    expect(none.vault).toBeUndefined();
   });
 
   test("access token carries the exact claims (scope, client_id, vault_scope, sub, iss, aud, exp, jti)", async () => {
@@ -211,9 +226,12 @@ describe("token — refresh rotation, replay, grace, family revocation", () => {
     const family = await familyIdFor(pair.refresh_token);
     const res = await refreshAt(clientId, pair.refresh_token, new Date());
     expect(res.status).toBe(200);
-    const rotated = (await res.json()) as { refresh_token: string };
+    const rotated = (await res.json()) as { refresh_token: string; vault?: string };
     expect(rotated.refresh_token).not.toBe(pair.refresh_token);
     expect(await familyIdFor(rotated.refresh_token)).toBe(family);
+    // The refresh grant carries the same `vault` extension as the code grant
+    // (notes-ui re-reads it on every rotation).
+    expect(rotated.vault).toBe("default");
   });
 
   test("replay of a revoked token PAST the window revokes the entire family", async () => {

@@ -144,10 +144,18 @@ export async function handleLogoutPost(db: D1Database, req: Request, deps: OAuth
 
 // --- console ---------------------------------------------------------------
 
+/**
+ * The standalone Notes PWA deploy. `/?add=<vault URL>` jumps straight into the
+ * connect flow for that vault — the console's everyday-user door onto a fresh
+ * vault (the CLI/MCP card stays as the "Connect your AI" secondary).
+ */
+const NOTES_APP_URL = "https://notes.parachute.computer";
+
 function cardFor(name: string, deps: OAuthDeps): ConsoleVaultCard {
   const base = vaultInstanceUrl(name, deps);
   return {
     name,
+    notesUrl: `${NOTES_APP_URL}/?add=${encodeURIComponent(base)}`,
     mcpUrl: `${base}/mcp`,
     restUrl: `${base}/api`,
     connectCmd: `claude mcp add --transport http parachute-${name} ${base}/mcp`,
@@ -159,7 +167,7 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
   if (!user) return redirectResponse("/login");
   const vaults = await listVaultsForOwner(db, user.id);
   const created = new URL(req.url).searchParams.get("created");
-  const notice = created ? `Your vault "${created}" is ready — connect your AI with the command below.` : undefined;
+  const notice = created ? `Your vault "${created}" is ready — open your notes, or connect your AI below.` : undefined;
   const csrf = ensureCsrfToken(req);
   return htmlResponse(
     renderConsole({

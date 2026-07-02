@@ -466,6 +466,32 @@ describe("console — vaults", () => {
     // the conformance "happy path" services-catalog assertion.)
     expect(html).toContain("https://u.parachute.computer/vault/my-notes/mcp");
     expect(html).toContain("is ready");
+    // Primary door: the Notes PWA connect deep-link with the url-encoded
+    // vault URL, opening in a new tab.
+    expect(html).toContain(
+      'href="https://notes.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fmy-notes"',
+    );
+    expect(html).toContain("Open your notes");
+    expect(html).toContain('target="_blank" rel="noopener"');
+    // The CLI/MCP coordinates are demoted into a disclosure, not removed.
+    expect(html).toContain("Connect your AI");
+    // Post-create notice points at the door first.
+    expect(html).toContain("open your notes, or connect your AI below");
+  });
+
+  test("vault-name input pattern compiles under the RegExp v flag (Chrome's pattern semantics)", async () => {
+    const session = await sessionFor("patterned@example.com");
+    const res = await app.fetch(
+      new Request(`${ISSUER}/console`, { headers: { cookie: `parachute_id_session=${session}` } }),
+      env,
+    );
+    const html = await res.text();
+    const m = /pattern="([^"]+)"/.exec(html);
+    expect(m).not.toBeNull();
+    // Chrome wraps the attribute as ^(?:...)$ and compiles it with the `v`
+    // flag; an unescaped hyphen inside the character class threw at compile
+    // time and the attribute was silently ignored (E2E console error).
+    expect(() => new RegExp(`^(?:${m![1]})$`, "v")).not.toThrow();
   });
 
   test("creating a reserved or taken name shows an error, no redirect", async () => {

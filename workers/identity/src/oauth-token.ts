@@ -3,7 +3,9 @@
  * Direct port of the hub's token endpoint: same error discriminators, same
  * success shape `{access_token, token_type:"Bearer", expires_in:900,
  * refresh_token, scope, services}`, and the same refresh-rotation semantics
- * (one-generation 30s grace, replay → family revocation).
+ * (one-generation 30s grace, replay → family revocation). Plus the optional
+ * `vault` field of app-client's TokenResponse contract when the scopes name
+ * exactly one vault (see `singleVaultName`).
  *
  * DIVERGENCE (documented): `vault_scope` is always `[]` (the "unrestricted"
  * sentinel the hub uses for admins). The cloud has no per-user vault-assignment
@@ -32,7 +34,22 @@ import {
   signRefreshToken,
 } from "./tokens.ts";
 import { type OAuthDeps, buildServicesCatalog, jsonResponse } from "./oauth-shared.ts";
-import { unownedNamedVaults } from "./vaults.ts";
+import { namedVaultsInScopes, unownedNamedVaults } from "./vaults.ts";
+
+/**
+ * The optional top-level `vault` field of the token response — app-client's
+ * `TokenResponse.vault?: string` extension. Notes' OAuthCallback reads it to
+ * (a) name the connected vault in the UI (falling back to the raw issuer
+ * origin without it — the E2E papercut this fixes) and (b) pick the per-vault
+ * `services["vault:<name>"]` catalog entry. Emitted when the granted scopes
+ * name exactly one vault — always true for cloud tokens, which are narrowed
+ * to a single vault (aud=vault.<name>); omitted otherwise, matching the
+ * field's optionality in the contract.
+ */
+function singleVaultName(scopes: readonly string[]): string | undefined {
+  const named = namedVaultsInScopes(scopes);
+  return named.length === 1 ? named[0] : undefined;
+}
 
 /**
  * Token-mint ownership gate (defense-in-depth). A vault-audience access token is
@@ -179,6 +196,7 @@ async function handleTokenAuthorizationCode(
     scopes: redeemed.scopes,
     now: deps.now,
   });
+  const vault = singleVaultName(redeemed.scopes);
   return jsonResponse({
     access_token: access.token,
     token_type: "Bearer",
@@ -186,6 +204,7 @@ async function handleTokenAuthorizationCode(
     refresh_token: refresh.token,
     scope: redeemed.scopes.join(" "),
     services: buildServicesCatalog(redeemed.scopes, deps),
+    ...(vault ? { vault } : {}),
   });
 }
 
@@ -292,6 +311,7 @@ async function rotateAndRespond(
     // Clean invalid_grant per RFC 6749 §5.2 — the batch rolled back.
     return jsonResponse({ error: "invalid_grant", error_description: "refresh_token rotation conflict" }, 400);
   }
+  const vault = singleVaultName(row.scopes);
   return jsonResponse({
     access_token: access.token,
     token_type: "Bearer",
@@ -299,5 +319,6 @@ async function rotateAndRespond(
     refresh_token: prepared.token,
     scope: row.scopes.join(" "),
     services: buildServicesCatalog(row.scopes, deps),
+    ...(vault ? { vault } : {}),
   });
 }
