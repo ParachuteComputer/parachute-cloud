@@ -15,6 +15,7 @@
  * static sites on any origin can call the API; writes still require a token.
  */
 import type { Env } from "./env.js";
+import { handleDiscovery } from "./discovery.js";
 
 export { VaultDO } from "./vault-do.js";
 
@@ -83,6 +84,12 @@ export default {
         vaults: resolved ? [resolved.name] : [],
       });
     }
+
+    // OAuth discovery — PUBLIC (no auth), wildcard CORS. Served at the router so
+    // the DO never wakes to answer metadata. Handles both RFC path shapes
+    // (insertion + append) and both addressing modes (path + subdomain), §3.1.
+    const discovery = handleDiscovery(url, request, env);
+    if (discovery) return discovery;
 
     const resolved = resolveVault(url, env);
     if (!resolved) return json({ error: "vault not addressable" }, 404);
