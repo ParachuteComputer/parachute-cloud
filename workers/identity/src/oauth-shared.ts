@@ -66,6 +66,55 @@ export function isSameOriginRequest(req: Request, boundOrigins: readonly string[
   return boundOrigins.includes(origin);
 }
 
+/**
+ * CORS for the token-family endpoints (/oauth/token, /oauth/revoke). Token
+ * exchange is an uncredentialed simple POST (form-urlencoded) — without an
+ * `Access-Control-Allow-Origin` the browser blocks a cross-origin SPA (the
+ * Notes PWA's PKCE callback) from READING the response, success or error.
+ * Nothing in these responses is cookie-derived, so the wildcard is correct.
+ * Applied at the route (index.ts) so every path — success and error — carries it.
+ */
+export function withWildcardCors(res: Response): Response {
+  res.headers.set("access-control-allow-origin", "*");
+  return res;
+}
+
+/**
+ * CORS for /oauth/register (DCR). surface-client sends the registration with
+ * `credentials: "include"`, and browsers reject a wildcard ACAO on credentialed
+ * requests — so the request Origin is REFLECTED instead, with
+ * `Access-Control-Allow-Credentials: true` + `Vary: Origin`. Safe to reflect:
+ * registration is unauthenticated by design and the response carries no
+ * cookie-derived data.
+ */
+export function withReflectedCors(res: Response, req: Request): Response {
+  res.headers.append("vary", "Origin");
+  const origin = req.headers.get("origin");
+  if (!origin) return res;
+  res.headers.set("access-control-allow-origin", origin);
+  res.headers.set("access-control-allow-credentials", "true");
+  return res;
+}
+
+/**
+ * OPTIONS /oauth/* preflight. Reflects the request Origin (not `*`) because the
+ * credentialed DCR preflight requires a non-wildcard ACAO; the uncredentialed
+ * endpoints tolerate a reflected origin just as well.
+ */
+export function oauthPreflight(req: Request): Response {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "access-control-allow-origin": req.headers.get("origin") ?? "*",
+      "access-control-allow-methods": "POST, OPTIONS",
+      "access-control-allow-headers": "Content-Type, Accept",
+      "access-control-allow-credentials": "true",
+      "access-control-max-age": "86400",
+      vary: "Origin",
+    },
+  });
+}
+
 export function jsonResponse(body: unknown, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
