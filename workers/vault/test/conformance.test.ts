@@ -258,26 +258,65 @@ describe("transaction seam (vault#521 / DoSqliteStore)", () => {
     expect(check.fields).toBeNull();
   });
 
-  it("the indexed-field Store.transaction op hits transactionSync — 0 raw-BEGIN interceptions", async () => {
+  it("GLOBAL 0 raw-BEGIN interceptions — boot + every free-transaction() op is DO-atomic (vault#523)", async () => {
     const v = freshVault();
     const stub = env.VAULT.get(env.VAULT.idFromName(v));
-    // First RPC constructs + boots the DO (boot migrations use core's FREE
-    // transaction helper → counted here); capture that as the baseline.
-    const before = await stub.debugTxnInterceptCount();
+    // Post-vault#523 the shim exposes transactionSync, which core's free
+    // transaction() duck-type-prefers — so the boot migrations run as REAL DO
+    // transactions, not the no-op BEGIN interception. A freshly-booted DO reads 0.
+    expect(await stub.debugTxnInterceptCount()).toBe(0);
 
-    const req = new Request(`https://vault.test/vault/${v}/api/tags/proj`, {
+    // Exercise every free-transaction() site through the wire (single-note ops
+    // only — the async BATCH path is the deferred residual, tested below):
+    // create → update → rename tag → merge tags → Store.transaction indexed
+    // field → delete.
+    const post = (body: unknown) =>
+      op(v, "/api/notes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const na = (await (await post({ content: "a", tags: ["t1"] })).json()) as any;
+    await op(v, `/api/notes/${na.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "a2", if_updated_at: na.updatedAt ?? na.createdAt }),
+    });
+    await op(v, "/api/tags/t1/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_name: "t2" }),
+    });
+    await post({ content: "s", tags: ["s1"] });
+    await post({ content: "s", tags: ["s2"] });
+    await op(v, "/api/tags/merge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sources: ["s1", "s2"], target: "comb" }),
+    });
+    await op(v, "/api/tags/proj", {
       method: "PUT",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OP}` },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ fields: { rank: { type: "integer", indexed: true } } }),
     });
-    const res = await stub.fetch(req);
-    expect(res.status).toBe(200);
+    await op(v, `/api/notes/${na.id}`, { method: "DELETE" });
 
-    // upsertTagRecord routes through Store.transaction → ctx.storage.transactionSync,
-    // so NO raw BEGIN reaches the shim during the op. A nonzero delta = a raw
-    // BEGIN regressed into core's Store.transaction path.
-    const after = await stub.debugTxnInterceptCount();
-    expect(after - before).toBe(0);
+    // No raw BEGIN reached the shim across boot + all of the above. A nonzero
+    // count = a free-transaction() site regressed off the transactionSync path.
+    expect(await stub.debugTxnInterceptCount()).toBe(0);
+  });
+
+  it("the async batch path is the SOLE residual — transactionAsync still BEGINs (deferred core port)", async () => {
+    const v = freshVault();
+    const stub = env.VAULT.get(env.VAULT.idFromName(v));
+    expect(await stub.debugTxnInterceptCount()).toBe(0); // boot is clean now
+
+    // A multi-note POST wraps N creates in transactionAsync — the one path the
+    // sync-only transactionSync can't absorb (its body awaits the Store facade
+    // between writes). BEGIN IMMEDIATE + COMMIT are both intercepted → exactly 2.
+    const res = await op(v, "/api/notes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ notes: [{ content: "a" }, { content: "b" }] }),
+    });
+    expect(res.status).toBe(201);
+    expect(await stub.debugTxnInterceptCount()).toBe(2);
   });
 });
 

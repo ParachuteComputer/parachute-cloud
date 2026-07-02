@@ -120,7 +120,30 @@ export class DatabaseShim {
   /** Durability PRAGMAs no-op'd. */
   readonly pragmaNoops: InterceptRecord[] = [];
 
-  constructor(private readonly sql: SqlStorage) {}
+  constructor(
+    private readonly sql: SqlStorage,
+    private readonly storage: DurableObjectStorage,
+  ) {}
+
+  /**
+   * Native DO transaction (commit-on-return / rollback-on-throw). Core's free
+   * `transaction(db, fn)` helper duck-type-prefers this when the injected db
+   * exposes it (vault#523 / core txn.ts), so every free-transaction site —
+   * renameTag / mergeTags / batchTag / createNotes AND the boot migrations in
+   * schema.ts — runs as a REAL `ctx.storage.transactionSync` instead of hitting
+   * the counted no-op BEGIN interception in `exec` below. Result: those ops
+   * become genuinely DO-atomic (a mid-block throw rolls the whole thing back).
+   *
+   * The ONE residual is the async batch path (`transactionAsync`, e.g. a
+   * multi-note POST): `transactionSync` runs its callback synchronously and
+   * forbids awaiting, so an async batch that awaits the Store facade between
+   * writes can't map onto it — it still emits the intercepted `BEGIN IMMEDIATE`
+   * / `COMMIT`. Porting that is a core follow-up (cloud#26 tripwire documents
+   * the exact residual).
+   */
+  transactionSync<T>(fn: () => T): T {
+    return this.storage.transactionSync(fn);
+  }
 
   prepare(query: string): StatementShim {
     return new StatementShim(this.sql, query, this);
@@ -136,17 +159,18 @@ export class DatabaseShim {
       // DO's sql.exec throws on explicit BEGIN/COMMIT (the one construct that
       // can't be shimmed), so any raw transaction statement is a COUNTED NO-OP.
       //
-      // Post vault#521 the primary atomic path — `Store.transaction`
-      // (upsertTagRecord's indexed-field reconciliation) — no longer reaches
-      // here: `DoSqliteStore` overrides it with `ctx.storage.transactionSync`, a
-      // REAL DO transaction, so those BEGINs never hit this branch (the
-      // conformance tripwire asserts a 0 delta around that op). What still lands
-      // here: boot migrations + core's remaining FREE `transaction(db, fn)`
-      // sites (renameTag / mergeTags / batchTag / createNotes) — harmless on a
-      // single-writer DO but not atomic-on-caught-error. Zeroing those is a
-      // ~3-line core follow-up (teach `transaction(db, fn)` to prefer a native
-      // `db.transactionSync`); the async batch (`transactionAsync`) can't map to
-      // the sync-only `transactionSync` and core defers it.
+      // Post vault#521/#523 essentially nothing lands here: `Store.transaction`
+      // (upsertTagRecord) routes through `DoSqliteStore.transactionSync`, and the
+      // free `transaction(db, fn)` sites — renameTag / mergeTags / batchTag /
+      // createNotes AND the boot migrations — now duck-type-prefer this shim's
+      // `transactionSync` (a REAL `ctx.storage.transactionSync`), so their BEGINs
+      // never reach this branch. The conformance tripwire (cloud#26) asserts a
+      // GLOBAL 0 across boot + all those ops.
+      //
+      // The lone residual is the async batch path (`transactionAsync`, e.g. a
+      // multi-note POST): the sync-only `transactionSync` can't wrap an async
+      // body that awaits the Store facade, so it still emits BEGIN IMMEDIATE /
+      // COMMIT here (2 intercepts per batch). Porting it is a core follow-up.
       this.txnIntercepts.push({ kind: "transaction", stmt: sql.trim(), caller: coreCaller() });
       return;
     }

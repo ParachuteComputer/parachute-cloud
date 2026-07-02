@@ -24,6 +24,12 @@ import { handleTags, handleFindPath } from "./rest/tags.js";
 import { handleVault, type VaultConfigLike } from "./rest/vault.js";
 import { R2_METER_KEY, capExceededResponse, resolveCap, usedBytes } from "./caps.js";
 import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./rest/storage-constants.js";
+import { handleMcp } from "./mcp.js";
+import { mcpWwwAuthenticate } from "./discovery.js";
+import { handleSubscribe } from "./live/subscribe.js";
+import { SubscriptionManager } from "./live/subscriptions.js";
+import { collectExportEntries, toTar } from "./export.js";
+import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
 
 function errText(e: unknown): string {
   if (e instanceof Error) return `${e.name}: ${e.message}`;
@@ -74,16 +80,28 @@ export class VaultDO extends DurableObject {
   private r2Bytes = 0;
   private stateLoaded = false;
 
+  // Live-query fan-out for THIS vault, bound to the store's own post-commit hook
+  // registry — the single-writer property (design §3): every mutation and every
+  // open stream for the vault co-locate in this object, so there is no
+  // cross-process dispatch. `resolveVault` is a constant (one DO === one vault).
+  private subManager!: SubscriptionManager;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
-    this.shim = new DatabaseShim(ctx.storage.sql);
+    // The shim carries `ctx.storage` (not just `.sql`) so its `transactionSync`
+    // can delegate to the real DO transaction primitive — the free
+    // `transaction(db, fn)` path (incl. boot migrations) prefers it (vault#523).
+    this.shim = new DatabaseShim(ctx.storage.sql, ctx.storage);
     try {
       // DoSqliteStore's constructor runs initSchema(db) synchronously (idempotent
       // across DO wakes): SCHEMA v23 + all migrateToVN steps. It also wires the
       // transaction seam to ctx.storage.transactionSync (design §4) so
       // Store.transaction blocks are real DO transactions.
       this.store = new DoSqliteStore(this.shim, ctx.storage);
+      this.subManager = new SubscriptionManager(this.store.hooks, {
+        resolveVault: () => this.config?.name ?? "",
+      });
     } catch (e) {
       this.bootError = errText(e);
     }
@@ -107,6 +125,20 @@ export class VaultDO extends DurableObject {
     const rest = m[2] ?? "";
 
     await this.ensureState(vaultName);
+
+    // MCP endpoint — /vault/<name>/mcp[/*] (the "connect your AI" moment). Auth
+    // like REST (Bearer → X-API-Key → ?key=); a 401 carries the RFC 9728
+    // WWW-Authenticate challenge so a bare 401 walks the client to discovery
+    // (design §3.1). Dispatched before the `/api/` gate — MCP is a sibling of it.
+    if (rest === "/mcp" || rest.startsWith("/mcp/")) {
+      const mauth = await authenticateVaultRequest(request, this.env, vaultName);
+      if ("error" in mauth) {
+        const headers = new Headers(mauth.error.headers);
+        headers.set("WWW-Authenticate", mcpWwwAuthenticate(request, vaultName));
+        return new Response(mauth.error.body, { status: mauth.error.status, headers });
+      }
+      return handleMcp(request, this.store, vaultName, mauth, this.config!.description);
+    }
 
     // Bare landing — GET /vault/<name>. Read-scoped.
     if (rest === "" || rest === "/") {
@@ -147,6 +179,20 @@ export class VaultDO extends DurableObject {
     ) {
       const over = this.capBlockIfFull();
       if (over) return over;
+    }
+
+    // Live-query SSE — GET /api/subscribe. Read-scoped (GET → verb=read above).
+    // snapshot → upsert/remove over text/event-stream; the DO's own subscription
+    // manager fans out from the post-commit hook (design §3.1).
+    if (apiPath === "/subscribe") {
+      return handleSubscribe(request, this.store, vaultName, NO_TAG_SCOPE, this.subManager);
+    }
+
+    // Portable-markdown export — GET /api/export. Read-scoped; streams core's
+    // export engine into a tar, also stored to R2 for the backup story (§3.3).
+    if (apiPath === "/export") {
+      if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+      return this.handleExport(request, vaultName);
     }
 
     if (apiPath.startsWith("/notes")) {
@@ -304,6 +350,62 @@ export class VaultDO extends DurableObject {
     }
 
     return json({ error: "Not found" }, 404);
+  }
+
+  // -------------------------------------------------------------------------
+  // Portable-markdown export (design §3.3)
+  // -------------------------------------------------------------------------
+
+  /** Engine opts shared by the HTTP handler + the test RPC, so both drive the
+   *  SAME core export code path (the byte-identity guarantee). */
+  private exportOpts(vaultName: string, opts: { since?: string; exportedAt?: string }): ExportEngineOptions {
+    return {
+      vaultName,
+      ...(this.config?.description ? { vaultDescription: this.config.description } : {}),
+      ...(opts.since ? { since: opts.since } : {}),
+      ...(opts.exportedAt ? { exportedAt: opts.exportedAt } : {}),
+    };
+  }
+
+  /** GET /api/export — stream the shared export engine into a tar, store it to
+   *  R2 (the nightly-backup artifact, §3.3), and return it as a download. */
+  private async handleExport(request: Request, vaultName: string): Promise<Response> {
+    const url = new URL(request.url);
+    const since = url.searchParams.get("since") ?? undefined;
+    const exportedAt = url.searchParams.get("exported_at") ?? undefined;
+    const { entries } = await collectExportEntries(this.store, this.exportOpts(vaultName, { since, exportedAt }));
+    const tar = toTar(entries);
+    const ts = (exportedAt ?? new Date().toISOString()).replace(/[:.]/g, "-");
+    // Every export writes a new tarball under vault-<name>/exports/ and nothing
+    // prunes them — they ACCUMULATE. Pre-deploy TODO: an R2 lifecycle rule (or a
+    // GC alarm) capping retention (e.g. keep N days / last K), so on-demand +
+    // nightly exports don't grow storage/COGS unbounded. Tracked for Phase 5 ops.
+    await this.env.ATTACHMENTS.put(`vault-${vaultName}/exports/${ts}.tar`, tar);
+    return new Response(tar, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/x-tar",
+        "Content-Disposition": `attachment; filename="vault-${vaultName}-${ts}.tar"`,
+        "Content-Length": String(tar.byteLength),
+      },
+    });
+  }
+
+  /**
+   * Test RPC: the export engine's entries as `{name,text}`, WITHOUT tar framing.
+   * The conformance suite asserts the HTTP tarball unpacks to exactly this,
+   * pinning that the portable-md serializer runs through the same core seam on
+   * both paths (so the tar packaging can't silently drift). Same `exportOpts` as
+   * the HTTP handler.
+   */
+  async exportEntries(
+    vaultName: string,
+    opts: { since?: string; exportedAt?: string } = {},
+  ): Promise<{ name: string; text: string }[]> {
+    await this.ensureState(vaultName);
+    const { entries } = await collectExportEntries(this.store, this.exportOpts(vaultName, opts));
+    const dec = new TextDecoder();
+    return entries.map((e) => ({ name: e.name, text: dec.decode(e.bytes) }));
   }
 
   /**
