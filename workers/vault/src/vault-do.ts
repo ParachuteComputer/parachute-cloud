@@ -89,7 +89,10 @@ export class VaultDO extends DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
-    this.shim = new DatabaseShim(ctx.storage.sql);
+    // The shim carries `ctx.storage` (not just `.sql`) so its `transactionSync`
+    // can delegate to the real DO transaction primitive — the free
+    // `transaction(db, fn)` path (incl. boot migrations) prefers it (vault#523).
+    this.shim = new DatabaseShim(ctx.storage.sql, ctx.storage);
     try {
       // DoSqliteStore's constructor runs initSchema(db) synchronously (idempotent
       // across DO wakes): SCHEMA v23 + all migrateToVN steps. It also wires the
