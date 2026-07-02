@@ -13,9 +13,9 @@
  * exercise the shim + the four DO SQLite unknowns and are cheap to keep.
  */
 import { DurableObject } from "cloudflare:workers";
-import { BunSqliteStore } from "@openparachute/core/src/store.js";
 import { SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 import { DatabaseShim } from "./shim.js";
+import { DoSqliteStore } from "./store-do.js";
 import type { Env } from "./env.js";
 import { authenticateVaultRequest, verbForMethod, insufficientScope } from "./auth.js";
 import { NO_TAG_SCOPE } from "./rest/parse.js";
@@ -64,7 +64,7 @@ type VaultConfigState = {
 
 export class VaultDO extends DurableObject {
   private shim: DatabaseShim;
-  private store!: BunSqliteStore;
+  private store!: DoSqliteStore;
   private bootError: string | null = null;
   protected env: Env;
 
@@ -79,9 +79,11 @@ export class VaultDO extends DurableObject {
     this.env = env;
     this.shim = new DatabaseShim(ctx.storage.sql);
     try {
-      // BunSqliteStore's constructor runs initSchema(db) synchronously (idempotent
-      // across DO wakes): SCHEMA v23 + all migrateToVN steps.
-      this.store = new BunSqliteStore(this.shim as never);
+      // DoSqliteStore's constructor runs initSchema(db) synchronously (idempotent
+      // across DO wakes): SCHEMA v23 + all migrateToVN steps. It also wires the
+      // transaction seam to ctx.storage.transactionSync (design §4) so
+      // Store.transaction blocks are real DO transactions.
+      this.store = new DoSqliteStore(this.shim, ctx.storage);
     } catch (e) {
       this.bootError = errText(e);
     }
@@ -302,6 +304,19 @@ export class VaultDO extends DurableObject {
     }
 
     return json({ error: "Not found" }, 404);
+  }
+
+  /**
+   * Diagnostic tripwire: how many raw `BEGIN/COMMIT` statements the shim has
+   * had to intercept. The `Store.transaction` path routes through
+   * `ctx.storage.transactionSync` (DoSqliteStore) and emits ZERO here — a
+   * nonzero delta around an `upsertTagRecord`-class op means a raw `BEGIN`
+   * regressed into core's transaction seam. (Boot migrations + core's remaining
+   * FREE `transaction(db,fn)` sites still increment this; the conformance
+   * tripwire measures the delta around a Store.transaction op, not the total.)
+   */
+  async debugTxnInterceptCount(): Promise<number> {
+    return this.shim.txnIntercepts.length;
   }
 
   // -------------------------------------------------------------------------

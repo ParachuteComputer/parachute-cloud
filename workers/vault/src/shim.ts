@@ -133,17 +133,20 @@ export class DatabaseShim {
 
   exec(sql: string): void {
     if (TXN_RE.test(sql)) {
-      // TODO(vault#521 integration): transaction control is a COUNTED NO-OP.
-      // DO's sql.exec throws on explicit BEGIN/COMMIT, so core's
-      // `transaction()` / `transactionAsync()` currently run their callback
-      // WITHOUT a real transaction — a mid-batch failure (path conflict, etc.)
-      // leaves prior inserts committed instead of rolling back. This is NOT
-      // atomic. The real fix lands when vault#521 (store.transaction seam)
-      // merges: this file's `@openparachute/core` dep still sees OLD core with
-      // raw BEGIN/COMMIT. A follow-up integration commit swaps a
-      // `DoSqliteStore` that overrides `store.transaction` with
-      // `ctx.storage.transactionSync`. The `.todo` conformance test
-      // ("POST batch is atomic") pins the gap until then.
+      // DO's sql.exec throws on explicit BEGIN/COMMIT (the one construct that
+      // can't be shimmed), so any raw transaction statement is a COUNTED NO-OP.
+      //
+      // Post vault#521 the primary atomic path — `Store.transaction`
+      // (upsertTagRecord's indexed-field reconciliation) — no longer reaches
+      // here: `DoSqliteStore` overrides it with `ctx.storage.transactionSync`, a
+      // REAL DO transaction, so those BEGINs never hit this branch (the
+      // conformance tripwire asserts a 0 delta around that op). What still lands
+      // here: boot migrations + core's remaining FREE `transaction(db, fn)`
+      // sites (renameTag / mergeTags / batchTag / createNotes) — harmless on a
+      // single-writer DO but not atomic-on-caught-error. Zeroing those is a
+      // ~3-line core follow-up (teach `transaction(db, fn)` to prefer a native
+      // `db.transactionSync`); the async batch (`transactionAsync`) can't map to
+      // the sync-only `transactionSync` and core defers it.
       this.txnIntercepts.push({ kind: "transaction", stmt: sql.trim(), caller: coreCaller() });
       return;
     }

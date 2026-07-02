@@ -1,4 +1,4 @@
-import { SELF } from "cloudflare:test";
+import { SELF, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { SignJWT, importJWK } from "jose";
 import { TEST_PRIVATE_JWK, TEST_KID } from "./test-keys.ts";
@@ -221,10 +221,64 @@ describe("batch cap", () => {
     expect(arr).toHaveLength(2);
   });
 
-  // Atomicity is a COUNTED NO-OP until vault#521's store.transaction lands (the
-  // shim intercepts BEGIN/COMMIT). This pins the gap; flip to a real assertion
-  // in the follow-up integration commit.
-  it.todo("POST batch is atomic — mid-batch failure rolls back prior inserts (blocked on vault#521)");
+  // The ASYNC batch (transactionAsync) still can't map to the sync-only
+  // ctx.storage.transactionSync, so mid-batch rollback remains pending a core
+  // port of the async seam (core defers it too). The SYNC seam IS wired — see
+  // the "transaction seam" block below.
+  it.todo("POST batch is atomic — async transactionAsync → transactionSync port pending (core follow-up)");
+});
+
+describe("transaction seam (vault#521 / DoSqliteStore)", () => {
+  it("Store.transaction rolls back on a mid-block throw (real transactionSync, not a no-op)", async () => {
+    const v = freshVault();
+    // Declare an indexed integer field `priority` on `meeting` → creates the
+    // meta_priority generated column (INTEGER) + index.
+    const a = await op(v, "/api/tags/meeting", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: { priority: { type: "integer", indexed: true } } }),
+    });
+    expect(a.status).toBe(200);
+
+    // Now declare the SAME field as a string on `standup`. upsertTagRecord
+    // writes standup's schema row, THEN declareField throws (cross-tag type
+    // mismatch: priority is already INTEGER). Under a real transaction the whole
+    // write rolls back; under the old no-op interception the schema row would
+    // have persisted.
+    const b = await op(v, "/api/tags/standup", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: { priority: { type: "string", indexed: true } } }),
+    });
+    expect(b.status).toBe(400);
+    expect((await b.json() as any).error_type).toBe("invalid_indexed_field");
+
+    // Rollback proof: standup's schema row must NOT have been persisted.
+    const check = await (await op(v, "/api/tags/standup")).json() as any;
+    expect(check.fields).toBeNull();
+  });
+
+  it("the indexed-field Store.transaction op hits transactionSync — 0 raw-BEGIN interceptions", async () => {
+    const v = freshVault();
+    const stub = env.VAULT.get(env.VAULT.idFromName(v));
+    // First RPC constructs + boots the DO (boot migrations use core's FREE
+    // transaction helper → counted here); capture that as the baseline.
+    const before = await stub.debugTxnInterceptCount();
+
+    const req = new Request(`https://vault.test/vault/${v}/api/tags/proj`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OP}` },
+      body: JSON.stringify({ fields: { rank: { type: "integer", indexed: true } } }),
+    });
+    const res = await stub.fetch(req);
+    expect(res.status).toBe(200);
+
+    // upsertTagRecord routes through Store.transaction → ctx.storage.transactionSync,
+    // so NO raw BEGIN reaches the shim during the op. A nonzero delta = a raw
+    // BEGIN regressed into core's Store.transaction path.
+    const after = await stub.debugTxnInterceptCount();
+    expect(after - before).toBe(0);
+  });
 });
 
 describe("tags", () => {
