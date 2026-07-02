@@ -1,4 +1,5 @@
 import { defineWorkersConfig } from "@cloudflare/vitest-pool-workers/config";
+import { TEST_PUBLIC_JWKS } from "./test/test-keys.ts";
 
 /**
  * `@openparachute/core` is raw TypeScript whose internal imports use `.js`
@@ -33,7 +34,27 @@ export default defineWorkersConfig({
     hookTimeout: 300_000,
     poolOptions: {
       workers: {
+        // Per-test DO snapshot/restore ("isolated storage") doesn't support
+        // SQLite-backed DOs in this pool version (it aborts the run). Each test
+        // instead uses a UNIQUE vault name → a fresh DO (idFromName), so state
+        // never crosses tests without the snapshot machinery.
+        isolatedStorage: false,
         wrangler: { configPath: "./wrangler.toml" },
+        miniflare: {
+          // Conformance-test bindings. TEST_JWKS lets the auth matrix run
+          // without a live Identity Worker (auth.ts validates against this
+          // static key set); VAULT_AUTH_TOKEN is the operator bearer the
+          // shape/R2/caps tests use; CAP_BYTES is deliberately small so the
+          // caps 413 is reachable with a modest upload.
+          bindings: {
+            ENVIRONMENT: "test",
+            ISSUER_ORIGIN: "https://id.test.example",
+            VAULT_BASE_DOMAIN: "u.parachute.computer",
+            CAP_BYTES: "2000000",
+            VAULT_AUTH_TOKEN: "test-operator-token",
+            TEST_JWKS: TEST_PUBLIC_JWKS,
+          },
+        },
       },
     },
   },

@@ -1,10 +1,12 @@
-# Phase-0 spike Worker: vault-core on Durable Object SQLite.
-# Not deployed — driven by @cloudflare/vitest-pool-workers inside workerd.
-name = "parachute-vault-do-spike"
+# Vault DO + edge router — the wire contract on Durable Objects (Phase 2).
+# Not deployed by this PR (integration + deploy land after merge). Tests drive
+# it via @cloudflare/vitest-pool-workers inside workerd; typecheck via tsc.
+name = "parachute-vault-do"
 main = "src/index.ts"
 compatibility_date = "2025-07-01"
 compatibility_flags = ["nodejs_compat"]
 
+# One Durable Object per vault. The router maps <name> → idFromName(name) → DO.
 [[durable_objects.bindings]]
 name = "VAULT"
 class_name = "VaultDO"
@@ -14,9 +16,21 @@ class_name = "VaultDO"
 tag = "v1"
 new_sqlite_classes = ["VaultDO"]
 
-# The spike's 100k-note FTS corpus can exceed the default 30s CPU budget in a
-# single message; raise the ceiling so the measurement completes. (In prod the
-# budget resets per incoming message — chunked imports need neither this nor
-# alarms; see design §8 risk 4.)
+# Attachment bytes + (later) export tarballs. Keys: vault-<name>/attachments/...
+[[r2_buckets]]
+binding = "ATTACHMENTS"
+bucket_name = "parachute-vault-attachments"
+
+[vars]
+# The Identity Worker origin — used to validate token `iss` and fetch its JWKS
+# + revocation list (scope-guard). Overridden per-environment on deploy.
+ISSUER_ORIGIN = "https://id.parachute.computer"
+# Subdomain base for hostname routing: <name>.u.parachute.computer → DO(name).
+VAULT_BASE_DOMAIN = "u.parachute.computer"
+# Default per-tenant storage cap (bytes). 1 GiB. Overridable per-DO in config.
+CAP_BYTES = "1073741824"
+
+# A single incoming request's CPU budget resets per message; a large import that
+# arrives as one request may exceed the 30s default. Raise the ceiling.
 [limits]
 cpu_ms = 300000
