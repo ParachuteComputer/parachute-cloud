@@ -25,6 +25,7 @@ import {
   validateVaultName,
 } from "../src/vaults.ts";
 import { getUserByEmail } from "../src/users.ts";
+import { SIGNUP_MAX_PER_WINDOW, checkAndBumpSignup } from "../src/rate-limit.ts";
 import {
   CSRF,
   ISSUER,
@@ -33,6 +34,8 @@ import {
   consentReq,
   deps,
   makePkce,
+  mintInitialPair,
+  refreshAt,
   seedApprovedClient,
   seedSession,
   seedUser,
@@ -134,6 +137,18 @@ describe("vault ownership — token endpoint", () => {
     const res = await mintCode(userId, clientId, "vault:owned:read vault:nope:read");
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error_description: string }).error_description).toContain("nope");
+  });
+
+  test("refresh grant also refuses a vault the subject no longer owns", async () => {
+    const { id: userId } = await seedUser("refresh-own@example.com");
+    const { clientId } = await seedApprovedClient();
+    const pair = await mintInitialPair(clientId, userId, { scope: "vault:tempvault:read" });
+    // Drop ownership (simulating a future delete/transfer) then refresh: the
+    // token-endpoint gate fires on the rotation path too.
+    await env.DB.prepare("DELETE FROM vaults WHERE name = ?").bind("tempvault").run();
+    const res = await refreshAt(clientId, pair.refresh_token, new Date());
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
   });
 });
 
@@ -299,6 +314,34 @@ describe("console — signup", () => {
     );
     expect(res.status).toBe(200);
     expect(await getUserByEmail(env.DB, "nocsrf@example.com")).toBeNull();
+  });
+
+  test("signup from a foreign Origin is refused (same-origin gate)", async () => {
+    const res = await app.fetch(
+      new Request(`${ISSUER}/signup`, {
+        method: "POST",
+        body: new URLSearchParams({ __csrf: CSRF, email: "foreign@example.com", password: "longenough1" }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://evil.example", cookie: `parachute_id_csrf=${CSRF}` },
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(await getUserByEmail(env.DB, "foreign@example.com")).toBeNull();
+  });
+});
+
+describe("signup throttle", () => {
+  test("allows up to the window max, blocks the next, then rolls after the window", async () => {
+    const ip = "10.0.0.7";
+    for (let i = 0; i < SIGNUP_MAX_PER_WINDOW; i++) {
+      expect((await checkAndBumpSignup(env.DB, ip)).allowed).toBe(true);
+    }
+    const blocked = await checkAndBumpSignup(env.DB, ip);
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.retryAfterSeconds).toBeGreaterThan(0);
+    // A request in the next window rolls the counter.
+    const later = new Date(Date.now() + 61 * 60 * 1000);
+    expect((await checkAndBumpSignup(env.DB, ip, later)).allowed).toBe(true);
   });
 });
 

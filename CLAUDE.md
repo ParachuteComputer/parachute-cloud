@@ -19,8 +19,8 @@ workers/identity/   the OAuth issuer (authorize/token/DCR/JWKS/revocation on D1)
                     reproduces the hub's issuer contract EXACTLY (conformance
                     corpus; rotation/replay/30s-grace/family-revocation). ALSO the
                     self-serve console (accounts + vaults, server-rendered) and
-                    vault-OWNERSHIP enforcement (vaults table). 63 tests (42
-                    issuer conformance + 21 console/ownership).
+                    vault-OWNERSHIP enforcement (vaults table). 66 tests (42
+                    issuer conformance + 24 console/ownership).
 src/                the OLD control plane (Worker + D1 + Stripe). Dormant; billing
                     lifecycle design gets harvested into the control-plane revival.
 scripts/            deploy-dev.sh (reproducible dev deploy) + smoke-dev.ts (22-step
@@ -34,7 +34,7 @@ bun install                         # ALSO refreshes the copied core dep (see go
 bun run test                        # control-plane tests (src/) — 123
 bun run typecheck                   # root tsc
 cd workers/vault && bun run typecheck && bun x vitest run    # 82+1 todo under workerd
-cd workers/identity && bun run typecheck && bun x vitest run # 63
+cd workers/identity && bun run typecheck && bun x vitest run # 66
 bash scripts/deploy-dev.sh          # deploy both workers (dev account) + seed
 bun scripts/smoke-dev.ts            # live smoke vs the deployed workers
 ```
