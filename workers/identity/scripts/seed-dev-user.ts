@@ -6,7 +6,7 @@
  *
  * which runs this generator then applies `scripts/seed-dev-user.sql` to the
  * local D1 via wrangler. The PBKDF2 parameters here MUST match `src/users.ts`
- * (`pbkdf2$sha256$210000$<salt>$<derived>`) so the verifier accepts the hash.
+ * (`pbkdf2$sha256$100000$<salt>$<derived>`) so the verifier accepts the hash.
  *
  * Never run against a production database — this is a local-dev convenience for
  * exercising the browser login + consent flow against a real client.

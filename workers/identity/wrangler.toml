@@ -1,7 +1,7 @@
 # Cloud Identity Worker — the authorization server for cloud vaults.
 # Reproduces the hub's OAuth issuer contract (authorize / token / register /
-# revoke / JWKS / revocation-list) on Workers + D1. Not deployed by this PR —
-# integration + deploy happen after the spike PR merges (Phase 3 → 5).
+# revoke / JWKS / revocation-list) on Workers + D1. DEPLOYED to the Unforced
+# Development account (Phase 5a, 2026-07-02) — see scripts/deploy-dev.sh + TRYIT-2026-07-02.md.
 name = "parachute-identity"
 main = "src/index.ts"
 compatibility_date = "2025-07-01"

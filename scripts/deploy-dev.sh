@@ -15,6 +15,13 @@ set -euo pipefail
 
 export CLOUDFLARE_ACCOUNT_ID=8f2a7eb9d5e21ffa902a76cf62975c82   # "Unforced Development"
 
+ROOT_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Refresh the copied file: dep FIRST — bun snapshots @openparachute/core into
+# node_modules at install time, so a vault-core change upstream is INVISIBLE to
+# builds until re-installed (bit us 2026-07-02: stale txn.ts tested green,
+# deployed stale). One bun install makes every deploy build against current core.
+(cd "$ROOT_EARLY" && bun install)
+
 # The workers.dev URLs are deterministic once the account subdomain (`unforced`)
 # is known. A brand-new account learns it from the first `wrangler deploy` output;
 # after that these are fixed. Both are also the smoke script's defaults.
