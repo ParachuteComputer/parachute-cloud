@@ -36,7 +36,7 @@ import {
 } from "./oauth-metadata.ts";
 import { handleRegister } from "./oauth-register.ts";
 import { handleRevoke } from "./oauth-revoke.ts";
-import type { OAuthDeps } from "./oauth-shared.ts";
+import { type OAuthDeps, oauthPreflight, withReflectedCors, withWildcardCors } from "./oauth-shared.ts";
 import { handleToken } from "./oauth-token.ts";
 
 function depsFor(env: Env): OAuthDeps {
@@ -66,11 +66,17 @@ app.get("/.well-known/jwks.json", (c) => handleJwks(c.env.DB));
 app.get("/.well-known/parachute-revocation.json", (c) => handleRevocationList(c.env.DB, depsFor(c.env)));
 
 // --- OAuth ---
+// CORS is applied at the route so success AND error paths carry it: wildcard on
+// the uncredentialed token-family endpoints, reflected-origin (credentialed DCR)
+// on register. Cross-origin browser PKCE (the Notes PWA) needs both.
+app.options("/oauth/*", (c) => oauthPreflight(c.req.raw));
 app.get("/oauth/authorize", (c) => handleAuthorizeGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/oauth/authorize", (c) => handleAuthorizePost(c.env.DB, c.req.raw, depsFor(c.env)));
-app.post("/oauth/token", (c) => handleToken(c.env.DB, c.req.raw, depsFor(c.env)));
-app.post("/oauth/register", (c) => handleRegister(c.env.DB, c.req.raw, depsFor(c.env)));
-app.post("/oauth/revoke", (c) => handleRevoke(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/oauth/token", async (c) => withWildcardCors(await handleToken(c.env.DB, c.req.raw, depsFor(c.env))));
+app.post("/oauth/register", async (c) =>
+  withReflectedCors(await handleRegister(c.env.DB, c.req.raw, depsFor(c.env)), c.req.raw),
+);
+app.post("/oauth/revoke", async (c) => withWildcardCors(await handleRevoke(c.env.DB, c.req.raw, depsFor(c.env))));
 
 // --- console (accounts + vaults) ---
 app.get("/signup", (c) => handleSignupGet(c.req.raw));

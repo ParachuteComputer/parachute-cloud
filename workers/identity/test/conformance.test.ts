@@ -567,6 +567,102 @@ describe("/oauth/revoke — RFC 7009", () => {
   });
 });
 
+// --- CORS: /oauth/* (cross-origin browser PKCE) ----------------------------
+
+describe("CORS — /oauth/* (cross-origin browser PKCE, e.g. the Notes PWA)", () => {
+  const NOTES_ORIGIN = "https://notes.parachute.computer";
+
+  function preflightReq(path: string): Request {
+    return new Request(`${ISSUER}${path}`, {
+      method: "OPTIONS",
+      headers: {
+        origin: NOTES_ORIGIN,
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "content-type",
+      },
+    });
+  }
+
+  test("OPTIONS /oauth/token preflight → 204 with reflected origin", async () => {
+    const res = await app.fetch(preflightReq("/oauth/token"), env);
+    expect(res.status).toBe(204);
+    expect(res.headers.get("access-control-allow-origin")).toBe(NOTES_ORIGIN);
+    expect(res.headers.get("access-control-allow-methods")).toBe("POST, OPTIONS");
+    expect(res.headers.get("access-control-allow-headers")).toBe("Content-Type, Accept");
+    expect(res.headers.get("access-control-allow-credentials")).toBe("true");
+    expect(res.headers.get("access-control-max-age")).toBe("86400");
+  });
+
+  test("OPTIONS /oauth/register preflight → 204 with reflected origin + credentials", async () => {
+    const res = await app.fetch(preflightReq("/oauth/register"), env);
+    expect(res.status).toBe(204);
+    expect(res.headers.get("access-control-allow-origin")).toBe(NOTES_ORIGIN);
+    expect(res.headers.get("access-control-allow-credentials")).toBe("true");
+    expect(res.headers.get("vary")).toContain("Origin");
+  });
+
+  test("token success (through the router) carries wildcard ACAO", async () => {
+    const { id: userId } = await seedUser();
+    const { clientId } = await seedApprovedClient();
+    await seedVault("default", userId);
+    const { verifier, challenge } = await makePkce();
+    const { issueAuthCode } = await import("../src/auth-codes.ts");
+    const code = await issueAuthCode(env.DB, {
+      clientId,
+      userId,
+      redirectUri: REDIRECT_URI,
+      scopes: ["vault:default:read"],
+      codeChallenge: challenge,
+      codeChallengeMethod: "S256",
+    });
+    const res = await app.fetch(
+      tokenReq({
+        grant_type: "authorization_code",
+        code: code.code,
+        client_id: clientId,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: verifier,
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
+  test("token ERROR (through the router) still carries wildcard ACAO", async () => {
+    const res = await app.fetch(tokenReq({ grant_type: "authorization_code", code: "bogus" }), env);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as Record<string, unknown>).error).toBe("invalid_request");
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
+  test("register response reflects the Origin + allows credentials (credentialed DCR)", async () => {
+    const res = await app.fetch(
+      registerReq({ redirect_uris: [REDIRECT_URI], client_name: "PWA" }, { origin: NOTES_ORIGIN }),
+      env,
+    );
+    expect(res.status).toBe(201);
+    expect(res.headers.get("access-control-allow-origin")).toBe(NOTES_ORIGIN);
+    expect(res.headers.get("access-control-allow-credentials")).toBe("true");
+    expect(res.headers.get("vary")).toContain("Origin");
+  });
+
+  test("register without an Origin gets no ACAO (nothing to reflect) but keeps Vary", async () => {
+    const res = await app.fetch(registerReq({ redirect_uris: [REDIRECT_URI] }), env);
+    expect(res.status).toBe(201);
+    expect(res.headers.get("access-control-allow-origin")).toBeNull();
+    expect(res.headers.get("access-control-allow-credentials")).toBeNull();
+    expect(res.headers.get("vary")).toContain("Origin");
+  });
+
+  test("revoke response (through the router) carries wildcard ACAO", async () => {
+    const { clientId } = await seedApprovedClient();
+    const res = await app.fetch(revokeReq({ token: "unknown-token", client_id: clientId }), env);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+  });
+});
+
 // --- authorize flow (browser) ---------------------------------------------
 
 describe("authorize flow — login, consent, skip-consent, errors", () => {
