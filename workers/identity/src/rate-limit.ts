@@ -122,3 +122,53 @@ export async function recordLoginFailure(db: D1Database, key: string, now: Date 
 export async function clearLoginFailures(db: D1Database, key: string): Promise<void> {
   await db.prepare("DELETE FROM login_throttle WHERE key = ?").bind(key).run();
 }
+
+// --- magic-link send fence -------------------------------------------------
+
+export const MAGIC_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+// A handful of link requests per (ip,email) per window — room for a legit resend,
+// tight enough to blunt email bombing. Not a security number (see the file header).
+export const MAGIC_MAX_PER_WINDOW = 5;
+
+interface MagicRow {
+  key: string;
+  count: number;
+  window_started_at: string;
+}
+
+/**
+ * Register a magic-link send from `(ip, email)` and report whether it's allowed.
+ * Keyed per (ip,email) — same shape as {@link loginKey} — so the fence is about
+ * the submitter's rate, never a signal of whether the account exists. Fixed
+ * window; rolls when elapsed.
+ */
+export async function checkAndBumpMagic(
+  db: D1Database,
+  ip: string,
+  email: string,
+  now: Date = new Date(),
+): Promise<{ allowed: boolean; retryAfterSeconds: number }> {
+  const key = loginKey(ip, email);
+  const row = await db.prepare("SELECT * FROM magic_throttle WHERE key = ?").bind(key).first<MagicRow>();
+  const nowMs = now.getTime();
+  if (!row) {
+    await db
+      .prepare("INSERT INTO magic_throttle (key, count, window_started_at) VALUES (?, 1, ?)")
+      .bind(key, now.toISOString())
+      .run();
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+  const elapsed = nowMs - new Date(row.window_started_at).getTime();
+  if (elapsed >= MAGIC_WINDOW_MS) {
+    await db
+      .prepare("UPDATE magic_throttle SET count = 1, window_started_at = ? WHERE key = ?")
+      .bind(now.toISOString(), key)
+      .run();
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+  if (row.count >= MAGIC_MAX_PER_WINDOW) {
+    return { allowed: false, retryAfterSeconds: Math.ceil((MAGIC_WINDOW_MS - elapsed) / 1000) };
+  }
+  await db.prepare("UPDATE magic_throttle SET count = count + 1 WHERE key = ?").bind(key).run();
+  return { allowed: true, retryAfterSeconds: 0 };
+}

@@ -18,6 +18,8 @@ import { isCoveredByGrant, recordGrant } from "./grants.ts";
 import { unownedNamedVaults } from "./vaults.ts";
 import { SESSION_COOKIE, buildSessionCookie, createSession, findActiveSession, parseSessionCookie } from "./sessions.ts";
 import { getUserByEmail, verifyPassword } from "./users.ts";
+import { isTotpEnrolled } from "./two-factor.ts";
+import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
 import { clearLoginFailures, clientIp, isLoginLocked, loginKey, recordLoginFailure } from "./rate-limit.ts";
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { type AuthorizeParams, describeScopes, renderConsent, renderError, renderLogin } from "./ui.ts";
@@ -253,6 +255,15 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
     return renderLoginPage(req, params, "Incorrect email or password.");
   }
   await clearLoginFailures(db, key);
+
+  // 2FA gate: a password login here must NOT bypass an enrolled second factor.
+  // Stash a pending login whose `next` resumes THIS authorize request (with the
+  // session the /login/2fa handler mints), and send the user to the code prompt.
+  if (await isTotpEnrolled(db, user.id)) {
+    const token = await createPendingLogin(db, user.id, buildAuthorizeUrl(deps.issuer, params), now);
+    return redirectResponse("/login/2fa", { "set-cookie": buildPendingLoginCookie(token) });
+  }
+
   const session = await createSession(db, user.id, now);
   // Re-enter the flow WITH the session cookie; attach it to the response.
   const carrier = new Request(`${deps.issuer}/oauth/authorize`, {
@@ -262,6 +273,21 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   const headers = new Headers(res.headers);
   headers.append("set-cookie", buildSessionCookie(session.id));
   return new Response(res.body, { status: res.status, headers });
+}
+
+/** Reconstruct the GET /oauth/authorize URL from parsed params (the post-2FA `next`). */
+function buildAuthorizeUrl(issuer: string, params: AuthorizeParams): string {
+  const u = new URL(`${issuer}/oauth/authorize`);
+  u.searchParams.set("client_id", params.clientId);
+  u.searchParams.set("redirect_uri", params.redirectUri);
+  u.searchParams.set("response_type", params.responseType);
+  u.searchParams.set("scope", params.scope);
+  u.searchParams.set("code_challenge", params.codeChallenge);
+  u.searchParams.set("code_challenge_method", params.codeChallengeMethod);
+  if (params.state !== null) u.searchParams.set("state", params.state);
+  if (params.resource !== null) u.searchParams.set("resource", params.resource);
+  if (params.vault !== null) u.searchParams.set("vault", params.vault);
+  return u.toString();
 }
 
 async function handleConsentSubmit(db: D1Database, req: Request, form: FormData, deps: OAuthDeps): Promise<Response> {

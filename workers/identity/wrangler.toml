@@ -51,3 +51,25 @@ VAULT_BASE_DOMAIN = "u.parachute.computer"
 # the single branded host (no wildcard subdomain cert yet). Drives the services
 # catalog + the console connect cards.
 VAULT_ORIGIN = "https://u.parachute.computer"
+# Deployment environment. NOT "production" here (this is the dev account), so the
+# magic-link send echoes the link in an `x-parachute-dev-magic-link` response
+# header — that's how smoke-dev.ts + manual testing complete the flow without a
+# real inbox. A public/prod deploy MUST set this to "production" (drops the echo).
+ENVIRONMENT = "development"
+# FROM address for magic-link email. Its domain must be onboarded to Cloudflare
+# Email Sending before real sends succeed (see the send_email binding note below).
+EMAIL_FROM = "noreply@parachute.computer"
+
+# --- outbound email (Cloudflare Email Sending) ------------------------------
+# Cloudflare Email Sending is in public beta (Workers Paid). To flip magic-link
+# email from dev-log (the current default) to REAL email:
+#   1. Onboard the sending domain (adds SPF + DKIM to the parachute.computer zone,
+#      which is already in this account — records are added automatically):
+#        Dashboard → Compute & AI → Email Service → Email Sending → Onboard Domain
+#        → parachute.computer → Add records and onboard
+#      (or: `wrangler email sending enable parachute.computer`)
+#   2. Uncomment the binding below and redeploy. The worker auto-detects the bound
+#      EMAIL and uses it; no code change needed (src/index.ts senderFor()).
+# Kept commented so a bare `wrangler deploy` stays green before onboarding.
+# [[send_email]]
+# name = "EMAIL"

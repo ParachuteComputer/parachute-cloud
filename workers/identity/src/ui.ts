@@ -80,6 +80,22 @@ const STYLE = `
   .foot{margin-top:1.4rem;text-align:center}
   .linkbtn{background:none;border:0;color:var(--sage-dark);text-decoration:underline;cursor:pointer;font-size:.9rem;padding:0}
   form.inline{display:inline}
+  .secondary{background:#eef0ea;color:var(--ink);width:100%;margin-top:1.1rem;font-weight:600}
+  .secondary:hover{background:#e4e8dd}
+  details{margin-top:1.1rem;border-top:1px solid var(--line);padding-top:1rem}
+  details>summary{cursor:pointer;color:var(--sage-dark);font-size:.9rem;font-weight:600;list-style:none}
+  details>summary::-webkit-details-marker{display:none}
+  details[open]>summary{margin-bottom:.6rem}
+  .qr{width:210px;max-width:100%;margin:.6rem auto;padding:.5rem;background:#fff;border:1px solid var(--line);border-radius:10px}
+  .qr svg{width:100%;height:auto;display:block}
+  .codegrid{list-style:none;padding:0;margin:.8rem 0;display:grid;grid-template-columns:repeat(2,1fr);gap:.5rem}
+  .codegrid li{background:#eff3ea;border:1px solid var(--line);border-radius:7px;padding:.45rem;text-align:center;font-family:ui-monospace,Menlo,monospace;font-size:.92rem;letter-spacing:.03em}
+  .warn{background:#faeee9;border:1px solid #e6c7ba;color:#8a3a2a;padding:.7rem .9rem;border-radius:9px;font-size:.88rem;margin:.6rem 0}
+  .status{display:flex;align-items:center;gap:.5rem;font-weight:600}
+  .dot{width:.6rem;height:.6rem;border-radius:999px;display:inline-block}
+  .dot-on{background:var(--sage)}.dot-off{background:#b9c2ad}
+  .h2row{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;margin-bottom:.4rem}
+  .secret{font-family:ui-monospace,Menlo,monospace;font-size:1rem;letter-spacing:.14em;word-break:break-all;background:#eef1ea;border:1px solid var(--line);border-radius:8px;padding:.55rem .7rem;text-align:center}
 `;
 
 function page(title: string, inner: string): string {
@@ -171,47 +187,210 @@ export function renderError(opts: { title: string; message: string }): string {
 
 // --- console (accounts + vaults) ------------------------------------------
 
-/** Signup — create a cloud account. Posts to /signup. */
-export function renderSignup(opts: { csrfToken: string; error?: string; email?: string }): string {
-  const { csrfToken, error, email } = opts;
+/** The magic-link (passwordless) form — the primary sign-in / sign-up affordance. */
+function magicForm(csrfToken: string, email: string | undefined, buttonLabel: string, error?: string): string {
+  return `<form method="post" action="/auth/magic">
+       <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+       <label for="email">Email</label>
+       <input id="email" name="email" type="email" autocomplete="email" value="${esc(email ?? "")}" required autofocus>
+       ${error ? `<div class="err">${esc(error)}</div>` : ""}
+       <button class="primary" type="submit">${esc(buttonLabel)}</button>
+     </form>`;
+}
+
+/** Signup — create a cloud account. Magic-link default; password in the disclosure. */
+export function renderSignup(opts: { csrfToken: string; error?: string; email?: string; showPassword?: boolean }): string {
+  const { csrfToken, error, email, showPassword } = opts;
   return page(
     "Create your account — Parachute",
     `<h1>Create your account</h1>
      <p class="muted" style="margin:0 0 1.1rem">A vault of your own, hosted. Free while in beta — no card needed.</p>
      <div class="card">
-       <form method="post" action="/signup">
-         <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
-         <label for="email">Email</label>
-         <input id="email" name="email" type="email" autocomplete="username" value="${esc(email ?? "")}" required autofocus>
-         <label for="password">Password</label>
-         <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
-         <p class="muted" style="margin:.35rem 0 0">At least 8 characters.</p>
-         ${error ? `<div class="err">${esc(error)}</div>` : ""}
-         <button class="primary" type="submit">Create account</button>
-       </form>
+       ${magicForm(csrfToken, email, "Email me a sign-in link", showPassword ? undefined : error)}
+       <p class="muted" style="margin:.7rem 0 0">We'll email you a link — no password to choose. It signs you in and creates your account.</p>
+       <details${showPassword ? " open" : ""}>
+         <summary>Use a password instead</summary>
+         <form method="post" action="/signup">
+           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+           <label for="pw-email">Email</label>
+           <input id="pw-email" name="email" type="email" autocomplete="username" value="${esc(email ?? "")}" required>
+           <label for="password">Password</label>
+           <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+           <p class="muted" style="margin:.35rem 0 0">At least 8 characters.</p>
+           ${showPassword && error ? `<div class="err">${esc(error)}</div>` : ""}
+           <button class="secondary" type="submit">Create account with a password</button>
+         </form>
+       </details>
      </div>
      <div class="foot"><span class="muted">Already have an account?</span> <a href="/login">Sign in</a></div>`,
   );
 }
 
-/** Console login (standalone, distinct from the OAuth authorize login). */
-export function renderConsoleLogin(opts: { csrfToken: string; error?: string; email?: string }): string {
-  const { csrfToken, error, email } = opts;
+/** Console login (standalone, distinct from the OAuth authorize login). Magic-link default. */
+export function renderConsoleLogin(opts: { csrfToken: string; error?: string; email?: string; showPassword?: boolean }): string {
+  const { csrfToken, error, email, showPassword } = opts;
   return page(
     "Sign in — Parachute",
     `<h1>Sign in</h1>
      <div class="card">
-       <form method="post" action="/login">
-         <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
-         <label for="email">Email</label>
-         <input id="email" name="email" type="email" autocomplete="username" value="${esc(email ?? "")}" required autofocus>
-         <label for="password">Password</label>
-         <input id="password" name="password" type="password" autocomplete="current-password" required>
-         ${error ? `<div class="err">${esc(error)}</div>` : ""}
-         <button class="primary" type="submit">Sign in</button>
-       </form>
+       ${magicForm(csrfToken, email, "Email me a sign-in link", showPassword ? undefined : error)}
+       <p class="muted" style="margin:.7rem 0 0">We'll email you a link that signs you in — no password needed.</p>
+       <details${showPassword ? " open" : ""}>
+         <summary>Use a password instead</summary>
+         <form method="post" action="/login">
+           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+           <label for="pw-email">Email</label>
+           <input id="pw-email" name="email" type="email" autocomplete="username" value="${esc(email ?? "")}" required>
+           <label for="password">Password</label>
+           <input id="password" name="password" type="password" autocomplete="current-password" required>
+           ${showPassword && error ? `<div class="err">${esc(error)}</div>` : ""}
+           <button class="secondary" type="submit">Sign in with a password</button>
+         </form>
+       </details>
      </div>
      <div class="foot"><span class="muted">New here?</span> <a href="/signup">Create an account</a></div>`,
+  );
+}
+
+/** "Check your email" — the neutral response to a magic-link request (no enumeration). */
+export function renderMagicSent(opts: { email: string }): string {
+  return page(
+    "Check your email — Parachute",
+    `<h1>Check your email</h1>
+     <div class="card">
+       <p>If <strong>${esc(opts.email)}</strong> has (or can have) a Parachute account, a sign-in link is on its way.</p>
+       <p class="muted">The link works once and expires in 10 minutes. You can close this tab — open the link from your email to continue.</p>
+     </div>
+     <div class="foot"><a href="/login">← Back to sign in</a></div>`,
+  );
+}
+
+/** The TOTP second-factor prompt after primary auth, when 2FA is enabled. */
+export function renderLogin2fa(opts: { csrfToken: string; error?: string }): string {
+  const { csrfToken, error } = opts;
+  return page(
+    "Two-factor — Parachute",
+    `<h1>Enter your code</h1>
+     <div class="card">
+       <form method="post" action="/login/2fa">
+         <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+         <label for="code">Authentication code</label>
+         <input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" required autofocus>
+         <p class="muted" style="margin:.35rem 0 0">From your authenticator app, or a backup code.</p>
+         ${error ? `<div class="err">${esc(error)}</div>` : ""}
+         <button class="primary" type="submit">Verify</button>
+       </form>
+     </div>`,
+  );
+}
+
+// --- security (TOTP 2FA + password) ---------------------------------------
+
+export type SecurityState =
+  | { kind: "overview"; enrolled: boolean; enrolledAt: string | null; backupRemaining: number }
+  | { kind: "enrolling"; qrSvg: string; secret: string }
+  | { kind: "backup-codes"; codes: string[] };
+
+export interface SecurityProps {
+  csrfToken: string;
+  email: string;
+  hasPassword: boolean;
+  state: SecurityState;
+  error?: string;
+  notice?: string;
+}
+
+function passwordSection(csrfToken: string, hasPassword: boolean): string {
+  return `<div class="card">
+     <h2>${hasPassword ? "Change your password" : "Add a password"}</h2>
+     <p class="muted" style="margin:.1rem 0 .3rem">${
+       hasPassword
+         ? "Update the optional password you sign in with."
+         : "Optional — a magic link already signs you in. Add a password if you'd like a second way in."
+     }</p>
+     <form method="post" action="/console/security">
+       <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+       <input type="hidden" name="action" value="set-password">
+       <label for="new-password">${hasPassword ? "New password" : "Password"}</label>
+       <input id="new-password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+       <p class="muted" style="margin:.35rem 0 0">At least 8 characters.</p>
+       <button class="secondary" type="submit">${hasPassword ? "Update password" : "Set password"}</button>
+     </form>
+   </div>`;
+}
+
+export function renderSecurity(props: SecurityProps): string {
+  const { csrfToken, email, hasPassword, state, error, notice } = props;
+  const banner = `${notice ? `<div class="notice">${esc(notice)}</div>` : ""}${error ? `<div class="err" style="margin-bottom:1rem">${esc(error)}</div>` : ""}`;
+
+  if (state.kind === "enrolling") {
+    return page(
+      "Set up two-factor — Parachute",
+      `<div class="h2row"><h1 style="margin:0">Set up two-factor</h1><a href="/console/security">Cancel</a></div>
+       ${banner}
+       <div class="card">
+         <p>1. Scan this QR code with your authenticator app (Google Authenticator, 1Password, Authy, …):</p>
+         <div class="qr" aria-label="TOTP QR code">${state.qrSvg}</div>
+         <p class="muted">Can't scan? Enter this key manually:</p>
+         <div class="secret" data-testid="totp-secret">${esc(state.secret)}</div>
+         <form method="post" action="/console/security" style="margin-top:1.1rem">
+           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+           <input type="hidden" name="action" value="confirm">
+           <input type="hidden" name="secret" value="${esc(state.secret)}">
+           <label for="code">2. Enter the 6-digit code to confirm</label>
+           <input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" required autofocus>
+           <button class="primary" type="submit">Confirm and enable</button>
+         </form>
+       </div>`,
+    );
+  }
+
+  if (state.kind === "backup-codes") {
+    const list = state.codes.map((c) => `<li>${esc(c)}</li>`).join("");
+    return page(
+      "Backup codes — Parachute",
+      `<h1>Two-factor is on</h1>
+       ${banner}
+       <div class="card">
+         <div class="warn"><strong>Save these backup codes now.</strong> Each works once if you lose your authenticator. They're shown only this once.</div>
+         <ul class="codegrid" data-testid="backup-codes">${list}</ul>
+         <a class="primary" href="/console/security" style="display:block;text-align:center;text-decoration:none;padding:.62rem 1rem">I've saved my codes</a>
+       </div>`,
+    );
+  }
+
+  // overview
+  const twoFactor = state.enrolled
+    ? `<div class="card">
+         <div class="status"><span class="dot dot-on"></span>Two-factor authentication is <strong>on</strong>${
+           state.enrolledAt ? ` (since ${esc(state.enrolledAt.slice(0, 10))})` : ""
+         }.</div>
+         <p class="muted" style="margin:.5rem 0 0">You have <strong data-testid="backup-remaining">${state.backupRemaining}</strong> backup code${state.backupRemaining === 1 ? "" : "s"} left.</p>
+         <form method="post" action="/console/security" style="margin-top:1rem">
+           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+           <input type="hidden" name="action" value="disable">
+           <label for="code">Turn off — enter a current code to confirm</label>
+           <input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="123456 or a backup code" required>
+           <button class="secondary" type="submit">Turn off two-factor</button>
+         </form>
+       </div>`
+    : `<div class="card">
+         <div class="status"><span class="dot dot-off"></span>Two-factor authentication is <strong>off</strong>.</div>
+         <p class="muted" style="margin:.5rem 0 0">Require a 6-digit code from your authenticator app in addition to your sign-in link or password.</p>
+         <form method="post" action="/console/security" style="margin-top:1rem">
+           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+           <input type="hidden" name="action" value="start">
+           <button class="primary" type="submit">Set up two-factor</button>
+         </form>
+       </div>`;
+
+  return page(
+    "Security — Parachute",
+    `<div class="h2row"><h1 style="margin:0">Security</h1><a href="/console">← Vaults</a></div>
+     <p class="muted" style="margin:.15rem 0 1.2rem">${esc(email)}</p>
+     ${banner}
+     ${twoFactor}
+     ${passwordSection(csrfToken, hasPassword)}`,
   );
 }
 
@@ -250,7 +429,8 @@ export function renderConsole(props: ConsoleProps): string {
     "Console — Parachute",
     `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">
        <h1 style="margin:0">Your vaults</h1>
-       <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}"><button class="linkbtn" type="submit">Sign out</button></form>
+       <span style="display:flex;gap:1rem;align-items:baseline"><a href="/console/security">Security</a>
+       <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}"><button class="linkbtn" type="submit">Sign out</button></form></span>
      </div>
      <p class="muted" style="margin:.15rem 0 1.2rem">${esc(email)}</p>
      ${notice ? `<div class="notice">${esc(notice)}</div>` : ""}

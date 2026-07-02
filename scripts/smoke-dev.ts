@@ -20,6 +20,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { totpCodeAt } from "../workers/identity/src/totp.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY = (process.env.IDENTITY ?? "https://cloud.parachute.computer").replace(/\/$/, "");
@@ -337,6 +338,93 @@ async function main() {
     let lastLogin = "";
     for (let i = 0; i < 6; i++) lastLogin = await oneLogin();
     assert(/too many attempts/i.test(lastLogin), "login throttle locks a hammered account", "");
+  }
+
+  // 10. Magic-link sign-in (the passwordless default). The dev deploy echoes the
+  //     link in an `x-parachute-dev-magic-link` header (ENVIRONMENT=development),
+  //     so we can complete the flow without an inbox.
+  {
+    const magicEmail = `magic+${Date.now()}@example.com`;
+    const lg = await fetch(`${IDENTITY}/login`, { redirect: "manual" });
+    const mcsrf = cookieVal(lg.headers.getSetCookie(), "parachute_id_csrf");
+    const sendRes = await fetch(`${IDENTITY}/auth/magic`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${mcsrf}` },
+      redirect: "manual",
+      body: form({ __csrf: mcsrf!, email: magicEmail }),
+    });
+    const magicLink = sendRes.headers.get("x-parachute-dev-magic-link");
+    assert(sendRes.status === 200 && !!magicLink, "magic-link send → neutral 200 + dev link header", `status ${sendRes.status}`);
+
+    const verifyRes = await fetch(magicLink!, { redirect: "manual" });
+    const magicSession = cookieVal(verifyRes.headers.getSetCookie(), "parachute_id_session");
+    assert(
+      verifyRes.status === 302 && verifyRes.headers.get("location") === "/console" && !!magicSession,
+      "magic-link verify → session + /console (first link = signup)",
+      `status ${verifyRes.status}`,
+    );
+
+    const reuse = await fetch(magicLink!, { redirect: "manual" });
+    assert(reuse.status === 400, "magic-link is single-use (second verify → 400)", `status ${reuse.status}`);
+
+    // 11. TOTP enroll on this (passwordless) account, then confirm a re-login
+    //     requires the code. Codes are computed from the shown secret; the ±1
+    //     step window covers small client/server clock skew.
+    const secGet = await fetch(`${IDENTITY}/console/security`, {
+      headers: { cookie: `parachute_id_session=${magicSession}` },
+      redirect: "manual",
+    });
+    const scsrf = cookieVal(secGet.headers.getSetCookie(), "parachute_id_csrf");
+    const secCookie = `parachute_id_session=${magicSession}; parachute_id_csrf=${scsrf}`;
+    const startRes = await fetch(`${IDENTITY}/console/security`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: secCookie },
+      redirect: "manual",
+      body: form({ __csrf: scsrf!, action: "start" }),
+    });
+    const secret = /data-testid="totp-secret">([^<]+)</.exec(await startRes.text())?.[1];
+    assert(startRes.status === 200 && !!secret, "TOTP enroll start → QR + secret", `status ${startRes.status}`);
+
+    const confirmRes = await fetch(`${IDENTITY}/console/security`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: secCookie },
+      redirect: "manual",
+      body: form({ __csrf: scsrf!, action: "confirm", secret: secret!, code: await totpCodeAt(secret!, new Date()) }),
+    });
+    assert(/Two-factor is on/.test(await confirmRes.text()), "TOTP confirm → 2FA enabled + backup codes", `status ${confirmRes.status}`);
+
+    // A fresh magic link for the now-2FA account diverts to the code prompt.
+    const send2 = await fetch(`${IDENTITY}/auth/magic`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${mcsrf}` },
+      redirect: "manual",
+      body: form({ __csrf: mcsrf!, email: magicEmail }),
+    });
+    const verify2 = await fetch(send2.headers.get("x-parachute-dev-magic-link")!, { redirect: "manual" });
+    const pending = cookieVal(verify2.headers.getSetCookie(), "parachute_id_pending");
+    assert(
+      verify2.status === 302 && verify2.headers.get("location") === "/login/2fa" && !!pending,
+      "2FA on: magic verify diverts to the code prompt (no session yet)",
+      `status ${verify2.status}, loc ${verify2.headers.get("location")}`,
+    );
+
+    const p2Get = await fetch(`${IDENTITY}/login/2fa`, { headers: { cookie: `parachute_id_pending=${pending}` }, redirect: "manual" });
+    const p2csrf = cookieVal(p2Get.headers.getSetCookie(), "parachute_id_csrf");
+    // Code for the NEXT step so it can't collide with the enroll code the replay
+    // guard already recorded (still inside the server's ±1 acceptance window).
+    const loginCode = await totpCodeAt(secret!, new Date(Date.now() + 30_000));
+    const p2Post = await fetch(`${IDENTITY}/login/2fa`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_pending=${pending}; parachute_id_csrf=${p2csrf}` },
+      redirect: "manual",
+      body: form({ __csrf: p2csrf!, code: loginCode }),
+    });
+    const twofaSession = cookieVal(p2Post.headers.getSetCookie(), "parachute_id_session");
+    assert(
+      p2Post.status === 302 && p2Post.headers.get("location") === "/console" && !!twofaSession,
+      "2FA code at the prompt mints the session",
+      `status ${p2Post.status}`,
+    );
   }
 
   // --- summary ---
