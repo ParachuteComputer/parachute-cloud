@@ -18,7 +18,27 @@ function errText(e: unknown): string {
   return String(e);
 }
 
-type StepResult = { step: string; ok: boolean; detail?: unknown; error?: string };
+// `detail` is heterogeneous measurement payload. It is `any` (not `unknown`)
+// deliberately: these types are the return values of Durable Object RPC
+// methods, which must satisfy `Rpc.Serializable` — `unknown` fails that
+// constraint and collapses the whole method's stub type to `never`.
+type StepResult = { step: string; ok: boolean; detail?: any; error?: string };
+
+// Concrete (all-optional) shape for the introspection probe — see the note in
+// `introspect()` on why this is not a `Record<string, any>`.
+type IntrospectResult = {
+  table_info_rows?: number;
+  table_info_columns?: string[];
+  table_info_ok?: boolean;
+  table_info_error?: string;
+  table_xinfo_rows?: number;
+  table_xinfo_ok?: boolean;
+  table_xinfo_error?: string;
+  foreign_keys_read?: Record<string, SqlStorageValue> | null;
+  foreign_keys_read_error?: string;
+  foreign_keys_set_ok?: boolean;
+  foreign_keys_set_error?: string;
+};
 
 export class VaultDO extends DurableObject {
   private shim: DatabaseShim;
@@ -89,8 +109,11 @@ export class VaultDO extends DurableObject {
   }
 
   // --- Unknown #4: introspection PRAGMAs (table_info / table_xinfo) ---
-  async introspect() {
-    const out: Record<string, unknown> = {};
+  async introspect(): Promise<IntrospectResult> {
+    // A concrete result type (not `Record<string, any>`): the DO RPC stub
+    // wraps every return in `Rpc.Serializable`, and an open `any`-valued
+    // record makes that transform recurse without a fixed point (TS2589).
+    const out: IntrospectResult = {};
     try {
       const tableInfo = this.raw().exec("PRAGMA table_info(notes)").toArray();
       out.table_info_rows = tableInfo.length;

@@ -55,6 +55,12 @@ const JOURNAL_PRAGMA_RE = /^\s*PRAGMA\s+journal_mode\b/i;
  * only. Core's `SCHEMA_SQL` ends with a comment block, so peel trailing
  * comments + whitespace before handing the string to DO. (Empty-after-strip
  * ⇒ nothing to run.)
+ *
+ * Invariant: only trusted, first-party schema/migration SQL reaches `exec()`
+ * (core's `SCHEMA_SQL` + `migrateToVN`). User input never flows here — all
+ * user-supplied values arrive as bound params through `prepare()` — so this
+ * lexical strip does not need to reason about comment markers inside string
+ * literals.
  */
 function stripTrailingComments(sql: string): string {
   let s = sql;

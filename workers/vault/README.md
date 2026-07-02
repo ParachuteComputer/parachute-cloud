@@ -12,6 +12,7 @@ gate the [Vault Cloud serverless design](../../../parachute.computer/design/2026
 ```sh
 cd workers/vault
 bun x vitest run            # all 9 tests; ~5s incl. the 100k-note FTS pass
+bun run typecheck           # clean (needs "bun" in tsconfig types for bun:sqlite)
 ```
 
 The DO is driven directly over RPC from the tests; the `fetch` handler is a
