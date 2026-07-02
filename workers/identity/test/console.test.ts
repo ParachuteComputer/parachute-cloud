@@ -25,7 +25,8 @@ import {
   validateVaultName,
 } from "../src/vaults.ts";
 import { getUserByEmail } from "../src/users.ts";
-import { SIGNUP_MAX_PER_WINDOW, checkAndBumpSignup } from "../src/rate-limit.ts";
+import { resolveResourceVault } from "../src/audience.ts";
+import { LOGIN_MAX_FAILURES, SIGNUP_MAX_PER_WINDOW, checkAndBumpSignup } from "../src/rate-limit.ts";
 import {
   CSRF,
   ISSUER,
@@ -345,6 +346,60 @@ describe("signup throttle", () => {
   });
 });
 
+describe("login brute-force fence", () => {
+  async function loginAttempt(email: string, password: string, ip: string): Promise<Response> {
+    return app.fetch(
+      new Request(`${ISSUER}/login`, {
+        method: "POST",
+        body: new URLSearchParams({ __csrf: CSRF, email, password }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: ISSUER, "cf-connecting-ip": ip, cookie: `parachute_id_csrf=${CSRF}` },
+      }),
+      env,
+    );
+  }
+
+  test("N failed logins lock the (ip,email) — even a correct password is refused", async () => {
+    await seedUser("brute@example.com", "correcthorse9");
+    const ip = "203.0.113.9";
+    for (let i = 0; i < LOGIN_MAX_FAILURES; i++) {
+      expect(await (await loginAttempt("brute@example.com", "wrong", ip)).text()).toContain("Incorrect email or password");
+    }
+    const locked = await loginAttempt("brute@example.com", "correcthorse9", ip);
+    expect(await locked.text()).toContain("Too many attempts");
+  });
+
+  test("a success before the limit clears the counter", async () => {
+    await seedUser("recover@example.com", "correcthorse9");
+    const ip = "203.0.113.10";
+    await loginAttempt("recover@example.com", "wrong", ip);
+    await loginAttempt("recover@example.com", "wrong", ip);
+    const ok = await loginAttempt("recover@example.com", "correcthorse9", ip);
+    expect(ok.status).toBe(302);
+    expect(ok.headers.get("location")).toBe("/console");
+    // The counter was cleared: a fresh wrong attempt is "incorrect", not "locked".
+    expect(await (await loginAttempt("recover@example.com", "wrong", ip)).text()).toContain("Incorrect email or password");
+  });
+
+  test("the lockout is per (ip,email) — a different IP for the same email is unaffected", async () => {
+    await seedUser("shared@example.com", "correcthorse9");
+    for (let i = 0; i < LOGIN_MAX_FAILURES; i++) {
+      await loginAttempt("shared@example.com", "wrong", "198.51.100.1");
+    }
+    // Same email, different IP: still gets the normal "incorrect", not a lockout.
+    expect(await (await loginAttempt("shared@example.com", "wrong", "198.51.100.2")).text()).toContain("Incorrect email or password");
+  });
+});
+
+describe("resolveResourceVault case-normalization", () => {
+  const opts = { boundOrigins: [ISSUER] as readonly string[], vaultBaseDomain: "u.parachute.computer" };
+  test("mixed-case path form canonicalizes to lowercase", () => {
+    expect(resolveResourceVault(`${ISSUER}/vault/MyVault/mcp`, opts)).toBe("myvault");
+  });
+  test("mixed-case subdomain form canonicalizes to lowercase", () => {
+    expect(resolveResourceVault("https://MyVault.u.parachute.computer/mcp", opts)).toBe("myvault");
+  });
+});
+
 describe("console — login / logout", () => {
   test("login with the right password → session → /console; wrong → error", async () => {
     await seedUser("member@example.com", "hunter2long");
@@ -406,8 +461,10 @@ describe("console — vaults", () => {
     const html = await consoleRes.text();
     expect(html).toContain("my-notes");
     expect(html).toContain("claude mcp add --transport http parachute-my-notes");
-    // Subdomain URL form when VAULT_ORIGIN is unset (the prod addressing).
-    expect(html).toContain("https://my-notes.u.parachute.computer/mcp");
+    // Path URL form: VAULT_ORIGIN is set in the toml (the live branded host).
+    // (buildServicesCatalog's subdomain form — VAULT_ORIGIN unset — is covered by
+    // the conformance "happy path" services-catalog assertion.)
+    expect(html).toContain("https://u.parachute.computer/vault/my-notes/mcp");
     expect(html).toContain("is ready");
   });
 

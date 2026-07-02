@@ -59,9 +59,13 @@ binding = "ATTACHMENTS"
 bucket_name = "parachute-vault-dev"
 
 [vars]
-# The Identity Worker origin — used to validate token `iss` and fetch its JWKS
-# + revocation list (scope-guard). Overridden per-environment on deploy.
-ISSUER_ORIGIN = "https://id.parachute.computer"
+# The Identity Worker origin — validates token `iss` + fetches its JWKS +
+# revocation list (scope-guard). This is the LIVE value so the deployed config is
+# self-contained: it MUST match the identity worker's ISSUER, else every token's
+# `iss` fails validation. A bare `wrangler deploy` now sets it correctly (no
+# deploy-time `--var` to forget). Tests use TEST_JWKS (gated on ENVIRONMENT=test),
+# so this value doesn't affect the vault vitest suite.
+ISSUER_ORIGIN = "https://cloud.parachute.computer"
 # Subdomain base for hostname routing: <name>.u.parachute.computer → DO(name).
 VAULT_BASE_DOMAIN = "u.parachute.computer"
 # Default per-tenant storage cap (bytes). 1 GiB. Overridable per-DO in config.

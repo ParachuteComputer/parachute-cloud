@@ -16,7 +16,14 @@
  * connect-your-AI consent without a second login.
  */
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { checkAndBumpSignup, clientIp } from "./rate-limit.ts";
+import {
+  checkAndBumpSignup,
+  clearLoginFailures,
+  clientIp,
+  isLoginLocked,
+  loginKey,
+  recordLoginFailure,
+} from "./rate-limit.ts";
 import {
   SESSION_COOKIE,
   buildSessionCookie,
@@ -116,11 +123,20 @@ export async function handleLoginPost(db: D1Database, req: Request, deps: OAuthD
   }
   const email = String(form.get("email") ?? "").trim();
   const password = String(form.get("password") ?? "");
+  const now = deps.now?.() ?? new Date();
+  // Brute-force fence BEFORE the (expensive) password verify: a locked key is
+  // refused without even running PBKDF2.
+  const key = loginKey(clientIp(req), email);
+  if ((await isLoginLocked(db, key, now)).locked) {
+    return loginError(req, "Too many attempts. Please wait a few minutes and try again.", email);
+  }
   const user = email ? await getUserByEmail(db, email) : null;
   if (!user || !(await verifyPassword(user, password))) {
+    await recordLoginFailure(db, key, now);
     return loginError(req, "Incorrect email or password.", email);
   }
-  const session = await createSession(db, user.id, deps.now?.() ?? new Date());
+  await clearLoginFailures(db, key);
+  const session = await createSession(db, user.id, now);
   return redirectResponse("/console", { "set-cookie": buildSessionCookie(session.id) });
 }
 

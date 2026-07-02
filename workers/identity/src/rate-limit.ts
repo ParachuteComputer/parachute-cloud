@@ -60,3 +60,65 @@ export async function checkAndBumpSignup(
   await db.prepare("UPDATE signup_throttle SET attempts = attempts + 1 WHERE ip = ?").bind(ip).run();
   return { allowed: true, retryAfterSeconds: 0 };
 }
+
+// --- login brute-force fence ----------------------------------------------
+
+export const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+export const LOGIN_MAX_FAILURES = 5;
+
+interface LoginRow {
+  key: string;
+  fails: number;
+  window_started_at: string;
+}
+
+/** Per-(ip, email) key so a lockout can't be weaponized to lock a victim out globally. */
+export function loginKey(ip: string, email: string): string {
+  return `${ip}|${email.trim().toLowerCase()}`;
+}
+
+/**
+ * Is this (ip, email) currently locked out? A locked key refuses even a correct
+ * password until the window rolls — that's the brute-force fence. Returns the
+ * retry-after so callers can surface it.
+ */
+export async function isLoginLocked(
+  db: D1Database,
+  key: string,
+  now: Date = new Date(),
+): Promise<{ locked: boolean; retryAfterSeconds: number }> {
+  const row = await db.prepare("SELECT * FROM login_throttle WHERE key = ?").bind(key).first<LoginRow>();
+  if (!row) return { locked: false, retryAfterSeconds: 0 };
+  const elapsed = now.getTime() - new Date(row.window_started_at).getTime();
+  if (elapsed >= LOGIN_WINDOW_MS) return { locked: false, retryAfterSeconds: 0 };
+  if (row.fails >= LOGIN_MAX_FAILURES) {
+    return { locked: true, retryAfterSeconds: Math.ceil((LOGIN_WINDOW_MS - elapsed) / 1000) };
+  }
+  return { locked: false, retryAfterSeconds: 0 };
+}
+
+/** Record a failed login attempt (rolls the window when it has elapsed). */
+export async function recordLoginFailure(db: D1Database, key: string, now: Date = new Date()): Promise<void> {
+  const row = await db.prepare("SELECT * FROM login_throttle WHERE key = ?").bind(key).first<LoginRow>();
+  if (!row) {
+    await db
+      .prepare("INSERT INTO login_throttle (key, fails, window_started_at) VALUES (?, 1, ?)")
+      .bind(key, now.toISOString())
+      .run();
+    return;
+  }
+  const elapsed = now.getTime() - new Date(row.window_started_at).getTime();
+  if (elapsed >= LOGIN_WINDOW_MS) {
+    await db
+      .prepare("UPDATE login_throttle SET fails = 1, window_started_at = ? WHERE key = ?")
+      .bind(now.toISOString(), key)
+      .run();
+  } else {
+    await db.prepare("UPDATE login_throttle SET fails = fails + 1 WHERE key = ?").bind(key).run();
+  }
+}
+
+/** Clear the failure counter on a successful login. */
+export async function clearLoginFailures(db: D1Database, key: string): Promise<void> {
+  await db.prepare("DELETE FROM login_throttle WHERE key = ?").bind(key).run();
+}

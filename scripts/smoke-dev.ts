@@ -319,6 +319,24 @@ async function main() {
     // The DEV user is REFUSED a token for the new user's vault.
     const intruder = await authorizeFor(email, password, newVault);
     assert(!intruder.token && intruder.error === "invalid_scope", "dev user CANNOT mint for another user's vault", intruder.error ? `error=${intruder.error}` : "unexpectedly minted");
+
+    // Login brute-force fence: hammering a throwaway email is locked out. The
+    // per-(ip,email) key means this never touches the dev or new-user accounts.
+    const victim = `throttle+${Date.now()}@example.com`;
+    const oneLogin = async (): Promise<string> => {
+      const g = await fetch(`${IDENTITY}/login`, { redirect: "manual" });
+      const c = cookieVal(g.headers.getSetCookie(), "parachute_id_csrf");
+      const r = await fetch(`${IDENTITY}/login`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${c}` },
+        redirect: "manual",
+        body: form({ __csrf: c!, email: victim, password: "definitely-wrong" }),
+      });
+      return r.text();
+    };
+    let lastLogin = "";
+    for (let i = 0; i < 6; i++) lastLogin = await oneLogin();
+    assert(/too many attempts/i.test(lastLogin), "login throttle locks a hammered account", "");
   }
 
   // --- summary ---

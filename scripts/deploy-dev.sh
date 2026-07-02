@@ -20,7 +20,9 @@ set -euo pipefail
 
 export CLOUDFLARE_ACCOUNT_ID=8f2a7eb9d5e21ffa902a76cf62975c82   # "Unforced Development"
 
-# The branded origins the deploy pins into the workers' env.
+# The live origins now live IN the wrangler.toml [vars] (self-contained config),
+# so the deploys below need no `--var` overrides — a bare `wrangler deploy` sets
+# the correct `iss`/`ISSUER_ORIGIN`/`VAULT_ORIGIN` and can't silently revert them.
 ISSUER_ORIGIN="https://cloud.parachute.computer"   # console + OAuth issuer (iss)
 VAULT_PUBLIC="https://u.parachute.computer"         # vault host (path routing)
 
@@ -47,17 +49,15 @@ cd "$ROOT/workers/identity"
 bunx wrangler d1 migrations apply parachute-identity --remote
 bun scripts/seed-dev-user.ts                                    # .dev-secrets -> scripts/seed-dev-user.sql (also grandfathers vault "demo")
 bunx wrangler d1 execute parachute-identity --remote --file=./scripts/seed-dev-user.sql
-# ISSUER = the branded issuer origin (a cloud vault has no hub; iss must equal a
-# real, reachable origin). The toml keeps id.parachute.computer as the default the
-# conformance corpus pins, so override here. VAULT_ORIGIN puts the console's
-# connect cards + services catalog on the branded vault host (path routing).
-bunx wrangler deploy --var "ISSUER:${ISSUER_ORIGIN}" --var "VAULT_ORIGIN:${VAULT_PUBLIC}"
+# ISSUER + VAULT_ORIGIN are baked into wrangler.toml [vars] (self-contained).
+bunx wrangler deploy
 
 # --- vault DO worker (DO SQLite + R2 + scope-guard against identity) ---------
 cd "$ROOT/workers/vault"
 # DO SQLite migration (new_sqlite_classes) applies automatically on deploy.
-# ISSUER_ORIGIN must match the identity issuer so token `iss` + JWKS validate.
-bunx wrangler deploy --var "ISSUER_ORIGIN:${ISSUER_ORIGIN}"
+# ISSUER_ORIGIN (baked into [vars]) must match the identity issuer so token `iss`
+# + JWKS validate.
+bunx wrangler deploy
 
 echo
 echo "Deployed."
