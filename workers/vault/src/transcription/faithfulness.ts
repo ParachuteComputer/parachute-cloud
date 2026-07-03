@@ -100,6 +100,10 @@ export const NEGATORS: ReadonlySet<string> = new Set([
   // standalone
   "not", "no", "never", "cannot", "nor", "neither", "none", "nobody",
   "nothing", "nowhere", "without", "hardly", "barely", "scarcely",
+  // negation-adverbs of frequency ("I rarely eat meat" → "I eat meat" flips
+  // meaning). Kept to the CLEAR negation class only — NOT ambiguous
+  // quantifiers like "little"/"few" that could reject legit cleanups.
+  "rarely", "seldom",
   // n't contractions (apostrophe already stripped by tokenize)
   "nt", "dont", "doesnt", "didnt", "cant", "couldnt", "wont", "wouldnt",
   "shouldnt", "isnt", "arent", "wasnt", "werent", "hasnt", "havent",

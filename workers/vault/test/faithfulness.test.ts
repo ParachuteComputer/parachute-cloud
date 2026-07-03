@@ -61,6 +61,12 @@ describe("checkFaithful — negation is sacred (meaning-flip fix)", () => {
     expect(v.reason).toMatch(/negation/);
   });
 
+  it("REJECTS a dropped negation-adverb ('I rarely eat meat' → 'I eat meat')", () => {
+    const v = checkFaithful("I rarely eat meat", "I eat meat");
+    expect(v.ok).toBe(false);
+    expect(v.reason).toMatch(/negation/);
+  });
+
   it("REJECTS a dropped 'not' on a LONG transcript even though the budget would allow one drop", () => {
     // 200 words, one is "not"; budget = min(floor(200*0.02)=4, cap 3) = 3, so a
     // lone drop would normally fit — but negators are never budget-eligible.
