@@ -33,13 +33,19 @@ workers/identity/   the OAuth issuer (authorize/token/DCR/JWKS/revocation on D1)
                     magic-link send counters. ALSO guided arrival (0.0.8-rc.11):
                     first-run hero + research questions, the getting-started
                     checklist (user_checklist), the Connect-your-AI card.
-                    161 tests.
+                    ALSO the onboarding email drip (0.0.8-rc.12, src/drip.ts):
+                    hourly cron sends day-0 welcome / day-3 connect-nudge
+                    (only without AI activity) / day-14 feedback ask, with a
+                    drip_sends idempotence ledger, per-run cap, PII-free
+                    drip_events counters, and tokenized GET/POST /unsubscribe
+                    (+ RFC 8058 List-Unsubscribe headers). 194 tests.
 src/                the OLD control plane (Worker + D1 + Stripe). Dormant; billing
                     lifecycle design gets harvested into the control-plane revival.
-scripts/            deploy-staging.sh + smoke-staging.ts (full 54-step live smoke,
+scripts/            deploy-staging.sh + smoke-staging.ts (full 58-step live smoke,
                     creates throwaway accounts/vaults — incl. the guided-arrival
-                    headless walk) for STAGING; deploy-prod.sh + smoke-prod.ts
-                    (read-only checks) for PRODUCTION.
+                    headless walk + a drip tick via the staging-only trigger)
+                    for STAGING; deploy-prod.sh + smoke-prod.ts (read-only
+                    checks) for PRODUCTION.
 ```
 
 ## Commands
@@ -48,8 +54,8 @@ scripts/            deploy-staging.sh + smoke-staging.ts (full 54-step live smok
 bun install                         # ALSO refreshes the copied core dep (see gotcha)
 bun run test                        # control-plane tests (src/) — 123
 bun run typecheck                   # root tsc
-cd workers/vault && bun run typecheck && bun x vitest run    # 99+1 todo under workerd
-cd workers/identity && bun run typecheck && bun x vitest run # 161
+cd workers/vault && bun run typecheck && bun x vitest run    # 109+1 todo under workerd
+cd workers/identity && bun run typecheck && bun x vitest run # 194
 bash scripts/deploy-staging.sh      # deploy both workers -e staging + migrate + seed
 bun scripts/smoke-staging.ts        # FULL live smoke vs staging (creates test debris)
 bash scripts/deploy-prod.sh         # deploy both workers top-level + migrate (NO seed)
@@ -62,7 +68,8 @@ bun scripts/smoke-prod.ts           # READ-ONLY live checks vs production
 - **Transactions**: DO SQLite rejects `BEGIN/COMMIT`. Core's `transaction()` duck-types the shim's `transactionSync` (→ `ctx.storage.transactionSync`) since vault 0.6.5-rc.2. The conformance suite pins a GLOBAL-zero interception count; the sole residual is the async-batch path (cloud#25 — close or accept before real clients batch-write).
 - **workerd ≠ vitest-workerd exactly**: workerd caps PBKDF2 at 100k iterations at runtime but vitest's pool does NOT enforce it (42/42 green while every live login 500'd). Live-smoke after deploy, always (`scripts/smoke-staging.ts` / `scripts/smoke-prod.ts`).
 - **TEST_JWKS** in workers/vault auth is double-gated on `ENVIRONMENT="test"` — never set that in a deployed config.
-- **Observability (since 0.0.8-rc.8)**: `[observability] enabled = true` (+ `head_sampling_rate = 1`) in BOTH wrangler.tomls, top-level AND `[env.staging.observability]` (NOT inherited by named envs) — before this the account had no persistent Workers Logs at all (`wrangler tail` captured zero events, 2026-07-02). The identity worker carries the ops cron (`[triggers]`, patterns must match `HEALTH_CRON`/`DIGEST_CRON` in `src/ops.ts`): every 10 min a health check (D1 self-check + `GET <VAULT_ORIGIN>/health`; failures email `OPERATOR_ALERT_EMAIL` with a 1-hour per-check dedupe in D1 `ops_alerts`), Mondays 14:00 UTC a counts-only ops digest (users/vaults/magic-link events — the `magic_link_events` per-day counters are PII-free by design). Staging runs the same crons but its devlog sender writes the emails to the worker log instead. Live cron firings can't be forced — `wrangler dev --test-scheduled` + `curl "http://localhost:8787/__scheduled?cron=..."` locally, `worker.scheduled` via `createScheduledController` in vitest.
+- **Observability (since 0.0.8-rc.8)**: `[observability] enabled = true` (+ `head_sampling_rate = 1`) in BOTH wrangler.tomls, top-level AND `[env.staging.observability]` (NOT inherited by named envs) — before this the account had no persistent Workers Logs at all (`wrangler tail` captured zero events, 2026-07-02). The identity worker carries the ops cron (`[triggers]`, patterns must match `HEALTH_CRON`/`DIGEST_CRON`/`DRIP_CRON` in `src/ops.ts`): every 10 min a health check (D1 self-check + `GET <VAULT_ORIGIN>/health`; failures email `OPERATOR_ALERT_EMAIL` with a 1-hour per-check dedupe in D1 `ops_alerts`), Mondays 14:00 UTC a counts-only ops digest (users/vaults/magic-link events — the `magic_link_events` per-day counters are PII-free by design), and hourly at :15 the onboarding drip (`src/drip.ts` — see the drip note below). Staging runs the same crons but its devlog sender writes the emails to the worker log instead. Live cron firings can't be forced — `wrangler dev --test-scheduled` + `curl "http://localhost:8787/__scheduled?cron=..."` locally, `worker.scheduled` via `createScheduledController` in vitest; for the drip specifically, staging additionally exposes `POST /__test/drip-run` (404 in production) so the live smoke can drive a tick deterministically.
+- **Onboarding drip (since 0.0.8-rc.12, ratified)**: three behavior-aware emails, never marketing-brained — day-0 welcome (within the hour of signup: the vault's three doors), day-3 connect-your-AI nudge ONLY when the account shows no AI activity (no `tokens` or `grants` row for a non-`parachute-console` client), day-14 feedback ask (Reply-To `hello@parachute.computer`). Exactly-once via the `drip_sends` ledger (send-then-record; a failed send retries next hour); eligibility windows are wider than the cron interval on purpose (missed-run tolerance — the ledger, not the window edge, prevents resends); `DRIP_RUN_CAP` (50 attempts/run) drains backlogs gradually. Every email carries a tokenized unsubscribe link (`users.drip_unsub_token`, raw-stored 256-bit random — it only authorizes opting out) + RFC 8058 `List-Unsubscribe`/`List-Unsubscribe-Post` headers; `GET|POST /unsubscribe?t=…` is loginless and idempotent, honored by every eligibility query (`users.drip_unsubscribed`). Counters in `drip_events` (PII-free, the `magic_link_events` pattern). Migration 0008.
 - **Environments (the production/staging split, 2026-07-02)** — both live in the **Unforced Development** CF account (the `parachute.computer` zone is there):
   - **PRODUCTION = the TOP-LEVEL config in both `wrangler.toml` files.** It can never move into an `[env.production]`: named envs auto-suffix worker names, and a differently-named worker would detach the Custom Domains (and, for the vault worker, orphan every existing DO). Branded Custom Domains: **console + OAuth issuer `https://cloud.parachute.computer`** (`iss` = this origin, worker `parachute-identity`, D1 `parachute-identity`); **vaults `https://u.parachute.computer/vault/<name>/…`** (path routing, worker `parachute-vault-do`, R2 `parachute-vault-dev` — name grandfathered from the pre-split era; per-vault subdomains need proxied wildcard DNS, Enterprise-gated; see TRYIT). workers.dev URLs still resolve as a fallback. `ENVIRONMENT="production"`: the `x-parachute-dev-magic-link` echo header is NEVER emitted and magic-link email is REAL. Deploy: `bash scripts/deploy-prod.sh` (migrations, NO seeding — `dev@parachute.computer` already exists in prod and is retained as the operator login for now; revisit before public). Verify: `bun scripts/smoke-prod.ts` (read-only).
   - **STAGING = `[env.staging]` in both files** (`wrangler deploy -e staging`): auto-suffixed workers `parachute-identity-staging` / `parachute-vault-do-staging` on **workers.dev URLs only** (`routes = []` overrides the inheritable top-level custom-domain route — load-bearing, see the comment in each toml), own D1 (`parachute-identity-staging`) + R2 (`parachute-vault-staging`) + a fresh DO namespace. `ENVIRONMENT="staging"` → echo header ON; identity staging deliberately has **no `send_email` binding** → dev-log sender, so the magic-link flow is fully headless-testable with zero real email. The staging issuer is staging's own workers.dev origin and the staging vault's `ISSUER_ORIGIN` matches it (tokens never cross environments). Deploy: `bash scripts/deploy-staging.sh` (migrations + dev-user seed). Verify: `bun scripts/smoke-staging.ts` (the FULL smoke — creates throwaway accounts/vaults; never point it at prod).

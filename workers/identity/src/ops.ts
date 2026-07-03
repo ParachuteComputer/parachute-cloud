@@ -14,6 +14,9 @@
  *     per-check dedupe persisted in D1 (`ops_alerts`).
  *   - Mondays 14:00 UTC (DIGEST_CRON): a counts-only digest from D1 — users,
  *     vaults, magic links sent/failed over 7 days. No PII, ever: counts only.
+ *   - hourly at :15 (DRIP_CRON): the onboarding email drip — routed here,
+ *     implemented in drip.ts (eligibility windows, idempotence ledger,
+ *     per-run cap, unsubscribe).
  *
  * Everything is a pure `(env, sender, deps)` function with an injectable clock
  * + fetch, mirroring the OAuth handlers, so the tests drive the same code the
@@ -21,10 +24,13 @@
  */
 import type { Env } from "./env.ts";
 import type { EmailSender } from "./email.ts";
+import { runDrip } from "./drip.ts";
 
 /** Cron patterns — MUST match `[triggers] crons` in wrangler.toml (both envs). */
 export const HEALTH_CRON = "*/10 * * * *";
 export const DIGEST_CRON = "0 14 * * 1";
+/** Hourly onboarding-drip tick (drip.ts) — :15 to stay clear of the :00 health tick. */
+export const DRIP_CRON = "15 * * * *";
 
 /** Re-alert at most once per hour per failing check. */
 export const ALERT_DEDUPE_MS = 60 * 60 * 1000;
@@ -41,16 +47,22 @@ export interface OpsDeps {
  * Which job a firing cron maps to. Cloudflare passes the matched pattern as
  * `controller.cron`. Anything unrecognized runs the health check — a safe
  * default: a drifted pattern degrades to "extra liveness checks", never to
- * "a cron that silently does nothing".
+ * "a cron that silently does nothing" (and never to accidental user email —
+ * only an exact DRIP_CRON match sends the drip).
  */
-export function routeCron(cron: string): "digest" | "health" {
-  return cron === DIGEST_CRON ? "digest" : "health";
+export function routeCron(cron: string): "digest" | "drip" | "health" {
+  if (cron === DIGEST_CRON) return "digest";
+  if (cron === DRIP_CRON) return "drip";
+  return "health";
 }
 
 /** The worker's scheduled entrypoint (wired in index.ts with the real sender). */
 export async function handleScheduled(cron: string, env: Env, sender: EmailSender, deps: OpsDeps = {}): Promise<void> {
-  if (routeCron(cron) === "digest") {
+  const job = routeCron(cron);
+  if (job === "digest") {
     await sendWeeklyDigest(env, sender, deps);
+  } else if (job === "drip") {
+    await runDrip(env, sender, deps);
   } else {
     await runHealthCheck(env, sender, deps);
   }

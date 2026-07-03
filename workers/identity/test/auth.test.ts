@@ -49,6 +49,9 @@ function captureSender(): EmailSender & { sent: Array<{ to: string; link: string
     async sendOps(): Promise<SendResult> {
       return { ok: true };
     },
+    async sendDrip(): Promise<SendResult> {
+      return { ok: true };
+    },
   };
 }
 
@@ -207,6 +210,9 @@ describe("magic link — send + verify", () => {
       async sendOps(): Promise<SendResult> {
         return { ok: true };
       },
+      async sendDrip(): Promise<SendResult> {
+        return { ok: true };
+      },
     };
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
@@ -267,6 +273,9 @@ describe("magic link — send + verify", () => {
         return { ok: false, error: "SendError: quota exceeded" };
       },
       async sendOps(): Promise<SendResult> {
+        return { ok: true };
+      },
+      async sendDrip(): Promise<SendResult> {
         return { ok: true };
       },
     };

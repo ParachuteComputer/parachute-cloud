@@ -622,6 +622,45 @@ async function main() {
     );
   }
 
+  // 13. Onboarding drip — the staging-only trigger (POST /__test/drip-run,
+  //     404 in production) drives one hourly drip tick NOW instead of waiting
+  //     for the :15 cron. This very run created fresh users above (sections
+  //     9/10/12), so a day-0 welcome MUST fire; re-triggering then proves the
+  //     drip_sends ledger (0 further welcomes). Staging's devlog sender means
+  //     every "send" is a worker-log line — no real email exists here. The
+  //     valid-unsubscribe path is vitest-covered (the raw token only rides the
+  //     emailed link); live we pin the tamper case.
+  {
+    let lastStatus = 0;
+    const run = async (): Promise<{ sent: { welcome: number }; capped: boolean } | null> => {
+      const r = await fetch(`${IDENTITY}/__test/drip-run`, { method: "POST" });
+      lastStatus = r.status;
+      return r.status === 200 ? ((await r.json()) as { sent: { welcome: number }; capped: boolean }) : null;
+    };
+    const first = await run();
+    assert(!!first, "drip: staging trigger answers 200 with a PII-free summary", `status ${lastStatus}`);
+    if (first) {
+      // Drain a capped backlog (prior debris) so this run's users are reached.
+      let welcome = first.sent.welcome;
+      let capped = first.capped;
+      for (let i = 0; capped && i < 5; i++) {
+        const next = await run();
+        if (!next) break;
+        welcome += next.sent.welcome;
+        capped = next.capped;
+      }
+      assert(welcome >= 1, "drip: day-0 welcome fires for this run's fresh signups", `welcome=${welcome}`);
+      const again = await run();
+      assert(
+        !!again && again.sent.welcome === 0,
+        "drip: ledger prevents resends (immediate re-trigger sends 0 welcomes)",
+        again ? `welcome=${again.sent.welcome}` : "non-200",
+      );
+    }
+    const bogus = await fetch(`${IDENTITY}/unsubscribe?t=bogus-${Date.now()}`);
+    assert(bogus.status === 404, "drip: unsubscribe with an unknown token is refused (404)", `status ${bogus.status}`);
+  }
+
   // --- summary ---
   console.log(`\n${"=".repeat(60)}\nSMOKE ${failures === 0 ? "PASSED" : "FAILED"} — ${results.filter((r) => r.includes("PASS")).length} pass, ${failures} fail\n${"=".repeat(60)}`);
   console.log(results.join("\n"));

@@ -46,9 +46,13 @@ head_sampling_rate = 1
 #                   1-hour per-check dedupe (ops_alerts, D1).
 #   0 14 * * 1    → weekly ops digest (Mon 14:00 UTC ≈ Monday morning MT):
 #                   counts-only from D1 (users/vaults/magic-link events).
-# The patterns here MUST stay in sync with HEALTH_CRON/DIGEST_CRON in ops.ts.
+#   15 * * * *    → hourly onboarding-drip tick (src/drip.ts): day-0 welcome,
+#                   day-3 connect nudge (only without AI activity), day-14
+#                   feedback ask; drip_sends ledger + per-run cap + unsubscribe.
+# The patterns here MUST stay in sync with HEALTH_CRON/DIGEST_CRON/DRIP_CRON
+# in ops.ts.
 [triggers]
-crons = ["*/10 * * * *", "0 14 * * 1"]
+crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *"]
 
 # Control-plane state: users, clients, auth_codes, tokens, grants, sessions,
 # signing_keys. The revocation list is DERIVED from the tokens table (exactly
@@ -186,10 +190,11 @@ OPERATOR_ALERT_EMAIL = "ag@unforced.org"
 enabled = true
 head_sampling_rate = 1
 
-# Same cron schedule as production: the health check + digest RUN on staging
-# (exercising the real cron path), with output to the log instead of email.
+# Same cron schedule as production: the health check + digest + drip RUN on
+# staging (exercising the real cron path), with output to the log instead of
+# email (no send_email binding → devlog sender captures drip sends too).
 [env.staging.triggers]
-crons = ["*/10 * * * *", "0 14 * * 1"]
+crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *"]
 
 # (no [[env.staging.send_email]] — see the staging banner above; the omission is
 # the point: dev-log sender + echo header = deterministic headless testing.)
