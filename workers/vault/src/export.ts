@@ -57,9 +57,11 @@ export function exportPrefix(vaultName: string): string {
  * Prune a vault's export tarballs down to the newest `keep`. Returns the keys
  * it deleted (for the caller's log line + tests).
  *
- * "Newest" = greatest R2 key: keys embed the export timestamp (fixed-width
- * ISO-8601 with `:`/`.` mapped to `-`), so lexicographic key order is
- * chronological order for everything this system writes.
+ * "Newest" = greatest R2 key: keys embed a SERVER-derived timestamp
+ * (fixed-width ISO-8601 with `:`/`.` mapped to `-` — see handleExport; the
+ * client-controlled `exported_at` param never reaches the key), so
+ * lexicographic key order is chronological order for everything this system
+ * writes and a caller cannot mint a key that pins itself past the prune.
  *
  * Metering: export tarballs are deliberately NOT counted in the `r2_bytes`
  * cap meter (the export write path never calls `meterAdd` — exports are

@@ -419,7 +419,15 @@ export class VaultDO extends DurableObject {
     const exportedAt = url.searchParams.get("exported_at") ?? undefined;
     const { entries } = await collectExportEntries(this.store, this.exportOpts(vaultName, { since, exportedAt }));
     const tar = toTar(entries);
-    const ts = (exportedAt ?? new Date().toISOString()).replace(/[:.]/g, "-");
+    // The R2 key is ALWAYS server-time-derived (fixed-width ISO with `:`/`.`
+    // mapped to `-`, so lexicographic key order is chronological). The
+    // caller-controlled `exported_at` param flows ONLY into the tarball
+    // CONTENT metadata (its documented purpose — deterministic re-exports);
+    // it must never touch the key, or a caller could mint a key that always
+    // sorts newest (e.g. "zzzz-…") and pin itself past the retention prune
+    // below. Two exports inside the same millisecond overwrite one key —
+    // benign: last-write-wins between equivalent backup artifacts.
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
     // Export tarballs are operational backup artifacts, NOT user content: they
     // are deliberately EXCLUDED from the r2_bytes cap meter (no meterAdd here),
     // so exports never eat the tenant's storage quota. The prune below matches

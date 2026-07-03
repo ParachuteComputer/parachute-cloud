@@ -24,7 +24,7 @@ workers/identity/   the OAuth issuer (authorize/token/DCR/JWKS/revocation on D1)
                     default, via an EmailSender interface — CF Email Sending
                     binding, LIVE since 2026-07-02, with a dev-log fallback)
                     + optional TOTP 2FA (WebCrypto, ported from the hub;
-                    enroll on /console/security). 97 tests.
+                    enroll on /console/security). 98 tests.
 src/                the OLD control plane (Worker + D1 + Stripe). Dormant; billing
                     lifecycle design gets harvested into the control-plane revival.
 scripts/            deploy-dev.sh (reproducible dev deploy) + smoke-dev.ts (29-step
@@ -37,8 +37,8 @@ scripts/            deploy-dev.sh (reproducible dev deploy) + smoke-dev.ts (29-s
 bun install                         # ALSO refreshes the copied core dep (see gotcha)
 bun run test                        # control-plane tests (src/) — 123
 bun run typecheck                   # root tsc
-cd workers/vault && bun run typecheck && bun x vitest run    # 92+1 todo under workerd
-cd workers/identity && bun run typecheck && bun x vitest run # 97
+cd workers/vault && bun run typecheck && bun x vitest run    # 98+1 todo under workerd
+cd workers/identity && bun run typecheck && bun x vitest run # 98
 bash scripts/deploy-dev.sh          # deploy both workers (dev account) + seed
 bun scripts/smoke-dev.ts            # live smoke vs the deployed workers
 ```
