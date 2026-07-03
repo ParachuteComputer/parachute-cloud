@@ -32,13 +32,19 @@
  *     THIS — the `usage` field is all-zeros for this model) + word timestamps +
  *     vtt "for free"; v1 only consumes `text` + `duration`.
  *
- * ## Cleanup seam (follow-on PR — deliberately NOT in this PR)
+ * ## Cleanup pass (SHIPPED — lives in the DO, not here)
  *
- * whisper-large-v3-turbo output is already punctuated, so it lands in the note
- * body verbatim. A later PR adds a cleanup pass (a researched model) BETWEEN
- * `this.ai.run(...)` returning and the `return` below — it would rewrite
- * `text` while leaving `audioSeconds` (the meter) untouched. Keep that the only
- * insertion point so metering can't drift from the raw model duration.
+ * This provider deliberately returns the RAW whisper `text` unchanged. The
+ * transcript-cleanup pass (punctuate/paragraph/strip-fillers via a text model,
+ * gated by the deterministic faithfulness guard) lives in the DO orchestration
+ * (`VaultDO.transcribeOne` → `transcription/cleanup.ts` + `faithfulness.ts`),
+ * NOT in this provider. It runs there — rather than at the earlier "between
+ * `ai.run` and `return`" seam — because raw-preservation is a DO concern: the
+ * DO writes the cleaned view to the note body while stamping the RAW transcript
+ * into note + attachment metadata, and it keeps metering on the raw
+ * `audioSeconds` this provider reports (cleanup never touches the meter). The
+ * provider's contract stays "audio → raw text"; cleanup is a cloud-runtime
+ * display policy on top.
  */
 
 import {

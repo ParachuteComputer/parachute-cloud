@@ -63,6 +63,7 @@ import {
   bodyWithFailureMarker,
   bodyWithTranscript,
 } from "./transcription/pipeline.js";
+import { cleanupTranscript, type TextGeneratorLike } from "./transcription/cleanup.js";
 
 function errText(e: unknown): string {
   if (e instanceof Error) return `${e.name}: ${e.message}`;
@@ -161,6 +162,14 @@ export class VaultDO extends DurableObject {
    * builds a `WorkersAiProvider` over `env.AI`. Never set on a deployed path.
    */
   private testProvider?: TranscriptionProvider;
+
+  /**
+   * TEST-ONLY cleanup generator override. The vitest suites inject a stub text
+   * generator here so the transcript-cleanup pass runs deterministically
+   * without a live Workers AI text model; production/staging use `env.AI`.
+   * Never set on a deployed path.
+   */
+  private testCleanupGen?: TextGeneratorLike;
 
   // Live-query fan-out for THIS vault, bound to the store's own post-commit hook
   // registry — the single-writer property (design §3): every mutation and every
@@ -821,6 +830,21 @@ export class VaultDO extends DurableObject {
   }
 
   /**
+   * Resolve the transcript-cleanup text generator — the injected test stub,
+   * else the `env.AI` binding (the cleanup pass reaches the same Workers AI
+   * binding as whisper). Under the vitest harness (`ENVIRONMENT === "test"`) we
+   * deliberately DON'T fall back to a bare `env.AI`: the pool would make a live,
+   * uncredentialed model call: cleanup soft-fails to raw unless a suite injects
+   * a stub via `__setTestCleanup`. Prod/staging return `env.AI` (undefined →
+   * cleanup soft-fails to raw, exactly as designed).
+   */
+  private cleanupGenerator(): TextGeneratorLike | undefined {
+    if (this.testCleanupGen) return this.testCleanupGen;
+    if (this.env.ENVIRONMENT === "test") return undefined;
+    return this.env.AI as TextGeneratorLike | undefined;
+  }
+
+  /**
    * Arm the transcription alarm to fire ~immediately. Called when a
    * `transcribe:true` attachment link lands (notes handler → RestDeps). If an
    * alarm is already pending (a burst of uploads, or a backoff re-arm), leave
@@ -1017,15 +1041,48 @@ export class VaultDO extends DurableObject {
       return;
     }
 
-    // --- Success. Surgically patch the note (legacy voice-memo stub path).
-    await this.patchNoteBody(attachment.noteId, (content) => bodyWithTranscript(content, text));
+    // --- Cleanup pass (default ON): tidy punctuation / casing / paragraphs /
+    // fillers into a readable body WITHOUT ever changing the words. The
+    // deterministic faithfulness guard (cleanupTranscript → checkFaithful)
+    // makes shipping an altered word structurally impossible — any add/change
+    // is discarded and we fall back to the RAW transcript. SOFT-FAIL: an
+    // unbound model / model error / guard rejection all keep raw, so cleanup
+    // can never block a transcript from landing (`cleanupTranscript` never
+    // throws; the try/catch is belt-and-suspenders). Metering is untouched — it
+    // rides the raw whisper `audioSeconds`, so the meter can't drift from the
+    // model's reported duration. RAW IS SACRED: it is preserved on both the
+    // note (`metadata.raw_transcript`) and the attachment (`transcript` /
+    // `raw_transcript`) so it is always recoverable; the note BODY carries the
+    // cleaned view (a derived view of the sacred raw capture).
+    let display = text;
+    let cleaned = false;
+    try {
+      const result = await cleanupTranscript(this.cleanupGenerator(), text);
+      display = result.text;
+      cleaned = result.cleaned;
+    } catch (e) {
+      console.warn(`[transcribe ${vaultName}] cleanup threw, keeping raw:`, errText(e));
+      display = text;
+      cleaned = false;
+    }
+
+    // --- Success. Surgically patch the note (legacy voice-memo stub path): the
+    // body shows the cleaned view; the RAW transcript is stamped into the note's
+    // own metadata so it is always recoverable.
+    await this.patchNoteBody(
+      attachment.noteId,
+      (content) => bodyWithTranscript(content, display),
+      (noteMeta) => ({ ...noteMeta, raw_transcript: text }),
+    );
 
     const doneMeta: Record<string, unknown> = {
       ...meta,
       transcribe_status: "done",
       transcribe_attempts: attempts + 1,
       transcribe_done_at: new Date().toISOString(),
-      transcript: text,
+      transcript: text, // RAW (sacred capture) — unchanged field semantics.
+      raw_transcript: text, // explicit raw, recoverable even if the note write is skipped.
+      transcribe_cleaned: cleaned, // whether the note body shows the cleaned view.
       ...(typeof audioSeconds === "number" ? { transcribe_audio_seconds: audioSeconds } : {}),
     };
     delete doneMeta.transcribe_backoff_until;
@@ -1081,7 +1138,11 @@ export class VaultDO extends DurableObject {
    * user edit: on conflict, re-read once and re-apply against fresh content;
    * best-effort thereafter (never crash the alarm).
    */
-  private async patchNoteBody(noteId: string, transform: (content: string) => string): Promise<void> {
+  private async patchNoteBody(
+    noteId: string,
+    transform: (content: string) => string,
+    metaTransform?: (meta: Record<string, unknown>) => Record<string, unknown>,
+  ): Promise<void> {
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         const note = await this.store.getNote(noteId);
@@ -1090,10 +1151,11 @@ export class VaultDO extends DurableObject {
         if (noteMeta.transcribe_stub !== true) return; // opted out / not a stub note
         const body = transform(note.content);
         const { transcribe_stub: _drop, ...restMeta } = noteMeta;
+        const nextMeta = metaTransform ? metaTransform(restMeta) : restMeta;
         try {
           await this.store.updateNote(note.id, {
             content: body,
-            metadata: restMeta,
+            metadata: nextMeta,
             skipUpdatedAt: true,
             if_updated_at: note.updatedAt,
           });
@@ -1115,6 +1177,15 @@ export class VaultDO extends DurableObject {
    */
   __setTestProvider(provider: TranscriptionProvider): void {
     this.testProvider = provider;
+  }
+
+  /**
+   * TEST RPC: inject a stub transcript-cleanup text generator so the cleanup
+   * pass runs deterministically without a live Workers AI text model. Set via
+   * `runInDurableObject` in the vitest suite; never called on a deployed path.
+   */
+  __setTestCleanup(gen: TextGeneratorLike): void {
+    this.testCleanupGen = gen;
   }
 
   /** TEST RPC: the monthly voice-minutes meter (pins metering + soft-cap). */

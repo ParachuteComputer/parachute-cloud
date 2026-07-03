@@ -20,6 +20,7 @@ import { base, freshVault, mintToken, op } from "./helpers.ts";
 import { r2Key } from "../src/rest/notes.ts";
 import type { TranscriptionProvider, TranscribeInput, TranscribeResult } from "@openparachute/core/src/transcription/provider.ts";
 import { TranscriptionError } from "@openparachute/core/src/transcription/provider.ts";
+import type { TextGeneratorLike } from "../src/transcription/cleanup.ts";
 
 /** First-party admin token — exactly what identity's plan push mints. */
 function firstPartyToken(vault: string): Promise<string> {
@@ -103,6 +104,41 @@ async function runAlarmWith(vault: string, provider: TranscriptionProvider): Pro
     inst.__setTestProvider(provider);
     await inst.alarm();
   });
+}
+
+/** A stub cleanup text generator — returns a scripted `{ response }` (or throws). */
+function stubCleanup(script: (raw: string) => { response?: unknown }): TextGeneratorLike {
+  return {
+    async run(_model, inputs) {
+      const raw = inputs.messages.find((m) => m.role === "user")?.content ?? "";
+      return script(raw) as { response?: unknown } & Record<string, unknown>;
+    },
+  };
+}
+
+/** Run one alarm pass with BOTH a stub provider and a stub cleanup generator
+ *  injected (the cleanup pass otherwise soft-fails to raw under the test env). */
+async function runAlarmWithCleanup(
+  vault: string,
+  provider: TranscriptionProvider,
+  cleanup: TextGeneratorLike,
+): Promise<void> {
+  await runInDurableObject<DurableObject, void>(doStub(vault), async (inst: any) => {
+    inst.__setTestProvider(provider);
+    inst.__setTestCleanup(cleanup);
+    await inst.alarm();
+  });
+}
+
+/** Read a note's stored metadata straight from the DO store (bypasses REST
+ *  metadata filtering) so we can assert `raw_transcript` is preserved. */
+async function noteMetaViaStore(vault: string, id: string): Promise<Record<string, unknown>> {
+  let meta: Record<string, unknown> = {};
+  await runInDurableObject<DurableObject, void>(doStub(vault), async (inst: any) => {
+    const note = await inst.store.getNote(id);
+    meta = (note?.metadata as Record<string, unknown>) ?? {};
+  });
+  return meta;
 }
 
 async function noteBody(vault: string, id: string): Promise<string> {
@@ -256,6 +292,97 @@ describe("voice transcription pipeline (cloud#56)", () => {
     expect(await noteBody(v, noteId)).toContain("kept the text");
     // R2 audio is gone (retention), but the transcript survives on the note.
     expect(await env.ATTACHMENTS.head(r2Key(v, audioPath))).toBeNull();
+  });
+
+  it("cleanup (default ON): tidied text lands in the body; RAW preserved in metadata", async () => {
+    const v = freshVault("tx");
+    await pushEntitlement(v, true, 600);
+    const { noteId } = await setupVoiceNote(v);
+
+    const rawTranscript = "um so i went to the uh store you know and it was fine";
+    const cleanedView = "I went to the store, and it was fine.";
+    // whisper returns the raw; the cleanup model returns a faithful tidy → the
+    // guard accepts it (only fillers dropped, punctuation/casing added).
+    await runAlarmWithCleanup(
+      v,
+      stubProvider(() => ({ text: rawTranscript, audioSeconds: 60 })),
+      stubCleanup(() => ({ response: cleanedView })),
+    );
+
+    const body = await noteBody(v, noteId);
+    expect(body).toContain(cleanedView); // note CONTENT = the cleaned (readable) view
+    expect(body).not.toContain("_Transcript pending._");
+    expect(body).not.toContain(rawTranscript); // the raw filler-laden text is NOT in the body
+
+    // RAW IS SACRED: preserved on the note metadata + the attachment.
+    const nMeta = await noteMetaViaStore(v, noteId);
+    expect(nMeta.raw_transcript).toBe(rawTranscript);
+    const att = (await attachments(v, noteId))[0];
+    expect(att.metadata.transcribe_cleaned).toBe(true);
+    expect(att.metadata.raw_transcript).toBe(rawTranscript);
+    expect(att.metadata.transcript).toBe(rawTranscript); // transcript field stays RAW
+  });
+
+  it("cleanup guard REJECTS a hallucination → RAW text is shown, raw preserved", async () => {
+    const v = freshVault("tx");
+    await pushEntitlement(v, true, 600);
+    const { noteId } = await setupVoiceNote(v);
+
+    const rawTranscript = "i really enjoy algorithms";
+    // The cleanup model hallucinates a changed phrase — the guard MUST discard it.
+    await runAlarmWithCleanup(
+      v,
+      stubProvider(() => ({ text: rawTranscript, audioSeconds: 30 })),
+      stubCleanup(() => ({ response: "I really enjoy Al Gore's ideas." })),
+    );
+
+    const body = await noteBody(v, noteId);
+    expect(body).toContain(rawTranscript); // the RAW is what's shown
+    expect(body).not.toContain("Al Gore"); // the hallucination never reaches the note
+    expect(body).not.toContain("_Transcript pending._");
+
+    const nMeta = await noteMetaViaStore(v, noteId);
+    expect(nMeta.raw_transcript).toBe(rawTranscript);
+    const att = (await attachments(v, noteId))[0];
+    expect(att.metadata.transcribe_cleaned).toBe(false);
+  });
+
+  it("cleanup soft-fail (model throws): RAW lands, note is never stuck", async () => {
+    const v = freshVault("tx");
+    await pushEntitlement(v, true, 600);
+    const { noteId } = await setupVoiceNote(v);
+
+    const rawTranscript = "the transcript must still land even if cleanup breaks";
+    await runAlarmWithCleanup(
+      v,
+      stubProvider(() => ({ text: rawTranscript, audioSeconds: 45 })),
+      stubCleanup(() => {
+        throw new Error("cleanup model 500");
+      }),
+    );
+
+    const body = await noteBody(v, noteId);
+    expect(body).toContain(rawTranscript);
+    expect(body).not.toContain("_Transcript pending._");
+    const att = (await attachments(v, noteId))[0];
+    expect(att.metadata.transcribe_status).toBe("done"); // resolved, not stuck
+    expect(att.metadata.transcribe_cleaned).toBe(false);
+    expect(att.metadata.raw_transcript).toBe(rawTranscript);
+  });
+
+  it("without an injected cleanup generator, the pipeline soft-fails to raw (unbound = default)", async () => {
+    const v = freshVault("tx");
+    await pushEntitlement(v, true, 600);
+    const { noteId } = await setupVoiceNote(v);
+
+    // The existing runAlarmWith injects NO cleanup gen → env.AI is unbound in
+    // the test env → cleanup soft-fails → the raw whisper text lands unchanged.
+    await runAlarmWith(v, stubProvider(() => ({ text: "plain whisper output here", audioSeconds: 12 })));
+
+    expect(await noteBody(v, noteId)).toContain("plain whisper output here");
+    const att = (await attachments(v, noteId))[0];
+    expect(att.metadata.transcribe_cleaned).toBe(false);
+    expect(att.metadata.raw_transcript).toBe("plain whisper output here");
   });
 
   it("transcribe:false attachments are plain data — no pending, no alarm", async () => {

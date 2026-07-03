@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/cloud",
-  "version": "0.0.8-rc.20",
+  "version": "0.0.8-rc.21",
   "private": true,
   "description": "Open Parachute PBC's Vault Cloud — one Durable Object per vault on Cloudflare, OAuth issuer + self-serve console (accounts + vault ownership).",
   "license": "AGPL-3.0",
@@ -21,7 +21,7 @@
   "dependencies": {
     "drizzle-orm": "^0.36.0",
     "hono": "^4.6.0",
-    "stripe": "^22.1.0"
+    "stripe": "22.1.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260101.0",
