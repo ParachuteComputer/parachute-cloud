@@ -55,11 +55,27 @@ export interface OpsEmail {
   text: string;
 }
 
+/**
+ * A plain-text onboarding-drip email (drip.ts). Always carries the unsubscribe
+ * URL — the binding sender turns it into RFC 8058 List-Unsubscribe headers in
+ * addition to the footer link the copy already contains — and a Reply-To
+ * pointed at a human.
+ */
+export interface DripEmail {
+  to: string;
+  subject: string;
+  text: string;
+  unsubscribeUrl: string;
+  replyTo?: string;
+}
+
 export interface EmailSender {
   readonly kind: "binding" | "devlog";
   sendMagicLink(to: string, link: string): Promise<SendResult>;
   /** Generic operational send — plain text, no templating. Used by ops.ts. */
   sendOps(msg: OpsEmail): Promise<SendResult>;
+  /** Onboarding-drip send — plain text + unsubscribe headers. Used by drip.ts. */
+  sendDrip(msg: DripEmail): Promise<SendResult>;
 }
 
 const FROM_NAME = "Parachute Cloud";
@@ -112,6 +128,15 @@ export interface RawEmailOpts {
   text: string;
   /** When present the message is multipart/alternative (text + html). */
   html?: string;
+  /** When present, adds a Reply-To header (drip emails: replies reach a human). */
+  replyTo?: string;
+  /**
+   * When present, adds `List-Unsubscribe: <url>` plus the RFC 8058 one-click
+   * companion `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (mail
+   * providers POST that body to the URL — the /unsubscribe route accepts both
+   * GET and POST on the same token).
+   */
+  unsubscribeUrl?: string;
   /** Deterministic clock/id for tests. */
   now?: Date;
   messageId?: string;
@@ -129,9 +154,16 @@ export function buildRawEmail(opts: RawEmailOpts): string {
   const headers = [
     `From: ${formatFrom(opts.fromName, opts.fromAddress)}`,
     `To: <${headerSafe(opts.to)}>`,
+    ...(opts.replyTo ? [`Reply-To: <${headerSafe(opts.replyTo)}>`] : []),
     `Subject: ${encodeHeaderText(opts.subject)}`,
     `Message-ID: <${headerSafe(messageId)}>`,
     `Date: ${date}`,
+    ...(opts.unsubscribeUrl
+      ? [
+          `List-Unsubscribe: <${headerSafe(opts.unsubscribeUrl)}>`,
+          "List-Unsubscribe-Post: List-Unsubscribe=One-Click",
+        ]
+      : []),
     "MIME-Version: 1.0",
   ];
 
@@ -203,7 +235,14 @@ function magicLinkBodies(link: string): { html: string; text: string } {
  * (see the module note: EmailMessage is the contract) and sends.
  */
 export function bindingSender(binding: SendEmailBinding, fromAddress: string): EmailSender {
-  async function send(opts: { to: string; subject: string; text: string; html?: string }): Promise<SendResult> {
+  async function send(opts: {
+    to: string;
+    subject: string;
+    text: string;
+    html?: string;
+    replyTo?: string;
+    unsubscribeUrl?: string;
+  }): Promise<SendResult> {
     try {
       const raw = buildRawEmail({ fromAddress, fromName: FROM_NAME, ...opts });
       await binding.send(new EmailMessage(fromAddress, opts.to, raw));
@@ -221,6 +260,9 @@ export function bindingSender(binding: SendEmailBinding, fromAddress: string): E
     async sendOps({ to, subject, text }) {
       return send({ to, subject, text });
     },
+    async sendDrip({ to, subject, text, unsubscribeUrl, replyTo }) {
+      return send({ to, subject, text, unsubscribeUrl, replyTo });
+    },
   };
 }
 
@@ -236,6 +278,12 @@ export function devLogSender(): EmailSender {
       // Staging's deterministic "alert": the full email lands in the worker log
       // (queryable now that [observability] is on) instead of an inbox.
       console.log(`[ops-email] would email ${to}: ${subject}\n${text}`);
+      return { ok: true };
+    },
+    async sendDrip({ to, subject, text }) {
+      // Same posture as sendOps: staging's deterministic drip "send" is a log
+      // line (the address is fine here — this sender never runs in production).
+      console.log(`[drip-email] would email ${to}: ${subject}\n${text}`);
       return { ok: true };
     },
   };

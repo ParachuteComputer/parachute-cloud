@@ -112,6 +112,29 @@ describe("buildRawEmail — RFC 5322 shape (the runtime-mock contract)", () => {
     expect(parsed.headers.some((h) => h.key.toLowerCase() === "x-injected")).toBe(false);
   });
 
+  test("drip options add Reply-To + RFC 8058 List-Unsubscribe headers, and only then", async () => {
+    const unsubscribeUrl = "https://cloud.parachute.computer/unsubscribe?t=t0k";
+    const raw = buildRawEmail({
+      fromAddress: FROM,
+      fromName: "Parachute Cloud",
+      to: "drip@example.com",
+      subject: "Welcome to Parachute",
+      text: `Your vault is ready.\n\nStop these emails: ${unsubscribeUrl}`,
+      replyTo: "hello@parachute.computer",
+      unsubscribeUrl,
+    });
+    const parsed = await parseAndValidate(raw, FROM);
+    expect(parsed.replyTo?.[0]?.address).toBe("hello@parachute.computer");
+    const header = (key: string) => parsed.headers.find((h) => h.key.toLowerCase() === key)?.value;
+    expect(header("list-unsubscribe")).toBe(`<${unsubscribeUrl}>`);
+    expect(header("list-unsubscribe-post")).toBe("List-Unsubscribe=One-Click");
+
+    // ...and a non-drip email (no replyTo/unsubscribeUrl) carries none of them.
+    const plain = buildRawEmail({ fromAddress: FROM, fromName: "Parachute Cloud", to: "a@example.com", subject: "s", text: "t" });
+    expect(plain.toLowerCase()).not.toContain("list-unsubscribe");
+    expect(plain.toLowerCase()).not.toContain("reply-to");
+  });
+
   test("deterministic inputs pin the exact header lines", () => {
     const raw = buildRawEmail({
       fromAddress: FROM,

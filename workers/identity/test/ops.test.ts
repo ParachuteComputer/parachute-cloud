@@ -20,6 +20,7 @@ import type { EmailSender, OpsEmail, SendResult } from "../src/email.ts";
 import {
   ALERT_DEDUPE_MS,
   DIGEST_CRON,
+  DRIP_CRON,
   HEALTH_CRON,
   bumpMagicLinkEvent,
   collectDigestStats,
@@ -44,6 +45,9 @@ function opsSender(result: SendResult = { ok: true }): EmailSender & { sent: Ops
     async sendOps(msg: OpsEmail): Promise<SendResult> {
       sent.push(msg);
       return result;
+    },
+    async sendDrip(): Promise<SendResult> {
+      return { ok: true };
     },
   };
 }
@@ -70,7 +74,9 @@ describe("cron routing", () => {
   test("each configured pattern maps to its job; unknown patterns degrade to the health check", () => {
     expect(routeCron(HEALTH_CRON)).toBe("health");
     expect(routeCron(DIGEST_CRON)).toBe("digest");
-    // Safe default: a drifted/unknown pattern means extra liveness checks, not a no-op.
+    expect(routeCron(DRIP_CRON)).toBe("drip");
+    // Safe default: a drifted/unknown pattern means extra liveness checks, not
+    // a no-op — and NEVER an accidental drip send (only the exact match drips).
     expect(routeCron("0 0 1 1 *")).toBe("health");
     expect(routeCron("")).toBe("health");
   });
@@ -85,6 +91,15 @@ describe("cron routing", () => {
     await quietly(() => handleScheduled(HEALTH_CRON, env, health, { fetchFn: downFetch }));
     expect(health.sent).toHaveLength(1);
     expect(health.sent[0]!.subject).toContain("health check failed");
+  });
+
+  test("the drip cron routes to the drip, never the health check or digest (routing undisturbed)", async () => {
+    // No eligible users seeded → the drip run is a no-op; what this pins is
+    // that DRIP_CRON dispatches to neither ops job (no ops email, no vault
+    // probe — a health probe would throw here since no fetch is mocked).
+    const sender = opsSender();
+    await quietly(() => handleScheduled(DRIP_CRON, env, sender, { fetchFn: downFetch }));
+    expect(sender.sent).toHaveLength(0);
   });
 });
 

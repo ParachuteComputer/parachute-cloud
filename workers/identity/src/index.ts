@@ -41,6 +41,7 @@ import { handleRevoke } from "./oauth-revoke.ts";
 import { type OAuthDeps, oauthPreflight, withReflectedCors, withWildcardCors } from "./oauth-shared.ts";
 import { handleToken } from "./oauth-token.ts";
 import { handleScheduled } from "./ops.ts";
+import { handleUnsubscribe, runDrip } from "./drip.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
 // (wrangler.toml [[durable_objects.bindings]] class_name = "RateLimiterDO").
@@ -125,6 +126,25 @@ app.post("/auth/magic", (c) => handleMagicRequestPost(c.env.DB, c.req.raw, depsF
 app.get("/auth/verify", (c) => handleMagicVerifyGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/login/2fa", (c) => handleLogin2faGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/login/2fa", (c) => handleLogin2faPost(c.env.DB, c.req.raw, depsFor(c.env)));
+
+// --- onboarding-drip unsubscribe (no login; the token is the authorization) ---
+// GET is the footer link in every drip email; POST is the RFC 8058 one-click
+// path (mail providers POST `List-Unsubscribe=One-Click` to the same URL).
+// Both are idempotent — see drip.ts handleUnsubscribe.
+app.get("/unsubscribe", (c) => handleUnsubscribe(c.env.DB, c.req.raw));
+app.post("/unsubscribe", (c) => handleUnsubscribe(c.env.DB, c.req.raw));
+
+// Staging/dev-only drip trigger: live cron firings can't be forced, so the
+// staging smoke drives one drip tick here and asserts on the returned counts
+// (PII-free summary — same shape runDrip logs). GATED OFF IN PRODUCTION: when
+// ENVIRONMENT is "production" this returns 404 like any unknown route (the
+// same gate as the x-parachute-dev-magic-link echo). Unauthenticated on
+// staging by design — the ledger + per-run cap bound what a stray caller can
+// do, and staging's sender is the devlog (no real email exists to abuse).
+app.post("/__test/drip-run", async (c) => {
+  if (!depsFor(c.env).exposeDevLinks) return c.notFound();
+  return c.json(await runDrip(c.env, senderFor(c.env)));
+});
 
 // Root → the console (which redirects to /login when signed out).
 app.get("/", (c) => c.redirect("/console", 302));
