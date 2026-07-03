@@ -42,19 +42,22 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # NOTE: the stored wrangler OAuth token carries d1 + r2 write scope. If a future
 # token lacks them, run an interactive `bunx wrangler login` before provisioning.
 
+# --- vault DO worker (DO SQLite + R2 + scope-guard against staging identity) --
+# Deployed FIRST: the identity worker's [[env.staging.services]] binding
+# (VAULT_SERVICE) references this worker by name — on a fresh account the
+# identity deploy would fail if the vault worker didn't exist yet.
+cd "$ROOT/workers/vault"
+# DO SQLite migration (new_sqlite_classes, top-level [[migrations]]) applies
+# automatically on deploy. ISSUER_ORIGIN in [env.staging.vars] points at the
+# STAGING identity worker so token `iss` + JWKS validate within staging.
+bunx wrangler deploy --env staging
+
 # --- identity worker (OAuth issuer on the STAGING D1) ------------------------
 cd "$ROOT/workers/identity"
 bunx wrangler d1 migrations apply parachute-identity-staging --remote --env staging
 bun scripts/seed-dev-user.ts                                    # .dev-secrets -> scripts/seed-dev-user.sql (also grandfathers vault "demo")
 bunx wrangler d1 execute parachute-identity-staging --remote --env staging --file=./scripts/seed-dev-user.sql
 # ISSUER + VAULT_ORIGIN are baked into [env.staging.vars] (self-contained).
-bunx wrangler deploy --env staging
-
-# --- vault DO worker (DO SQLite + R2 + scope-guard against staging identity) --
-cd "$ROOT/workers/vault"
-# DO SQLite migration (new_sqlite_classes, top-level [[migrations]]) applies
-# automatically on deploy. ISSUER_ORIGIN in [env.staging.vars] points at the
-# STAGING identity worker so token `iss` + JWKS validate within staging.
 bunx wrangler deploy --env staging
 
 echo

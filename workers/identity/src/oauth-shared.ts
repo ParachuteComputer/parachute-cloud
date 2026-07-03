@@ -38,6 +38,14 @@ export interface OAuthDeps {
    * silently-disabled fence; runtime DO failures fail OPEN in rate-limit.ts.
    */
   rateLimiter: RateLimiterNamespace;
+  /**
+   * Dispatcher for server-side calls to the vault worker (POST /console/packs).
+   * Wired from env.VAULT_SERVICE (a service binding) when bound — staging,
+   * whose workers.dev VAULT_ORIGIN is not a valid subrequest target — else
+   * omitted and the handler uses global `fetch` (production custom domain;
+   * vitest, where fetchMock intercepts). Same Request either way.
+   */
+  vaultFetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 }
 
 /**

@@ -54,6 +54,9 @@ function depsFor(env: Env): OAuthDeps {
     boundOrigins: () => [issuer],
     exposeDevLinks: env.ENVIRONMENT !== "production",
     rateLimiter: env.RATE_LIMITER,
+    // Service binding when bound (staging — workers.dev origins aren't valid
+    // subrequest targets); else the handlers fall back to global fetch.
+    ...(env.VAULT_SERVICE ? { vaultFetch: env.VAULT_SERVICE.fetch.bind(env.VAULT_SERVICE) } : {}),
   };
 }
 

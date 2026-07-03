@@ -45,4 +45,16 @@ export interface Env {
    * and runs.
    */
   EMAIL?: SendEmailBinding;
+  /**
+   * Service binding to the vault worker — STAGING ONLY today. Staging's
+   * VAULT_ORIGIN is a workers.dev URL, which is not a valid subrequest target
+   * from inside a Worker (the platform answers 404 without ever routing to the
+   * worker — the same reason staging's vault-health cron check can't pass).
+   * When bound, server-side vault calls (POST /console/packs) dispatch through
+   * it; unbound (production, whose custom-domain VAULT_ORIGIN is a proven
+   * subrequest target via the health cron; and vitest, where fetchMock
+   * intercepts global fetch) they use plain `fetch`. The REQUEST is identical
+   * either way — full public URL + Bearer JWT through the vault router.
+   */
+  VAULT_SERVICE?: Fetcher;
 }

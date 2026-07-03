@@ -12,6 +12,7 @@
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import app from "../src/index.ts";
+import { handleAddPackPost } from "../src/console.ts";
 import { validateAccessToken } from "../src/tokens.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "../src/oauth-authorize.ts";
 import { handleToken } from "../src/oauth-token.ts";
@@ -33,6 +34,7 @@ import {
   CSRF,
   ISSUER,
   REDIRECT_URI,
+  VAULT_BASE,
   authorizeGetReq,
   consentReq,
   deps,
@@ -505,6 +507,32 @@ describe("console — Surface Starter pack button (POST /console/packs)", () => 
     expect(payload.sub).toBe(userId);
     expect(payload.client_id).toBe("parachute-console");
     expect((payload.exp as number) - (payload.iat as number)).toBe(60);
+  });
+
+  test("a bound VAULT_SERVICE dispatcher is preferred over global fetch (the staging transport)", async () => {
+    const { id: userId } = await seedUser("packs-binding@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("boundvault", userId);
+    // No fetchMock interceptor + disableNetConnect: if the handler fell back to
+    // global fetch it would throw → the "couldn't reach" error page, not a 302.
+    let seen: { url: string; auth: string | null } | null = null;
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        seen = { url: String(input), auth: new Headers(init?.headers).get("authorization") };
+        return Response.json({ pack: "surface-starter", applied: [], skipped: ["Surface Starter"], tags: [] });
+      },
+    };
+    const res = await handleAddPackPost(
+      env.DB,
+      post("/console/packs", { __csrf: CSRF, vault: "boundvault", pack: "surface-starter" }, sessionCookie(sessionId)),
+      boundDeps,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?pack_added=boundvault");
+    expect(seen).not.toBeNull();
+    expect(seen!.url).toBe(`https://boundvault.${VAULT_BASE}/api/packs/surface-starter`);
+    expect(seen!.auth).toMatch(/^Bearer /);
   });
 
   test("the success notice renders on /console?pack_added=<name>", async () => {

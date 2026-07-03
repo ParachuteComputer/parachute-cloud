@@ -153,6 +153,20 @@ migrations_dir = "migrations"
 name = "RATE_LIMITER"
 class_name = "RateLimiterDO"
 
+# STAGING-ONLY service binding to the vault worker. Staging's VAULT_ORIGIN is a
+# workers.dev URL, which is NOT a valid subrequest target from inside a Worker
+# (the platform answers 404 without routing — the standing vault-health cron
+# alert on staging is the same restriction). Server-side vault calls
+# (POST /console/packs) dispatch through this binding here; PRODUCTION stays on
+# plain fetch to its custom-domain VAULT_ORIGIN (a proven subrequest target —
+# the health cron passes there), so no top-level binding: the vitest config
+# reads this file's top level and a service binding would need an auxiliary
+# worker under miniflare. Deploy order: the vault worker must exist before an
+# identity deploy referencing it (deploy-staging.sh deploys vault first).
+[[env.staging.services]]
+binding = "VAULT_SERVICE"
+service = "parachute-vault-do-staging"
+
 # vars are non-inheritable: restate the full set, pointed at the staging
 # workers.dev origins. ISSUER is staging's own origin (tokens minted here carry
 # iss=<staging identity>, and the staging vault worker's ISSUER_ORIGIN matches).

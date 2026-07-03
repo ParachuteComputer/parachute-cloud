@@ -289,10 +289,15 @@ export async function handleAddPackPost(db: D1Database, req: Request, deps: OAut
     now: deps.now,
   });
 
+  // Transport: the service binding when bound (staging — workers.dev origins
+  // aren't valid subrequest targets), else global fetch (production's custom
+  // domain; tests' fetchMock). Same URL + Bearer JWT through the vault
+  // router's ordinary auth either way.
+  const fetchFn = deps.vaultFetch ?? fetch;
   const url = `${vaultInstanceUrl(vaultName, deps)}/api/packs/${encodeURIComponent(pack)}`;
   let res: Response;
   try {
-    res = await fetch(url, {
+    res = await fetchFn(url, {
       method: "POST",
       headers: { authorization: `Bearer ${signed.token}` },
     });
