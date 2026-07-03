@@ -128,6 +128,14 @@ function utcMonth(d: Date): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
+/** An attachment's `transcribe_backoff_until` as epoch ms (0 = no backoff, i.e.
+ *  immediately due). */
+function backoffUntil(att: Attachment): number {
+  const meta = (att.metadata as Record<string, unknown> | undefined) ?? {};
+  const until = meta.transcribe_backoff_until ? Date.parse(String(meta.transcribe_backoff_until)) : NaN;
+  return Number.isFinite(until) ? until : 0;
+}
+
 export class VaultDO extends DurableObject {
   private shim: DatabaseShim;
   private store!: DoSqliteStore;
@@ -838,46 +846,46 @@ export class VaultDO extends DurableObject {
     if (!vaultName) return;
     await this.ensureState(vaultName);
 
+    const due = await this.dueTranscription();
+    if (due) {
+      try {
+        await this.transcribeOne(vaultName, due);
+      } catch (e) {
+        console.error(`[transcribe ${vaultName}] unexpected error on ${due.id}:`, errText(e));
+      }
+    }
+    // Re-arm from the CURRENT pending set: soonest of (a due item → now, a
+    // backed-off item → its backoff time), or leave no alarm when the queue is
+    // empty. One inference per wake, and we wake exactly when the next item is
+    // actually due (never spin early on a backed-off item).
+    await this.rearmFromPending(vaultName);
+  }
+
+  /** The first pending attachment whose backoff (if any) has elapsed (FIFO). */
+  private async dueTranscription(): Promise<Attachment | undefined> {
     let pending: Attachment[];
     try {
       pending = await this.store.listAttachmentsByTranscribeStatus("pending", 50);
     } catch (e) {
-      console.error(`[transcribe ${vaultName}] list failed:`, errText(e));
-      return;
+      console.error(`[transcribe ${this.config?.name}] list failed:`, errText(e));
+      return undefined;
     }
-
     const now = Date.now();
-    // FIFO: find the first attachment whose backoff (if any) has elapsed.
-    const due = pending.find((att) => {
-      const meta = (att.metadata as Record<string, unknown> | undefined) ?? {};
-      const until = meta.transcribe_backoff_until ? Date.parse(String(meta.transcribe_backoff_until)) : NaN;
-      return !(Number.isFinite(until) && until > now);
-    });
+    return pending.find((att) => backoffUntil(att) <= now);
+  }
 
-    if (!due) {
-      // Everything remaining is still backing off — re-arm at the earliest
-      // backoff so we wake exactly when the next attempt is due.
-      const nextAt = pending.reduce<number | null>((soonest, att) => {
-        const meta = (att.metadata as Record<string, unknown> | undefined) ?? {};
-        const until = meta.transcribe_backoff_until ? Date.parse(String(meta.transcribe_backoff_until)) : NaN;
-        if (!Number.isFinite(until)) return soonest;
-        return soonest === null || until < soonest ? until : soonest;
-      }, null);
-      if (nextAt !== null) await this.ctx.storage.setAlarm(nextAt);
-      return;
-    }
-
+  /** Set the alarm to when the next pending attachment becomes due (a due item
+   *  → now; else the earliest backoff time); no pending → no alarm. */
+  private async rearmFromPending(vaultName: string): Promise<void> {
     try {
-      await this.transcribeOne(vaultName, due);
-    } catch (e) {
-      console.error(`[transcribe ${vaultName}] unexpected error on ${due.id}:`, errText(e));
-    }
-
-    // Re-arm if anything is still pending (this one may have gone to backoff, or
-    // there are more in the queue) — drains the batch one inference per wake.
-    try {
-      const stillPending = await this.store.listAttachmentsByTranscribeStatus("pending", 1);
-      if (stillPending.length > 0) await this.ctx.storage.setAlarm(Date.now());
+      const pending = await this.store.listAttachmentsByTranscribeStatus("pending", 50);
+      if (pending.length === 0) return;
+      const now = Date.now();
+      const soonest = pending.reduce((min, att) => {
+        const until = backoffUntil(att);
+        return Math.min(min, until <= now ? now : until);
+      }, Number.POSITIVE_INFINITY);
+      await this.ctx.storage.setAlarm(Number.isFinite(soonest) ? soonest : now);
     } catch (e) {
       console.warn(`[transcribe ${vaultName}] re-arm check failed:`, errText(e));
     }

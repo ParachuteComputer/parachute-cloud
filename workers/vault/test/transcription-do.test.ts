@@ -88,20 +88,41 @@ function doStub(vault: string): DurableObjectStub {
   return env.VAULT.get(env.VAULT.idFromName(vault)) as unknown as DurableObjectStub;
 }
 
-/** Inject a stub provider into the vault's DO, then fire the armed alarm.
- *  (Explicit type args on runInDurableObject keep tsc from deep-instantiating
- *  the large VaultDO RPC surface — TS2589.) */
-async function runAlarmWith(vault: string, provider: TranscriptionProvider): Promise<boolean> {
-  const stub = doStub(vault);
-  await runInDurableObject<DurableObject, void>(stub, (inst: any) => {
+/**
+ * Inject a stub provider into the vault's DO and run ONE alarm pass
+ * deterministically (call `alarm()` directly rather than `runDurableObjectAlarm`
+ * — a `setAlarm(now)` fires opportunistically in the vitest pool, so the armed
+ * alarm may already be consumed by an intervening request; a direct call runs
+ * the exact production code path without that race). Production auto-arming is
+ * proven by the live staging E2E; the transcribe:false test below still pins
+ * that NO alarm is armed without the flag.
+ * (Explicit type args keep tsc from deep-instantiating the VaultDO RPC surface.)
+ */
+async function runAlarmWith(vault: string, provider: TranscriptionProvider): Promise<void> {
+  await runInDurableObject<DurableObject, void>(doStub(vault), async (inst: any) => {
     inst.__setTestProvider(provider);
+    await inst.alarm();
   });
-  return runDurableObjectAlarm(stub);
 }
 
 async function noteBody(vault: string, id: string): Promise<string> {
   const res = await op(vault, `/api/notes/${id}`);
   return ((await res.json()) as { content: string }).content;
+}
+
+async function attachments(vault: string, noteId: string): Promise<any[]> {
+  return (await (await op(vault, `/api/notes/${noteId}/attachments`)).json()) as any[];
+}
+
+/** Clear a pending attachment's backoff so the next alarm treats it as due
+ *  (fast-forwards past the exponential backoff the retry path sets). */
+async function clearBackoff(vault: string, attId: string): Promise<void> {
+  await runInDurableObject<DurableObject, void>(doStub(vault), async (inst: any) => {
+    const att = await inst.store.getAttachment(attId);
+    const meta = { ...(att.metadata ?? {}) };
+    delete meta.transcribe_backoff_until;
+    await inst.store.setAttachmentMetadata(attId, meta);
+  });
 }
 
 async function landing(vault: string): Promise<any> {
@@ -160,6 +181,42 @@ describe("voice transcription pipeline (cloud#56)", () => {
     expect(body).toContain("Monthly voice limit reached");
     expect(body).not.toContain("_Transcript pending._");
     expect(called).toBe(false);
+  });
+
+  it("retriable failures back off (still pending, spinner honest), then go terminal after 3 attempts", async () => {
+    const v = freshVault("tx");
+    await pushEntitlement(v, true, 600);
+    const { noteId } = await setupVoiceNote(v);
+    const attId = (await attachments(v, noteId))[0].id;
+    // A plain Error is retriable (the worker contract): the worker backs off.
+    const retriable = stubProvider(() => {
+      throw new Error("transient upstream 503");
+    });
+
+    // Attempt 1 → still PENDING with a backoff, note still shows the spinner
+    // (honest — it IS still being retried, not failed).
+    await runAlarmWith(v, retriable);
+    let att = (await attachments(v, noteId))[0];
+    expect(att.metadata.transcribe_status).toBe("pending");
+    expect(att.metadata.transcribe_attempts).toBe(1);
+    expect(att.metadata.transcribe_backoff_until).toBeTruthy();
+    expect(await noteBody(v, noteId)).toContain("_Transcript pending._");
+
+    // Attempt 2 (past the backoff) → still pending, attempts=2.
+    await clearBackoff(v, attId);
+    await runAlarmWith(v, retriable);
+    att = (await attachments(v, noteId))[0];
+    expect(att.metadata.transcribe_status).toBe("pending");
+    expect(att.metadata.transcribe_attempts).toBe(2);
+
+    // Attempt 3 → exhausted → TERMINAL: failed + the unavailable marker.
+    await clearBackoff(v, attId);
+    await runAlarmWith(v, retriable);
+    att = (await attachments(v, noteId))[0];
+    expect(att.metadata.transcribe_status).toBe("failed");
+    const body = await noteBody(v, noteId);
+    expect(body).toContain("_Transcription unavailable._");
+    expect(body).not.toContain("_Transcript pending._");
   });
 
   it("terminal provider failure writes the unavailable marker + fails the attachment", async () => {
