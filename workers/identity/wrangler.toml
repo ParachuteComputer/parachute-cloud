@@ -61,15 +61,13 @@ ENVIRONMENT = "development"
 EMAIL_FROM = "noreply@parachute.computer"
 
 # --- outbound email (Cloudflare Email Sending) ------------------------------
-# Cloudflare Email Sending is in public beta (Workers Paid). To flip magic-link
-# email from dev-log (the current default) to REAL email:
-#   1. Onboard the sending domain (adds SPF + DKIM to the parachute.computer zone,
-#      which is already in this account — records are added automatically):
-#        Dashboard → Compute & AI → Email Service → Email Sending → Onboard Domain
-#        → parachute.computer → Add records and onboard
-#      (or: `wrangler email sending enable parachute.computer`)
-#   2. Uncomment the binding below and redeploy. The worker auto-detects the bound
-#      EMAIL and uses it; no code change needed (src/index.ts senderFor()).
-# Kept commented so a bare `wrangler deploy` stays green before onboarding.
-# [[send_email]]
-# name = "EMAIL"
+# Cloudflare Email Sending (public beta, Workers Paid). parachute.computer was
+# onboarded 2026-07-02 (`wrangler email sending enable` — SPF + DKIM live in the
+# zone), so the binding below makes magic-link email REAL. senderFor()
+# (src/index.ts) auto-detects it; with no binding it falls back to the dev-log
+# sender. NOTE the echo affordance is independent of the sender: while
+# ENVIRONMENT != "production", POST /auth/magic ALSO returns the link in the
+# `x-parachute-dev-magic-link` header (headless tests + smoke depend on it);
+# a production deploy (ENVIRONMENT="production") never emits the header.
+[[send_email]]
+name = "EMAIL"

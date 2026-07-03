@@ -50,8 +50,15 @@ function depsFor(env: Env): OAuthDeps {
   };
 }
 
-/** The email sender: the Cloudflare binding when bound + configured, else dev-log. */
-function senderFor(env: Env): EmailSender {
+/**
+ * The email sender: the Cloudflare binding when bound + configured, else dev-log.
+ * Sender selection is INDEPENDENT of the dev echo header: in any non-production
+ * environment, POST /auth/magic both sends (via whichever sender this picks) AND
+ * echoes the link in `x-parachute-dev-magic-link` (deps.exposeDevLinks) — so the
+ * headless test path survives the real binding. Production never echoes.
+ * Exported for the tests that pin that contract (auth.test.ts).
+ */
+export function senderFor(env: Env): EmailSender {
   if (env.EMAIL) return bindingSender(env.EMAIL, env.EMAIL_FROM ?? "noreply@parachute.computer");
   return devLogSender();
 }

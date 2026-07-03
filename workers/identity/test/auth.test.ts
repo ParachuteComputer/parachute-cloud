@@ -8,7 +8,7 @@
  */
 import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
-import app from "../src/index.ts";
+import app, { senderFor } from "../src/index.ts";
 import type { EmailSender, SendResult } from "../src/email.ts";
 import {
   handleLogin2faGet,
@@ -190,12 +190,31 @@ describe("magic link — send + verify", () => {
     expect(sender.sent).toHaveLength(0);
   });
 
-  test("through the real router: dev deploy echoes the link in the dev-only header", async () => {
-    // ENVIRONMENT=development in wrangler.toml → exposeDevLinks → header present.
+  test("through the real router: non-production echoes the link even with the REAL binding bound", async () => {
+    // wrangler.toml binds [[send_email]] EMAIL (Email Sending onboarded
+    // 2026-07-02), so senderFor picks the real binding — and the dev echo
+    // header must SURVIVE it: the header is gated on exposeDevLinks
+    // (ENVIRONMENT !== "production"), independent of sender selection. The
+    // headless dev/smoke flow depends on this.
+    expect(senderFor(env as never).kind).toBe("binding");
     const res = await app.fetch(magicReq("router@example.com", "10.5.5.5"), env);
     expect(res.status).toBe(200);
     const link = res.headers.get("x-parachute-dev-magic-link");
     expect(link).toContain("/auth/verify?token=");
+  });
+
+  test("through the real router: production never emits the echo header (binding still bound)", async () => {
+    const prodEnv = { ...env, ENVIRONMENT: "production" };
+    const res = await app.fetch(magicReq("prod-router@example.com", "10.6.6.6"), prodEnv as never);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-parachute-dev-magic-link")).toBeNull();
+    expect(await res.text()).toContain("Check your email"); // flow stays neutral-200
+  });
+
+  test("senderFor falls back to dev-log when no binding is bound", () => {
+    const { EMAIL: _unused, ...withoutBinding } = env as unknown as Record<string, unknown>;
+    expect(senderFor(withoutBinding as never).kind).toBe("devlog");
+    expect(senderFor(env as never).kind).toBe("binding");
   });
 });
 
