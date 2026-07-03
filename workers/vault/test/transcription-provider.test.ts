@@ -58,6 +58,17 @@ describe("WorkersAiProvider", () => {
     expect(result).toEqual({ text: "hello world", audioSeconds: 42.5 });
   });
 
+  it("zero-copy encode uses the exact view window (subarray with a non-zero byteOffset)", async () => {
+    // A Uint8Array that is a VIEW into a larger buffer — the encode must send
+    // ONLY the view's bytes, not the whole underlying ArrayBuffer. Guards the
+    // `Buffer.from(buffer, byteOffset, byteLength)` zero-copy path.
+    const backing = new Uint8Array([9, 9, 10, 20, 30, 40, 99, 99]);
+    const view = backing.subarray(2, 6); // [10,20,30,40], byteOffset 2, length 4
+    const ai = stubAi(() => ({ text: "ok" }));
+    await new WorkersAiProvider(ai).transcribe({ audio: view, filename: "m.webm", mimeType: "audio/webm" });
+    expect([...Buffer.from(ai.calls[0]!.audio, "base64")]).toEqual([10, 20, 30, 40]);
+  });
+
   it("omits audioSeconds when the model reports no duration", async () => {
     const ai = stubAi(() => ({ text: "no duration here" }));
     const result = await new WorkersAiProvider(ai).transcribe(input(new Uint8Array([1, 2, 3])));

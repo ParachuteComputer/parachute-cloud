@@ -208,6 +208,19 @@ export class VaultDO extends DurableObject {
 
     await this.ensureState(vaultName);
 
+    // STAGING-ONLY test hook — POST /vault/<name>/__test/transcribe-run drives
+    // the transcription drain synchronously (the DO alarm auto-fires in seconds
+    // in production, but the live smoke wants a deterministic tick — mirrors the
+    // identity worker's __test/* triggers). 404 in production AND test/vitest
+    // (`ENVIRONMENT !== "staging"`), pinned by smoke-prod. No auth: it only
+    // fires the already-armed pipeline, exposes no data, and only exists on
+    // staging (the echo-header posture).
+    if (rest === "/__test/transcribe-run") {
+      if (this.env.ENVIRONMENT !== "staging") return json({ error: "Not found" }, 404);
+      if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+      return this.handleTranscribeRun(vaultName);
+    }
+
     // MCP endpoint — /vault/<name>/mcp[/*] (the "connect your AI" moment). Auth
     // like REST (Bearer → X-API-Key → ?key=); a 401 carries the RFC 9728
     // WWW-Authenticate challenge so a bare 401 walks the client to discovery
@@ -861,6 +874,27 @@ export class VaultDO extends DurableObject {
     await this.rearmFromPending(vaultName);
   }
 
+  /**
+   * STAGING-ONLY: drain due transcriptions NOW (bounded), synchronously, for
+   * the live smoke — the same per-attachment path the alarm runs. Returns a
+   * count so the smoke can assert progress. Bounded at 10 so a stuck/backed-off
+   * queue can't loop; the smoke drives a single fresh attachment.
+   */
+  private async handleTranscribeRun(vaultName: string): Promise<Response> {
+    let processed = 0;
+    for (let i = 0; i < 10; i++) {
+      const due = await this.dueTranscription();
+      if (!due) break;
+      try {
+        await this.transcribeOne(vaultName, due);
+      } catch (e) {
+        console.error(`[transcribe-run ${vaultName}] error on ${due.id}:`, errText(e));
+      }
+      processed++;
+    }
+    return json({ processed });
+  }
+
   /** The first pending attachment whose backoff (if any) has elapsed (FIFO). */
   private async dueTranscription(): Promise<Attachment | undefined> {
     let pending: Attachment[];
@@ -916,8 +950,12 @@ export class VaultDO extends DurableObject {
       return;
     }
 
-    // --- Read the R2 audio. Size-gate BEFORE loading into memory where we can
-    // (head), so oversized audio fails cheaply without a 45 MB read.
+    // --- Read the R2 audio. HEAD-gate on MAX_TRANSCRIBE_BYTES BEFORE the read
+    // AND the base64 encode: an OOM in the synchronous encode is uncatchable
+    // (see workers-ai.ts), so an oversized file must fail terminally here,
+    // before it ever lands in memory. Uploads are capped at 100 MB, so any
+    // 25–100 MB object is caught here; the provider's byteLength check is the
+    // post-read, still-pre-encode backstop.
     const key = r2Key(vaultName, attachment.path);
     const head = await this.env.ATTACHMENTS.head(key);
     if (head && head.size > MAX_TRANSCRIBE_BYTES) {

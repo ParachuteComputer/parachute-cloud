@@ -192,6 +192,11 @@ async function main() {
 
     const unauthed = await fetch(`${VAULT}/vault/${VAULT_NAME}/api/notes`);
     assert(unauthed.status === 401, "unauthenticated vault API request is refused (401)", `status ${unauthed.status}`);
+
+    // Voice transcription (cloud#56): the staging-only drain hook must NOT exist
+    // in production (ENVIRONMENT="production" → 404, the __test posture).
+    const txRun = await fetch(`${VAULT}/vault/${VAULT_NAME}/__test/transcribe-run`, { method: "POST" });
+    assert(txRun.status === 404, "PRODUCTION: /vault/<name>/__test/transcribe-run does not exist (404)", `status ${txRun.status}`);
   }
 
   // --- summary ---

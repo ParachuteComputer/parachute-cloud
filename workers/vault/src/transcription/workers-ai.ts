@@ -11,15 +11,18 @@
  * ## Hard-won constraints from the 2026-07-03 whisper spike (encoded here)
  *
  *   - **Input is a base64 STRING** (`{ audio: "<b64>" }`), NOT a byte array.
- *     `Buffer.from(bytes).toString("base64")` (nodejs_compat) is used instead of
- *     a `btoa(String.fromCharCode(...))` binary-string round-trip — the latter
- *     roughly triples peak memory, and this runs inside a 128 MB Durable Object.
- *   - **~50 MB file ceiling inside the 128 MB DO** — base64 alone is ~1.33× the
- *     raw bytes and the encode holds both buffers transiently, so we REJECT
- *     anything over {@link MAX_TRANSCRIBE_BYTES} (~45 MB) up front with a
- *     non-retriable `audio_too_large` (a retry can't shrink the file). The DO
- *     also size-gates before ever reading R2, so oversized audio never even
- *     lands in memory; this is the provider-level backstop.
+ *     A ZERO-COPY `Buffer` VIEW over the audio's ArrayBuffer + `.toString(
+ *     "base64")` (nodejs_compat) — NOT `Buffer.from(uint8array)` (which copies)
+ *     nor a `btoa(String.fromCharCode(...))` binary-string round-trip (which
+ *     roughly triples peak memory). This runs inside a 128 MB Durable Object.
+ *   - **25 MB raw ceiling under the 128 MB DO** — the encode's peak is
+ *     ~2.33 × N (raw view + ~1.33 × N base64 string) plus the DO baseline, and
+ *     an OOM in the synchronous encode is UNCATCHABLE, so the ceiling is
+ *     enforced BEFORE the encode: the DO head-size-gates on
+ *     {@link MAX_TRANSCRIBE_BYTES} before the R2 read, and this provider
+ *     re-checks `byteLength` before the encode. Over → non-retriable
+ *     `audio_too_large` (a retry can't shrink the file). See the constant's
+ *     doc for the full memory math + why 25, not 45.
  *   - **~240 s inference wall-clock (≈60 min of audio per call)** — Workers AI
  *     surfaces an over-length job as a `4002` error AFTER ~240 s. We map that
  *     (and its siblings) to a non-retriable `audio_too_long`: each blind retry
@@ -50,12 +53,43 @@ import {
 export const WHISPER_MODEL = "@cf/openai/whisper-large-v3-turbo";
 
 /**
- * Raw-audio ceiling (~45 MB). base64 costs ~1.33× and the encode holds both
- * the raw and encoded buffers transiently — inside a 128 MB DO that keeps peak
- * memory comfortably bounded. Files over this fail non-retriably (a retry can't
- * shrink them); chunking is the follow-on for genuinely long recordings.
+ * Raw-audio ceiling — **25 MB**, chosen with real headroom under the 128 MB DO
+ * isolate cap (NOT the earlier 45 MB, which was dangerously close).
+ *
+ * ## The memory math (why 25, not 45)
+ *
+ * A DO isolate is hard-capped at ~128 MB. Transcribing one attachment holds,
+ * transiently and concurrently:
+ *   - the raw audio: N bytes (read from R2 as one `ArrayBuffer` → `Uint8Array`);
+ *   - the base64 string: ~1.33 × N bytes (base64 is 4/3, stored as a 1-byte
+ *     ASCII/Latin-1 string in V8) — allocated by `toString("base64")` while the
+ *     raw bytes are still referenced (the provider still holds `input.audio`);
+ *   - on top of the DO baseline: core + the vault's SQLite pages + config +
+ *     the Workers-AI subrequest marshalling of that base64 string.
+ *
+ * So peak ≈ **2.33 × N + baseline**. The encode is ZERO-COPY (a `Buffer` VIEW
+ * over the existing `ArrayBuffer` — see `transcribe`), which removes the extra
+ * N-byte copy `Buffer.from(uint8array)` would have made, but 1.33 × N for the
+ * base64 string is irreducible without streaming (Workers AI wants the whole
+ * string). At N = 25 MB → ~58 MB of audio+base64, leaving comfortable room for
+ * the baseline + marshalling under 128 MB. At the old 45 MB it was ~105 MB
+ * before baseline — an OOM waiting for a warm DO.
+ *
+ * **Critically**, the OOM would strike inside the SYNCHRONOUS `toString`, which
+ * can tear down the isolate UNCATCHABLY — so the ceiling MUST be enforced
+ * BEFORE the encode (and before the R2 read). The DO head-size-gates on this
+ * constant before ever reading the object (`VaultDO.transcribeOne`), and this
+ * provider re-checks `byteLength` before the encode as a backstop; a file over
+ * the ceiling fails non-retriably (`audio_too_large`) and never reaches the
+ * encode. Uploads are already capped at 100 MB, so 25–100 MB files are all
+ * head-gated to a terminal marker (never spin).
+ *
+ * 25 MB is generous for a voice NOTE: compressed opus/m4a at ~24–32 kbps ≈
+ * 100+ minutes; PCM wav 16 kHz mono ≈ 13 minutes. Genuinely long recordings
+ * hit the ~240 s inference wall first (`4002` → terminal `audio_too_long`) or
+ * need chunking (a later phase).
  */
-export const MAX_TRANSCRIBE_BYTES = 45 * 1024 * 1024;
+export const MAX_TRANSCRIBE_BYTES = 25 * 1024 * 1024;
 
 /**
  * The narrow slice of the Workers AI binding this provider depends on — just
@@ -108,17 +142,23 @@ export class WorkersAiProvider implements TranscriptionProvider {
     }
 
     if (input.audio.byteLength > this.maxBytes) {
-      // A retry can't shrink the file — terminal. The DO size-gates before it
-      // ever reads R2; this is the provider-level backstop.
+      // A retry can't shrink the file — terminal. The DO head-size-gates BEFORE
+      // it reads R2 (so an oversized file never reaches this encode, where an
+      // OOM would be uncatchable); this is the provider-level backstop for that
+      // gate, still BEFORE the allocating encode below.
       throw new TranscriptionError(
         `audio too large (${input.audio.byteLength} bytes > ${this.maxBytes}-byte ceiling)`,
         { code: "audio_too_large", retriable: false },
       );
     }
 
-    // base64 STRING input (spike constraint). Buffer (nodejs_compat) is the
-    // memory-frugal encoder — no intermediate JS binary string.
-    const b64 = Buffer.from(input.audio).toString("base64");
+    // base64 STRING input (spike constraint), ZERO-COPY: a `Buffer` VIEW over
+    // the audio's existing ArrayBuffer window — `Buffer.from(uint8array)` would
+    // COPY the N bytes, adding an N-byte transient on top of the ~1.33 × N
+    // base64 string. Only the base64 string is a fresh allocation. See the
+    // MAX_TRANSCRIBE_BYTES memory math for why this + the 25 MB ceiling keep the
+    // encode safely under the 128 MB isolate cap.
+    const b64 = Buffer.from(input.audio.buffer, input.audio.byteOffset, input.audio.byteLength).toString("base64");
 
     let out: { text?: unknown; transcription_info?: { duration?: unknown } } & Record<string, unknown>;
     try {
