@@ -78,10 +78,11 @@ export async function runUsageRollup(
     try {
       const usage = await readVaultUsage(env.DB, deps, v.owner_user_id, v.name);
       await env.DB.prepare(
-        `INSERT INTO vault_usage (vault_name, day, db_bytes, r2_bytes) VALUES (?, ?, ?, ?)
-         ON CONFLICT(vault_name, day) DO UPDATE SET db_bytes = excluded.db_bytes, r2_bytes = excluded.r2_bytes`,
+        `INSERT INTO vault_usage (vault_name, day, db_bytes, r2_bytes, transcribe_minutes) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(vault_name, day) DO UPDATE SET db_bytes = excluded.db_bytes, r2_bytes = excluded.r2_bytes,
+           transcribe_minutes = excluded.transcribe_minutes`,
       )
-        .bind(v.name, day, usage.dbBytes, usage.r2Bytes)
+        .bind(v.name, day, usage.dbBytes, usage.r2Bytes, usage.transcribeMinutes)
         .run();
       recorded++;
     } catch (err) {
@@ -108,6 +109,8 @@ export interface VaultUsageRow {
   day: string;
   dbBytes: number;
   r2Bytes: number;
+  /** Voice minutes transcribed this UTC month (cloud#56). */
+  transcribeMinutes: number;
 }
 
 /**
@@ -121,14 +124,20 @@ export async function latestUsageForVaults(db: D1Database, names: string[]): Pro
   const placeholders = names.map(() => "?").join(", ");
   const res = await db
     .prepare(
-      `SELECT u.vault_name, u.day, u.db_bytes, u.r2_bytes FROM vault_usage u
+      `SELECT u.vault_name, u.day, u.db_bytes, u.r2_bytes, u.transcribe_minutes FROM vault_usage u
        WHERE u.vault_name IN (${placeholders})
          AND u.day = (SELECT MAX(day) FROM vault_usage x WHERE x.vault_name = u.vault_name)`,
     )
     .bind(...names)
-    .all<{ vault_name: string; day: string; db_bytes: number; r2_bytes: number }>();
+    .all<{ vault_name: string; day: string; db_bytes: number; r2_bytes: number; transcribe_minutes: number }>();
   for (const r of res.results ?? []) {
-    out.set(r.vault_name, { vaultName: r.vault_name, day: r.day, dbBytes: r.db_bytes, r2Bytes: r.r2_bytes });
+    out.set(r.vault_name, {
+      vaultName: r.vault_name,
+      day: r.day,
+      dbBytes: r.db_bytes,
+      r2Bytes: r.r2_bytes,
+      transcribeMinutes: r.transcribe_minutes ?? 0,
+    });
   }
   return out;
 }

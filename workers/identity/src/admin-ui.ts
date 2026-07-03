@@ -158,14 +158,22 @@ export function renderAdminUsers(props: AdminUsersProps): string {
   const { users, page: current, totalPages, totalUsers, csrfToken, notice, error } = props;
   const rows = users
     .map((u) => {
-      const otherPlan: PlanId = u.plan === "parachute" ? "free" : "parachute";
-      const planForm = `<form class="inline" method="post" action="/admin/users/plan">
+      // Comp lever — a button per OTHER plan (free / parachute / voice), so an
+      // operator can grant the $5 Voice tier directly while Stripe keys are
+      // pending (cloud#56). setUserPlan + applyPlanToVaults pushes the storage
+      // cap AND the voice entitlement into the owner's vault DOs immediately.
+      const planForm = (Object.keys(PLAN_SPECS) as PlanId[])
+        .filter((p) => p !== u.plan)
+        .map(
+          (p) => `<form class="inline" method="post" action="/admin/users/plan">
           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
           <input type="hidden" name="user_id" value="${esc(u.id)}">
-          <input type="hidden" name="plan" value="${esc(otherPlan)}">
+          <input type="hidden" name="plan" value="${esc(p)}">
           <input type="hidden" name="page" value="${current}">
-          <button class="rowbtn" type="submit">&rarr; ${esc(PLAN_SPECS[otherPlan].label)}</button>
-        </form>`;
+          <button class="rowbtn" type="submit">&rarr; ${esc(PLAN_SPECS[p].label)}</button>
+        </form>`,
+        )
+        .join(" ");
       const suspendForm = `<form class="inline" method="post" action="/admin/users/suspend">
           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
           <input type="hidden" name="user_id" value="${esc(u.id)}">
@@ -219,7 +227,7 @@ export interface AdminVaultRow {
   ownerEmail: string | null;
   createdAt: string;
   /** Latest vault_usage split, or null when no rollup row exists yet. */
-  usage: { dbBytes: number; r2Bytes: number; day: string } | null;
+  usage: { dbBytes: number; r2Bytes: number; day: string; transcribeMinutes: number } | null;
   /** The owner's plan cap (v1: per-vault cap = plan total). */
   capBytes: number;
 }
@@ -235,8 +243,12 @@ export function renderAdminVaults(props: AdminVaultsProps): string {
   const { vaults, page: current, totalPages, totalVaults } = props;
   const rows = vaults
     .map((v) => {
+      const voice =
+        v.usage && v.usage.transcribeMinutes > 0
+          ? ` <span class="muted">&middot; ${Math.round(v.usage.transcribeMinutes)} voice min</span>`
+          : "";
       const usage = v.usage
-        ? `${formatUsageBytes(v.usage.dbBytes + v.usage.r2Bytes)} <span class="muted">(db ${formatUsageBytes(v.usage.dbBytes)} + r2 ${formatUsageBytes(v.usage.r2Bytes)}, ${esc(v.usage.day)})</span>`
+        ? `${formatUsageBytes(v.usage.dbBytes + v.usage.r2Bytes)} <span class="muted">(db ${formatUsageBytes(v.usage.dbBytes)} + r2 ${formatUsageBytes(v.usage.r2Bytes)}, ${esc(v.usage.day)})</span>${voice}`
         : `<span class="muted">no rollup row yet</span>`;
       return `<tr data-testid="admin-vault-row">
         <td><code>${esc(v.name)}</code></td>

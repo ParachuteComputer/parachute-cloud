@@ -246,7 +246,7 @@ export async function handleAdminVaultsGet(db: D1Database, req: Request, deps: O
       name: r.name,
       ownerEmail: r.owner_email,
       createdAt: r.created_at,
-      usage: u ? { dbBytes: u.dbBytes, r2Bytes: u.r2Bytes, day: u.day } : null,
+      usage: u ? { dbBytes: u.dbBytes, r2Bytes: u.r2Bytes, day: u.day, transcribeMinutes: u.transcribeMinutes } : null,
       // v1 cap semantics: per-vault cap = the owner's plan total (plans.ts).
       // An orphan owner coerces to 'free' — the conservative read.
       capBytes: PLAN_SPECS[coercePlanId(r.owner_plan)].total_bytes,

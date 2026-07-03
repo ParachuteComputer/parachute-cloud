@@ -54,6 +54,9 @@ export interface OAuthDeps {
    * whole billing feature degrades invisibly (teaser copy, 503 routes).
    */
   billingConfigured?: boolean;
+  /** True when billing is configured AND the Voice Stripe Price is set — the
+   *  console renders the $5 Voice Upgrade button only then (cloud#56). */
+  voiceBillingConfigured?: boolean;
 }
 
 /**
@@ -89,6 +92,7 @@ export function depsForEnv(env: Env): OAuthDeps {
     exposeDevLinks: env.ENVIRONMENT !== "production",
     rateLimiter: env.RATE_LIMITER,
     billingConfigured: billingConfig(env) !== null,
+    voiceBillingConfigured: billingConfig(env)?.priceVoiceMonthly != null,
     // Service binding when bound (staging — workers.dev origins aren't valid
     // subrequest targets); else the handlers fall back to global fetch.
     ...(env.VAULT_SERVICE ? { vaultFetch: env.VAULT_SERVICE.fetch.bind(env.VAULT_SERVICE) } : {}),

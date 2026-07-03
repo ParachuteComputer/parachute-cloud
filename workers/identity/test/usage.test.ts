@@ -160,6 +160,30 @@ describe("runUsageRollup", () => {
     expect((payload.exp as number) - (payload.iat as number)).toBe(60);
   });
 
+  test("records the DO's transcribe_minutes into the rollup (cloud#56 voice)", async () => {
+    const { id: owner } = await seedUser("voice-roll@example.com");
+    await seedVault("voice-a", owner);
+    // A pre-voice DO omits the field → defaults to 0 (readVaultUsage contract).
+    await seedVault("voice-legacy", owner);
+    interceptConfigGet("voice-a", { ...splitBody(100, 200), transcribe_minutes: 12.5 });
+    interceptConfigGet("voice-legacy", splitBody(10, 0)); // no transcribe_minutes
+
+    const now = new Date();
+    const today = now.toISOString().slice(0, 10);
+    const summary = await quietly(() => runUsageRollup(env, rollupDeps(() => now)));
+    expect(summary.recorded).toBe(2);
+
+    const row = await env.DB
+      .prepare("SELECT transcribe_minutes AS m FROM vault_usage WHERE vault_name = 'voice-a' AND day = ?")
+      .bind(today)
+      .first<{ m: number }>();
+    expect(row?.m).toBe(12.5);
+    // The console read surfaces it; the legacy vault reads 0.
+    const map = await latestUsageForVaults(env.DB, ["voice-a", "voice-legacy"]);
+    expect(map.get("voice-a")?.transcribeMinutes).toBe(12.5);
+    expect(map.get("voice-legacy")?.transcribeMinutes).toBe(0);
+  });
+
   test("a failing vault is skipped + logged; the run continues (self-heals next run)", async () => {
     const { id: owner } = await seedUser("skip@example.com");
     await seedVault("skip-bad", owner);
@@ -228,8 +252,8 @@ describe("latestUsageForVaults", () => {
     await seedRow("lat-b", "2026-06-30", 999, 1);
     await seedRow("lat-other", "2026-07-02", 5, 5); // not requested — never returned
     const map = await latestUsageForVaults(env.DB, ["lat-a", "lat-b", "lat-new"]);
-    expect(map.get("lat-a")).toEqual({ vaultName: "lat-a", day: "2026-07-02", dbBytes: 200, r2Bytes: 50 });
-    expect(map.get("lat-b")).toEqual({ vaultName: "lat-b", day: "2026-06-30", dbBytes: 999, r2Bytes: 1 });
+    expect(map.get("lat-a")).toEqual({ vaultName: "lat-a", day: "2026-07-02", dbBytes: 200, r2Bytes: 50, transcribeMinutes: 0 });
+    expect(map.get("lat-b")).toEqual({ vaultName: "lat-b", day: "2026-06-30", dbBytes: 999, r2Bytes: 1, transcribeMinutes: 0 });
     expect(map.has("lat-new")).toBe(false);
     expect(map.has("lat-other")).toBe(false);
   });

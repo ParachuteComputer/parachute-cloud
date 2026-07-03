@@ -61,8 +61,16 @@ import { logStrictBypass } from "./shims.js";
  * Runtime deps a handler needs beyond the store. `deleteObject` is provided by
  * the DO so the R2 delete AND the storage-meter decrement stay together in the
  * one place that owns the meter (see VaultDO.deleteObject).
+ *
+ * `scheduleTranscription` arms the DO's transcription alarm when a
+ * `transcribe:true` attachment link lands (cloud#56) — the alarm drains the
+ * work off the request path.
  */
-export type RestDeps = { vaultName: string; deleteObject: (relativePath: string) => Promise<void> };
+export type RestDeps = {
+  vaultName: string;
+  deleteObject: (relativePath: string) => Promise<void>;
+  scheduleTranscription: () => Promise<void>;
+};
 
 /** Strict-schema gate — mirrors routes.ts:gateStrictWrite (bun#299). */
 function gateStrictWrite(
@@ -477,9 +485,32 @@ async function handleNotesInner(
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found" }, 404);
       const body = await req.json() as { path: string; mimeType: string; transcribe?: boolean };
       if (!body.path || !body.mimeType) return json({ error: "path and mimeType are required" }, 400);
-      // Cloud v1 is data-only (design §3.1) — record the attachment; no scribe
-      // enqueue. The `transcribe` flag is accepted but a no-op here.
-      const attachment = await store.addAttachment(note.id, body.path, body.mimeType);
+      // Voice transcription (cloud#56): on `transcribe:true`, stamp the
+      // attachment `pending` (the DB IS the queue — the same shape the self-host
+      // worker uses) and mark the owning note as a transcribe stub, then arm the
+      // DO alarm to drain it off the request path. The alarm enforces the plan
+      // entitlement + monthly minutes cap; a vault without voice resolves the
+      // note to an honest marker rather than an eternal spinner. Without the
+      // flag it's a plain data attachment (Daily / non-voice callers).
+      const optIn = body.transcribe === true;
+      const attMeta = optIn
+        ? {
+            transcribe_status: "pending" as const,
+            transcribe_requested_at: new Date().toISOString(),
+            transcribe_origin: "legacy" as const,
+          }
+        : undefined;
+      const attachment = await store.addAttachment(note.id, body.path, body.mimeType, attMeta);
+      if (optIn) {
+        const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+        if (noteMeta.transcribe_stub !== true) {
+          await store.updateNote(note.id, {
+            metadata: { ...noteMeta, transcribe_stub: true },
+            skipUpdatedAt: true,
+          });
+        }
+        await deps.scheduleTranscription();
+      }
       return json(attachment, 201);
     }
     if (method === "GET") {

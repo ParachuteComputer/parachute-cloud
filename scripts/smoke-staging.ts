@@ -991,6 +991,81 @@ async function main() {
     }
   }
 
+  // 18. Voice transcription (cloud#56) — comp the arrival user to the VOICE
+  //     tier, upload the committed real-speech fixture, link transcribe:true,
+  //     drive the DO drain via the staging __test hook, and assert the note
+  //     resolves to a REAL transcript (not eternal pending, not a failure/limit
+  //     marker). This exercises the live Workers AI path at deploy time.
+  if (arrivalVault && arrivalEmail) {
+    const vCsrf = `smoke-voice-${Date.now()}`;
+    const usersHtml = await (await fetch(`${IDENTITY}/admin/users`, { headers: { cookie: `parachute_id_session=${session}` } })).text();
+    const row = usersHtml.split("<tr>").find((r) => r.includes(arrivalEmail));
+    const uid = row ? /name="user_id" value="([^"]+)"/.exec(row)?.[1] : undefined;
+    const compVoice = await fetch(`${IDENTITY}/admin/users/plan`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${session}; parachute_id_csrf=${vCsrf}` },
+      redirect: "manual",
+      body: form({ __csrf: vCsrf, user_id: uid ?? "", plan: "voice" }),
+    });
+    assert(compVoice.status === 302, "voice: admin comp lever flips the arrival user to Voice", `status ${compVoice.status}`);
+
+    const owner = await authorizeFor(arrivalEmail, arrivalPassword, arrivalVault);
+    if (!owner.token) {
+      fail("voice: owner mints a token for the arrival vault", owner.error ?? "no token");
+    } else {
+      const AUTH = { authorization: `Bearer ${owner.token}` };
+      const land = (await (await fetch(`${VAULT}/vault/${arrivalVault}`, { headers: AUTH })).json()) as any;
+      assert(
+        land.transcription?.enabled === true && typeof land.transcription?.minutes_remaining === "number",
+        "voice: landing reports transcription enabled + minutes_remaining",
+        JSON.stringify(land.transcription),
+      );
+
+      const wav = readFileSync(join(HERE, "fixtures", "voice-smoke.wav"));
+      const fd = new FormData();
+      fd.set("file", new File([wav], "voice-smoke.wav", { type: "audio/wav" }));
+      const up = await fetch(`${VAULT}/vault/${arrivalVault}/api/storage/upload`, { method: "POST", headers: AUTH, body: fd });
+      const upPath = ((await up.json()) as any).path;
+      assert(up.status === 201 && !!upPath, "voice: uploaded the real-speech fixture", `status ${up.status}`);
+
+      const note = (await (await fetch(`${VAULT}/vault/${arrivalVault}/api/notes`, {
+        method: "POST",
+        headers: { ...AUTH, "content-type": "application/json" },
+        body: JSON.stringify({ content: "# 🎙️ Voice memo\n\n_Transcript pending._\n\n![[voice-smoke.wav]]\n" }),
+      })).json()) as { id: string };
+      const link = await fetch(`${VAULT}/vault/${arrivalVault}/api/notes/${note.id}/attachments`, {
+        method: "POST",
+        headers: { ...AUTH, "content-type": "application/json" },
+        body: JSON.stringify({ path: upPath, mimeType: "audio/wav", transcribe: true }),
+      });
+      assert(link.status === 201, "voice: linked the attachment with transcribe:true", `status ${link.status}`);
+
+      // Drive the drain synchronously (a REAL Workers AI inference runs here).
+      const run = await fetch(`${VAULT}/vault/${arrivalVault}/__test/transcribe-run`, { method: "POST" });
+      const runBody = (await run.json()) as { processed: number };
+      assert(
+        run.status === 200 && runBody.processed >= 1,
+        "voice: __test/transcribe-run drained the pending transcription",
+        `status ${run.status} processed=${runBody.processed}`,
+      );
+
+      const finalBody = ((await (await fetch(`${VAULT}/vault/${arrivalVault}/api/notes/${note.id}?include_content=true`, { headers: AUTH })).json()) as { content: string }).content;
+      assert(!finalBody.includes("_Transcript pending._"), "voice: the eternal 'Transcribing…' spinner is GONE", finalBody.replace(/\n/g, " ").slice(0, 90));
+      assert(
+        !finalBody.includes("_Transcription unavailable._") && !finalBody.includes("Monthly voice limit"),
+        "voice: resolved to a real Workers-AI transcript (not a failure/limit marker)",
+        finalBody.replace(/\n/g, " ").slice(0, 120),
+      );
+
+      const land2 = (await (await fetch(`${VAULT}/vault/${arrivalVault}`, { headers: AUTH })).json()) as any;
+      assert(
+        land2.transcription.minutes_remaining < land.transcription.minutes_remaining,
+        "voice: minutes_remaining metered down after the transcription",
+        `${land.transcription.minutes_remaining} → ${land2.transcription.minutes_remaining}`,
+      );
+    }
+  }
+
   // --- summary ---
   console.log(`\n${"=".repeat(60)}\nSMOKE ${failures === 0 ? "PASSED" : "FAILED"} — ${results.filter((r) => r.includes("PASS")).length} pass, ${failures} fail\n${"=".repeat(60)}`);
   console.log(results.join("\n"));

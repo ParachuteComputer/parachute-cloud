@@ -13,6 +13,16 @@ export interface Env {
    */
   ATTACHMENTS: R2Bucket;
 
+  /**
+   * Workers AI binding — the cloud voice-transcription provider (cloud#56).
+   * The DO alarm resolves a `WorkersAiProvider` over this and calls
+   * `@cf/openai/whisper-large-v3-turbo`. Optional in the type so the DO still
+   * constructs in test/dev where the binding is unbound (the provider reports
+   * itself unavailable, and the vitest suites inject a stub provider directly);
+   * the deployed configs (top-level + [env.staging]) bind it via `[ai]`.
+   */
+  AI?: Ai;
+
   // --- vars (wrangler [vars] / secrets) ---
   /** Identity Worker origin — token `iss` pin + JWKS/revocation fetch base. */
   ISSUER_ORIGIN: string;
