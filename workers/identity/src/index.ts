@@ -51,6 +51,8 @@ import { handleToken } from "./oauth-token.ts";
 import { handleScheduled } from "./ops.ts";
 import { handleUnsubscribe, runDrip } from "./drip.ts";
 import { runUsageRollup } from "./usage.ts";
+import { handleCheckoutPost, handlePortalPost } from "./billing.ts";
+import { handleStripeWebhookPost } from "./billing-webhook.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
 // (wrangler.toml [[durable_objects.bindings]] class_name = "RateLimiterDO").
@@ -131,6 +133,16 @@ app.get("/admin/users", (c) => handleAdminUsersGet(c.env.DB, c.req.raw, depsFor(
 app.get("/admin/vaults", (c) => handleAdminVaultsGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/admin/users/plan", (c) => handleAdminSetPlanPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/admin/users/suspend", (c) => handleAdminSuspendPost(c.env.DB, c.req.raw, depsFor(c.env)));
+
+// --- billing (Wave 4d — Stripe) ---
+// All three routes config-gate FIRST (billing-config.ts): without the Stripe
+// secrets + price ids they answer a clean 503 and the console renders no
+// billing UI — the whole feature degrades invisibly until the keys land.
+// checkout/portal: session + CSRF + same-origin (the console write boundary);
+// webhook: Stripe-Signature over the raw body + two-layer idempotency.
+app.post("/billing/checkout", (c) => handleCheckoutPost(c.env, c.req.raw, depsFor(c.env)));
+app.post("/billing/portal", (c) => handlePortalPost(c.env, c.req.raw, depsFor(c.env)));
+app.post("/billing/webhook", (c) => handleStripeWebhookPost(c.env, c.req.raw, depsFor(c.env)));
 
 // --- magic-link sign-in + second factor ---
 app.post("/auth/magic", (c) => handleMagicRequestPost(c.env.DB, c.req.raw, depsFor(c.env), senderFor(c.env)));

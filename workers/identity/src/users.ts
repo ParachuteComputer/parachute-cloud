@@ -70,6 +70,26 @@ export interface User {
    * vault data untouched.
    */
   suspendedAt: string | null;
+  /**
+   * Stripe linkage (migration 0012) — set by the checkout.session.completed
+   * webhook; null for free users and comped accounts. The lifecycle handlers
+   * resolve events by these ids (billing-lifecycle.ts).
+   */
+  stripeCustomerId: string | null;
+  stripeSubscriptionId: string | null;
+  /**
+   * The deferred-downgrade pair (migration 0012, old lifecycle.ts semantics):
+   * `customer.subscription.deleted` records pending_plan='free' +
+   * plan_downgrade_at = paid-through end + 3-day grace; the hourly billing
+   * sweep applies it. `pendingPlan` alone (no timestamp) = a scheduled
+   * cancel_at_period_end, informational until `deleted` stamps the time.
+   */
+  pendingPlan: PlanId | null;
+  planDowngradeAt: string | null;
+  /** Soft dunning (migration 0012): flags only, never auto-suspend. */
+  lastInvoicePaidAt: string | null;
+  paymentFailedAt: string | null;
+  paymentFailedCount: number;
 }
 
 interface Row {
@@ -81,6 +101,13 @@ interface Row {
   plan: string;
   role: string;
   suspended_at: string | null;
+  stripe_customer_id: string | null;
+  stripe_subscription_id: string | null;
+  pending_plan: string | null;
+  plan_downgrade_at: string | null;
+  last_invoice_paid_at: string | null;
+  payment_failed_at: string | null;
+  payment_failed_count: number;
 }
 
 function rowToUser(r: Row): User {
@@ -95,6 +122,14 @@ function rowToUser(r: Row): User {
     plan: coercePlanId(r.plan),
     role: coerceRole(r.role),
     suspendedAt: r.suspended_at,
+    stripeCustomerId: r.stripe_customer_id,
+    stripeSubscriptionId: r.stripe_subscription_id,
+    // Same defensive coercion as `plan`; null stays null (no pending change).
+    pendingPlan: r.pending_plan === null ? null : coercePlanId(r.pending_plan),
+    planDowngradeAt: r.plan_downgrade_at,
+    lastInvoicePaidAt: r.last_invoice_paid_at,
+    paymentFailedAt: r.payment_failed_at,
+    paymentFailedCount: r.payment_failed_count,
   };
 }
 
@@ -188,7 +223,23 @@ export async function createUser(
     .prepare("INSERT INTO users (id, email, password_hash, created_at, email_verified) VALUES (?, ?, ?, ?, ?)")
     .bind(id, email, passwordHash, createdAt, emailVerified ? 1 : 0)
     .run();
-  return { id, email, passwordHash, createdAt, emailVerified, plan: "free", role: "user", suspendedAt: null };
+  return {
+    id,
+    email,
+    passwordHash,
+    createdAt,
+    emailVerified,
+    plan: "free",
+    role: "user",
+    suspendedAt: null,
+    stripeCustomerId: null,
+    stripeSubscriptionId: null,
+    pendingPlan: null,
+    planDowngradeAt: null,
+    lastInvoicePaidAt: null,
+    paymentFailedAt: null,
+    paymentFailedCount: 0,
+  };
 }
 
 /** Mark an account's email verified (idempotent). */
@@ -231,5 +282,23 @@ export async function getUserByEmail(db: D1Database, email: string): Promise<Use
 
 export async function getUserById(db: D1Database, id: string): Promise<User | null> {
   const row = await db.prepare("SELECT * FROM users WHERE id = ?").bind(id).first<Row>();
+  return row ? rowToUser(row) : null;
+}
+
+/**
+ * Webhook-side lookups (billing-lifecycle.ts): invoice.* events resolve by
+ * `customer`, customer.subscription.* by the subscription id — both set on the
+ * row at checkout.session.completed time. Indexed (migration 0012).
+ */
+export async function getUserByStripeCustomerId(db: D1Database, customerId: string): Promise<User | null> {
+  const row = await db.prepare("SELECT * FROM users WHERE stripe_customer_id = ?").bind(customerId).first<Row>();
+  return row ? rowToUser(row) : null;
+}
+
+export async function getUserByStripeSubscriptionId(db: D1Database, subscriptionId: string): Promise<User | null> {
+  const row = await db
+    .prepare("SELECT * FROM users WHERE stripe_subscription_id = ?")
+    .bind(subscriptionId)
+    .first<Row>();
   return row ? rowToUser(row) : null;
 }

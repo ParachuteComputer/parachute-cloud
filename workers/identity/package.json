@@ -13,7 +13,8 @@
   "dependencies": {
     "@paulmillr/qr": "^0.3.0",
     "hono": "^4.6.0",
-    "jose": "^5.9.0"
+    "jose": "^5.9.0",
+    "stripe": "22.1.0"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.8.57",

@@ -139,6 +139,9 @@ interface UserPageRow {
   created_at: string;
   suspended_at: string | null;
   drip_unsubscribed: string | null;
+  payment_failed_at: string | null;
+  payment_failed_count: number;
+  pending_plan: string | null;
   vault_count: number;
   checklist_done: number;
 }
@@ -159,6 +162,7 @@ export async function handleAdminUsersGet(db: D1Database, req: Request, deps: OA
   const res = await db
     .prepare(
       `SELECT u.id, u.email, u.plan, u.role, u.created_at, u.suspended_at, u.drip_unsubscribed,
+         u.payment_failed_at, u.payment_failed_count, u.pending_plan,
          (SELECT COUNT(*) FROM vaults v WHERE v.owner_user_id = u.id) AS vault_count,
          (SELECT COUNT(*) FROM user_checklist c WHERE c.user_id = u.id AND c.item <> 'hidden') AS checklist_done
        FROM users u
@@ -176,6 +180,12 @@ export async function handleAdminUsersGet(db: D1Database, req: Request, deps: OA
     createdAt: r.created_at,
     suspendedAt: r.suspended_at,
     dripUnsubscribed: r.drip_unsubscribed !== null,
+    // Soft dunning (Wave 4d): flagged by invoice.payment_failed, cleared by
+    // invoice.paid — surfaced as a badge; action stays operator-judgment.
+    paymentFailedAt: r.payment_failed_at,
+    paymentFailedCount: r.payment_failed_count,
+    // A scheduled downgrade (cancel_at_period_end / subscription deleted).
+    pendingPlan: r.pending_plan,
     vaultCount: r.vault_count,
     checklistDone: r.checklist_done,
   }));

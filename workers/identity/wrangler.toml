@@ -115,6 +115,21 @@ ENVIRONMENT = "production"
 EMAIL_FROM = "noreply@parachute.computer"
 # Where the scheduled health-check alerts + weekly ops digest go (src/ops.ts).
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
+# --- Stripe billing (Wave 4d) -------------------------------------------------
+# Billing activates only when ALL FOUR values exist (src/billing-config.ts);
+# until then /billing/* answers 503 and the console shows no billing UI.
+#   Secrets (NEVER in this file — per environment):
+#     wrangler secret put STRIPE_SECRET_KEY                (sk_live_… here; sk_test_… on staging)
+#     wrangler secret put STRIPE_WEBHOOK_SECRET            (whsec_… from the dashboard webhook
+#                                                           endpoint pointing at POST /billing/webhook,
+#                                                           events: checkout.session.completed,
+#                                                           invoice.paid, invoice.payment_failed,
+#                                                           customer.subscription.deleted,
+#                                                           customer.subscription.updated)
+#   Price ids (not secret — uncomment + fill once the Stripe product exists;
+#   the Parachute plan: $3/mo + $30/yr, amounts live on the Prices):
+# STRIPE_PRICE_PARACHUTE_MONTHLY = "price_..."
+# STRIPE_PRICE_PARACHUTE_YEARLY = "price_..."
 
 # --- outbound email (Cloudflare Email Sending) ------------------------------
 # Cloudflare Email Sending (public beta, Workers Paid). parachute.computer was
@@ -187,6 +202,13 @@ EMAIL_FROM = "noreply@parachute.computer"
 # Same operator address as production — but staging has no send_email binding,
 # so ops alerts/digests land in the worker log (devlog sender), never an inbox.
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
+# Stripe billing (staging = TEST-mode keys): `wrangler secret put
+# STRIPE_SECRET_KEY -e staging` + `wrangler secret put STRIPE_WEBHOOK_SECRET
+# -e staging`, then uncomment the TEST-mode price ids. See the production
+# [vars] block for the full seam; unset = billing degrades cleanly (503 +
+# hidden console UI — pinned by smoke-staging).
+# STRIPE_PRICE_PARACHUTE_MONTHLY = "price_..."
+# STRIPE_PRICE_PARACHUTE_YEARLY = "price_..."
 
 # Workers Logs for staging too (explicit per-env restatement; see the top-level
 # [observability] note).

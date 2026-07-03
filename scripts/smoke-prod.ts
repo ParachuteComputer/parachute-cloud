@@ -143,6 +143,34 @@ async function main() {
     assert(admin.status === 404, "PRODUCTION: unauthenticated /admin → 404 (surface hidden)", `status ${admin.status}`);
   }
 
+  // 3d. Billing (Wave 4d) — state-adaptive, all state-free probes. NOT
+  //     CONFIGURED (until the Stripe keys land): /billing/* answers the clean
+  //     503. CONFIGURED: anonymous checkout redirects to /login and an
+  //     unsigned webhook is refused 400. Either state is a pass; the detail
+  //     names which one this deploy is in.
+  {
+    const probe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
+    if (probe.status === 503) {
+      const body = (await probe.json()) as { error?: string };
+      assert(body.error === "billing_not_configured", "billing: NOT CONFIGURED — checkout answers the clean 503", String(body.error));
+      const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
+      assert(webhook.status === 503, "billing: NOT CONFIGURED — webhook → 503", `status ${webhook.status}`);
+    } else {
+      assert(
+        probe.status === 302 && probe.headers.get("location") === "/login",
+        "billing: CONFIGURED — anonymous checkout redirects to /login",
+        `status ${probe.status} → ${probe.headers.get("location")}`,
+      );
+      const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
+      const wj = (await webhook.json()) as { error?: string };
+      assert(
+        webhook.status === 400 && wj.error === "missing_signature",
+        "billing: CONFIGURED — an unsigned webhook is refused (400)",
+        `status ${webhook.status}`,
+      );
+    }
+  }
+
   // 4. Vault worker on its custom domain (all GET, no DO writes).
   {
     const health = await fetch(`${VAULT}/health`);

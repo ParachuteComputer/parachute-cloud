@@ -46,6 +46,25 @@ export interface Env {
    */
   EMAIL?: SendEmailBinding;
   /**
+   * Stripe secret key (sk_test_… / sk_live_…) — `wrangler secret put
+   * STRIPE_SECRET_KEY` (per environment). Absent → billing degrades cleanly
+   * (billing-config.ts): /billing/* answers 503, the console hides Upgrade.
+   */
+  STRIPE_SECRET_KEY?: string;
+  /**
+   * Stripe webhook endpoint signing secret (whsec_…) — `wrangler secret put
+   * STRIPE_WEBHOOK_SECRET`. From the webhook endpoint created in the Stripe
+   * dashboard pointing at POST /billing/webhook.
+   */
+  STRIPE_WEBHOOK_SECRET?: string;
+  /**
+   * Stripe Price ids for the Parachute plan ($3/mo, $30/yr — the amounts live
+   * in plans.ts copy + the Stripe dashboard; the ids come from env, NEVER
+   * hardcoded). Set in [vars] once the product exists (see wrangler.toml).
+   */
+  STRIPE_PRICE_PARACHUTE_MONTHLY?: string;
+  STRIPE_PRICE_PARACHUTE_YEARLY?: string;
+  /**
    * Service binding to the vault worker — STAGING ONLY today. Staging's
    * VAULT_ORIGIN is a workers.dev URL, which is not a valid subrequest target
    * from inside a Worker (the platform answers 404 without ever routing to the

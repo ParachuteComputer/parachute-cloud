@@ -45,8 +45,13 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
   parachute: { id: "parachute", label: "Parachute", vault_count: 5, total_bytes: 10 * GiB },
 };
 
-/** The paid plan's price copy — one place, so console + site can't drift. */
-export const PARACHUTE_PRICE_LINE = "$3/mo or $30/yr";
+/** The paid plan's price copy — one place, so console + site can't drift.
+ * The two labels also caption the console's Upgrade buttons (ui.ts); the
+ * ACTUAL amounts live on the Stripe Prices (env STRIPE_PRICE_PARACHUTE_*) —
+ * keep dashboard and copy in step when pricing ever changes. */
+export const PARACHUTE_PRICE_MONTHLY_LABEL = "$3/mo";
+export const PARACHUTE_PRICE_YEARLY_LABEL = "$30/yr";
+export const PARACHUTE_PRICE_LINE = `${PARACHUTE_PRICE_MONTHLY_LABEL} or ${PARACHUTE_PRICE_YEARLY_LABEL}`;
 
 export function isPlanId(raw: string): raw is PlanId {
   return raw === "free" || raw === "parachute";
