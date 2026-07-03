@@ -755,7 +755,12 @@ describe("console — vaults", () => {
     expect(await reserved.text()).toContain("reserved");
 
     await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "taken-name" }, cookie), env);
-    const taken = await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "taken-name" }, cookie), env);
+    // The "taken" path is now inherently CROSS-user: the free plan's 1-vault
+    // cap (plans.ts) refuses a same-user second create before the name is
+    // even looked at, so a different account collides on the name.
+    const session2 = await sessionFor("vaultmaker2b@example.com");
+    const cookie2 = `parachute_id_session=${session2}; parachute_id_csrf=${CSRF}`;
+    const taken = await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "taken-name" }, cookie2), env);
     expect(taken.status).toBe(200);
     expect(await taken.text()).toContain("already taken");
   });

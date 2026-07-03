@@ -74,9 +74,12 @@ const esc = (s: string) => s.replace(/'/g, "''");
 // before this seed on the deployed D1).
 // email_verified = 1: the dev address is known/owned, and INSERT OR REPLACE would
 // otherwise reset it to the column default (0) on every re-seed.
+// plan = 'parachute': the dev/operator account is a comp (Wave 4, matching the
+// scripts/backfill-plans.ts comp list) — INSERT OR REPLACE would otherwise
+// reset it to 'free' on every re-seed.
 const sql = `-- DEV-ONLY generated seed — do not commit. Regenerate with \`bun run seed:dev\`.
-INSERT OR REPLACE INTO users (id, email, password_hash, created_at, email_verified)
-VALUES ('${esc(DEV_USER_ID)}', '${esc(email)}', '${esc(passwordHash)}', '${esc(createdAt)}', 1);
+INSERT OR REPLACE INTO users (id, email, password_hash, created_at, email_verified, plan)
+VALUES ('${esc(DEV_USER_ID)}', '${esc(email)}', '${esc(passwordHash)}', '${esc(createdAt)}', 1, 'parachute');
 INSERT OR REPLACE INTO vaults (name, owner_user_id, created_at)
 VALUES ('demo', '${esc(DEV_USER_ID)}', '${esc(createdAt)}');
 `;

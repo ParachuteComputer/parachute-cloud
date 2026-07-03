@@ -318,10 +318,33 @@ async function main() {
     });
     assert(cvRes.status === 302 && (cvRes.headers.get("location") ?? "").includes(`created=${newVault}`), "console create vault → claimed", `status ${cvRes.status}`);
 
-    // The console page shows the connect card with the reachable URL shape.
+    // The console page shows the connect card with the reachable URL shape,
+    // plus the Wave-4 plan line (fresh signup = free plan) rendered from
+    // PLAN_SPECS, and the at-cap note in place of the create form (free = 1
+    // vault, just used).
     const conPage = await fetch(`${IDENTITY}/console`, { headers: { cookie: `parachute_id_session=${newSession}` } });
     const conHtml = await conPage.text();
     assert(conHtml.includes(newVault) && conHtml.includes(`parachute-${newVault}`), "console shows the vault + connect card", "");
+    assert(
+      conHtml.includes("Free plan — 1 vault, 100 MB") && conHtml.includes("coming this week"),
+      "console shows the free plan line + Parachute teaser",
+      "",
+    );
+
+    // Plan vault-count enforcement: the free plan includes 1 vault, so a 2nd
+    // create is refused with the friendly message and claims nothing.
+    const cv2 = await fetch(`${IDENTITY}/console/vaults`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${newSession}; parachute_id_csrf=${conCsrf}` },
+      redirect: "manual",
+      body: form({ __csrf: conCsrf!, name: `${newVault}-two` }),
+    });
+    const cv2Html = cv2.status === 200 ? await cv2.text() : "";
+    assert(
+      cv2.status === 200 && cv2Html.includes("Your plan includes 1 vault"),
+      "2nd vault create on the free plan → refused with the friendly at-cap message",
+      `status ${cv2.status}`,
+    );
 
     // New user mints a token for THEIR vault via the real authorize flow.
     const owner = await authorizeFor(newEmail, newPassword, newVault);
@@ -329,6 +352,19 @@ async function main() {
 
     if (owner.token) {
       const OWN_AUTH = { authorization: `Bearer ${owner.token}` };
+
+      // Wave-4 storage-cap push, verified end-to-end through the REAL staging
+      // transport (identity minted a first-party admin token and PUT the cap
+      // through the VAULT_SERVICE binding at creation): the vault landing
+      // surfaces the RESOLVED cap — the free plan's 100 MB, not the 1 GiB
+      // env default.
+      const landing = await fetch(`${VAULT}/vault/${newVault}`, { headers: OWN_AUTH });
+      const landingJson = (await landing.json()) as { cap_bytes?: number };
+      assert(
+        landing.status === 200 && landingJson.cap_bytes === 104_857_600,
+        "create-time cap push landed in the DO (landing cap_bytes = 100 MB)",
+        `status ${landing.status}, cap_bytes=${landingJson.cap_bytes}`,
+      );
 
       // The fresh vault materialized with the DEFAULT SEED PACKS (core's
       // welcome + getting-started): exactly 4 notes + 3 capture tags, before

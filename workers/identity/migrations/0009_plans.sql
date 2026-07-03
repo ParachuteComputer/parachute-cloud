@@ -1,0 +1,15 @@
+-- Plans — the entitlement layer (Wave 4 opener; payments/Stripe come later).
+--
+-- `users.plan` is the single billing-relevant fact on the user row:
+--   'free'      — 1 vault, 100 MB total storage (the default for every signup)
+--   'parachute' — the paid plan, $3/mo or $30/yr: 5 vaults, 10 GiB total
+-- Values are enforced in code (src/plans.ts is the single source of truth for
+-- plan ids + entitlements; unknown values coerce to 'free' defensively). No
+-- CHECK constraint: adding a plan must never require a schema migration, and
+-- D1 can't ALTER a CHECK later. Comps (e.g. the operator's own accounts) are
+-- set via script/admin — scripts/backfill-plans.ts is the first writer.
+--
+-- Additive only: every existing row lands on 'free' via the DEFAULT; the
+-- backfill script then sets the comp accounts + pushes per-plan storage caps
+-- into the vault DOs (grandfathering is handled there, not here).
+ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'free';

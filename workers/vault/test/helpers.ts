@@ -29,11 +29,14 @@ export async function mintToken(opts: {
   vaultScope?: string[];
   expiresIn?: string;
   kid?: string;
+  /** `client_id` claim — the internal-config seam gates on the first-party id. */
+  clientId?: string;
 }): Promise<string> {
   const key = await importJWK(TEST_PRIVATE_JWK as any, "RS256");
   return new SignJWT({
     scope: opts.scopes,
     ...(opts.vaultScope ? { vault_scope: opts.vaultScope } : {}),
+    ...(opts.clientId ? { client_id: opts.clientId } : {}),
   })
     .setProtectedHeader({ alg: "RS256", kid: opts.kid ?? TEST_KID })
     .setIssuer(opts.iss ?? ISSUER)

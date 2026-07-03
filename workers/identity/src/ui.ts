@@ -7,6 +7,9 @@
 // The first-run research chips mirror the landing page's set; the values live
 // in checklist.ts (next to the allowlist that gates the write).
 import { NOTES_APP_OPTIONS } from "./checklist.ts";
+// Plan copy renders from plans.ts (the single source of truth for
+// entitlements + display strings) — the console can never drift from it.
+import { type PlanId, parachuteTeaser, planLine, vaultCapMessage } from "./plans.ts";
 
 export interface AuthorizeParams {
   clientId: string;
@@ -468,6 +471,10 @@ export interface ConsoleProps {
   checklist?: ConsoleChecklistProps | null;
   /** Zero-vault re-render values (the first-run hero preserves answers). */
   firstRun?: FirstRunValues;
+  /** The user's plan — the header line + the at-cap create card render from plans.ts. */
+  plan: PlanId;
+  /** At/over the plan's vault count → the create form yields to the at-cap note. */
+  atVaultCap: boolean;
 }
 
 /**
@@ -645,13 +652,20 @@ function consoleScript(csrfToken: string): string {
  * getting-started checklist (until dismissed) + vault cards + create form.
  */
 export function renderConsole(props: ConsoleProps): string {
-  const { email, vaults, csrfToken, error, notice, checklist, firstRun } = props;
+  const { email, vaults, csrfToken, error, notice, checklist, firstRun, plan, atVaultCap } = props;
+  // Plan display (no payment link yet — the entitlement layer ships first).
+  // Free users also see the Parachute teaser; Parachute users just their plan.
+  const planHtml =
+    plan === "free"
+      ? `${esc(planLine(plan))} <span style="opacity:.75">&middot; ${esc(parachuteTeaser())}</span>`
+      : esc(planLine(plan));
   const header = (title: string) => `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">
        <h1 style="margin:0">${esc(title)}</h1>
        <span style="display:flex;gap:1rem;align-items:baseline"><a href="/console/security">Security</a>
        <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}"><button class="linkbtn" type="submit">Sign out</button></form></span>
      </div>
-     <p class="muted" style="margin:.15rem 0 1.2rem">${esc(email)}</p>`;
+     <p class="muted" style="margin:.15rem 0 .2rem">${esc(email)}</p>
+     <p class="muted" data-testid="plan-line" style="margin:0 0 1.2rem;font-size:.88rem">${planHtml}</p>`;
 
   if (vaults.length === 0) {
     return page(
@@ -663,13 +677,16 @@ export function renderConsole(props: ConsoleProps): string {
   }
 
   const list = vaults.map((v) => vaultCard(v, csrfToken)).join("\n");
-  return page(
-    "Console — Parachute",
-    `${header("Your vaults")}
-     ${notice ? `<div class="notice">${esc(notice)}</div>` : ""}
-     ${checklist ? checklistCard(checklist, csrfToken) : ""}
-     ${list}
-     <div class="card">
+  // At the plan's vault cap the create form yields to the friendly note (the
+  // POST handler enforces regardless — this keeps the door honest). An error
+  // still renders inside whichever card is shown.
+  const createCard = atVaultCap
+    ? `<div class="card" data-testid="vault-cap">
+       <h2>Create a vault</h2>
+       <p class="muted" style="margin:.35rem 0 0">${esc(vaultCapMessage(plan))}</p>
+       ${error ? `<div class="err">${esc(error)}</div>` : ""}
+     </div>`
+    : `<div class="card">
        <h2>Create a vault</h2>
        <form method="post" action="/console/vaults">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -679,7 +696,14 @@ export function renderConsole(props: ConsoleProps): string {
          ${error ? `<div class="err">${esc(error)}</div>` : ""}
          <button class="primary" type="submit">Create vault</button>
        </form>
-     </div>
+     </div>`;
+  return page(
+    "Console — Parachute",
+    `${header("Your vaults")}
+     ${notice ? `<div class="notice">${esc(notice)}</div>` : ""}
+     ${checklist ? checklistCard(checklist, csrfToken) : ""}
+     ${list}
+     ${createCard}
      ${consoleScript(csrfToken)}`,
   );
 }
