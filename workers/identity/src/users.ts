@@ -39,6 +39,18 @@ const PBKDF2_MAX_ITERATIONS = 100_000;
 const PBKDF2_HASH_ALGS: Record<string, string> = { sha256: "SHA-256", sha512: "SHA-512" };
 const PBKDF2_CURRENT_TAG = "sha512";
 
+/** Account role (migration 0011). 'operator' unlocks the /admin console. */
+export type UserRole = "user" | "operator";
+
+/**
+ * Coerce a stored role to a known UserRole. Unknown/garbage values degrade to
+ * 'user' — the safe direction: never grant operator powers the code doesn't
+ * know about (mirrors coercePlanId).
+ */
+export function coerceRole(raw: string | null | undefined): UserRole {
+  return raw === "operator" ? "operator" : "user";
+}
+
 export interface User {
   id: string;
   email: string;
@@ -49,6 +61,15 @@ export interface User {
   emailVerified: boolean;
   /** Billing plan (entitlements in plans.ts). Migration 0009; default 'free'. */
   plan: PlanId;
+  /** Account role (migration 0011). Set ONLY by scripts/set-operator-role.ts. */
+  role: UserRole;
+  /**
+   * ISO-8601 timestamp when an operator suspended the account; null = active.
+   * Semantics are documented on migration 0011: sessions die on next request,
+   * login/magic answer neutrally without minting, tokens expire naturally,
+   * vault data untouched.
+   */
+  suspendedAt: string | null;
 }
 
 interface Row {
@@ -58,6 +79,8 @@ interface Row {
   created_at: string;
   email_verified: number;
   plan: string;
+  role: string;
+  suspended_at: string | null;
 }
 
 function rowToUser(r: Row): User {
@@ -70,6 +93,8 @@ function rowToUser(r: Row): User {
     // Defensive coercion: an unknown stored value degrades to 'free' rather
     // than granting entitlements this build doesn't know about.
     plan: coercePlanId(r.plan),
+    role: coerceRole(r.role),
+    suspendedAt: r.suspended_at,
   };
 }
 
@@ -157,13 +182,13 @@ export async function createUser(
   const passwordHash = password.length > 0 ? await hashPassword(password) : "";
   const emailVerified = opts.emailVerified ?? false;
   const createdAt = now.toISOString();
-  // `plan` is deliberately NOT in the INSERT: every signup lands on the
-  // migration-0009 DEFAULT ('free'), which the plans test suite pins.
+  // `plan` and `role` are deliberately NOT in the INSERT: every signup lands
+  // on the migration DEFAULTs ('free' / 'user'), which the test suites pin.
   await db
     .prepare("INSERT INTO users (id, email, password_hash, created_at, email_verified) VALUES (?, ?, ?, ?, ?)")
     .bind(id, email, passwordHash, createdAt, emailVerified ? 1 : 0)
     .run();
-  return { id, email, passwordHash, createdAt, emailVerified, plan: "free" };
+  return { id, email, passwordHash, createdAt, emailVerified, plan: "free", role: "user", suspendedAt: null };
 }
 
 /** Mark an account's email verified (idempotent). */
@@ -184,6 +209,19 @@ export async function setPassword(db: D1Database, userId: string, password: stri
  */
 export async function setUserPlan(db: D1Database, userId: string, plan: PlanId): Promise<void> {
   await db.prepare("UPDATE users SET plan = ? WHERE id = ?").bind(plan, userId).run();
+}
+
+/**
+ * Suspend (timestamp) or un-suspend (null) an account — the /admin moderation
+ * lever. Suspension semantics live on migration 0011; the CALLER (admin.ts)
+ * also deletes the user's session rows on suspend, and findActiveSession
+ * (sessions.ts) refuses suspended users' sessions as the read-time backstop.
+ */
+export async function setUserSuspended(db: D1Database, userId: string, suspendedAt: Date | null): Promise<void> {
+  await db
+    .prepare("UPDATE users SET suspended_at = ? WHERE id = ?")
+    .bind(suspendedAt ? suspendedAt.toISOString() : null, userId)
+    .run();
 }
 
 export async function getUserByEmail(db: D1Database, email: string): Promise<User | null> {

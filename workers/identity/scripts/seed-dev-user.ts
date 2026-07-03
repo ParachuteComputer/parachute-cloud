@@ -77,9 +77,13 @@ const esc = (s: string) => s.replace(/'/g, "''");
 // plan = 'parachute': the dev/operator account is a comp (Wave 4, matching the
 // scripts/backfill-plans.ts comp list) — INSERT OR REPLACE would otherwise
 // reset it to 'free' on every re-seed.
+// role = 'operator': the dev account IS the operator login (Wave 4c /admin —
+// smoke-staging.ts asserts it sees the console) — INSERT OR REPLACE would
+// otherwise reset it to 'user' on every re-seed. suspended_at stays unnamed
+// (→ NULL default): a re-seed never leaves the operator suspended.
 const sql = `-- DEV-ONLY generated seed — do not commit. Regenerate with \`bun run seed:dev\`.
-INSERT OR REPLACE INTO users (id, email, password_hash, created_at, email_verified, plan)
-VALUES ('${esc(DEV_USER_ID)}', '${esc(email)}', '${esc(passwordHash)}', '${esc(createdAt)}', 1, 'parachute');
+INSERT OR REPLACE INTO users (id, email, password_hash, created_at, email_verified, plan, role)
+VALUES ('${esc(DEV_USER_ID)}', '${esc(email)}', '${esc(passwordHash)}', '${esc(createdAt)}', 1, 'parachute', 'operator');
 INSERT OR REPLACE INTO vaults (name, owner_user_id, created_at)
 VALUES ('demo', '${esc(DEV_USER_ID)}', '${esc(createdAt)}');
 `;

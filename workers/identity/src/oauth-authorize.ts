@@ -253,7 +253,9 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
     return renderLoginPage(req, params, "Too many attempts. Please wait a few minutes and try again.");
   }
   const user = email ? await getUserByEmail(db, email) : null;
-  if (!user || !(await verifyPassword(user, password))) {
+  // SUSPENDED accounts get the same wrong-password message here too (this is
+  // the other public login-submit path) — never a session, never an oracle.
+  if (!user || !(await verifyPassword(user, password)) || user.suspendedAt) {
     await recordLoginFailure(deps.rateLimiter, key, now);
     return renderLoginPage(req, params, "Incorrect email or password.");
   }
