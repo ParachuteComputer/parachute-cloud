@@ -1078,6 +1078,33 @@ async function main() {
         finalBody.replace(/\n/g, " ").slice(0, 120),
       );
 
+      // --- Transcript CLEANUP pass (cloud#66 follow-on) — the cleanup+guard ran
+      // live. RAW IS SACRED: assert the raw transcript is preserved (note +
+      // attachment metadata) and the transcribe_cleaned flag is set (proving the
+      // guard was exercised — it accepts the cleaned view or falls back to raw).
+      const noteFull = (await (await fetch(`${VAULT}/vault/${arrivalVault}/api/notes/${note.id}?include_content=true&include_metadata=true`, { headers: AUTH })).json()) as { metadata?: Record<string, any> };
+      const noteRaw = noteFull.metadata?.raw_transcript;
+      assert(
+        typeof noteRaw === "string" && noteRaw.trim().length > 0,
+        "voice cleanup: RAW transcript preserved on note.metadata.raw_transcript (raw is sacred)",
+        `raw_transcript len ${String(noteRaw ?? "").length}`,
+      );
+      const vAtts = (await (await fetch(`${VAULT}/vault/${arrivalVault}/api/notes/${note.id}/attachments`, { headers: AUTH })).json()) as any[];
+      const vam = vAtts[0]?.metadata ?? {};
+      assert(
+        typeof vam.transcribe_cleaned === "boolean" && typeof vam.raw_transcript === "string" && vam.raw_transcript === noteRaw,
+        "voice cleanup: guard exercised (transcribe_cleaned flag set; attachment raw matches note raw)",
+        `cleaned=${vam.transcribe_cleaned} rawLen=${String(vam.raw_transcript ?? "").length}`,
+      );
+      // The note BODY is the cleaned view when accepted, else the raw — either
+      // way non-empty; when accepted (transcribe_cleaned===true) the guard has
+      // GUARANTEED the body words are a faithful subsequence of the raw.
+      assert(
+        finalBody.trim().length > 0,
+        `voice cleanup: note body carries the ${vam.transcribe_cleaned ? "CLEANED" : "raw"} transcript`,
+        finalBody.replace(/\n/g, " ").slice(0, 120),
+      );
+
       const land2 = (await (await fetch(`${VAULT}/vault/${arrivalVault}`, { headers: AUTH })).json()) as any;
       assert(
         land2.transcription.minutes_remaining < land.transcription.minutes_remaining,

@@ -11,10 +11,10 @@
 #     need the sibling present.
 #   - bun.lock is gitignored in this repo (installs resolve fresh from
 #     package.json ranges), so the download cache is keyed on the manifests.
-#   - Root `bun run typecheck` is deliberately NOT run here: it is
-#     known-broken from stripe caret drift — see cloud#23
-#     (https://github.com/ParachuteComputer/parachute-cloud/issues/23).
-#     The two worker typechecks ARE run (they are green and load-bearing).
+#   - Root `bun run typecheck` IS run now (control-plane job): cloud#23 (stripe
+#     caret drift) is closed — `stripe` is pinned EXACT ("22.1.0"), so a fresh
+#     install (bun.lock is gitignored) can no longer resolve 22.3.0's
+#     API-version type drift. The two worker typechecks are also run.
 
 name: CI
 
@@ -129,7 +129,12 @@ jobs:
       - name: Install (fresh — copies the core file dep into node_modules)
         run: bun install
 
-      # Root `bun run typecheck` is deliberately excluded — known-broken from
-      # stripe caret drift (cloud#23). Add it back once that issue closes.
+      # Root `bun run typecheck` — re-enabled now that cloud#23 (stripe caret
+      # drift) is closed: `stripe` is pinned EXACT ("22.1.0") so `^22.1.0` can
+      # no longer silently resolve to 22.3.0's API-version type drift. This gate
+      # was previously masking real control-plane typecheck errors on every PR.
+      - name: Typecheck control plane (root tsc)
+        run: bun run typecheck
+
       - name: Test control plane (root bun test)
         run: bun run test
