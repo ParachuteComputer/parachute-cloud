@@ -418,7 +418,7 @@ export interface ConsoleProps {
   notice?: string;
 }
 
-function vaultCard(v: ConsoleVaultCard): string {
+function vaultCard(v: ConsoleVaultCard, csrfToken: string): string {
   // Primary door: the Notes PWA connect deep-link. The CLI/MCP coordinates
   // stay one disclosure below — demoted from the headline, not removed.
   return `<div class="vault">
@@ -429,6 +429,16 @@ function vaultCard(v: ConsoleVaultCard): string {
       <div class="field"><div class="k">Connect Claude Code</div><pre>${esc(v.connectCmd)}</pre></div>
       <div class="field"><div class="k">MCP endpoint</div><pre>${esc(v.mcpUrl)}</pre></div>
       <div class="field"><div class="k">REST base</div><pre>${esc(v.restUrl)}</pre></div>
+    </details>
+    <details>
+      <summary>Building a surface?</summary>
+      <p class="muted" style="margin:.2rem 0 0">Seed this vault with the <strong>Surface Starter</strong> guide — a living note that walks your connected AI through building a custom surface (UI) over the vault. It's not seeded by default; adding it again is harmless.</p>
+      <form method="post" action="/console/packs">
+        <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+        <input type="hidden" name="vault" value="${esc(v.name)}">
+        <input type="hidden" name="pack" value="surface-starter">
+        <button class="secondary" type="submit" style="margin-top:.7rem">Add the Surface Starter guide</button>
+      </form>
     </details>
   </div>`;
 }
@@ -447,7 +457,7 @@ export function renderConsole(props: ConsoleProps): string {
   const { email, vaults, csrfToken, error, notice } = props;
   const list =
     vaults.length > 0
-      ? vaults.map(vaultCard).join("\n")
+      ? vaults.map((v) => vaultCard(v, csrfToken)).join("\n")
       : `<p class="muted">No vaults yet. Create your first one below.</p>`;
   return page(
     "Console — Parachute",

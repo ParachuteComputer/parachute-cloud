@@ -31,6 +31,7 @@ import { SubscriptionManager } from "./live/subscriptions.js";
 import { collectExportEntries, exportPrefix, pruneExportTarballs, toTar } from "./export.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, type WelcomeSeedResult } from "./welcome.js";
+import { SEED_PACK_NAMES, applySeedPack, getSeedPack } from "@openparachute/core/src/seed-packs.js";
 
 function errText(e: unknown): string {
   if (e instanceof Error) return `${e.name}: ${e.message}`;
@@ -205,6 +206,13 @@ export class VaultDO extends DurableObject {
     if (apiPath === "/find-path") {
       return handleFindPath(request, this.store, NO_TAG_SCOPE);
     }
+    // Seed-pack application — POST /api/packs/<name>. Write-scoped (POST →
+    // verb=write above); idempotent per item via core's applier, so re-POSTing
+    // is always safe. The console's "Add the Surface Starter guide" button is
+    // the primary caller (via the identity worker's server-side mint).
+    if (apiPath.startsWith("/packs/")) {
+      return this.handleApplyPack(request, apiPath.slice(7));
+    }
     if (apiPath === "/vault") {
       const cfg: VaultConfigLike = {
         name: this.config!.name,
@@ -257,8 +265,9 @@ export class VaultDO extends DurableObject {
     };
     if (!stored) {
       await this.ctx.storage.put("config", this.config);
-      // First-ever materialization of this vault → seed the welcome content
-      // (Notes' required capture tags + the three-note welcome web). This is
+      // First-ever materialization of this vault → seed the default packs
+      // (welcome: Notes' capture tags + the three-note welcome web;
+      // getting-started: the AI-facing guide). This is
       // the create-time seam: the console's createVault is only a D1 ownership
       // claim ("the DO comes into existence on first access"), so the vault-as-
       // data first exists HERE, and this DO is the single writer for it.
@@ -270,8 +279,9 @@ export class VaultDO extends DurableObject {
   }
 
   /**
-   * Seed the welcome content once per vault. Guards: the `welcome_seeded`
-   * marker (fast path), then a zero-notes check (belt-and-braces — never write
+   * Seed the default packs (welcome + getting-started) once per vault.
+   * Guards: the `welcome_seeded` marker (fast path), then a zero-notes check
+   * (belt-and-braces — never write
    * into a vault that somehow already has content, e.g. a future restore path
    * that plants data before config). Best-effort: a seed failure must never
    * fail the request that materialized the vault; per-item guards inside
@@ -301,6 +311,38 @@ export class VaultDO extends DurableObject {
   async seedWelcomeAgain(vaultName: string): Promise<WelcomeSeedResult> {
     await this.ensureState(vaultName);
     return seedWelcome(this.store, { consoleOrigin: this.env.ISSUER_ORIGIN });
+  }
+
+  /**
+   * POST /api/packs/<name> — apply a named core seed pack, idempotently.
+   * `surface-starter` is the motivating case (opt-in, not default-seeded);
+   * `welcome` / `getting-started` are also allowed (harmless — every item is
+   * individually guarded, so a re-apply converges to {applied: [], skipped:
+   * [...]}). Unknown pack → 404 listing the available names. Errors propagate
+   * to the router's 500 — unlike the create-time seed, an explicit pack apply
+   * SHOULD report failure to its caller.
+   */
+  private async handleApplyPack(request: Request, rawName: string): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    let packName: string;
+    try {
+      packName = decodeURIComponent(rawName);
+    } catch {
+      return json({ error: "Not found" }, 404);
+    }
+    // consoleOrigin only affects the `welcome` pack's Connect-your-AI note —
+    // same origin the create-time seed uses, so a re-apply is byte-identical.
+    const pack = getSeedPack(packName, { consoleOrigin: this.env.ISSUER_ORIGIN });
+    if (!pack) {
+      return json({ error: `Unknown pack '${packName}'`, available: [...SEED_PACK_NAMES] }, 404);
+    }
+    const result = await applySeedPack(this.store, pack);
+    return json({
+      pack: result.pack,
+      applied: result.seededNotes,
+      skipped: result.skippedNotes,
+      tags: result.tags,
+    });
   }
 
   private capBytes(): number {

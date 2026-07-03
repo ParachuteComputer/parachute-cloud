@@ -9,9 +9,11 @@
  * Console: signup/login/logout + vault creation, driven through the real router
  * (`app.fetch`) with cookies, the way a browser hits them.
  */
-import { env } from "cloudflare:test";
-import { describe, expect, test } from "vitest";
+import { env, fetchMock } from "cloudflare:test";
+import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import app from "../src/index.ts";
+import { handleAddPackPost } from "../src/console.ts";
+import { validateAccessToken } from "../src/tokens.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "../src/oauth-authorize.ts";
 import { handleToken } from "../src/oauth-token.ts";
 import { issueAuthCode } from "../src/auth-codes.ts";
@@ -32,6 +34,7 @@ import {
   CSRF,
   ISSUER,
   REDIRECT_URI,
+  VAULT_BASE,
   authorizeGetReq,
   consentReq,
   deps,
@@ -446,6 +449,197 @@ describe("password KDF posture (#28)", () => {
     const legacy = await legacySha256Verifier("BACKUP-CODE-1234");
     expect(await verifySecret("BACKUP-CODE-1234", legacy)).toBe(true);
     expect(await verifySecret("WRONG", legacy)).toBe(false);
+  });
+});
+
+// --- console: the Surface Starter pack button ------------------------------
+
+describe("console — Surface Starter pack button (POST /console/packs)", () => {
+  beforeAll(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+  afterEach(() => fetchMock.assertNoPendingInterceptors());
+
+  function sessionCookie(sessionId: string): string {
+    return `parachute_id_csrf=${CSRF}; parachute_id_session=${sessionId}`;
+  }
+
+  test("happy path: mints a narrow 60s token, POSTs the pack to the vault worker, redirects with the notice", async () => {
+    const { id: userId } = await seedUser("packs@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("mine", userId);
+
+    let auth: string | undefined;
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({
+        path: "/vault/mine/api/packs/surface-starter",
+        method: "POST",
+        headers: (h: Record<string, string>) => {
+          auth = h.authorization ?? h.Authorization;
+          return true;
+        },
+      })
+      .reply(
+        200,
+        { pack: "surface-starter", applied: ["Surface Starter"], skipped: [], tags: [] },
+        { headers: { "content-type": "application/json" } },
+      );
+
+    const res = await app.fetch(
+      post("/console/packs", { __csrf: CSRF, vault: "mine", pack: "surface-starter" }, sessionCookie(sessionId)),
+      env,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?pack_added=mine");
+
+    // THE MINT SEAM, pinned end-to-end: the token that went over the wire is a
+    // real issuer-signed JWT carrying exactly the narrow claims the vault
+    // worker enforces (aud strict-pin, resource-narrowed scope, vault_scope
+    // pin) and nothing more — 60s TTL, first-party client_id.
+    expect(auth).toBeTruthy();
+    const token = auth!.replace(/^Bearer /, "");
+    const { payload } = await validateAccessToken(env.DB, token, ISSUER);
+    expect(payload.aud).toBe("vault.mine");
+    expect(payload.scope).toBe("vault:mine:write");
+    expect(payload.vault_scope).toEqual(["mine"]);
+    expect(payload.sub).toBe(userId);
+    expect(payload.client_id).toBe("parachute-console");
+    expect((payload.exp as number) - (payload.iat as number)).toBe(60);
+  });
+
+  test("a bound VAULT_SERVICE dispatcher is preferred over global fetch (the staging transport)", async () => {
+    const { id: userId } = await seedUser("packs-binding@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("boundvault", userId);
+    // No fetchMock interceptor + disableNetConnect: if the handler fell back to
+    // global fetch it would throw → the "couldn't reach" error page, not a 302.
+    let seen: { url: string; auth: string | null } | null = null;
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        seen = { url: String(input), auth: new Headers(init?.headers).get("authorization") };
+        return Response.json({ pack: "surface-starter", applied: [], skipped: ["Surface Starter"], tags: [] });
+      },
+    };
+    const res = await handleAddPackPost(
+      env.DB,
+      post("/console/packs", { __csrf: CSRF, vault: "boundvault", pack: "surface-starter" }, sessionCookie(sessionId)),
+      boundDeps,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?pack_added=boundvault");
+    expect(seen).not.toBeNull();
+    expect(seen!.url).toBe(`https://boundvault.${VAULT_BASE}/api/packs/surface-starter`);
+    expect(seen!.auth).toMatch(/^Bearer /);
+  });
+
+  test("the success notice renders on /console?pack_added=<name> — for an OWNED vault only", async () => {
+    const { id: userId } = await seedUser("packs-notice@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("mine-notice", userId);
+    const res = await app.fetch(
+      new Request(`${ISSUER}/console?pack_added=mine-notice`, { headers: { cookie: sessionCookie(sessionId) } }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Surface Starter added to mine-notice — ask your connected AI to read it.");
+
+    // A crafted pack_added naming a vault the user doesn't own paints nothing.
+    const crafted = await app.fetch(
+      new Request(`${ISSUER}/console?pack_added=not-my-vault`, { headers: { cookie: sessionCookie(sessionId) } }),
+      env,
+    );
+    expect(crafted.status).toBe(200);
+    expect(await crafted.text()).not.toContain("Surface Starter added");
+  });
+
+  test("the vault card carries the button form", async () => {
+    const { id: userId } = await seedUser("packs-card@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("cardvault", userId);
+    const res = await app.fetch(
+      new Request(`${ISSUER}/console`, { headers: { cookie: sessionCookie(sessionId) } }),
+      env,
+    );
+    const html = await res.text();
+    expect(html).toContain("Building a surface?");
+    expect(html).toContain("Add the Surface Starter guide");
+    expect(html).toContain('action="/console/packs"');
+    expect(html).toContain('name="vault" value="cardvault"');
+    expect(html).toContain('name="pack" value="surface-starter"');
+  });
+
+  test("an unowned vault is refused BEFORE any mint or outbound call", async () => {
+    const { id: owner } = await seedUser("packs-owner@example.com");
+    const { id: other } = await seedUser("packs-other@example.com");
+    await seedVault("owned-by-a", owner);
+    const sessionId = await seedSession(other);
+    // No interceptor registered + disableNetConnect: an outbound call would
+    // surface as the "couldn't reach" error, not this ownership message.
+    const res = await app.fetch(
+      post("/console/packs", { __csrf: CSRF, vault: "owned-by-a", pack: "surface-starter" }, sessionCookie(sessionId)),
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("only add guides to a vault you own");
+  });
+
+  test("a pack the console doesn't offer is refused (the vault endpoint is the general seam)", async () => {
+    const { id: userId } = await seedUser("packs-unknown@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("mine2", userId);
+    const res = await app.fetch(
+      post("/console/packs", { __csrf: CSRF, vault: "mine2", pack: "welcome" }, sessionCookie(sessionId)),
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Unknown guide");
+  });
+
+  test("a vault-worker failure surfaces as a console error, not a success notice", async () => {
+    const { id: userId } = await seedUser("packs-fail@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("failing", userId);
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: "/vault/failing/api/packs/surface-starter", method: "POST" })
+      .reply(500, { error: "Internal server error" }, { headers: { "content-type": "application/json" } });
+
+    const res = await app.fetch(
+      post("/console/packs", { __csrf: CSRF, vault: "failing", pack: "surface-starter" }, sessionCookie(sessionId)),
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Couldn&#39;t add the guide");
+  });
+
+  test("no session → redirect to /login; missing CSRF → refused", async () => {
+    const anon = await app.fetch(
+      post("/console/packs", { __csrf: CSRF, vault: "mine", pack: "surface-starter" }, `parachute_id_csrf=${CSRF}`),
+      env,
+    );
+    expect(anon.status).toBe(302);
+    expect(anon.headers.get("location")).toBe("/login");
+
+    const { id: userId } = await seedUser("packs-csrf@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("mine3", userId);
+    const noCsrf = await app.fetch(
+      new Request(`${ISSUER}/console/packs`, {
+        method: "POST",
+        body: new URLSearchParams({ vault: "mine3", pack: "surface-starter" }),
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: ISSUER,
+          cookie: `parachute_id_session=${sessionId}`,
+        },
+      }),
+      env,
+    );
+    expect(noCsrf.status).toBe(200);
+    expect(await noCsrf.text()).toContain("session expired");
   });
 });
 

@@ -10,6 +10,9 @@
  *   POST /logout           clear session → /login
  *   GET  /console          my vaults + create form + connect cards
  *   POST /console/vaults   claim a vault name → /console?created=<name>
+ *   POST /console/packs    apply a seed pack to an owned vault (server-side
+ *                          call to the vault worker with an internally minted
+ *                          scoped token) → /console?pack_added=<name>
  *
  * A cloud login session (parachute_id_session) is the same cookie the OAuth
  * authorize flow uses, so signing in here also carries you through a subsequent
@@ -39,7 +42,9 @@ import {
   VaultNameTakenError,
   createVault,
   listVaultsForOwner,
+  userOwnsVault,
 } from "./vaults.ts";
+import { signAccessToken } from "./tokens.ts";
 import {
   type ConsoleVaultCard,
   renderConsole,
@@ -169,8 +174,18 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
   const vaults = await listVaultsForOwner(db, user.id);
-  const created = new URL(req.url).searchParams.get("created");
-  const notice = created ? `Your vault "${created}" is ready — open your notes, or connect your AI below.` : undefined;
+  const params = new URL(req.url).searchParams;
+  const created = params.get("created");
+  // Render the pack notice only for a vault this user actually owns — the
+  // param is user-editable (it's escaped either way; this just keeps a crafted
+  // ?pack_added=whatever from painting a false success banner).
+  const packAdded = params.get("pack_added");
+  const packVault = packAdded && vaults.some((v) => v.name === packAdded) ? packAdded : null;
+  const notice = created
+    ? `Your vault "${created}" is ready — open your notes, or connect your AI below.`
+    : packVault
+      ? `Surface Starter added to ${packVault} — ask your connected AI to read it.`
+      : undefined;
   const csrf = ensureCsrfToken(req);
   return htmlResponse(
     renderConsole({
@@ -208,6 +223,101 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
     }
     throw err;
   }
+}
+
+// --- seed packs (the "Building a surface?" button) --------------------------
+
+/**
+ * Packs the console offers. Only `surface-starter` today (ratified 2026-07-02:
+ * it's out of the default seed, added on demand). The vault worker's
+ * POST /api/packs/:name is the general seam; this allowlist is just what the
+ * console UI puts a button on.
+ */
+const CONSOLE_PACKS = new Set(["surface-starter"]);
+
+/**
+ * `client_id` claim on console-minted tokens. Not a DCR-registered client —
+ * this is the ISSUER itself acting first-party for a cookie-authenticated
+ * session (see the mint-seam note on {@link handleAddPackPost}); the claim
+ * exists so vault-side logs can attribute the write.
+ */
+const CONSOLE_MINT_CLIENT_ID = "parachute-console";
+
+/** TTL for the console's internally-minted vault token: one server-side hop. */
+const PACK_TOKEN_TTL_SECONDS = 60;
+
+/**
+ * POST /console/packs — apply a seed pack to one of the user's vaults, via the
+ * vault worker's POST /api/packs/:name.
+ *
+ * THE MINT SEAM: the console (this worker) has no vault-scoped token — the
+ * vault worker only trusts JWTs from the issuer. But the console IS the
+ * issuer: it owns the signing keys and the authenticated session. So this
+ * handler mints a first-party access token through the same `signAccessToken`
+ * the OAuth token endpoint uses, under the same ownership chokepoint the
+ * OAuth path enforces (`userOwnsVault` — the exact check behind
+ * `unownedNamedVaults`), then spends it on ONE server-side request:
+ *   - scope strictly `vault:<name>:write` (resource-narrowed; never broad),
+ *   - `aud` pinned to `vault.<name>` (the vault worker strict-checks it),
+ *   - `vault_scope` pinned to the one vault,
+ *   - 60s TTL, no refresh token, no registry row (stateless — it expires
+ *     before the revocation list would ever matter).
+ * The user-facing trust boundary is unchanged: session cookie + CSRF +
+ * same-origin + ownership — identical to creating the vault itself.
+ */
+export async function handleAddPackPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const user = await sessionUser(db, req, deps);
+  if (!user) return redirectResponse("/login");
+  const form = await req.formData();
+  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+    return consoleError(db, req, deps, user, "Your session expired. Please try again.");
+  }
+  const vaultName = String(form.get("vault") ?? "").trim().toLowerCase();
+  const pack = String(form.get("pack") ?? "");
+  if (!CONSOLE_PACKS.has(pack)) {
+    return consoleError(db, req, deps, user, "Unknown guide.");
+  }
+  // Ownership chokepoint — same predicate the OAuth mint paths enforce.
+  if (!vaultName || !(await userOwnsVault(db, user.id, vaultName))) {
+    return consoleError(db, req, deps, user, "You can only add guides to a vault you own.");
+  }
+
+  const signed = await signAccessToken(db, {
+    sub: user.id,
+    scopes: [`vault:${vaultName}:write`],
+    audience: `vault.${vaultName}`,
+    clientId: CONSOLE_MINT_CLIENT_ID,
+    issuer: deps.issuer,
+    vaultScope: [vaultName],
+    ttlSeconds: PACK_TOKEN_TTL_SECONDS,
+    now: deps.now,
+  });
+
+  // Transport: the service binding when bound (staging — workers.dev origins
+  // aren't valid subrequest targets), else global fetch (production's custom
+  // domain; tests' fetchMock). Same URL + Bearer JWT through the vault
+  // router's ordinary auth either way.
+  const fetchFn = deps.vaultFetch ?? fetch;
+  const url = `${vaultInstanceUrl(vaultName, deps)}/api/packs/${encodeURIComponent(pack)}`;
+  let res: Response;
+  try {
+    res = await fetchFn(url, {
+      method: "POST",
+      headers: { authorization: `Bearer ${signed.token}` },
+    });
+  } catch (err) {
+    console.warn(
+      `event=pack_apply_unreachable vault=${vaultName} pack=${pack} error=${err instanceof Error ? err.message : String(err)}`,
+    );
+    return consoleError(db, req, deps, user, "Couldn't reach your vault just now. Please try again.");
+  }
+  if (!res.ok) {
+    console.warn(`event=pack_apply_failed vault=${vaultName} pack=${pack} status=${res.status}`);
+    return consoleError(db, req, deps, user, "Couldn't add the guide just now. Please try again.");
+  }
+  // Idempotent on the vault side — "already there" is also a 200, so re-clicks
+  // land on the same success notice instead of an error.
+  return redirectResponse(`/console?pack_added=${encodeURIComponent(vaultName)}`);
 }
 
 async function consoleError(
