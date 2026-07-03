@@ -1,4 +1,5 @@
 import type { SendEmailBinding } from "./email.ts";
+import type { RateLimiterNamespace } from "./rate-limit.ts";
 
 /**
  * Worker bindings + config. `DB` is the control-plane D1; `ISSUER` and
@@ -6,6 +7,11 @@ import type { SendEmailBinding } from "./email.ts";
  */
 export interface Env {
   DB: D1Database;
+  /**
+   * The RateLimiterDO namespace (#30) — the login/signup/magic abuse fences.
+   * One DO per rate key; the client (rate-limit.ts) fails OPEN on DO errors.
+   */
+  RATE_LIMITER: RateLimiterNamespace;
   /** Issuer origin — the `iss` claim + discovery-doc base. No trailing slash. */
   ISSUER: string;
   /** Cloud vault addressing: `vault:<name>` → `https://<name>.<VAULT_BASE_DOMAIN>`. */

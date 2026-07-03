@@ -17,7 +17,7 @@ import { approveClient, getClient, requireRegisteredRedirectUri } from "./client
 import { isCoveredByGrant, recordGrant } from "./grants.ts";
 import { unownedNamedVaults } from "./vaults.ts";
 import { SESSION_COOKIE, buildSessionCookie, createSession, findActiveSession, parseSessionCookie } from "./sessions.ts";
-import { getUserByEmail, verifyPassword } from "./users.ts";
+import { getUserByEmail, needsRehash, setPassword, verifyPassword } from "./users.ts";
 import { isTotpEnrolled } from "./two-factor.ts";
 import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
 import { clearLoginFailures, clientIp, isLoginLocked, loginKey, recordLoginFailure } from "./rate-limit.ts";
@@ -210,6 +210,9 @@ async function authorizeCore(
       scopeDescriptions: describeScopes(requestedScopes),
       lockedVault,
       needsVaultPick: hasUnnamedVault && !lockedVault,
+      // From CONFIG (deps.issuer), never from the request — the "issued by
+      // <host>" trust line on the consent page (#42).
+      issuerHost: new URL(deps.issuer).host,
     }),
     200,
     extra,
@@ -246,15 +249,18 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   // Same brute-force fence as the console /login (this is the other public
   // login-submit path). Check lockout BEFORE the expensive password verify.
   const key = loginKey(clientIp(req), email);
-  if ((await isLoginLocked(db, key, now)).locked) {
+  if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
     return renderLoginPage(req, params, "Too many attempts. Please wait a few minutes and try again.");
   }
   const user = email ? await getUserByEmail(db, email) : null;
   if (!user || !(await verifyPassword(user, password))) {
-    await recordLoginFailure(db, key, now);
+    await recordLoginFailure(deps.rateLimiter, key, now);
     return renderLoginPage(req, params, "Incorrect email or password.");
   }
-  await clearLoginFailures(db, key);
+  await clearLoginFailures(deps.rateLimiter, key);
+  // Transparent KDF upgrade: a verified-correct password stored under the
+  // legacy sha256 verifier is re-hashed to the current format (users.ts, #28).
+  if (needsRehash(user)) await setPassword(db, user.id, password);
 
   // 2FA gate: a password login here must NOT bypass an enrolled second factor.
   // Stash a pending login whose `next` resumes THIS authorize request (with the

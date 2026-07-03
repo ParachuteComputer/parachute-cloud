@@ -679,6 +679,76 @@ describe("CORS — /oauth/* (cross-origin browser PKCE, e.g. the Notes PWA)", ()
     expect(res.status).toBe(200);
     expect(res.headers.get("access-control-allow-origin")).toBe("*");
   });
+
+  test("MALFORMED token body → 400 invalid_request WITH wildcard ACAO (never a bare 500)", async () => {
+    // A non-form body makes req.formData() throw; before the #35 fix that threw
+    // past the route wrapper into a CORS-less 500 the browser couldn't read.
+    const res = await app.fetch(
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: "{not-a-form}",
+        headers: { "content-type": "application/json", origin: NOTES_ORIGIN },
+      }),
+      env,
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as Record<string, unknown>).error).toBe("invalid_request");
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
+  test("MALFORMED revoke body → 400 invalid_request WITH wildcard ACAO", async () => {
+    const res = await app.fetch(
+      new Request(`${ISSUER}/oauth/revoke`, {
+        method: "POST",
+        body: "{not-a-form}",
+        headers: { "content-type": "application/json", origin: NOTES_ORIGIN },
+      }),
+      env,
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as Record<string, unknown>).error).toBe("invalid_request");
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
+  test("token + register responses expose WWW-Authenticate (hub parity)", async () => {
+    const tokenRes = await app.fetch(tokenReq({ grant_type: "authorization_code", code: "bogus" }), env);
+    expect(tokenRes.headers.get("access-control-expose-headers")).toBe("WWW-Authenticate");
+    const regRes = await app.fetch(
+      registerReq({ redirect_uris: [REDIRECT_URI] }, { origin: NOTES_ORIGIN }),
+      env,
+    );
+    expect(regRes.headers.get("access-control-expose-headers")).toBe("WWW-Authenticate");
+  });
+
+  test("NEGATIVE: /oauth/authorize responses carry NO CORS headers (browser-navigated HTML, not a CORS surface)", async () => {
+    const { clientId } = await seedApprovedClient();
+    const { challenge } = await makePkce();
+    const url = new URL(`${ISSUER}/oauth/authorize`);
+    url.searchParams.set("client_id", clientId);
+    url.searchParams.set("redirect_uri", REDIRECT_URI);
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("scope", "vault:default:read");
+    url.searchParams.set("code_challenge", challenge);
+    url.searchParams.set("code_challenge_method", "S256");
+    // Even WITH a cross-site Origin header, authorize reflects nothing.
+    const get = await app.fetch(new Request(url.toString(), { headers: { origin: NOTES_ORIGIN } }), env);
+    expect(get.status).toBe(200);
+    for (const h of ["access-control-allow-origin", "access-control-allow-credentials", "access-control-expose-headers"]) {
+      expect(get.headers.get(h)).toBeNull();
+    }
+    const post = await app.fetch(
+      new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: new URLSearchParams({ __action: "bogus" }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: NOTES_ORIGIN },
+      }),
+      env,
+    );
+    expect(post.status).toBe(400);
+    for (const h of ["access-control-allow-origin", "access-control-allow-credentials", "access-control-expose-headers"]) {
+      expect(post.headers.get(h)).toBeNull();
+    }
+  });
 });
 
 // --- authorize flow (browser) ---------------------------------------------
@@ -751,6 +821,33 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     );
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("Incorrect email or password");
+  });
+
+  test("consent page displays 'issued by <issuer host>' from CONFIG (#42)", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("default", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        },
+        sessionId,
+      ),
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("issued by");
+    expect(html).toContain(new URL(ISSUER).host);
   });
 
   test("consent approve → 302 with code; deny → 302 access_denied", async () => {

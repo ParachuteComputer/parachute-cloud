@@ -142,7 +142,18 @@ function mapAuthCodeError(err: unknown): Response {
 }
 
 export async function handleToken(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
-  const form = await req.formData();
+  // A malformed/non-form body must map to a 400 here, not throw into the
+  // framework's bare 500 — a thrown handler skips the route-level CORS wrapper,
+  // so the browser couldn't even read the error (#35).
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch {
+    return jsonResponse(
+      { error: "invalid_request", error_description: "request body must be application/x-www-form-urlencoded" },
+      400,
+    );
+  }
   const grantType = String(form.get("grant_type") ?? "");
   if (grantType === "authorization_code") return handleTokenAuthorizationCode(db, req, form, deps);
   if (grantType === "refresh_token") return handleTokenRefresh(db, req, form, deps);

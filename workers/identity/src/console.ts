@@ -33,7 +33,7 @@ import {
 import { sessionUser } from "./session-user.ts";
 import { finishPrimaryAuth } from "./auth-handlers.ts";
 import { EMAIL_RE, PASSWORD_MIN } from "./validation.ts";
-import { createUser, getUserByEmail, verifyPassword, type User } from "./users.ts";
+import { createUser, getUserByEmail, needsRehash, setPassword, verifyPassword, type User } from "./users.ts";
 import {
   VaultNameInvalidError,
   VaultNameTakenError,
@@ -76,8 +76,8 @@ export async function handleSignupPost(db: D1Database, req: Request, deps: OAuth
   if (!EMAIL_RE.test(email)) return signupError(req, "Enter a valid email address.", email);
   if (password.length < PASSWORD_MIN) return signupError(req, `Password must be at least ${PASSWORD_MIN} characters.`, email);
 
-  // Best-effort abuse fence (see rate-limit.ts for the documented limits).
-  const throttle = await checkAndBumpSignup(db, clientIp(req), deps.now?.() ?? new Date());
+  // DO-backed abuse fence, fail-open (see rate-limit.ts for the documented limits).
+  const throttle = await checkAndBumpSignup(deps.rateLimiter, clientIp(req), deps.now?.() ?? new Date());
   if (!throttle.allowed) {
     return signupError(req, "Too many signups from this network. Try again later.", email);
   }
@@ -114,15 +114,18 @@ export async function handleLoginPost(db: D1Database, req: Request, deps: OAuthD
   // Brute-force fence BEFORE the (expensive) password verify: a locked key is
   // refused without even running PBKDF2.
   const key = loginKey(clientIp(req), email);
-  if ((await isLoginLocked(db, key, now)).locked) {
+  if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
     return loginError(req, "Too many attempts. Please wait a few minutes and try again.", email);
   }
   const user = email ? await getUserByEmail(db, email) : null;
   if (!user || !(await verifyPassword(user, password))) {
-    await recordLoginFailure(db, key, now);
+    await recordLoginFailure(deps.rateLimiter, key, now);
     return loginError(req, "Incorrect email or password.", email);
   }
-  await clearLoginFailures(db, key);
+  await clearLoginFailures(deps.rateLimiter, key);
+  // Transparent KDF upgrade: a verified-correct password stored under the
+  // legacy sha256 verifier is re-hashed to the current format (users.ts, #28).
+  if (needsRehash(user)) await setPassword(db, user.id, password);
   // 2FA on → this diverts to the code prompt; otherwise it mints the session.
   return finishPrimaryAuth(db, deps, user.id, "/console");
 }

@@ -23,7 +23,13 @@ export function db(): D1Database {
 }
 
 export function deps(now?: () => Date): OAuthDeps {
-  return { issuer: ISSUER, vaultBaseDomain: VAULT_BASE, boundOrigins: () => [ISSUER], now };
+  return {
+    issuer: ISSUER,
+    vaultBaseDomain: VAULT_BASE,
+    boundOrigins: () => [ISSUER],
+    now,
+    rateLimiter: env.RATE_LIMITER,
+  };
 }
 
 export async function makePkce(): Promise<{ verifier: string; challenge: string }> {

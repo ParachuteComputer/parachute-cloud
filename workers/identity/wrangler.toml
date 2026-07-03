@@ -62,6 +62,21 @@ database_name = "parachute-identity"
 database_id = "893b353e-697a-407b-8fd9-5e1ce440135a"
 migrations_dir = "migrations"
 
+# The rate-limiter DO (#30): one instance per rate key (signup:<ip>,
+# login:<ip>|<email>, magic:<ip>|<email>) — atomic sliding-window counters the
+# best-effort D1 fences couldn't provide. POLICY (windows/limits) lives in
+# src/rate-limit.ts; the client there fails OPEN on DO errors.
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
+# SQLite-backed DO — required for ctx.storage.sql. ([[migrations]] is shared
+# across environments; the staging worker gets the same class on its own
+# namespace via [[env.staging.durable_objects.bindings]] below.)
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiterDO"]
+
 [vars]
 # These are the LIVE values, so the deployed config is SELF-CONTAINED: a bare
 # `wrangler deploy` sets the correct `iss` and can't silently revert it (the prior
@@ -130,6 +145,13 @@ binding = "DB"
 database_name = "parachute-identity-staging"
 database_id = "e1079d62-b571-4647-a333-ab4fd902d80d"
 migrations_dir = "migrations"
+
+# Bindings are non-inheritable: restate the rate-limiter DO. Same class; a
+# different worker (parachute-identity-staging) = its own DO namespace, so
+# staging counters never mix with production's.
+[[env.staging.durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
 
 # vars are non-inheritable: restate the full set, pointed at the staging
 # workers.dev origins. ISSUER is staging's own origin (tokens minted here carry

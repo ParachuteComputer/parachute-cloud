@@ -24,7 +24,8 @@ import {
   listVaultsForOwner,
   validateVaultName,
 } from "../src/vaults.ts";
-import { getUserByEmail } from "../src/users.ts";
+import { getUserByEmail, hashPassword, needsRehash, verifyPassword } from "../src/users.ts";
+import { hashSecret, randomUUID, verifySecret } from "../src/crypto.ts";
 import { resolveResourceVault } from "../src/audience.ts";
 import { LOGIN_MAX_FAILURES, SIGNUP_MAX_PER_WINDOW, checkAndBumpSignup } from "../src/rate-limit.ts";
 import {
@@ -332,17 +333,17 @@ describe("console — signup", () => {
 });
 
 describe("signup throttle", () => {
-  test("allows up to the window max, blocks the next, then rolls after the window", async () => {
+  test("allows up to the window max, blocks the next, then frees after the window", async () => {
     const ip = "10.0.0.7";
     for (let i = 0; i < SIGNUP_MAX_PER_WINDOW; i++) {
-      expect((await checkAndBumpSignup(env.DB, ip)).allowed).toBe(true);
+      expect((await checkAndBumpSignup(env.RATE_LIMITER, ip)).allowed).toBe(true);
     }
-    const blocked = await checkAndBumpSignup(env.DB, ip);
+    const blocked = await checkAndBumpSignup(env.RATE_LIMITER, ip);
     expect(blocked.allowed).toBe(false);
     expect(blocked.retryAfterSeconds).toBeGreaterThan(0);
-    // A request in the next window rolls the counter.
+    // Once the recorded events age out of the sliding window, requests flow.
     const later = new Date(Date.now() + 61 * 60 * 1000);
-    expect((await checkAndBumpSignup(env.DB, ip, later)).allowed).toBe(true);
+    expect((await checkAndBumpSignup(env.RATE_LIMITER, ip, later)).allowed).toBe(true);
   });
 });
 
@@ -387,6 +388,64 @@ describe("login brute-force fence", () => {
     }
     // Same email, different IP: still gets the normal "incorrect", not a lockout.
     expect(await (await loginAttempt("shared@example.com", "wrong", "198.51.100.2")).text()).toContain("Incorrect email or password");
+  });
+});
+
+describe("password KDF posture (#28)", () => {
+  /** Craft a LEGACY (pre-sha512) verifier the way users.ts used to write them. */
+  async function legacySha256Verifier(password: string): Promise<string> {
+    const enc = new TextEncoder();
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const km = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits(
+      { name: "PBKDF2", salt: salt as BufferSource, iterations: 100_000, hash: "SHA-256" },
+      km,
+      256,
+    );
+    const b64u = (b: Uint8Array) =>
+      btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    return `pbkdf2$sha256$100000$${b64u(salt)}$${b64u(new Uint8Array(bits))}`;
+  }
+
+  test("new verifiers are pbkdf2$sha512$ at the 100k workerd cap", async () => {
+    const hash = await hashPassword("correct horse battery");
+    expect(hash.startsWith("pbkdf2$sha512$100000$")).toBe(true);
+    expect(await verifyPassword({ passwordHash: hash } as never, "correct horse battery")).toBe(true);
+    expect(await verifyPassword({ passwordHash: hash } as never, "wrong")).toBe(false);
+    expect(needsRehash({ passwordHash: hash } as never)).toBe(false);
+  });
+
+  test("legacy sha256 verifier still verifies (versioned format) and is flagged for rehash", async () => {
+    const legacy = await legacySha256Verifier("old-password-9");
+    expect(await verifyPassword({ passwordHash: legacy } as never, "old-password-9")).toBe(true);
+    expect(await verifyPassword({ passwordHash: legacy } as never, "wrong")).toBe(false);
+    expect(needsRehash({ passwordHash: legacy } as never)).toBe(true);
+  });
+
+  test("a successful login transparently upgrades a legacy hash to sha512", async () => {
+    const email = "legacy@example.com";
+    const password = "still-works-123";
+    await env.DB.prepare(
+      "INSERT INTO users (id, email, password_hash, created_at, email_verified) VALUES (?, ?, ?, ?, 1)",
+    )
+      .bind(randomUUID(), email, await legacySha256Verifier(password), new Date().toISOString())
+      .run();
+    const res = await app.fetch(post("/login", { __csrf: CSRF, email, password }, `parachute_id_csrf=${CSRF}`), env);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console");
+    const user = await getUserByEmail(env.DB, email);
+    expect(user!.passwordHash.startsWith("pbkdf2$sha512$100000$")).toBe(true);
+    // The upgraded verifier still verifies the same password.
+    expect(await verifyPassword(user!, password)).toBe(true);
+  });
+
+  test("generic secret hashes (TOTP backup codes) share the posture: sha512 new, sha256 accepted", async () => {
+    const hash = await hashSecret("BACKUP-CODE-1234");
+    expect(hash.startsWith("pbkdf2$sha512$100000$")).toBe(true);
+    expect(await verifySecret("BACKUP-CODE-1234", hash)).toBe(true);
+    const legacy = await legacySha256Verifier("BACKUP-CODE-1234");
+    expect(await verifySecret("BACKUP-CODE-1234", legacy)).toBe(true);
+    expect(await verifySecret("WRONG", legacy)).toBe(false);
   });
 });
 
