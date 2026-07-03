@@ -9,6 +9,7 @@
 import { Hono } from "hono";
 import type { Env } from "./env.ts";
 import {
+  handleAddPackPost,
   handleConsoleGet,
   handleCreateVaultPost,
   handleLoginGet,
@@ -105,6 +106,10 @@ app.post("/login", (c) => handleLoginPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/logout", (c) => handleLogoutPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/console", (c) => handleConsoleGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/vaults", (c) => handleCreateVaultPost(c.env.DB, c.req.raw, depsFor(c.env)));
+// Seed-pack apply (the "Add the Surface Starter guide" button): session + CSRF
+// + ownership, then a server-side call to the vault worker with an internally
+// minted 60s vault:<name>:write token (the mint seam — see handleAddPackPost).
+app.post("/console/packs", (c) => handleAddPackPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/console/security", (c) => handleSecurityGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/security", (c) => handleSecurityPost(c.env.DB, c.req.raw, depsFor(c.env)));
 

@@ -8,8 +8,9 @@
  *   identity discovery → DCR → login → consent → token (real RS256 JWT)
  *   → vault REST create/read/update → MCP initialize/tools.list/tools.call
  *   → SSE snapshot → portable-md export tarball (unpacked + checked)
- *   → console signup/vault-claim/ownership refusal → login throttle
- *   → magic-link + TOTP.
+ *   → console signup/vault-claim/ownership refusal → seed packs (default
+ *     4-note seed, POST /api/packs, the console Surface-Starter button)
+ *   → login throttle → magic-link + TOTP.
  *
  * This smoke CREATES accounts + vaults — that's what staging is for; NEVER
  * point it at production (scripts/smoke-prod.ts is the read-only prod check).
@@ -328,6 +329,72 @@ async function main() {
 
     if (owner.token) {
       const OWN_AUTH = { authorization: `Bearer ${owner.token}` };
+
+      // The fresh vault materialized with the DEFAULT SEED PACKS (core's
+      // welcome + getting-started): exactly 4 notes + 3 capture tags, before
+      // this user writes anything.
+      const seededRes = await fetch(`${VAULT}/vault/${newVault}/api/notes`, { headers: OWN_AUTH });
+      const seeded = (await seededRes.json()) as Array<{ path?: string }>;
+      const seededPaths = seeded.map((n) => n.path).sort();
+      assert(
+        seededRes.status === 200 &&
+          seeded.length === 4 &&
+          ["Connect your AI", "Getting Started", "Try linking notes", "Welcome to your vault 🪂"].every((p) =>
+            seededPaths.includes(p),
+          ),
+        "fresh vault seeds the default packs (4 notes: welcome web + Getting Started)",
+        `${seeded.length} notes: ${seededPaths.join(", ")}`,
+      );
+      const tagRes = await fetch(`${VAULT}/vault/${newVault}/api/tags`, { headers: OWN_AUTH });
+      const tagRows = (await tagRes.json()) as Array<{ name: string }>;
+      assert(
+        tagRes.status === 200 && tagRows.length === 3 && ["capture", "capture/text", "capture/voice"].every((t) => tagRows.some((r) => r.name === t)),
+        "fresh vault seeds the 3 capture tags",
+        tagRows.map((r) => r.name).join(", "),
+      );
+
+      // Surface Starter is NOT default-seeded; POST /api/packs applies it.
+      const packRes = await fetch(`${VAULT}/vault/${newVault}/api/packs/surface-starter`, {
+        method: "POST",
+        headers: OWN_AUTH,
+      });
+      const packJson = (await packRes.json()) as { applied?: string[]; skipped?: string[] };
+      assert(
+        packRes.status === 200 && (packJson.applied ?? []).includes("Surface Starter"),
+        "POST /api/packs/surface-starter applies the pack",
+        `status ${packRes.status}, applied=${JSON.stringify(packJson.applied)}`,
+      );
+      const packAgain = await fetch(`${VAULT}/vault/${newVault}/api/packs/surface-starter`, {
+        method: "POST",
+        headers: OWN_AUTH,
+      });
+      const againJson = (await packAgain.json()) as { applied?: string[]; skipped?: string[] };
+      assert(
+        packAgain.status === 200 && (againJson.applied ?? []).length === 0 && (againJson.skipped ?? []).includes("Surface Starter"),
+        "re-POSTing the pack is idempotent (skipped, not duplicated)",
+        `applied=${JSON.stringify(againJson.applied)} skipped=${JSON.stringify(againJson.skipped)}`,
+      );
+      const unknownPack = await fetch(`${VAULT}/vault/${newVault}/api/packs/nonsense`, {
+        method: "POST",
+        headers: OWN_AUTH,
+      });
+      assert(unknownPack.status === 404, "unknown pack → 404", `status ${unknownPack.status}`);
+
+      // The console button path — the identity worker mints its own scoped
+      // token server-side and calls the vault worker (idempotent, so the pack
+      // already being present still lands on the success redirect).
+      const btnRes = await fetch(`${IDENTITY}/console/packs`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${newSession}; parachute_id_csrf=${conCsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: conCsrf!, vault: newVault, pack: "surface-starter" }),
+      });
+      assert(
+        btnRes.status === 302 && (btnRes.headers.get("location") ?? "").includes(`pack_added=${newVault}`),
+        "console button POST /console/packs → server-side mint + apply + notice redirect",
+        `status ${btnRes.status}, loc ${btnRes.headers.get("location")}`,
+      );
+
       const w = await fetch(`${VAULT}/vault/${newVault}/api/notes`, {
         method: "POST",
         headers: { ...OWN_AUTH, "content-type": "application/json" },
