@@ -3,8 +3,9 @@
  * seed packs (core/src/seed-packs.ts, the single source of truth for pack
  * content across BOTH runtimes since vault#526). A brand-new cloud vault seeds:
  *
- *  1. The `welcome` pack — the three `capture` tags Notes' schema audit
- *     requires + the three-note welcome web (welcome → try-linking → back,
+ *  1. The `welcome` pack — the `capture` tag Notes' schema audit requires
+ *     (ONE tag since vault#528; entry method lives in note metadata.source)
+ *     + the three-note welcome web (welcome → try-linking → back,
  *     connect-AI → welcome), person-voiced, with the console origin
  *     (ISSUER_ORIGIN) named in the Connect-your-AI note. This content used to
  *     live verbatim in this file; it was ported INTO core (test-pinned
@@ -52,7 +53,7 @@ export interface WelcomeSeedResult {
   seededNotes: string[];
   /** Note paths skipped because a note already lives there (idempotency). */
   skippedNotes: string[];
-  /** Tag names upserted (upserts are idempotent; always all three). */
+  /** Tag names upserted (upserts are idempotent; always core's full declared set). */
   tags: string[];
 }
 
