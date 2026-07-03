@@ -1,0 +1,135 @@
+# CI — typecheck + test the two Vault Cloud workers (under real workerd via
+# @cloudflare/vitest-pool-workers) and the dormant control plane (root bun test).
+#
+# Load-bearing setup notes (all three jobs):
+#   - workers/vault depends on @openparachute/core via
+#     `file:../../../parachute-vault/core` — a SIBLING checkout of the public
+#     parachute-vault repo, OUTSIDE this repo. Bun copies it into node_modules
+#     at install time, so each job clones parachute-vault@main next to this
+#     checkout BEFORE `bun install`. The root install covers the whole
+#     workspace (workers/*), which is why even the identity/control-plane jobs
+#     need the sibling present.
+#   - bun.lock is gitignored in this repo (installs resolve fresh from
+#     package.json ranges), so the download cache is keyed on the manifests.
+#   - Root `bun run typecheck` is deliberately NOT run here: it is
+#     known-broken from stripe caret drift — see cloud#23
+#     (https://github.com/ParachuteComputer/parachute-cloud/issues/23).
+#     The two worker typechecks ARE run (they are green and load-bearing).
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  identity-worker:
+    name: identity worker (typecheck + vitest/workerd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone parachute-vault (sibling file dep for @openparachute/core)
+        # actions/checkout can't place a repo outside $GITHUB_WORKSPACE, so a
+        # plain clone puts the sibling where the file: path resolves.
+        run: |
+          git clone --depth 1 https://github.com/ParachuteComputer/parachute-vault.git "$GITHUB_WORKSPACE/../parachute-vault"
+          echo "parachute-vault @ $(git -C "$GITHUB_WORKSPACE/../parachute-vault" rev-parse HEAD)"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13 # keep consistent with local dev
+
+      - name: Cache bun download cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('package.json', 'workers/*/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install (fresh — copies the core file dep into node_modules)
+        run: bun install
+
+      - name: Typecheck workers/identity
+        working-directory: workers/identity
+        run: bun run typecheck
+
+      - name: Test workers/identity (vitest under workerd)
+        working-directory: workers/identity
+        run: bun x vitest run
+
+  vault-worker:
+    name: vault worker (typecheck + vitest/workerd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone parachute-vault (sibling file dep for @openparachute/core)
+        run: |
+          git clone --depth 1 https://github.com/ParachuteComputer/parachute-vault.git "$GITHUB_WORKSPACE/../parachute-vault"
+          echo "parachute-vault @ $(git -C "$GITHUB_WORKSPACE/../parachute-vault" rev-parse HEAD)"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13 # keep consistent with local dev
+
+      - name: Cache bun download cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('package.json', 'workers/*/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install (fresh — copies the core file dep into node_modules)
+        run: bun install
+
+      - name: Typecheck workers/vault
+        working-directory: workers/vault
+        run: bun run typecheck
+
+      - name: Test workers/vault (vitest under workerd)
+        working-directory: workers/vault
+        run: bun x vitest run
+
+  control-plane:
+    name: control plane (root bun test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone parachute-vault (sibling file dep for @openparachute/core)
+        # Needed even here — the root workspace install resolves workers/vault's
+        # file dep regardless of which package's tests run.
+        run: |
+          git clone --depth 1 https://github.com/ParachuteComputer/parachute-vault.git "$GITHUB_WORKSPACE/../parachute-vault"
+          echo "parachute-vault @ $(git -C "$GITHUB_WORKSPACE/../parachute-vault" rev-parse HEAD)"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13 # keep consistent with local dev
+
+      - name: Cache bun download cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('package.json', 'workers/*/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install (fresh — copies the core file dep into node_modules)
+        run: bun install
+
+      # Root `bun run typecheck` is deliberately excluded — known-broken from
+      # stripe caret drift (cloud#23). Add it back once that issue closes.
+      - name: Test control plane (root bun test)
+        run: bun run test
