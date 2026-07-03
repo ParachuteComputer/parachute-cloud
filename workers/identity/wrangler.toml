@@ -49,10 +49,14 @@ head_sampling_rate = 1
 #   15 * * * *    → hourly onboarding-drip tick (src/drip.ts): day-0 welcome,
 #                   day-3 connect nudge (only without AI activity), day-14
 #                   feedback ask; drip_sends ledger + per-run cap + unsubscribe.
-# The patterns here MUST stay in sync with HEALTH_CRON/DIGEST_CRON/DRIP_CRON
-# in ops.ts.
+#   30 3 * * *    → daily per-vault storage-usage rollup (src/usage.ts): read
+#                   each vault DO's live db/R2 split through the internal
+#                   config seam, upsert one D1 `vault_usage` row per vault per
+#                   UTC day (skip+log+continue per vault; USAGE_RUN_CAP bound).
+# The patterns here MUST stay in sync with HEALTH_CRON/DIGEST_CRON/DRIP_CRON/
+# USAGE_CRON in ops.ts.
 [triggers]
-crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *"]
+crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *", "30 3 * * *"]
 
 # Control-plane state: users, clients, auth_codes, tokens, grants, sessions,
 # signing_keys. The revocation list is DERIVED from the tokens table (exactly
@@ -190,11 +194,12 @@ OPERATOR_ALERT_EMAIL = "ag@unforced.org"
 enabled = true
 head_sampling_rate = 1
 
-# Same cron schedule as production: the health check + digest + drip RUN on
-# staging (exercising the real cron path), with output to the log instead of
-# email (no send_email binding → devlog sender captures drip sends too).
+# Same cron schedule as production: the health check + digest + drip + usage
+# rollup RUN on staging (exercising the real cron path), with output to the
+# log instead of email (no send_email binding → devlog sender captures drip
+# sends too; the usage rollup sends no email anywhere).
 [env.staging.triggers]
-crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *"]
+crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *", "30 3 * * *"]
 
 # (no [[env.staging.send_email]] — see the staging banner above; the omission is
 # the point: dev-log sender + echo header = deterministic headless testing.)

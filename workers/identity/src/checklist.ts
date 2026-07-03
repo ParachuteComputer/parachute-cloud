@@ -52,6 +52,18 @@ export async function getChecklistState(db: D1Database, userId: string): Promise
 }
 
 /**
+ * Bring a dismissed checklist card back (the console's "Show setup guide"
+ * footer link): delete the reserved `hidden` row. Done rows are untouched —
+ * restored progress renders exactly where the user left it. Idempotent.
+ */
+export async function unhideChecklist(db: D1Database, userId: string): Promise<void> {
+  await db
+    .prepare("DELETE FROM user_checklist WHERE user_id = ? AND item = ?")
+    .bind(userId, CHECKLIST_HIDDEN)
+    .run();
+}
+
+/**
  * Mark an item done (or `hidden`). Idempotent — re-clicking a door keeps the
  * original `done_at`. Unknown items are the caller's job to refuse first.
  */

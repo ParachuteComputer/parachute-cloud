@@ -9,7 +9,15 @@
 import { NOTES_APP_OPTIONS } from "./checklist.ts";
 // Plan copy renders from plans.ts (the single source of truth for
 // entitlements + display strings) — the console can never drift from it.
-import { type PlanId, parachuteTeaser, planLine, vaultCapMessage } from "./plans.ts";
+import {
+  PLAN_SPECS,
+  type PlanId,
+  formatPlanBytes,
+  formatUsageBytes,
+  parachuteTeaser,
+  planLine,
+  vaultCapMessage,
+} from "./plans.ts";
 
 export interface AuthorizeParams {
   clientId: string;
@@ -438,10 +446,18 @@ export interface ConsoleVaultCard {
   name: string;
   /** Notes-PWA connect deep link (`/?add=<vault URL>`) — the card's primary action. */
   notesUrl: string;
+  /** Notes-PWA connect deep link that lands on the new-note editor (`/new`). */
+  writeUrl: string;
   /** Notes-PWA connect deep link that lands on /import after connecting. */
   importUrl: string;
   mcpUrl: string;
   connectCmd: string;
+  /**
+   * Latest recorded storage usage (the daily rollup's `vault_usage` row):
+   * set → "Using X of Y"; null → no row yet ("usage appears within a day");
+   * undefined → caller didn't look it up (non-render paths).
+   */
+  usage?: { usedBytes: number; day: string } | null;
 }
 
 /** State for the getting-started checklist card (null → don't render it). */
@@ -469,10 +485,18 @@ export interface ConsoleProps {
   notice?: string;
   /** Non-null → render the checklist card above the vault cards. */
   checklist?: ConsoleChecklistProps | null;
+  /** Checklist dismissed → render the quiet "Show setup guide" footer link. */
+  showChecklistRestore?: boolean;
   /** Zero-vault re-render values (the first-run hero preserves answers). */
   firstRun?: FirstRunValues;
   /** The user's plan — the header line + the at-cap create card render from plans.ts. */
   plan: PlanId;
+  /**
+   * Across-vaults total of the latest recorded usage rows (bytes). Null until
+   * the first rollup lands — the plan line then omits the usage segment
+   * rather than claiming a misleading zero.
+   */
+  totalUsedBytes?: number | null;
   /** At/over the plan's vault count → the create form yields to the at-cap note. */
   atVaultCap: boolean;
 }
@@ -501,12 +525,20 @@ function addToPhoneContent(v: ConsoleVaultCard): string {
     <p style="margin:.3rem 0;font-size:.92rem"><strong>Android:</strong> open it in Chrome → menu <strong>⋮</strong> → <strong>Add to Home screen</strong> (or <strong>Install app</strong>).</p>`;
 }
 
-function vaultCard(v: ConsoleVaultCard, csrfToken: string): string {
+function vaultCard(v: ConsoleVaultCard, csrfToken: string, planCapBytes: number): string {
+  // Storage line: the latest rollup row, human units against the plan cap
+  // (v1: each vault's cap IS the plan total — plans.ts). No row yet (fresh
+  // vault, or the nightly rollup hasn't reached it) → the honest "within a
+  // day" line, never a made-up zero.
+  const usageLine = v.usage
+    ? `Using ${formatUsageBytes(v.usage.usedBytes)} of ${formatPlanBytes(planCapBytes)}`
+    : "Usage appears within a day.";
   // Primary door: the Notes PWA connect deep-link. The Claude walkthrough +
   // MCP coordinates stay one disclosure below — demoted from the headline,
   // not removed.
   return `<div class="vault">
     <h3>${esc(v.name)}</h3>
+    <p class="muted" data-testid="vault-usage" style="margin:.1rem 0 0;font-size:.85rem">${esc(usageLine)}</p>
     <a class="primary" href="${esc(v.notesUrl)}" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none;padding:.62rem 1rem;margin-top:.6rem">Open your notes &rarr;</a>
     <details>
       <summary>Connect your AI</summary>
@@ -652,13 +684,29 @@ function consoleScript(csrfToken: string): string {
  * getting-started checklist (until dismissed) + vault cards + create form.
  */
 export function renderConsole(props: ConsoleProps): string {
-  const { email, vaults, csrfToken, error, notice, checklist, firstRun, plan, atVaultCap } = props;
+  const {
+    email,
+    vaults,
+    csrfToken,
+    error,
+    notice,
+    checklist,
+    showChecklistRestore,
+    firstRun,
+    plan,
+    totalUsedBytes,
+    atVaultCap,
+  } = props;
   // Plan display (no payment link yet — the entitlement layer ships first).
-  // Free users also see the Parachute teaser; Parachute users just their plan.
-  const planHtml =
-    plan === "free"
-      ? `${esc(planLine(plan))} <span style="opacity:.75">&middot; ${esc(parachuteTeaser())}</span>`
-      : esc(planLine(plan));
+  // The across-vaults usage total (latest rollup rows) rides the plan line;
+  // free users also see the Parachute teaser; Parachute users just their plan.
+  const usageHtml =
+    totalUsedBytes != null
+      ? ` <span data-testid="usage-total">&middot; Using ${esc(formatUsageBytes(totalUsedBytes))}</span>`
+      : "";
+  const teaserHtml =
+    plan === "free" ? ` <span style="opacity:.75">&middot; ${esc(parachuteTeaser())}</span>` : "";
+  const planHtml = `${esc(planLine(plan))}${usageHtml}${teaserHtml}`;
   const header = (title: string) => `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">
        <h1 style="margin:0">${esc(title)}</h1>
        <span style="display:flex;gap:1rem;align-items:baseline"><a href="/console/security">Security</a>
@@ -676,7 +724,7 @@ export function renderConsole(props: ConsoleProps): string {
     );
   }
 
-  const list = vaults.map((v) => vaultCard(v, csrfToken)).join("\n");
+  const list = vaults.map((v) => vaultCard(v, csrfToken, PLAN_SPECS[plan].total_bytes)).join("\n");
   // At the plan's vault cap the create form yields to the friendly note (the
   // POST handler enforces regardless — this keeps the door honest). An error
   // still renders inside whichever card is shown.
@@ -697,6 +745,14 @@ export function renderConsole(props: ConsoleProps): string {
          <button class="primary" type="submit">Create vault</button>
        </form>
      </div>`;
+  // The dismissed checklist's way back: a quiet footer link, never a banner —
+  // guidance stays reachable without ever re-imposing itself.
+  const restoreFoot = showChecklistRestore
+    ? `<div class="foot"><form class="inline" method="post" action="/console/checklist/restore">
+         <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+         <button class="linkbtn" type="submit" style="color:var(--muted)" data-testid="show-setup-guide">Show setup guide</button>
+       </form></div>`
+    : "";
   return page(
     "Console — Parachute",
     `${header("Your vaults")}
@@ -704,6 +760,7 @@ export function renderConsole(props: ConsoleProps): string {
      ${checklist ? checklistCard(checklist, csrfToken) : ""}
      ${list}
      ${createCard}
+     ${restoreFoot}
      ${consoleScript(csrfToken)}`,
   );
 }

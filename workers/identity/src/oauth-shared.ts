@@ -9,6 +9,7 @@
  * the Worker (index.ts) calls them with the request-time deps.
  */
 import { VAULT_VERBS } from "./audience.ts";
+import type { Env } from "./env.ts";
 import type { RateLimiterNamespace } from "./rate-limit.ts";
 
 export interface OAuthDeps {
@@ -62,6 +63,28 @@ export function vaultInstanceUrl(name: string, deps: OAuthDeps): string {
 
 export function resolveBoundOrigins(deps: OAuthDeps): readonly string[] {
   return deps.boundOrigins ? deps.boundOrigins() : [deps.issuer];
+}
+
+/**
+ * The request-time deps built from worker config — THE single construction
+ * (formerly index.ts's private `depsFor`; moved here so the scheduled handler
+ * (ops.ts, the usage rollup's vault calls) can build the same deps without
+ * importing the worker entrypoint). Deps come from env vars, never the request
+ * origin — the cloud issuer is a fixed configured origin.
+ */
+export function depsForEnv(env: Env): OAuthDeps {
+  const issuer = env.ISSUER.replace(/\/$/, "");
+  return {
+    issuer,
+    vaultBaseDomain: env.VAULT_BASE_DOMAIN,
+    vaultOrigin: env.VAULT_ORIGIN,
+    boundOrigins: () => [issuer],
+    exposeDevLinks: env.ENVIRONMENT !== "production",
+    rateLimiter: env.RATE_LIMITER,
+    // Service binding when bound (staging — workers.dev origins aren't valid
+    // subrequest targets); else the handlers fall back to global fetch.
+    ...(env.VAULT_SERVICE ? { vaultFetch: env.VAULT_SERVICE.fetch.bind(env.VAULT_SERVICE) } : {}),
+  };
 }
 
 /**

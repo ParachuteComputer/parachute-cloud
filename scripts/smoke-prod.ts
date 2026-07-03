@@ -122,13 +122,15 @@ async function main() {
     assert(echo === null, "PRODUCTION: x-parachute-dev-magic-link echo header is ABSENT", echo ? "HEADER PRESENT (misconfigured!)" : "absent");
   }
 
-  // 3b. The onboarding-drip staging trigger must NOT exist in production (the
-  //     hourly DRIP_CRON is the only production entry point; the route is
-  //     gated on ENVIRONMENT != "production"). An unknown-token unsubscribe is
-  //     refused — both checks state-free.
+  // 3b. The staging-only triggers must NOT exist in production (the crons are
+  //     the only production entry points; both routes are gated on
+  //     ENVIRONMENT != "production"). An unknown-token unsubscribe is
+  //     refused — all checks state-free.
   {
     const trig = await fetch(`${IDENTITY}/__test/drip-run`, { method: "POST" });
     assert(trig.status === 404, "PRODUCTION: /__test/drip-run does not exist (404)", `status ${trig.status}`);
+    const usage = await fetch(`${IDENTITY}/__test/usage-run`, { method: "POST" });
+    assert(usage.status === 404, "PRODUCTION: /__test/usage-run does not exist (404)", `status ${usage.status}`);
     const unsub = await fetch(`${IDENTITY}/unsubscribe?t=bogus-${Date.now()}`);
     assert(unsub.status === 404, "unsubscribe with an unknown token is refused (404)", `status ${unsub.status}`);
   }

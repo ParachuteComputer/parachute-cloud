@@ -63,7 +63,9 @@ import {
   isChecklistItem,
   markChecklistItem,
   setNotesApp,
+  unhideChecklist,
 } from "./checklist.ts";
+import { latestUsageForVaults } from "./usage.ts";
 import { isTotpEnrolled } from "./two-factor.ts";
 import {
   type ConsoleVaultCard,
@@ -186,7 +188,10 @@ function cardFor(name: string, deps: OAuthDeps): ConsoleVaultCard {
     name,
     notesUrl: `${NOTES_APP_URL}/?add=${encodeURIComponent(base)}`,
     // The PWA's connect flow honors a `redirect` companion: connect the vault
-    // (or skip if already connected), then land on /import.
+    // (or skip if already connected), then land on the given view. write-note
+    // lands on the new-note editor (/new — notes-ui 0.1.10 shipped the
+    // redirect fix); import-notes lands on /import.
+    writeUrl: `${NOTES_APP_URL}/?add=${encodeURIComponent(base)}&redirect=${encodeURIComponent("/new")}`,
     importUrl: `${NOTES_APP_URL}/?add=${encodeURIComponent(base)}&redirect=${encodeURIComponent("/import")}`,
     mcpUrl: `${base}/mcp`,
     connectCmd: `claude mcp add --transport http parachute-${name} ${base}/mcp`,
@@ -207,11 +212,25 @@ async function renderConsoleFor(
 ): Promise<Response> {
   const vaults = await listVaultsForOwner(db, user.id);
   const cards = vaults.map((v) => cardFor(v.name, deps));
+  // Latest recorded usage per vault (the daily rollup's `vault_usage` rows,
+  // usage.ts). A vault without a row yet — created since the last rollup, or
+  // its read failed — renders the "appears within a day" line instead; the
+  // plan line totals only what's recorded.
+  const usage = await latestUsageForVaults(db, vaults.map((v) => v.name));
+  for (const card of cards) {
+    const row = usage.get(card.name);
+    card.usage = row ? { usedBytes: row.dbBytes + row.r2Bytes, day: row.day } : null;
+  }
+  const recorded = [...usage.values()];
+  const totalUsedBytes =
+    recorded.length > 0 ? recorded.reduce((sum, r) => sum + r.dbBytes + r.r2Bytes, 0) : null;
   // The checklist card renders once a vault exists, until dismissed. Its doors
   // open the FIRST (oldest) vault — the one the first-run flow created.
   let checklist = null;
+  let checklistHidden = false;
   if (cards.length > 0) {
     const state = await getChecklistState(db, user.id);
+    checklistHidden = state.hidden;
     if (!state.hidden) {
       checklist = {
         done: state.done,
@@ -231,8 +250,11 @@ async function renderConsoleFor(
       error: opts.error,
       notice: opts.notice,
       checklist,
+      // Dismissed → the quiet "Show setup guide" footer link brings it back.
+      showChecklistRestore: checklistHidden,
       firstRun: opts.firstRun,
       plan: user.plan,
+      totalUsedBytes,
       // At (or over — grandfathered) the plan's vault count: the create form
       // gives way to the friendly at-cap note. The POST handler is the real
       // gate; this just keeps the UI honest.
@@ -358,7 +380,10 @@ async function writeFirstNote(
  * the checklist card renders for).
  */
 function checklistDestination(item: string, card: ConsoleVaultCard): string {
-  if (item === "open-notes" || item === "write-note") return card.notesUrl;
+  if (item === "open-notes") return card.notesUrl;
+  // Write-a-note lands on the new-note editor, not the notes home — the door
+  // should open onto a blank page with the pen already in hand.
+  if (item === "write-note") return card.writeUrl;
   if (item === "import-notes") return card.importUrl;
   return "/console";
 }
@@ -385,6 +410,23 @@ export async function handleChecklistPost(db: D1Database, req: Request, deps: OA
   if (vaults.length === 0) return redirectResponse("/console");
   await markChecklistItem(db, user.id, item, deps.now?.() ?? new Date());
   return redirectResponse(checklistDestination(item, cardFor(vaults[0]!.name, deps)));
+}
+
+/**
+ * POST /console/checklist/restore — bring back a dismissed checklist card
+ * (the quiet "Show setup guide" footer link). Deletes the reserved `hidden`
+ * row; done rows survive, so progress renders exactly where it was left.
+ * Same trust boundary as every console write: session + CSRF + same-origin.
+ */
+export async function handleChecklistRestorePost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const user = await sessionUser(db, req, deps);
+  if (!user) return redirectResponse("/login");
+  const form = await req.formData();
+  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+    return consoleError(db, req, deps, user, "Your session expired. Please try again.");
+  }
+  await unhideChecklist(db, user.id);
+  return redirectResponse("/console");
 }
 
 // --- seed packs (the "Building a surface?" button) --------------------------

@@ -11,6 +11,7 @@ import type { Env } from "./env.ts";
 import {
   handleAddPackPost,
   handleChecklistPost,
+  handleChecklistRestorePost,
   handleConsoleGet,
   handleCreateVaultPost,
   handleLoginGet,
@@ -38,29 +39,19 @@ import {
 } from "./oauth-metadata.ts";
 import { handleRegister } from "./oauth-register.ts";
 import { handleRevoke } from "./oauth-revoke.ts";
-import { type OAuthDeps, oauthPreflight, withReflectedCors, withWildcardCors } from "./oauth-shared.ts";
+import { type OAuthDeps, depsForEnv, oauthPreflight, withReflectedCors, withWildcardCors } from "./oauth-shared.ts";
 import { handleToken } from "./oauth-token.ts";
 import { handleScheduled } from "./ops.ts";
 import { handleUnsubscribe, runDrip } from "./drip.ts";
+import { runUsageRollup } from "./usage.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
 // (wrangler.toml [[durable_objects.bindings]] class_name = "RateLimiterDO").
 export { RateLimiterDO } from "./rate-limiter-do.ts";
 
-function depsFor(env: Env): OAuthDeps {
-  const issuer = env.ISSUER.replace(/\/$/, "");
-  return {
-    issuer,
-    vaultBaseDomain: env.VAULT_BASE_DOMAIN,
-    vaultOrigin: env.VAULT_ORIGIN,
-    boundOrigins: () => [issuer],
-    exposeDevLinks: env.ENVIRONMENT !== "production",
-    rateLimiter: env.RATE_LIMITER,
-    // Service binding when bound (staging — workers.dev origins aren't valid
-    // subrequest targets); else the handlers fall back to global fetch.
-    ...(env.VAULT_SERVICE ? { vaultFetch: env.VAULT_SERVICE.fetch.bind(env.VAULT_SERVICE) } : {}),
-  };
-}
+// Construction lives in oauth-shared.ts (depsForEnv) so the scheduled handler
+// can build the same deps; this alias keeps the route wiring below readable.
+const depsFor = (env: Env): OAuthDeps => depsForEnv(env);
 
 /**
  * The email sender: the Cloudflare binding when bound + configured, else dev-log.
@@ -118,6 +109,9 @@ app.post("/console/packs", (c) => handleAddPackPost(c.env.DB, c.req.raw, depsFor
 // Getting-started checklist doors: mark an item done (or dismiss the card),
 // then 302 to the item's destination. Session + CSRF + same-origin.
 app.post("/console/checklist", (c) => handleChecklistPost(c.env.DB, c.req.raw, depsFor(c.env)));
+// Un-dismiss the checklist (the "Show setup guide" footer link): delete the
+// hidden row, done rows survive. Session + CSRF + same-origin.
+app.post("/console/checklist/restore", (c) => handleChecklistRestorePost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/console/security", (c) => handleSecurityGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/security", (c) => handleSecurityPost(c.env.DB, c.req.raw, depsFor(c.env)));
 
@@ -146,13 +140,23 @@ app.post("/__test/drip-run", async (c) => {
   return c.json(await runDrip(c.env, senderFor(c.env)));
 });
 
+// Staging/dev-only usage-rollup trigger — same gate + rationale as
+// /__test/drip-run above (live cron firings can't be forced; 404 in
+// production; a stray staging caller can only refresh today's usage rows).
+app.post("/__test/usage-run", async (c) => {
+  const deps = depsFor(c.env);
+  if (!deps.exposeDevLinks) return c.notFound();
+  return c.json(await runUsageRollup(c.env, deps));
+});
+
 // Root → the console (which redirects to /login when signed out).
 app.get("/", (c) => c.redirect("/console", 302));
 
 /**
  * Default export: the Hono fetch handler + the ops cron ([triggers] in
  * wrangler.toml). `controller.cron` is the matched pattern — ops.routeCron maps
- * it to the health check (every 10 min) or the weekly digest (Mon 14:00 UTC).
+ * it to the health check (every 10 min), the weekly digest (Mon 14:00 UTC),
+ * the hourly drip tick, or the daily usage rollup (03:30 UTC).
  * Same sender selection as the magic-link flow: real binding in production,
  * dev-log on staging (deterministic, lands in Workers Logs).
  */

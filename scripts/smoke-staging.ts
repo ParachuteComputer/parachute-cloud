@@ -367,8 +367,11 @@ async function main() {
       );
 
       // The fresh vault materialized with the DEFAULT SEED PACKS (core's
-      // welcome + getting-started): exactly 4 notes + 3 capture tags, before
-      // this user writes anything.
+      // welcome + getting-started): exactly 4 notes + the 3 capture tags
+      // (core@main's declared set), before this user writes anything.
+      // NOTE: parachute-vault's in-flight capture-schema change (ONE #capture
+      // tag, its ag-unforced-dev) will flip this to 1 when it merges — that
+      // PR's propagation includes this pin.
       const seededRes = await fetch(`${VAULT}/vault/${newVault}/api/notes`, { headers: OWN_AUTH });
       const seeded = (await seededRes.json()) as Array<{ path?: string }>;
       const seededPaths = seeded.map((n) => n.path).sort();
@@ -554,7 +557,10 @@ async function main() {
 
   // 12. Guided arrival — the first-run hero, research answers, the first note
   //     written into the new vault, and the getting-started checklist
-  //     (mark-done doors + dismissal). The full headless session walk.
+  //     (mark-done doors + dismissal + restore). The full headless session
+  //     walk. The session + vault carry into section 14 (usage rollup).
+  let arrivalCookie = "";
+  let arrivalVault = "";
   {
     const email = `arrival+${Date.now()}@example.com`;
     const password = b64url(crypto.getRandomValues(new Uint8Array(18)));
@@ -573,6 +579,8 @@ async function main() {
     const session = cookieVal(suRes.headers.getSetCookie(), "parachute_id_session");
     const cookie = `parachute_id_session=${session}; parachute_id_csrf=${csrf}`;
     assert(suRes.status === 302 && !!session, "arrival: signup → session", `status ${suRes.status}`);
+    arrivalCookie = cookie;
+    arrivalVault = vaultName;
 
     // Zero vaults → the first-run hero with both research questions.
     const heroHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie } })).text();
@@ -644,7 +652,23 @@ async function main() {
     const doneHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie } })).text();
     assert(doneHtml.includes('data-item="open-notes" data-done="1"'), "arrival: the walked door renders done");
 
-    // Dismiss the card ("hide this") — persisted; vault cards remain.
+    // write-note carries its own redirect: connect, then land on the /new
+    // (new-note editor) view — notes-ui 0.1.10's redirect fix.
+    const writeRes = await fetch(`${IDENTITY}/console/checklist`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie },
+      redirect: "manual",
+      body: form({ __csrf: csrf!, item: "write-note" }),
+    });
+    const writeLoc = writeRes.headers.get("location") ?? "";
+    assert(
+      writeRes.status === 302 && writeLoc.includes("?add=") && writeLoc.includes("redirect=%2Fnew"),
+      "arrival: the write-note door 302s to the /new deep-link (redirect=%2Fnew)",
+      writeLoc,
+    );
+
+    // Dismiss the card ("hide this") — persisted; vault cards remain; the
+    // quiet "Show setup guide" footer link appears.
     await fetch(`${IDENTITY}/console/checklist`, {
       method: "POST",
       headers: { ...FORM, origin: IDENTITY, cookie },
@@ -655,6 +679,27 @@ async function main() {
     assert(
       !hiddenHtml.includes('data-testid="checklist"') && hiddenHtml.includes(vaultName),
       "arrival: 'hide this' dismisses the checklist, vault card stays",
+    );
+    assert(
+      hiddenHtml.includes('data-testid="show-setup-guide"') && hiddenHtml.includes("Show setup guide"),
+      "arrival: the dismissed console offers the quiet 'Show setup guide' footer link",
+    );
+
+    // Restore: the CSRF POST deletes the hidden row; progress survives.
+    const restoreRes = await fetch(`${IDENTITY}/console/checklist/restore`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie },
+      redirect: "manual",
+      body: form({ __csrf: csrf! }),
+    });
+    const backHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie } })).text();
+    assert(
+      restoreRes.status === 302 &&
+        backHtml.includes('data-testid="checklist"') &&
+        backHtml.includes('data-item="open-notes" data-done="1"') &&
+        !backHtml.includes('data-testid="show-setup-guide"'),
+      "arrival: 'Show setup guide' restores the checklist with progress intact",
+      `status ${restoreRes.status}`,
     );
   }
 
@@ -695,6 +740,46 @@ async function main() {
     }
     const bogus = await fetch(`${IDENTITY}/unsubscribe?t=bogus-${Date.now()}`);
     assert(bogus.status === 404, "drip: unsubscribe with an unknown token is refused (404)", `status ${bogus.status}`);
+  }
+
+  // 14. Usage rollup — the staging-only trigger (POST /__test/usage-run, 404
+  //     in production) drives the daily 03:30 UTC rollup NOW. Section 12
+  //     created a fresh vault this run, so a row for it MUST be recorded and
+  //     the console MUST surface it: the card's "Using X of Y" line + the
+  //     plan line's across-vaults total. Re-triggering proves the same-day
+  //     upsert (rows refresh, never duplicate — the summary stays recorded>0).
+  {
+    const run = async (): Promise<{ day: string; vaults: number; recorded: number; failed: number; capped: boolean } | null> => {
+      const r = await fetch(`${IDENTITY}/__test/usage-run`, { method: "POST" });
+      return r.status === 200
+        ? ((await r.json()) as { day: string; vaults: number; recorded: number; failed: number; capped: boolean })
+        : null;
+    };
+    const first = await run();
+    assert(!!first, "usage: staging trigger answers 200 with a run summary");
+    if (first) {
+      assert(
+        first.recorded >= 1 && !first.capped,
+        "usage: the rollup recorded rows (this run's fresh vault included)",
+        `day=${first.day} vaults=${first.vaults} recorded=${first.recorded} failed=${first.failed}`,
+      );
+      const again = await run();
+      assert(
+        !!again && again.recorded >= 1 && again.day === first.day,
+        "usage: a same-day re-run refreshes rows (upsert, no duplicates)",
+        again ? `recorded=${again.recorded}` : "non-200",
+      );
+    }
+    const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
+    assert(
+      conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 100 MB/.test(conHtml),
+      "usage: the vault card shows 'Using X of Y' from the rollup row",
+      arrivalVault,
+    );
+    assert(
+      conHtml.includes('data-testid="usage-total"'),
+      "usage: the plan line carries the across-vaults total",
+    );
   }
 
   // --- summary ---
