@@ -30,6 +30,19 @@ export const SCOPE_READ = "vault:read";
 export const SCOPE_WRITE = "vault:write";
 export const SCOPE_ADMIN = "vault:admin";
 
+/**
+ * The `client_id` claim the Identity Worker mints on ITS OWN first-party
+ * tokens (workers/identity/src/vault-call.ts FIRST_PARTY_CLIENT_ID — keep the
+ * two constants identical). Load-bearing for the internal config seam
+ * (vault-do.ts handleInternalConfig): a vault OWNER can legitimately mint
+ * `vault:<name>:admin` through the public OAuth flow, so scope alone can't
+ * distinguish platform from tenant — but DCR client ids are server-generated
+ * UUIDs, so no OAuth client can ever carry this id. Only the issuer's
+ * internal mint (and the VAULT_AUTH_TOKEN operator bearer) may touch
+ * platform-owned config like the plan storage cap.
+ */
+export const FIRST_PARTY_CLIENT_ID = "parachute-console";
+
 export type VaultVerb = "read" | "write" | "admin";
 const VERB_RANK: Record<VaultVerb, number> = { read: 0, write: 1, admin: 2 };
 
@@ -40,6 +53,12 @@ export interface AuthResult {
   scoped_tags: string[] | null;
   actor: string | null;
   via: string | null;
+  /**
+   * The validated JWT's `client_id` claim (null for the operator bearer or a
+   * token without one). The internal config seam gates on
+   * {@link FIRST_PARTY_CLIENT_ID}; everything else ignores it.
+   */
+  clientId: string | null;
 }
 
 function isVerb(s: string): s is VaultVerb {
@@ -152,6 +171,7 @@ export async function authenticateVaultRequest(
       scoped_tags: null,
       actor: "operator",
       via: "operator",
+      clientId: null,
     };
   }
 
@@ -202,6 +222,7 @@ export async function authenticateVaultRequest(
     scoped_tags: null,
     actor: claims.sub && claims.sub.length > 0 ? claims.sub : null,
     via: "api",
+    clientId: claims.clientId ?? null,
   };
 }
 

@@ -95,6 +95,15 @@ export async function listVaultsForOwner(db: D1Database, ownerUserId: string): P
   return (res.results ?? []).map(rowToVault);
 }
 
+/** How many vaults `ownerUserId` owns — the plan vault-count gate reads this. */
+export async function countVaultsForOwner(db: D1Database, ownerUserId: string): Promise<number> {
+  const row = await db
+    .prepare("SELECT COUNT(*) AS n FROM vaults WHERE owner_user_id = ?")
+    .bind(ownerUserId)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
 export async function userOwnsVault(db: D1Database, userId: string, name: string): Promise<boolean> {
   const v = await getVault(db, name);
   return v !== null && v.ownerUserId === userId;

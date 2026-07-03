@@ -11,6 +11,7 @@
  * login password is stored differs, and that never crosses the wire to a client.
  */
 import { bytesToBase64url, randomUUID, timingSafeEqualString } from "./crypto.ts";
+import { type PlanId, coercePlanId } from "./plans.ts";
 
 const encoder = new TextEncoder();
 // KDF POSTURE (#28, settled 2026-07-02 — the honest version):
@@ -46,6 +47,8 @@ export interface User {
   createdAt: string;
   /** True once a magic link to this address has been consumed (or seeded). */
   emailVerified: boolean;
+  /** Billing plan (entitlements in plans.ts). Migration 0009; default 'free'. */
+  plan: PlanId;
 }
 
 interface Row {
@@ -54,6 +57,7 @@ interface Row {
   password_hash: string;
   created_at: string;
   email_verified: number;
+  plan: string;
 }
 
 function rowToUser(r: Row): User {
@@ -63,6 +67,9 @@ function rowToUser(r: Row): User {
     passwordHash: r.password_hash,
     createdAt: r.created_at,
     emailVerified: r.email_verified === 1,
+    // Defensive coercion: an unknown stored value degrades to 'free' rather
+    // than granting entitlements this build doesn't know about.
+    plan: coercePlanId(r.plan),
   };
 }
 
@@ -150,11 +157,13 @@ export async function createUser(
   const passwordHash = password.length > 0 ? await hashPassword(password) : "";
   const emailVerified = opts.emailVerified ?? false;
   const createdAt = now.toISOString();
+  // `plan` is deliberately NOT in the INSERT: every signup lands on the
+  // migration-0009 DEFAULT ('free'), which the plans test suite pins.
   await db
     .prepare("INSERT INTO users (id, email, password_hash, created_at, email_verified) VALUES (?, ?, ?, ?, ?)")
     .bind(id, email, passwordHash, createdAt, emailVerified ? 1 : 0)
     .run();
-  return { id, email, passwordHash, createdAt, emailVerified };
+  return { id, email, passwordHash, createdAt, emailVerified, plan: "free" };
 }
 
 /** Mark an account's email verified (idempotent). */
@@ -166,6 +175,15 @@ export async function markEmailVerified(db: D1Database, userId: string): Promise
 export async function setPassword(db: D1Database, userId: string, password: string): Promise<void> {
   const passwordHash = await hashPassword(password);
   await db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(passwordHash, userId).run();
+}
+
+/**
+ * Set a user's plan. The plan-change seam (admin / Stripe webhook, later PRs)
+ * calls this then `applyPlanToVaults` (vault-call.ts) so storage caps follow
+ * the entitlement. Type-narrowed to PlanId — callers validate raw input.
+ */
+export async function setUserPlan(db: D1Database, userId: string, plan: PlanId): Promise<void> {
+  await db.prepare("UPDATE users SET plan = ? WHERE id = ?").bind(plan, userId).run();
 }
 
 export async function getUserByEmail(db: D1Database, email: string): Promise<User | null> {

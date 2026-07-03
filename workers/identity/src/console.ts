@@ -51,11 +51,13 @@ import { createUser, getUserByEmail, needsRehash, setPassword, verifyPassword, t
 import {
   VaultNameInvalidError,
   VaultNameTakenError,
+  countVaultsForOwner,
   createVault,
   listVaultsForOwner,
   userOwnsVault,
 } from "./vaults.ts";
-import { signAccessToken } from "./tokens.ts";
+import { PLAN_SPECS, vaultCapMessage } from "./plans.ts";
+import { callVaultApi, pushVaultCap } from "./vault-call.ts";
 import {
   getChecklistState,
   isChecklistItem,
@@ -230,6 +232,11 @@ async function renderConsoleFor(
       notice: opts.notice,
       checklist,
       firstRun: opts.firstRun,
+      plan: user.plan,
+      // At (or over — grandfathered) the plan's vault count: the create form
+      // gives way to the friendly at-cap note. The POST handler is the real
+      // gate; this just keeps the UI honest.
+      atVaultCap: cards.length >= PLAN_SPECS[user.plan].vault_count,
     }),
     200,
     csrfExtra(csrf.setCookie),
@@ -268,8 +275,22 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
     return consoleError(db, req, deps, user, "Your session expired. Please try again.", firstRun);
   }
+  // Plan vault-count gate (plans.ts). `>=` grandfathers users already OVER a
+  // cap (e.g. accounts predating plans): they keep and use every vault they
+  // own — reads, tokens, everything — but can't create more until under the
+  // cap. Benign TOCTOU: two concurrent creates can both pass the count — a
+  // one-vault overshoot, reconciled by the same rule on the next attempt.
+  const spec = PLAN_SPECS[user.plan];
+  if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
+    return consoleError(db, req, deps, user, vaultCapMessage(user.plan), firstRun);
+  }
   try {
     const vault = await createVault(db, rawName, user.id, deps.now?.() ?? new Date());
+    // Push the plan's storage cap into the new vault's DO config (the
+    // internal seam — vault-call.ts). Best-effort by the same contract as the
+    // first note: a hiccup leaves the DO on the (more generous) env default,
+    // never fails creation; applyPlanToVaults / the backfill reconcile.
+    await pushVaultCap(db, deps, user.id, vault.name, spec.total_bytes);
     // (a) research answer → user row. Allowlisted inside; unknown values no-op.
     if (notesApp) await setNotesApp(db, user.id, notesApp);
     // (b) their first note → INTO the new vault, verbatim. Best-effort by
@@ -377,32 +398,9 @@ export async function handleChecklistPost(db: D1Database, req: Request, deps: OA
 const CONSOLE_PACKS = new Set(["surface-starter"]);
 
 /**
- * `client_id` claim on console-minted tokens. Not a DCR-registered client —
- * this is the ISSUER itself acting first-party for a cookie-authenticated
- * session (see the mint-seam note on {@link handleAddPackPost}); the claim
- * exists so vault-side logs can attribute the write.
- */
-const CONSOLE_MINT_CLIENT_ID = "parachute-console";
-
-/** TTL for the console's internally-minted vault token: one server-side hop. */
-const CONSOLE_MINT_TTL_SECONDS = 60;
-
-/**
- * THE MINT SEAM, shared by every server-side console→vault write (the packs
- * button, the first-run first note): mint a first-party access token through
- * the same `signAccessToken` the OAuth token endpoint uses —
- *   - scope strictly `vault:<name>:write` (resource-narrowed; never broad),
- *   - `aud` pinned to `vault.<name>` (the vault worker strict-checks it),
- *   - `vault_scope` pinned to the one vault,
- *   - 60s TTL, no refresh token, no registry row (stateless — it expires
- *     before the revocation list would ever matter) —
- * then spend it on ONE POST to the vault worker. Transport: the service
- * binding when bound (staging — workers.dev origins aren't valid subrequest
- * targets), else global fetch (production's custom domain; tests' fetchMock).
- *
- * CALLERS enforce the user-facing trust boundary FIRST (session + CSRF +
- * same-origin + `userOwnsVault`-or-just-created) — this helper only mints and
- * sends. Network errors propagate; non-2xx returns as-is.
+ * THE MINT SEAM lives in vault-call.ts (shared with the plan-cap push): mint a
+ * first-party 60s aud-pinned `vault:<name>:write` token, spend it on one POST.
+ * This wrapper keeps the console's write-verb call sites one line.
  */
 async function postVaultApi(
   db: D1Database,
@@ -412,24 +410,7 @@ async function postVaultApi(
   apiPath: string,
   jsonBody?: unknown,
 ): Promise<Response> {
-  const signed = await signAccessToken(db, {
-    sub: userId,
-    scopes: [`vault:${vaultName}:write`],
-    audience: `vault.${vaultName}`,
-    clientId: CONSOLE_MINT_CLIENT_ID,
-    issuer: deps.issuer,
-    vaultScope: [vaultName],
-    ttlSeconds: CONSOLE_MINT_TTL_SECONDS,
-    now: deps.now,
-  });
-  const fetchFn = deps.vaultFetch ?? fetch;
-  const headers: Record<string, string> = { authorization: `Bearer ${signed.token}` };
-  if (jsonBody !== undefined) headers["content-type"] = "application/json";
-  return fetchFn(`${vaultInstanceUrl(vaultName, deps)}${apiPath}`, {
-    method: "POST",
-    headers,
-    ...(jsonBody !== undefined ? { body: JSON.stringify(jsonBody) } : {}),
-  });
+  return callVaultApi(db, deps, { userId, vaultName, method: "POST", apiPath, verb: "write", jsonBody });
 }
 
 /**

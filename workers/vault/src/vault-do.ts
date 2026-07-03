@@ -17,7 +17,14 @@ import { SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 import { DatabaseShim } from "./shim.js";
 import { DoSqliteStore } from "./store-do.js";
 import type { Env } from "./env.js";
-import { authenticateVaultRequest, verbForMethod, insufficientScope } from "./auth.js";
+import {
+  FIRST_PARTY_CLIENT_ID,
+  authenticateVaultRequest,
+  hasScopeForVault,
+  insufficientScope,
+  verbForMethod,
+  type AuthResult,
+} from "./auth.js";
 import { NO_TAG_SCOPE } from "./rest/parse.js";
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
 import { handleTags, handleFindPath } from "./rest/tags.js";
@@ -142,7 +149,11 @@ export class VaultDO extends DurableObject {
       return handleMcp(request, this.store, vaultName, mauth, this.config!.description);
     }
 
-    // Bare landing — GET /vault/<name>. Read-scoped.
+    // Bare landing — GET /vault/<name>. Read-scoped. `cap_bytes` is the
+    // RESOLVED effective storage cap (per-DO plan override, else the env
+    // default) — a cloud-runtime ADDITIVE extension over the bun vault's
+    // landing shape (self-hosted vaults have no tenant cap): the tenant's own
+    // quota is not a secret from them, and the smoke/console read it here.
     if (rest === "" || rest === "/") {
       if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
       const auth = await authenticateVaultRequest(request, this.env, vaultName);
@@ -151,6 +162,7 @@ export class VaultDO extends DurableObject {
         name: this.config!.name,
         description: this.config!.description,
         createdAt: this.config!.createdAt,
+        cap_bytes: this.capBytes(),
         stats: await this.store.getVaultStats(),
       });
     }
@@ -171,6 +183,15 @@ export class VaultDO extends DurableObject {
 
     const writeCtx = { actor: auth.actor, via: auth.via };
     const deps: RestDeps = { vaultName, deleteObject: (rel) => this.deleteObject(vaultName, rel) };
+
+    // Internal config seam — PUT/GET /api/internal/config. Dispatched BEFORE
+    // the cap gate ON PURPOSE: a plan upgrade must be able to RAISE the cap of
+    // a vault that is already full (the gate would 413 the very write that
+    // fixes it). Its own authorization gate lives inside (first-party/operator
+    // only — see handleInternalConfig).
+    if (apiPath === "/internal/config") {
+      return this.handleInternalConfig(request, auth, vaultName);
+    }
 
     // Cap gate for byte-growing writes (POST/PATCH/PUT). DELETE is exempt so a
     // tenant at the cap can always delete their way back under it. Storage
@@ -347,6 +368,67 @@ export class VaultDO extends DurableObject {
 
   private capBytes(): number {
     return resolveCap(this.config?.cap_bytes, this.env.CAP_BYTES);
+  }
+
+  /**
+   * PUT/GET /api/internal/config — PLATFORM-owned per-vault config (today:
+   * `cap_bytes`, the plan storage cap the Identity Worker pushes on vault
+   * creation / plan change / backfill).
+   *
+   * AUTHORIZATION (the honest seam, chosen with cloud#55): the general auth +
+   * verb gates have already run, but they are NOT sufficient here — a vault
+   * owner can mint `vault:<name>:admin` through the public OAuth flow, and the
+   * plan cap is the platform's control, not the tenant's. So this endpoint
+   * additionally requires the ISSUER'S OWN first-party mint: `client_id ===
+   * FIRST_PARTY_CLIENT_ID` (unforgeable — DCR ids are server-generated UUIDs;
+   * the claim rides a signature-checked JWT) AND the admin verb for this
+   * vault; or the VAULT_AUTH_TOKEN operator bearer (the pre-existing
+   * control-plane seam). Everything else → 403.
+   *
+   * NOT part of the shared wire contract (the bun vault has no such endpoint);
+   * the cloud conformance suite pins it as cloud-runtime surface.
+   */
+  private async handleInternalConfig(request: Request, auth: AuthResult, vaultName: string): Promise<Response> {
+    const firstParty =
+      auth.via === "operator" ||
+      (auth.clientId === FIRST_PARTY_CLIENT_ID && hasScopeForVault(auth.scopes, vaultName, "admin"));
+    if (!firstParty) {
+      return json(
+        {
+          error: "Forbidden",
+          error_type: "internal_config_forbidden",
+          message:
+            "Per-vault platform config (plan storage caps) is set by the service, not through tenant tokens.",
+        },
+        403,
+      );
+    }
+
+    const shape = () => ({
+      name: this.config!.name,
+      /** The per-DO override (null = none; the env default applies). */
+      cap_bytes: this.config!.cap_bytes ?? null,
+      /** The effective cap after resolution (override → env default → 1 GiB). */
+      resolved_cap_bytes: this.capBytes(),
+      used_bytes: usedBytes(Number(this.raw().databaseSize), this.r2Bytes),
+    });
+
+    if (request.method === "GET") return json(shape());
+    if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
+
+    let body: { cap_bytes?: unknown };
+    try {
+      body = (await request.json()) as { cap_bytes?: unknown };
+    } catch {
+      return json({ error: "Invalid JSON body" }, 400);
+    }
+    const cap = body.cap_bytes;
+    if (typeof cap !== "number" || !Number.isSafeInteger(cap) || cap <= 0) {
+      return json({ error: "cap_bytes must be a positive integer" }, 400);
+    }
+    this.config!.cap_bytes = cap;
+    await this.ctx.storage.put("config", this.config);
+    return json(shape());
   }
 
   /** 413 when the tenant is already at/over its cap (blocks growth writes). */
