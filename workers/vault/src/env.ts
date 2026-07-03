@@ -5,7 +5,12 @@
 export interface Env {
   /** One Durable Object per vault; the router maps <name> → idFromName(name). */
   VAULT: DurableObjectNamespace;
-  /** Attachment bytes (+ later export tarballs). Keys: vault-<name>/attachments/... */
+  /**
+   * Attachment bytes (`vault-<name>/attachments/...`, counted in the r2_bytes
+   * cap meter) + export tarballs (`vault-<name>/exports/...`, NOT metered,
+   * pruned to EXPORT_KEEP). A future snapshot system adds
+   * `vault-<name>/snapshots/...` with its own retention manifest.
+   */
   ATTACHMENTS: R2Bucket;
 
   // --- vars (wrangler [vars] / secrets) ---

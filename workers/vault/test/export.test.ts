@@ -1,6 +1,7 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
+import { EXPORT_KEEP, exportPrefix, pruneExportTarballs } from "../src/export.ts";
 
 /**
  * Portable-markdown export conformance (design §3.3). The no-lock-in promise:
@@ -92,6 +93,142 @@ describe("export — same core seam (byte identity)", () => {
     const b = new Uint8Array(await (await op(v, `/api/export?exported_at=${FIXED}`)).arrayBuffer());
     expect(a.length).toBe(b.length);
     expect([...a]).toEqual([...b]);
+  });
+});
+
+describe("export — tarball retention (R2 GC)", () => {
+  /** R2 keys are SERVER-time-derived (never from exported_at): fixed-width
+   *  ISO with `:`/`.` → `-`. The suite asserts shape + ordering, not exact
+   *  stamps — server time is the only clock the key path has. */
+  const SERVER_KEY_RE = /\/exports\/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.tar$/;
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const listKeys = async (v: string): Promise<string[]> => {
+    const listed = await env.ATTACHMENTS.list({ prefix: exportPrefix(v) });
+    return listed.objects.map((o) => o.key).sort();
+  };
+  /** Export once; the small sleep guarantees a distinct millisecond timestamp
+   *  → a distinct key (same-ms exports overwrite one key by design). */
+  const exportOnce = async (v: string, qs = ""): Promise<void> => {
+    expect((await op(v, `/api/export${qs}`)).status).toBe(200);
+    await sleep(3);
+  };
+
+  it(`export EXPORT_KEEP+2 times → exactly EXPORT_KEEP tarballs remain, newest kept`, async () => {
+    const v = freshVault();
+    await seed(v);
+    // Two exports first; capture their (server-derived) keys…
+    for (let i = 0; i < 2; i++) await exportOnce(v);
+    const firstTwo = await listKeys(v);
+    expect(firstTwo.length).toBe(2);
+    // …then EXPORT_KEEP more: the first two are now the oldest and must go.
+    for (let i = 0; i < EXPORT_KEEP; i++) await exportOnce(v);
+    const keys = await listKeys(v);
+    expect(keys.length).toBe(EXPORT_KEEP);
+    for (const old of firstTwo) {
+      expect(keys).not.toContain(old);
+      // Every survivor is NEWER than the pruned ones (sorts after).
+      expect(keys.every((k) => k > old)).toBe(true);
+    }
+    for (const k of keys) expect(k).toMatch(SERVER_KEY_RE);
+  });
+
+  it("client-controlled exported_at cannot pin a key past pruning (key is server-derived)", async () => {
+    const v = freshVault();
+    await seed(v);
+    // Adversarial: a key derived from this would sort after every ISO stamp
+    // forever, permanently defeating the prune for this vault.
+    const res = await op(v, `/api/export?exported_at=zzzz-pin-me`);
+    expect(res.status).toBe(200);
+    const keys1 = await listKeys(v);
+    expect(keys1.length).toBe(1);
+    expect(keys1[0]).toMatch(SERVER_KEY_RE); // server ISO shape…
+    expect(keys1[0]).not.toContain("zzzz"); // …not the attacker's stamp
+    await sleep(3);
+    // And it ages out like any other once EXPORT_KEEP newer exports land.
+    for (let i = 0; i < EXPORT_KEEP; i++) await exportOnce(v);
+    const keys2 = await listKeys(v);
+    expect(keys2.length).toBe(EXPORT_KEEP);
+    expect(keys2).not.toContain(keys1[0]!);
+  });
+
+  it("prune is scoped per vault — vault A's prune never touches vault B's exports", async () => {
+    const a = freshVault();
+    const b = freshVault();
+    await seed(a);
+    await seed(b);
+    await exportOnce(b);
+    const bKeys = await listKeys(b);
+    expect(bKeys.length).toBe(1);
+    for (let i = 0; i < EXPORT_KEEP + 2; i++) await exportOnce(a);
+    expect((await listKeys(a)).length).toBe(EXPORT_KEEP);
+    expect(await listKeys(b)).toEqual(bKeys); // B untouched by A's prunes
+  });
+
+  it("prune touches only exports/ — attachments in the same vault survive", async () => {
+    const v = freshVault();
+    await seed(v);
+    const form = new FormData();
+    form.set("file", new File([new Uint8Array([9, 9, 9])], "keep.png", { type: "image/png" }));
+    const up = await op(v, "/api/storage/upload", { method: "POST", body: form });
+    expect(up.status).toBe(201);
+    const meta = (await up.json()) as any;
+
+    for (let i = 0; i < EXPORT_KEEP + 2; i++) await exportOnce(v);
+
+    const get = await op(v, `/api/storage/${meta.path}`);
+    expect(get.status).toBe(200);
+  });
+
+  it("exports are EXCLUDED from the r2_bytes cap meter — exports+prune leave it unchanged", async () => {
+    const v = freshVault();
+    await seed(v);
+    // Seed the meter through the metered path (attachment upload).
+    const bytes = new Uint8Array(64);
+    const form = new FormData();
+    form.set("file", new File([bytes], "m.png", { type: "image/png" }));
+    expect((await op(v, "/api/storage/upload", { method: "POST", body: form })).status).toBe(201);
+
+    const stub = env.VAULT.get(env.VAULT.idFromName(v));
+    expect(await stub.debugR2MeterBytes(v)).toBe(64);
+
+    // EXPORT_KEEP+2 exports: tarballs written AND pruned. Neither side may move
+    // the user-facing meter (write never meterAdds; prune never meterSubs).
+    for (let i = 0; i < EXPORT_KEEP + 2; i++) await exportOnce(v);
+    expect(await stub.debugR2MeterBytes(v)).toBe(64);
+  });
+});
+
+describe("pruneExportTarballs — paginated listing (unit, fake bucket)", () => {
+  it("walks truncated list pages, deletes all but the newest keep, chunks deletes at 1000", async () => {
+    // 2500 keys across 3 pages exercises the cursor loop AND the 1000-key
+    // delete chunking without 2500 real R2 objects.
+    const mk = (i: number) => `vault-x/exports/2026-07-02T00-00-00-${String(i).padStart(4, "0")}Z.tar`;
+    const all = Array.from({ length: 2500 }, (_, i) => mk(i));
+    const pages = [all.slice(0, 1000), all.slice(1000, 2000), all.slice(2000)];
+    const deleted: string[][] = [];
+    let listCalls = 0;
+    const fake = {
+      list: async (opts: { prefix?: string; cursor?: string }) => {
+        expect(opts.prefix).toBe("vault-x/exports/");
+        const idx = opts.cursor ? Number(opts.cursor) : 0;
+        listCalls++;
+        const truncated = idx < pages.length - 1;
+        return {
+          objects: pages[idx]!.map((key) => ({ key })),
+          truncated,
+          ...(truncated ? { cursor: String(idx + 1) } : {}),
+        };
+      },
+      delete: async (keys: string | string[]) => {
+        deleted.push(Array.isArray(keys) ? keys : [keys]);
+      },
+    } as unknown as R2Bucket;
+
+    const stale = await pruneExportTarballs(fake, "x", 5);
+    expect(listCalls).toBe(3);
+    expect(stale).toEqual(all.slice(0, 2495)); // survivors = the newest 5
+    for (const chunk of deleted) expect(chunk.length).toBeLessThanOrEqual(1000);
+    expect(deleted.flat()).toEqual(all.slice(0, 2495));
   });
 });
 
