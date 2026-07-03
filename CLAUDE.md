@@ -64,7 +64,16 @@ The engine is `@openparachute/core` (in parachute-vault) — never reimplement s
 
 ## Governance
 
-Same as the workspace: PR-only, reviewer-gated, no self-merge. Root version bumps rc.N per code-touching PR (private package, never published — the discipline is for history legibility). No CI on this repo yet — cite literal local gate counts in PR bodies.
+Same as the workspace: PR-only, reviewer-gated, no self-merge. Root version bumps rc.N per code-touching PR (private package, never published — the discipline is for history legibility).
+
+**CI/CD (since 0.0.8-rc.7)** — `.github/workflows/`:
+
+- `ci.yml` (every PR + push to main): both worker suites (typecheck + vitest under workerd) and the root control-plane `bun test`, as three parallel jobs. Root `bun run typecheck` is deliberately excluded until cloud#23 (stripe caret drift) closes. Every job clones **parachute-vault@main as a sibling** first — the vault worker's `@openparachute/core` is a `file:` dep pointing outside this repo.
+- `deploy-staging.yml` (push to main touching `workers/**` or `scripts/**`, or manual dispatch): `deploy-staging.sh` + the full `smoke-staging.ts`.
+- `deploy-prod.yml` (`v*` tag push, or manual dispatch): `deploy-prod.sh` + the read-only `smoke-prod.ts`.
+- Both deploy workflows are **secret-gated**: until the repo secrets `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `DEV_SECRETS` (the `.dev-secrets` file body) exist, they warn + skip and exit green — merges are never red-gated on the pending ops step. Token permissions + formats are documented in `deploy-staging.yml`'s header.
+
+PR bodies can cite the CI run for the suites it covers; keep the literal-counts convention for anything CI doesn't cover (live smokes, manual verification, one-off scripts). Branch-protection required checks are NOT enabled (Aaron's call, later).
 
 ## License
 
