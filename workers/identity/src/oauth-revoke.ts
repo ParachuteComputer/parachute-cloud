@@ -57,7 +57,17 @@ function unverifiedJtiOf(token: string): string | null {
 }
 
 export async function handleRevoke(db: D1Database, req: Request, _deps: OAuthDeps): Promise<Response> {
-  const form = await req.formData();
+  // Same malformed-body guard as handleToken: a throw here would skip the
+  // route-level wildcard-CORS wrapper (#35).
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch {
+    return jsonResponse(
+      { error: "invalid_request", error_description: "request body must be application/x-www-form-urlencoded" },
+      400,
+    );
+  }
   const token = String(form.get("token") ?? "");
   const hint = String(form.get("token_type_hint") ?? "");
   const bodyClientId = String(form.get("client_id") ?? "");

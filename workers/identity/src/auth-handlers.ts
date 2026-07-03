@@ -114,7 +114,7 @@ export async function handleMagicRequestPost(
   if (!EMAIL_RE.test(email)) return magicError(req, "Enter a valid email address.", email);
 
   const now = deps.now?.() ?? new Date();
-  const throttle = await checkAndBumpMagic(db, clientIp(req), email, now);
+  const throttle = await checkAndBumpMagic(deps.rateLimiter, clientIp(req), email, now);
   // On throttle, still return the neutral page but send nothing — this neither
   // reveals account existence nor lets the endpoint be used to bomb an inbox.
   if (throttle.allowed) {
@@ -198,15 +198,15 @@ export async function handleLogin2faPost(db: D1Database, req: Request, deps: OAu
   // Brute-force fence on the second factor (a caller here already passed primary
   // auth). Keyed per (ip, 2fa:<userId>) so it can't lock out another account.
   const key = loginKey(clientIp(req), `2fa:${pending.userId}`);
-  if ((await isLoginLocked(db, key, now)).locked) {
+  if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
     return login2faError(req, "Too many attempts. Please wait a few minutes and try again.");
   }
   const result = await verifySecondFactor(db, pending.userId, String(form.get("code") ?? ""), now);
   if (!result.ok) {
-    await recordLoginFailure(db, key, now);
+    await recordLoginFailure(deps.rateLimiter, key, now);
     return login2faError(req, "That code didn't match. Try again.");
   }
-  await clearLoginFailures(db, key);
+  await clearLoginFailures(deps.rateLimiter, key);
   await consumePendingLogin(db, rawToken);
   const session = await createSession(db, pending.userId, now);
   const headers = new Headers({ location: safeNext(pending.next, deps) });

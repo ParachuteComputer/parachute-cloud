@@ -9,6 +9,7 @@
  * the Worker (index.ts) calls them with the request-time deps.
  */
 import { VAULT_VERBS } from "./audience.ts";
+import type { RateLimiterNamespace } from "./rate-limit.ts";
 
 export interface OAuthDeps {
   /** The fixed configured issuer origin — `iss`, discovery-doc base. No trailing slash. */
@@ -31,6 +32,12 @@ export interface OAuthDeps {
    * real email. Set from ENVIRONMENT !== "production"; MUST be false in prod.
    */
   exposeDevLinks?: boolean;
+  /**
+   * The RateLimiterDO namespace (#30) — signup/login/magic abuse fences.
+   * REQUIRED (not optional) so a missed wiring is a type error, never a
+   * silently-disabled fence; runtime DO failures fail OPEN in rate-limit.ts.
+   */
+  rateLimiter: RateLimiterNamespace;
 }
 
 /**
@@ -67,6 +74,30 @@ export function isSameOriginRequest(req: Request, boundOrigins: readonly string[
 }
 
 /**
+ * CORS POSTURE — the issuer's documented contract (#35, settled 2026-07-02).
+ *
+ * The cloud issuer runs a deliberate three-way SPLIT:
+ *   - /oauth/token + /oauth/revoke → WILDCARD, uncredentialed ({@link withWildcardCors})
+ *   - /oauth/register              → REFLECTED Origin + credentials ({@link withReflectedCors})
+ *   - /oauth/authorize             → NO CORS headers at all (browser-navigated
+ *     HTML: login/consent forms are same-origin; a cross-origin script has no
+ *     business reading them — pinned by a negative conformance test)
+ *
+ * DIVERGENCE FROM THE HUB (intentional-conservative): the hub's issuer
+ * (parachute-hub/src/cors.ts) applies echo-Origin + `Allow-Credentials: true`
+ * uniformly across all of /oauth/* (hub#742-adjacent). Wildcard-uncredentialed
+ * on the token family is strictly narrower (no credentialed cross-origin reads
+ * where none are needed), and authorize gets nothing at all. Every WIRE
+ * response shape is still hub-identical; only these response HEADERS differ,
+ * and the conformance corpus pins the split. Both helpers expose
+ * `WWW-Authenticate` (hub parity) so browser clients can read 401 challenges.
+ *
+ * Applied at the ROUTE (index.ts), and handlers must not throw before
+ * returning (body parsing is try/caught) — so every path, success and error,
+ * carries the route's CORS headers.
+ */
+
+/**
  * CORS for the token-family endpoints (/oauth/token, /oauth/revoke). Token
  * exchange is an uncredentialed simple POST (form-urlencoded) — without an
  * `Access-Control-Allow-Origin` the browser blocks a cross-origin SPA (the
@@ -76,6 +107,7 @@ export function isSameOriginRequest(req: Request, boundOrigins: readonly string[
  */
 export function withWildcardCors(res: Response): Response {
   res.headers.set("access-control-allow-origin", "*");
+  res.headers.set("access-control-expose-headers", "WWW-Authenticate");
   return res;
 }
 
@@ -93,6 +125,7 @@ export function withReflectedCors(res: Response, req: Request): Response {
   if (!origin) return res;
   res.headers.set("access-control-allow-origin", origin);
   res.headers.set("access-control-allow-credentials", "true");
+  res.headers.set("access-control-expose-headers", "WWW-Authenticate");
   return res;
 }
 

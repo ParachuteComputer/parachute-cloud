@@ -40,6 +40,10 @@ import { type OAuthDeps, oauthPreflight, withReflectedCors, withWildcardCors } f
 import { handleToken } from "./oauth-token.ts";
 import { handleScheduled } from "./ops.ts";
 
+// The rate-limiter DO class (#30) — the runtime resolves it from this module
+// (wrangler.toml [[durable_objects.bindings]] class_name = "RateLimiterDO").
+export { RateLimiterDO } from "./rate-limiter-do.ts";
+
 function depsFor(env: Env): OAuthDeps {
   const issuer = env.ISSUER.replace(/\/$/, "");
   return {
@@ -48,6 +52,7 @@ function depsFor(env: Env): OAuthDeps {
     vaultOrigin: env.VAULT_ORIGIN,
     boundOrigins: () => [issuer],
     exposeDevLinks: env.ENVIRONMENT !== "production",
+    rateLimiter: env.RATE_LIMITER,
   };
 }
 

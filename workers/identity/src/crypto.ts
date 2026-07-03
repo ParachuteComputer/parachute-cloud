@@ -64,11 +64,22 @@ export function timingSafeEqualString(a: string, b: string): boolean {
 }
 
 // --- generic salted secret hashing -----------------------------------------
-// Same PBKDF2-SHA256 verifier format as the password store (`users.ts`), exposed
-// generically for hashing TOTP backup codes. workerd caps PBKDF2 at 100k
-// iterations at runtime, so this MUST NOT exceed it (a higher count writes a hash
-// that can never be verified on the deployed worker — see users.ts).
+// Same versioned PBKDF2 verifier format as the password store (`users.ts`),
+// exposed generically for hashing TOTP backup codes.
+//
+// KDF POSTURE (#28): workerd caps PBKDF2 at 100k iterations at RUNTIME (and
+// the vitest-pool workerd does NOT enforce the cap — live-smoke is the only
+// honest check), with no argon2/scrypt available without a WASM dep. So the
+// KDF here is PBKDF2-SHA512 at the 100k cap — the ceiling of this runtime —
+// and the SECURITY posture does not lean on it: passwords are an OPTIONAL
+// secondary factor (magic-link is primary), the DO-backed rate limiter (#30)
+// blunts online guessing, TOTP 2FA is available, and backup codes hashed here
+// are high-entropy random strings (the KDF hardly matters for those). The
+// full note lives in users.ts. NEVER raise the count above 100000 — a hash
+// written above the cap can never be verified on the deployed worker.
 const SECRET_PBKDF2_ITERATIONS = 100_000;
+const SECRET_HASH_ALGS: Record<string, string> = { sha256: "SHA-256", sha512: "SHA-512" };
+const SECRET_CURRENT_TAG = "sha512";
 
 function base64urlToBytes(s: string): Uint8Array {
   const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
@@ -78,35 +89,40 @@ function base64urlToBytes(s: string): Uint8Array {
   return out;
 }
 
-async function pbkdf2(secret: string, salt: Uint8Array, iterations: number): Promise<string> {
+async function pbkdf2(secret: string, salt: Uint8Array, iterations: number, hash: string): Promise<string> {
   const keyMaterial = await crypto.subtle.importKey("raw", encoder.encode(secret), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt: salt as BufferSource, iterations, hash: "SHA-256" },
+    { name: "PBKDF2", salt: salt as BufferSource, iterations, hash },
     keyMaterial,
     256,
   );
   return bytesToBase64url(new Uint8Array(bits));
 }
 
-/** `pbkdf2$sha256$<iterations>$<salt-b64url>$<derived-b64url>` — a salted hash of an arbitrary secret. */
+/** `pbkdf2$sha512$<iterations>$<salt-b64url>$<derived-b64url>` — a salted hash of an arbitrary secret. */
 export async function hashSecret(secret: string): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  const derived = await pbkdf2(secret, salt, SECRET_PBKDF2_ITERATIONS);
-  return `pbkdf2$sha256$${SECRET_PBKDF2_ITERATIONS}$${bytesToBase64url(salt)}$${derived}`;
+  const derived = await pbkdf2(secret, salt, SECRET_PBKDF2_ITERATIONS, SECRET_HASH_ALGS[SECRET_CURRENT_TAG]!);
+  return `pbkdf2$${SECRET_CURRENT_TAG}$${SECRET_PBKDF2_ITERATIONS}$${bytesToBase64url(salt)}$${derived}`;
 }
 
-/** Verify a secret against a {@link hashSecret} output. Any parse/crypto failure is a non-match, never a throw. */
+/**
+ * Verify a secret against a {@link hashSecret} output. The stored format is
+ * versioned (algorithm tag + iteration count), so legacy sha256 hashes keep
+ * verifying. Any parse/crypto failure is a non-match, never a throw.
+ */
 export async function verifySecret(secret: string, stored: string): Promise<boolean> {
   const parts = stored.split("$");
-  if (parts.length !== 5 || parts[0] !== "pbkdf2" || parts[1] !== "sha256") return false;
+  if (parts.length !== 5 || parts[0] !== "pbkdf2") return false;
+  const hashAlg = SECRET_HASH_ALGS[parts[1] ?? ""];
   const iterations = Number(parts[2]);
   const saltB64 = parts[3];
   const expected = parts[4];
-  if (!Number.isFinite(iterations) || iterations < 1 || iterations > SECRET_PBKDF2_ITERATIONS || !saltB64 || !expected) {
+  if (!hashAlg || !Number.isFinite(iterations) || iterations < 1 || iterations > SECRET_PBKDF2_ITERATIONS || !saltB64 || !expected) {
     return false;
   }
   try {
-    const derived = await pbkdf2(secret, base64urlToBytes(saltB64), iterations);
+    const derived = await pbkdf2(secret, base64urlToBytes(saltB64), iterations, hashAlg);
     return timingSafeEqualString(derived, expected);
   } catch {
     return false;

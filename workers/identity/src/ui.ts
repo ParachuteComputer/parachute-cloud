@@ -132,6 +132,12 @@ export interface ConsentProps {
   lockedVault: string | null;
   /** True when an unnamed vault verb needs a vault chosen at submit time. */
   needsVaultPick: boolean;
+  /**
+   * The issuer's host, derived from CONFIG (deps.issuer — never request/user
+   * input): the "issued by <host>" trust line so the user can verify WHERE
+   * they're consenting (#42; also disambiguates staging vs production).
+   */
+  issuerHost: string;
 }
 
 function scopeLabel(scope: string): string {
@@ -146,7 +152,7 @@ export function describeScopes(scopes: string[]): Array<{ scope: string; label: 
 }
 
 export function renderConsent(props: ConsentProps): string {
-  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick } = props;
+  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, issuerHost } = props;
   const scopeList = scopeDescriptions
     .map((s) => `<li><strong>${esc(s.label)}</strong><br><span class="muted">${esc(s.scope)}</span></li>`)
     .join("\n");
@@ -160,6 +166,7 @@ export function renderConsent(props: ConsentProps): string {
   return page(
     "Authorize — Parachute",
     `<h1>Authorize ${esc(clientName)}</h1>
+     <p class="muted" style="margin:0 0 1rem">issued by <strong>${esc(issuerHost)}</strong></p>
      <div class="card">
        <p class="muted"><strong>${esc(clientName)}</strong> is requesting access to:</p>
        <ul class="scopes">${scopeList}</ul>
