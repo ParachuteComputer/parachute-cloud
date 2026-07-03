@@ -1,0 +1,27 @@
+-- Operator admin console (Wave 4c): the operator role + account suspension.
+--
+-- `users.role` — 'user' (default, every signup) | 'operator'. Operators see
+-- the /admin console (fleet overview, users/vaults tables, the comp + suspend
+-- levers). Values are enforced in code (src/users.ts coerces unknown values to
+-- 'user' — the safe direction, never granting operator powers old code doesn't
+-- know about); no CHECK constraint, same rationale as `plan` (0009): adding a
+-- role must never require a schema migration. There is NO in-product way to
+-- set role — scripts/set-operator-role.ts (operator's wrangler credential) is
+-- the only writer, deliberately: the admin surface can suspend and comp, but
+-- can never mint another operator.
+--
+-- `users.suspended_at` — ISO-8601 timestamp when an operator suspended the
+-- account (NULL = active). SUSPENSION SEMANTICS (documented contract):
+--   - sessions: invalidated on next request — findActiveSession (sessions.ts)
+--     refuses a session whose user is suspended, and the suspend action also
+--     deletes the user's session rows outright;
+--   - login/magic: blocked with the SAME neutral responses an unknown account
+--     gets (wrong-password message / "check your email" page / "link expired")
+--     — suspension is never revealed, no oracle;
+--   - OAuth tokens: NOT revoked — access/refresh tokens expire naturally
+--     (suspension is a moderation lever, not a kill switch; revocation stays
+--     the token-registry's job);
+--   - vault DATA: untouched. Nothing is deleted or capped; un-suspending
+--     (suspended_at back to NULL) restores login exactly as it was.
+ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';
+ALTER TABLE users ADD COLUMN suspended_at TEXT;

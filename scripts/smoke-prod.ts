@@ -135,6 +135,14 @@ async function main() {
     assert(unsub.status === 404, "unsubscribe with an unknown token is refused (404)", `status ${unsub.status}`);
   }
 
+  // 3c. The operator admin console (Wave 4c) never reveals itself: with no
+  //     session, /admin answers the router's own 404 — the PINNED no-session
+  //     shape (not a 302-to-login; indistinguishable from no-route).
+  {
+    const admin = await fetch(`${IDENTITY}/admin`, { redirect: "manual" });
+    assert(admin.status === 404, "PRODUCTION: unauthenticated /admin → 404 (surface hidden)", `status ${admin.status}`);
+  }
+
   // 4. Vault worker on its custom domain (all GET, no DO writes).
   {
     const health = await fetch(`${VAULT}/health`);

@@ -31,7 +31,7 @@ export interface AuthorizeParams {
   vault: string | null;
 }
 
-function esc(s: string): string {
+export function esc(s: string): string {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -139,7 +139,9 @@ const STYLE = `
   .copybtn:hover{background:#e4e8dd}
 `;
 
-function page(title: string, inner: string): string {
+// Exported for admin-ui.ts (the operator console reuses the exact page shell +
+// brand styles, widening itself with its own style block).
+export function page(title: string, inner: string): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>${FONT_LINK}<style>${STYLE}</style></head><body><div class="brand">Parachute</div>${inner}</body></html>`;
 }
 
@@ -499,6 +501,8 @@ export interface ConsoleProps {
   totalUsedBytes?: number | null;
   /** At/over the plan's vault count → the create form yields to the at-cap note. */
   atVaultCap: boolean;
+  /** Operator account → the quiet "Admin" header link (/admin). */
+  isOperator?: boolean;
 }
 
 /**
@@ -696,6 +700,7 @@ export function renderConsole(props: ConsoleProps): string {
     plan,
     totalUsedBytes,
     atVaultCap,
+    isOperator,
   } = props;
   // Plan display (no payment link yet — the entitlement layer ships first).
   // The across-vaults usage total (latest rollup rows) rides the plan line;
@@ -707,9 +712,11 @@ export function renderConsole(props: ConsoleProps): string {
   const teaserHtml =
     plan === "free" ? ` <span style="opacity:.75">&middot; ${esc(parachuteTeaser())}</span>` : "";
   const planHtml = `${esc(planLine(plan))}${usageHtml}${teaserHtml}`;
+  // The Admin link renders ONLY for operators — everyone else never learns the
+  // route exists (it answers 404 to them anyway; admin.ts).
   const header = (title: string) => `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">
        <h1 style="margin:0">${esc(title)}</h1>
-       <span style="display:flex;gap:1rem;align-items:baseline"><a href="/console/security">Security</a>
+       <span style="display:flex;gap:1rem;align-items:baseline">${isOperator ? `<a href="/admin" data-testid="admin-link">Admin</a>` : ""}<a href="/console/security">Security</a>
        <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}"><button class="linkbtn" type="submit">Sign out</button></form></span>
      </div>
      <p class="muted" style="margin:.15rem 0 .2rem">${esc(email)}</p>

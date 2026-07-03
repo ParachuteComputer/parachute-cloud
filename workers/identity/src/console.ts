@@ -146,7 +146,10 @@ export async function handleLoginPost(db: D1Database, req: Request, deps: OAuthD
     return loginError(req, "Too many attempts. Please wait a few minutes and try again.", email);
   }
   const user = email ? await getUserByEmail(db, email) : null;
-  if (!user || !(await verifyPassword(user, password))) {
+  // A SUSPENDED account fails with the exact wrong-password message — even on
+  // the correct password (suspension is never revealed; migration 0011). The
+  // failure is recorded like any other so the fence stays indistinguishable.
+  if (!user || !(await verifyPassword(user, password)) || user.suspendedAt) {
     await recordLoginFailure(deps.rateLimiter, key, now);
     return loginError(req, "Incorrect email or password.", email);
   }
@@ -259,6 +262,9 @@ async function renderConsoleFor(
       // gives way to the friendly at-cap note. The POST handler is the real
       // gate; this just keeps the UI honest.
       atVaultCap: cards.length >= PLAN_SPECS[user.plan].vault_count,
+      // Operators get the quiet Admin header link (the surface itself 404s
+      // for everyone else — admin.ts).
+      isOperator: user.role === "operator",
     }),
     200,
     csrfExtra(csrf.setCookie),

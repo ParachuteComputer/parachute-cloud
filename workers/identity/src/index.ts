@@ -28,6 +28,13 @@ import {
   handleSecurityGet,
   handleSecurityPost,
 } from "./auth-handlers.ts";
+import {
+  handleAdminOverviewGet,
+  handleAdminSetPlanPost,
+  handleAdminSuspendPost,
+  handleAdminUsersGet,
+  handleAdminVaultsGet,
+} from "./admin.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
 import {
@@ -114,6 +121,16 @@ app.post("/console/checklist", (c) => handleChecklistPost(c.env.DB, c.req.raw, d
 app.post("/console/checklist/restore", (c) => handleChecklistRestorePost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/console/security", (c) => handleSecurityGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/security", (c) => handleSecurityPost(c.env.DB, c.req.raw, depsFor(c.env)));
+
+// --- operator admin console (Wave 4c) ---
+// EVERY route (GET and POST) resolves the session and requires role='operator'
+// inside the handler; anything else answers the router's own 404 shape — the
+// surface never reveals itself (admin.ts). POSTs add CSRF + same-origin.
+app.get("/admin", (c) => handleAdminOverviewGet(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/admin/users", (c) => handleAdminUsersGet(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/admin/vaults", (c) => handleAdminVaultsGet(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/admin/users/plan", (c) => handleAdminSetPlanPost(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/admin/users/suspend", (c) => handleAdminSuspendPost(c.env.DB, c.req.raw, depsFor(c.env)));
 
 // --- magic-link sign-in + second factor ---
 app.post("/auth/magic", (c) => handleMagicRequestPost(c.env.DB, c.req.raw, depsFor(c.env), senderFor(c.env)));

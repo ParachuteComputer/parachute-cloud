@@ -564,6 +564,7 @@ async function main() {
   //     walk. The session + vault carry into section 14 (usage rollup).
   let arrivalCookie = "";
   let arrivalVault = "";
+  let arrivalEmail = "";
   {
     const email = `arrival+${Date.now()}@example.com`;
     const password = b64url(crypto.getRandomValues(new Uint8Array(18)));
@@ -584,6 +585,7 @@ async function main() {
     assert(suRes.status === 302 && !!session, "arrival: signup → session", `status ${suRes.status}`);
     arrivalCookie = cookie;
     arrivalVault = vaultName;
+    arrivalEmail = email;
 
     // Zero vaults → the first-run hero with both research questions.
     const heroHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie } })).text();
@@ -783,6 +785,44 @@ async function main() {
       conHtml.includes('data-testid="usage-total"'),
       "usage: the plan line carries the across-vaults total",
     );
+  }
+
+  // 15. Operator admin console (Wave 4c). The dev user IS the operator
+  //     (seed-dev-user.ts seeds role='operator' on every staging deploy); the
+  //     arrival user (section 12) is a plain account created this run. Role
+  //     gate: operator 200; a plain user AND an anonymous probe both get the
+  //     router's own 404 — the surface never reveals it exists.
+  {
+    const opCookie = `parachute_id_session=${session}`;
+    const overview = await fetch(`${IDENTITY}/admin`, { headers: { cookie: opCookie }, redirect: "manual" });
+    const overviewHtml = overview.status === 200 ? await overview.text() : "";
+    assert(
+      overview.status === 200 && overviewHtml.includes("Fleet overview"),
+      "admin: the operator sees /admin (200 + fleet overview)",
+      `status ${overview.status}`,
+    );
+
+    const usersRes = await fetch(`${IDENTITY}/admin/users`, { headers: { cookie: opCookie } });
+    const usersHtml = usersRes.status === 200 ? await usersRes.text() : "";
+    assert(
+      usersRes.status === 200 && usersHtml.includes(arrivalEmail),
+      "admin: this run's fresh signup appears in the users table",
+      arrivalEmail,
+    );
+
+    const vaultsRes = await fetch(`${IDENTITY}/admin/vaults`, { headers: { cookie: opCookie } });
+    const vaultsHtml = vaultsRes.status === 200 ? await vaultsRes.text() : "";
+    assert(
+      vaultsRes.status === 200 && vaultsHtml.includes(arrivalVault),
+      "admin: this run's fresh vault appears in the vaults table",
+      arrivalVault,
+    );
+
+    const plain = await fetch(`${IDENTITY}/admin`, { headers: { cookie: arrivalCookie }, redirect: "manual" });
+    assert(plain.status === 404, "admin: a plain (non-operator) user gets 404", `status ${plain.status}`);
+
+    const anon = await fetch(`${IDENTITY}/admin`, { redirect: "manual" });
+    assert(anon.status === 404, "admin: unauthenticated /admin is 404 (indistinguishable from no-route)", `status ${anon.status}`);
   }
 
   // --- summary ---

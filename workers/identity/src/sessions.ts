@@ -33,12 +33,31 @@ export async function createSession(db: D1Database, userId: string, now: Date = 
   return { id, userId, createdAt, expiresAt };
 }
 
-/** Find a live (un-expired) session by id. */
+/**
+ * Find a live (un-expired) session by id. A session whose user is SUSPENDED
+ * (users.suspended_at, migration 0011) is refused here — the single read-time
+ * chokepoint that invalidates a suspended user's sessions on their next
+ * request, across every cookie-authed surface (console, /oauth/authorize
+ * login-skip, consent submit). The suspend action (admin.ts) also deletes the
+ * rows outright; this join is the backstop for anything it raced.
+ */
 export async function findActiveSession(db: D1Database, id: string, now: Date = new Date()): Promise<Session | null> {
-  const row = await db.prepare("SELECT * FROM sessions WHERE id = ?").bind(id).first<Row>();
+  const row = await db
+    .prepare(
+      `SELECT s.id, s.user_id, s.created_at, s.expires_at FROM sessions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.id = ? AND u.suspended_at IS NULL`,
+    )
+    .bind(id)
+    .first<Row>();
   if (!row) return null;
   if (now.getTime() > new Date(row.expires_at).getTime()) return null;
   return { id: row.id, userId: row.user_id, createdAt: row.created_at, expiresAt: row.expires_at };
+}
+
+/** Delete ALL of a user's sessions (the suspend action's immediate part). */
+export async function deleteSessionsForUser(db: D1Database, userId: string): Promise<void> {
+  await db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId).run();
 }
 
 /** Delete a session row (logout). Idempotent. */
