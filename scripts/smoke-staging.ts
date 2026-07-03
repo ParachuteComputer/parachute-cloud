@@ -330,9 +330,16 @@ async function main() {
     const conPage = await fetch(`${IDENTITY}/console`, { headers: { cookie: `parachute_id_session=${newSession}` } });
     const conHtml = await conPage.text();
     assert(conHtml.includes(newVault) && conHtml.includes(`parachute-${newVault}`), "console shows the vault + connect card", "");
+    // The free plan line renders, plus a billing affordance whose SHAPE depends
+    // on the deploy state: the mock Upgrade UI ("test mode" — staging today,
+    // no Stripe), the real Upgrade buttons (Stripe configured), or the
+    // copy-only teaser ("coming this week" — prod, no keys). Any is a pass.
     assert(
-      conHtml.includes("Free plan — 1 vault, 100 MB") && conHtml.includes("coming this week"),
-      "console shows the free plan line + Parachute teaser",
+      conHtml.includes("Free plan — 1 vault, 100 MB") &&
+        (conHtml.includes('data-testid="mock-billing-note"') ||
+          conHtml.includes('data-testid="upgrade-billing"') ||
+          conHtml.includes("coming this week")),
+      "console shows the free plan line + a billing affordance (mock / real Upgrade / teaser)",
       "",
     );
 
@@ -831,30 +838,42 @@ async function main() {
     assert(anon.status === 404, "admin: unauthenticated /admin is 404 (indistinguishable from no-route)", `status ${anon.status}`);
   }
 
-  // 16. Billing (Wave 4d) — STATE-ADAPTIVE: the deploy ships before the Stripe
-  //     keys exist, so the smoke detects which state the worker is in and pins
-  //     that state's contract. NOT CONFIGURED (today): all three /billing/*
-  //     routes answer the clean 503 and the console renders no billing door
-  //     (the teaser stays). CONFIGURED (after `wrangler secret put` ×2 + the
-  //     price [vars] land): the routes gate normally (anonymous checkout →
-  //     /login; unsigned webhook → 400) and the free user's console shows the
-  //     Upgrade buttons. Either way the assertions are deterministic.
+  // 16. Billing (mock-payments + Wave 4d) — STATE-ADAPTIVE, FAST-PROBE half.
+  //     Staging ships with NO real Stripe keys, so it runs in MOCK mode
+  //     (billing-config.ts mockBillingEnabled): the interim mock checkout
+  //     stands in for Stripe. This half pins the console UI + route CONTRACT
+  //     (read-only + probes — no throwaway vault, no inference — so it can't
+  //     perturb the arrival-user snapshot/voice sections that follow); the
+  //     heavy live mock-upgrade → VOICE + transcription E2E runs LAST (§19).
+  //       MOCK (today): the real /billing/checkout stays 503 (config-gated),
+  //         the arrival free user's console shows mock Upgrade buttons →
+  //         /billing/mock-checkout + a "test mode" label (NO teaser), and the
+  //         mock endpoint is session-gated (unauthenticated → /login).
+  //       CONFIGURED (once TEST keys land): the real routes gate (anonymous
+  //         checkout → /login; unsigned webhook → 400), the console shows real
+  //         Upgrade buttons → /billing/checkout, and the mock endpoint 404s.
   {
-    const probe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
-    if (probe.status === 503) {
-      const body = (await probe.json()) as { error?: string };
-      assert(body.error === "billing_not_configured", "billing NOT CONFIGURED: checkout answers the clean 503", String(body.error));
-      const portal = await fetch(`${IDENTITY}/billing/portal`, { method: "POST", body: "", redirect: "manual" });
-      assert(portal.status === 503, "billing NOT CONFIGURED: portal → 503", `status ${portal.status}`);
-      const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
-      assert(webhook.status === 503, "billing NOT CONFIGURED: webhook → 503", `status ${webhook.status}`);
-      const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
+    const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
+    const mockMode = conHtml.includes('action="/billing/mock-checkout"');
+    if (mockMode) {
+      // The real checkout route stays config-gated (503) even in mock mode; the
+      // mock is a SEPARATE endpoint.
+      const realProbe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
+      assert(realProbe.status === 503, "billing MOCK: the real /billing/checkout stays 503 (config-gated)", `status ${realProbe.status}`);
       assert(
-        !conHtml.includes('data-testid="upgrade-billing"') && !conHtml.includes("/billing/checkout"),
-        "billing NOT CONFIGURED: the console hides every billing door",
+        conHtml.includes('data-testid="upgrade-billing"') &&
+          conHtml.includes('data-testid="upgrade-voice"') &&
+          conHtml.includes('data-testid="mock-billing-note"') &&
+          !conHtml.includes("coming this week"),
+        "billing MOCK: the arrival free user's console shows mock Upgrade buttons (parachute + voice) + 'test mode' label, no teaser",
       );
-      assert(conHtml.includes("coming this week"), "billing NOT CONFIGURED: the free-plan teaser stays");
+      // The mock endpoint keeps the console write boundary (session-gated).
+      const noSess = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
+      assert(noSess.status === 302 && noSess.headers.get("location") === "/login", "billing MOCK: unauthenticated mock-checkout → /login (session-gated)", `status ${noSess.status}`);
     } else {
+      // CONFIGURED (real Stripe keys present) — the pre-mock contract, plus the
+      // mock endpoint now 404ing because the real path has taken over.
+      const probe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
       assert(
         probe.status === 302 && probe.headers.get("location") === "/login",
         "billing CONFIGURED: anonymous checkout redirects to /login",
@@ -867,11 +886,12 @@ async function main() {
         "billing CONFIGURED: an unsigned webhook is refused (400 missing_signature)",
         `status ${webhook.status}`,
       );
-      const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
       assert(
-        conHtml.includes('data-testid="upgrade-billing"'),
-        "billing CONFIGURED: the free user's console shows the Upgrade buttons",
+        conHtml.includes('data-testid="upgrade-billing"') && conHtml.includes('action="/billing/checkout"'),
+        "billing CONFIGURED: the free user's console shows the real Upgrade buttons",
       );
+      const mock = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
+      assert(mock.status === 404, "billing CONFIGURED: the mock endpoint 404s (the real path is active)", `status ${mock.status}`);
     }
   }
 
@@ -995,7 +1015,8 @@ async function main() {
   //     tier, upload the committed real-speech fixture, link transcribe:true,
   //     drive the DO drain via the staging __test hook, and assert the note
   //     resolves to a REAL transcript (not eternal pending, not a failure/limit
-  //     marker). This exercises the live Workers AI path at deploy time.
+  //     marker). This exercises the live Workers AI path at deploy time. (The
+  //     MOCK-upgraded user's own transcription is proven back-to-back in §16.)
   if (arrivalVault && arrivalEmail) {
     const vCsrf = `smoke-voice-${Date.now()}`;
     const usersHtml = await (await fetch(`${IDENTITY}/admin/users`, { headers: { cookie: `parachute_id_session=${session}` } })).text();
@@ -1063,6 +1084,119 @@ async function main() {
         "voice: minutes_remaining metered down after the transcription",
         `${land.transcription.minutes_remaining} → ${land2.transcription.minutes_remaining}`,
       );
+    }
+  }
+
+  // 19. MOCK-upgrade E2E (mock-payments) — the live end-to-end proof, run LAST
+  //     so its throwaway vault + Workers-AI inference can't perturb §17/§18's
+  //     arrival-user snapshot/voice flow. Only in MOCK mode (real Stripe
+  //     absent — detected by the mock endpoint being session-gated, not 404).
+  //     Fresh signup → mock-checkout(VOICE) → plan=Voice + landing
+  //     {enabled, minutes_remaining:600} + the 10 GiB voice cap → a REAL
+  //     transcription resolves. Proves the whole interim checkout → upgrade →
+  //     cap/voice-lift flow, no live charge.
+  {
+    const detect = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
+    const mockMode = detect.status === 302 && detect.headers.get("location") === "/login";
+    if (mockMode) {
+      const mEmail = `mock-${Date.now()}@smoke.test`;
+      const mPass = b64url(crypto.getRandomValues(new Uint8Array(18)));
+      const mVault = `mockbox-${Date.now()}`;
+      const mSuGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
+      const mCsrf = cookieVal(mSuGet.headers.getSetCookie(), "parachute_id_csrf");
+      const mSu = await fetch(`${IDENTITY}/signup`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${mCsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: mCsrf!, email: mEmail, password: mPass }),
+      });
+      const mSession = cookieVal(mSu.headers.getSetCookie(), "parachute_id_session");
+      assert(mSu.status === 302 && !!mSession, "mock E2E: fresh signup → session", `status ${mSu.status}`);
+      const mCookie = `parachute_id_session=${mSession}; parachute_id_csrf=${mCsrf}`;
+
+      // The fresh free user's console shows the mock Upgrade buttons + label.
+      const mFreeCon = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: mCookie } })).text();
+      assert(
+        mFreeCon.includes('action="/billing/mock-checkout"') && mFreeCon.includes('data-testid="mock-billing-note"'),
+        "mock E2E: the fresh free user's console shows mock Upgrade buttons + 'test mode' label",
+      );
+
+      const mCv = await fetch(`${IDENTITY}/console/vaults`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: mCookie },
+        redirect: "manual",
+        body: form({ __csrf: mCsrf!, name: mVault }),
+      });
+      assert(mCv.status === 302 && (mCv.headers.get("location") ?? "").includes(`created=${mVault}`), "mock E2E: created a vault", `status ${mCv.status}`);
+
+      const mUp = await fetch(`${IDENTITY}/billing/mock-checkout`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: mCookie },
+        redirect: "manual",
+        body: form({ __csrf: mCsrf!, plan: "voice" }),
+      });
+      assert(
+        mUp.status === 302 && (mUp.headers.get("location") ?? "").includes("mock_upgraded=1"),
+        "mock E2E: mock-checkout(voice) → 302 mock_upgraded",
+        `status ${mUp.status} → ${mUp.headers.get("location")}`,
+      );
+      const mCon = await (await fetch(`${IDENTITY}/console?mock_upgraded=1`, { headers: { cookie: mCookie } })).text();
+      assert(
+        mCon.includes("Voice plan") && mCon.includes("Test purchase complete") && !mCon.includes('data-testid="upgrade-billing"'),
+        "mock E2E: console shows the Voice plan line + the test-purchase notice, Upgrade gone",
+      );
+
+      const mOwner = await authorizeFor(mEmail, mPass, mVault);
+      if (!mOwner.token) {
+        fail("mock E2E: the mock-upgraded user mints a token for their vault", mOwner.error ?? "no token");
+      } else {
+        const mAuth = { authorization: `Bearer ${mOwner.token}` };
+        const mLand = (await (await fetch(`${VAULT}/vault/${mVault}`, { headers: mAuth })).json()) as any;
+        assert(
+          mLand.transcription?.enabled === true && mLand.transcription?.minutes_remaining === 600,
+          "mock E2E: landing reports voice transcription enabled + 600 minutes_remaining",
+          JSON.stringify(mLand.transcription),
+        );
+        assert(
+          mLand.cap_bytes === 10 * 1024 * 1024 * 1024,
+          "mock E2E: landing cap_bytes reflects the Voice tier (10 GiB)",
+          `cap_bytes=${mLand.cap_bytes}`,
+        );
+
+        // Item 4: a REAL voice transcription now works for the mock-upgraded user.
+        const wav = readFileSync(join(HERE, "fixtures", "voice-smoke.wav"));
+        const mFd = new FormData();
+        mFd.set("file", new File([wav], "voice-smoke.wav", { type: "audio/wav" }));
+        const mUpload = await fetch(`${VAULT}/vault/${mVault}/api/storage/upload`, { method: "POST", headers: mAuth, body: mFd });
+        const mPath = ((await mUpload.json()) as any).path;
+        assert(mUpload.status === 201 && !!mPath, "mock E2E: uploaded the real-speech fixture", `status ${mUpload.status}`);
+        const mNote = (await (await fetch(`${VAULT}/vault/${mVault}/api/notes`, {
+          method: "POST",
+          headers: { ...mAuth, "content-type": "application/json" },
+          body: JSON.stringify({ content: "# 🎙️ Voice memo\n\n_Transcript pending._\n\n![[voice-smoke.wav]]\n" }),
+        })).json()) as { id: string };
+        const mLink = await fetch(`${VAULT}/vault/${mVault}/api/notes/${mNote.id}/attachments`, {
+          method: "POST",
+          headers: { ...mAuth, "content-type": "application/json" },
+          body: JSON.stringify({ path: mPath, mimeType: "audio/wav", transcribe: true }),
+        });
+        assert(mLink.status === 201, "mock E2E: linked the attachment with transcribe:true", `status ${mLink.status}`);
+        const mRun = await fetch(`${VAULT}/vault/${mVault}/__test/transcribe-run`, { method: "POST" });
+        const mRunBody = (await mRun.json()) as { processed: number };
+        assert(
+          mRun.status === 200 && mRunBody.processed >= 1,
+          "mock E2E: __test/transcribe-run drained the mock-upgraded user's transcription",
+          `status ${mRun.status} processed=${mRunBody.processed}`,
+        );
+        const mFinal = ((await (await fetch(`${VAULT}/vault/${mVault}/api/notes/${mNote.id}?include_content=true`, { headers: mAuth })).json()) as { content: string }).content;
+        assert(
+          !mFinal.includes("_Transcript pending._") &&
+            !mFinal.includes("_Transcription unavailable._") &&
+            !mFinal.includes("Monthly voice limit"),
+          "mock E2E: the mock-upgraded user's voice memo resolved to a REAL transcript",
+          mFinal.replace(/\n/g, " ").slice(0, 120),
+        );
+      }
     }
   }
 

@@ -286,6 +286,10 @@ async function renderConsoleFor(
       // today's deploy = the teaser stays and no billing UI exists).
       billingConfigured: deps.billingConfigured === true,
       voiceBillingConfigured: deps.voiceBillingConfigured === true,
+      // Interim MOCK path (mock-payments): non-prod + no real Stripe (or the
+      // explicit MOCK_BILLING flag). Upgrade buttons then POST the mock
+      // endpoint + a "test mode" label; ALWAYS false in production.
+      mockBillingEnabled: deps.mockBillingEnabled === true,
       hasBillingAccount: user.stripeCustomerId !== null,
       // At (or over — grandfathered) the plan's vault count: the create form
       // gives way to the friendly at-cap note. The POST handler is the real
@@ -335,11 +339,13 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
       ? `Snapshot restored into "${restoredVault}" — a new vault; the original is untouched. Heads up: v1 snapshots don't include attachment files, so notes and their attachment references are back but the files themselves aren't.`
       : packVault
       ? `Surface Starter added to ${packVault} — ask your connected AI to read it.`
-      : params.get("upgraded")
-        ? "Thanks — payment received. Your Parachute plan activates the moment Stripe's confirmation lands (usually seconds)."
-        : params.get("checkout_canceled")
-          ? "Checkout canceled — nothing changed."
-          : undefined;
+      : params.get("mock_upgraded")
+        ? `Test purchase complete — no real charge. You're on the ${PLAN_SPECS[user.plan].label} plan now (mock billing; the caps and any voice entitlement lifted exactly as a real payment would).`
+        : params.get("upgraded")
+          ? "Thanks — payment received. Your Parachute plan activates the moment Stripe's confirmation lands (usually seconds)."
+          : params.get("checkout_canceled")
+            ? "Checkout canceled — nothing changed."
+            : undefined;
   const error = BILLING_ERRORS[params.get("billing_err") ?? ""];
   return renderConsoleFor(db, req, deps, user, { notice, error });
 }

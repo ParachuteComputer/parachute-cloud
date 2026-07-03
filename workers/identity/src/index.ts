@@ -53,7 +53,7 @@ import { handleScheduled } from "./ops.ts";
 import { handleUnsubscribe, runDrip } from "./drip.ts";
 import { runSnapshotSweep } from "./snapshots.ts";
 import { runUsageRollup } from "./usage.ts";
-import { handleCheckoutPost, handlePortalPost } from "./billing.ts";
+import { handleCheckoutPost, handleMockCheckoutPost, handlePortalPost } from "./billing.ts";
 import { handleStripeWebhookPost } from "./billing-webhook.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
@@ -150,6 +150,17 @@ app.post("/admin/users/suspend", (c) => handleAdminSuspendPost(c.env.DB, c.req.r
 app.post("/billing/checkout", (c) => handleCheckoutPost(c.env, c.req.raw, depsFor(c.env)));
 app.post("/billing/portal", (c) => handlePortalPost(c.env, c.req.raw, depsFor(c.env)));
 app.post("/billing/webhook", (c) => handleStripeWebhookPost(c.env, c.req.raw, depsFor(c.env)));
+// Interim MOCK checkout (mock-payments PR) — the demo path before real Stripe
+// keys land. HARD-gated to non-production via mockBillingEnabled: this route
+// 404s (like the __test/* hooks) whenever mock is off, so a free self-upgrade
+// can NEVER be reached in production (pinned by a test + smoke-prod). When mock
+// is active, the same session + CSRF + same-origin boundary as the real
+// checkout, reusing the real post-payment lifecycle (billing.ts).
+app.post("/billing/mock-checkout", (c) => {
+  const deps = depsFor(c.env);
+  if (deps.mockBillingEnabled !== true) return c.notFound();
+  return handleMockCheckoutPost(c.env.DB, c.req.raw, deps);
+});
 
 // --- magic-link sign-in + second factor ---
 app.post("/auth/magic", (c) => handleMagicRequestPost(c.env.DB, c.req.raw, depsFor(c.env), senderFor(c.env)));

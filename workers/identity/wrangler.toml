@@ -139,6 +139,15 @@ OPERATOR_ALERT_EMAIL = "ag@unforced.org"
 #   does NOT block Parachute billing; set once the Voice Price exists and the
 #   voice Upgrade button + voice checkout light up on their own.
 # STRIPE_PRICE_VOICE_MONTHLY = "price_..."
+# --- interim MOCK billing (mock-payments PR) ----------------------------------
+# The mock checkout demos the full upgrade → cap/voice-lift flow BEFORE real
+# Stripe keys land. It is HARD-gated to non-production (billing-config.ts
+# mockBillingEnabled): ENVIRONMENT="production" here means the mock is ALWAYS
+# off and /billing/mock-checkout 404s — a free self-upgrade is unreachable in
+# prod (pinned by a test + smoke-prod). So there is NOTHING to set here: MOCK_BILLING
+# is intentionally NOT declared in this production block. It auto-activates only
+# on non-prod deploys with no real Stripe (staging), and goes inert the moment
+# real keys land. (MOCK_BILLING="1" is an optional non-prod-only override.)
 
 # --- outbound email (Cloudflare Email Sending) ------------------------------
 # Cloudflare Email Sending (public beta, Workers Paid). parachute.computer was
@@ -219,6 +228,14 @@ OPERATOR_ALERT_EMAIL = "ag@unforced.org"
 # STRIPE_PRICE_PARACHUTE_MONTHLY = "price_..."
 # STRIPE_PRICE_PARACHUTE_YEARLY = "price_..."
 # STRIPE_PRICE_VOICE_MONTHLY = "price_..."   # $5/mo Voice tier (cloud#56; additive)
+# Interim MOCK billing (mock-payments PR): staging has no Stripe keys and
+# ENVIRONMENT="staging" (!= production), so the mock checkout AUTO-ACTIVATES
+# here — the console's Upgrade buttons drive /billing/mock-checkout and the
+# full cap/voice-lift flow is demoable now, no live charge. Nothing to set: the
+# moment the TEST-mode Stripe keys above are uncommented + set, the mock goes
+# inert and the real Checkout path takes over (no code change). MOCK_BILLING="1"
+# would force the mock ON even alongside real keys (staging-only demo escape
+# hatch) — normally leave it unset.
 
 # Workers Logs for staging too (explicit per-env restatement; see the top-level
 # [observability] note).

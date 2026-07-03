@@ -59,14 +59,23 @@ function sessionCookie(sessionId: string): string {
   return `parachute_id_csrf=${CSRF}; parachute_id_session=${sessionId}`;
 }
 
-async function consoleHtml(sessionId: string): Promise<string> {
+async function consoleHtml(sessionId: string, testEnv: typeof env = env): Promise<string> {
   const res = await app.fetch(
     new Request(`${ISSUER}/console`, { headers: { cookie: sessionCookie(sessionId) } }),
-    env,
+    testEnv,
   );
   expect(res.status).toBe(200);
   return res.text();
 }
+
+/**
+ * PRODUCTION env (no Stripe): the plain test env pins ENVIRONMENT="test", which
+ * auto-enables the interim mock billing path (billing-config.ts) — so a free
+ * user's console now shows mock Upgrade buttons, NOT the teaser. The teaser is
+ * the PRODUCTION-no-keys state; render it under a prod env. (The mock path is
+ * pinned in mock-billing.test.ts.)
+ */
+const PROD_ENV = { ...env, ENVIRONMENT: "production" };
 
 async function vaultRowCount(userId: string): Promise<number> {
   const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM vaults WHERE owner_user_id = ?")
@@ -145,10 +154,10 @@ describe("plan defaults", () => {
 // --- console rendering (from PLAN_SPECS) --------------------------------------
 
 describe("console plan display", () => {
-  test("free user: the plan line + the Parachute teaser render from PLAN_SPECS", async () => {
+  test("free user (prod, no keys): the plan line + the Parachute teaser render from PLAN_SPECS", async () => {
     const { id } = await seedUser("planline@example.com");
     await seedVault("planline-box", id);
-    const html = await consoleHtml(await seedSession(id));
+    const html = await consoleHtml(await seedSession(id), PROD_ENV);
     expect(html).toContain('data-testid="plan-line"');
     expect(html).toContain("Free plan — 1 vault, 100 MB");
     expect(html).toContain("$3/mo or $30/yr");

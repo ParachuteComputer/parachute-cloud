@@ -542,6 +542,14 @@ export interface ConsoleProps {
   /** Voice Stripe Price present too → free users also see the $5 Voice Upgrade
    *  button (cloud#56). Additive to `billingConfigured`. */
   voiceBillingConfigured?: boolean;
+  /**
+   * Interim MOCK billing active (billing-config.ts `mockBillingEnabled`):
+   * non-prod + no real Stripe (or MOCK_BILLING=1). Free users get the Upgrade
+   * buttons wired to the mock endpoint + a "test mode" label; both tiers are
+   * offered (the mock applies any tier). Takes precedence over the teaser and,
+   * when set, over the real Checkout action. ALWAYS false in production.
+   */
+  mockBillingEnabled?: boolean;
   /** The user has a Stripe customer (false for comped parachute accounts). */
   hasBillingAccount?: boolean;
 }
@@ -798,6 +806,7 @@ export function renderConsole(props: ConsoleProps): string {
     isOperator,
     billingConfigured,
     voiceBillingConfigured,
+    mockBillingEnabled,
     hasBillingAccount,
   } = props;
   // Plan display. The across-vaults usage total (latest rollup rows) rides the
@@ -811,28 +820,43 @@ export function renderConsole(props: ConsoleProps): string {
     totalUsedBytes != null
       ? ` <span data-testid="usage-total">&middot; Using ${esc(formatUsageBytes(totalUsedBytes))}</span>`
       : "";
-  const upgradeHtml =
-    plan === "free" && billingConfigured
-      ? `<form class="inline" method="post" action="/billing/checkout" data-testid="upgrade-billing" style="margin-left:.35rem">
+  // A free user's Upgrade has THREE clean states, mutually exclusive:
+  //   1. MOCK    (mockBillingEnabled — non-prod, no real Stripe / MOCK_BILLING=1):
+  //      the buttons POST the mock endpoint + a "test mode — no real charge"
+  //      label, so the caps/voice-lift flow is demoable now with no live charge.
+  //      Both tiers offered (the mock applies any tier).
+  //   2. REAL    (billingConfigured): the buttons POST hosted Checkout (#63);
+  //      the Voice button needs the Voice Price too (voiceBillingConfigured).
+  //   3. NEITHER (prod, no keys — today's deploy): the copy-only teaser.
+  // Mock wins when active (non-prod only); when real keys land without
+  // MOCK_BILLING the mock goes inert and REAL takes over with no code change.
+  const showParachuteUpgrade = plan === "free" && (mockBillingEnabled || billingConfigured);
+  const checkoutAction = mockBillingEnabled ? "/billing/mock-checkout" : "/billing/checkout";
+  // Voice: the real path needs the Voice Price configured; the mock applies any
+  // tier, so it always offers voice.
+  const showVoiceUpgrade = plan === "free" && (mockBillingEnabled || voiceBillingConfigured);
+  const mockNoteHtml =
+    plan === "free" && mockBillingEnabled
+      ? ` <span class="muted" data-testid="mock-billing-note">&middot; test mode &mdash; no real charge</span>`
+      : "";
+  const upgradeHtml = showParachuteUpgrade
+    ? `<form class="inline" method="post" action="${checkoutAction}" data-testid="upgrade-billing" style="margin-left:.35rem">
            <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
            <span style="opacity:.85">&middot; ${esc(PLAN_SPECS.parachute.label)}: ${PLAN_SPECS.parachute.vault_count} vaults, ${esc(formatPlanBytes(PLAN_SPECS.parachute.total_bytes))} —</span>
            <button class="linkbtn" type="submit" name="interval" value="monthly">Upgrade &mdash; ${esc(PARACHUTE_PRICE_MONTHLY_LABEL)}</button>
            <span class="muted">or</span>
            <button class="linkbtn" type="submit" name="interval" value="yearly">${esc(PARACHUTE_PRICE_YEARLY_LABEL)}</button>
          </form>`
-      : "";
+    : "";
   // The $5 Voice tier Upgrade (cloud#56) — voice transcription; monthly only.
-  // Renders alongside the Parachute Upgrade for free users, only when the Voice
-  // Stripe Price is configured (voiceBillingConfigured).
-  const voiceUpgradeHtml =
-    plan === "free" && voiceBillingConfigured
-      ? `<form class="inline" method="post" action="/billing/checkout" data-testid="upgrade-voice" style="margin-left:.35rem">
+  const voiceUpgradeHtml = showVoiceUpgrade
+    ? `<form class="inline" method="post" action="${checkoutAction}" data-testid="upgrade-voice" style="margin-left:.35rem">
            <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
            <input type="hidden" name="plan" value="voice">
            <span style="opacity:.85">&middot; ${esc(PLAN_SPECS.voice.label)}: voice transcription —</span>
            <button class="linkbtn" type="submit">Upgrade &mdash; ${esc(VOICE_PRICE_MONTHLY_LABEL)}</button>
          </form>`
-      : "";
+    : "";
   const manageBillingHtml =
     isPaidPlan(plan) && billingConfigured && hasBillingAccount
       ? ` <form class="inline" method="post" action="/billing/portal" data-testid="manage-billing">
@@ -841,10 +865,10 @@ export function renderConsole(props: ConsoleProps): string {
          </form>`
       : "";
   const teaserHtml =
-    plan === "free" && !billingConfigured
+    plan === "free" && !billingConfigured && !mockBillingEnabled
       ? ` <span style="opacity:.75">&middot; ${esc(parachuteTeaser())}</span>`
       : "";
-  const planHtml = `${esc(planLine(plan))}${usageHtml}${teaserHtml}${upgradeHtml}${voiceUpgradeHtml}${manageBillingHtml}`;
+  const planHtml = `${esc(planLine(plan))}${usageHtml}${teaserHtml}${upgradeHtml}${voiceUpgradeHtml}${mockNoteHtml}${manageBillingHtml}`;
   // The Admin link renders ONLY for operators — everyone else never learns the
   // route exists (it answers 404 to them anyway; admin.ts).
   const header = (title: string) => `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">

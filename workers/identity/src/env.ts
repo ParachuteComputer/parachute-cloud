@@ -72,6 +72,15 @@ export interface Env {
    */
   STRIPE_PRICE_VOICE_MONTHLY?: string;
   /**
+   * Interim MOCK-billing opt-in (the demo path before real Stripe keys land).
+   * "1" forces the mock checkout ON — but ONLY in a non-production environment
+   * (billing-config.ts `mockBillingEnabled` hard-gates on ENVIRONMENT !==
+   * "production", so this flag can NEVER activate mock in prod). Normally left
+   * unset: the mock auto-activates on any non-prod deploy that has no real
+   * Stripe config, and stays inert the moment real keys land. See wrangler.toml.
+   */
+  MOCK_BILLING?: string;
+  /**
    * Service binding to the vault worker — STAGING ONLY today. Staging's
    * VAULT_ORIGIN is a workers.dev URL, which is not a valid subrequest target
    * from inside a Worker (the platform answers 404 without ever routing to the

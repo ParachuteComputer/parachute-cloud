@@ -41,6 +41,8 @@ import { sessionUser } from "./session-user.ts";
 import { billingConfig, billingNotConfiguredResponse } from "./billing-config.ts";
 import { makeStripe } from "./stripe-client.ts";
 import { type PlanId, isPaidPlan } from "./plans.ts";
+import { setUserPlan } from "./users.ts";
+import { applyPlanToVaults } from "./vault-call.ts";
 
 export interface BillingOverrides {
   stripe?: Stripe;
@@ -132,6 +134,60 @@ export async function handleCheckoutPost(
     );
     return redirectResponse("/console?billing_err=stripe");
   }
+}
+
+/**
+ * POST /billing/mock-checkout — the INTERIM mock payment path (non-production
+ * only; see billing-config.ts `mockBillingEnabled`). SIMULATES a successful
+ * Stripe payment by reusing the EXACT post-payment lifecycle a real webhook
+ * runs — `setUserPlan` + `applyPlanToVaults` (the storage caps + voice
+ * entitlement lift IDENTICALLY to `checkout.session.completed`,
+ * billing-lifecycle.ts) — then redirects to /console with a test-purchase
+ * notice. The ONLY thing the mock skips is Stripe's payment confirmation.
+ *
+ * SECURITY (the load-bearing constraint): hard-gated on `deps.mockBillingEnabled`
+ * — a free self-upgrade in production would be a disaster. The route wiring
+ * (index.ts) 404s this endpoint before the handler when mock is off (the
+ * __test/* posture; production is always off); this handler re-checks the gate
+ * as a defense-in-depth backstop, returning the same router-shaped 404.
+ *
+ * TRUST BOUNDARY: identical to the real /billing/checkout — session + CSRF +
+ * same-origin. `already` guards a second "purchase" for a paid/comped user.
+ */
+export async function handleMockCheckoutPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  // Belt + suspenders in code too: never apply a mock upgrade unless mock is
+  // active. 404 (not 503/redirect) so the endpoint is indistinguishable from a
+  // non-existent route wherever mock is off (production, or real Stripe live).
+  if (deps.mockBillingEnabled !== true) {
+    return new Response("404 Not Found", { status: 404, headers: { "content-type": "text/plain; charset=UTF-8" } });
+  }
+
+  const user = await sessionUser(db, req, deps);
+  if (!user) return redirectResponse("/login");
+  const form = await req.formData();
+  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+    return redirectResponse("/console?billing_err=session");
+  }
+  const plan = checkoutPlan(String(form.get("plan") ?? "parachute"));
+  if (isPaidPlan(user.plan)) {
+    // Already paid/comped — the real flow refuses a second checkout here too.
+    return redirectResponse("/console?billing_err=already");
+  }
+
+  // Apply the plan through the REAL lifecycle code (NOT a fork): flip the plan,
+  // then push the plan's caps + voice entitlement into every owned vault DO —
+  // the exact seam checkout.session.completed calls. Best-effort per vault
+  // (vault-call.ts); a miss reconciles via the backfill script / next change.
+  await setUserPlan(db, user.id, plan);
+  const results = await applyPlanToVaults(db, deps, user.id);
+  const failed = results.filter((r) => !r.ok);
+  if (failed.length > 0) {
+    console.warn(
+      `event=mock_checkout_cap_push_partial user=${user.id} plan=${plan} failed=${failed.map((f) => f.vault).join(",")}`,
+    );
+  }
+  console.log(`event=mock_checkout_upgraded user=${user.id} plan=${plan} vaults=${results.length}`);
+  return redirectResponse("/console?mock_upgraded=1");
 }
 
 /**

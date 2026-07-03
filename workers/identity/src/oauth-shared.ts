@@ -9,7 +9,7 @@
  * the Worker (index.ts) calls them with the request-time deps.
  */
 import { VAULT_VERBS } from "./audience.ts";
-import { billingConfig } from "./billing-config.ts";
+import { billingConfig, mockBillingEnabled } from "./billing-config.ts";
 import type { Env } from "./env.ts";
 import type { RateLimiterNamespace } from "./rate-limit.ts";
 
@@ -57,6 +57,14 @@ export interface OAuthDeps {
   /** True when billing is configured AND the Voice Stripe Price is set — the
    *  console renders the $5 Voice Upgrade button only then (cloud#56). */
   voiceBillingConfigured?: boolean;
+  /**
+   * True when the interim MOCK billing path is active (billing-config.ts
+   * `mockBillingEnabled`): non-production AND (no real Stripe OR MOCK_BILLING=1).
+   * The console's Upgrade buttons then POST the mock checkout endpoint instead
+   * of hosted Checkout, and the mock endpoint's own hard gate reads this.
+   * ALWAYS false in production — the mock 404s there.
+   */
+  mockBillingEnabled?: boolean;
 }
 
 /**
@@ -93,6 +101,7 @@ export function depsForEnv(env: Env): OAuthDeps {
     rateLimiter: env.RATE_LIMITER,
     billingConfigured: billingConfig(env) !== null,
     voiceBillingConfigured: billingConfig(env)?.priceVoiceMonthly != null,
+    mockBillingEnabled: mockBillingEnabled(env),
     // Service binding when bound (staging — workers.dev origins aren't valid
     // subrequest targets); else the handlers fall back to global fetch.
     ...(env.VAULT_SERVICE ? { vaultFetch: env.VAULT_SERVICE.fetch.bind(env.VAULT_SERVICE) } : {}),
