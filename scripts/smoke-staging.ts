@@ -1,21 +1,31 @@
 #!/usr/bin/env bun
 /**
- * smoke-dev.ts — end-to-end smoke against the DEPLOYED dev workers.
+ * smoke-staging.ts — FULL end-to-end smoke against the DEPLOYED STAGING workers
+ * ([env.staging] — workers.dev URLs, own D1/R2/DOs; scripts/deploy-staging.sh).
  *
- * Walks the whole "connect your AI + use the vault" path against the live
- * Unforced Development deploy (workers.dev + path routing):
+ * Walks the whole "connect your AI + use the vault" path:
  *
  *   identity discovery → DCR → login → consent → token (real RS256 JWT)
  *   → vault REST create/read/update → MCP initialize/tools.list/tools.call
- *   → SSE snapshot → portable-md export tarball (unpacked + checked).
+ *   → SSE snapshot → portable-md export tarball (unpacked + checked)
+ *   → console signup/vault-claim/ownership refusal → login throttle
+ *   → magic-link + TOTP.
+ *
+ * This smoke CREATES accounts + vaults — that's what staging is for; NEVER
+ * point it at production (scripts/smoke-prod.ts is the read-only prod check).
+ * The magic-link steps REQUIRE the `x-parachute-dev-magic-link` echo header,
+ * which staging emits deterministically: ENVIRONMENT="staging" turns the echo
+ * on, and staging identity has no send_email binding (dev-log sender, so no
+ * real email is sent either).
  *
  * Re-runnable: each run uses a unique marker so assertions don't collide with
  * prior runs' notes (the DO is persistent). Reads the dev login credential from
- * workers/identity/.dev-secrets (gitignored). Prints every URL + literal result
- * and exits non-zero on the first failure.
+ * workers/identity/.dev-secrets (gitignored — the same dev user is seeded into
+ * staging by deploy-staging.sh). Prints every URL + literal result and exits
+ * non-zero on the first failure.
  *
- *   bun scripts/smoke-dev.ts
- *   IDENTITY=<url> VAULT=<url> VAULT_NAME=demo bun scripts/smoke-dev.ts
+ *   bun scripts/smoke-staging.ts
+ *   IDENTITY=<url> VAULT=<url> VAULT_NAME=demo bun scripts/smoke-staging.ts
  */
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -23,8 +33,8 @@ import { fileURLToPath } from "node:url";
 import { totpCodeAt } from "../workers/identity/src/totp.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const IDENTITY = (process.env.IDENTITY ?? "https://cloud.parachute.computer").replace(/\/$/, "");
-const VAULT = (process.env.VAULT ?? "https://u.parachute.computer").replace(/\/$/, "");
+const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.unforced.workers.dev").replace(/\/$/, "");
+const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.unforced.workers.dev").replace(/\/$/, "");
 const VAULT_NAME = process.env.VAULT_NAME ?? "demo";
 const REDIRECT_URI = "http://localhost:8976/callback";
 const MARKER = `smoke-${Date.now()}`;
@@ -340,9 +350,11 @@ async function main() {
     assert(/too many attempts/i.test(lastLogin), "login throttle locks a hammered account", "");
   }
 
-  // 10. Magic-link sign-in (the passwordless default). The dev deploy echoes the
-  //     link in an `x-parachute-dev-magic-link` header (ENVIRONMENT=development),
-  //     so we can complete the flow without an inbox.
+  // 10. Magic-link sign-in (the passwordless default). Staging echoes the link
+  //     in an `x-parachute-dev-magic-link` header (ENVIRONMENT=staging) and has
+  //     no send_email binding, so we complete the flow without an inbox and
+  //     without sending real email. The echo header is REQUIRED here — its
+  //     absence means staging is misconfigured (e.g. ENVIRONMENT=production).
   {
     const magicEmail = `magic+${Date.now()}@example.com`;
     const lg = await fetch(`${IDENTITY}/login`, { redirect: "manual" });

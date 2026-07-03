@@ -1,7 +1,14 @@
 # Cloud Identity Worker — the authorization server for cloud vaults.
 # Reproduces the hub's OAuth issuer contract (authorize / token / register /
-# revoke / JWKS / revocation-list) on Workers + D1. DEPLOYED to the Unforced
-# Development account (Phase 5a, 2026-07-02) — see scripts/deploy-dev.sh + TRYIT-2026-07-02.md.
+# revoke / JWKS / revocation-list) on Workers + D1. Deployed to the Unforced
+# Development account since Phase 5a (2026-07-02) — see TRYIT-2026-07-02.md.
+#
+# ENVIRONMENTS: the TOP LEVEL of this file IS production (scripts/deploy-prod.sh;
+# custom domain cloud.parachute.computer). It cannot move into an [env.production]
+# because named envs auto-suffix the worker name (parachute-identity-production
+# would be a NEW worker) — deploying it would strand/detach the Custom Domain
+# from the worker that actually holds it. Staging lives in [env.staging] below
+# (scripts/deploy-staging.sh; workers.dev only).
 name = "parachute-identity"
 main = "src/index.ts"
 compatibility_date = "2025-07-01"
@@ -51,11 +58,14 @@ VAULT_BASE_DOMAIN = "u.parachute.computer"
 # the single branded host (no wildcard subdomain cert yet). Drives the services
 # catalog + the console connect cards.
 VAULT_ORIGIN = "https://u.parachute.computer"
-# Deployment environment. NOT "production" here (this is the dev account), so the
-# magic-link send echoes the link in an `x-parachute-dev-magic-link` response
-# header — that's how smoke-dev.ts + manual testing complete the flow without a
-# real inbox. A public/prod deploy MUST set this to "production" (drops the echo).
-ENVIRONMENT = "development"
+# Deployment environment. "production" here (the top level IS the production
+# deploy, on the live custom domain): the magic-link send NEVER echoes the link
+# in the `x-parachute-dev-magic-link` response header. Headless/smoke testing of
+# the magic-link flow happens on STAGING ([env.staging] below, ENVIRONMENT
+# "staging"), where the echo header is on and the email sender falls back to
+# dev-log (no send_email binding there). Tests pin their own value in
+# vitest.config.ts (miniflare bindings), so this var doesn't affect the suite.
+ENVIRONMENT = "production"
 # FROM address for magic-link email. Its domain must be onboarded to Cloudflare
 # Email Sending before real sends succeed (see the send_email binding note below).
 EMAIL_FROM = "noreply@parachute.computer"
@@ -71,3 +81,42 @@ EMAIL_FROM = "noreply@parachute.computer"
 # a production deploy (ENVIRONMENT="production") never emits the header.
 [[send_email]]
 name = "EMAIL"
+
+# =============================================================================
+# STAGING — `wrangler deploy -e staging` → worker "parachute-identity-staging"
+# (named envs auto-suffix the name), served ONLY at its workers.dev URL. Own D1,
+# echo header ON (ENVIRONMENT != "production"), and DELIBERATELY no send_email
+# binding: bindings are non-inheritable, so staging's sender is the dev-log
+# fallback — POST /auth/magic sends no real email and the echo header is the
+# deterministic way smoke-staging.ts completes the flow.
+# Deploy via scripts/deploy-staging.sh; smoke via bun scripts/smoke-staging.ts.
+# =============================================================================
+[env.staging]
+workers_dev = true
+# `routes` IS inheritable — without this override a staging deploy would adopt
+# the production [[routes]] custom domain (Custom Domains attach to exactly one
+# worker, so parachute-identity-staging would DETACH cloud.parachute.computer
+# from production). An explicit empty list keeps staging on workers.dev only.
+routes = []
+
+# Staging's own control-plane D1 (created 2026-07-02 via
+# `wrangler d1 create parachute-identity-staging`). Same migrations dir; the
+# deploy script applies migrations + seeds the dev user here.
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "parachute-identity-staging"
+database_id = "e1079d62-b571-4647-a333-ab4fd902d80d"
+migrations_dir = "migrations"
+
+# vars are non-inheritable: restate the full set, pointed at the staging
+# workers.dev origins. ISSUER is staging's own origin (tokens minted here carry
+# iss=<staging identity>, and the staging vault worker's ISSUER_ORIGIN matches).
+[env.staging.vars]
+ISSUER = "https://parachute-identity-staging.unforced.workers.dev"
+VAULT_BASE_DOMAIN = "parachute-vault-do-staging.unforced.workers.dev"
+VAULT_ORIGIN = "https://parachute-vault-do-staging.unforced.workers.dev"
+ENVIRONMENT = "staging"
+EMAIL_FROM = "noreply@parachute.computer"
+
+# (no [[env.staging.send_email]] — see the staging banner above; the omission is
+# the point: dev-log sender + echo header = deterministic headless testing.)

@@ -1,7 +1,14 @@
 # Vault DO + edge router — the wire contract on Durable Objects (Phase 2).
 # Tests drive it via @cloudflare/vitest-pool-workers inside workerd; typecheck
-# via tsc. Deployed to the Unforced Development CF account (dev) via
-# scripts/deploy-dev.sh — see that script + workers/vault/README.md.
+# via tsc. Deployed to the Unforced Development CF account — see
+# workers/vault/README.md.
+#
+# ENVIRONMENTS: the TOP LEVEL of this file IS production (scripts/deploy-prod.sh;
+# custom domain u.parachute.computer). It cannot move into an [env.production]
+# because named envs auto-suffix the worker name (parachute-vault-do-production
+# would be a NEW worker — with FRESH, EMPTY Durable Objects) — deploying it would
+# detach the Custom Domain AND orphan every existing vault DO. Staging lives in
+# [env.staging] below (scripts/deploy-staging.sh; workers.dev only).
 #
 # BUNDLING (the `.js`→`.ts` question): `@openparachute/core` is raw TypeScript
 # whose internal imports use `.js` specifiers pointing at sibling `.ts` files
@@ -51,9 +58,10 @@ tag = "v1"
 new_sqlite_classes = ["VaultDO"]
 
 # Attachment bytes + (later) export tarballs. Keys: vault-<name>/attachments/...
-# Dev bucket in the Unforced Development account (created via `wrangler r2 bucket
-# create parachute-vault-dev`). vitest ignores bucket_name (local R2 sim by
-# binding). A real prod deploy adds an [env.production] with its own bucket.
+# The PRODUCTION bucket (created via `wrangler r2 bucket create parachute-vault-dev`
+# back when this deploy was "dev"; the name is grandfathered — it holds the live
+# data, so it stays). vitest ignores bucket_name (local R2 sim by binding).
+# Staging has its own bucket in [env.staging] below.
 [[r2_buckets]]
 binding = "ATTACHMENTS"
 bucket_name = "parachute-vault-dev"
@@ -70,8 +78,50 @@ ISSUER_ORIGIN = "https://cloud.parachute.computer"
 VAULT_BASE_DOMAIN = "u.parachute.computer"
 # Default per-tenant storage cap (bytes). 1 GiB. Overridable per-DO in config.
 CAP_BYTES = "1073741824"
+# Deployment environment. "production" makes the TEST_JWKS double-gate in
+# src/auth.ts fully inert (it requires ENVIRONMENT="test" AND a TEST_JWKS var —
+# now neither holds). Tests pin ENVIRONMENT="test" in vitest.config.ts bindings.
+ENVIRONMENT = "production"
 
 # A single incoming request's CPU budget resets per message; a large import that
 # arrives as one request may exceed the 30s default. Raise the ceiling.
+# (`limits` is inheritable — staging gets this too.)
 [limits]
 cpu_ms = 300000
+
+# =============================================================================
+# STAGING — `wrangler deploy -e staging` → worker "parachute-vault-do-staging"
+# (named envs auto-suffix the name), served ONLY at its workers.dev URL, with its
+# own (empty) DO namespace + its own R2 bucket. Top-level [[migrations]] +
+# [alias] + [limits] apply here too (top-level-only / inheritable keys).
+# Deploy via scripts/deploy-staging.sh; smoke via bun scripts/smoke-staging.ts.
+# =============================================================================
+[env.staging]
+workers_dev = true
+# `routes` IS inheritable — without this override a staging deploy would adopt
+# the production [[routes]] custom domain (Custom Domains attach to exactly one
+# worker, so parachute-vault-do-staging would DETACH u.parachute.computer from
+# production). An explicit empty list keeps staging on workers.dev only.
+routes = []
+
+# Bindings are non-inheritable: restate the DO + R2 bindings. Same class, but a
+# DIFFERENT worker → a completely separate (fresh) set of Durable Objects.
+[[env.staging.durable_objects.bindings]]
+name = "VAULT"
+class_name = "VaultDO"
+
+# Staging's own attachment/export bucket (created 2026-07-02 via
+# `wrangler r2 bucket create parachute-vault-staging`).
+[[env.staging.r2_buckets]]
+binding = "ATTACHMENTS"
+bucket_name = "parachute-vault-staging"
+
+# vars are non-inheritable: restate the full set. ISSUER_ORIGIN MUST equal the
+# staging identity worker's ISSUER ([env.staging.vars] in
+# workers/identity/wrangler.toml) — staging vaults trust the STAGING issuer.
+[env.staging.vars]
+ISSUER_ORIGIN = "https://parachute-identity-staging.unforced.workers.dev"
+VAULT_BASE_DOMAIN = "parachute-vault-do-staging.unforced.workers.dev"
+CAP_BYTES = "1073741824"
+# "staging" ≠ "test": the TEST_JWKS double-gate stays closed here too.
+ENVIRONMENT = "staging"

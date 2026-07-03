@@ -7,9 +7,12 @@
  * which runs this generator then applies `scripts/seed-dev-user.sql` to the
  * local D1 via wrangler. The PBKDF2 parameters here MUST match `src/users.ts`
  * (`pbkdf2$sha256$100000$<salt>$<derived>`) so the verifier accepts the hash.
+ * deploy-staging.sh also runs it against the STAGING D1 (staging seeds the same
+ * dev user + demo vault so smoke-staging.ts can log in).
  *
- * Never run against a production database — this is a local-dev convenience for
- * exercising the browser login + consent flow against a real client.
+ * Never run against the PRODUCTION database (deploy-prod.sh deliberately has no
+ * seed step): the INSERT OR REPLACE below would rotate the live operator
+ * credentials as a deploy side effect.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -63,10 +66,10 @@ const passwordHash = await hashPassword(password);
 const createdAt = new Date().toISOString();
 const esc = (s: string) => s.replace(/'/g, "''");
 
-// Grandfather the existing `demo` vault (used by scripts/smoke-dev.ts + TRYIT)
-// to the dev user. `demo` is a RESERVED name (vaults.ts) so it can't be claimed
-// via the console — this seed is the only way it gets an owner, which keeps the
-// dev smoke's demo vault mintable now that ownership is enforced. A migration
+// Grandfather the existing `demo` vault (used by scripts/smoke-staging.ts +
+// TRYIT) to the dev user. `demo` is a RESERVED name (vaults.ts) so it can't be
+// claimed via the console — this seed is the only way it gets an owner, which
+// keeps the smoke's demo vault mintable now that ownership is enforced. A migration
 // can't do this: the dev user's id isn't known at migration time (migrations run
 // before this seed on the deployed D1).
 // email_verified = 1: the dev address is known/owned, and INSERT OR REPLACE would
