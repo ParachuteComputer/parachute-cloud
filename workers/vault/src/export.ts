@@ -32,6 +32,59 @@ interface TarEntry {
   bytes: Uint8Array;
 }
 
+// ---------------------------------------------------------------------------
+// Export-tarball retention (R2 GC)
+// ---------------------------------------------------------------------------
+
+/**
+ * How many export tarballs to retain per vault. Every `GET /api/export` writes
+ * a tarball under `vault-<name>/exports/`; after each successful write the DO
+ * prunes all but the newest EXPORT_KEEP, so on-demand + nightly exports can't
+ * grow R2 storage/COGS unbounded (closes the pre-deploy TODO in vault-do.ts).
+ * Simple keep-last-N is deliberate: a future snapshot system layers a GFS
+ * retention manifest over `vault-<name>/snapshots/` — a SEPARATE prefix this
+ * prune never touches.
+ */
+export const EXPORT_KEEP = 5;
+
+/** The R2 key prefix export tarballs live under — one place, so the write path
+ *  and the prune path can't drift apart. */
+export function exportPrefix(vaultName: string): string {
+  return `vault-${vaultName}/exports/`;
+}
+
+/**
+ * Prune a vault's export tarballs down to the newest `keep`. Returns the keys
+ * it deleted (for the caller's log line + tests).
+ *
+ * "Newest" = greatest R2 key: keys embed the export timestamp (fixed-width
+ * ISO-8601 with `:`/`.` mapped to `-`), so lexicographic key order is
+ * chronological order for everything this system writes.
+ *
+ * Metering: export tarballs are deliberately NOT counted in the `r2_bytes`
+ * cap meter (the export write path never calls `meterAdd` — exports are
+ * operational backup artifacts, not user content, so they must not eat the
+ * tenant's storage quota). Pruning therefore does NOT `meterSub`, keeping the
+ * meter consistent in both directions. The conformance suite pins this.
+ */
+export async function pruneExportTarballs(bucket: R2Bucket, vaultName: string, keep = EXPORT_KEEP): Promise<string[]> {
+  const prefix = exportPrefix(vaultName);
+  const keys: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, ...(cursor ? { cursor } : {}) });
+    for (const obj of page.objects) keys.push(obj.key);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  keys.sort();
+  const stale = keys.slice(0, Math.max(0, keys.length - keep));
+  // R2 bulk delete caps at 1000 keys per call.
+  for (let i = 0; i < stale.length; i += 1000) {
+    await bucket.delete(stale.slice(i, i + 1000));
+  }
+  return stale;
+}
+
 /**
  * In-DO `ExportSink` that collects the engine's writes in emission order. A
  * key-addressed namespace is always case-sensitive (no fs collision path);

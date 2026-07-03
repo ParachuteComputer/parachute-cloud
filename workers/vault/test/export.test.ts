@@ -1,6 +1,7 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
+import { EXPORT_KEEP, exportPrefix } from "../src/export.ts";
 
 /**
  * Portable-markdown export conformance (design §3.3). The no-lock-in promise:
@@ -92,6 +93,62 @@ describe("export — same core seam (byte identity)", () => {
     const b = new Uint8Array(await (await op(v, `/api/export?exported_at=${FIXED}`)).arrayBuffer());
     expect(a.length).toBe(b.length);
     expect([...a]).toEqual([...b]);
+  });
+});
+
+describe("export — tarball retention (R2 GC)", () => {
+  /** Deterministic "clock": distinct fixed exported_at stamps, in order. The
+   *  handler derives the R2 key from exported_at, so these ARE the timeline. */
+  const stamp = (i: number) => `2026-07-02T00:00:${String(i).padStart(2, "0")}.000Z`;
+  const keyFor = (v: string, s: string) => `${exportPrefix(v)}${s.replace(/[:.]/g, "-")}.tar`;
+
+  it(`export EXPORT_KEEP+2 times → exactly EXPORT_KEEP tarballs remain, newest kept`, async () => {
+    const v = freshVault();
+    await seed(v);
+    const stamps = Array.from({ length: EXPORT_KEEP + 2 }, (_, i) => stamp(i));
+    for (const s of stamps) {
+      const res = await op(v, `/api/export?exported_at=${s}`);
+      expect(res.status).toBe(200);
+    }
+    const listed = await env.ATTACHMENTS.list({ prefix: exportPrefix(v) });
+    const keys = listed.objects.map((o) => o.key).sort();
+    // Exactly EXPORT_KEEP survive, and they are the NEWEST EXPORT_KEEP.
+    expect(keys).toEqual(stamps.slice(-EXPORT_KEEP).map((s) => keyFor(v, s)));
+  });
+
+  it("prune touches only exports/ — attachments in the same vault survive", async () => {
+    const v = freshVault();
+    await seed(v);
+    const form = new FormData();
+    form.set("file", new File([new Uint8Array([9, 9, 9])], "keep.png", { type: "image/png" }));
+    const up = await op(v, "/api/storage/upload", { method: "POST", body: form });
+    expect(up.status).toBe(201);
+    const meta = (await up.json()) as any;
+
+    for (let i = 0; i < EXPORT_KEEP + 2; i++) await op(v, `/api/export?exported_at=${stamp(i)}`);
+
+    const get = await op(v, `/api/storage/${meta.path}`);
+    expect(get.status).toBe(200);
+  });
+
+  it("exports are EXCLUDED from the r2_bytes cap meter — exports+prune leave it unchanged", async () => {
+    const v = freshVault();
+    await seed(v);
+    // Seed the meter through the metered path (attachment upload).
+    const bytes = new Uint8Array(64);
+    const form = new FormData();
+    form.set("file", new File([bytes], "m.png", { type: "image/png" }));
+    expect((await op(v, "/api/storage/upload", { method: "POST", body: form })).status).toBe(201);
+
+    const stub = env.VAULT.get(env.VAULT.idFromName(v));
+    expect(await stub.debugR2MeterBytes(v)).toBe(64);
+
+    // EXPORT_KEEP+2 exports: tarballs written AND pruned. Neither side may move
+    // the user-facing meter (write never meterAdds; prune never meterSubs).
+    for (let i = 0; i < EXPORT_KEEP + 2; i++) {
+      expect((await op(v, `/api/export?exported_at=${stamp(i)}`)).status).toBe(200);
+    }
+    expect(await stub.debugR2MeterBytes(v)).toBe(64);
   });
 });
 

@@ -28,7 +28,7 @@ import { handleMcp } from "./mcp.js";
 import { mcpWwwAuthenticate } from "./discovery.js";
 import { handleSubscribe } from "./live/subscribe.js";
 import { SubscriptionManager } from "./live/subscriptions.js";
-import { collectExportEntries, toTar } from "./export.js";
+import { collectExportEntries, exportPrefix, pruneExportTarballs, toTar } from "./export.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, type WelcomeSeedResult } from "./welcome.js";
 
@@ -420,11 +420,25 @@ export class VaultDO extends DurableObject {
     const { entries } = await collectExportEntries(this.store, this.exportOpts(vaultName, { since, exportedAt }));
     const tar = toTar(entries);
     const ts = (exportedAt ?? new Date().toISOString()).replace(/[:.]/g, "-");
-    // Every export writes a new tarball under vault-<name>/exports/ and nothing
-    // prunes them — they ACCUMULATE. Pre-deploy TODO: an R2 lifecycle rule (or a
-    // GC alarm) capping retention (e.g. keep N days / last K), so on-demand +
-    // nightly exports don't grow storage/COGS unbounded. Tracked for Phase 5 ops.
-    await this.env.ATTACHMENTS.put(`vault-${vaultName}/exports/${ts}.tar`, tar);
+    // Export tarballs are operational backup artifacts, NOT user content: they
+    // are deliberately EXCLUDED from the r2_bytes cap meter (no meterAdd here),
+    // so exports never eat the tenant's storage quota. The prune below matches
+    // (no meterSub) — see pruneExportTarballs.
+    await this.env.ATTACHMENTS.put(`${exportPrefix(vaultName)}${ts}.tar`, tar);
+    // Retention: keep only the newest EXPORT_KEEP tarballs. Best-effort — a
+    // prune failure is logged and never fails the export response (the caller
+    // gets their bytes either way; a leaked tarball is caught by the next
+    // export's prune).
+    try {
+      const pruned = await pruneExportTarballs(this.env.ATTACHMENTS, vaultName);
+      if (pruned.length > 0) console.log(`[export-prune ${vaultName}] deleted ${pruned.length} stale tarball(s)`);
+    } catch (e) {
+      console.warn(`[export-prune ${vaultName}] non-fatal: ${errText(e)}`);
+    }
+    // SEAM (future snapshot system — separate PR): a snapshot cron will manage
+    // `vault-<name>/snapshots/` with its own GFS retention manifest. That
+    // prefix is intentionally OUTSIDE this prune (which touches only
+    // `exports/`), so the two retention regimes can't interfere.
     return new Response(tar, {
       status: 200,
       headers: {
@@ -450,6 +464,16 @@ export class VaultDO extends DurableObject {
     const { entries } = await collectExportEntries(this.store, this.exportOpts(vaultName, opts));
     const dec = new TextDecoder();
     return entries.map((e) => ({ name: e.name, text: dec.decode(e.bytes) }));
+  }
+
+  /**
+   * Test RPC: the current r2_bytes cap-meter value. The conformance suite uses
+   * it to pin metering consistency — attachment uploads/deletes move it, export
+   * tarball writes/prunes must NOT (exports are excluded from the tenant cap).
+   */
+  async debugR2MeterBytes(vaultName: string): Promise<number> {
+    await this.ensureState(vaultName);
+    return this.r2Bytes;
   }
 
   /**
