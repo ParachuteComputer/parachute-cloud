@@ -176,11 +176,15 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
   const vaults = await listVaultsForOwner(db, user.id);
   const params = new URL(req.url).searchParams;
   const created = params.get("created");
+  // Render the pack notice only for a vault this user actually owns — the
+  // param is user-editable (it's escaped either way; this just keeps a crafted
+  // ?pack_added=whatever from painting a false success banner).
   const packAdded = params.get("pack_added");
+  const packVault = packAdded && vaults.some((v) => v.name === packAdded) ? packAdded : null;
   const notice = created
     ? `Your vault "${created}" is ready — open your notes, or connect your AI below.`
-    : packAdded
-      ? `Surface Starter added to ${packAdded} — ask your connected AI to read it.`
+    : packVault
+      ? `Surface Starter added to ${packVault} — ask your connected AI to read it.`
       : undefined;
   const csrf = ensureCsrfToken(req);
   return htmlResponse(

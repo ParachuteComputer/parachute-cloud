@@ -535,15 +535,24 @@ describe("console — Surface Starter pack button (POST /console/packs)", () => 
     expect(seen!.auth).toMatch(/^Bearer /);
   });
 
-  test("the success notice renders on /console?pack_added=<name>", async () => {
+  test("the success notice renders on /console?pack_added=<name> — for an OWNED vault only", async () => {
     const { id: userId } = await seedUser("packs-notice@example.com");
     const sessionId = await seedSession(userId);
+    await seedVault("mine-notice", userId);
     const res = await app.fetch(
-      new Request(`${ISSUER}/console?pack_added=mine`, { headers: { cookie: sessionCookie(sessionId) } }),
+      new Request(`${ISSUER}/console?pack_added=mine-notice`, { headers: { cookie: sessionCookie(sessionId) } }),
       env,
     );
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain("Surface Starter added to mine — ask your connected AI to read it.");
+    expect(await res.text()).toContain("Surface Starter added to mine-notice — ask your connected AI to read it.");
+
+    // A crafted pack_added naming a vault the user doesn't own paints nothing.
+    const crafted = await app.fetch(
+      new Request(`${ISSUER}/console?pack_added=not-my-vault`, { headers: { cookie: sessionCookie(sessionId) } }),
+      env,
+    );
+    expect(crafted.status).toBe(200);
+    expect(await crafted.text()).not.toContain("Surface Starter added");
   });
 
   test("the vault card carries the button form", async () => {
