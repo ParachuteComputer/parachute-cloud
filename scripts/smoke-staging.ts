@@ -99,6 +99,16 @@ async function main() {
   console.log(`\nSmoke: identity=${IDENTITY}\n       vault=${VAULT} (name="${VAULT_NAME}")  marker=${MARKER}\n`);
   const { email, password } = readDevSecrets();
 
+  // 0. Liveness — the endpoints the ops cron + external monitors watch.
+  {
+    const ih = await fetch(`${IDENTITY}/health`);
+    const ij = (await ih.json()) as { status?: string; service?: string };
+    assert(ih.status === 200 && ij.status === "ok" && ij.service === "identity", "identity /health → ok", `status ${ih.status}`);
+    const vh = await fetch(`${VAULT}/health`);
+    const vj = (await vh.json()) as { status?: string };
+    assert(vh.status === 200 && vj.status === "ok", "vault /health → ok", `status ${vh.status}`);
+  }
+
   // 1. Identity discovery.
   {
     const md = await (await fetch(`${IDENTITY}/.well-known/oauth-authorization-server`)).json();

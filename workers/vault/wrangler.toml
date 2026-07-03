@@ -39,6 +39,14 @@ workers_dev = true
 pattern = "u.parachute.computer"
 custom_domain = true
 
+# Workers Logs: persist invocation logs + console.* (router errors, DO logs) so
+# tail/dashboard/logs-API surface them — before this stanza the account had no
+# persistent logs at all (2026-07-02 blind spot). head_sampling_rate 1 = every
+# request. NOT inherited by named envs — [env.staging] repeats it.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 # Deploy-bundle mirror of the vitest `bun:sqlite` alias (vitest.config.ts). Core
 # value-imports `Database` from bun:sqlite only in type positions (erased at
 # transpile), so today this is a no-op — but if a future core change makes the
@@ -125,3 +133,8 @@ VAULT_BASE_DOMAIN = "parachute-vault-do-staging.unforced.workers.dev"
 CAP_BYTES = "1073741824"
 # "staging" ≠ "test": the TEST_JWKS double-gate stays closed here too.
 ENVIRONMENT = "staging"
+
+# Workers Logs for staging too (observability is NOT inherited by named envs).
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1

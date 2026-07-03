@@ -30,9 +30,18 @@ export interface SendEmailBinding {
 
 export type SendResult = { ok: true } | { ok: false; error: string };
 
+/** A plain-text operational email (health alerts, the weekly ops digest). */
+export interface OpsEmail {
+  to: string;
+  subject: string;
+  text: string;
+}
+
 export interface EmailSender {
   readonly kind: "binding" | "devlog";
   sendMagicLink(to: string, link: string): Promise<SendResult>;
+  /** Generic operational send — plain text, no templating. Used by ops.ts. */
+  sendOps(msg: OpsEmail): Promise<SendResult>;
 }
 
 const FROM_NAME = "Parachute Cloud";
@@ -67,16 +76,22 @@ function magicLinkBodies(link: string): { html: string; text: string } {
 
 /** Cloudflare `send_email` binding sender. */
 export function bindingSender(binding: SendEmailBinding, fromAddress: string): EmailSender {
+  async function send(message: Parameters<SendEmailBinding["send"]>[0]): Promise<SendResult> {
+    try {
+      await binding.send(message);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? `${err.name}: ${err.message}` : String(err) };
+    }
+  }
   return {
     kind: "binding",
     async sendMagicLink(to, link) {
       const { html, text } = magicLinkBodies(link);
-      try {
-        await binding.send({ to, from: { email: fromAddress, name: FROM_NAME }, subject: SUBJECT, html, text });
-        return { ok: true };
-      } catch (err) {
-        return { ok: false, error: err instanceof Error ? `${err.name}: ${err.message}` : String(err) };
-      }
+      return send({ to, from: { email: fromAddress, name: FROM_NAME }, subject: SUBJECT, html, text });
+    },
+    async sendOps({ to, subject, text }) {
+      return send({ to, from: { email: fromAddress, name: FROM_NAME }, subject, text });
     },
   };
 }
@@ -87,6 +102,12 @@ export function devLogSender(): EmailSender {
     kind: "devlog",
     async sendMagicLink(to, link) {
       console.log(`[magic-link] would email ${to}: ${link}`);
+      return { ok: true };
+    },
+    async sendOps({ to, subject, text }) {
+      // Staging's deterministic "alert": the full email lands in the worker log
+      // (queryable now that [observability] is on) instead of an inbox.
+      console.log(`[ops-email] would email ${to}: ${subject}\n${text}`);
       return { ok: true };
     },
   };

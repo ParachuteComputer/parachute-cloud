@@ -38,6 +38,7 @@ import { handleRegister } from "./oauth-register.ts";
 import { handleRevoke } from "./oauth-revoke.ts";
 import { type OAuthDeps, oauthPreflight, withReflectedCors, withWildcardCors } from "./oauth-shared.ts";
 import { handleToken } from "./oauth-token.ts";
+import { handleScheduled } from "./ops.ts";
 
 function depsFor(env: Env): OAuthDeps {
   const issuer = env.ISSUER.replace(/\/$/, "");
@@ -64,6 +65,12 @@ export function senderFor(env: Env): EmailSender {
 }
 
 const app = new Hono<{ Bindings: Env }>();
+
+// --- liveness (public, unauthenticated, no D1) ---
+// Cheap JSON for external monitors + the smoke scripts. The scheduled health
+// check does NOT fetch this (a worker can't fetch its own route, and "the cron
+// fired" already proves the worker runs) — its identity leg checks D1 directly.
+app.get("/health", (c) => c.json({ status: "ok", service: "identity" }));
 
 // --- discovery (public, wildcard CORS) ---
 app.options("/.well-known/*", () => corsPreflight());
@@ -105,4 +112,16 @@ app.post("/login/2fa", (c) => handleLogin2faPost(c.env.DB, c.req.raw, depsFor(c.
 // Root → the console (which redirects to /login when signed out).
 app.get("/", (c) => c.redirect("/console", 302));
 
-export default app;
+/**
+ * Default export: the Hono fetch handler + the ops cron ([triggers] in
+ * wrangler.toml). `controller.cron` is the matched pattern — ops.routeCron maps
+ * it to the health check (every 10 min) or the weekly digest (Mon 14:00 UTC).
+ * Same sender selection as the magic-link flow: real binding in production,
+ * dev-log on staging (deterministic, lands in Workers Logs).
+ */
+export default {
+  fetch: app.fetch,
+  async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    await handleScheduled(controller.cron, env, senderFor(env));
+  },
+};

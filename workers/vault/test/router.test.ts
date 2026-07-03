@@ -4,10 +4,19 @@
  * lowercase + tokens carry a lowercase `aud=vault.<name>`). Without this, an
  * owner visiting `/vault/MyVault/…` self-locks-out onto a new empty DO.
  */
+import { SELF } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import { resolveVault } from "../src/index.ts";
 
 const env = { VAULT_BASE_DOMAIN: "u.parachute.computer" };
+
+describe("router-level /health", () => {
+  test("public 200 + {status:'ok'} — the identity ops cron's probe target (no DO wakeup)", async () => {
+    const res = await SELF.fetch("https://u.parachute.computer/health");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "ok" });
+  });
+});
 
 describe("resolveVault case-normalization", () => {
   test("mixed-case path resolves to the canonical lowercase vault", () => {

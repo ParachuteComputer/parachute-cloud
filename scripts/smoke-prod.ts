@@ -73,6 +73,13 @@ async function main() {
   console.log(`\nProd smoke (read-only): identity=${IDENTITY}\n                        vault=${VAULT} (name="${VAULT_NAME}")\n`);
   const operatorEmail = readOperatorEmail();
 
+  // 0. Liveness — identity /health (the vault /health check lives in section 4).
+  {
+    const ih = await fetch(`${IDENTITY}/health`);
+    const ij = (await ih.json()) as { status?: string; service?: string };
+    assert(ih.status === 200 && ij.status === "ok" && ij.service === "identity", "identity /health → ok", `status ${ih.status}`);
+  }
+
   // 1. Identity discovery surface (all GET).
   {
     const md = await (await fetch(`${IDENTITY}/.well-known/oauth-authorization-server`)).json();
