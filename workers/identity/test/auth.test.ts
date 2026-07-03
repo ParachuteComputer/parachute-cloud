@@ -7,7 +7,7 @@
  * real router (`app.fetch`) for the neutral-response + dev-link-header contract.
  */
 import { env } from "cloudflare:test";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import app, { senderFor } from "../src/index.ts";
 import type { EmailSender, SendResult } from "../src/email.ts";
 import {
@@ -188,6 +188,36 @@ describe("magic link — send + verify", () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("valid email");
     expect(sender.sent).toHaveLength(0);
+  });
+
+  test("a failing sender still returns the neutral 200, with a structured PII-safe log trail", async () => {
+    // A real-binding failure (bad address, quota, CF transient) must not turn
+    // into a silent 200: the handler logs event=magic_link_send_failed with the
+    // email's DOMAIN only. The response is unchanged (no enumeration signal).
+    let attempts = 0;
+    const sender: EmailSender = {
+      kind: "binding",
+      async sendMagicLink(): Promise<SendResult> {
+        attempts++;
+        return { ok: false, error: "SendError: 550 mailbox unavailable" };
+      },
+    };
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await handleMagicRequestPost(env.DB, magicReq("failsend@example.com", "10.8.8.8"), deps(), sender);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("Check your email"); // same neutral page
+      expect(attempts).toBe(1); // the failure path was exercised
+
+      const logged = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).toContain("event=magic_link_send_failed");
+      expect(logged).toContain("sender=binding");
+      expect(logged).toContain("domain=example.com");
+      expect(logged).toContain("550 mailbox unavailable");
+      expect(logged).not.toContain("failsend@"); // never the full address
+    } finally {
+      errSpy.mockRestore();
+    }
   });
 
   test("through the real router: non-production echoes the link even with the REAL binding bound", async () => {

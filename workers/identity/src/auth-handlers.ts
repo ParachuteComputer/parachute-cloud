@@ -120,7 +120,17 @@ export async function handleMagicRequestPost(
     const existing = await getUserByEmail(db, email);
     const { rawToken } = await createMagicLink(db, email, existing?.id ?? null, now);
     const link = `${deps.issuer}/auth/verify?token=${encodeURIComponent(rawToken)}`;
-    await sender.sendMagicLink(email, link);
+    const sent = await sender.sendMagicLink(email, link);
+    if (!sent.ok) {
+      // A real-binding failure (bad address, quota, CF transient) must leave a
+      // log trail — otherwise it's a silent 200 and an inbox that never rings.
+      // Structured + PII-safe: the email's DOMAIN only, never the full address.
+      // The response below stays the same neutral 200 (no enumeration change).
+      const domain = email.split("@")[1] ?? "unknown";
+      console.error(
+        `event=magic_link_send_failed sender=${sender.kind} domain=${domain} error=${JSON.stringify(sent.error)}`,
+      );
+    }
     const extra: Record<string, string> = {};
     // DEV ONLY: echo the link so the flow is testable without real email. Gated
     // hard on ENVIRONMENT !== "production" (deps.exposeDevLinks).
