@@ -32,6 +32,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { totpCodeAt } from "../workers/identity/src/totp.ts";
+import { NOTES_REQUIRED_TAGS } from "../workers/vault/src/welcome.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.unforced.workers.dev").replace(/\/$/, "");
@@ -367,11 +368,11 @@ async function main() {
       );
 
       // The fresh vault materialized with the DEFAULT SEED PACKS (core's
-      // welcome + getting-started): exactly 4 notes + the 3 capture tags
-      // (core@main's declared set), before this user writes anything.
-      // NOTE: parachute-vault's in-flight capture-schema change (ONE #capture
-      // tag, its ag-unforced-dev) will flip this to 1 when it merges — that
-      // PR's propagation includes this pin.
+      // welcome + getting-started): exactly 4 notes + core's declared tag set
+      // (NOTES_REQUIRED_TAGS — ONE #capture tag since vault#528; entry method
+      // lives in note metadata.source), before this user writes anything.
+      // Asserted dynamically against the import so core-side vocabulary
+      // changes can't strand a stale literal pin here again.
       const seededRes = await fetch(`${VAULT}/vault/${newVault}/api/notes`, { headers: OWN_AUTH });
       const seeded = (await seededRes.json()) as Array<{ path?: string }>;
       const seededPaths = seeded.map((n) => n.path).sort();
@@ -386,9 +387,11 @@ async function main() {
       );
       const tagRes = await fetch(`${VAULT}/vault/${newVault}/api/tags`, { headers: OWN_AUTH });
       const tagRows = (await tagRes.json()) as Array<{ name: string }>;
+      const expectedTagNames = NOTES_REQUIRED_TAGS.map((t) => t.name).sort();
       assert(
-        tagRes.status === 200 && tagRows.length === 3 && ["capture", "capture/text", "capture/voice"].every((t) => tagRows.some((r) => r.name === t)),
-        "fresh vault seeds the 3 capture tags",
+        tagRes.status === 200 &&
+          tagRows.map((r) => r.name).sort().join(",") === expectedTagNames.join(","),
+        `fresh vault seeds exactly core's declared tag set (${expectedTagNames.join(", ")})`,
         tagRows.map((r) => r.name).join(", "),
       );
 
