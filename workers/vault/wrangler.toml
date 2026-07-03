@@ -42,7 +42,7 @@ custom_domain = true
 # Workers Logs: persist invocation logs + console.* (router errors, DO logs) so
 # tail/dashboard/logs-API surface them — before this stanza the account had no
 # persistent logs at all (2026-07-02 blind spot). head_sampling_rate 1 = every
-# request. NOT inherited by named envs — [env.staging] repeats it.
+# request. Restated explicitly in [env.staging] — explicit beats implicit.
 [observability]
 enabled = true
 head_sampling_rate = 1
@@ -134,7 +134,8 @@ CAP_BYTES = "1073741824"
 # "staging" ≠ "test": the TEST_JWKS double-gate stays closed here too.
 ENVIRONMENT = "staging"
 
-# Workers Logs for staging too (observability is NOT inherited by named envs).
+# Workers Logs for staging too (explicit per-env restatement; see the top-level
+# [observability] note).
 [env.staging.observability]
 enabled = true
 head_sampling_rate = 1

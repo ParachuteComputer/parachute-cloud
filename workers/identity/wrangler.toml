@@ -34,7 +34,8 @@ custom_domain = true
 # account had NO persistent logs — structured failure lines like
 # event=magic_link_send_failed were emitted into the void (a tail probe captured
 # zero events, 2026-07-02). head_sampling_rate 1 = log every request; revisit if
-# volume ever costs. NOT inherited by named envs — [env.staging] repeats it.
+# volume ever costs. Restated explicitly in [env.staging] — the docs' guidance
+# on env inheritance of observability has varied; explicit beats implicit.
 [observability]
 enabled = true
 head_sampling_rate = 1
@@ -143,7 +144,8 @@ EMAIL_FROM = "noreply@parachute.computer"
 # so ops alerts/digests land in the worker log (devlog sender), never an inbox.
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
 
-# Workers Logs for staging too (observability is NOT inherited by named envs).
+# Workers Logs for staging too (explicit per-env restatement; see the top-level
+# [observability] note).
 [env.staging.observability]
 enabled = true
 head_sampling_rate = 1

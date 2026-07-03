@@ -128,9 +128,15 @@ describe("health check + alerting", () => {
     expect(second.alerted).toEqual([]);
     expect(sender.sent).toHaveLength(1);
 
-    // Past the dedupe window: it rings again.
-    const third = await quietly(() => runHealthCheck(env, sender, { ...at(ALERT_DEDUPE_MS + 60 * 1000), fetchFn: downFetch }));
+    // Exactly AT the boundary (now - last == ALERT_DEDUPE_MS): no longer
+    // "within" the window (the guard is strict <) — it rings again.
+    const third = await quietly(() => runHealthCheck(env, sender, { ...at(ALERT_DEDUPE_MS), fetchFn: downFetch }));
     expect(third.alerted.map((f) => f.check)).toEqual(["vault-health"]);
+    expect(sender.sent).toHaveLength(2);
+
+    // ...and one tick short of the NEW mark's window stays quiet.
+    const fourth = await quietly(() => runHealthCheck(env, sender, { ...at(ALERT_DEDUPE_MS + 10 * 60 * 1000), fetchFn: downFetch }));
+    expect(fourth.alerted).toEqual([]);
     expect(sender.sent).toHaveLength(2);
   });
 

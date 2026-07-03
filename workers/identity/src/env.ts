@@ -11,10 +11,11 @@ export interface Env {
   /** Cloud vault addressing: `vault:<name>` → `https://<name>.<VAULT_BASE_DOMAIN>`. */
   VAULT_BASE_DOMAIN: string;
   /**
-   * Dev-only: the vault worker's origin for PATH routing
-   * (`<VAULT_ORIGIN>/vault/<name>`). Set on the workers.dev dev deploy where
-   * there is no wildcard subdomain cert; unset in prod (subdomain addressing).
-   * Consumed by the services catalog + the console connect cards.
+   * The vault worker's origin for PATH routing (`<VAULT_ORIGIN>/vault/<name>`).
+   * Set in BOTH environments' vars (production uses path routing on the branded
+   * host until wildcard subdomains land). Consumed by the services catalog, the
+   * console connect cards, AND the scheduled health check (ops.ts probes
+   * `<VAULT_ORIGIN>/health`). Optional only for type-safety of bare configs.
    */
   VAULT_ORIGIN?: string;
   /**
