@@ -12,7 +12,9 @@
  * Selection: use the binding when it's bound; otherwise dev-log. The "echo the
  * link back" affordance is separately gated on ENVIRONMENT !== "production" (see
  * auth-handlers.ts), so a misconfigured prod can't leak links even if the binding
- * is somehow absent.
+ * is somehow absent — and, symmetrically, a NON-production deploy with the real
+ * binding bound sends the email AND still echoes the header (the headless dev/
+ * smoke flow keeps working after the binding lands).
  */
 
 /** The subset of the Cloudflare `send_email` binding we use. */

@@ -30,6 +30,7 @@ import { handleSubscribe } from "./live/subscribe.js";
 import { SubscriptionManager } from "./live/subscriptions.js";
 import { collectExportEntries, toTar } from "./export.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
+import { WELCOME_SEEDED_KEY, seedWelcome, type WelcomeSeedResult } from "./welcome.js";
 
 function errText(e: unknown): string {
   if (e instanceof Error) return `${e.name}: ${e.message}`;
@@ -254,9 +255,52 @@ export class VaultDO extends DurableObject {
       audio_retention: "keep",
       auto_transcribe: { enabled: false },
     };
-    if (!stored) await this.ctx.storage.put("config", this.config);
+    if (!stored) {
+      await this.ctx.storage.put("config", this.config);
+      // First-ever materialization of this vault → seed the welcome content
+      // (Notes' required capture tags + the three-note welcome web). This is
+      // the create-time seam: the console's createVault is only a D1 ownership
+      // claim ("the DO comes into existence on first access"), so the vault-as-
+      // data first exists HERE, and this DO is the single writer for it.
+      // Existing vaults are untouched — they all carry a stored config already.
+      await this.maybeSeedWelcome();
+    }
     this.r2Bytes = (await this.ctx.storage.get<number>(R2_METER_KEY)) ?? 0;
     this.stateLoaded = true;
+  }
+
+  /**
+   * Seed the welcome content once per vault. Guards: the `welcome_seeded`
+   * marker (fast path), then a zero-notes check (belt-and-braces — never write
+   * into a vault that somehow already has content, e.g. a future restore path
+   * that plants data before config). Best-effort: a seed failure must never
+   * fail the request that materialized the vault; per-item guards inside
+   * `seedWelcome` make any retry/re-entry duplicate-safe.
+   */
+  private async maybeSeedWelcome(): Promise<void> {
+    try {
+      if (await this.ctx.storage.get<boolean>(WELCOME_SEEDED_KEY)) return;
+      const stats = await this.store.getVaultStats();
+      if (stats.totalNotes === 0) {
+        await seedWelcome(this.store, { consoleOrigin: this.env.ISSUER_ORIGIN });
+      }
+      await this.ctx.storage.put(WELCOME_SEEDED_KEY, true);
+    } catch (e) {
+      // Non-fatal by design (mirrors the bun vault's best-effort onboarding
+      // seed): the vault is still fully usable without the welcome content.
+      console.warn(`[welcome-seed ${this.config?.name}]`, errText(e));
+    }
+  }
+
+  /**
+   * Test RPC: re-run the welcome seed, BYPASSING the `welcome_seeded` marker.
+   * Pins the deeper idempotency invariant — even a marker-loss re-run (double
+   * cold start, restored storage) converges instead of duplicating, because
+   * every item is individually guarded (note-by-path absence, tag upsert).
+   */
+  async seedWelcomeAgain(vaultName: string): Promise<WelcomeSeedResult> {
+    await this.ensureState(vaultName);
+    return seedWelcome(this.store, { consoleOrigin: this.env.ISSUER_ORIGIN });
   }
 
   private capBytes(): number {

@@ -7,8 +7,8 @@
  * real router (`app.fetch`) for the neutral-response + dev-link-header contract.
  */
 import { env } from "cloudflare:test";
-import { describe, expect, test } from "vitest";
-import app from "../src/index.ts";
+import { describe, expect, test, vi } from "vitest";
+import app, { senderFor } from "../src/index.ts";
 import type { EmailSender, SendResult } from "../src/email.ts";
 import {
   handleLogin2faGet,
@@ -190,12 +190,61 @@ describe("magic link — send + verify", () => {
     expect(sender.sent).toHaveLength(0);
   });
 
-  test("through the real router: dev deploy echoes the link in the dev-only header", async () => {
-    // ENVIRONMENT=development in wrangler.toml → exposeDevLinks → header present.
+  test("a failing sender still returns the neutral 200, with a structured PII-safe log trail", async () => {
+    // A real-binding failure (bad address, quota, CF transient) must not turn
+    // into a silent 200: the handler logs event=magic_link_send_failed with the
+    // email's DOMAIN only. The response is unchanged (no enumeration signal).
+    let attempts = 0;
+    const sender: EmailSender = {
+      kind: "binding",
+      async sendMagicLink(): Promise<SendResult> {
+        attempts++;
+        return { ok: false, error: "SendError: 550 mailbox unavailable" };
+      },
+    };
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await handleMagicRequestPost(env.DB, magicReq("failsend@example.com", "10.8.8.8"), deps(), sender);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("Check your email"); // same neutral page
+      expect(attempts).toBe(1); // the failure path was exercised
+
+      const logged = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).toContain("event=magic_link_send_failed");
+      expect(logged).toContain("sender=binding");
+      expect(logged).toContain("domain=example.com");
+      expect(logged).toContain("550 mailbox unavailable");
+      expect(logged).not.toContain("failsend@"); // never the full address
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  test("through the real router: non-production echoes the link even with the REAL binding bound", async () => {
+    // wrangler.toml binds [[send_email]] EMAIL (Email Sending onboarded
+    // 2026-07-02), so senderFor picks the real binding — and the dev echo
+    // header must SURVIVE it: the header is gated on exposeDevLinks
+    // (ENVIRONMENT !== "production"), independent of sender selection. The
+    // headless dev/smoke flow depends on this.
+    expect(senderFor(env as never).kind).toBe("binding");
     const res = await app.fetch(magicReq("router@example.com", "10.5.5.5"), env);
     expect(res.status).toBe(200);
     const link = res.headers.get("x-parachute-dev-magic-link");
     expect(link).toContain("/auth/verify?token=");
+  });
+
+  test("through the real router: production never emits the echo header (binding still bound)", async () => {
+    const prodEnv = { ...env, ENVIRONMENT: "production" };
+    const res = await app.fetch(magicReq("prod-router@example.com", "10.6.6.6"), prodEnv as never);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-parachute-dev-magic-link")).toBeNull();
+    expect(await res.text()).toContain("Check your email"); // flow stays neutral-200
+  });
+
+  test("senderFor falls back to dev-log when no binding is bound", () => {
+    const { EMAIL: _unused, ...withoutBinding } = env as unknown as Record<string, unknown>;
+    expect(senderFor(withoutBinding as never).kind).toBe("devlog");
+    expect(senderFor(env as never).kind).toBe("binding");
   });
 });
 
