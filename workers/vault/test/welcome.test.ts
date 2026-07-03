@@ -12,10 +12,10 @@ import { GETTING_STARTED_PACK, welcomePack } from "@openparachute/core/src/seed-
 
 /**
  * Default-seed conformance: a brand-new vault materializes with the two
- * default core packs — the three-note welcome web + the `capture` tag
- * (the `welcome` pack; ONE tag since core 0.6.5-rc.4's schema simplification)
- * and the AI-facing Getting Started guide (the `getting-started` pack) — and
- * NOTHING else. The seed must be invisible to
+ * default core packs — the three-note welcome web + core's declared capture
+ * tags (the `welcome` pack; the set is NOTES_REQUIRED_TAGS, asserted
+ * dynamically so this suite tracks core@main) and the AI-facing Getting
+ * Started guide (the `getting-started` pack) — and NOTHING else. The seed must be invisible to
  * everything that already exists: idempotent on re-entry, absent for
  * pre-existing vaults, ordinary/deletable notes, exported like any other note.
  *
@@ -57,8 +57,9 @@ describe("default seed — a new vault's first materialization", () => {
     const gettingStarted = notes.find((n) => n.path === GETTING_STARTED_PATH)!;
     expect(gettingStarted.content).toContain("start-here guide");
 
-    // Exactly core's declared set — ONE `capture` tag since 0.6.5-rc.4 (the
-    // capture-schema simplification; entry method moved to metadata.source).
+    // Exactly core's declared set (NOTES_REQUIRED_TAGS) — dynamic, so the
+    // assertion follows core@main rather than pinning a count that a core
+    // seed-schema change would silently strand.
     const tags = await listTagsWithSchema(v);
     expect(tags.map((t) => t.name).sort()).toEqual(NOTES_REQUIRED_TAGS.map((d) => d.name).sort());
     for (const decl of NOTES_REQUIRED_TAGS) {

@@ -367,8 +367,11 @@ async function main() {
       );
 
       // The fresh vault materialized with the DEFAULT SEED PACKS (core's
-      // welcome + getting-started): exactly 4 notes + the capture tag (ONE
-      // since core 0.6.5-rc.4), before this user writes anything.
+      // welcome + getting-started): exactly 4 notes + the 3 capture tags
+      // (core@main's declared set), before this user writes anything.
+      // NOTE: parachute-vault's in-flight capture-schema change (ONE #capture
+      // tag, its ag-unforced-dev) will flip this to 1 when it merges — that
+      // PR's propagation includes this pin.
       const seededRes = await fetch(`${VAULT}/vault/${newVault}/api/notes`, { headers: OWN_AUTH });
       const seeded = (await seededRes.json()) as Array<{ path?: string }>;
       const seededPaths = seeded.map((n) => n.path).sort();
@@ -384,8 +387,8 @@ async function main() {
       const tagRes = await fetch(`${VAULT}/vault/${newVault}/api/tags`, { headers: OWN_AUTH });
       const tagRows = (await tagRes.json()) as Array<{ name: string }>;
       assert(
-        tagRes.status === 200 && tagRows.length === 1 && tagRows.some((r) => r.name === "capture"),
-        "fresh vault seeds the capture tag (ONE since core 0.6.5-rc.4)",
+        tagRes.status === 200 && tagRows.length === 3 && ["capture", "capture/text", "capture/voice"].every((t) => tagRows.some((r) => r.name === t)),
+        "fresh vault seeds the 3 capture tags",
         tagRows.map((r) => r.name).join(", "),
       );
 

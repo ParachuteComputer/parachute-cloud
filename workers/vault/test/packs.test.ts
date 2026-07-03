@@ -7,7 +7,7 @@ import {
   SURFACE_STARTER_CONTENT,
   SURFACE_STARTER_PATH,
 } from "@openparachute/core/src/seed-packs.js";
-import { GETTING_STARTED_PATH, WELCOME_PATH } from "../src/welcome.ts";
+import { GETTING_STARTED_PATH, NOTES_REQUIRED_TAGS, WELCOME_PATH } from "../src/welcome.ts";
 
 /**
  * POST /api/packs/<name> — the on-demand seam for core's seed packs.
@@ -82,7 +82,7 @@ describe("POST /api/packs/:name", () => {
     const w = (await (await applyPack(v, "welcome")).json()) as any;
     expect(w.applied).toEqual([]);
     expect(w.skipped.sort()).toEqual([WELCOME_PATH, "Connect your AI", "Try linking notes"].sort());
-    expect(w.tags).toEqual(["capture"]); // upserts, idempotent (ONE tag since core 0.6.5-rc.4)
+    expect(w.tags).toEqual(NOTES_REQUIRED_TAGS.map((t) => t.name)); // upserts, idempotent — core's declared set
     const g = (await (await applyPack(v, "getting-started")).json()) as any;
     expect(g.applied).toEqual([]);
     expect(g.skipped).toEqual([GETTING_STARTED_PATH]);
