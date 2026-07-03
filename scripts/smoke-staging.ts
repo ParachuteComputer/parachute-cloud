@@ -631,12 +631,14 @@ async function main() {
   //     valid-unsubscribe path is vitest-covered (the raw token only rides the
   //     emailed link); live we pin the tamper case.
   {
+    let lastStatus = 0;
     const run = async (): Promise<{ sent: { welcome: number }; capped: boolean } | null> => {
       const r = await fetch(`${IDENTITY}/__test/drip-run`, { method: "POST" });
+      lastStatus = r.status;
       return r.status === 200 ? ((await r.json()) as { sent: { welcome: number }; capped: boolean }) : null;
     };
     const first = await run();
-    assert(!!first, "drip: staging trigger answers 200 with a PII-free summary");
+    assert(!!first, "drip: staging trigger answers 200 with a PII-free summary", `status ${lastStatus}`);
     if (first) {
       // Drain a capped backlog (prior debris) so this run's users are reached.
       let welcome = first.sent.welcome;

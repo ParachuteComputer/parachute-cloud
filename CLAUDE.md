@@ -41,10 +41,11 @@ workers/identity/   the OAuth issuer (authorize/token/DCR/JWKS/revocation on D1)
                     (+ RFC 8058 List-Unsubscribe headers). 194 tests.
 src/                the OLD control plane (Worker + D1 + Stripe). Dormant; billing
                     lifecycle design gets harvested into the control-plane revival.
-scripts/            deploy-staging.sh + smoke-staging.ts (full 54-step live smoke,
+scripts/            deploy-staging.sh + smoke-staging.ts (full 58-step live smoke,
                     creates throwaway accounts/vaults — incl. the guided-arrival
-                    headless walk) for STAGING; deploy-prod.sh + smoke-prod.ts
-                    (read-only checks) for PRODUCTION.
+                    headless walk + a drip tick via the staging-only trigger)
+                    for STAGING; deploy-prod.sh + smoke-prod.ts (read-only
+                    checks) for PRODUCTION.
 ```
 
 ## Commands
