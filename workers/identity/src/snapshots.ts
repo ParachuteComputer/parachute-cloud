@@ -115,7 +115,17 @@ export async function runSnapshotSweep(
         throw new Error("internal snapshot POST carried no run shape (skipped/manifest)");
       }
       body.skipped ? skipped++ : taken++;
-      await mirrorManifest(env.DB, v.name, body.manifest as SnapshotEntryWire[]);
+      // The D1 mirror is a render cache — a mirror-only failure is NOT a
+      // snapshot failure (the tarball + R2 manifest landed; the console shows
+      // last night's rows until tomorrow's sweep refreshes them). Logged under
+      // its own event so the sweep summary stays honest about what failed.
+      try {
+        await mirrorManifest(env.DB, v.name, body.manifest as SnapshotEntryWire[]);
+      } catch (err) {
+        console.error(
+          `event=snapshot_mirror_failed vault=${v.name} error=${JSON.stringify(err instanceof Error ? err.message : String(err))}`,
+        );
+      }
     } catch (err) {
       // Skip + log + continue — one vault's bad night never starves the rest.
       failed++;

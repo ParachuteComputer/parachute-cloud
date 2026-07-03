@@ -477,6 +477,14 @@ export class VaultDO extends DurableObject {
    * Returns the post-run manifest so the caller (the sweep) can mirror it to
    * D1 in one hop. Snapshots never touch the r2_bytes cap meter (no
    * meterAdd/meterSub — quota honesty, pinned by the conformance suite).
+   *
+   * CONCURRENCY NOTE: the manifest read-modify-write below is NOT mutexed —
+   * DO event interleaving across awaits means two concurrent snapshot POSTs
+   * to the same vault could race it. Acceptable by topology: the only callers
+   * are the single nightly cron and the staging test trigger, and a same-
+   * millisecond collision degrades to a key overwrite + manifest replace
+   * (handled below). Add blockConcurrencyWhile before ever giving this verb
+   * a second concurrent caller.
    */
   private async handleSnapshot(request: Request, vaultName: string): Promise<Response> {
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
