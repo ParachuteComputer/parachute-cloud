@@ -60,13 +60,16 @@ Additional findings:
 **Verdict: all four unknowns green → the Durable-Object design is real.** No
 Fly-fallback conversation needed.
 
-## Deploy (dev) + bundling
+## Deploy + bundling
 
 Phase 2+ shipped the production DO (REST + MCP + SSE + export) — the spike RPC
 methods above are retained so `test/spike.test.ts` stays green. The worker
-deploys to the **Unforced Development** CF account (workers.dev + path routing);
-`scripts/deploy-dev.sh` at the repo root is the reproducible command, and
-`TRYIT-2026-07-02.md` is the live-deploy report.
+deploys to the **Unforced Development** CF account in two environments:
+**production** is the top-level wrangler.toml config (custom domain
+`u.parachute.computer`, `scripts/deploy-prod.sh` at the repo root) and
+**staging** is `[env.staging]` (workers.dev only, own R2 + fresh DOs,
+`scripts/deploy-staging.sh`). `TRYIT-2026-07-02.md` is the original
+live-deploy report.
 
 **How the bundle works.** `wrangler deploy` bundles with its built-in esbuild.
 `@openparachute/core` is raw TypeScript that imports sibling files with `.js`

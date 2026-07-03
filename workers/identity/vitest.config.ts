@@ -18,7 +18,12 @@ export default defineWorkersConfig(async () => {
           wrangler: { configPath: "./wrangler.toml" },
           miniflare: {
             // Surfaced to `test/apply-migrations.ts` via `env.TEST_MIGRATIONS`.
-            bindings: { TEST_MIGRATIONS: migrations },
+            // ENVIRONMENT is PINNED here (overrides the wrangler.toml [vars],
+            // which say "production" since the top level became the production
+            // deploy): the suite depends on the x-parachute-dev-magic-link echo
+            // being ON by default, with the production-drops-it case exercised
+            // via an explicit env override in auth.test.ts.
+            bindings: { TEST_MIGRATIONS: migrations, ENVIRONMENT: "test" },
           },
         },
       },
