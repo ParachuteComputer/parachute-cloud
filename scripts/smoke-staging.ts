@@ -570,6 +570,10 @@ async function main() {
   let arrivalVault = "";
   let arrivalEmail = "";
   let arrivalPassword = "";
+  // The mock-upgraded VOICE user from §16 (mock-payments), handed to §18 so the
+  // live transcription proves it works for a MOCK-upgraded account. Null when
+  // billing is configured (real Stripe) — §18 falls back to the admin comp.
+  let mockVoice: { email: string; password: string; vault: string } | null = null;
   {
     const email = `arrival+${Date.now()}@example.com`;
     const password = b64url(crypto.getRandomValues(new Uint8Array(18)));
@@ -831,30 +835,104 @@ async function main() {
     assert(anon.status === 404, "admin: unauthenticated /admin is 404 (indistinguishable from no-route)", `status ${anon.status}`);
   }
 
-  // 16. Billing (Wave 4d) — STATE-ADAPTIVE: the deploy ships before the Stripe
-  //     keys exist, so the smoke detects which state the worker is in and pins
-  //     that state's contract. NOT CONFIGURED (today): all three /billing/*
-  //     routes answer the clean 503 and the console renders no billing door
-  //     (the teaser stays). CONFIGURED (after `wrangler secret put` ×2 + the
-  //     price [vars] land): the routes gate normally (anonymous checkout →
-  //     /login; unsigned webhook → 400) and the free user's console shows the
-  //     Upgrade buttons. Either way the assertions are deterministic.
+  // 16. Billing (mock-payments + Wave 4d) — STATE-ADAPTIVE. Staging ships with
+  //     NO real Stripe keys, so it runs in MOCK mode (billing-config.ts
+  //     mockBillingEnabled): the interim mock checkout stands in for Stripe so
+  //     the whole checkout → upgrade → cap/voice-lift flow is demoable NOW. The
+  //     smoke detects the state and pins its contract:
+  //       MOCK (today): the real /billing/checkout stays 503 (config-gated),
+  //         the console shows mock Upgrade buttons → /billing/mock-checkout +
+  //         a "test mode" label (NO teaser), and a LIVE E2E — fresh signup →
+  //         mock-upgrade to VOICE → plan=Voice + the voice entitlement
+  //         {enabled, minutes_remaining:600} + the voice cap (10 GiB) on the
+  //         landing — proves the whole lift end to end. The upgraded user is
+  //         handed to §18 to prove a real transcription works for them too.
+  //       CONFIGURED (once TEST keys land): the real routes gate (anonymous
+  //         checkout → /login; unsigned webhook → 400), the console shows real
+  //         Upgrade buttons → /billing/checkout, and the mock endpoint 404s.
   {
-    const probe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
-    if (probe.status === 503) {
-      const body = (await probe.json()) as { error?: string };
-      assert(body.error === "billing_not_configured", "billing NOT CONFIGURED: checkout answers the clean 503", String(body.error));
-      const portal = await fetch(`${IDENTITY}/billing/portal`, { method: "POST", body: "", redirect: "manual" });
-      assert(portal.status === 503, "billing NOT CONFIGURED: portal → 503", `status ${portal.status}`);
-      const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
-      assert(webhook.status === 503, "billing NOT CONFIGURED: webhook → 503", `status ${webhook.status}`);
-      const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
+    const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
+    const mockMode = conHtml.includes('action="/billing/mock-checkout"');
+    if (mockMode) {
+      // The real checkout route stays config-gated (503) even in mock mode; the
+      // mock is a SEPARATE endpoint.
+      const realProbe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
+      assert(realProbe.status === 503, "billing MOCK: the real /billing/checkout stays 503 (config-gated)", `status ${realProbe.status}`);
       assert(
-        !conHtml.includes('data-testid="upgrade-billing"') && !conHtml.includes("/billing/checkout"),
-        "billing NOT CONFIGURED: the console hides every billing door",
+        conHtml.includes('data-testid="upgrade-billing"') &&
+          conHtml.includes('data-testid="upgrade-voice"') &&
+          conHtml.includes('data-testid="mock-billing-note"') &&
+          !conHtml.includes("coming this week"),
+        "billing MOCK: the console shows mock Upgrade buttons (parachute + voice) + 'test mode' label, no teaser",
       );
-      assert(conHtml.includes("coming this week"), "billing NOT CONFIGURED: the free-plan teaser stays");
+      // The mock endpoint keeps the console write boundary (session-gated).
+      const noSess = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
+      assert(noSess.status === 302 && noSess.headers.get("location") === "/login", "billing MOCK: unauthenticated mock-checkout → /login", `status ${noSess.status}`);
+
+      // --- the live mock-upgrade E2E on a FRESH user → VOICE tier ---
+      const mEmail = `mock-${Date.now()}@smoke.test`;
+      const mPass = b64url(crypto.getRandomValues(new Uint8Array(18)));
+      const mVault = `mockbox-${Date.now()}`;
+      const mSuGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
+      const mCsrf = cookieVal(mSuGet.headers.getSetCookie(), "parachute_id_csrf");
+      const mSu = await fetch(`${IDENTITY}/signup`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${mCsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: mCsrf!, email: mEmail, password: mPass }),
+      });
+      const mSession = cookieVal(mSu.headers.getSetCookie(), "parachute_id_session");
+      assert(mSu.status === 302 && !!mSession, "billing MOCK E2E: fresh signup → session", `status ${mSu.status}`);
+      const mCookie = `parachute_id_session=${mSession}; parachute_id_csrf=${mCsrf}`;
+      const mCv = await fetch(`${IDENTITY}/console/vaults`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: mCookie },
+        redirect: "manual",
+        body: form({ __csrf: mCsrf!, name: mVault }),
+      });
+      assert(mCv.status === 302 && (mCv.headers.get("location") ?? "").includes(`created=${mVault}`), "billing MOCK E2E: created a vault", `status ${mCv.status}`);
+
+      const mUp = await fetch(`${IDENTITY}/billing/mock-checkout`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: mCookie },
+        redirect: "manual",
+        body: form({ __csrf: mCsrf!, plan: "voice" }),
+      });
+      assert(
+        mUp.status === 302 && (mUp.headers.get("location") ?? "").includes("mock_upgraded=1"),
+        "billing MOCK E2E: mock-checkout(voice) → 302 mock_upgraded",
+        `status ${mUp.status} → ${mUp.headers.get("location")}`,
+      );
+      const mCon = await (await fetch(`${IDENTITY}/console?mock_upgraded=1`, { headers: { cookie: mCookie } })).text();
+      assert(
+        mCon.includes("Voice plan") && mCon.includes("Test purchase complete") && !mCon.includes('data-testid="upgrade-billing"'),
+        "billing MOCK E2E: console shows the Voice plan line + the test-purchase notice, Upgrade gone",
+      );
+
+      // The vault landing reflects the VOICE entitlement + the voice-tier cap —
+      // the same applyPlanToVaults lift a real webhook performs.
+      const mOwner = await authorizeFor(mEmail, mPass, mVault);
+      if (!mOwner.token) {
+        fail("billing MOCK E2E: the mock-upgraded user mints a token for their vault", mOwner.error ?? "no token");
+      } else {
+        const mLand = (await (await fetch(`${VAULT}/vault/${mVault}`, { headers: { authorization: `Bearer ${mOwner.token}` } })).json()) as any;
+        assert(
+          mLand.transcription?.enabled === true && mLand.transcription?.minutes_remaining === 600,
+          "billing MOCK E2E: landing reports voice transcription enabled + 600 minutes_remaining",
+          JSON.stringify(mLand.transcription),
+        );
+        assert(
+          mLand.cap_bytes === 10 * 1024 * 1024 * 1024,
+          "billing MOCK E2E: landing cap_bytes reflects the Voice tier (10 GiB)",
+          `cap_bytes=${mLand.cap_bytes}`,
+        );
+        // Hand this mock-upgraded voice user to §18 for the live transcription.
+        mockVoice = { email: mEmail, password: mPass, vault: mVault };
+      }
     } else {
+      // CONFIGURED (real Stripe keys present) — the pre-mock contract, plus the
+      // mock endpoint now 404ing because the real path has taken over.
+      const probe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
       assert(
         probe.status === 302 && probe.headers.get("location") === "/login",
         "billing CONFIGURED: anonymous checkout redirects to /login",
@@ -867,11 +945,12 @@ async function main() {
         "billing CONFIGURED: an unsigned webhook is refused (400 missing_signature)",
         `status ${webhook.status}`,
       );
-      const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
       assert(
-        conHtml.includes('data-testid="upgrade-billing"'),
-        "billing CONFIGURED: the free user's console shows the Upgrade buttons",
+        conHtml.includes('data-testid="upgrade-billing"') && conHtml.includes('action="/billing/checkout"'),
+        "billing CONFIGURED: the free user's console shows the real Upgrade buttons",
       );
+      const mock = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
+      assert(mock.status === 404, "billing CONFIGURED: the mock endpoint 404s (the real path is active)", `status ${mock.status}`);
     }
   }
 
@@ -991,12 +1070,17 @@ async function main() {
     }
   }
 
-  // 18. Voice transcription (cloud#56) — comp the arrival user to the VOICE
-  //     tier, upload the committed real-speech fixture, link transcribe:true,
-  //     drive the DO drain via the staging __test hook, and assert the note
-  //     resolves to a REAL transcript (not eternal pending, not a failure/limit
-  //     marker). This exercises the live Workers AI path at deploy time.
-  if (arrivalVault && arrivalEmail) {
+  // 18. Voice transcription (cloud#56) — prove the LIVE Workers AI path for a
+  //     VOICE-tier user: upload the committed real-speech fixture, link
+  //     transcribe:true, drive the DO drain via the staging __test hook, and
+  //     assert the note resolves to a REAL transcript (not eternal pending, not
+  //     a failure/limit marker). The voice user is preferentially the
+  //     MOCK-upgraded user from §16 — so this ALSO proves a real transcription
+  //     works for a mock-upgraded account (the mock-payments bonus E2E). When
+  //     billing is configured (no mock user), fall back to admin-comping the
+  //     arrival user to Voice (which also exercises the comp lever).
+  let voiceUser: { email: string; password: string; vault: string } | null = mockVoice;
+  if (!voiceUser && arrivalVault && arrivalEmail) {
     const vCsrf = `smoke-voice-${Date.now()}`;
     const usersHtml = await (await fetch(`${IDENTITY}/admin/users`, { headers: { cookie: `parachute_id_session=${session}` } })).text();
     const row = usersHtml.split("<tr>").find((r) => r.includes(arrivalEmail));
@@ -1008,32 +1092,36 @@ async function main() {
       body: form({ __csrf: vCsrf, user_id: uid ?? "", plan: "voice" }),
     });
     assert(compVoice.status === 302, "voice: admin comp lever flips the arrival user to Voice", `status ${compVoice.status}`);
-
-    const owner = await authorizeFor(arrivalEmail, arrivalPassword, arrivalVault);
+    voiceUser = { email: arrivalEmail, password: arrivalPassword, vault: arrivalVault };
+  }
+  if (voiceUser) {
+    const { email: vEmail, password: vPass, vault: vVault } = voiceUser;
+    const via = mockVoice ? "mock-upgraded" : "admin-comped";
+    const owner = await authorizeFor(vEmail, vPass, vVault);
     if (!owner.token) {
-      fail("voice: owner mints a token for the arrival vault", owner.error ?? "no token");
+      fail(`voice: the ${via} owner mints a token for their vault`, owner.error ?? "no token");
     } else {
       const AUTH = { authorization: `Bearer ${owner.token}` };
-      const land = (await (await fetch(`${VAULT}/vault/${arrivalVault}`, { headers: AUTH })).json()) as any;
+      const land = (await (await fetch(`${VAULT}/vault/${vVault}`, { headers: AUTH })).json()) as any;
       assert(
         land.transcription?.enabled === true && typeof land.transcription?.minutes_remaining === "number",
-        "voice: landing reports transcription enabled + minutes_remaining",
+        `voice: landing reports transcription enabled + minutes_remaining (${via} user)`,
         JSON.stringify(land.transcription),
       );
 
       const wav = readFileSync(join(HERE, "fixtures", "voice-smoke.wav"));
       const fd = new FormData();
       fd.set("file", new File([wav], "voice-smoke.wav", { type: "audio/wav" }));
-      const up = await fetch(`${VAULT}/vault/${arrivalVault}/api/storage/upload`, { method: "POST", headers: AUTH, body: fd });
+      const up = await fetch(`${VAULT}/vault/${vVault}/api/storage/upload`, { method: "POST", headers: AUTH, body: fd });
       const upPath = ((await up.json()) as any).path;
       assert(up.status === 201 && !!upPath, "voice: uploaded the real-speech fixture", `status ${up.status}`);
 
-      const note = (await (await fetch(`${VAULT}/vault/${arrivalVault}/api/notes`, {
+      const note = (await (await fetch(`${VAULT}/vault/${vVault}/api/notes`, {
         method: "POST",
         headers: { ...AUTH, "content-type": "application/json" },
         body: JSON.stringify({ content: "# 🎙️ Voice memo\n\n_Transcript pending._\n\n![[voice-smoke.wav]]\n" }),
       })).json()) as { id: string };
-      const link = await fetch(`${VAULT}/vault/${arrivalVault}/api/notes/${note.id}/attachments`, {
+      const link = await fetch(`${VAULT}/vault/${vVault}/api/notes/${note.id}/attachments`, {
         method: "POST",
         headers: { ...AUTH, "content-type": "application/json" },
         body: JSON.stringify({ path: upPath, mimeType: "audio/wav", transcribe: true }),
@@ -1041,7 +1129,7 @@ async function main() {
       assert(link.status === 201, "voice: linked the attachment with transcribe:true", `status ${link.status}`);
 
       // Drive the drain synchronously (a REAL Workers AI inference runs here).
-      const run = await fetch(`${VAULT}/vault/${arrivalVault}/__test/transcribe-run`, { method: "POST" });
+      const run = await fetch(`${VAULT}/vault/${vVault}/__test/transcribe-run`, { method: "POST" });
       const runBody = (await run.json()) as { processed: number };
       assert(
         run.status === 200 && runBody.processed >= 1,
@@ -1049,15 +1137,15 @@ async function main() {
         `status ${run.status} processed=${runBody.processed}`,
       );
 
-      const finalBody = ((await (await fetch(`${VAULT}/vault/${arrivalVault}/api/notes/${note.id}?include_content=true`, { headers: AUTH })).json()) as { content: string }).content;
-      assert(!finalBody.includes("_Transcript pending._"), "voice: the eternal 'Transcribing…' spinner is GONE", finalBody.replace(/\n/g, " ").slice(0, 90));
+      const finalBody = ((await (await fetch(`${VAULT}/vault/${vVault}/api/notes/${note.id}?include_content=true`, { headers: AUTH })).json()) as { content: string }).content;
+      assert(!finalBody.includes("_Transcript pending._"), `voice: the eternal 'Transcribing…' spinner is GONE (${via} user)`, finalBody.replace(/\n/g, " ").slice(0, 90));
       assert(
         !finalBody.includes("_Transcription unavailable._") && !finalBody.includes("Monthly voice limit"),
-        "voice: resolved to a real Workers-AI transcript (not a failure/limit marker)",
+        `voice: resolved to a real Workers-AI transcript (${via} user; not a failure/limit marker)`,
         finalBody.replace(/\n/g, " ").slice(0, 120),
       );
 
-      const land2 = (await (await fetch(`${VAULT}/vault/${arrivalVault}`, { headers: AUTH })).json()) as any;
+      const land2 = (await (await fetch(`${VAULT}/vault/${vVault}`, { headers: AUTH })).json()) as any;
       assert(
         land2.transcription.minutes_remaining < land.transcription.minutes_remaining,
         "voice: minutes_remaining metered down after the transcription",

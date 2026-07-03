@@ -133,6 +133,13 @@ async function main() {
     assert(usage.status === 404, "PRODUCTION: /__test/usage-run does not exist (404)", `status ${usage.status}`);
     const snap = await fetch(`${IDENTITY}/__test/snapshot-run`, { method: "POST" });
     assert(snap.status === 404, "PRODUCTION: /__test/snapshot-run does not exist (404)", `status ${snap.status}`);
+    // THE MOCK-BILLING SECURITY PIN: the interim mock-checkout endpoint is
+    // hard-gated to non-production (billing-config.ts mockBillingEnabled). In
+    // prod it 404s exactly like the __test/* hooks — a free self-upgrade is
+    // unreachable here, EVEN if MOCK_BILLING were ever mis-set (the belt beats
+    // the flag). State-free POST; a redirect/302 would be a red flag.
+    const mock = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
+    assert(mock.status === 404, "PRODUCTION: /billing/mock-checkout does not exist (404) — no free self-upgrade", `status ${mock.status}`);
     const unsub = await fetch(`${IDENTITY}/unsubscribe?t=bogus-${Date.now()}`);
     assert(unsub.status === 404, "unsubscribe with an unknown token is refused (404)", `status ${unsub.status}`);
   }

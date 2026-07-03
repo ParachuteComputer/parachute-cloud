@@ -56,6 +56,16 @@ const BILLING_ENV = {
   STRIPE_PRICE_PARACHUTE_YEARLY: PRICE_YEARLY,
 };
 
+/**
+ * PRODUCTION, no Stripe keys — the true "today's deploy" degradation state.
+ * The plain test `env` pins ENVIRONMENT="test", which now AUTO-ENABLES the
+ * interim mock path (billing-config.ts `mockBillingEnabled`); the teaser +
+ * hidden-billing contract belongs to PRODUCTION (where the mock 404s), so the
+ * degradation assertions run against a production env. (The mock path itself is
+ * pinned in mock-billing.test.ts.)
+ */
+const PROD_UNCONFIGURED_ENV = { ...env, ENVIRONMENT: "production" };
+
 // --- helpers ------------------------------------------------------------------
 
 /**
@@ -200,19 +210,21 @@ describe("NOT CONFIGURED — the clean degradation (today's deploy)", () => {
     },
   );
 
-  test("free user's console hides every billing door; the teaser stays", async () => {
+  test("PRODUCTION, no keys: free user's console hides every billing door (incl. mock); the teaser stays", async () => {
     const { id } = await seedUser("noconfig@example.com");
     await seedVault("noconfig-box", id);
-    const html = await consoleHtml(await seedSession(id));
+    const html = await consoleHtml(await seedSession(id), PROD_UNCONFIGURED_ENV);
     expect(html).not.toContain('data-testid="upgrade-billing"');
     expect(html).not.toContain('data-testid="manage-billing"');
+    expect(html).not.toContain('data-testid="mock-billing-note"'); // the mock 404s in prod
     expect(html).not.toContain("/billing/checkout");
+    expect(html).not.toContain("/billing/mock-checkout");
     expect(html).toContain("coming this week"); // the copy-only teaser, unchanged
   });
 
   test("paid user's console hides Manage billing while unconfigured", async () => {
     const { id } = await seedPaidUser("noconfig-paid@example.com");
-    const html = await consoleHtml(await seedSession(id));
+    const html = await consoleHtml(await seedSession(id), PROD_UNCONFIGURED_ENV);
     expect(html).not.toContain('data-testid="manage-billing"');
   });
 });
