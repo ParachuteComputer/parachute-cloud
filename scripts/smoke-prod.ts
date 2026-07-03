@@ -131,6 +131,8 @@ async function main() {
     assert(trig.status === 404, "PRODUCTION: /__test/drip-run does not exist (404)", `status ${trig.status}`);
     const usage = await fetch(`${IDENTITY}/__test/usage-run`, { method: "POST" });
     assert(usage.status === 404, "PRODUCTION: /__test/usage-run does not exist (404)", `status ${usage.status}`);
+    const snap = await fetch(`${IDENTITY}/__test/snapshot-run`, { method: "POST" });
+    assert(snap.status === 404, "PRODUCTION: /__test/snapshot-run does not exist (404)", `status ${snap.status}`);
     const unsub = await fetch(`${IDENTITY}/unsubscribe?t=bogus-${Date.now()}`);
     assert(unsub.status === 404, "unsubscribe with an unknown token is refused (404)", `status ${unsub.status}`);
   }

@@ -53,11 +53,18 @@ import {
   VaultNameTakenError,
   countVaultsForOwner,
   createVault,
+  getVault,
   listVaultsForOwner,
   userOwnsVault,
 } from "./vaults.ts";
-import { PLAN_SPECS, vaultCapMessage } from "./plans.ts";
+import { PLAN_SPECS, restoreAtCapMessage, vaultCapMessage } from "./plans.ts";
 import { callVaultApi, pushVaultCap } from "./vault-call.ts";
+import {
+  callVaultRestore,
+  isKnownSnapshot,
+  listSnapshotsForVaults,
+  restoredVaultName,
+} from "./snapshots.ts";
 import {
   getChecklistState,
   isChecklistItem,
@@ -224,6 +231,21 @@ async function renderConsoleFor(
     const row = usage.get(card.name);
     card.usage = row ? { usedBytes: row.dbBytes + row.r2Bytes, day: row.day } : null;
   }
+  // History (Wave 4e): restore points from the D1 snapshot mirror — paid
+  // plans see the list + restore doors; free plans see the teaser (their
+  // rolling weekly is OUR disaster-recovery artifact, never surfaced).
+  if (PLAN_SPECS[user.plan].restore) {
+    const snapshots = await listSnapshotsForVaults(db, vaults.map((v) => v.name));
+    for (const card of cards) {
+      const rows = snapshots.get(card.name) ?? [];
+      card.history = {
+        kind: "restore-points",
+        entries: rows.map((r) => ({ key: r.key, takenAt: r.takenAt, bytes: r.bytes, ranks: r.ranks })),
+      };
+    }
+  } else {
+    for (const card of cards) card.history = { kind: "teaser" };
+  }
   const recorded = [...usage.values()];
   const totalUsedBytes =
     recorded.length > 0 ? recorded.reduce((sum, r) => sum + r.dbBytes + r.r2Bytes, 0) : null;
@@ -301,9 +323,16 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
   // ?pack_added=whatever from painting a false success banner).
   const packAdded = params.get("pack_added");
   const packVault = packAdded && vaults.some((v) => v.name === packAdded) ? packAdded : null;
+  // Restore success notice — only for a vault this user actually owns (the
+  // param is user-editable; same rule as pack_added). The attachments caveat
+  // rides the success message: honesty at the exact moment it matters.
+  const restoredParam = params.get("restored");
+  const restoredVault = restoredParam && vaults.some((v) => v.name === restoredParam) ? restoredParam : null;
   const notice = created
     ? `Your vault "${created}" is ready — open your notes, or connect your AI below.`
-    : packVault
+    : restoredVault
+      ? `Snapshot restored into "${restoredVault}" — a new vault; the original is untouched. Heads up: v1 snapshots don't include attachment files, so notes and their attachment references are back but the files themselves aren't.`
+      : packVault
       ? `Surface Starter added to ${packVault} — ask your connected AI to read it.`
       : params.get("upgraded")
         ? "Thanks — payment received. Your Parachute plan activates the moment Stripe's confirmation lands (usually seconds)."
@@ -399,6 +428,101 @@ async function writeFirstNote(
       `event=first_note_write_failed vault=${vaultName} error=${err instanceof Error ? err.message : String(err)}`,
     );
   }
+}
+
+// --- snapshot restore (Wave 4e — paid plans only) -----------------------------
+
+/** Mirrors the admin router's own 404 — the restore surface doesn't exist for
+ *  plans without the entitlement (free), same as it doesn't for anonymous. */
+function restoreNotFound(): Response {
+  return new Response("404 Not Found", {
+    status: 404,
+    headers: { "content-type": "text/plain; charset=UTF-8" },
+  });
+}
+
+/**
+ * POST /console/vaults/restore — restore a snapshot into a NEW vault.
+ *
+ * The user-facing trust boundary, in order:
+ *   1. session; 2. PLAN entitlement (plans.ts `restore`) — free plans get the
+ *   router-shaped 404, the surface doesn't exist for them (the admin
+ *   pattern); 3. CSRF + same-origin; 4. ownership of the SOURCE vault;
+ *   5. the snapshot key must be a mirrored restore point of that vault;
+ *   6. the plan's vault-count cap (restore CREATES a vault — friendly
+ *   refusal at the cap).
+ *
+ * Then: claim `<vault>-restored-<date>` (REUSED if this user already owns it
+ * — the same-day-retry convergence; a retry never burns a second slot), push
+ * the plan cap, and have the target DO replay the tarball
+ * (snapshots.ts callVaultRestore → POST /api/internal/restore, blow-away
+ * import). The SOURCE vault is never touched — the DO enforces that too
+ * (restore_into_self → 400). A failed replay keeps the target row (its
+ * content is the owner's own snapshot data; retrying converges) and reports
+ * honestly.
+ */
+export async function handleRestorePost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const user = await sessionUser(db, req, deps);
+  if (!user) return redirectResponse("/login");
+  const spec = PLAN_SPECS[user.plan];
+  if (!spec.restore) return restoreNotFound();
+
+  const form = await req.formData();
+  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+    return consoleError(db, req, deps, user, "Your session expired. Please try again.");
+  }
+  const vaultName = String(form.get("vault") ?? "").trim().toLowerCase();
+  const key = String(form.get("key") ?? "");
+  if (!vaultName || !(await userOwnsVault(db, user.id, vaultName))) {
+    return consoleError(db, req, deps, user, "You can only restore a vault you own.");
+  }
+  if (!(await isKnownSnapshot(db, vaultName, key))) {
+    return consoleError(db, req, deps, user, "That restore point wasn't recognized — reload and try again.");
+  }
+
+  const now = deps.now?.() ?? new Date();
+  const targetName = restoredVaultName(vaultName, now);
+  const existing = await getVault(db, targetName);
+  if (existing && existing.ownerUserId !== user.id) {
+    // Practically unreachable (restored-names derive from a vault the user
+    // owns), but never restore into someone else's vault.
+    return consoleError(db, req, deps, user, "Couldn't claim a name for the restored vault. Please try again tomorrow.");
+  }
+  if (!existing) {
+    // Restore creates a NEW vault — it counts against the plan's vault limit
+    // exactly like any other creation (same `>=` grandfathering rule).
+    if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
+      return consoleError(db, req, deps, user, restoreAtCapMessage(user.plan));
+    }
+    try {
+      await createVault(db, targetName, user.id, now);
+    } catch (err) {
+      if (err instanceof VaultNameTakenError || err instanceof VaultNameInvalidError) {
+        return consoleError(db, req, deps, user, "Couldn't claim a name for the restored vault. Please try again.");
+      }
+      throw err;
+    }
+    // Same best-effort cap push as any vault creation (a miss leaves the
+    // more-generous env default; applyPlanToVaults reconciles).
+    await pushVaultCap(db, deps, user.id, targetName, spec.total_bytes);
+  }
+
+  try {
+    await callVaultRestore(db, deps, user.id, targetName, vaultName, key);
+  } catch (err) {
+    console.warn(
+      `event=restore_failed vault=${vaultName} target=${targetName} error=${err instanceof Error ? err.message : String(err)}`,
+    );
+    return consoleError(
+      db,
+      req,
+      deps,
+      user,
+      `Restore didn't complete — please try again in a moment. (Retrying reuses "${targetName}"; it never touches "${vaultName}".)`,
+    );
+  }
+  console.log(`event=restore_completed vault=${vaultName} target=${targetName}`);
+  return redirectResponse(`/console?restored=${encodeURIComponent(targetName)}`);
 }
 
 // --- the getting-started checklist ------------------------------------------
