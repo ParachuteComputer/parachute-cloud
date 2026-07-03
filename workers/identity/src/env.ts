@@ -11,10 +11,11 @@ export interface Env {
   /** Cloud vault addressing: `vault:<name>` → `https://<name>.<VAULT_BASE_DOMAIN>`. */
   VAULT_BASE_DOMAIN: string;
   /**
-   * Dev-only: the vault worker's origin for PATH routing
-   * (`<VAULT_ORIGIN>/vault/<name>`). Set on the workers.dev dev deploy where
-   * there is no wildcard subdomain cert; unset in prod (subdomain addressing).
-   * Consumed by the services catalog + the console connect cards.
+   * The vault worker's origin for PATH routing (`<VAULT_ORIGIN>/vault/<name>`).
+   * Set in BOTH environments' vars (production uses path routing on the branded
+   * host until wildcard subdomains land). Consumed by the services catalog, the
+   * console connect cards, AND the scheduled health check (ops.ts probes
+   * `<VAULT_ORIGIN>/health`). Optional only for type-safety of bare configs.
    */
   VAULT_ORIGIN?: string;
   /**
@@ -25,6 +26,12 @@ export interface Env {
   ENVIRONMENT?: string;
   /** FROM address for outbound email. Its domain must be onboarded to Email Sending. */
   EMAIL_FROM?: string;
+  /**
+   * Where the scheduled health-check alerts + the weekly ops digest go
+   * (ops.ts). On staging the devlog sender writes these to the worker log
+   * instead of sending. Unset → ops emails are skipped (logged).
+   */
+  OPERATOR_ALERT_EMAIL?: string;
   /**
    * The Cloudflare `send_email` binding, when declared in wrangler.toml AND the
    * sending domain is onboarded. Absent → the magic-link flow uses the dev-log

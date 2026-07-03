@@ -29,6 +29,27 @@ workers_dev = true
 pattern = "cloud.parachute.computer"
 custom_domain = true
 
+# Workers Logs: persist invocation logs + console.* so `wrangler tail`, the
+# dashboard, and the logs API can actually surface them. Before this stanza the
+# account had NO persistent logs — structured failure lines like
+# event=magic_link_send_failed were emitted into the void (a tail probe captured
+# zero events, 2026-07-02). head_sampling_rate 1 = log every request; revisit if
+# volume ever costs. Restated explicitly in [env.staging] — the docs' guidance
+# on env inheritance of observability has varied; explicit beats implicit.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# Ops cron (src/ops.ts, routed by the matched pattern in controller.cron):
+#   */10 * * * *  → health check: identity D1 self-check + vault /health via
+#                   VAULT_ORIGIN; failures email OPERATOR_ALERT_EMAIL with a
+#                   1-hour per-check dedupe (ops_alerts, D1).
+#   0 14 * * 1    → weekly ops digest (Mon 14:00 UTC ≈ Monday morning MT):
+#                   counts-only from D1 (users/vaults/magic-link events).
+# The patterns here MUST stay in sync with HEALTH_CRON/DIGEST_CRON in ops.ts.
+[triggers]
+crons = ["*/10 * * * *", "0 14 * * 1"]
+
 # Control-plane state: users, clients, auth_codes, tokens, grants, sessions,
 # signing_keys. The revocation list is DERIVED from the tokens table (exactly
 # like the hub) — no separate KV needed. database_id is the real D1 in the
@@ -69,6 +90,8 @@ ENVIRONMENT = "production"
 # FROM address for magic-link email. Its domain must be onboarded to Cloudflare
 # Email Sending before real sends succeed (see the send_email binding note below).
 EMAIL_FROM = "noreply@parachute.computer"
+# Where the scheduled health-check alerts + weekly ops digest go (src/ops.ts).
+OPERATOR_ALERT_EMAIL = "ag@unforced.org"
 
 # --- outbound email (Cloudflare Email Sending) ------------------------------
 # Cloudflare Email Sending (public beta, Workers Paid). parachute.computer was
@@ -117,6 +140,20 @@ VAULT_BASE_DOMAIN = "parachute-vault-do-staging.unforced.workers.dev"
 VAULT_ORIGIN = "https://parachute-vault-do-staging.unforced.workers.dev"
 ENVIRONMENT = "staging"
 EMAIL_FROM = "noreply@parachute.computer"
+# Same operator address as production — but staging has no send_email binding,
+# so ops alerts/digests land in the worker log (devlog sender), never an inbox.
+OPERATOR_ALERT_EMAIL = "ag@unforced.org"
+
+# Workers Logs for staging too (explicit per-env restatement; see the top-level
+# [observability] note).
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1
+
+# Same cron schedule as production: the health check + digest RUN on staging
+# (exercising the real cron path), with output to the log instead of email.
+[env.staging.triggers]
+crons = ["*/10 * * * *", "0 14 * * 1"]
 
 # (no [[env.staging.send_email]] — see the staging banner above; the omission is
 # the point: dev-log sender + echo header = deterministic headless testing.)

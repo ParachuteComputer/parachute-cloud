@@ -17,6 +17,7 @@
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import type { EmailSender } from "./email.ts";
 import { consumeMagicLink, createMagicLink } from "./magic-links.ts";
+import { bumpMagicLinkEvent } from "./ops.ts";
 import {
   buildPendingLoginCookie,
   clearPendingLoginCookie,
@@ -131,6 +132,8 @@ export async function handleMagicRequestPost(
         `event=magic_link_send_failed sender=${sender.kind} domain=${domain} error=${JSON.stringify(sent.error)}`,
       );
     }
+    // PII-free per-day counter for the weekly ops digest (never throws).
+    await bumpMagicLinkEvent(db, sent.ok ? "sent" : "failed", now);
     const extra: Record<string, string> = {};
     // DEV ONLY: echo the link so the flow is testable without real email. Gated
     // hard on ENVIRONMENT !== "production" (deps.exposeDevLinks).

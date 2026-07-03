@@ -46,6 +46,9 @@ function captureSender(): EmailSender & { sent: Array<{ to: string; link: string
       sent.push({ to, link });
       return { ok: true };
     },
+    async sendOps(): Promise<SendResult> {
+      return { ok: true };
+    },
   };
 }
 
@@ -201,6 +204,9 @@ describe("magic link — send + verify", () => {
         attempts++;
         return { ok: false, error: "SendError: 550 mailbox unavailable" };
       },
+      async sendOps(): Promise<SendResult> {
+        return { ok: true };
+      },
     };
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
@@ -245,6 +251,40 @@ describe("magic link — send + verify", () => {
     const { EMAIL: _unused, ...withoutBinding } = env as unknown as Record<string, unknown>;
     expect(senderFor(withoutBinding as never).kind).toBe("devlog");
     expect(senderFor(env as never).kind).toBe("binding");
+  });
+
+  test("send outcomes are counted per day for the ops digest — PII-free", async () => {
+    // Two successful sends + one failed send on the same UTC day → sent=2,
+    // failed=1 in magic_link_events. The rows carry NO email/domain/IP.
+    const now = new Date("2026-07-02T12:00:00Z");
+    const sender = captureSender();
+    await handleMagicRequestPost(env.DB, magicReq("counted-a@example.com", "10.9.9.1"), deps(() => now), sender);
+    await handleMagicRequestPost(env.DB, magicReq("counted-b@example.com", "10.9.9.2"), deps(() => now), sender);
+
+    const failing: EmailSender = {
+      kind: "binding",
+      async sendMagicLink(): Promise<SendResult> {
+        return { ok: false, error: "SendError: quota exceeded" };
+      },
+      async sendOps(): Promise<SendResult> {
+        return { ok: true };
+      },
+    };
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await handleMagicRequestPost(env.DB, magicReq("counted-c@example.com", "10.9.9.3"), deps(() => now), failing);
+      expect(res.status).toBe(200); // counter never breaks the neutral flow
+    } finally {
+      errSpy.mockRestore();
+    }
+
+    const rows = await env.DB.prepare("SELECT event, count FROM magic_link_events WHERE day = ? ORDER BY event")
+      .bind("2026-07-02")
+      .all<{ event: string; count: number }>();
+    expect(rows.results).toEqual([
+      { event: "failed", count: 1 },
+      { event: "sent", count: 2 },
+    ]);
   });
 });
 
