@@ -516,6 +516,112 @@ async function main() {
     );
   }
 
+  // 12. Guided arrival — the first-run hero, research answers, the first note
+  //     written into the new vault, and the getting-started checklist
+  //     (mark-done doors + dismissal). The full headless session walk.
+  {
+    const email = `arrival+${Date.now()}@example.com`;
+    const password = b64url(crypto.getRandomValues(new Uint8Array(18)));
+    const vaultName = `arrive-${Date.now()}`;
+    const firstNote = `Remember: I am rebuilding my garden (${MARKER})`;
+
+    // Signup → session.
+    const suGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
+    const csrf = cookieVal(suGet.headers.getSetCookie(), "parachute_id_csrf");
+    const suRes = await fetch(`${IDENTITY}/signup`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${csrf}` },
+      redirect: "manual",
+      body: form({ __csrf: csrf!, email, password }),
+    });
+    const session = cookieVal(suRes.headers.getSetCookie(), "parachute_id_session");
+    const cookie = `parachute_id_session=${session}; parachute_id_csrf=${csrf}`;
+    assert(suRes.status === 302 && !!session, "arrival: signup → session", `status ${suRes.status}`);
+
+    // Zero vaults → the first-run hero with both research questions.
+    const heroHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie } })).text();
+    assert(
+      heroHtml.includes("Name your vault") &&
+        heroHtml.includes("What do you take notes in today?") &&
+        heroHtml.includes("What's the first thing you want your AI to remember?") &&
+        !heroHtml.includes('data-testid="checklist"'),
+      "arrival: zero-vault console renders the first-run hero + research questions",
+    );
+
+    // Create with BOTH answers.
+    const cvRes = await fetch(`${IDENTITY}/console/vaults`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie },
+      redirect: "manual",
+      body: form({ __csrf: csrf!, name: vaultName, notes_app: "obsidian", first_note: firstNote }),
+    });
+    assert(
+      cvRes.status === 302 && (cvRes.headers.get("location") ?? "").includes(`created=${vaultName}`),
+      "arrival: create with research answers → vault claimed",
+      `status ${cvRes.status}`,
+    );
+
+    // The first note exists IN the vault (verbatim), alongside the 4 seed notes.
+    const owner = await authorizeFor(email, password, vaultName);
+    assert(!!owner.token, "arrival: owner mints a token for the new vault", owner.error ? `error=${owner.error}` : "ok");
+    if (owner.token) {
+      const notesRes = await fetch(`${VAULT}/vault/${vaultName}/api/notes?include_content=true`, {
+        headers: { authorization: `Bearer ${owner.token}` },
+      });
+      const notes = (await notesRes.json()) as Array<{ path?: string; content?: string }>;
+      const mine = notes.find((n) => n.path === "My first note");
+      assert(
+        notesRes.status === 200 && !!mine && (mine.content ?? "").includes(firstNote),
+        "arrival: 'My first note' written into the vault, content verbatim",
+        `${notes.length} notes: ${notes.map((n) => n.path).join(", ")}`,
+      );
+      assert(
+        notes.length === 5 && notes.some((n) => n.path === "Welcome to your vault 🪂"),
+        "arrival: the first note JOINS the welcome seed (4 seed notes + theirs)",
+        `${notes.length} notes`,
+      );
+    }
+
+    // The console now shows the checklist (with the 2FA nudge) above the vault.
+    const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie } })).text();
+    assert(
+      conHtml.includes('data-testid="checklist"') &&
+        conHtml.includes('data-item="open-notes" data-done="0"') &&
+        conHtml.includes("Add custom connector") &&
+        conHtml.includes("Secure your account:"),
+      "arrival: checklist card renders (undone doors + connect walkthrough + 2FA nudge)",
+    );
+
+    // Walk a door: open-notes marks done + 302s to the Notes deep-link.
+    const doorRes = await fetch(`${IDENTITY}/console/checklist`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie },
+      redirect: "manual",
+      body: form({ __csrf: csrf!, item: "open-notes" }),
+    });
+    const doorLoc = doorRes.headers.get("location") ?? "";
+    assert(
+      doorRes.status === 302 && doorLoc.startsWith("https://notes.parachute.computer/?add="),
+      "arrival: a checklist door 302s to the Notes deep-link",
+      doorLoc,
+    );
+    const doneHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie } })).text();
+    assert(doneHtml.includes('data-item="open-notes" data-done="1"'), "arrival: the walked door renders done");
+
+    // Dismiss the card ("hide this") — persisted; vault cards remain.
+    await fetch(`${IDENTITY}/console/checklist`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie },
+      redirect: "manual",
+      body: form({ __csrf: csrf!, item: "hidden" }),
+    });
+    const hiddenHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie } })).text();
+    assert(
+      !hiddenHtml.includes('data-testid="checklist"') && hiddenHtml.includes(vaultName),
+      "arrival: 'hide this' dismisses the checklist, vault card stays",
+    );
+  }
+
   // --- summary ---
   console.log(`\n${"=".repeat(60)}\nSMOKE ${failures === 0 ? "PASSED" : "FAILED"} — ${results.filter((r) => r.includes("PASS")).length} pass, ${failures} fail\n${"=".repeat(60)}`);
   console.log(results.join("\n"));

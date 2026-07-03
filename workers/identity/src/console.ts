@@ -3,16 +3,27 @@
  * (it already owns users, sessions, cookies, and the rendered-HTML surface).
  *
  * Routes (all pure `(db, req, deps)` like the OAuth handlers):
- *   GET  /signup           create-account form
- *   POST /signup           create user + session → /console
- *   GET  /login            console sign-in form
- *   POST /login            verify + session → /console
- *   POST /logout           clear session → /login
- *   GET  /console          my vaults + create form + connect cards
- *   POST /console/vaults   claim a vault name → /console?created=<name>
- *   POST /console/packs    apply a seed pack to an owned vault (server-side
- *                          call to the vault worker with an internally minted
- *                          scoped token) → /console?pack_added=<name>
+ *   GET  /signup             create-account form
+ *   POST /signup             create user + session → /console
+ *   GET  /login              console sign-in form
+ *   POST /login              verify + session → /console
+ *   POST /logout             clear session → /login
+ *   GET  /console            zero vaults → the first-run hero ("Name your
+ *                            vault" + two optional research questions);
+ *                            otherwise the checklist card + vault cards +
+ *                            create form
+ *   POST /console/vaults     claim a vault name → /console?created=<name>.
+ *                            Also carries the OPTIONAL first-run extras:
+ *                            `notes_app` (research, stored on the user row) and
+ *                            `first_note` (written INTO the new vault as the
+ *                            user's real first note — best-effort, see
+ *                            writeFirstNote)
+ *   POST /console/packs      apply a seed pack to an owned vault (server-side
+ *                            call to the vault worker with an internally minted
+ *                            scoped token) → /console?pack_added=<name>
+ *   POST /console/checklist  mark a getting-started item done (or `hidden` to
+ *                            dismiss the card) → 302 to the item's destination
+ *                            (door items) or /console
  *
  * A cloud login session (parachute_id_session) is the same cookie the OAuth
  * authorize flow uses, so signing in here also carries you through a subsequent
@@ -46,7 +57,15 @@ import {
 } from "./vaults.ts";
 import { signAccessToken } from "./tokens.ts";
 import {
+  getChecklistState,
+  isChecklistItem,
+  markChecklistItem,
+  setNotesApp,
+} from "./checklist.ts";
+import { isTotpEnrolled } from "./two-factor.ts";
+import {
   type ConsoleVaultCard,
+  type FirstRunValues,
   renderConsole,
   renderConsoleLogin,
   renderSignup,
@@ -164,10 +183,57 @@ function cardFor(name: string, deps: OAuthDeps): ConsoleVaultCard {
   return {
     name,
     notesUrl: `${NOTES_APP_URL}/?add=${encodeURIComponent(base)}`,
+    // The PWA's connect flow honors a `redirect` companion: connect the vault
+    // (or skip if already connected), then land on /import.
+    importUrl: `${NOTES_APP_URL}/?add=${encodeURIComponent(base)}&redirect=${encodeURIComponent("/import")}`,
     mcpUrl: `${base}/mcp`,
-    restUrl: `${base}/api`,
     connectCmd: `claude mcp add --transport http parachute-${name} ${base}/mcp`,
   };
+}
+
+/**
+ * Render the console for `user` in its current state — the single render path
+ * for GET /console and every error re-render, so the first-run hero vs
+ * checklist-plus-cards decision lives in exactly one place.
+ */
+async function renderConsoleFor(
+  db: D1Database,
+  req: Request,
+  deps: OAuthDeps,
+  user: User,
+  opts: { error?: string; notice?: string; firstRun?: FirstRunValues } = {},
+): Promise<Response> {
+  const vaults = await listVaultsForOwner(db, user.id);
+  const cards = vaults.map((v) => cardFor(v.name, deps));
+  // The checklist card renders once a vault exists, until dismissed. Its doors
+  // open the FIRST (oldest) vault — the one the first-run flow created.
+  let checklist = null;
+  if (cards.length > 0) {
+    const state = await getChecklistState(db, user.id);
+    if (!state.hidden) {
+      checklist = {
+        done: state.done,
+        vault: cards[0]!,
+        // Quiet one-liner in the card footer; dismissed with the card. 2FA
+        // stays a surfaced OPTION, never a wall.
+        showTwoFactorNudge: !(await isTotpEnrolled(db, user.id)),
+      };
+    }
+  }
+  const csrf = ensureCsrfToken(req);
+  return htmlResponse(
+    renderConsole({
+      email: user.email,
+      vaults: cards,
+      csrfToken: csrf.token,
+      error: opts.error,
+      notice: opts.notice,
+      checklist,
+      firstRun: opts.firstRun,
+    }),
+    200,
+    csrfExtra(csrf.setCookie),
+  );
 }
 
 export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
@@ -186,29 +252,29 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
     : packVault
       ? `Surface Starter added to ${packVault} — ask your connected AI to read it.`
       : undefined;
-  const csrf = ensureCsrfToken(req);
-  return htmlResponse(
-    renderConsole({
-      email: user.email,
-      vaults: vaults.map((v) => cardFor(v.name, deps)),
-      csrfToken: csrf.token,
-      notice,
-    }),
-    200,
-    csrfExtra(csrf.setCookie),
-  );
+  return renderConsoleFor(db, req, deps, user, { notice });
 }
 
 export async function handleCreateVaultPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
   const form = await req.formData();
-  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
-    return consoleError(db, req, deps, user, "Your session expired. Please try again.");
-  }
   const rawName = String(form.get("name") ?? "");
+  // First-run extras — both OPTIONAL (the questions are research, not a wall).
+  const notesApp = String(form.get("notes_app") ?? "");
+  const firstNote = String(form.get("first_note") ?? "");
+  // Preserve the user's answers across a validation error re-render.
+  const firstRun: FirstRunValues = { name: rawName, notesApp, firstNote };
+  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+    return consoleError(db, req, deps, user, "Your session expired. Please try again.", firstRun);
+  }
   try {
     const vault = await createVault(db, rawName, user.id, deps.now?.() ?? new Date());
+    // (a) research answer → user row. Allowlisted inside; unknown values no-op.
+    if (notesApp) await setNotesApp(db, user.id, notesApp);
+    // (b) their first note → INTO the new vault, verbatim. Best-effort by
+    // contract: a vault-worker hiccup must never fail vault creation.
+    if (firstNote.trim().length > 0) await writeFirstNote(db, deps, user, vault.name, firstNote);
     return redirectResponse(`/console?created=${encodeURIComponent(vault.name)}`);
   } catch (err) {
     if (err instanceof VaultNameInvalidError) {
@@ -216,13 +282,88 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
         err.reason === "reserved"
           ? "That name is reserved. Please choose another."
           : "Use 2–63 characters: lowercase letters, numbers, and hyphens (starting with a letter or number).";
-      return consoleError(db, req, deps, user, msg);
+      return consoleError(db, req, deps, user, msg, firstRun);
     }
     if (err instanceof VaultNameTakenError) {
-      return consoleError(db, req, deps, user, "That vault name is already taken.");
+      return consoleError(db, req, deps, user, "That vault name is already taken.", firstRun);
     }
     throw err;
   }
+}
+
+/** Path of the note the first-run answer (b) becomes in the user's new vault. */
+const FIRST_NOTE_PATH = "My first note";
+
+/**
+ * Write the first-run "first thing you want your AI to remember" into the
+ * freshly created vault as a REAL note (path "My first note", content
+ * verbatim), through the same mint seam the packs button uses (60s
+ * `vault:<name>:write`, aud-pinned — see {@link handleAddPackPost}).
+ *
+ * BEST-EFFORT by contract: this runs after the vault row is committed, and a
+ * failure (vault worker down, cold-start hiccup) logs a structured warning and
+ * returns — vault creation MUST still succeed. This request is typically the
+ * vault DO's first materialization, so the welcome seed runs in the same
+ * breath and the user's note joins the seeded web.
+ */
+async function writeFirstNote(
+  db: D1Database,
+  deps: OAuthDeps,
+  user: User,
+  vaultName: string,
+  content: string,
+): Promise<void> {
+  try {
+    const res = await postVaultApi(db, deps, user.id, vaultName, "/api/notes", {
+      path: FIRST_NOTE_PATH,
+      content,
+    });
+    if (!res.ok) {
+      console.warn(`event=first_note_write_failed vault=${vaultName} status=${res.status}`);
+    }
+  } catch (err) {
+    console.warn(
+      `event=first_note_write_failed vault=${vaultName} error=${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+// --- the getting-started checklist ------------------------------------------
+
+/**
+ * Where each checklist door goes after the mark-done write. Doors ① ② ⑤
+ * navigate out to the Notes PWA; the expandables (③ ④) and the dismissal
+ * land back on the console. Computed against the user's FIRST vault (the one
+ * the checklist card renders for).
+ */
+function checklistDestination(item: string, card: ConsoleVaultCard): string {
+  if (item === "open-notes" || item === "write-note") return card.notesUrl;
+  if (item === "import-notes") return card.importUrl;
+  return "/console";
+}
+
+/**
+ * POST /console/checklist — mark a getting-started item done (or `hidden` to
+ * dismiss the whole card), then 302 to the item's destination. The door IS the
+ * mark: clicking "Open your notes" records open-notes and takes you there in
+ * one gesture (form target opens the PWA in a new tab; the expandables post
+ * via a tiny fetch on first open). Same trust boundary as every console
+ * write: session + CSRF + same-origin.
+ */
+export async function handleChecklistPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const user = await sessionUser(db, req, deps);
+  if (!user) return redirectResponse("/login");
+  const form = await req.formData();
+  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+    return consoleError(db, req, deps, user, "Your session expired. Please try again.");
+  }
+  const item = String(form.get("item") ?? "");
+  if (!isChecklistItem(item)) return redirectResponse("/console");
+  const vaults = await listVaultsForOwner(db, user.id);
+  // No vault yet → nothing for a door to open; don't record phantom progress.
+  if (vaults.length === 0) return redirectResponse("/console");
+  await markChecklistItem(db, user.id, item, deps.now?.() ?? new Date());
+  return redirectResponse(checklistDestination(item, cardFor(vaults[0]!.name, deps)));
 }
 
 // --- seed packs (the "Building a surface?" button) --------------------------
@@ -244,26 +385,60 @@ const CONSOLE_PACKS = new Set(["surface-starter"]);
 const CONSOLE_MINT_CLIENT_ID = "parachute-console";
 
 /** TTL for the console's internally-minted vault token: one server-side hop. */
-const PACK_TOKEN_TTL_SECONDS = 60;
+const CONSOLE_MINT_TTL_SECONDS = 60;
 
 /**
- * POST /console/packs — apply a seed pack to one of the user's vaults, via the
- * vault worker's POST /api/packs/:name.
- *
- * THE MINT SEAM: the console (this worker) has no vault-scoped token — the
- * vault worker only trusts JWTs from the issuer. But the console IS the
- * issuer: it owns the signing keys and the authenticated session. So this
- * handler mints a first-party access token through the same `signAccessToken`
- * the OAuth token endpoint uses, under the same ownership chokepoint the
- * OAuth path enforces (`userOwnsVault` — the exact check behind
- * `unownedNamedVaults`), then spends it on ONE server-side request:
+ * THE MINT SEAM, shared by every server-side console→vault write (the packs
+ * button, the first-run first note): mint a first-party access token through
+ * the same `signAccessToken` the OAuth token endpoint uses —
  *   - scope strictly `vault:<name>:write` (resource-narrowed; never broad),
  *   - `aud` pinned to `vault.<name>` (the vault worker strict-checks it),
  *   - `vault_scope` pinned to the one vault,
  *   - 60s TTL, no refresh token, no registry row (stateless — it expires
- *     before the revocation list would ever matter).
- * The user-facing trust boundary is unchanged: session cookie + CSRF +
- * same-origin + ownership — identical to creating the vault itself.
+ *     before the revocation list would ever matter) —
+ * then spend it on ONE POST to the vault worker. Transport: the service
+ * binding when bound (staging — workers.dev origins aren't valid subrequest
+ * targets), else global fetch (production's custom domain; tests' fetchMock).
+ *
+ * CALLERS enforce the user-facing trust boundary FIRST (session + CSRF +
+ * same-origin + `userOwnsVault`-or-just-created) — this helper only mints and
+ * sends. Network errors propagate; non-2xx returns as-is.
+ */
+async function postVaultApi(
+  db: D1Database,
+  deps: OAuthDeps,
+  userId: string,
+  vaultName: string,
+  apiPath: string,
+  jsonBody?: unknown,
+): Promise<Response> {
+  const signed = await signAccessToken(db, {
+    sub: userId,
+    scopes: [`vault:${vaultName}:write`],
+    audience: `vault.${vaultName}`,
+    clientId: CONSOLE_MINT_CLIENT_ID,
+    issuer: deps.issuer,
+    vaultScope: [vaultName],
+    ttlSeconds: CONSOLE_MINT_TTL_SECONDS,
+    now: deps.now,
+  });
+  const fetchFn = deps.vaultFetch ?? fetch;
+  const headers: Record<string, string> = { authorization: `Bearer ${signed.token}` };
+  if (jsonBody !== undefined) headers["content-type"] = "application/json";
+  return fetchFn(`${vaultInstanceUrl(vaultName, deps)}${apiPath}`, {
+    method: "POST",
+    headers,
+    ...(jsonBody !== undefined ? { body: JSON.stringify(jsonBody) } : {}),
+  });
+}
+
+/**
+ * POST /console/packs — apply a seed pack to one of the user's vaults, via the
+ * vault worker's POST /api/packs/:name through the shared mint seam
+ * ({@link postVaultApi}). The user-facing trust boundary: session cookie +
+ * CSRF + same-origin + ownership (`userOwnsVault` — the exact predicate behind
+ * `unownedNamedVaults` on the OAuth mint paths) — identical to creating the
+ * vault itself.
  */
 export async function handleAddPackPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
@@ -282,29 +457,9 @@ export async function handleAddPackPost(db: D1Database, req: Request, deps: OAut
     return consoleError(db, req, deps, user, "You can only add guides to a vault you own.");
   }
 
-  const signed = await signAccessToken(db, {
-    sub: user.id,
-    scopes: [`vault:${vaultName}:write`],
-    audience: `vault.${vaultName}`,
-    clientId: CONSOLE_MINT_CLIENT_ID,
-    issuer: deps.issuer,
-    vaultScope: [vaultName],
-    ttlSeconds: PACK_TOKEN_TTL_SECONDS,
-    now: deps.now,
-  });
-
-  // Transport: the service binding when bound (staging — workers.dev origins
-  // aren't valid subrequest targets), else global fetch (production's custom
-  // domain; tests' fetchMock). Same URL + Bearer JWT through the vault
-  // router's ordinary auth either way.
-  const fetchFn = deps.vaultFetch ?? fetch;
-  const url = `${vaultInstanceUrl(vaultName, deps)}/api/packs/${encodeURIComponent(pack)}`;
   let res: Response;
   try {
-    res = await fetchFn(url, {
-      method: "POST",
-      headers: { authorization: `Bearer ${signed.token}` },
-    });
+    res = await postVaultApi(db, deps, user.id, vaultName, `/api/packs/${encodeURIComponent(pack)}`);
   } catch (err) {
     console.warn(
       `event=pack_apply_unreachable vault=${vaultName} pack=${pack} error=${err instanceof Error ? err.message : String(err)}`,
@@ -326,19 +481,9 @@ async function consoleError(
   deps: OAuthDeps,
   user: User,
   message: string,
+  firstRun?: FirstRunValues,
 ): Promise<Response> {
-  const vaults = await listVaultsForOwner(db, user.id);
-  const csrf = ensureCsrfToken(req);
-  return htmlResponse(
-    renderConsole({
-      email: user.email,
-      vaults: vaults.map((v) => cardFor(v.name, deps)),
-      csrfToken: csrf.token,
-      error: message,
-    }),
-    200,
-    csrfExtra(csrf.setCookie),
-  );
+  return renderConsoleFor(db, req, deps, user, { error: message, firstRun });
 }
 
 // Re-exported for index.ts route wiring symmetry.
