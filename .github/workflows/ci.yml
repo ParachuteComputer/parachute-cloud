@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Clone parachute-vault (sibling file dep for @openparachute/core)
         # actions/checkout can't place a repo outside $GITHUB_WORKSPACE, so a
@@ -47,7 +47,7 @@ jobs:
           bun-version: 1.3.13 # keep consistent with local dev
 
       - name: Cache bun download cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('package.json', 'workers/*/package.json') }}
@@ -70,7 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Clone parachute-vault (sibling file dep for @openparachute/core)
         run: |
@@ -82,7 +82,7 @@ jobs:
           bun-version: 1.3.13 # keep consistent with local dev
 
       - name: Cache bun download cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('package.json', 'workers/*/package.json') }}
@@ -105,7 +105,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Clone parachute-vault (sibling file dep for @openparachute/core)
         # Needed even here — the root workspace install resolves workers/vault's
@@ -119,7 +119,7 @@ jobs:
           bun-version: 1.3.13 # keep consistent with local dev
 
       - name: Cache bun download cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('package.json', 'workers/*/package.json') }}
