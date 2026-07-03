@@ -17,6 +17,7 @@ import {
   handleLoginGet,
   handleLoginPost,
   handleLogoutPost,
+  handleRestorePost,
   handleSignupGet,
   handleSignupPost,
 } from "./console.ts";
@@ -50,6 +51,7 @@ import { type OAuthDeps, depsForEnv, oauthPreflight, withReflectedCors, withWild
 import { handleToken } from "./oauth-token.ts";
 import { handleScheduled } from "./ops.ts";
 import { handleUnsubscribe, runDrip } from "./drip.ts";
+import { runSnapshotSweep } from "./snapshots.ts";
 import { runUsageRollup } from "./usage.ts";
 import { handleCheckoutPost, handlePortalPost } from "./billing.ts";
 import { handleStripeWebhookPost } from "./billing-webhook.ts";
@@ -111,6 +113,11 @@ app.post("/login", (c) => handleLoginPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/logout", (c) => handleLogoutPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/console", (c) => handleConsoleGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/vaults", (c) => handleCreateVaultPost(c.env.DB, c.req.raw, depsFor(c.env)));
+// Snapshot restore (Wave 4e — PAID plans only): session + plan entitlement
+// (free → the router-shaped 404; the surface doesn't exist for them) + CSRF +
+// ownership + vault-count cap, then the target DO replays the tarball through
+// the mint seam. Restore always creates a NEW vault — never overwrites.
+app.post("/console/vaults/restore", (c) => handleRestorePost(c.env.DB, c.req.raw, depsFor(c.env)));
 // Seed-pack apply (the "Add the Surface Starter guide" button): session + CSRF
 // + ownership, then a server-side call to the vault worker with an internally
 // minted 60s vault:<name>:write token (the mint seam — see handleAddPackPost).
@@ -176,6 +183,15 @@ app.post("/__test/usage-run", async (c) => {
   const deps = depsFor(c.env);
   if (!deps.exposeDevLinks) return c.notFound();
   return c.json(await runUsageRollup(c.env, deps));
+});
+
+// Staging/dev-only snapshot-sweep trigger — same gate + rationale (404 in
+// production, pinned by smoke-prod). A stray staging caller can only take
+// policy-conformant snapshots; the GFS skip/prune bounds the work.
+app.post("/__test/snapshot-run", async (c) => {
+  const deps = depsFor(c.env);
+  if (!deps.exposeDevLinks) return c.notFound();
+  return c.json(await runSnapshotSweep(c.env, deps));
 });
 
 // Root → the console (which redirects to /login when signed out).

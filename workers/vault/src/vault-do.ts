@@ -36,6 +36,18 @@ import { mcpWwwAuthenticate } from "./discovery.js";
 import { handleSubscribe } from "./live/subscribe.js";
 import { SubscriptionManager } from "./live/subscriptions.js";
 import { collectExportEntries, exportPrefix, pruneExportTarballs, toTar } from "./export.js";
+import {
+  loadManifest,
+  pruneSnapshotTarballs,
+  ranksFor,
+  retainedKeys,
+  saveManifest,
+  snapshotPrefix,
+  validateRetention,
+  wouldRetain,
+  type SnapshotEntry,
+} from "./snapshots.js";
+import { restoreFromTar } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, type WelcomeSeedResult } from "./welcome.js";
 import { SEED_PACK_NAMES, applySeedPack, getSeedPack } from "@openparachute/core/src/seed-packs.js";
@@ -184,13 +196,20 @@ export class VaultDO extends DurableObject {
     const writeCtx = { actor: auth.actor, via: auth.via };
     const deps: RestDeps = { vaultName, deleteObject: (rel) => this.deleteObject(vaultName, rel) };
 
-    // Internal config seam — PUT/GET /api/internal/config. Dispatched BEFORE
+    // Internal (platform-owned) seams — /api/internal/*. ALL dispatched BEFORE
     // the cap gate ON PURPOSE: a plan upgrade must be able to RAISE the cap of
     // a vault that is already full (the gate would 413 the very write that
-    // fixes it). Its own authorization gate lives inside (first-party/operator
-    // only — see handleInternalConfig).
-    if (apiPath === "/internal/config") {
-      return this.handleInternalConfig(request, auth, vaultName);
+    // fixes it), and a FULL vault especially needs its nightly snapshot to
+    // land. One shared authorization gate (first-party/operator only — see
+    // internalForbidden); the wire contract for these is cloud-runtime only.
+    if (apiPath.startsWith("/internal/")) {
+      const forbidden = this.internalForbidden(auth, vaultName);
+      if (forbidden) return forbidden;
+      if (apiPath === "/internal/config") return this.handleInternalConfig(request);
+      if (apiPath === "/internal/snapshot") return this.handleSnapshot(request, vaultName);
+      if (apiPath === "/internal/snapshots") return this.handleListSnapshots(request, vaultName);
+      if (apiPath === "/internal/restore") return this.handleRestore(request, vaultName);
+      return json({ error: "Not found" }, 404);
     }
 
     // Cap gate for byte-growing writes (POST/PATCH/PUT). DELETE is exempt so a
@@ -371,39 +390,43 @@ export class VaultDO extends DurableObject {
   }
 
   /**
-   * PUT/GET /api/internal/config — PLATFORM-owned per-vault config (today:
-   * `cap_bytes`, the plan storage cap the Identity Worker pushes on vault
-   * creation / plan change / backfill).
-   *
-   * AUTHORIZATION (the honest seam, chosen with cloud#55): the general auth +
-   * verb gates have already run, but they are NOT sufficient here — a vault
-   * owner can mint `vault:<name>:admin` through the public OAuth flow, and the
-   * plan cap is the platform's control, not the tenant's. So this endpoint
-   * additionally requires the ISSUER'S OWN first-party mint: `client_id ===
+   * The shared authorization gate for every /api/internal/* seam (the honest
+   * seam, chosen with cloud#55): the general auth + verb gates have already
+   * run, but they are NOT sufficient here — a vault owner can mint
+   * `vault:<name>:admin` through the public OAuth flow, and these endpoints
+   * are the PLATFORM's controls, not the tenant's. So they additionally
+   * require the ISSUER'S OWN first-party mint: `client_id ===
    * FIRST_PARTY_CLIENT_ID` (unforgeable — DCR ids are server-generated UUIDs;
    * the claim rides a signature-checked JWT) AND the admin verb for this
    * vault; or the VAULT_AUTH_TOKEN operator bearer (the pre-existing
    * control-plane seam). Everything else → 403.
    *
-   * NOT part of the shared wire contract (the bun vault has no such endpoint);
+   * NOT part of the shared wire contract (the bun vault has no such surface);
    * the cloud conformance suite pins it as cloud-runtime surface.
    */
-  private async handleInternalConfig(request: Request, auth: AuthResult, vaultName: string): Promise<Response> {
+  private internalForbidden(auth: AuthResult, vaultName: string): Response | null {
     const firstParty =
       auth.via === "operator" ||
       (auth.clientId === FIRST_PARTY_CLIENT_ID && hasScopeForVault(auth.scopes, vaultName, "admin"));
-    if (!firstParty) {
-      return json(
-        {
-          error: "Forbidden",
-          error_type: "internal_config_forbidden",
-          message:
-            "Per-vault platform config (plan storage caps) is set by the service, not through tenant tokens.",
-        },
-        403,
-      );
-    }
+    if (firstParty) return null;
+    return json(
+      {
+        error: "Forbidden",
+        error_type: "internal_config_forbidden",
+        message:
+          "Per-vault platform operations (plan caps, snapshots, restore) are driven by the service, not through tenant tokens.",
+      },
+      403,
+    );
+  }
 
+  /**
+   * PUT/GET /api/internal/config — PLATFORM-owned per-vault config (today:
+   * `cap_bytes`, the plan storage cap the Identity Worker pushes on vault
+   * creation / plan change / backfill). Authorization: {@link internalForbidden}
+   * (already enforced by the /api/internal/* dispatcher).
+   */
+  private async handleInternalConfig(request: Request): Promise<Response> {
     const shape = () => {
       const dbBytes = Number(this.raw().databaseSize);
       return {
@@ -439,6 +462,147 @@ export class VaultDO extends DurableObject {
     this.config!.cap_bytes = cap;
     await this.ctx.storage.put("config", this.config);
     return json(shape());
+  }
+
+  /**
+   * POST /api/internal/snapshot — take a GFS snapshot of this vault (Wave 4e;
+   * see snapshots.ts for the full promotion/retention algorithm). Body:
+   * `{ retention: { daily, weekly, monthly } }` — the identity worker derives
+   * the policy from the owner's plan (paid 14/8/12; free 0/1/0) so the DO
+   * stays plan-agnostic. Flow: rank the would-be snapshot against the
+   * manifest → skip if no rank is retained under the policy (a free vault
+   * exports once per ISO week, not nightly) → export-engine → tar → R2 write
+   * (`vault-<name>/snapshots/<server-ts>.tar` — server-derived key, same
+   * anti-pinning rule as exports) → list-based prune → manifest write.
+   * Returns the post-run manifest so the caller (the sweep) can mirror it to
+   * D1 in one hop. Snapshots never touch the r2_bytes cap meter (no
+   * meterAdd/meterSub — quota honesty, pinned by the conformance suite).
+   */
+  private async handleSnapshot(request: Request, vaultName: string): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    let body: { retention?: unknown };
+    try {
+      body = (await request.json()) as { retention?: unknown };
+    } catch {
+      return json({ error: "Invalid JSON body" }, 400);
+    }
+    const checked = validateRetention(body.retention);
+    if ("error" in checked) return json({ error: checked.error }, 400);
+    const { policy } = checked;
+
+    // A corrupt manifest THROWS here (→ the router's 500) rather than being
+    // read as empty — an empty read would mass-prune every existing tarball.
+    const manifest = await loadManifest(this.env.ATTACHMENTS, vaultName);
+    const now = new Date();
+    const ranks = ranksFor(now, manifest.snapshots);
+    if (!wouldRetain(ranks, policy)) {
+      // Nothing this snapshot could be retained AS — don't do the export work
+      // the prune would immediately discard (the free-tier nightly no-op).
+      return json({ skipped: true, reason: "no_retained_rank", ranks, manifest: manifest.snapshots });
+    }
+
+    const { entries, stats } = await collectExportEntries(this.store, this.exportOpts(vaultName, {}));
+    const tar = toTar(entries);
+    // Server-derived key (never caller input) — lexicographic order is
+    // chronological, and a caller can't mint a key that outsorts the prune.
+    const ts = now.toISOString().replace(/[:.]/g, "-");
+    const key = `${snapshotPrefix(vaultName)}${ts}.tar`;
+    // Deliberately NO meterAdd — snapshots are outside the tenant quota.
+    await this.env.ATTACHMENTS.put(key, tar);
+
+    const entry: SnapshotEntry = { key, taken_at: now.toISOString(), bytes: tar.byteLength, notes: stats.notes, ranks };
+    // Same-millisecond double snapshot overwrites one R2 key — keep the
+    // manifest consistent with that (replace, never duplicate, the entry).
+    manifest.snapshots = manifest.snapshots.filter((s) => s.key !== key);
+    manifest.snapshots.push(entry);
+
+    const retained = retainedKeys(manifest.snapshots, policy);
+    const pruned = await pruneSnapshotTarballs(this.env.ATTACHMENTS, vaultName, retained);
+    manifest.snapshots = manifest.snapshots
+      .filter((s) => retained.has(s.key))
+      .sort((a, b) => (a.taken_at < b.taken_at ? -1 : a.taken_at > b.taken_at ? 1 : 0));
+    await saveManifest(this.env.ATTACHMENTS, manifest);
+
+    if (pruned.length > 0) console.log(`[snapshot-prune ${vaultName}] deleted ${pruned.length} stale snapshot(s)`);
+    return json({ skipped: false, entry, pruned, manifest: manifest.snapshots });
+  }
+
+  /** GET /api/internal/snapshots — the manifest (restore points), for the
+   *  console History surface + restore-time validation. */
+  private async handleListSnapshots(request: Request, vaultName: string): Promise<Response> {
+    if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+    const manifest = await loadManifest(this.env.ATTACHMENTS, vaultName);
+    return json({ vault: vaultName, snapshots: manifest.snapshots });
+  }
+
+  /**
+   * POST /api/internal/restore — replay a SOURCE vault's snapshot tarball into
+   * THIS vault (the restore target), REPLACING its content (blow-away import:
+   * that's what clears the fresh target's welcome seed so the restored vault
+   * equals the snapshot exactly). Body:
+   * `{ source_vault: string, snapshot_key: string }`.
+   *
+   * Trust model: only the platform reaches this (the /api/internal/* gate).
+   * The identity worker enforces the user-facing boundary FIRST — session +
+   * CSRF + ownership of the SOURCE vault + paid plan + vault-count cap — then
+   * creates the new target vault and calls here with a first-party admin
+   * token for the TARGET. DO-side guards (defense in depth):
+   *   - the target can never be the source (a restore NEVER overwrites the
+   *     original vault — 400),
+   *   - `snapshot_key` must live under the source's snapshots/ prefix (no
+   *     arbitrary R2 reads through this endpoint).
+   *
+   * The cap gate is deliberately not consulted (internal dispatch precedes
+   * it): a restore larger than the target's plan cap lands fully and leaves
+   * the vault over-cap → write-limited by the existing cap machinery, exactly
+   * the documented downgrade posture (reads/export always work).
+   */
+  private async handleRestore(request: Request, vaultName: string): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    let body: { source_vault?: unknown; snapshot_key?: unknown };
+    try {
+      body = (await request.json()) as { source_vault?: unknown; snapshot_key?: unknown };
+    } catch {
+      return json({ error: "Invalid JSON body" }, 400);
+    }
+    const source = typeof body.source_vault === "string" ? body.source_vault.toLowerCase() : "";
+    const key = typeof body.snapshot_key === "string" ? body.snapshot_key : "";
+    if (!source || !key) return json({ error: "source_vault and snapshot_key are required" }, 400);
+    if (source === vaultName) {
+      return json(
+        { error: "Refusing to restore a vault onto itself — restore targets are always new vaults.", error_type: "restore_into_self" },
+        400,
+      );
+    }
+    if (!key.startsWith(snapshotPrefix(source)) || !key.endsWith(".tar")) {
+      return json({ error: "snapshot_key is not a snapshot of source_vault", error_type: "invalid_snapshot_key" }, 400);
+    }
+
+    const obj = await this.env.ATTACHMENTS.get(key);
+    if (!obj) return json({ error: "Snapshot not found", error_type: "snapshot_not_found" }, 404);
+    const tarBytes = new Uint8Array(await obj.arrayBuffer());
+
+    const stats = await restoreFromTar(this.store, tarBytes);
+    console.log(
+      `[restore ${vaultName}] from=${key} notes_created=${stats.notes_created} notes_wiped=${stats.notes_wiped} ` +
+        `schemas=${stats.schemas_restored} links=${stats.links_restored} attachments_referenced=${stats.attachments_restored}`,
+    );
+    return json({
+      restored: true,
+      source_vault: source,
+      snapshot_key: key,
+      stats: {
+        notes_created: stats.notes_created,
+        notes_updated: stats.notes_updated,
+        notes_wiped: stats.notes_wiped,
+        schemas_restored: stats.schemas_restored,
+        links_restored: stats.links_restored,
+        /** Attachment ROWS restored — the binaries are NOT in v1 snapshots. */
+        attachments_referenced: stats.attachments_restored,
+        skipped_links: stats.skipped_links.length,
+        skipped_sidecars: stats.skipped_sidecars.length,
+      },
+    });
   }
 
   /** 413 when the tenant is already at/over its cap (blocks growth writes). */
@@ -577,10 +741,10 @@ export class VaultDO extends DurableObject {
     } catch (e) {
       console.warn(`[export-prune ${vaultName}] non-fatal: ${errText(e)}`);
     }
-    // SEAM (future snapshot system — separate PR): a snapshot cron will manage
-    // `vault-<name>/snapshots/` with its own GFS retention manifest. That
-    // prefix is intentionally OUTSIDE this prune (which touches only
-    // `exports/`), so the two retention regimes can't interfere.
+    // The snapshot system (Wave 4e, snapshots.ts) manages `vault-<name>/
+    // snapshots/` with its own GFS retention manifest. That prefix is
+    // intentionally OUTSIDE this prune (which touches only `exports/`), so
+    // the two retention regimes can't interfere.
     return new Response(tar, {
       status: 200,
       headers: {

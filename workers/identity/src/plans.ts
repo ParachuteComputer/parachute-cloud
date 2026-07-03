@@ -27,6 +27,14 @@
 
 export type PlanId = "free" | "parachute";
 
+/** GFS snapshot retention per rank (Wave 4e — the vault worker's snapshots.ts
+ *  owns the rotation algorithm; THIS is the per-plan policy fed into it). */
+export interface SnapshotRetention {
+  daily: number;
+  weekly: number;
+  monthly: number;
+}
+
 export interface PlanSpec {
   id: PlanId;
   /** Display name ("Free", "Parachute"). */
@@ -35,14 +43,43 @@ export interface PlanSpec {
   vault_count: number;
   /** Total storage in bytes — pushed to each vault DO as cap_bytes (v1, above). */
   total_bytes: number;
+  /**
+   * Nightly GFS snapshot retention (ratified 2026-07-03): paid keeps 14
+   * daily / 8 weekly / 12 monthly restore points; free keeps ONE rolling
+   * weekly — an INTERNAL disaster-recovery artifact (ours, never surfaced;
+   * the vault worker skips nights that nothing would retain, so a free vault
+   * exports once per ISO week). Snapshot storage is NOT metered into the
+   * user's quota on either plan.
+   */
+  snapshot_retention: SnapshotRetention;
+  /**
+   * Whether the console surfaces restore points + the restore-to-a-new-vault
+   * action. Free users see the History teaser instead, and the restore POST
+   * answers 404 (the surface doesn't exist for them — the admin pattern).
+   */
+  restore: boolean;
 }
 
 const MiB = 1024 * 1024;
 const GiB = 1024 * MiB;
 
 export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
-  free: { id: "free", label: "Free", vault_count: 1, total_bytes: 100 * MiB },
-  parachute: { id: "parachute", label: "Parachute", vault_count: 5, total_bytes: 10 * GiB },
+  free: {
+    id: "free",
+    label: "Free",
+    vault_count: 1,
+    total_bytes: 100 * MiB,
+    snapshot_retention: { daily: 0, weekly: 1, monthly: 0 },
+    restore: false,
+  },
+  parachute: {
+    id: "parachute",
+    label: "Parachute",
+    vault_count: 5,
+    total_bytes: 10 * GiB,
+    snapshot_retention: { daily: 14, weekly: 8, monthly: 12 },
+    restore: true,
+  },
 };
 
 /** The paid plan's price copy — one place, so console + site can't drift.
@@ -99,6 +136,15 @@ export function planLine(plan: PlanId): string {
 export function parachuteTeaser(): string {
   const p = PLAN_SPECS.parachute;
   return `${p.label} — ${PARACHUTE_PRICE_LINE}, ${p.vault_count} vaults, ${formatPlanBytes(p.total_bytes)} — coming this week`;
+}
+
+/**
+ * The friendly refusal when a restore would need a vault slot the plan
+ * doesn't have (restore always creates a NEW vault — it never overwrites).
+ */
+export function restoreAtCapMessage(plan: PlanId): string {
+  const spec = PLAN_SPECS[plan];
+  return `Restoring creates a new vault, and your ${spec.label} plan is at its ${spec.vault_count}-vault limit. Free up a slot first, or write hello@parachute.computer.`;
 }
 
 /**

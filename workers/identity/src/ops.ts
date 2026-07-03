@@ -21,6 +21,9 @@
  *   - daily 03:30 UTC (USAGE_CRON): the per-vault storage-usage rollup —
  *     routed here, implemented in usage.ts (internal-config reads through the
  *     vault-call seam, one D1 `vault_usage` row per vault per UTC day).
+ *   - nightly 04:00 UTC (SNAPSHOT_CRON): the GFS snapshot sweep — routed
+ *     here, implemented in snapshots.ts (per-plan retention, D1 manifest
+ *     mirror, failure isolation per vault).
  *
  * Everything is a pure `(env, sender, deps)` function with an injectable clock
  * + fetch, mirroring the OAuth handlers, so the tests drive the same code the
@@ -31,6 +34,7 @@ import type { EmailSender } from "./email.ts";
 import { runBillingSweep } from "./billing-lifecycle.ts";
 import { runDrip } from "./drip.ts";
 import { depsForEnv } from "./oauth-shared.ts";
+import { runSnapshotSweep } from "./snapshots.ts";
 import { runUsageRollup } from "./usage.ts";
 
 /** Cron patterns — MUST match `[triggers] crons` in wrangler.toml (both envs). */
@@ -40,6 +44,8 @@ export const DIGEST_CRON = "0 14 * * 1";
 export const DRIP_CRON = "15 * * * *";
 /** Daily usage rollup (usage.ts) — 03:30 UTC, a quiet hour; :30 stays clear of :15/:00. */
 export const USAGE_CRON = "30 3 * * *";
+/** Nightly GFS snapshot sweep (snapshots.ts) — 04:00 UTC, after the usage rollup. */
+export const SNAPSHOT_CRON = "0 4 * * *";
 
 /** Re-alert at most once per hour per failing check. */
 export const ALERT_DEDUPE_MS = 60 * 60 * 1000;
@@ -59,10 +65,11 @@ export interface OpsDeps {
  * "a cron that silently does nothing" (and never to accidental user email —
  * only an exact DRIP_CRON match sends the drip).
  */
-export function routeCron(cron: string): "digest" | "drip" | "usage" | "health" {
+export function routeCron(cron: string): "digest" | "drip" | "usage" | "snapshot" | "health" {
   if (cron === DIGEST_CRON) return "digest";
   if (cron === DRIP_CRON) return "drip";
   if (cron === USAGE_CRON) return "usage";
+  if (cron === SNAPSHOT_CRON) return "snapshot";
   return "health";
 }
 
@@ -90,6 +97,12 @@ export async function handleScheduled(cron: string, env: Env, sender: EmailSende
     const rollupDeps = depsForEnv(env);
     if (deps.now) rollupDeps.now = deps.now;
     await runUsageRollup(env, rollupDeps);
+  } else if (job === "snapshot") {
+    // The nightly GFS snapshot sweep (snapshots.ts) — same mint-seam deps
+    // shape as the usage rollup.
+    const sweepDeps = depsForEnv(env);
+    if (deps.now) sweepDeps.now = deps.now;
+    await runSnapshotSweep(env, sweepDeps);
   } else {
     await runHealthCheck(env, sender, deps);
   }

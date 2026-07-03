@@ -139,6 +139,11 @@ const STYLE = `
   .copyrow pre{flex:1;margin:0}
   .copybtn{flex:none;background:#eef0ea;border:1px solid var(--line);border-radius:8px;padding:.4rem .85rem;font-size:.85rem;font-weight:600;color:var(--sage-dark)}
   .copybtn:hover{background:#e4e8dd}
+  ul.history{list-style:none;padding:0;margin:.3rem 0 0}
+  ul.history li{display:flex;align-items:baseline;gap:.6rem;flex-wrap:wrap;border-top:1px solid var(--line);padding:.45rem .1rem;font-size:.9rem}
+  ul.history li:first-child{border-top:0}
+  ul.history .when{font-family:ui-monospace,Menlo,monospace;font-size:.84rem}
+  ul.history form{margin-left:auto}
 `;
 
 // Exported for admin-ui.ts (the operator console reuses the exact page shell +
@@ -446,6 +451,25 @@ export function renderSecurity(props: SecurityProps): string {
   );
 }
 
+/** One restore point in the History section (Wave 4e). */
+export interface VaultHistoryEntry {
+  /** The snapshot's R2 key — the restore form's `key` field. */
+  key: string;
+  /** ISO-8601 taken-at (rendered as "YYYY-MM-DD HH:MM UTC"). */
+  takenAt: string;
+  bytes: number;
+  ranks: string[];
+}
+
+/**
+ * The card's History section: paid plans get restore points + the
+ * restore-to-a-new-vault doors; free plans get the teaser line (their
+ * internal rolling weekly is never surfaced — it's ours, not theirs).
+ */
+export type VaultHistory =
+  | { kind: "restore-points"; entries: VaultHistoryEntry[] }
+  | { kind: "teaser" };
+
 export interface ConsoleVaultCard {
   name: string;
   /** Notes-PWA connect deep link (`/?add=<vault URL>`) — the card's primary action. */
@@ -462,6 +486,8 @@ export interface ConsoleVaultCard {
    * undefined → caller didn't look it up (non-render paths).
    */
   usage?: { usedBytes: number; day: string } | null;
+  /** Snapshot history (Wave 4e); undefined → caller didn't look it up. */
+  history?: VaultHistory;
 }
 
 /** State for the getting-started checklist card (null → don't render it). */
@@ -539,6 +565,59 @@ function addToPhoneContent(v: ConsoleVaultCard): string {
     <p style="margin:.3rem 0;font-size:.92rem"><strong>Android:</strong> open it in Chrome → menu <strong>⋮</strong> → <strong>Add to Home screen</strong> (or <strong>Install app</strong>).</p>`;
 }
 
+/** "2026-07-03T04:00:12.345Z" → "2026-07-03 04:00 UTC" (deterministic, tz-free). */
+function humanSnapshotDate(iso: string): string {
+  return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
+}
+
+/** The highest GFS rank a snapshot carries — the one-word label on its row. */
+function topRank(ranks: string[]): string {
+  if (ranks.includes("monthly")) return "monthly";
+  if (ranks.includes("weekly")) return "weekly";
+  return "daily";
+}
+
+/**
+ * The History disclosure (Wave 4e). Paid: restore points, newest first, each
+ * with a "Restore to a new vault" door — plus the standing caveats (restore
+ * never touches this vault; v1 snapshots carry no attachment binaries). Free:
+ * the plan teaser — the internal DR snapshot is deliberately not mentioned.
+ */
+function historySection(v: ConsoleVaultCard, csrfToken: string): string {
+  if (!v.history) return "";
+  if (v.history.kind === "teaser") {
+    return `<details data-testid="vault-history">
+      <summary>History</summary>
+      <p class="muted" style="margin:.2rem 0 0" data-testid="history-teaser">Nightly restore points — 14 daily, 8 weekly, and 12 monthly snapshots of this vault — come with the Parachute plan.</p>
+    </details>`;
+  }
+  const { entries } = v.history;
+  const body =
+    entries.length === 0
+      ? `<p class="muted" style="margin:.2rem 0 0">Nightly snapshots begin within a day — restore points will appear here.</p>`
+      : `<p class="muted" style="margin:.2rem 0 .5rem">Restoring never touches this vault — it creates a new one from the snapshot. Heads up: v1 snapshots don't include attachment files, so notes and their attachment references restore, the files themselves don't.</p>
+    <ul class="history">
+      ${entries
+        .map(
+          (e) => `<li data-testid="restore-point">
+        <span class="when">${esc(humanSnapshotDate(e.takenAt))}</span>
+        <span class="muted">${esc(formatUsageBytes(e.bytes))} &middot; ${esc(topRank(e.ranks))}</span>
+        <form class="inline" method="post" action="/console/vaults/restore">
+          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+          <input type="hidden" name="vault" value="${esc(v.name)}">
+          <input type="hidden" name="key" value="${esc(e.key)}">
+          <button class="linkbtn" type="submit">Restore to a new vault</button>
+        </form>
+      </li>`,
+        )
+        .join("\n")}
+    </ul>`;
+  return `<details data-testid="vault-history">
+      <summary>History</summary>
+      ${body}
+    </details>`;
+}
+
 function vaultCard(v: ConsoleVaultCard, csrfToken: string, planCapBytes: number): string {
   // Storage line: the latest rollup row, human units against the plan cap
   // (v1: each vault's cap IS the plan total — plans.ts). No row yet (fresh
@@ -568,6 +647,7 @@ function vaultCard(v: ConsoleVaultCard, csrfToken: string, planCapBytes: number)
         <button class="secondary" type="submit" style="margin-top:.7rem">Add the Surface Starter guide</button>
       </form>
     </details>
+    ${historySection(v, csrfToken)}
   </div>`;
 }
 

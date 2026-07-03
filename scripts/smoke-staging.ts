@@ -12,7 +12,9 @@
  *     4-note seed, POST /api/packs, the console Surface-Starter button)
  *   → login throttle → magic-link + TOTP → billing (state-adaptive: the
  *     not-configured 503 + hidden console doors today; the configured gates
- *     once the Stripe keys land — section 16).
+ *     once the Stripe keys land — section 16) → GFS snapshots + paid restore
+ *     (free teaser + 404 pins, the staging-only sweep trigger, the admin comp
+ *     lever, a live restore round-trip — section 17).
  *
  * This smoke CREATES accounts + vaults — that's what staging is for; NEVER
  * point it at production (scripts/smoke-prod.ts is the read-only prod check).
@@ -567,6 +569,7 @@ async function main() {
   let arrivalCookie = "";
   let arrivalVault = "";
   let arrivalEmail = "";
+  let arrivalPassword = "";
   {
     const email = `arrival+${Date.now()}@example.com`;
     const password = b64url(crypto.getRandomValues(new Uint8Array(18)));
@@ -588,6 +591,7 @@ async function main() {
     arrivalCookie = cookie;
     arrivalVault = vaultName;
     arrivalEmail = email;
+    arrivalPassword = password;
 
     // Zero vaults → the first-run hero with both research questions.
     const heroHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie } })).text();
@@ -868,6 +872,122 @@ async function main() {
         conHtml.includes('data-testid="upgrade-billing"'),
         "billing CONFIGURED: the free user's console shows the Upgrade buttons",
       );
+    }
+  }
+
+  // 17. GFS snapshots + paid restore (Wave 4e). Flow: pin the FREE contract
+  //     first (History teaser, restore POST → 404), drive one snapshot sweep
+  //     via the staging-only trigger (POST /__test/snapshot-run, 404 in
+  //     production), comp the arrival user to Parachute through the shipped
+  //     admin lever, then walk the paid contract live: History lists the
+  //     restore point → "Restore to a new vault" → the restored vault's
+  //     notes round-trip (this run's marker note included, count intact).
+  {
+    // FREE, before anything else: the teaser renders, no restore points leak,
+    // and the restore POST answers the router-shaped 404 (the surface doesn't
+    // exist for free plans).
+    const freeHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
+    assert(
+      freeHtml.includes('data-testid="vault-history"') &&
+        freeHtml.includes('data-testid="history-teaser"') &&
+        !freeHtml.includes('data-testid="restore-point"'),
+      "snapshots: FREE console shows the History teaser, no restore points",
+    );
+    const arrivalCsrf = /parachute_id_csrf=([^;]+)/.exec(arrivalCookie)?.[1] ?? "";
+    const freePost = await fetch(`${IDENTITY}/console/vaults/restore`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: arrivalCookie },
+      redirect: "manual",
+      body: form({ __csrf: arrivalCsrf, vault: arrivalVault, key: `vault-${arrivalVault}/snapshots/x.tar` }),
+    });
+    assert(freePost.status === 404, "snapshots: FREE restore POST → 404 (pinned)", `status ${freePost.status}`);
+
+    // One sweep tick via the staging-only trigger. The arrival vault is fresh
+    // this run → its (free-policy) rolling weekly is taken now.
+    const runSweep = async (): Promise<{ day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean } | null> => {
+      const r = await fetch(`${IDENTITY}/__test/snapshot-run`, { method: "POST" });
+      return r.status === 200 ? ((await r.json()) as { day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean }) : null;
+    };
+    const sweep = await runSweep();
+    assert(!!sweep, "snapshots: staging trigger answers 200 with a sweep summary");
+    if (sweep) {
+      assert(
+        sweep.taken >= 1 && !sweep.capped,
+        "snapshots: the sweep took at least this run's fresh-vault snapshot",
+        `day=${sweep.day} vaults=${sweep.vaults} taken=${sweep.taken} skipped=${sweep.skipped} failed=${sweep.failed}`,
+      );
+    }
+
+    // Comp the arrival user to Parachute via the shipped admin lever (the
+    // operator session from section 15). Double-submit CSRF: any matching
+    // cookie/field pair.
+    const usersHtml = await (await fetch(`${IDENTITY}/admin/users`, { headers: { cookie: `parachute_id_session=${session}` } })).text();
+    const rowMatch = usersHtml.split("<tr>").find((r) => r.includes(arrivalEmail));
+    const userId = rowMatch ? /name="user_id" value="([^"]+)"/.exec(rowMatch)?.[1] : undefined;
+    assert(!!userId, "snapshots: scraped the arrival user's id from /admin/users", userId ?? "not found");
+    const compCsrf = `smoke-csrf-${Date.now()}`;
+    const compRes = await fetch(`${IDENTITY}/admin/users/plan`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${session}; parachute_id_csrf=${compCsrf}` },
+      redirect: "manual",
+      body: form({ __csrf: compCsrf, user_id: userId ?? "", plan: "parachute" }),
+    });
+    assert(
+      compRes.status === 302 && (compRes.headers.get("location") ?? "").includes("notice=plan"),
+      "snapshots: admin comp lever flips the arrival user to Parachute",
+      `status ${compRes.status} → ${compRes.headers.get("location")}`,
+    );
+
+    // PAID: History now lists the restore point (mirrored by the sweep).
+    const paidHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
+    const keyMatch = new RegExp(`name="key" value="(vault-${arrivalVault}/snapshots/[^"]+\\.tar)"`).exec(paidHtml);
+    assert(
+      paidHtml.includes('data-testid="restore-point"') && !!keyMatch && paidHtml.includes("Restore to a new vault"),
+      "snapshots: PAID console History lists the restore point with a restore door",
+      keyMatch?.[1] ?? "no key found",
+    );
+
+    // Restore to a new vault → 302 with the restored target.
+    let restoredName = "";
+    if (keyMatch) {
+      const restoreRes = await fetch(`${IDENTITY}/console/vaults/restore`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: arrivalCookie },
+        redirect: "manual",
+        body: form({ __csrf: arrivalCsrf, vault: arrivalVault, key: keyMatch[1]! }),
+      });
+      const loc = restoreRes.headers.get("location") ?? "";
+      restoredName = /restored=([^&]+)/.exec(loc)?.[1] ?? "";
+      restoredName = decodeURIComponent(restoredName);
+      assert(
+        restoreRes.status === 302 && restoredName.startsWith(`${arrivalVault}-restored-`),
+        "snapshots: restore POST creates the new vault and redirects",
+        `status ${restoreRes.status} → ${loc}`,
+      );
+      const noticeHtml = await (await fetch(`${IDENTITY}${loc}`, { headers: { cookie: arrivalCookie } })).text();
+      assert(
+        noticeHtml.includes("Snapshot restored into") && noticeHtml.includes("attachment files"),
+        "snapshots: the success notice renders with the attachments caveat",
+      );
+    }
+
+    // Live round-trip: the restored vault serves the SAME notes — this run's
+    // marker note included, welcome seed intact, nothing extra.
+    if (restoredName) {
+      const owner = await authorizeFor(arrivalEmail, arrivalPassword, restoredName);
+      assert(!!owner.token, "snapshots: owner mints a token for the RESTORED vault", owner.error ? `error=${owner.error}` : "ok");
+      if (owner.token) {
+        const notesRes = await fetch(`${VAULT}/vault/${restoredName}/api/notes?include_content=true`, {
+          headers: { authorization: `Bearer ${owner.token}` },
+        });
+        const notes = (await notesRes.json()) as Array<{ path?: string; content?: string }>;
+        const mine = notes.find((n) => n.path === "My first note");
+        assert(
+          notesRes.status === 200 && notes.length === 5 && !!mine && (mine.content ?? "").includes(MARKER),
+          "snapshots: restored vault round-trips — 5 notes incl. the marker note, verbatim",
+          `${notes.length} notes: ${notes.map((n) => n.path).join(", ")}`,
+        );
+      }
     }
   }
 

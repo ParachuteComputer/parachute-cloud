@@ -53,10 +53,15 @@ head_sampling_rate = 1
 #                   each vault DO's live db/R2 split through the internal
 #                   config seam, upsert one D1 `vault_usage` row per vault per
 #                   UTC day (skip+log+continue per vault; USAGE_RUN_CAP bound).
+#   0 4 * * *     → nightly GFS snapshot sweep (src/snapshots.ts): each vault
+#                   DO snapshots itself under the owner's plan retention (paid
+#                   14 daily/8 weekly/12 monthly; free 1 rolling weekly — the
+#                   internal DR artifact) and the post-run manifest mirrors
+#                   into D1 `vault_snapshots` for the console History section.
 # The patterns here MUST stay in sync with HEALTH_CRON/DIGEST_CRON/DRIP_CRON/
-# USAGE_CRON in ops.ts.
+# USAGE_CRON/SNAPSHOT_CRON in ops.ts.
 [triggers]
-crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *", "30 3 * * *"]
+crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *", "30 3 * * *", "0 4 * * *"]
 
 # Control-plane state: users, clients, auth_codes, tokens, grants, sessions,
 # signing_keys. The revocation list is DERIVED from the tokens table (exactly
@@ -217,11 +222,11 @@ enabled = true
 head_sampling_rate = 1
 
 # Same cron schedule as production: the health check + digest + drip + usage
-# rollup RUN on staging (exercising the real cron path), with output to the
-# log instead of email (no send_email binding → devlog sender captures drip
-# sends too; the usage rollup sends no email anywhere).
+# rollup + snapshot sweep RUN on staging (exercising the real cron path), with
+# output to the log instead of email (no send_email binding → devlog sender
+# captures drip sends too; the usage rollup + snapshot sweep email no one).
 [env.staging.triggers]
-crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *", "30 3 * * *"]
+crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *", "30 3 * * *", "0 4 * * *"]
 
 # (no [[env.staging.send_email]] — see the staging banner above; the omission is
 # the point: dev-log sender + echo header = deterministic headless testing.)
