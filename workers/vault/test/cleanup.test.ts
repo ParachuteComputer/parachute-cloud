@@ -34,13 +34,13 @@ function stubGen(
 
 describe("cleanupTranscript", () => {
   it("accepts a faithful clean → cleaned text, and calls the model correctly", async () => {
-    const raw = "um so i went to the uh store you know and it was fine";
-    const gen = stubGen(() => ({ response: "I went to the store, and it was fine." }));
+    const raw = "um I went to the uh store and it was fine er";
+    const gen = stubGen(() => ({ response: "I went to the store and it was fine." }));
 
     const res = await cleanupTranscript(gen, raw);
 
     expect(res.cleaned).toBe(true);
-    expect(res.text).toBe("I went to the store, and it was fine.");
+    expect(res.text).toBe("I went to the store and it was fine.");
 
     // Model wiring: right model, temperature 0, capped max_tokens, 2 messages.
     expect(gen.calls).toHaveLength(1);

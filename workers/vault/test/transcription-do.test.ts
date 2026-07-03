@@ -299,10 +299,10 @@ describe("voice transcription pipeline (cloud#56)", () => {
     await pushEntitlement(v, true, 600);
     const { noteId } = await setupVoiceNote(v);
 
-    const rawTranscript = "um so i went to the uh store you know and it was fine";
-    const cleanedView = "I went to the store, and it was fine.";
+    const rawTranscript = "um I went to the uh store and it was fine";
+    const cleanedView = "I went to the store and it was fine.";
     // whisper returns the raw; the cleanup model returns a faithful tidy → the
-    // guard accepts it (only fillers dropped, punctuation/casing added).
+    // guard accepts it (only disfluencies dropped, punctuation/casing added).
     await runAlarmWithCleanup(
       v,
       stubProvider(() => ({ text: rawTranscript, audioSeconds: 60 })),

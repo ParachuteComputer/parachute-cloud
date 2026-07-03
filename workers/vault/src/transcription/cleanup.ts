@@ -56,18 +56,21 @@ import { checkFaithful, type FaithfulnessOptions } from "./faithfulness.js";
 export const CLEANUP_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 /**
- * "Clean, don't rewrite" system prompt — the discipline harvested from
- * parachute-scribe/src/cleanup/prompt.ts (kept self-contained here; cloud does
- * not depend on scribe). The whitelist in {@link import("./faithfulness").DEFAULT_FILLERS}
- * is co-designed with the filler list named here.
+ * "Clean, don't rewrite" system prompt. CRITICAL: the set of removable
+ * "fillers" here must MATCH {@link import("./faithfulness").DEFAULT_FILLERS} —
+ * only non-lexical disfluencies (um/uh/er/hmm/…) + immediate stutter repeats.
+ * If the prompt told the model to strip discourse words like "so"/"like"/"you
+ * know", the guard (which does NOT whitelist those) would reject the result and
+ * cleanup would soft-fail to raw on most notes — doing nothing. Model and guard
+ * must agree on what "filler" means.
  */
 const SYSTEM_PROMPT = `You clean up raw voice-transcript text. Your ONLY job is light copy-editing:
 
 - Fix punctuation, capitalization, and sentence boundaries.
 - Break run-on text into readable paragraphs.
-- Remove filler words and verbal stumbles (um, uh, er, like, you know, I mean, so, basically, right) and stutter repetitions.
-- Keep EVERY other word exactly as spoken. Do not paraphrase, summarize, reorder, translate, or correct facts.
-- Never invent or substitute words, names, or numbers. If a passage is unclear, leave it exactly as-is.
+- Remove ONLY non-lexical filler SOUNDS and false starts: um, uh, uhh, er, erm, hmm, mm, mhm, ah, uh-huh. Also collapse an immediate stutter repeat (e.g. "the the" → "the").
+- Keep EVERY actual word exactly as spoken — INCLUDING discourse words like "so", "like", "well", "right", "actually", "basically", "you know", "I mean". Do NOT remove them.
+- Do not paraphrase, summarize, reorder, translate, or correct facts. Never add, substitute, or drop a word, name, number, or negation ("not", "no", "never", "n't"). If a passage is unclear, leave it exactly as-is.
 
 Return ONLY the cleaned transcript text — no preamble, no commentary, no quotation marks.`;
 
