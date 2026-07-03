@@ -10,6 +10,7 @@ import { Hono } from "hono";
 import type { Env } from "./env.ts";
 import {
   handleAddPackPost,
+  handleChecklistPost,
   handleConsoleGet,
   handleCreateVaultPost,
   handleLoginGet,
@@ -113,6 +114,9 @@ app.post("/console/vaults", (c) => handleCreateVaultPost(c.env.DB, c.req.raw, de
 // + ownership, then a server-side call to the vault worker with an internally
 // minted 60s vault:<name>:write token (the mint seam — see handleAddPackPost).
 app.post("/console/packs", (c) => handleAddPackPost(c.env.DB, c.req.raw, depsFor(c.env)));
+// Getting-started checklist doors: mark an item done (or dismiss the card),
+// then 302 to the item's destination. Session + CSRF + same-origin.
+app.post("/console/checklist", (c) => handleChecklistPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/console/security", (c) => handleSecurityGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/security", (c) => handleSecurityPost(c.env.DB, c.req.raw, depsFor(c.env)));
 

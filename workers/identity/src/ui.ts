@@ -4,6 +4,9 @@
  * /oauth/authorize. Kept deliberately small: this is the human surface, not the
  * wire contract.
  */
+// The first-run research chips mirror the landing page's set; the values live
+// in checklist.ts (next to the allowlist that gates the write).
+import { NOTES_APP_OPTIONS } from "./checklist.ts";
 
 export interface AuthorizeParams {
   clientId: string;
@@ -96,6 +99,33 @@ const STYLE = `
   .dot-on{background:var(--sage)}.dot-off{background:#b9c2ad}
   .h2row{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;margin-bottom:.4rem}
   .secret{font-family:ui-monospace,Menlo,monospace;font-size:1rem;letter-spacing:.14em;word-break:break-all;background:#eef1ea;border:1px solid var(--line);border-radius:8px;padding:.55rem .7rem;text-align:center}
+  .biginput{font-size:1.15rem;padding:.75rem .8rem}
+  .chips{display:flex;flex-wrap:wrap;gap:.45rem;margin-top:.4rem}
+  .chips input{position:absolute;opacity:0;pointer-events:none}
+  .chips label{display:inline-block;margin:0;padding:.4rem .85rem;border:1px solid var(--line);border-radius:999px;font-size:.88rem;font-weight:500;cursor:pointer;background:#fcfdfb;color:var(--ink)}
+  .chips input:checked+label{background:var(--sage);border-color:var(--sage);color:#fff}
+  .chips input:focus-visible+label{outline:2px solid var(--sage);outline-offset:2px}
+  .check{list-style:none;padding:0;margin:.3rem 0 0}
+  .check>li{border-top:1px solid var(--line)}
+  .check>li:first-child{border-top:0}
+  .door{display:flex;align-items:center;gap:.65rem;width:100%;background:none;border:0;padding:.62rem .15rem;font-size:.95rem;font-weight:500;font-family:inherit;color:var(--ink);cursor:pointer;text-align:left}
+  .door:hover{color:var(--sage-dark)}
+  .door .mark{width:1.3rem;height:1.3rem;border-radius:999px;border:1.5px solid #c3ccb8;display:inline-flex;align-items:center;justify-content:center;font-size:.72rem;flex:none;color:transparent}
+  .check>li[data-done="1"] .door{color:var(--muted)}
+  .check>li[data-done="1"] .door .mark{background:var(--sage);border-color:var(--sage);color:#fff}
+  .door .go{margin-left:auto;color:var(--sage-dark);flex:none}
+  details.checkx{margin:0;border-top:0;padding:0}
+  details.checkx>.doorbody{padding:.1rem .3rem 1rem 2.1rem}
+  summary.door{font-size:.95rem;font-weight:500;color:var(--ink)}
+  details.checkx[open]>summary{margin-bottom:0}
+  .check-foot{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;border-top:1px solid var(--line);padding-top:.7rem;margin-top:.2rem;font-size:.86rem}
+  .check-foot .hide{margin-left:auto}
+  ol.steps{margin:.5rem 0 .65rem;padding-left:1.35rem}
+  ol.steps li{margin:.32rem 0}
+  .copyrow{display:flex;gap:.5rem;align-items:stretch}
+  .copyrow pre{flex:1;margin:0}
+  .copybtn{flex:none;background:#eef0ea;border:1px solid var(--line);border-radius:8px;padding:.4rem .85rem;font-size:.85rem;font-weight:600;color:var(--sage-dark)}
+  .copybtn:hover{background:#e4e8dd}
 `;
 
 function page(title: string, inner: string): string {
@@ -403,11 +433,29 @@ export function renderSecurity(props: SecurityProps): string {
 
 export interface ConsoleVaultCard {
   name: string;
-  /** Notes-PWA deep link (`/?add=<vault URL>`) — the card's primary action. */
+  /** Notes-PWA connect deep link (`/?add=<vault URL>`) — the card's primary action. */
   notesUrl: string;
+  /** Notes-PWA connect deep link that lands on /import after connecting. */
+  importUrl: string;
   mcpUrl: string;
-  restUrl: string;
   connectCmd: string;
+}
+
+/** State for the getting-started checklist card (null → don't render it). */
+export interface ConsoleChecklistProps {
+  /** Item keys already done (checklist.ts CHECKLIST_ITEMS). */
+  done: ReadonlySet<string>;
+  /** The vault the checklist doors open — the user's first vault. */
+  vault: ConsoleVaultCard;
+  /** Render the quiet "add 2FA" footer line (TOTP not enrolled). */
+  showTwoFactorNudge: boolean;
+}
+
+/** First-run form values preserved across a validation-error re-render. */
+export interface FirstRunValues {
+  name?: string;
+  notesApp?: string;
+  firstNote?: string;
 }
 
 export interface ConsoleProps {
@@ -416,19 +464,46 @@ export interface ConsoleProps {
   csrfToken: string;
   error?: string;
   notice?: string;
+  /** Non-null → render the checklist card above the vault cards. */
+  checklist?: ConsoleChecklistProps | null;
+  /** Zero-vault re-render values (the first-run hero preserves answers). */
+  firstRun?: FirstRunValues;
+}
+
+/**
+ * The Connect-your-AI walkthrough — Claude first (numbered doors, not a
+ * manual), then the "any MCP client" line, with the CLI one-liner as the nerd
+ * footnote. Shared between each vault card's disclosure and checklist item ③
+ * so the two can never drift.
+ */
+function connectAiContent(v: ConsoleVaultCard): string {
+  return `<ol class="steps">
+      <li>Open <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> and go to <strong>Settings → Connectors</strong></li>
+      <li>Choose <strong>Add custom connector</strong></li>
+      <li>Paste your vault&#39;s URL and connect:</li>
+    </ol>
+    <div class="copyrow"><pre>${esc(v.mcpUrl)}</pre><button type="button" class="copybtn" data-copy="${esc(v.mcpUrl)}">Copy</button></div>
+    <p class="muted" style="margin:.65rem 0 0"><strong>Other AIs:</strong> that same URL works in any MCP-compatible client — paste it wherever your AI asks for an MCP server.</p>
+    <p class="muted" style="margin:.45rem 0 0">Command line: <code>${esc(v.connectCmd)}</code></p>`;
+}
+
+/** iOS/Android add-to-home-screen steps for the Notes PWA (checklist item ④). */
+function addToPhoneContent(v: ConsoleVaultCard): string {
+  return `<p class="muted" style="margin:.15rem 0 .45rem">Parachute Notes installs straight from the browser — no app store.</p>
+    <p style="margin:.3rem 0;font-size:.92rem"><strong>iPhone / iPad:</strong> open <a href="${esc(v.notesUrl)}" target="_blank" rel="noopener">notes.parachute.computer</a> in Safari → tap <strong>Share</strong> → <strong>Add to Home Screen</strong>.</p>
+    <p style="margin:.3rem 0;font-size:.92rem"><strong>Android:</strong> open it in Chrome → menu <strong>⋮</strong> → <strong>Add to Home screen</strong> (or <strong>Install app</strong>).</p>`;
 }
 
 function vaultCard(v: ConsoleVaultCard, csrfToken: string): string {
-  // Primary door: the Notes PWA connect deep-link. The CLI/MCP coordinates
-  // stay one disclosure below — demoted from the headline, not removed.
+  // Primary door: the Notes PWA connect deep-link. The Claude walkthrough +
+  // MCP coordinates stay one disclosure below — demoted from the headline,
+  // not removed.
   return `<div class="vault">
     <h3>${esc(v.name)}</h3>
     <a class="primary" href="${esc(v.notesUrl)}" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none;padding:.62rem 1rem;margin-top:.6rem">Open your notes &rarr;</a>
     <details>
       <summary>Connect your AI</summary>
-      <div class="field"><div class="k">Connect Claude Code</div><pre>${esc(v.connectCmd)}</pre></div>
-      <div class="field"><div class="k">MCP endpoint</div><pre>${esc(v.mcpUrl)}</pre></div>
-      <div class="field"><div class="k">REST base</div><pre>${esc(v.restUrl)}</pre></div>
+      ${connectAiContent(v)}
     </details>
     <details>
       <summary>Building a surface?</summary>
@@ -452,22 +527,147 @@ function vaultCard(v: ConsoleVaultCard, csrfToken: string): string {
  */
 const VAULT_NAME_PATTERN = "[a-z0-9][a-z0-9\\-]{1,62}";
 
-/** The console: my vaults + a create form + per-vault connect cards. */
+// --- the getting-started checklist card -------------------------------------
+
+/** A checklist door that navigates: POST marks it done, then 302s onward. */
+function checklistDoor(item: string, label: string, done: boolean, csrfToken: string, extra = ""): string {
+  return `<li data-item="${esc(item)}" data-done="${done ? "1" : "0"}">
+    <form method="post" action="/console/checklist" target="_blank">
+      <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+      <input type="hidden" name="item" value="${esc(item)}">
+      <button class="door" type="submit"><span class="mark">&#10003;</span>${esc(label)}${extra}<span class="go">&rarr;</span></button>
+    </form>
+  </li>`;
+}
+
+/** A checklist item that expands in place (marked done on first open, via JS). */
+function checklistExpand(item: string, label: string, done: boolean, body: string): string {
+  return `<li data-item="${esc(item)}" data-done="${done ? "1" : "0"}">
+    <details class="checkx" data-check="${esc(item)}">
+      <summary class="door"><span class="mark">&#10003;</span>${esc(label)}<span class="go">+</span></summary>
+      <div class="doorbody">${body}</div>
+    </details>
+  </li>`;
+}
+
+/**
+ * The getting-started checklist: five doors, each one an action — never just
+ * an instruction. Dismissible ("hide this", persisted), never a modal wall.
+ * The 2FA nudge rides the footer so it dismisses with the card; 2FA remains a
+ * surfaced option, not a gate.
+ */
+function checklistCard(c: ConsoleChecklistProps, csrfToken: string): string {
+  const d = (item: string) => c.done.has(item);
+  const optional = `<span class="muted" style="font-weight:400;margin-left:.35rem">(optional)</span>`;
+  return `<div class="card" data-testid="checklist">
+    <h2 style="margin-bottom:.1rem">Getting started</h2>
+    <p class="muted" style="margin:0 0 .3rem">Five small steps and this place is yours.</p>
+    <ul class="check">
+      ${checklistDoor("open-notes", "Open your notes", d("open-notes"), csrfToken)}
+      ${checklistDoor("write-note", "Write a note", d("write-note"), csrfToken)}
+      ${checklistExpand("connect-ai", "Connect your AI", d("connect-ai"), connectAiContent(c.vault))}
+      ${checklistExpand("add-phone", "Add Notes to your phone", d("add-phone"), addToPhoneContent(c.vault))}
+      ${checklistDoor("import-notes", "Import your old notes", d("import-notes"), csrfToken, optional)}
+    </ul>
+    <div class="check-foot">
+      ${c.showTwoFactorNudge ? `<span class="muted">Secure your account: <a href="/console/security">add 2FA &rarr;</a></span>` : ""}
+      <form class="inline hide" method="post" action="/console/checklist">
+        <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+        <input type="hidden" name="item" value="hidden">
+        <button class="linkbtn" type="submit" style="color:var(--muted)">hide this</button>
+      </form>
+    </div>
+  </div>`;
+}
+
+// --- first-run (zero vaults) -------------------------------------------------
+
+/**
+ * The first-run hero: one warm card — name your vault (the only required
+ * field) plus two OPTIONAL research questions. The questions never gate
+ * creation; skipping both is a fine answer.
+ */
+function firstRunHero(csrfToken: string, values: FirstRunValues, error?: string): string {
+  const chips = NOTES_APP_OPTIONS.map(
+    ({ value, label }) =>
+      `<span><input type="radio" id="na-${esc(value)}" name="notes_app" value="${esc(value)}"${
+        values.notesApp === value ? " checked" : ""
+      }><label for="na-${esc(value)}">${esc(label)}</label></span>`,
+  ).join("\n");
+  return `<p style="margin:.4rem 0 1.1rem">Welcome. Your vault is where your notes — and everything you want your AI to remember — will live, under a name you choose. It's yours: open format, export anytime.</p>
+    <div class="card">
+      <form method="post" action="/console/vaults">
+        <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+        <label for="name" style="font-size:.95rem">Vault name</label>
+        <input class="biginput" id="name" name="name" type="text" placeholder="e.g. field-notes" pattern="${VAULT_NAME_PATTERN}" value="${esc(values.name ?? "")}" required autofocus>
+        <p class="muted" style="margin:.35rem 0 0">Lowercase letters, numbers, and hyphens. 2–63 characters.</p>
+        <label style="margin-top:1.3rem">What do you take notes in today? <span class="muted" style="font-weight:400">(optional)</span></label>
+        <div class="chips">${chips}</div>
+        <label for="first_note" style="margin-top:1.3rem">What's the first thing you want your AI to remember? <span class="muted" style="font-weight:400">(optional)</span></label>
+        <input id="first_note" name="first_note" type="text" maxlength="500" placeholder="e.g. I'm rebuilding my garden this summer" value="${esc(values.firstNote ?? "")}">
+        <p class="muted" style="margin:.35rem 0 0">We'll tuck it into your new vault as your first note.</p>
+        ${error ? `<div class="err">${esc(error)}</div>` : ""}
+        <button class="primary" type="submit">Create my vault</button>
+      </form>
+    </div>`;
+}
+
+/**
+ * Console page JS — deliberately tiny (this file is otherwise zero-JS):
+ * clipboard for the MCP-URL copy buttons, and marking an expandable checklist
+ * item done on first open. Both degrade quietly without JS (the URL is
+ * selectable text; the disclosure still opens — it just isn't recorded).
+ */
+function consoleScript(csrfToken: string): string {
+  return `<script>(function(){
+  var CSRF=${JSON.stringify(csrfToken)};
+  document.addEventListener("click",function(e){
+    var b=e.target&&e.target.closest?e.target.closest("[data-copy]"):null;
+    if(!b)return;
+    navigator.clipboard.writeText(b.getAttribute("data-copy")).then(function(){
+      var t=b.textContent;b.textContent="Copied \\u2713";
+      setTimeout(function(){b.textContent=t;},1600);
+    });
+  });
+  var ds=document.querySelectorAll("details[data-check]");
+  for(var i=0;i<ds.length;i++)(function(d){
+    d.addEventListener("toggle",function(){
+      if(!d.open||d.getAttribute("data-sent"))return;
+      d.setAttribute("data-sent","1");
+      fetch("/console/checklist",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams({__csrf:CSRF,item:d.getAttribute("data-check")}).toString()});
+    });
+  })(ds[i]);
+})();</script>`;
+}
+
+/**
+ * The console: first-run hero when no vault exists yet; otherwise the
+ * getting-started checklist (until dismissed) + vault cards + create form.
+ */
 export function renderConsole(props: ConsoleProps): string {
-  const { email, vaults, csrfToken, error, notice } = props;
-  const list =
-    vaults.length > 0
-      ? vaults.map((v) => vaultCard(v, csrfToken)).join("\n")
-      : `<p class="muted">No vaults yet. Create your first one below.</p>`;
-  return page(
-    "Console — Parachute",
-    `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">
-       <h1 style="margin:0">Your vaults</h1>
+  const { email, vaults, csrfToken, error, notice, checklist, firstRun } = props;
+  const header = (title: string) => `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">
+       <h1 style="margin:0">${esc(title)}</h1>
        <span style="display:flex;gap:1rem;align-items:baseline"><a href="/console/security">Security</a>
        <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}"><button class="linkbtn" type="submit">Sign out</button></form></span>
      </div>
-     <p class="muted" style="margin:.15rem 0 1.2rem">${esc(email)}</p>
+     <p class="muted" style="margin:.15rem 0 1.2rem">${esc(email)}</p>`;
+
+  if (vaults.length === 0) {
+    return page(
+      "Console — Parachute",
+      `${header("Name your vault")}
+       ${notice ? `<div class="notice">${esc(notice)}</div>` : ""}
+       ${firstRunHero(csrfToken, firstRun ?? {}, error)}`,
+    );
+  }
+
+  const list = vaults.map((v) => vaultCard(v, csrfToken)).join("\n");
+  return page(
+    "Console — Parachute",
+    `${header("Your vaults")}
      ${notice ? `<div class="notice">${esc(notice)}</div>` : ""}
+     ${checklist ? checklistCard(checklist, csrfToken) : ""}
      ${list}
      <div class="card">
        <h2>Create a vault</h2>
@@ -479,6 +679,7 @@ export function renderConsole(props: ConsoleProps): string {
          ${error ? `<div class="err">${esc(error)}</div>` : ""}
          <button class="primary" type="submit">Create vault</button>
        </form>
-     </div>`,
+     </div>
+     ${consoleScript(csrfToken)}`,
   );
 }
