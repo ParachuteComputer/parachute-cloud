@@ -74,6 +74,14 @@ new_sqlite_classes = ["VaultDO"]
 binding = "ATTACHMENTS"
 bucket_name = "parachute-vault-dev"
 
+# Workers AI — the cloud voice-transcription backend (cloud#56). The DO alarm
+# resolves a WorkersAiProvider over this binding and calls
+# `@cf/openai/whisper-large-v3-turbo`. `[ai]` is inherited by named envs (unlike
+# r2_buckets/durable_objects), but we restate it under [env.staging] anyway for
+# explicit-beats-implicit parity with the rest of this file.
+[ai]
+binding = "AI"
+
 [vars]
 # The Identity Worker origin — validates token `iss` + fetches its JWKS +
 # revocation list (scope-guard). This is the LIVE value so the deployed config is
@@ -123,6 +131,12 @@ class_name = "VaultDO"
 [[env.staging.r2_buckets]]
 binding = "ATTACHMENTS"
 bucket_name = "parachute-vault-staging"
+
+# Workers AI for staging too. Account-scoped (no per-env resource to create),
+# restated for explicit parity — voice transcription is testable end-to-end on
+# staging (deploy-staging → smoke's live transcription E2E).
+[env.staging.ai]
+binding = "AI"
 
 # vars are non-inheritable: restate the full set. ISSUER_ORIGIN MUST equal the
 # staging identity worker's ISSUER ([env.staging.vars] in

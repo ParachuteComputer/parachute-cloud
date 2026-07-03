@@ -40,16 +40,23 @@ import { verifyCsrfToken } from "./csrf.ts";
 import { sessionUser } from "./session-user.ts";
 import { billingConfig, billingNotConfiguredResponse } from "./billing-config.ts";
 import { makeStripe } from "./stripe-client.ts";
+import { type PlanId, isPaidPlan } from "./plans.ts";
 
 export interface BillingOverrides {
   stripe?: Stripe;
 }
 
-/** The two Upgrade buttons — form field `interval`. */
+/** The two Parachute Upgrade buttons — form field `interval`. */
 export type BillingInterval = "monthly" | "yearly";
 
 function isBillingInterval(raw: string): raw is BillingInterval {
   return raw === "monthly" || raw === "yearly";
+}
+
+/** Which paid plan the Upgrade button buys — form field `plan` (default
+ *  parachute for back-compat with the pre-voice buttons). Voice is monthly-only. */
+function checkoutPlan(raw: string): PlanId {
+  return raw === "voice" ? "voice" : "parachute";
 }
 
 /**
@@ -71,19 +78,33 @@ export async function handleCheckoutPost(
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
     return redirectResponse("/console?billing_err=session");
   }
-  const interval = String(form.get("interval") ?? "");
-  if (!isBillingInterval(interval)) return redirectResponse("/console?billing_err=invalid");
-  if (user.plan === "parachute") {
+  const plan = checkoutPlan(String(form.get("plan") ?? "parachute"));
+  if (isPaidPlan(user.plan)) {
     // Already paid (or comped) — the portal is the door for changes; a second
     // subscription would double-bill.
     return redirectResponse("/console?billing_err=already");
+  }
+
+  // Resolve the Stripe Price. Voice is monthly-only (its price is additive and
+  // may be unset even while Parachute billing is live — refuse cleanly then).
+  let price: string;
+  if (plan === "voice") {
+    if (!config.priceVoiceMonthly) return redirectResponse("/console?billing_err=invalid");
+    price = config.priceVoiceMonthly;
+  } else {
+    const interval = String(form.get("interval") ?? "");
+    if (!isBillingInterval(interval)) return redirectResponse("/console?billing_err=invalid");
+    price = interval === "monthly" ? config.priceMonthly : config.priceYearly;
   }
 
   const stripe = overrides?.stripe ?? makeStripe(config.secretKey);
   try {
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
-      line_items: [{ price: interval === "monthly" ? config.priceMonthly : config.priceYearly, quantity: 1 }],
+      line_items: [{ price, quantity: 1 }],
+      // Stamp the chosen plan so the webhook (billing-lifecycle.ts) sets the
+      // right tier without expanding line_items.
+      metadata: { plan },
       // The correlation key: the webhook resolves this back to the users row.
       client_reference_id: user.id,
       // Reuse the Stripe customer when one exists (a re-subscribe after a
@@ -103,7 +124,7 @@ export async function handleCheckoutPost(
       subscription_data: { metadata: { user_id: user.id } },
     });
     if (!session.url) throw new Error("stripe_checkout_no_url");
-    console.log(`event=billing_checkout_started user=${user.id} interval=${interval} session=${session.id}`);
+    console.log(`event=billing_checkout_started user=${user.id} plan=${plan} session=${session.id}`);
     return redirectResponse(session.url);
   } catch (err) {
     console.error(

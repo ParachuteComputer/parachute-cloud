@@ -32,7 +32,7 @@
  */
 import { signAccessToken } from "./tokens.ts";
 import { type OAuthDeps, vaultInstanceUrl } from "./oauth-shared.ts";
-import { PLAN_SPECS } from "./plans.ts";
+import { PLAN_SPECS, transcriptionEntitlement } from "./plans.ts";
 import { getUserById } from "./users.ts";
 import { listVaultsForOwner } from "./vaults.ts";
 
@@ -86,6 +86,9 @@ export async function callVaultApi(
 export interface VaultUsageReading {
   dbBytes: number;
   r2Bytes: number;
+  /** Voice minutes used this UTC month (cloud#56). 0 when the DO reports none
+   *  (a pre-voice vault worker, or no transcriptions yet). */
+  transcribeMinutes: number;
 }
 
 /**
@@ -110,11 +113,14 @@ export async function readVaultUsage(
     verb: "admin",
   });
   if (!res.ok) throw new Error(`internal config GET → HTTP ${res.status}`);
-  const body = (await res.json()) as { db_bytes?: unknown; r2_bytes?: unknown };
+  const body = (await res.json()) as { db_bytes?: unknown; r2_bytes?: unknown; transcribe_minutes?: unknown };
   if (typeof body.db_bytes !== "number" || typeof body.r2_bytes !== "number") {
     throw new Error("internal config GET carried no usage split (db_bytes/r2_bytes)");
   }
-  return { dbBytes: body.db_bytes, r2Bytes: body.r2_bytes };
+  // transcribe_minutes is additive (cloud#56) — a pre-voice vault worker omits
+  // it, so default 0 rather than fail the whole usage read.
+  const transcribeMinutes = typeof body.transcribe_minutes === "number" ? body.transcribe_minutes : 0;
+  return { dbBytes: body.db_bytes, r2Bytes: body.r2_bytes, transcribeMinutes };
 }
 
 /** One vault's outcome from a cap push. `status` absent = transport error. */
@@ -140,6 +146,9 @@ export async function pushVaultCap(
   userId: string,
   vaultName: string,
   capBytes: number,
+  /** Voice entitlement to push alongside the cap (cloud#56). Omitted → cap only
+   *  (back-compat; the DO leaves any prior entitlement untouched). */
+  transcription?: { enabled: boolean; minutes_limit: number },
 ): Promise<CapPushResult> {
   try {
     const res = await callVaultApi(db, deps, {
@@ -148,7 +157,7 @@ export async function pushVaultCap(
       method: "PUT",
       apiPath: "/api/internal/config",
       verb: "admin",
-      jsonBody: { cap_bytes: capBytes },
+      jsonBody: transcription ? { cap_bytes: capBytes, transcription } : { cap_bytes: capBytes },
     });
     if (!res.ok) {
       console.warn(`event=plan_cap_push_failed vault=${vaultName} cap_bytes=${capBytes} status=${res.status}`);
@@ -181,10 +190,13 @@ export async function applyPlanToVaults(
   const user = await getUserById(db, userId);
   if (!user) return [];
   const capBytes = PLAN_SPECS[user.plan].total_bytes;
+  // Push the voice entitlement in the SAME hop as the cap (cloud#56) — a plan
+  // change (comp / Stripe) flips both the storage cap and voice at once.
+  const transcription = transcriptionEntitlement(user.plan);
   const vaults = await listVaultsForOwner(db, userId);
   const results: CapPushResult[] = [];
   for (const v of vaults) {
-    results.push(await pushVaultCap(db, deps, userId, v.name, capBytes));
+    results.push(await pushVaultCap(db, deps, userId, v.name, capBytes, transcription));
   }
   return results;
 }

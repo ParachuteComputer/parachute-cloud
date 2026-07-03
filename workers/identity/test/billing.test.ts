@@ -513,7 +513,10 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
     expect(user.stripeCustomerId).toBe("cus_up_1");
     expect(user.stripeSubscriptionId).toBe("sub_up_1");
     expect(user.pendingPlan).toBeNull();
-    expect(JSON.parse(pushed)).toEqual({ cap_bytes: PLAN_SPECS.parachute.total_bytes });
+    expect(JSON.parse(pushed)).toEqual({
+      cap_bytes: PLAN_SPECS.parachute.total_bytes,
+      transcription: { enabled: false, minutes_limit: 0 },
+    });
   });
 
   test("an upgrade CLEARS a pending downgrade (re-subscribe during grace)", async () => {
@@ -781,7 +784,10 @@ describe("runBillingSweep — the hourly downgrade pass", () => {
     // window + re-subscribe matching) — nothing deleted anywhere.
     expect(user.stripeCustomerId).toBe("cus_test_1");
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.body).toEqual({ cap_bytes: PLAN_SPECS.free.total_bytes });
+    expect(calls[0]!.body).toEqual({
+      cap_bytes: PLAN_SPECS.free.total_bytes,
+      transcription: { enabled: false, minutes_limit: 0 },
+    });
     const vaultRow = await env.DB.prepare("SELECT name FROM vaults WHERE name = 'sweep1-box'").first();
     expect(vaultRow).not.toBeNull(); // downgrade NEVER deletes data
   });

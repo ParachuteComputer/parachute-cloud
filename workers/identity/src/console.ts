@@ -57,7 +57,7 @@ import {
   listVaultsForOwner,
   userOwnsVault,
 } from "./vaults.ts";
-import { PLAN_SPECS, restoreAtCapMessage, vaultCapMessage } from "./plans.ts";
+import { PLAN_SPECS, restoreAtCapMessage, transcriptionEntitlement, vaultCapMessage } from "./plans.ts";
 import { callVaultApi, pushVaultCap } from "./vault-call.ts";
 import {
   callVaultRestore,
@@ -285,6 +285,7 @@ async function renderConsoleFor(
       // only while billing is configured (billing-config.ts; unconfigured =
       // today's deploy = the teaser stays and no billing UI exists).
       billingConfigured: deps.billingConfigured === true,
+      voiceBillingConfigured: deps.voiceBillingConfigured === true,
       hasBillingAccount: user.stripeCustomerId !== null,
       // At (or over — grandfathered) the plan's vault count: the create form
       // gives way to the friendly at-cap note. The POST handler is the real
@@ -367,11 +368,11 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   }
   try {
     const vault = await createVault(db, rawName, user.id, deps.now?.() ?? new Date());
-    // Push the plan's storage cap into the new vault's DO config (the
-    // internal seam — vault-call.ts). Best-effort by the same contract as the
-    // first note: a hiccup leaves the DO on the (more generous) env default,
-    // never fails creation; applyPlanToVaults / the backfill reconcile.
-    await pushVaultCap(db, deps, user.id, vault.name, spec.total_bytes);
+    // Push the plan's storage cap + voice entitlement into the new vault's DO
+    // config (the internal seam — vault-call.ts). Best-effort by the same
+    // contract as the first note: a hiccup leaves the DO on the (more generous)
+    // env default, never fails creation; applyPlanToVaults / the backfill reconcile.
+    await pushVaultCap(db, deps, user.id, vault.name, spec.total_bytes, transcriptionEntitlement(user.plan));
     // (a) research answer → user row. Allowlisted inside; unknown values no-op.
     if (notesApp) await setNotesApp(db, user.id, notesApp);
     // (b) their first note → INTO the new vault, verbatim. Best-effort by
@@ -502,9 +503,9 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
       }
       throw err;
     }
-    // Same best-effort cap push as any vault creation (a miss leaves the
-    // more-generous env default; applyPlanToVaults reconciles).
-    await pushVaultCap(db, deps, user.id, targetName, spec.total_bytes);
+    // Same best-effort cap + voice-entitlement push as any vault creation (a
+    // miss leaves the more-generous env default; applyPlanToVaults reconciles).
+    await pushVaultCap(db, deps, user.id, targetName, spec.total_bytes, transcriptionEntitlement(user.plan));
   }
 
   try {

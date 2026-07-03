@@ -4,6 +4,7 @@
  *
  *   free       1 vault,  100 MB total storage
  *   parachute  5 vaults, 10 GiB total storage — $3/mo or $30/yr
+ *   voice      5 vaults, 10 GiB + voice transcription (~600 min/mo) — $5/mo
  *
  * Everything that speaks about a plan reads THIS module: the console (plan
  * line + at-cap message), vault-count enforcement (console.ts), the storage-cap
@@ -25,7 +26,7 @@
  * Deliberately PURE (no D1, no fetch) so ui.ts can import it for rendering.
  */
 
-export type PlanId = "free" | "parachute";
+export type PlanId = "free" | "parachute" | "voice";
 
 /** GFS snapshot retention per rank (Wave 4e — the vault worker's snapshots.ts
  *  owns the rotation algorithm; THIS is the per-plan policy fed into it). */
@@ -58,10 +59,27 @@ export interface PlanSpec {
    * answers 404 (the surface doesn't exist for them — the admin pattern).
    */
   restore: boolean;
+  /**
+   * Whether the plan includes voice transcription (cloud#56). Pushed to each
+   * vault DO's config as the `transcription.enabled` entitlement; Notes gates
+   * its microphone on the vault landing's resolved flag (honest: free hides
+   * the mic). Only the $5 Voice tier enables it today.
+   */
+  voice_enabled: boolean;
+  /**
+   * Monthly voice-transcription budget in minutes (0 when voice is off). Pushed
+   * as `transcription.minutes_limit`; the vault DO meters `audioSeconds/60` per
+   * transcription against it and soft-caps new transcriptions at the limit
+   * (text is never blocked). ~600 min/mo on the Voice tier.
+   */
+  transcribe_minutes: number;
 }
 
 const MiB = 1024 * 1024;
 const GiB = 1024 * MiB;
+
+/** The Voice tier's monthly transcription budget (minutes). ~600 min/mo. */
+export const VOICE_MONTHLY_MINUTES = 600;
 
 export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
   free: {
@@ -71,6 +89,8 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
     total_bytes: 100 * MiB,
     snapshot_retention: { daily: 0, weekly: 1, monthly: 0 },
     restore: false,
+    voice_enabled: false,
+    transcribe_minutes: 0,
   },
   parachute: {
     id: "parachute",
@@ -79,6 +99,19 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
     total_bytes: 10 * GiB,
     snapshot_retention: { daily: 14, weekly: 8, monthly: 12 },
     restore: true,
+    voice_enabled: false,
+    transcribe_minutes: 0,
+  },
+  voice: {
+    id: "voice",
+    label: "Voice",
+    vault_count: 5,
+    total_bytes: 10 * GiB,
+    // Voice is a paid tier — same disaster-recovery + restore posture as Parachute.
+    snapshot_retention: { daily: 14, weekly: 8, monthly: 12 },
+    restore: true,
+    voice_enabled: true,
+    transcribe_minutes: VOICE_MONTHLY_MINUTES,
   },
 };
 
@@ -90,8 +123,25 @@ export const PARACHUTE_PRICE_MONTHLY_LABEL = "$3/mo";
 export const PARACHUTE_PRICE_YEARLY_LABEL = "$30/yr";
 export const PARACHUTE_PRICE_LINE = `${PARACHUTE_PRICE_MONTHLY_LABEL} or ${PARACHUTE_PRICE_YEARLY_LABEL}`;
 
+/** The Voice tier price copy (monthly only for v1). The ACTUAL amount lives on
+ *  the Stripe Price (env STRIPE_PRICE_VOICE_MONTHLY) — keep them in step. */
+export const VOICE_PRICE_MONTHLY_LABEL = "$5/mo";
+
 export function isPlanId(raw: string): raw is PlanId {
-  return raw === "free" || raw === "parachute";
+  return raw === "free" || raw === "parachute" || raw === "voice";
+}
+
+/** Any non-free plan is "paid" (has an Upgrade→Manage-billing lifecycle). */
+export function isPaidPlan(plan: PlanId): boolean {
+  return plan !== "free";
+}
+
+/** The voice entitlement pushed to a vault DO for a plan (vault-call.ts):
+ *  `{ enabled, minutes_limit }`, the shape the DO's internal-config seam
+ *  validates + stores. Free/Parachute → disabled; Voice → enabled + budget. */
+export function transcriptionEntitlement(plan: PlanId): { enabled: boolean; minutes_limit: number } {
+  const spec = PLAN_SPECS[plan];
+  return { enabled: spec.voice_enabled, minutes_limit: spec.transcribe_minutes };
 }
 
 /**

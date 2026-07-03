@@ -51,6 +51,18 @@ import { restoreFromTar } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, type WelcomeSeedResult } from "./welcome.js";
 import { SEED_PACK_NAMES, applySeedPack, getSeedPack } from "@openparachute/core/src/seed-packs.js";
+import type { Attachment } from "@openparachute/core/src/types.js";
+import {
+  TranscriptionError,
+  type TranscriptionProvider,
+} from "@openparachute/core/src/transcription/provider.js";
+import { WorkersAiProvider, MAX_TRANSCRIBE_BYTES } from "./transcription/workers-ai.js";
+import {
+  TRANSCRIPT_UNAVAILABLE,
+  TRANSCRIPT_LIMIT_REACHED,
+  bodyWithFailureMarker,
+  bodyWithTranscript,
+} from "./transcription/pipeline.js";
 
 function errText(e: unknown): string {
   if (e instanceof Error) return `${e.name}: ${e.message}`;
@@ -79,6 +91,16 @@ type IntrospectResult = {
   foreign_keys_set_error?: string;
 };
 
+/** The voice-transcription entitlement the Identity Worker pushes per plan
+ *  (cloud#56) — the same internal-config seam as `cap_bytes`. Absent = the
+ *  free default (disabled, no minutes). */
+type TranscriptionEntitlement = {
+  /** Whether the owner's plan includes voice (Notes gates the mic on this). */
+  enabled: boolean;
+  /** Monthly transcription budget in minutes (0 when disabled). */
+  minutes_limit: number;
+};
+
 /** Persisted per-vault config (DO storage key "config"). */
 type VaultConfigState = {
   name: string;
@@ -87,7 +109,24 @@ type VaultConfigState = {
   audio_retention: "keep" | "until_transcribed" | "never";
   auto_transcribe: { enabled: boolean };
   cap_bytes?: number;
+  /** Voice entitlement (plan-pushed via PUT /api/internal/config). */
+  transcription?: TranscriptionEntitlement;
 };
+
+/** DO-storage keys for the monthly voice-minutes meter (the r2_bytes pattern):
+ *  a running float of minutes used, tagged with the UTC month it accrued in so
+ *  a month rollover lazily resets it on the next read/write. */
+const TRANSCRIBE_MINUTES_KEY = "transcribe_minutes";
+const TRANSCRIBE_MONTH_KEY = "transcribe_minutes_month";
+
+/** Max attempts before a transcription is marked terminally unavailable
+ *  (mirrors the self-host worker's DEFAULT_MAX_ATTEMPTS). */
+const TRANSCRIBE_MAX_ATTEMPTS = 3;
+
+/** UTC "YYYY-MM" for the meter's month tag. */
+function utcMonth(d: Date): string {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
 
 export class VaultDO extends DurableObject {
   private shim: DatabaseShim;
@@ -100,6 +139,20 @@ export class VaultDO extends DurableObject {
   private config: VaultConfigState | null = null;
   private r2Bytes = 0;
   private stateLoaded = false;
+
+  // Monthly voice-minutes meter (loaded lazily with the rest of DO state).
+  // `transcribeMinutes` is the running float of minutes used in
+  // `transcribeMonth` (UTC "YYYY-MM"); a month rollover resets it lazily.
+  private transcribeMinutes = 0;
+  private transcribeMonth = "";
+
+  /**
+   * TEST-ONLY provider override. The vitest suites inject a stub here (via
+   * `runInDurableObject`) so the alarm pipeline runs without a live Workers AI
+   * binding; production leaves it undefined and {@link transcriptionProvider}
+   * builds a `WorkersAiProvider` over `env.AI`. Never set on a deployed path.
+   */
+  private testProvider?: TranscriptionProvider;
 
   // Live-query fan-out for THIS vault, bound to the store's own post-commit hook
   // registry — the single-writer property (design §3): every mutation and every
@@ -175,6 +228,13 @@ export class VaultDO extends DurableObject {
         description: this.config!.description,
         createdAt: this.config!.createdAt,
         cap_bytes: this.capBytes(),
+        // Voice-transcription capability (cloud#56) — Notes gates the mic on
+        // `enabled`. Populated from the owner's plan (pushed into config via
+        // the internal seam): free → { enabled: false }; the $5 Voice tier →
+        // { enabled: true, minutes_remaining } from the monthly meter. This is
+        // the cloud analogue of the self-host landing's `transcription` flag
+        // (parachute-vault vault#529), extended with the metered `minutes_remaining`.
+        transcription: this.transcriptionCapability(),
         stats: await this.store.getVaultStats(),
       });
     }
@@ -194,7 +254,13 @@ export class VaultDO extends DurableObject {
     }
 
     const writeCtx = { actor: auth.actor, via: auth.via };
-    const deps: RestDeps = { vaultName, deleteObject: (rel) => this.deleteObject(vaultName, rel) };
+    const deps: RestDeps = {
+      vaultName,
+      deleteObject: (rel) => this.deleteObject(vaultName, rel),
+      // A transcribe:true attachment link arms the DO alarm (fires ~now); the
+      // alarm drains pending transcriptions off the request path (cloud#56).
+      scheduleTranscription: () => this.scheduleTranscriptionAlarm(),
+    };
 
     // Internal (platform-owned) seams — /api/internal/*. ALL dispatched BEFORE
     // the cap gate ON PURPOSE: a plan upgrade must be able to RAISE the cap of
@@ -315,6 +381,8 @@ export class VaultDO extends DurableObject {
       await this.maybeSeedWelcome();
     }
     this.r2Bytes = (await this.ctx.storage.get<number>(R2_METER_KEY)) ?? 0;
+    this.transcribeMinutes = (await this.ctx.storage.get<number>(TRANSCRIBE_MINUTES_KEY)) ?? 0;
+    this.transcribeMonth = (await this.ctx.storage.get<string>(TRANSCRIBE_MONTH_KEY)) ?? "";
     this.stateLoaded = true;
   }
 
@@ -429,6 +497,7 @@ export class VaultDO extends DurableObject {
   private async handleInternalConfig(request: Request): Promise<Response> {
     const shape = () => {
       const dbBytes = Number(this.raw().databaseSize);
+      const ent = this.config!.transcription;
       return {
         name: this.config!.name,
         /** The per-DO override (null = none; the env default applies). */
@@ -443,25 +512,71 @@ export class VaultDO extends DurableObject {
          */
         db_bytes: dbBytes,
         r2_bytes: this.r2Bytes,
+        /**
+         * Voice entitlement + the monthly minutes meter (cloud#56). The usage
+         * rollup reads `transcribe_minutes` (this UTC month, month-normalized)
+         * into D1 alongside the byte split; `transcription_*` echo the pushed
+         * plan entitlement so the admin console can render it.
+         */
+        transcription_enabled: ent?.enabled ?? false,
+        transcribe_minutes_limit: ent?.minutes_limit ?? 0,
+        transcribe_minutes: this.usedMinutesThisMonth(),
       };
     };
 
     if (request.method === "GET") return json(shape());
     if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
 
-    let body: { cap_bytes?: unknown };
+    let body: { cap_bytes?: unknown; transcription?: unknown };
     try {
-      body = (await request.json()) as { cap_bytes?: unknown };
+      body = (await request.json()) as { cap_bytes?: unknown; transcription?: unknown };
     } catch {
       return json({ error: "Invalid JSON body" }, 400);
     }
-    const cap = body.cap_bytes;
-    if (typeof cap !== "number" || !Number.isSafeInteger(cap) || cap <= 0) {
-      return json({ error: "cap_bytes must be a positive integer" }, 400);
+
+    // Both fields are OPTIONAL and independently applied — a plan change pushes
+    // both; the vault-creation cap push sends only cap_bytes. At least one must
+    // be present so an empty PUT is an obvious client error.
+    const hasCap = body.cap_bytes !== undefined;
+    const hasTranscription = body.transcription !== undefined;
+    if (!hasCap && !hasTranscription) {
+      return json({ error: "provide cap_bytes and/or transcription" }, 400);
     }
-    this.config!.cap_bytes = cap;
+
+    if (hasCap) {
+      const cap = body.cap_bytes;
+      if (typeof cap !== "number" || !Number.isSafeInteger(cap) || cap <= 0) {
+        return json({ error: "cap_bytes must be a positive integer" }, 400);
+      }
+      this.config!.cap_bytes = cap;
+    }
+
+    if (hasTranscription) {
+      const ent = this.parseTranscriptionEntitlement(body.transcription);
+      if ("error" in ent) return json({ error: ent.error }, 400);
+      this.config!.transcription = ent.value;
+    }
+
     await this.ctx.storage.put("config", this.config);
     return json(shape());
+  }
+
+  /** Validate the pushed `{ enabled, minutes_limit }` entitlement. */
+  private parseTranscriptionEntitlement(
+    raw: unknown,
+  ): { value: TranscriptionEntitlement } | { error: string } {
+    if (typeof raw !== "object" || raw === null) {
+      return { error: "transcription must be an object { enabled, minutes_limit }" };
+    }
+    const r = raw as { enabled?: unknown; minutes_limit?: unknown };
+    if (typeof r.enabled !== "boolean") {
+      return { error: "transcription.enabled must be a boolean" };
+    }
+    const limit = r.minutes_limit;
+    if (typeof limit !== "number" || !Number.isFinite(limit) || limit < 0) {
+      return { error: "transcription.minutes_limit must be a non-negative number" };
+    }
+    return { value: { enabled: r.enabled, minutes_limit: limit } };
   }
 
   /**
@@ -642,6 +757,324 @@ export class VaultDO extends DurableObject {
     const head = await this.env.ATTACHMENTS.head(key);
     await this.env.ATTACHMENTS.delete(key);
     if (head) await this.meterSub(head.size);
+  }
+
+  // -------------------------------------------------------------------------
+  // Voice transcription (cloud#56) — Workers AI provider + DO-alarm pipeline
+  // -------------------------------------------------------------------------
+
+  /** Minutes used in the CURRENT UTC month (a stale month tag reads as 0 — the
+   *  lazy monthly reset; the stored value is only zeroed on the next accrual). */
+  private usedMinutesThisMonth(): number {
+    return this.transcribeMonth === utcMonth(new Date()) ? this.transcribeMinutes : 0;
+  }
+
+  /** The voice capability for the landing: `enabled` from the plan entitlement;
+   *  `minutes_remaining` = limit − used-this-month (0 when disabled). */
+  private transcriptionCapability(): { enabled: boolean; minutes_remaining: number } {
+    const ent = this.config?.transcription;
+    if (!ent?.enabled) return { enabled: false, minutes_remaining: 0 };
+    return {
+      enabled: true,
+      minutes_remaining: Math.max(0, ent.minutes_limit - this.usedMinutesThisMonth()),
+    };
+  }
+
+  /** Add `minutes` to the monthly meter, resetting first on a month rollover. */
+  private async recordTranscribeMinutes(minutes: number): Promise<void> {
+    if (!(minutes > 0)) return;
+    const month = utcMonth(new Date());
+    if (this.transcribeMonth !== month) {
+      this.transcribeMonth = month;
+      this.transcribeMinutes = 0;
+      await this.ctx.storage.put(TRANSCRIBE_MONTH_KEY, month);
+    }
+    this.transcribeMinutes += minutes;
+    await this.ctx.storage.put(TRANSCRIBE_MINUTES_KEY, this.transcribeMinutes);
+  }
+
+  /** Resolve the transcription provider — the injected test stub, else a
+   *  `WorkersAiProvider` over the `env.AI` binding. */
+  private transcriptionProvider(): TranscriptionProvider {
+    return this.testProvider ?? new WorkersAiProvider(this.env.AI, { maxBytes: MAX_TRANSCRIBE_BYTES });
+  }
+
+  /**
+   * Arm the transcription alarm to fire ~immediately. Called when a
+   * `transcribe:true` attachment link lands (notes handler → RestDeps). If an
+   * alarm is already pending (a burst of uploads, or a backoff re-arm), leave
+   * the earlier one — the alarm drains ALL pending attachments, so one wake
+   * covers the batch. Best-effort: a scheduling hiccup is caught by the fact
+   * that the note keeps its `pending` attachment and a later upload re-arms.
+   */
+  private async scheduleTranscriptionAlarm(): Promise<void> {
+    try {
+      const existing = await this.ctx.storage.getAlarm();
+      if (existing === null) await this.ctx.storage.setAlarm(Date.now());
+    } catch (e) {
+      console.warn(`[transcribe-schedule ${this.config?.name}]`, errText(e));
+    }
+  }
+
+  /**
+   * The transcription pipeline (cloud#56). Fires off the request path (armed by
+   * a `transcribe:true` attachment link, or re-armed after a backoff). Drains
+   * pending attachments FIFO, ONE inference per wake — whisper-turbo runs up to
+   * ~240 s of wall-clock as an I/O subrequest, so a single alarm invocation
+   * handles one attachment and re-arms if more remain (bounding each wake's work
+   * and keeping the meter/soft-cap re-checked between attachments).
+   *
+   * Mirrors the self-host worker's terminal semantics (surgical placeholder
+   * replacement, {@link TRANSCRIBE_MAX_ATTEMPTS}-attempt backoff, an
+   * "unavailable" marker on terminal failure, retention on success) so the
+   * eternal "Transcribing…" spinner (cloud#56) always resolves to text or a
+   * marker — never infinite pending.
+   */
+  async alarm(): Promise<void> {
+    if (this.bootError) return;
+    // The alarm has no request → recover the vault name from persisted config.
+    const cfg = (await this.ctx.storage.get<VaultConfigState>("config")) ?? null;
+    const vaultName = cfg?.name;
+    if (!vaultName) return;
+    await this.ensureState(vaultName);
+
+    let pending: Attachment[];
+    try {
+      pending = await this.store.listAttachmentsByTranscribeStatus("pending", 50);
+    } catch (e) {
+      console.error(`[transcribe ${vaultName}] list failed:`, errText(e));
+      return;
+    }
+
+    const now = Date.now();
+    // FIFO: find the first attachment whose backoff (if any) has elapsed.
+    const due = pending.find((att) => {
+      const meta = (att.metadata as Record<string, unknown> | undefined) ?? {};
+      const until = meta.transcribe_backoff_until ? Date.parse(String(meta.transcribe_backoff_until)) : NaN;
+      return !(Number.isFinite(until) && until > now);
+    });
+
+    if (!due) {
+      // Everything remaining is still backing off — re-arm at the earliest
+      // backoff so we wake exactly when the next attempt is due.
+      const nextAt = pending.reduce<number | null>((soonest, att) => {
+        const meta = (att.metadata as Record<string, unknown> | undefined) ?? {};
+        const until = meta.transcribe_backoff_until ? Date.parse(String(meta.transcribe_backoff_until)) : NaN;
+        if (!Number.isFinite(until)) return soonest;
+        return soonest === null || until < soonest ? until : soonest;
+      }, null);
+      if (nextAt !== null) await this.ctx.storage.setAlarm(nextAt);
+      return;
+    }
+
+    try {
+      await this.transcribeOne(vaultName, due);
+    } catch (e) {
+      console.error(`[transcribe ${vaultName}] unexpected error on ${due.id}:`, errText(e));
+    }
+
+    // Re-arm if anything is still pending (this one may have gone to backoff, or
+    // there are more in the queue) — drains the batch one inference per wake.
+    try {
+      const stillPending = await this.store.listAttachmentsByTranscribeStatus("pending", 1);
+      if (stillPending.length > 0) await this.ctx.storage.setAlarm(Date.now());
+    } catch (e) {
+      console.warn(`[transcribe ${vaultName}] re-arm check failed:`, errText(e));
+    }
+  }
+
+  /**
+   * Transcribe one pending attachment: re-read its status (skip if a concurrent
+   * path already resolved it), enforce the plan entitlement + monthly soft cap,
+   * read the R2 audio, call the provider, then surgically patch the note body,
+   * meter the minutes, and honor `audio_retention`. Failures back off up to
+   * {@link TRANSCRIBE_MAX_ATTEMPTS}, then write the "unavailable" marker.
+   */
+  private async transcribeOne(vaultName: string, attachment: Attachment): Promise<void> {
+    const fresh = (await this.store.getAttachment(attachment.id)) ?? attachment;
+    const meta: Record<string, unknown> = { ...(fresh.metadata ?? {}) };
+    if (meta.transcribe_status !== "pending") return;
+    const attempts = typeof meta.transcribe_attempts === "number" ? meta.transcribe_attempts : 0;
+
+    // --- Entitlement gate: no plan voice → honest terminal, no eternal spinner.
+    const ent = this.config?.transcription;
+    if (!ent?.enabled) {
+      await this.markTerminal(vaultName, attachment, meta, "voice not enabled for this plan", TRANSCRIPT_UNAVAILABLE);
+      return;
+    }
+    // --- Soft cap: out of monthly minutes → limit marker, never touch text.
+    if (ent.minutes_limit - this.usedMinutesThisMonth() <= 0) {
+      await this.markTerminal(vaultName, attachment, meta, "monthly voice limit reached", TRANSCRIPT_LIMIT_REACHED);
+      return;
+    }
+
+    // --- Read the R2 audio. Size-gate BEFORE loading into memory where we can
+    // (head), so oversized audio fails cheaply without a 45 MB read.
+    const key = r2Key(vaultName, attachment.path);
+    const head = await this.env.ATTACHMENTS.head(key);
+    if (head && head.size > MAX_TRANSCRIBE_BYTES) {
+      await this.markTerminal(
+        vaultName,
+        attachment,
+        meta,
+        `audio too large (${head.size} bytes)`,
+        TRANSCRIPT_UNAVAILABLE,
+      );
+      return;
+    }
+    const obj = await this.env.ATTACHMENTS.get(key);
+    if (!obj) {
+      // Audio gone — nothing to transcribe. Terminal (never loops).
+      await this.markTerminal(vaultName, attachment, meta, "audio file not found", TRANSCRIPT_UNAVAILABLE);
+      return;
+    }
+    const audio = new Uint8Array(await obj.arrayBuffer());
+
+    let text: string;
+    let audioSeconds: number | undefined;
+    try {
+      const result = await this.transcriptionProvider().transcribe({
+        audio,
+        filename: attachment.path.split("/").pop() ?? "audio",
+        mimeType: attachment.mimeType,
+      });
+      text = result.text;
+      audioSeconds = result.audioSeconds;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const apiErr = err instanceof TranscriptionError ? err : null;
+      const nonRetriable = apiErr !== null && !apiErr.retriable;
+      const nextAttempts = attempts + 1;
+      const terminal = nonRetriable || nextAttempts >= TRANSCRIBE_MAX_ATTEMPTS;
+
+      if (terminal) {
+        console.error(`[transcribe ${vaultName}] giving up on ${attachment.id} (${apiErr?.code ?? "error"}):`, errMsg);
+        await this.markTerminal(
+          vaultName,
+          attachment,
+          { ...meta, transcribe_attempts: nextAttempts, ...(apiErr?.code ? { transcribe_error_code: apiErr.code } : {}) },
+          errMsg,
+          TRANSCRIPT_UNAVAILABLE,
+        );
+        return;
+      }
+      // Exponential backoff (30s, 2m, …), re-checked when the alarm re-fires.
+      const backoffMs = 30_000 * Math.pow(4, nextAttempts - 1);
+      const backoffUntil = new Date(Date.now() + backoffMs).toISOString();
+      await this.store.setAttachmentMetadata(attachment.id, {
+        ...meta,
+        transcribe_status: "pending",
+        transcribe_attempts: nextAttempts,
+        transcribe_backoff_until: backoffUntil,
+        transcribe_error: errMsg,
+      });
+      return;
+    }
+
+    // --- Success. Surgically patch the note (legacy voice-memo stub path).
+    await this.patchNoteBody(attachment.noteId, (content) => bodyWithTranscript(content, text));
+
+    const doneMeta: Record<string, unknown> = {
+      ...meta,
+      transcribe_status: "done",
+      transcribe_attempts: attempts + 1,
+      transcribe_done_at: new Date().toISOString(),
+      transcript: text,
+      ...(typeof audioSeconds === "number" ? { transcribe_audio_seconds: audioSeconds } : {}),
+    };
+    delete doneMeta.transcribe_backoff_until;
+    delete doneMeta.transcribe_error;
+    delete doneMeta.transcribe_error_code;
+    await this.store.setAttachmentMetadata(attachment.id, doneMeta);
+
+    // --- Meter the audio duration (the plan concern). No duration reported →
+    // don't meter (a follow-on could fall back to a byte-rate estimate).
+    if (typeof audioSeconds === "number") await this.recordTranscribeMinutes(audioSeconds / 60);
+
+    // --- Retention: drop the R2 audio (+ decrement the storage meter) on
+    // "until_transcribed"/"never"; keep the attachment row so the transcript
+    // stays addressable.
+    const retention = this.config?.audio_retention ?? "keep";
+    if (retention === "until_transcribed" || retention === "never") {
+      try { await this.deleteObject(vaultName, attachment.path); } catch (e) {
+        console.warn(`[transcribe ${vaultName}] retention delete failed:`, errText(e));
+      }
+    }
+  }
+
+  /**
+   * Record a terminal transcription outcome: flip the attachment to `failed`
+   * (or, for the soft cap, leave a clear error) and stamp the note body marker
+   * (only when the note still carries the `transcribe_stub` opt-in — a user
+   * edit clearing it opts out). Honors `retention: "never"` (drop the audio on
+   * any terminal state).
+   */
+  private async markTerminal(
+    vaultName: string,
+    attachment: Attachment,
+    meta: Record<string, unknown>,
+    error: string,
+    marker: string,
+  ): Promise<void> {
+    await this.store.setAttachmentMetadata(attachment.id, {
+      ...meta,
+      transcribe_status: "failed",
+      transcribe_error: error,
+    });
+    await this.patchNoteBody(attachment.noteId, (content) => bodyWithFailureMarker(content, marker));
+    if ((this.config?.audio_retention ?? "keep") === "never") {
+      try { await this.deleteObject(vaultName, attachment.path); } catch { /* best-effort */ }
+    }
+  }
+
+  /**
+   * Apply a surgical body transform to the voice-memo note, gated on the
+   * `transcribe_stub` opt-in (the notes handler stamps it on transcribe:true;
+   * a user edit clearing it opts out of the overwrite) and clearing the stub on
+   * write. Single-writer DO + `if_updated_at` precondition guard a concurrent
+   * user edit: on conflict, re-read once and re-apply against fresh content;
+   * best-effort thereafter (never crash the alarm).
+   */
+  private async patchNoteBody(noteId: string, transform: (content: string) => string): Promise<void> {
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const note = await this.store.getNote(noteId);
+        if (!note) return;
+        const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+        if (noteMeta.transcribe_stub !== true) return; // opted out / not a stub note
+        const body = transform(note.content);
+        const { transcribe_stub: _drop, ...restMeta } = noteMeta;
+        try {
+          await this.store.updateNote(note.id, {
+            content: body,
+            metadata: restMeta,
+            skipUpdatedAt: true,
+            if_updated_at: note.updatedAt,
+          });
+          return;
+        } catch (err: any) {
+          if (!err || err.code !== "CONFLICT" || attempt === 1) throw err;
+          // else: a user edit landed between read and write — re-read + retry.
+        }
+      }
+    } catch (e) {
+      console.error(`[transcribe] patch note ${noteId} failed:`, errText(e));
+    }
+  }
+
+  /**
+   * TEST RPC: inject a stub transcription provider so the alarm pipeline runs
+   * without a live Workers AI binding. Set via `runInDurableObject` in the
+   * vitest suite; never called on a deployed path.
+   */
+  __setTestProvider(provider: TranscriptionProvider): void {
+    this.testProvider = provider;
+  }
+
+  /** TEST RPC: the monthly voice-minutes meter (pins metering + soft-cap). */
+  async __transcribeMeter(vaultName: string): Promise<{ minutes: number; month: string }> {
+    await this.ensureState(vaultName);
+    return { minutes: this.usedMinutesThisMonth(), month: this.transcribeMonth };
   }
 
   /** POST /api/storage/upload · GET /api/storage/<date>/<file> — R2-backed. */

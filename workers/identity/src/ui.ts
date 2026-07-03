@@ -12,10 +12,12 @@ import { NOTES_APP_OPTIONS } from "./checklist.ts";
 import {
   PARACHUTE_PRICE_MONTHLY_LABEL,
   PARACHUTE_PRICE_YEARLY_LABEL,
+  VOICE_PRICE_MONTHLY_LABEL,
   PLAN_SPECS,
   type PlanId,
   formatPlanBytes,
   formatUsageBytes,
+  isPaidPlan,
   parachuteTeaser,
   planLine,
   vaultCapMessage,
@@ -537,6 +539,9 @@ export interface ConsoleProps {
    * pre-keys) → the teaser stays and no billing UI renders at all.
    */
   billingConfigured?: boolean;
+  /** Voice Stripe Price present too → free users also see the $5 Voice Upgrade
+   *  button (cloud#56). Additive to `billingConfigured`. */
+  voiceBillingConfigured?: boolean;
   /** The user has a Stripe customer (false for comped parachute accounts). */
   hasBillingAccount?: boolean;
 }
@@ -792,6 +797,7 @@ export function renderConsole(props: ConsoleProps): string {
     atVaultCap,
     isOperator,
     billingConfigured,
+    voiceBillingConfigured,
     hasBillingAccount,
   } = props;
   // Plan display. The across-vaults usage total (latest rollup rows) rides the
@@ -815,8 +821,20 @@ export function renderConsole(props: ConsoleProps): string {
            <button class="linkbtn" type="submit" name="interval" value="yearly">${esc(PARACHUTE_PRICE_YEARLY_LABEL)}</button>
          </form>`
       : "";
+  // The $5 Voice tier Upgrade (cloud#56) — voice transcription; monthly only.
+  // Renders alongside the Parachute Upgrade for free users, only when the Voice
+  // Stripe Price is configured (voiceBillingConfigured).
+  const voiceUpgradeHtml =
+    plan === "free" && voiceBillingConfigured
+      ? `<form class="inline" method="post" action="/billing/checkout" data-testid="upgrade-voice" style="margin-left:.35rem">
+           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+           <input type="hidden" name="plan" value="voice">
+           <span style="opacity:.85">&middot; ${esc(PLAN_SPECS.voice.label)}: voice transcription —</span>
+           <button class="linkbtn" type="submit">Upgrade &mdash; ${esc(VOICE_PRICE_MONTHLY_LABEL)}</button>
+         </form>`
+      : "";
   const manageBillingHtml =
-    plan === "parachute" && billingConfigured && hasBillingAccount
+    isPaidPlan(plan) && billingConfigured && hasBillingAccount
       ? ` <form class="inline" method="post" action="/billing/portal" data-testid="manage-billing">
            <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
            <span style="opacity:.75">&middot;</span> <button class="linkbtn" type="submit">Manage billing</button>
@@ -826,7 +844,7 @@ export function renderConsole(props: ConsoleProps): string {
     plan === "free" && !billingConfigured
       ? ` <span style="opacity:.75">&middot; ${esc(parachuteTeaser())}</span>`
       : "";
-  const planHtml = `${esc(planLine(plan))}${usageHtml}${teaserHtml}${upgradeHtml}${manageBillingHtml}`;
+  const planHtml = `${esc(planLine(plan))}${usageHtml}${teaserHtml}${upgradeHtml}${voiceUpgradeHtml}${manageBillingHtml}`;
   // The Admin link renders ONLY for operators — everyone else never learns the
   // route exists (it answers 404 to them anyway; admin.ts).
   const header = (title: string) => `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">

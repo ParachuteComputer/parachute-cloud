@@ -65,6 +65,13 @@ export interface Env {
   STRIPE_PRICE_PARACHUTE_MONTHLY?: string;
   STRIPE_PRICE_PARACHUTE_YEARLY?: string;
   /**
+   * Stripe Price id for the $5/mo Voice tier (cloud#56). OPTIONAL + additive:
+   * absent → the voice Upgrade button hides and voice checkout is refused, but
+   * the rest of billing (the Parachute prices) still gates normally. Set in
+   * [vars] once the Voice product exists.
+   */
+  STRIPE_PRICE_VOICE_MONTHLY?: string;
+  /**
    * Service binding to the vault worker — STAGING ONLY today. Staging's
    * VAULT_ORIGIN is a workers.dev URL, which is not a valid subrequest target
    * from inside a Worker (the platform answers 404 without ever routing to the

@@ -230,8 +230,12 @@ describe("vault-count enforcement + storage-cap push", () => {
     expect(created.headers.get("location")).toBe("/console?created=capflow-box");
 
     // The pushed body is the plan's total_bytes (v1 semantics: per-vault cap
-    // = plan total; the usage-rollup PR tightens to a true aggregate).
-    expect(JSON.parse(body!)).toEqual({ cap_bytes: PLAN_SPECS.free.total_bytes });
+    // = plan total; the usage-rollup PR tightens to a true aggregate) PLUS the
+    // voice entitlement (cloud#56 — free = disabled, 0 minutes).
+    expect(JSON.parse(body!)).toEqual({
+      cap_bytes: PLAN_SPECS.free.total_bytes,
+      transcription: { enabled: false, minutes_limit: 0 },
+    });
 
     // The mint seam, pinned end-to-end: first-party client, ADMIN verb,
     // aud-pinned, vault_scope-pinned, 60s TTL — a real issuer-signed JWT.
@@ -370,7 +374,10 @@ describe("applyPlanToVaults — the seam admin/Stripe will call", () => {
     ]);
     for (const c of calls) {
       expect(c.method).toBe("PUT");
-      expect(c.body).toEqual({ cap_bytes: PLAN_SPECS.parachute.total_bytes });
+      expect(c.body).toEqual({
+        cap_bytes: PLAN_SPECS.parachute.total_bytes,
+        transcription: { enabled: false, minutes_limit: 0 },
+      });
       const payload = decodeJwtPayload(c.auth!.replace(/^Bearer /, ""));
       expect(payload.client_id).toBe(FIRST_PARTY_CLIENT_ID);
       expect(String(payload.scope)).toMatch(/^vault:apply-(one|two):admin$/);

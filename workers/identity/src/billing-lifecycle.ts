@@ -42,7 +42,7 @@
  */
 import type Stripe from "stripe";
 import type { OAuthDeps } from "./oauth-shared.ts";
-import { type PlanId, coercePlanId } from "./plans.ts";
+import { type PlanId, coercePlanId, isPaidPlan } from "./plans.ts";
 import { getUserById, getUserByStripeCustomerId, getUserByStripeSubscriptionId, setUserPlan } from "./users.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 import type { BillingConfig } from "./billing-config.ts";
@@ -118,29 +118,37 @@ export async function handleCheckoutSessionCompleted(
   const customerId = typeof session.customer === "string" ? session.customer : null;
   const subscriptionId = typeof session.subscription === "string" ? session.subscription : null;
 
-  if (user.plan === "parachute" && user.stripeSubscriptionId !== null && user.stripeSubscriptionId === subscriptionId) {
+  // Which paid plan did they buy? The checkout stamps the chosen plan into
+  // session metadata (billing.ts) so we don't need to expand line_items here.
+  // Coerce (unknown → free), then floor to a paid plan — a completed paid
+  // checkout is never "free"; a missing/garbled tag defaults to parachute
+  // (back-compat with sessions minted before the voice tier).
+  const metaPlan = coercePlanId(session.metadata?.plan);
+  const boughtPlan: PlanId = isPaidPlan(metaPlan) ? metaPlan : "parachute";
+
+  if (isPaidPlan(user.plan) && user.plan === boughtPlan && user.stripeSubscriptionId !== null && user.stripeSubscriptionId === subscriptionId) {
     return { ok: true, userId: user.id, action: "checkout_completed_idempotent" };
   }
 
   await db
     .prepare(
-      `UPDATE users SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = 'parachute',
+      `UPDATE users SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = ?,
          pending_plan = NULL, plan_downgrade_at = NULL
        WHERE id = ?`,
     )
-    .bind(customerId, subscriptionId, user.id)
+    .bind(customerId, subscriptionId, boughtPlan, user.id)
     .run();
 
-  // Caps lift immediately (best-effort per vault; a miss self-heals via the
-  // backfill script / the next plan event — vault-call.ts contract).
+  // Caps + voice entitlement lift immediately (best-effort per vault; a miss
+  // self-heals via the backfill script / the next plan event — vault-call.ts).
   const results = await applyPlanToVaults(db, deps, user.id);
   const failed = results.filter((r) => !r.ok);
   if (failed.length > 0) {
     console.warn(
-      `event=billing_cap_push_partial user=${user.id} plan=parachute failed=${failed.map((f) => f.vault).join(",")}`,
+      `event=billing_cap_push_partial user=${user.id} plan=${boughtPlan} failed=${failed.map((f) => f.vault).join(",")}`,
     );
   }
-  console.log(`event=billing_upgraded user=${user.id} subscription=${subscriptionId ?? "-"} vaults=${results.length}`);
+  console.log(`event=billing_upgraded user=${user.id} plan=${boughtPlan} subscription=${subscriptionId ?? "-"} vaults=${results.length}`);
   return { ok: true, userId: user.id, action: "checkout_completed_upgraded" };
 }
 
@@ -243,6 +251,7 @@ export async function handleSubscriptionDeleted(
 /** Map a Stripe Price id to the plan it buys (env-configured, never hardcoded). */
 export function planForPrice(priceId: string, config: BillingConfig): PlanId | null {
   if (priceId === config.priceMonthly || priceId === config.priceYearly) return "parachute";
+  if (config.priceVoiceMonthly && priceId === config.priceVoiceMonthly) return "voice";
   return null;
 }
 

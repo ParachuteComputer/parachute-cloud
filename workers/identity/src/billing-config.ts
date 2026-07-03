@@ -23,16 +23,25 @@ export interface BillingConfig {
   priceMonthly: string;
   /** Price id for Parachute yearly ($30/yr) — env STRIPE_PRICE_PARACHUTE_YEARLY. */
   priceYearly: string;
+  /**
+   * Price id for the $5/mo Voice tier (cloud#56). OPTIONAL + additive — its
+   * absence does NOT block billing (the Parachute prices still gate the whole
+   * feature); when unset, the voice Upgrade button hides and voice checkout is
+   * refused. Set once the Voice Stripe Price exists.
+   */
+  priceVoiceMonthly?: string;
 }
 
-/** The full Stripe config, or null when any piece is missing (degrade cleanly). */
+/** The full Stripe config, or null when any piece is missing (degrade cleanly).
+ *  Only the Parachute prices gate configuration — the Voice price is additive
+ *  (see the field note), so voice can light up independently once it's set. */
 export function billingConfig(env: Env): BillingConfig | null {
   const secretKey = env.STRIPE_SECRET_KEY;
   const webhookSecret = env.STRIPE_WEBHOOK_SECRET;
   const priceMonthly = env.STRIPE_PRICE_PARACHUTE_MONTHLY;
   const priceYearly = env.STRIPE_PRICE_PARACHUTE_YEARLY;
   if (!secretKey || !webhookSecret || !priceMonthly || !priceYearly) return null;
-  return { secretKey, webhookSecret, priceMonthly, priceYearly };
+  return { secretKey, webhookSecret, priceMonthly, priceYearly, priceVoiceMonthly: env.STRIPE_PRICE_VOICE_MONTHLY };
 }
 
 /** The clean 503 every /billing/* route answers while unconfigured. */

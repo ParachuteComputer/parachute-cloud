@@ -265,8 +265,12 @@ describe("POST /admin/users/plan — the comp lever", () => {
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/admin/users?notice=plan-updated");
     expect((await getUserById(env.DB, id))!.plan).toBe("parachute");
-    // The pushed cap is the NEW plan's total — the comp takes effect now.
-    expect(JSON.parse(body!)).toEqual({ cap_bytes: PLAN_SPECS.parachute.total_bytes });
+    // The pushed cap is the NEW plan's total — the comp takes effect now — plus
+    // the voice entitlement (cloud#56; parachute = voice off).
+    expect(JSON.parse(body!)).toEqual({
+      cap_bytes: PLAN_SPECS.parachute.total_bytes,
+      transcription: { enabled: false, minutes_limit: 0 },
+    });
   });
 
   test("a failed cap push still comps the plan and reports partially", async () => {
