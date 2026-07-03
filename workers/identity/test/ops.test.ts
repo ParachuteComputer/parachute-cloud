@@ -22,6 +22,7 @@ import {
   DIGEST_CRON,
   DRIP_CRON,
   HEALTH_CRON,
+  USAGE_CRON,
   bumpMagicLinkEvent,
   collectDigestStats,
   handleScheduled,
@@ -75,6 +76,7 @@ describe("cron routing", () => {
     expect(routeCron(HEALTH_CRON)).toBe("health");
     expect(routeCron(DIGEST_CRON)).toBe("digest");
     expect(routeCron(DRIP_CRON)).toBe("drip");
+    expect(routeCron(USAGE_CRON)).toBe("usage");
     // Safe default: a drifted/unknown pattern means extra liveness checks, not
     // a no-op — and NEVER an accidental drip send (only the exact match drips).
     expect(routeCron("0 0 1 1 *")).toBe("health");

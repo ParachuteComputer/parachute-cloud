@@ -82,7 +82,7 @@ describe("POST /api/packs/:name", () => {
     const w = (await (await applyPack(v, "welcome")).json()) as any;
     expect(w.applied).toEqual([]);
     expect(w.skipped.sort()).toEqual([WELCOME_PATH, "Connect your AI", "Try linking notes"].sort());
-    expect(w.tags).toEqual(["capture", "capture/text", "capture/voice"]); // upserts, idempotent
+    expect(w.tags).toEqual(["capture"]); // upserts, idempotent (ONE tag since core 0.6.5-rc.4)
     const g = (await (await applyPack(v, "getting-started")).json()) as any;
     expect(g.applied).toEqual([]);
     expect(g.skipped).toEqual([GETTING_STARTED_PATH]);

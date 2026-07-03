@@ -12,9 +12,10 @@ import { GETTING_STARTED_PACK, welcomePack } from "@openparachute/core/src/seed-
 
 /**
  * Default-seed conformance: a brand-new vault materializes with the two
- * default core packs — the three-note welcome web + the three `capture` tags
- * (the `welcome` pack) and the AI-facing Getting Started guide (the
- * `getting-started` pack) — and NOTHING else. The seed must be invisible to
+ * default core packs — the three-note welcome web + the `capture` tag
+ * (the `welcome` pack; ONE tag since core 0.6.5-rc.4's schema simplification)
+ * and the AI-facing Getting Started guide (the `getting-started` pack) — and
+ * NOTHING else. The seed must be invisible to
  * everything that already exists: idempotent on re-entry, absent for
  * pre-existing vaults, ordinary/deletable notes, exported like any other note.
  *
@@ -40,7 +41,7 @@ async function listTagsWithSchema(v: string): Promise<any[]> {
 }
 
 describe("default seed — a new vault's first materialization", () => {
-  it("contains exactly the 4 seeded notes and exactly the 3 capture tags", async () => {
+  it("contains exactly the 4 seeded notes and exactly core's declared capture tags", async () => {
     const v = freshVault("w");
     const notes = await listNotes(v);
     expect(notes).toHaveLength(4);
@@ -56,8 +57,10 @@ describe("default seed — a new vault's first materialization", () => {
     const gettingStarted = notes.find((n) => n.path === GETTING_STARTED_PATH)!;
     expect(gettingStarted.content).toContain("start-here guide");
 
+    // Exactly core's declared set — ONE `capture` tag since 0.6.5-rc.4 (the
+    // capture-schema simplification; entry method moved to metadata.source).
     const tags = await listTagsWithSchema(v);
-    expect(tags).toHaveLength(3);
+    expect(tags.map((t) => t.name).sort()).toEqual(NOTES_REQUIRED_TAGS.map((d) => d.name).sort());
     for (const decl of NOTES_REQUIRED_TAGS) {
       const row = tags.find((t) => t.name === decl.name);
       expect(row, `tag ${decl.name} exists`).toBeTruthy();
@@ -128,7 +131,7 @@ describe("default seed — a new vault's first materialization", () => {
     expect(again.skippedNotes.sort()).toEqual([...ALL_PATHS].sort());
 
     expect(await listNotes(v)).toHaveLength(4);
-    expect(await listTagsWithSchema(v)).toHaveLength(3);
+    expect(await listTagsWithSchema(v)).toHaveLength(NOTES_REQUIRED_TAGS.length);
   });
 
   it("seeded notes are ordinary notes — deletable, and never re-seeded after delete", async () => {

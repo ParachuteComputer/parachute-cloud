@@ -14,10 +14,13 @@
  * V1 STORAGE-CAP SEMANTICS (deliberate, documented): the plan's `total_bytes`
  * is pushed to EACH owned vault as its per-vault cap — i.e. the total is
  * enforced as "every vault ≤ total", not as a true cross-vault aggregate.
- * Honest cross-vault aggregation needs the per-vault usage rollup (next PR);
- * that PR tightens this to a real shared budget. Until then a 5-vault
- * parachute user can technically hold up to 5 × 10 GiB — acceptable, bounded,
- * and simpler than a wrong-by-races distribution scheme.
+ * The daily usage rollup (usage.ts, Wave 4b) now RECORDS per-vault usage in
+ * D1 `vault_usage` and the console surfaces it — but ENFORCEMENT stays v1
+ * until the billing PR flips applyPlanToVaults to a real shared budget
+ * (recording and enforcing were split on purpose: enforcement belongs with
+ * billing). Until then a 5-vault parachute user can technically hold up to
+ * 5 × 10 GiB — acceptable, bounded, and simpler than a wrong-by-races
+ * distribution scheme.
  *
  * Deliberately PURE (no D1, no fetch) so ui.ts can import it for rendering.
  */
@@ -67,6 +70,17 @@ export function coercePlanId(raw: string | null | undefined): PlanId {
 export function formatPlanBytes(n: number): string {
   if (n > 0 && n % GiB === 0) return `${n / GiB} GiB`;
   return `${Math.round(n / MiB)} MB`;
+}
+
+/**
+ * Human copy for LIVE usage numbers (vault_usage rollup rows): one decimal,
+ * MB below a GiB, GB from there ("2.3 MB", "1.2 GB"). Binary units under the
+ * everyday labels — the same convention as {@link formatPlanBytes}, so a
+ * vault at its cap reads "Using 100.0 MB of 100 MB", never a unit mismatch.
+ */
+export function formatUsageBytes(n: number): string {
+  if (n >= GiB) return `${(n / GiB).toFixed(1)} GB`;
+  return `${(n / MiB).toFixed(1)} MB`;
 }
 
 /** "Free plan — 1 vault, 100 MB" / "Parachute plan — 5 vaults, 10 GiB". */

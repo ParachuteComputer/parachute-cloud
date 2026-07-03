@@ -17,6 +17,9 @@
  *   - hourly at :15 (DRIP_CRON): the onboarding email drip — routed here,
  *     implemented in drip.ts (eligibility windows, idempotence ledger,
  *     per-run cap, unsubscribe).
+ *   - daily 03:30 UTC (USAGE_CRON): the per-vault storage-usage rollup —
+ *     routed here, implemented in usage.ts (internal-config reads through the
+ *     vault-call seam, one D1 `vault_usage` row per vault per UTC day).
  *
  * Everything is a pure `(env, sender, deps)` function with an injectable clock
  * + fetch, mirroring the OAuth handlers, so the tests drive the same code the
@@ -25,12 +28,16 @@
 import type { Env } from "./env.ts";
 import type { EmailSender } from "./email.ts";
 import { runDrip } from "./drip.ts";
+import { depsForEnv } from "./oauth-shared.ts";
+import { runUsageRollup } from "./usage.ts";
 
 /** Cron patterns — MUST match `[triggers] crons` in wrangler.toml (both envs). */
 export const HEALTH_CRON = "*/10 * * * *";
 export const DIGEST_CRON = "0 14 * * 1";
 /** Hourly onboarding-drip tick (drip.ts) — :15 to stay clear of the :00 health tick. */
 export const DRIP_CRON = "15 * * * *";
+/** Daily usage rollup (usage.ts) — 03:30 UTC, a quiet hour; :30 stays clear of :15/:00. */
+export const USAGE_CRON = "30 3 * * *";
 
 /** Re-alert at most once per hour per failing check. */
 export const ALERT_DEDUPE_MS = 60 * 60 * 1000;
@@ -50,9 +57,10 @@ export interface OpsDeps {
  * "a cron that silently does nothing" (and never to accidental user email —
  * only an exact DRIP_CRON match sends the drip).
  */
-export function routeCron(cron: string): "digest" | "drip" | "health" {
+export function routeCron(cron: string): "digest" | "drip" | "usage" | "health" {
   if (cron === DIGEST_CRON) return "digest";
   if (cron === DRIP_CRON) return "drip";
+  if (cron === USAGE_CRON) return "usage";
   return "health";
 }
 
@@ -63,6 +71,12 @@ export async function handleScheduled(cron: string, env: Env, sender: EmailSende
     await sendWeeklyDigest(env, sender, deps);
   } else if (job === "drip") {
     await runDrip(env, sender, deps);
+  } else if (job === "usage") {
+    // The rollup's vault reads go through the mint seam, so it takes the full
+    // OAuthDeps (issuer/signing + per-environment transport), not OpsDeps.
+    const rollupDeps = depsForEnv(env);
+    if (deps.now) rollupDeps.now = deps.now;
+    await runUsageRollup(env, rollupDeps);
   } else {
     await runHealthCheck(env, sender, deps);
   }

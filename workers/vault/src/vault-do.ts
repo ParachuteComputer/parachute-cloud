@@ -404,14 +404,24 @@ export class VaultDO extends DurableObject {
       );
     }
 
-    const shape = () => ({
-      name: this.config!.name,
-      /** The per-DO override (null = none; the env default applies). */
-      cap_bytes: this.config!.cap_bytes ?? null,
-      /** The effective cap after resolution (override → env default → 1 GiB). */
-      resolved_cap_bytes: this.capBytes(),
-      used_bytes: usedBytes(Number(this.raw().databaseSize), this.r2Bytes),
-    });
+    const shape = () => {
+      const dbBytes = Number(this.raw().databaseSize);
+      return {
+        name: this.config!.name,
+        /** The per-DO override (null = none; the env default applies). */
+        cap_bytes: this.config!.cap_bytes ?? null,
+        /** The effective cap after resolution (override → env default → 1 GiB). */
+        resolved_cap_bytes: this.capBytes(),
+        used_bytes: usedBytes(dbBytes, this.r2Bytes),
+        /**
+         * The usage SPLIT behind used_bytes — the daily usage rollup (identity
+         * worker USAGE_CRON) GETs these and writes them to D1 `vault_usage`.
+         * Same live numbers the cap gate uses: SQLite databaseSize + R2 meter.
+         */
+        db_bytes: dbBytes,
+        r2_bytes: this.r2Bytes,
+      };
+    };
 
     if (request.method === "GET") return json(shape());
     if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);

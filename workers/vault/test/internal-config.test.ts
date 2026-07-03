@@ -91,6 +91,22 @@ describe("internal config — authorization matrix", () => {
     expect(((await res.json()) as any).error_type).toBe("internal_config_forbidden");
   });
 
+  it("GET reports the usage split — db_bytes + r2_bytes = used_bytes (the daily rollup's read)", async () => {
+    const v = freshVault("ic");
+    // Materialize with real content so the SQLite size is nonzero.
+    await createNote(v, { content: "some bytes so the database has a size" });
+    const res = await SELF.fetch(`${base(v)}/api/internal/config`, {
+      headers: { authorization: `Bearer ${await firstPartyToken(v)}` },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(typeof body.db_bytes).toBe("number");
+    expect(body.db_bytes).toBeGreaterThan(0);
+    // No attachments uploaded → the R2 meter is zero.
+    expect(body.r2_bytes).toBe(0);
+    expect(body.used_bytes).toBe(body.db_bytes + body.r2_bytes);
+  });
+
   it("GET is gated the same way: first-party reads it, a tenant read token cannot", async () => {
     const v = freshVault("ic");
     await putConfig(v, await firstPartyToken(v), { cap_bytes: 7_000_000 });

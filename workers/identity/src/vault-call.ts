@@ -54,7 +54,7 @@ export async function callVaultApi(
   opts: {
     userId: string;
     vaultName: string;
-    method: "POST" | "PUT";
+    method: "GET" | "POST" | "PUT";
     apiPath: string;
     /** "write" for content calls (packs, notes); "admin" for the internal config seam. */
     verb: "write" | "admin";
@@ -80,6 +80,41 @@ export async function callVaultApi(
     headers,
     ...(jsonBody !== undefined ? { body: JSON.stringify(jsonBody) } : {}),
   });
+}
+
+/** The usage split GET /api/internal/config reports (the rollup's read). */
+export interface VaultUsageReading {
+  dbBytes: number;
+  r2Bytes: number;
+}
+
+/**
+ * Read one vault's live storage usage through the internal seam (GET
+ * /api/internal/config — the same first-party-gated endpoint the cap push
+ * writes through; the DO reports its SQLite databaseSize + R2 meter, the
+ * numbers its own cap gate uses). THROWS on any failure — non-2xx, transport
+ * error, or a body without the split (a stale vault worker) — so the usage
+ * rollup (usage.ts) can log-skip-continue per vault.
+ */
+export async function readVaultUsage(
+  db: D1Database,
+  deps: OAuthDeps,
+  ownerUserId: string,
+  vaultName: string,
+): Promise<VaultUsageReading> {
+  const res = await callVaultApi(db, deps, {
+    userId: ownerUserId,
+    vaultName,
+    method: "GET",
+    apiPath: "/api/internal/config",
+    verb: "admin",
+  });
+  if (!res.ok) throw new Error(`internal config GET → HTTP ${res.status}`);
+  const body = (await res.json()) as { db_bytes?: unknown; r2_bytes?: unknown };
+  if (typeof body.db_bytes !== "number" || typeof body.r2_bytes !== "number") {
+    throw new Error("internal config GET carried no usage split (db_bytes/r2_bytes)");
+  }
+  return { dbBytes: body.db_bytes, r2Bytes: body.r2_bytes };
 }
 
 /** One vault's outcome from a cap push. `status` absent = transport error. */
@@ -132,9 +167,11 @@ export async function pushVaultCap(
  * Re-apply the owner's CURRENT plan cap to every vault they own — the seam a
  * plan change calls (admin / Stripe webhook, later PRs: `setUserPlan` then
  * this). Per-vault cap = the plan's `total_bytes` (v1 semantics — see the
- * plans.ts module note; the usage-rollup PR tightens this to a true
- * cross-vault aggregate). Best-effort per vault; the per-vault results let
- * the caller report/retry.
+ * plans.ts module note; the daily usage rollup now RECORDS per-vault usage in
+ * D1 `vault_usage`, so a true cross-vault aggregate is computable here — the
+ * enforcement change itself ships with the billing PR, deliberately not
+ * before). Best-effort per vault; the per-vault results let the caller
+ * report/retry.
  */
 export async function applyPlanToVaults(
   db: D1Database,

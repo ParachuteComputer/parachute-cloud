@@ -27,6 +27,7 @@ import {
   PLAN_SPECS,
   coercePlanId,
   formatPlanBytes,
+  formatUsageBytes,
   parachuteTeaser,
   planLine,
   vaultCapMessage,
@@ -84,6 +85,15 @@ describe("PLAN_SPECS — the ratified plan shape", () => {
     expect(PLAN_SPECS.parachute.total_bytes).toBe(10_737_418_240); // 10 GiB
     expect(formatPlanBytes(PLAN_SPECS.free.total_bytes)).toBe("100 MB");
     expect(formatPlanBytes(PLAN_SPECS.parachute.total_bytes)).toBe("10 GiB");
+  });
+
+  test("formatUsageBytes: one decimal, MB below a GiB, GB from there — binary under everyday labels", () => {
+    expect(formatUsageBytes(0)).toBe("0.0 MB");
+    expect(formatUsageBytes(209_715)).toBe("0.2 MB"); // a fresh vault's ~200 KB
+    expect(formatUsageBytes(1_048_576)).toBe("1.0 MB");
+    expect(formatUsageBytes(PLAN_SPECS.free.total_bytes)).toBe("100.0 MB"); // at-cap reads "100.0 MB of 100 MB"
+    expect(formatUsageBytes(1_288_490_189)).toBe("1.2 GB"); // 1.2 GiB
+    expect(formatUsageBytes(PLAN_SPECS.parachute.total_bytes)).toBe("10.0 GB");
   });
 
   test("display copy derives from the specs", () => {

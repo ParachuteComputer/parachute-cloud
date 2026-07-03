@@ -271,15 +271,17 @@ describe("getting-started checklist (POST /console/checklist)", () => {
     expect(html).toContain('data-item="write-note" data-done="0"');
   });
 
-  test("write-note → notes deep-link; import-notes → the /import deep-link", async () => {
+  test("write-note → the /new (new-note editor) deep-link; import-notes → the /import deep-link", async () => {
     const { userId, sessionId } = await userWithVault("doors2@example.com", "doorvault2");
     const base = encodeURIComponent("https://u.parachute.computer/vault/doorvault2");
 
+    // write-note carries its own redirect: connect, then land on the new-note
+    // editor (notes-ui 0.1.10's redirect fix) — not the notes home.
     const write = await app.fetch(
       post("/console/checklist", { __csrf: CSRF, item: "write-note" }, sessionCookie(sessionId)),
       env,
     );
-    expect(write.headers.get("location")).toBe(`${NOTES_APP}/?add=${base}`);
+    expect(write.headers.get("location")).toBe(`${NOTES_APP}/?add=${base}&redirect=%2Fnew`);
 
     const imp = await app.fetch(
       post("/console/checklist", { __csrf: CSRF, item: "import-notes" }, sessionCookie(sessionId)),
@@ -342,6 +344,59 @@ describe("getting-started checklist (POST /console/checklist)", () => {
     // Vault cards still render — dismissing guidance never removes function.
     expect(html).toContain("dismissvault");
     expect(await checklistRow(userId, "open-notes")).not.toBeNull();
+  });
+
+  test("dismiss → the quiet 'Show setup guide' footer link; restore brings the card back, progress intact", async () => {
+    const { userId, sessionId } = await userWithVault("restore@example.com", "restorevault");
+    await app.fetch(post("/console/checklist", { __csrf: CSRF, item: "open-notes" }, sessionCookie(sessionId)), env);
+
+    // While the card shows, there is no restore link.
+    expect(await consoleHtml(sessionId)).not.toContain('data-testid="show-setup-guide"');
+
+    // Dismiss → card gone, the footer link appears.
+    await app.fetch(post("/console/checklist", { __csrf: CSRF, item: "hidden" }, sessionCookie(sessionId)), env);
+    const hiddenHtml = await consoleHtml(sessionId);
+    expect(hiddenHtml).not.toContain('data-testid="checklist"');
+    expect(hiddenHtml).toContain('data-testid="show-setup-guide"');
+    expect(hiddenHtml).toContain("Show setup guide");
+    expect(hiddenHtml).toContain('action="/console/checklist/restore"');
+
+    // Restore (CSRF POST deleting the hidden row) → 302 back to the console.
+    const res = await app.fetch(post("/console/checklist/restore", { __csrf: CSRF }, sessionCookie(sessionId)), env);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console");
+    expect(await checklistRow(userId, "hidden")).toBeNull(); // the row is DELETED
+    const backHtml = await consoleHtml(sessionId);
+    expect(backHtml).toContain('data-testid="checklist"');
+    expect(backHtml).toContain('data-item="open-notes" data-done="1"'); // progress survived the round-trip
+    expect(backHtml).not.toContain('data-testid="show-setup-guide"');
+  });
+
+  test("restore requires CSRF + session (same trust boundary as every console write)", async () => {
+    const { userId, sessionId } = await userWithVault("restore2@example.com", "restorevault2");
+    await app.fetch(post("/console/checklist", { __csrf: CSRF, item: "hidden" }, sessionCookie(sessionId)), env);
+
+    // Missing CSRF → refused; the card stays hidden.
+    const noCsrf = await app.fetch(
+      new Request(`${ISSUER}/console/checklist/restore`, {
+        method: "POST",
+        body: new URLSearchParams({}),
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: ISSUER,
+          cookie: `parachute_id_session=${sessionId}`,
+        },
+      }),
+      env,
+    );
+    expect(noCsrf.status).toBe(200);
+    expect(await noCsrf.text()).toContain("session expired");
+    expect(await checklistRow(userId, "hidden")).not.toBeNull();
+
+    // No session → /login.
+    const anon = await app.fetch(post("/console/checklist/restore", { __csrf: CSRF }, `parachute_id_csrf=${CSRF}`), env);
+    expect(anon.status).toBe(302);
+    expect(anon.headers.get("location")).toBe("/login");
   });
 
   test("CSRF is required; a sessionless POST redirects to /login", async () => {
