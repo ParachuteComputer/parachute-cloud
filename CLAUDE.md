@@ -80,7 +80,7 @@ scripts/            deploy-staging.sh + smoke-staging.ts (full 69-step live smok
 bun install                         # ALSO refreshes the copied core dep (see gotcha)
 bun run test                        # control-plane tests (src/) — 123
 bun run typecheck                   # root tsc
-cd workers/vault && bun run typecheck && bun x vitest run    # 169+1 todo under workerd
+cd workers/vault && bun run typecheck && bun x vitest run    # 170+1 todo under workerd
 cd workers/identity && bun run typecheck && bun x vitest run # 313
 bash scripts/deploy-staging.sh      # deploy both workers -e staging + migrate + seed
 bun scripts/smoke-staging.ts        # FULL live smoke vs staging (creates test debris)

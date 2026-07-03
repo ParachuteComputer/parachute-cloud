@@ -97,6 +97,16 @@ describe("WorkersAiProvider", () => {
     });
   });
 
+  it("maps a 3030 / decode failure to a non-retriable audio_decode_failed", async () => {
+    const ai = stubAi(() => {
+      throw new Error("3030: Failed to decode audio file. Ensure it is a valid audio file.");
+    });
+    await expect(new WorkersAiProvider(ai).transcribe(input(new Uint8Array([1])))).rejects.toMatchObject({
+      code: "audio_decode_failed",
+      retriable: false,
+    });
+  });
+
   it("propagates a generic model error as a plain Error (worker treats it retriable)", async () => {
     const ai = stubAi(() => {
       throw new Error("transient upstream 503");

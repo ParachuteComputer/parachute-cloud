@@ -168,14 +168,25 @@ export class WorkersAiProvider implements TranscriptionProvider {
       // A `4002` (or an over-length / inference-upstream failure) surfaces AFTER
       // ~240 s and means the audio exceeds one inference window. Blind-retrying
       // burns ~4 min per attempt for the same guaranteed failure — make it
-      // TERMINAL. Everything else (transient upstream, network) stays retriable
-      // (a plain Error → the worker treats it as retriable).
+      // TERMINAL.
       if (/\b4002\b|too long|inferenceupstream|exceed(s|ed)? .*(length|duration|limit)/i.test(msg)) {
         throw new TranscriptionError(`audio too long for a single inference: ${msg}`, {
           code: "audio_too_long",
           retriable: false,
         });
       }
+      // A `3030` "Failed to decode" (a corrupt / unsupported / truncated audio
+      // file) is ALSO permanent for that file — retrying the same bytes just
+      // re-fails, so terminal, not 3 wasted whisper inferences. (Surfaced by the
+      // near-ceiling measurement, cloud#56.)
+      if (/\b3030\b|failed to decode|could ?n[o']t decode|invalid audio|unsupported (audio|format)/i.test(msg)) {
+        throw new TranscriptionError(`audio could not be decoded: ${msg}`, {
+          code: "audio_decode_failed",
+          retriable: false,
+        });
+      }
+      // Everything else (transient upstream, network) stays retriable (a plain
+      // Error → the worker treats it as retriable).
       throw err;
     }
 
