@@ -128,6 +128,11 @@ export interface AdminUserRow {
   createdAt: string;
   suspendedAt: string | null;
   dripUnsubscribed: boolean;
+  /** Soft dunning (Wave 4d): last invoice.payment_failed, or null when clear. */
+  paymentFailedAt: string | null;
+  paymentFailedCount: number;
+  /** A scheduled downgrade (pending_plan), or null. */
+  pendingPlan: string | null;
   vaultCount: number;
   checklistDone: number;
 }
@@ -172,6 +177,12 @@ export function renderAdminUsers(props: AdminUsersProps): string {
         u.role === "operator" ? `<span class="badge badge-on">operator</span>` : "",
         u.suspendedAt ? `<span class="badge badge-warn">suspended ${esc(u.suspendedAt.slice(0, 10))}</span>` : "",
         u.dripUnsubscribed ? `<span class="badge">drip-unsub</span>` : "",
+        // The soft-dunning flag (billing-lifecycle.ts): informational — Stripe
+        // retries on its own schedule; suspend stays a human call.
+        u.paymentFailedAt
+          ? `<span class="badge badge-warn" data-testid="payment-failed-badge">payment failed &times;${u.paymentFailedCount} since ${esc(u.paymentFailedAt.slice(0, 10))}</span>`
+          : "",
+        u.pendingPlan ? `<span class="badge">downgrade scheduled &rarr; ${esc(u.pendingPlan)}</span>` : "",
       ]
         .filter(Boolean)
         .join(" ");

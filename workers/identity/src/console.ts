@@ -258,6 +258,12 @@ async function renderConsoleFor(
       firstRun: opts.firstRun,
       plan: user.plan,
       totalUsedBytes,
+      // Billing doors (Wave 4d): Upgrade for free users / Manage billing for
+      // paid users WITH a Stripe customer (comped accounts have none) — both
+      // only while billing is configured (billing-config.ts; unconfigured =
+      // today's deploy = the teaser stays and no billing UI exists).
+      billingConfigured: deps.billingConfigured === true,
+      hasBillingAccount: user.stripeCustomerId !== null,
       // At (or over — grandfathered) the plan's vault count: the create form
       // gives way to the friendly at-cap note. The POST handler is the real
       // gate; this just keeps the UI honest.
@@ -270,6 +276,19 @@ async function renderConsoleFor(
     csrfExtra(csrf.setCookie),
   );
 }
+
+/**
+ * Billing feedback rides the redirect as allowlisted CODES (the admin.ts
+ * pattern) — the query string is user-editable, so it can only ever pick
+ * from this fixed copy, never inject its own text.
+ */
+const BILLING_ERRORS: Record<string, string> = {
+  session: "Your session expired. Please try again.",
+  invalid: "Invalid request. Please try again.",
+  already: "You're already on the Parachute plan — use Manage billing to make changes.",
+  "no-billing": "This account has no billing profile to manage. Write hello@parachute.computer if something looks off.",
+  stripe: "Couldn't reach the payment provider just now. Please try again in a moment.",
+};
 
 export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
@@ -286,8 +305,13 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
     ? `Your vault "${created}" is ready — open your notes, or connect your AI below.`
     : packVault
       ? `Surface Starter added to ${packVault} — ask your connected AI to read it.`
-      : undefined;
-  return renderConsoleFor(db, req, deps, user, { notice });
+      : params.get("upgraded")
+        ? "Thanks — payment received. Your Parachute plan activates the moment Stripe's confirmation lands (usually seconds)."
+        : params.get("checkout_canceled")
+          ? "Checkout canceled — nothing changed."
+          : undefined;
+  const error = BILLING_ERRORS[params.get("billing_err") ?? ""];
+  return renderConsoleFor(db, req, deps, user, { notice, error });
 }
 
 export async function handleCreateVaultPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {

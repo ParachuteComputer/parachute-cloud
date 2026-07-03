@@ -16,7 +16,8 @@
  *     vaults, magic links sent/failed over 7 days. No PII, ever: counts only.
  *   - hourly at :15 (DRIP_CRON): the onboarding email drip — routed here,
  *     implemented in drip.ts (eligibility windows, idempotence ledger,
- *     per-run cap, unsubscribe).
+ *     per-run cap, unsubscribe) — plus the billing sweep (Wave 4d,
+ *     billing-lifecycle.ts): apply due pending plan downgrades.
  *   - daily 03:30 UTC (USAGE_CRON): the per-vault storage-usage rollup —
  *     routed here, implemented in usage.ts (internal-config reads through the
  *     vault-call seam, one D1 `vault_usage` row per vault per UTC day).
@@ -27,6 +28,7 @@
  */
 import type { Env } from "./env.ts";
 import type { EmailSender } from "./email.ts";
+import { runBillingSweep } from "./billing-lifecycle.ts";
 import { runDrip } from "./drip.ts";
 import { depsForEnv } from "./oauth-shared.ts";
 import { runUsageRollup } from "./usage.ts";
@@ -71,6 +73,17 @@ export async function handleScheduled(cron: string, env: Env, sender: EmailSende
     await sendWeeklyDigest(env, sender, deps);
   } else if (job === "drip") {
     await runDrip(env, sender, deps);
+    // The billing sweep rides the same hourly tick (no new cron pattern):
+    // apply due pending downgrades (billing-lifecycle.ts — pending_plan +
+    // plan_downgrade_at, stamped by customer.subscription.deleted). Guarded
+    // so a sweep failure never masks that the drip already ran.
+    try {
+      const sweepDeps = depsForEnv(env);
+      if (deps.now) sweepDeps.now = deps.now;
+      await runBillingSweep(env.DB, sweepDeps, deps.now?.() ?? new Date());
+    } catch (err) {
+      console.error(`event=billing_sweep_failed error=${err instanceof Error ? err.message : String(err)}`);
+    }
   } else if (job === "usage") {
     // The rollup's vault reads go through the mint seam, so it takes the full
     // OAuthDeps (issuer/signing + per-environment transport), not OpsDeps.

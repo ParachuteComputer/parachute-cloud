@@ -10,7 +10,9 @@
  *   → SSE snapshot → portable-md export tarball (unpacked + checked)
  *   → console signup/vault-claim/ownership refusal → seed packs (default
  *     4-note seed, POST /api/packs, the console Surface-Starter button)
- *   → login throttle → magic-link + TOTP.
+ *   → login throttle → magic-link + TOTP → billing (state-adaptive: the
+ *     not-configured 503 + hidden console doors today; the configured gates
+ *     once the Stripe keys land — section 16).
  *
  * This smoke CREATES accounts + vaults — that's what staging is for; NEVER
  * point it at production (scripts/smoke-prod.ts is the read-only prod check).
@@ -823,6 +825,50 @@ async function main() {
 
     const anon = await fetch(`${IDENTITY}/admin`, { redirect: "manual" });
     assert(anon.status === 404, "admin: unauthenticated /admin is 404 (indistinguishable from no-route)", `status ${anon.status}`);
+  }
+
+  // 16. Billing (Wave 4d) — STATE-ADAPTIVE: the deploy ships before the Stripe
+  //     keys exist, so the smoke detects which state the worker is in and pins
+  //     that state's contract. NOT CONFIGURED (today): all three /billing/*
+  //     routes answer the clean 503 and the console renders no billing door
+  //     (the teaser stays). CONFIGURED (after `wrangler secret put` ×2 + the
+  //     price [vars] land): the routes gate normally (anonymous checkout →
+  //     /login; unsigned webhook → 400) and the free user's console shows the
+  //     Upgrade buttons. Either way the assertions are deterministic.
+  {
+    const probe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
+    if (probe.status === 503) {
+      const body = (await probe.json()) as { error?: string };
+      assert(body.error === "billing_not_configured", "billing NOT CONFIGURED: checkout answers the clean 503", String(body.error));
+      const portal = await fetch(`${IDENTITY}/billing/portal`, { method: "POST", body: "", redirect: "manual" });
+      assert(portal.status === 503, "billing NOT CONFIGURED: portal → 503", `status ${portal.status}`);
+      const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
+      assert(webhook.status === 503, "billing NOT CONFIGURED: webhook → 503", `status ${webhook.status}`);
+      const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
+      assert(
+        !conHtml.includes('data-testid="upgrade-billing"') && !conHtml.includes("/billing/checkout"),
+        "billing NOT CONFIGURED: the console hides every billing door",
+      );
+      assert(conHtml.includes("coming this week"), "billing NOT CONFIGURED: the free-plan teaser stays");
+    } else {
+      assert(
+        probe.status === 302 && probe.headers.get("location") === "/login",
+        "billing CONFIGURED: anonymous checkout redirects to /login",
+        `status ${probe.status} → ${probe.headers.get("location")}`,
+      );
+      const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
+      const wj = (await webhook.json()) as { error?: string };
+      assert(
+        webhook.status === 400 && wj.error === "missing_signature",
+        "billing CONFIGURED: an unsigned webhook is refused (400 missing_signature)",
+        `status ${webhook.status}`,
+      );
+      const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
+      assert(
+        conHtml.includes('data-testid="upgrade-billing"'),
+        "billing CONFIGURED: the free user's console shows the Upgrade buttons",
+      );
+    }
   }
 
   // --- summary ---

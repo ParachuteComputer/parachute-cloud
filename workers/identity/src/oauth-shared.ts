@@ -9,6 +9,7 @@
  * the Worker (index.ts) calls them with the request-time deps.
  */
 import { VAULT_VERBS } from "./audience.ts";
+import { billingConfig } from "./billing-config.ts";
 import type { Env } from "./env.ts";
 import type { RateLimiterNamespace } from "./rate-limit.ts";
 
@@ -47,6 +48,12 @@ export interface OAuthDeps {
    * vitest, where fetchMock intercepts). Same Request either way.
    */
   vaultFetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  /**
+   * True when the full Stripe config is present (billing-config.ts) — the
+   * console renders Upgrade / Manage billing only then; while false the
+   * whole billing feature degrades invisibly (teaser copy, 503 routes).
+   */
+  billingConfigured?: boolean;
 }
 
 /**
@@ -81,6 +88,7 @@ export function depsForEnv(env: Env): OAuthDeps {
     boundOrigins: () => [issuer],
     exposeDevLinks: env.ENVIRONMENT !== "production",
     rateLimiter: env.RATE_LIMITER,
+    billingConfigured: billingConfig(env) !== null,
     // Service binding when bound (staging — workers.dev origins aren't valid
     // subrequest targets); else the handlers fall back to global fetch.
     ...(env.VAULT_SERVICE ? { vaultFetch: env.VAULT_SERVICE.fetch.bind(env.VAULT_SERVICE) } : {}),

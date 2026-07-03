@@ -10,6 +10,8 @@ import { NOTES_APP_OPTIONS } from "./checklist.ts";
 // Plan copy renders from plans.ts (the single source of truth for
 // entitlements + display strings) — the console can never drift from it.
 import {
+  PARACHUTE_PRICE_MONTHLY_LABEL,
+  PARACHUTE_PRICE_YEARLY_LABEL,
   PLAN_SPECS,
   type PlanId,
   formatPlanBytes,
@@ -503,6 +505,14 @@ export interface ConsoleProps {
   atVaultCap: boolean;
   /** Operator account → the quiet "Admin" header link (/admin). */
   isOperator?: boolean;
+  /**
+   * Stripe config present (billing-config.ts) → free users get the Upgrade
+   * buttons, paid users the Manage-billing door. False (today's deploy,
+   * pre-keys) → the teaser stays and no billing UI renders at all.
+   */
+  billingConfigured?: boolean;
+  /** The user has a Stripe customer (false for comped parachute accounts). */
+  hasBillingAccount?: boolean;
 }
 
 /**
@@ -701,17 +711,42 @@ export function renderConsole(props: ConsoleProps): string {
     totalUsedBytes,
     atVaultCap,
     isOperator,
+    billingConfigured,
+    hasBillingAccount,
   } = props;
-  // Plan display (no payment link yet — the entitlement layer ships first).
-  // The across-vaults usage total (latest rollup rows) rides the plan line;
-  // free users also see the Parachute teaser; Parachute users just their plan.
+  // Plan display. The across-vaults usage total (latest rollup rows) rides the
+  // plan line. Billing doors (Wave 4d) render only while billing is CONFIGURED
+  // (billing-config.ts): free users get the two Upgrade buttons (hosted
+  // Checkout, POST /billing/checkout), paid users with a real Stripe customer
+  // get Manage billing (the portal, POST /billing/portal — comped accounts
+  // have no customer, so no door). Unconfigured — today's deploy — free users
+  // see the copy-only teaser exactly as before.
   const usageHtml =
     totalUsedBytes != null
       ? ` <span data-testid="usage-total">&middot; Using ${esc(formatUsageBytes(totalUsedBytes))}</span>`
       : "";
+  const upgradeHtml =
+    plan === "free" && billingConfigured
+      ? `<form class="inline" method="post" action="/billing/checkout" data-testid="upgrade-billing" style="margin-left:.35rem">
+           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+           <span style="opacity:.85">&middot; ${esc(PLAN_SPECS.parachute.label)}: ${PLAN_SPECS.parachute.vault_count} vaults, ${esc(formatPlanBytes(PLAN_SPECS.parachute.total_bytes))} —</span>
+           <button class="linkbtn" type="submit" name="interval" value="monthly">Upgrade &mdash; ${esc(PARACHUTE_PRICE_MONTHLY_LABEL)}</button>
+           <span class="muted">or</span>
+           <button class="linkbtn" type="submit" name="interval" value="yearly">${esc(PARACHUTE_PRICE_YEARLY_LABEL)}</button>
+         </form>`
+      : "";
+  const manageBillingHtml =
+    plan === "parachute" && billingConfigured && hasBillingAccount
+      ? ` <form class="inline" method="post" action="/billing/portal" data-testid="manage-billing">
+           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+           <span style="opacity:.75">&middot;</span> <button class="linkbtn" type="submit">Manage billing</button>
+         </form>`
+      : "";
   const teaserHtml =
-    plan === "free" ? ` <span style="opacity:.75">&middot; ${esc(parachuteTeaser())}</span>` : "";
-  const planHtml = `${esc(planLine(plan))}${usageHtml}${teaserHtml}`;
+    plan === "free" && !billingConfigured
+      ? ` <span style="opacity:.75">&middot; ${esc(parachuteTeaser())}</span>`
+      : "";
+  const planHtml = `${esc(planLine(plan))}${usageHtml}${teaserHtml}${upgradeHtml}${manageBillingHtml}`;
   // The Admin link renders ONLY for operators — everyone else never learns the
   // route exists (it answers 404 to them anyway; admin.ts).
   const header = (title: string) => `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">
