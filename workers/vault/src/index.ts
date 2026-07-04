@@ -36,6 +36,11 @@ function json(data: unknown, status = 200): Response {
   return withCors(Response.json(data, { status }));
 }
 
+/** A client asking to upgrade to a WebSocket (the live-query WS binding). */
+function isWebSocketUpgrade(request: Request): boolean {
+  return (request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket";
+}
+
 /** Subdomains that are NOT tenant vaults (reserved for platform services). */
 const RESERVED_SUBDOMAINS = new Set(["id", "www", "api", "app", "admin", "notes", "cloud"]);
 
@@ -111,6 +116,15 @@ export default {
     const stub = env.VAULT.get(id);
     try {
       const res = await stub.fetch(forwarded);
+      // A WebSocket upgrade returns a 101 carrying a `webSocket` handle.
+      // `withCors` does `new Response(res.body, res)`, which CANNOT reconstruct a
+      // 101 (the status is protected) nor carry the `webSocket` — it would break
+      // the handshake. Forward the upgrade response UNMODIFIED (the live-query WS
+      // binding — the hibernation transport). CORS is irrelevant on a 101: the
+      // browser WebSocket handshake isn't CORS-gated, and auth is a first socket
+      // message (see docs/live-query-ws.md). Every other path is withCors'd
+      // exactly as before — SSE and all REST unchanged.
+      if (isWebSocketUpgrade(request)) return res;
       return withCors(res);
     } catch (err) {
       console.error(`[router ${request.method} ${url.pathname}]`, err);

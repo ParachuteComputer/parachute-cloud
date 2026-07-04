@@ -20,12 +20,15 @@ import type { Env } from "./env.js";
 import {
   FIRST_PARTY_CLIENT_ID,
   authenticateVaultRequest,
+  authenticateVaultToken,
   hasScopeForVault,
   insufficientScope,
+  vaultVerbRank,
   verbForMethod,
   type AuthResult,
 } from "./auth.js";
 import { NO_TAG_SCOPE } from "./rest/parse.js";
+import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
 import { handleTags, handleFindPath } from "./rest/tags.js";
 import { handleVault, type VaultConfigLike } from "./rest/vault.js";
@@ -34,7 +37,22 @@ import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./re
 import { handleMcp } from "./mcp.js";
 import { mcpWwwAuthenticate } from "./discovery.js";
 import { handleSubscribe } from "./live/subscribe.js";
-import { SubscriptionManager } from "./live/subscriptions.js";
+import { SubscriptionManager, WsSink, type SubscriptionHandle } from "./live/subscriptions.js";
+import { buildLiveMatcher, type LiveMatcher } from "./live/live-match.js";
+import {
+  MAX_WS_SUBSCRIPTIONS,
+  WS_AUTH_DEADLINE_MS,
+  WS_CLOSE,
+  RevocationTracker,
+  buildPendingAttachment,
+  buildSnapshotFrames,
+  parseAttachment,
+  parseClientMessage,
+  subscriptionCapResponse,
+  urlFromQuery,
+  validateWsSubscribeQuery,
+  type WsAttachment,
+} from "./live/ws-subscribe.js";
 import {
   buildAttachmentIndex,
   collectExportEntries,
@@ -145,6 +163,30 @@ function backoffUntil(att: Attachment): number {
   return Number.isFinite(until) ? until : 0;
 }
 
+/** A client asking to upgrade to a WebSocket (the live-query WS binding). */
+function isWebSocketUpgrade(request: Request): boolean {
+  return (request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket";
+}
+
+/**
+ * Count only LIVE sockets (readyState CONNECTING=0 / OPEN=1) toward the per-vault
+ * cap. `getWebSockets()` also returns sockets in the CLOSING (2) / CLOSED (3)
+ * state — including ones the sweep just closed on this same wake — so counting
+ * raw length would keep the cap "full" of already-departing sockets and defeat
+ * the pending-socket self-heal (sweep-before-cap-check runs on every fetch).
+ */
+function liveSocketCount(sockets: WebSocket[]): number {
+  return sockets.filter((ws) => ws.readyState < 2).length;
+}
+
+/**
+ * Isolate-wide revocation tracker for the WS sweep — shared across every DO in
+ * the isolate (the revocation list is keyed per ISSUER_ORIGIN, so one fetch
+ * serves all vaults). Best-effort, fail-open for already-authed sockets — see
+ * {@link RevocationTracker}.
+ */
+const revocationTracker = new RevocationTracker();
+
 export class VaultDO extends DurableObject {
   private shim: DatabaseShim;
   private store!: DoSqliteStore;
@@ -185,6 +227,15 @@ export class VaultDO extends DurableObject {
   // cross-process dispatch. `resolveVault` is a constant (one DO === one vault).
   private subManager!: SubscriptionManager;
 
+  // Live-query WebSocket binding (hibernatable; WS-hibernation migration).
+  // `subsRehydrated` guards the once-per-warm-DO rebuild of in-memory subs from
+  // the sockets' serialized attachments; `wsSubs` maps each READY socket to its
+  // manager handle for O(1) teardown on close/sweep. Both reset via field
+  // initializers on EVERY constructor — i.e. every eviction/cold-wake — which is
+  // exactly when rehydration must re-run. See docs/live-query-ws.md.
+  private subsRehydrated = false;
+  private wsSubs = new Map<WebSocket, SubscriptionHandle>();
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
@@ -203,6 +254,17 @@ export class VaultDO extends DurableObject {
       });
     } catch (e) {
       this.bootError = errText(e);
+    }
+
+    // Client-driven WS liveness: the runtime answers a literal `ping` with
+    // `pong` WITHOUT waking the DO — THIS is what keeps an idle-but-open live
+    // socket at ~$0 (it replaces both the 25s SSE keepalive and the 15-min SSE
+    // lifetime cap; no server-side keepalive timer, which would pin the DO
+    // awake). Best-effort: a runtime lacking the API must not fail DO boot.
+    try {
+      ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    } catch (e) {
+      console.warn("[ws] setWebSocketAutoResponse unavailable:", errText(e));
     }
   }
 
@@ -224,6 +286,15 @@ export class VaultDO extends DurableObject {
     const rest = m[2] ?? "";
 
     await this.ensureState(vaultName);
+
+    // Live-query WS binding: rebuild in-memory subscriptions from the sockets'
+    // serialized attachments (once per warm DO), THEN sweep expired/revoked/
+    // timed-out sockets — BEFORE any write's post-commit hook can dispatch to
+    // them. Single-DO-per-vault makes write → wake → rehydrate(awaited) →
+    // apply-write → hook → dispatch clean by construction. Both are cheap no-ops
+    // when the vault has no live WebSocket. See docs/live-query-ws.md.
+    await this.ensureSubscriptionsRehydrated();
+    await this.sweepWsSockets();
 
     // STAGING-ONLY test hook — POST /vault/<name>/__test/transcribe-run drives
     // the transcription drain synchronously (the DO alarm auto-fires in seconds
@@ -281,6 +352,16 @@ export class VaultDO extends DurableObject {
       return json({ error: "Not found" }, 404);
     }
     const apiPath = rest.slice(4); // "/api/notes" → "/notes"
+
+    // Live-query WebSocket upgrade — GET /api/subscribe with `Upgrade:
+    // websocket`. Dispatched BEFORE the request-auth gate: a browser WebSocket
+    // carries no Authorization header, so auth is the FIRST socket message
+    // (`{"type":"auth","token"}`). Accepting pre-auth is bounded by the per-vault
+    // cap + the pending-socket sweep (design fork 2, ratified). Non-upgrade GET
+    // /subscribe falls through to the SSE handler below, unchanged.
+    if (apiPath === "/subscribe" && isWebSocketUpgrade(request)) {
+      return this.handleWsUpgrade(request, vaultName);
+    }
 
     // Health is read-only + cheap; still requires read scope like the bun vault.
     const auth = await authenticateVaultRequest(request, this.env, vaultName);
@@ -807,6 +888,387 @@ export class VaultDO extends DurableObject {
   }
 
   // -------------------------------------------------------------------------
+  // Live-query WebSocket binding (hibernatable) — WS-hibernation migration.
+  // Contract: docs/live-query-ws.md. The SSE path (handleSubscribe) is the
+  // untouched fallback; this is the transport that lets an idle-but-open socket
+  // evict the DO → ~$0 idle. Pure helpers live in ./live/ws-subscribe.ts.
+  // -------------------------------------------------------------------------
+
+  /**
+   * GET /api/subscribe with `Upgrade: websocket`. Validates the query (same
+   * rejects as SSE), enforces the per-vault cap via `getWebSockets().length`,
+   * accepts the socket with a PENDING attachment (the raw query string, guarded
+   * < 15 KB so it fits `serializeAttachment`'s 16 KB limit), and returns the 101.
+   * NO auth here — the first socket message authenticates (see
+   * {@link webSocketMessage}). Synchronous (no await) so the upgrade is cheap.
+   */
+  private handleWsUpgrade(request: Request, vaultName: string): Response {
+    const url = new URL(request.url);
+    const validated = validateWsSubscribeQuery(url);
+    if ("error" in validated) return validated.error;
+
+    // Cap via the LIVE socket count (excludes CLOSING/CLOSED — see
+    // liveSocketCount). The sweep at the top of this fetch already closed any
+    // stale pending sockets, so their slots are free here. A 503 the client can
+    // retry — byte-identical body to the SSE cap.
+    if (liveSocketCount(this.ctx.getWebSockets()) >= MAX_WS_SUBSCRIPTIONS) {
+      return subscriptionCapResponse();
+    }
+
+    const built = buildPendingAttachment(url.search);
+    if ("tooLarge" in built) {
+      return json(
+        {
+          error: "subscription query is too large to persist across hibernation — narrow the query.",
+          code: "SUBSCRIPTION_QUERY_TOO_LARGE",
+        },
+        400,
+      );
+    }
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    server.serializeAttachment(built.attachment);
+    this.ctx.acceptWebSocket(server);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /**
+   * Rebuild in-memory subscriptions from the sockets' serialized attachments,
+   * ONCE per warm DO (guarded by `subsRehydrated`, reset on every constructor).
+   * A hibernated DO loses the manager + `wsSubs`; `ctx.getWebSockets()` keeps the
+   * accepted sockets + their attachments, so we re-derive the matcher from the
+   * stored RAW query and re-register — NO re-snapshot (the client keeps its set;
+   * the next write pushes an upsert/remove). Unparseable / version-mismatch /
+   * bad-query sockets are closed 4400. Pending sockets are left for their auth
+   * message. Called at the TOP of every wake entry point.
+   */
+  private async ensureSubscriptionsRehydrated(): Promise<void> {
+    if (this.subsRehydrated) return;
+    this.subsRehydrated = true;
+    this.wsSubs = new Map();
+
+    const sockets = this.ctx.getWebSockets();
+    for (const ws of sockets) {
+      const att = this.readAttachment(ws);
+      if (!att) {
+        this.closeWs(ws, WS_CLOSE.PROTOCOL, "unparseable subscription");
+        continue;
+      }
+      if (att.state !== "ready") continue; // pending: registers on auth
+
+      const matcher = await this.buildMatcherFromQuery(att.q);
+      if (!matcher) {
+        this.closeWs(ws, WS_CLOSE.PROTOCOL, "invalid subscription query");
+        continue;
+      }
+      const handle = this.registerWsSub(ws, matcher);
+      if (handle) this.wsSubs.set(ws, handle);
+      else this.closeWs(ws, WS_CLOSE.PROTOCOL, "could not register subscription");
+    }
+  }
+
+  /**
+   * Close expired / revoked / auth-timed-out sockets — the standing-timer-free
+   * enforcement (a timer would pin the DO awake and defeat hibernation). Ready
+   * sockets past `exp` → 4401; ready sockets whose jti is CONFIRMED revoked →
+   * 4401 (best-effort, fail-open on a revocation-list outage — the socket already
+   * passed full validation at auth time; see RevocationTracker); pending sockets
+   * past the auth deadline → 4408. Runs before any write dispatch (top of fetch).
+   */
+  private async sweepWsSockets(): Promise<void> {
+    const sockets = this.ctx.getWebSockets();
+    if (sockets.length === 0) return;
+    const nowMs = Date.now();
+    const nowSec = Math.floor(nowMs / 1000);
+    const issuer = (this.env.ISSUER_ORIGIN ?? "").replace(/\/$/, "");
+
+    for (const ws of sockets) {
+      const att = this.readAttachment(ws);
+      if (!att) {
+        this.closeWs(ws, WS_CLOSE.PROTOCOL, "unparseable subscription");
+        continue;
+      }
+      if (att.state === "pending") {
+        if (nowMs - att.connectedAt > WS_AUTH_DEADLINE_MS) this.closeWs(ws, WS_CLOSE.AUTH_TIMEOUT, "auth timeout");
+        continue;
+      }
+      // ready
+      if (att.exp !== null && att.exp <= nowSec) {
+        this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token expired");
+        continue;
+      }
+      // Revocation (best-effort). Skip the network hop under the vitest pool
+      // (ENVIRONMENT=test) to keep the integration suite hermetic — the tracker
+      // is unit-tested with an injected fetcher, and staging exercises the live
+      // path. A null jti (operator bearer) is never revocable.
+      if (att.jti && issuer && this.env.ENVIRONMENT !== "test") {
+        try {
+          if (await revocationTracker.isRevoked(issuer, att.jti)) {
+            this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
+          }
+        } catch {
+          /* fail-open for an already-authed socket */
+        }
+      }
+    }
+  }
+
+  /** First-message auth (`{"type":"auth","token"}`) and re-auth on token
+   *  refresh; the literal `ping` keepalive never reaches here (autoResponse). */
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (this.bootError) {
+      this.closeWs(ws, WS_CLOSE.PROTOCOL, "vault unavailable");
+      return;
+    }
+    const vaultName = await this.ensureStateForWake();
+    if (!vaultName) {
+      this.closeWs(ws, WS_CLOSE.PROTOCOL, "vault not initialized");
+      return;
+    }
+    await this.ensureSubscriptionsRehydrated();
+
+    const att = this.readAttachment(ws);
+    if (!att) {
+      this.closeWs(ws, WS_CLOSE.PROTOCOL, "unparseable subscription");
+      return;
+    }
+    const parsed = parseClientMessage(message);
+    if (parsed.kind === "malformed") {
+      this.closeWs(ws, WS_CLOSE.PROTOCOL, "malformed message");
+      return;
+    }
+
+    // Handle THIS message BEFORE sweeping the rest — a timely re-auth refreshes
+    // exp so the subsequent sweep won't close an expiring-but-refreshed socket.
+    if (att.state === "pending") {
+      if (parsed.kind !== "auth") {
+        this.closeWs(ws, WS_CLOSE.PROTOCOL, "expected auth message");
+        return;
+      }
+      await this.authenticatePendingSocket(vaultName, ws, att, parsed.token);
+    } else if (parsed.kind === "auth") {
+      await this.reauthReadySocket(vaultName, ws, att, parsed.token);
+    }
+    // Any other message on a ready socket: ignored (forward-compat).
+
+    await this.sweepWsSockets();
+  }
+
+  async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
+    if (this.bootError) return;
+    await this.ensureStateForWake();
+    await this.ensureSubscriptionsRehydrated();
+    this.cleanupSocket(ws);
+  }
+
+  async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
+    if (this.bootError) return;
+    await this.ensureStateForWake();
+    await this.ensureSubscriptionsRehydrated();
+    this.cleanupSocket(ws);
+  }
+
+  /**
+   * Authenticate a pending socket's first message. On success: build the matcher
+   * from the stored raw query, compute the snapshot (BEFORE registering, so a
+   * live event can't slip ahead of it — the SSE ordering), flip the attachment
+   * → ready (records exp/jti/scope for the sweep + re-auth), register, and flush
+   * the chunked snapshot SYNCHRONOUSLY (no await between register and flush).
+   * Failure → 4401 (auth) / 4403 (scope) / 4400 (bad query).
+   */
+  private async authenticatePendingSocket(
+    vaultName: string,
+    ws: WebSocket,
+    att: WsAttachment,
+    token: string,
+  ): Promise<void> {
+    const result = await authenticateVaultToken(token, this.env, vaultName);
+    if (!result.ok) {
+      this.closeWs(ws, result.reason === "vault_scope_mismatch" ? WS_CLOSE.FORBIDDEN : WS_CLOSE.UNAUTHORIZED, result.reason);
+      return;
+    }
+    const auth = result.auth;
+
+    const matcher = await this.buildMatcherFromQuery(att.q);
+    if (!matcher) {
+      this.closeWs(ws, WS_CLOSE.PROTOCOL, "invalid subscription query");
+      return;
+    }
+
+    // Snapshot FIRST (await) — the complete scoped matching set, paging stripped
+    // (snapshot ⊇ live), mirroring the SSE route.
+    let snapshotNotes;
+    try {
+      const raw = await this.store.queryNotes({ ...matcher.opts, limit: Number.MAX_SAFE_INTEGER, offset: undefined });
+      snapshotNotes = filterNotesByTagScope(raw, NO_TAG_SCOPE.allowed, NO_TAG_SCOPE.raw);
+    } catch {
+      this.closeWs(ws, WS_CLOSE.PROTOCOL, "snapshot query failed");
+      return;
+    }
+    const frames = buildSnapshotFrames(snapshotNotes);
+
+    // --- SYNCHRONOUS from here (no await) so no write interleaves between
+    //     register and the snapshot flush.
+    const ready: WsAttachment = {
+      ...att,
+      state: "ready",
+      scopeRaw: auth.scopes,
+      exp: auth.exp,
+      jti: auth.jti,
+      actor: auth.actor,
+      via: auth.via,
+      clientId: auth.clientId,
+    };
+    ws.serializeAttachment(ready);
+
+    const handle = this.registerWsSub(ws, matcher);
+    if (!handle) {
+      this.closeWs(ws, WS_CLOSE.PROTOCOL, "could not register subscription");
+      return;
+    }
+    this.wsSubs.set(ws, handle);
+
+    const sink = new WsSink(ws);
+    for (const frame of frames) if (!sink.sendRaw(frame)) break;
+  }
+
+  /**
+   * Re-auth on the open socket (client re-sends `auth` on token refresh):
+   * re-validate, enforce narrow-or-equal scope (a WIDEN → 4403), and update the
+   * attachment's exp/jti/scope for the sweep. NO re-snapshot, NO re-register —
+   * the matcher + socket are unchanged; only the auth window moves (hours-long
+   * sockets at $0, no re-snapshot churn).
+   */
+  private async reauthReadySocket(
+    vaultName: string,
+    ws: WebSocket,
+    att: WsAttachment,
+    token: string,
+  ): Promise<void> {
+    const result = await authenticateVaultToken(token, this.env, vaultName);
+    if (!result.ok) {
+      this.closeWs(ws, result.reason === "vault_scope_mismatch" ? WS_CLOSE.FORBIDDEN : WS_CLOSE.UNAUTHORIZED, result.reason);
+      return;
+    }
+    const auth = result.auth;
+    if (vaultVerbRank(auth.scopes, vaultName) > vaultVerbRank(att.scopeRaw ?? [], vaultName)) {
+      this.closeWs(ws, WS_CLOSE.FORBIDDEN, "re-auth widens scope");
+      return;
+    }
+    const updated: WsAttachment = {
+      ...att,
+      scopeRaw: auth.scopes,
+      exp: auth.exp,
+      jti: auth.jti,
+      actor: auth.actor,
+      via: auth.via,
+      clientId: auth.clientId,
+    };
+    ws.serializeAttachment(updated);
+  }
+
+  /** Register a WS subscription with the manager (no manager-cap accounting — the
+   *  WS cap is enforced at upgrade via getWebSockets; no flush tracking — the
+   *  runtime bounds the socket's outgoing buffer). */
+  private registerWsSub(ws: WebSocket, matcher: LiveMatcher): SubscriptionHandle | null {
+    return this.subManager.register({
+      vaultName: this.config!.name,
+      matcher,
+      tagScopeAllowed: NO_TAG_SCOPE.allowed,
+      tagScopeRaw: NO_TAG_SCOPE.raw,
+      sink: new WsSink(ws),
+      tracksFlush: false,
+      countsTowardCap: false,
+    });
+  }
+
+  /** Deserialize + version-check a socket's attachment (null on absent/bad). */
+  private readAttachment(ws: WebSocket): WsAttachment | null {
+    try {
+      return parseAttachment(ws.deserializeAttachment());
+    } catch {
+      return null;
+    }
+  }
+
+  /** Build a LiveMatcher from a stored raw query string (null on invalid). */
+  private async buildMatcherFromQuery(q: string): Promise<LiveMatcher | null> {
+    const validated = validateWsSubscribeQuery(urlFromQuery(q));
+    if ("error" in validated) return null;
+    try {
+      return await buildLiveMatcher(this.store, validated.queryOpts);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Close a socket with a specific code, then drop its manager sub. The
+   *  explicit close code lands FIRST (the manager's sink.close 1011 no-ops on the
+   *  already-closing socket), so the client sees the intended 4401/4403/etc. */
+  private closeWs(ws: WebSocket, code: number, reason: string): void {
+    try {
+      ws.close(code, reason);
+    } catch {
+      /* already closing / closed */
+    }
+    this.cleanupSocket(ws);
+  }
+
+  /** Drop a socket's manager subscription (idempotent). */
+  private cleanupSocket(ws: WebSocket): void {
+    const handle = this.wsSubs.get(ws);
+    if (handle) {
+      handle.close();
+      this.wsSubs.delete(ws);
+    }
+  }
+
+  /**
+   * Ensure DO state is loaded on a wake that carries no request URL (the WS
+   * handlers). Recovers the vault name from persisted config (the DO can't derive
+   * its name from its id), then runs the normal `ensureState`. Returns the name,
+   * or null if the vault was never materialized (no config → nothing to do).
+   */
+  private async ensureStateForWake(): Promise<string | null> {
+    if (this.stateLoaded && this.config) return this.config.name;
+    const cfg = (await this.ctx.storage.get<VaultConfigState>("config")) ?? null;
+    const name = cfg?.name;
+    if (!name) return null;
+    await this.ensureState(name);
+    return name;
+  }
+
+  /**
+   * TEST RPC: simulate a hibernation eviction WITHOUT tearing down the DO (the
+   * vitest pool can't evict a SQLite DO). Drops ALL in-memory subscription state
+   * (manager subs + hook registrations + `wsSubs`) and the rehydration flag,
+   * while `ctx.getWebSockets()` keeps the accepted sockets + their serialized
+   * attachments — exactly the post-eviction shape. The next wake (a REST write's
+   * fetch → rehydrate) must rebuild from those attachments and still push, with
+   * no missed event and no spurious re-snapshot. The `testProvider` precedent.
+   */
+  async __simulateEviction(): Promise<void> {
+    // Detach the old manager's hooks WITHOUT closing sinks (a real eviction
+    // leaves the hibernated sockets untouched — only the DO's in-memory state is
+    // lost). `shutdown()` would close every sink → close the client sockets,
+    // which an eviction never does.
+    this.subManager.detachHooks();
+    this.subManager = new SubscriptionManager(this.store.hooks, {
+      resolveVault: () => this.config?.name ?? "",
+    });
+    this.wsSubs = new Map();
+    this.subsRehydrated = false;
+  }
+
+  /** TEST RPC: how many live WS subscriptions the manager currently fans out to
+   *  (pins rehydration rebuilt the in-memory set). */
+  async __wsSubCount(): Promise<number> {
+    return this.wsSubs.size;
+  }
+
+  // -------------------------------------------------------------------------
   // Voice transcription (cloud#56) — Workers AI provider + DO-alarm pipeline
   // -------------------------------------------------------------------------
 
@@ -899,6 +1361,15 @@ export class VaultDO extends DurableObject {
     const vaultName = cfg?.name;
     if (!vaultName) return;
     await this.ensureState(vaultName);
+
+    // Wake entry point: keep the live-query subscriptions consistent (rehydrate
+    // once per warm DO) and sweep stale sockets. Additive to — never touching —
+    // the transcription drain below (the alarm's owner). The transcription alarm
+    // and the WS binding share no state; a scheduled far-future transcription
+    // alarm does NOT keep an idle-WS vault awake (hibernation still evicts; the
+    // alarm re-fires the DO only when actually due).
+    await this.ensureSubscriptionsRehydrated();
+    await this.sweepWsSockets();
 
     const due = await this.dueTranscription();
     if (due) {

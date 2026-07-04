@@ -23,7 +23,7 @@ import {
   type HubJwtClaims,
   type JwksGetter,
 } from "@openparachute/scope-guard";
-import { createLocalJWKSet } from "jose";
+import { createLocalJWKSet, decodeJwt } from "jose";
 import type { Env } from "./env.js";
 
 export const SCOPE_READ = "vault:read";
@@ -59,7 +59,32 @@ export interface AuthResult {
    * {@link FIRST_PARTY_CLIENT_ID}; everything else ignores it.
    */
   clientId: string | null;
+  /**
+   * The JWT's `exp` (epoch SECONDS), or null for the operator bearer / a token
+   * with no exp. Surfaced so the WS live-query binding can sweep-close a socket
+   * whose token has expired (a hibernatable socket carries no standing timer, so
+   * expiry is enforced on the next DO wake — see `docs/live-query-ws.md`).
+   */
+  exp: number | null;
+  /**
+   * The JWT's `jti`, or null (operator bearer / no jti). Surfaced so the WS
+   * sweep can check an already-authed socket's token against the revocation list
+   * (auth-time validation already fail-closes on revocation; this catches a
+   * revocation that lands AFTER the socket authed).
+   */
+  jti: string | null;
 }
+
+/**
+ * Result of authenticating a raw token (the transport-agnostic core of
+ * {@link authenticateVaultRequest}). The WS binding maps a failure onto a close
+ * code (unauthorized → 4401, vault_scope_mismatch → 4403); the request path
+ * maps it onto the exact 401/403 response bodies (below).
+ */
+export type TokenAuthResult =
+  | { ok: true; auth: AuthResult }
+  | { ok: false; reason: "unauthorized"; message: string }
+  | { ok: false; reason: "vault_scope_mismatch"; vaultScope: string[] };
 
 function isVerb(s: string): s is VaultVerb {
   return s === "read" || s === "write" || s === "admin";
@@ -151,8 +176,100 @@ function unauthorized(message: string): { error: Response } {
 }
 
 /**
+ * Authenticate a RAW token against `vaultName` (Bearer/X-API-Key/?key= value,
+ * or a WS first-message auth token). Transport-agnostic: the request path
+ * ({@link authenticateVaultRequest}) and the WS binding both call this and map
+ * the result onto their own error surface. Never touches the `Request` — a
+ * WebSocket first-message auth has no header to read.
+ */
+export async function authenticateVaultToken(
+  token: string,
+  env: Env,
+  vaultName: string,
+): Promise<TokenAuthResult> {
+  // Server-wide operator bearer (mirrors VAULT_AUTH_TOKEN). No exp — the sweep
+  // treats a null-exp socket as non-expiring (control-plane / test seam).
+  const operator = env.VAULT_AUTH_TOKEN?.trim();
+  if (operator && operator.length > 0 && constantTimeEquals(token, operator)) {
+    return {
+      ok: true,
+      auth: {
+        permission: "full",
+        scopes: [SCOPE_ADMIN, SCOPE_WRITE, SCOPE_READ],
+        scoped_tags: null,
+        actor: "operator",
+        via: "operator",
+        clientId: null,
+        exp: null,
+        jti: null,
+      },
+    };
+  }
+
+  if (!looksLikeJwt(token)) return { ok: false, reason: "unauthorized", message: "Invalid API key" };
+
+  let claims: HubJwtClaims;
+  try {
+    claims = await getGuard(env).validateHubJwt(token, { expectedAudience: `vault.${vaultName}` });
+  } catch (err) {
+    if (err instanceof HubJwtError) {
+      if (err.code === "revoked") return { ok: false, reason: "unauthorized", message: "token has been revoked" };
+      if (err.code === "revocation_unavailable") {
+        return { ok: false, reason: "unauthorized", message: "token cannot be validated: revocation list unavailable" };
+      }
+      return { ok: false, reason: "unauthorized", message: err.message };
+    }
+    return { ok: false, reason: "unauthorized", message: err instanceof Error ? err.message : "JWT validation failed" };
+  }
+
+  const broad = findBroadVaultScopes(claims.scopes);
+  if (broad.length > 0) {
+    return {
+      ok: false,
+      reason: "unauthorized",
+      message: `token carries broad vault scope(s): ${broad.join(" ")}. Cloud tokens must use resource-narrowed scopes (vault:<name>:<verb>).`,
+    };
+  }
+
+  // Per-user vault pin (defense in depth after the audience strict-check).
+  if (!enforceVaultScope(claims, vaultName)) {
+    return { ok: false, reason: "vault_scope_mismatch", vaultScope: claims.vaultScope };
+  }
+
+  const permission: "full" | "read" =
+    hasScopeForVault(claims.scopes, vaultName, "write") ? "full" : "read";
+
+  // The signature is already verified (validateHubJwt above); decoding the
+  // payload for `exp` is safe. `jti` is surfaced by scope-guard's claims.
+  let exp: number | null = null;
+  try {
+    const payload = decodeJwt(token);
+    exp = typeof payload.exp === "number" ? payload.exp : null;
+  } catch {
+    exp = null;
+  }
+
+  return {
+    ok: true,
+    auth: {
+      permission,
+      scopes: claims.scopes,
+      scoped_tags: null,
+      actor: claims.sub && claims.sub.length > 0 ? claims.sub : null,
+      via: "api",
+      clientId: claims.clientId ?? null,
+      exp,
+      jti: claims.jti ?? null,
+    },
+  };
+}
+
+/**
  * Authenticate a request against `vaultName`. Returns an AuthResult or a
- * `{ error: Response }` shaped exactly like the bun vault's.
+ * `{ error: Response }` shaped exactly like the bun vault's. A thin wrapper over
+ * {@link authenticateVaultToken} — the credential-order extraction plus the
+ * failure → response mapping (byte-identical bodies to before the WS-binding
+ * refactor).
  */
 export async function authenticateVaultRequest(
   req: Request,
@@ -162,68 +279,35 @@ export async function authenticateVaultRequest(
   const key = extractApiKey(req);
   if (!key) return unauthorized("API key required");
 
-  // Server-wide operator bearer (mirrors VAULT_AUTH_TOKEN).
-  const operator = env.VAULT_AUTH_TOKEN?.trim();
-  if (operator && operator.length > 0 && constantTimeEquals(key, operator)) {
-    return {
-      permission: "full",
-      scopes: [SCOPE_ADMIN, SCOPE_WRITE, SCOPE_READ],
-      scoped_tags: null,
-      actor: "operator",
-      via: "operator",
-      clientId: null,
-    };
-  }
+  const result = await authenticateVaultToken(key, env, vaultName);
+  if (result.ok) return result.auth;
 
-  if (!looksLikeJwt(key)) return unauthorized("Invalid API key");
-
-  let claims: HubJwtClaims;
-  try {
-    claims = await getGuard(env).validateHubJwt(key, { expectedAudience: `vault.${vaultName}` });
-  } catch (err) {
-    if (err instanceof HubJwtError) {
-      if (err.code === "revoked") return unauthorized("token has been revoked");
-      if (err.code === "revocation_unavailable") {
-        return unauthorized("token cannot be validated: revocation list unavailable");
-      }
-      return unauthorized(err.message);
-    }
-    return unauthorized(err instanceof Error ? err.message : "JWT validation failed");
-  }
-
-  const broad = findBroadVaultScopes(claims.scopes);
-  if (broad.length > 0) {
-    return unauthorized(
-      `token carries broad vault scope(s): ${broad.join(" ")}. Cloud tokens must use resource-narrowed scopes (vault:<name>:<verb>).`,
-    );
-  }
-
-  // Per-user vault pin (defense in depth after the audience strict-check).
-  if (!enforceVaultScope(claims, vaultName)) {
+  if (result.reason === "vault_scope_mismatch") {
     return {
       error: Response.json(
         {
           error: "Forbidden",
           error_type: "vault_scope_mismatch",
-          message: `token's vault_scope (${claims.vaultScope.join(", ")}) does not include the requested vault '${vaultName}'`,
+          message: `token's vault_scope (${result.vaultScope.join(", ")}) does not include the requested vault '${vaultName}'`,
           required_vault: vaultName,
         },
         { status: 403 },
       ),
     };
   }
+  return unauthorized(result.message);
+}
 
-  const permission: "full" | "read" =
-    hasScopeForVault(claims.scopes, vaultName, "write") ? "full" : "read";
-
-  return {
-    permission,
-    scopes: claims.scopes,
-    scoped_tags: null,
-    actor: claims.sub && claims.sub.length > 0 ? claims.sub : null,
-    via: "api",
-    clientId: claims.clientId ?? null,
-  };
+/**
+ * The highest verb a scope set grants for `vaultName` (VERB_RANK, or -1 for
+ * none). Used by the WS binding's re-auth check: a token refresh on an open
+ * socket may narrow-or-equal the granted verb, never widen it.
+ */
+export function vaultVerbRank(scopes: string[], vaultName: string): number {
+  if (hasScopeForVault(scopes, vaultName, "admin")) return VERB_RANK.admin;
+  if (hasScopeForVault(scopes, vaultName, "write")) return VERB_RANK.write;
+  if (hasScopeForVault(scopes, vaultName, "read")) return VERB_RANK.read;
+  return -1;
 }
 
 /** Insufficient-scope 403 envelope (parachute-vault HTTP_API.md). */
