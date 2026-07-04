@@ -55,6 +55,7 @@ import { runSnapshotSweep } from "./snapshots.ts";
 import { runUsageRollup } from "./usage.ts";
 import { handleCheckoutPost, handleMockCheckoutPost, handlePortalPost } from "./billing.ts";
 import { handleStripeWebhookPost } from "./billing-webhook.ts";
+import { handlePromoRedeemPost } from "./promo.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
 // (wrangler.toml [[durable_objects.bindings]] class_name = "RateLimiterDO").
@@ -130,6 +131,10 @@ app.post("/console/checklist", (c) => handleChecklistPost(c.env.DB, c.req.raw, d
 app.post("/console/checklist/restore", (c) => handleChecklistRestorePost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/console/security", (c) => handleSecurityGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/security", (c) => handleSecurityPost(c.env.DB, c.req.raw, depsFor(c.env)));
+// Promo-code redemption (July 4th launch): session + CSRF + same-origin (the
+// console write boundary), then the race-safe claim + comp grant (promo.ts).
+// Pure comp machinery — no Stripe, no env gate; LIVE in production by design.
+app.post("/console/promo", (c) => handlePromoRedeemPost(c.env.DB, c.req.raw, depsFor(c.env)));
 
 // --- operator admin console (Wave 4c) ---
 // EVERY route (GET and POST) resolves the session and requires role='operator'
