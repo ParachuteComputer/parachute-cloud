@@ -315,6 +315,31 @@ describe("ws-subscribe — contract parity WS ⇄ SSE (live bytes)", () => {
   });
 });
 
+describe("ws-subscribe — alarm-wake coexistence (transcription-alarm ↔ hibernation)", () => {
+  it("an alarm-driven wake rehydrates WS subs from attachments (they survive the transcription alarm's wake)", async () => {
+    const v = freshVault();
+    const { h } = await openAuthed(v, "?tag=watch");
+
+    // Evict in-memory state, then wake via the ALARM path (the transcription
+    // alarm's entry point). ensureSubscriptionsRehydrated at the top of alarm()
+    // must rebuild the WS sub — a pending far-future transcription alarm does not
+    // pin the DO awake (CF wakes it at the scheduled time), and when it wakes the
+    // live sockets are re-registered so a later write still pushes.
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      await inst.__simulateEviction();
+      expect(await inst.__wsSubCount()).toBe(0);
+      await inst.alarm();
+      expect(await inst.__wsSubCount()).toBe(1);
+    });
+
+    await createNote(v, { content: "after alarm wake", tags: ["watch"] });
+    const ev = await h.nextMessage();
+    expect(ev.type).toBe("upsert");
+    expect(ev.note.content).toBe("after alarm wake");
+    h.close();
+  });
+});
+
 describe("ws-subscribe — simulated eviction (the hibernation gate, local)", () => {
   it("push survives an in-memory wipe: rehydrate-on-write → upsert arrives, no re-snapshot", async () => {
     const v = freshVault();
