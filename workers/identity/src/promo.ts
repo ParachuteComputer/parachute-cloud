@@ -26,9 +26,15 @@
  *   2. one-promo-per-account is the `promo_redemptions` PRIMARY KEY(user_id)
  *      — a concurrent double-redeem loses at the INSERT, and the loser gives
  *      the claimed slot back (counter decrement) before answering friendly;
- *   3. the grant itself is a CAS on "still free, still no live subscription"
- *      — if a real payment landed between our read and our write, the comp
- *      unwinds completely instead of stomping a paying customer's row.
+ *   3. the grant itself is a CAS on "still free" (`WHERE plan = 'free'`) — if
+ *      a real payment landed between our read and our write, the comp unwinds
+ *      completely instead of stomping a paying customer's row. `plan='free'`
+ *      alone is the right guard: every path that records a live subscription
+ *      (checkout-completed's CAS, subscription.updated) flips the plan paid in
+ *      the same write, while a CHURNED subscriber keeps a stale
+ *      stripe_subscription_id on their free row forever (the sweep never
+ *      clears it) — the earlier extra `AND stripe_subscription_id IS NULL`
+ *      clause permanently locked those users out (#73 review).
  *
  * TRUST BOUNDARY: session + CSRF + same-origin — the console's write
  * boundary, exactly like /billing/checkout and /console/vaults (cookie
@@ -138,14 +144,16 @@ export async function handlePromoRedeemPost(db: D1Database, req: Request, deps: 
 
   // 3. GRANT THE COMP — plan flips now; expiry is the EXISTING deferred-
   //    downgrade pair the hourly sweep applies (module note). CAS on "still
-  //    free, still no live subscription": if a real checkout completed since
-  //    our read, unwind entirely rather than schedule a downgrade for a
-  //    paying customer (the strand/over-charge failure class).
+  //    free": if a real checkout completed since our read it flipped the plan
+  //    paid, so this misses and we unwind entirely rather than schedule a
+  //    downgrade for a paying customer (the strand/over-charge failure class).
+  //    Deliberately NOT conditioned on stripe_subscription_id — a churned
+  //    subscriber's free row keeps its stale id (module note, point 3).
   const until = new Date(now.getTime() + promo.comp_days * 86_400_000).toISOString();
   const grant = await db
     .prepare(
       `UPDATE users SET plan = ?, pending_plan = 'free', plan_downgrade_at = ?
-       WHERE id = ? AND plan = 'free' AND stripe_subscription_id IS NULL`,
+       WHERE id = ? AND plan = 'free'`,
     )
     .bind(PROMO_COMP_PLAN, until, user.id)
     .run();

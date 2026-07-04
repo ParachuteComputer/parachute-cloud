@@ -182,10 +182,16 @@ export function planLine(plan: PlanId): string {
   return `${spec.label} plan — ${vaults}, ${formatPlanBytes(spec.total_bytes)}`;
 }
 
-/** The console teaser shown to free users. No payment link yet (later PR). */
+/**
+ * The console teaser shown to free users while billing is UNCONFIGURED (the
+ * NEITHER state — no Stripe keys, no mock; ui.ts renders real Upgrade buttons
+ * instead once either exists). Honest about the current state: paid plans are
+ * arriving, and the launch promo box ("Have a code?") sits directly below the
+ * plan line this teaser renders on.
+ */
 export function parachuteTeaser(): string {
   const p = PLAN_SPECS.parachute;
-  return `${p.label} — ${PARACHUTE_PRICE_LINE}, ${p.vault_count} vaults, ${formatPlanBytes(p.total_bytes)} — coming this week`;
+  return `${p.label} — ${PARACHUTE_PRICE_LINE}, ${p.vault_count} vaults, ${formatPlanBytes(p.total_bytes)} — paid plans arriving; have a code? Redeem it below`;
 }
 
 /**
@@ -206,7 +212,9 @@ export function vaultCapMessage(plan: PlanId): string {
   const spec = PLAN_SPECS[plan];
   const vaults = `${spec.vault_count} vault${spec.vault_count === 1 ? "" : "s"}`;
   if (plan === "free") {
-    return `Your plan includes ${vaults}. More room is coming with the paid plan.`;
+    // The promo box ("Have a code?") renders under the plan line at the top of
+    // the console — point there honestly instead of promising a date.
+    return `Your plan includes ${vaults}. Paid plans add more room — have a code? Redeem it under your plan line above.`;
   }
   return `Your ${spec.label} plan includes ${vaults} — that's the current ceiling. Need more? Write hello@parachute.computer.`;
 }

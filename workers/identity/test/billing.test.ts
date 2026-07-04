@@ -276,7 +276,7 @@ describe("NOT CONFIGURED — the clean degradation (today's deploy)", () => {
     expect(html).not.toContain('data-testid="mock-billing-note"'); // the mock 404s in prod
     expect(html).not.toContain("/billing/checkout");
     expect(html).not.toContain("/billing/mock-checkout");
-    expect(html).toContain("coming this week"); // the copy-only teaser, unchanged
+    expect(html).toContain("paid plans arriving"); // the copy-only teaser, unchanged
   });
 
   test("paid user's console hides Manage billing while unconfigured", async () => {
@@ -299,7 +299,7 @@ describe("console billing doors (configured)", () => {
     expect(html).toContain('value="yearly"');
     expect(html).toContain("$3/mo");
     expect(html).toContain("$30/yr");
-    expect(html).not.toContain("coming this week");
+    expect(html).not.toContain("paid plans arriving");
     expect(html).not.toContain('data-testid="manage-billing"');
   });
 

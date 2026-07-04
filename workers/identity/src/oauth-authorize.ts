@@ -100,6 +100,18 @@ function paramsFromForm(form: FormData): AuthorizeParams | { error: string } {
   });
 }
 
+/**
+ * Authorize params carried on a NON-authorize form POST (the magic-link send
+ * from the authorize login page — auth-handlers.ts), or null when the form
+ * carries none / an incomplete set. Same field vocabulary as the login/consent
+ * round-trip (ui.ts hiddenParams); incomplete → null rather than an error
+ * because for that caller the params are an optional rider, not the request.
+ */
+export function authorizeParamsFromForm(form: FormData): AuthorizeParams | null {
+  const parsed = paramsFromForm(form);
+  return "error" in parsed ? null : parsed;
+}
+
 async function issueAuthCodeRedirect(
   db: D1Database,
   params: AuthorizeParams,
@@ -222,7 +234,10 @@ async function authorizeCore(
 function renderLoginPage(req: Request, params: AuthorizeParams, error?: string): Response {
   const csrf = ensureCsrfToken(req);
   const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
-  return htmlResponse(renderLogin({ params, csrfToken: csrf.token, error }), error ? 200 : 200, extra);
+  // Errors on this page today only come from the password submit path, so an
+  // error render opens the password disclosure (magic-send errors re-render via
+  // auth-handlers.ts with showPassword: false).
+  return htmlResponse(renderLogin({ params, csrfToken: csrf.token, error, showPassword: Boolean(error) }), 200, extra);
 }
 
 export async function handleAuthorizeGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
@@ -283,8 +298,13 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   return new Response(res.body, { status: res.status, headers });
 }
 
-/** Reconstruct the GET /oauth/authorize URL from parsed params (the post-2FA `next`). */
-function buildAuthorizeUrl(issuer: string, params: AuthorizeParams): string {
+/**
+ * Reconstruct the GET /oauth/authorize URL from parsed params — the resume
+ * handle for flows that leave this page and come back with a session: the
+ * post-2FA `next` (pending_logins), and the magic-link `next` (magic_links,
+ * migration 0017 — auth-handlers.ts stores it server-side at send time).
+ */
+export function buildAuthorizeUrl(issuer: string, params: AuthorizeParams): string {
   const u = new URL(`${issuer}/oauth/authorize`);
   u.searchParams.set("client_id", params.clientId);
   u.searchParams.set("redirect_uri", params.redirectUri);

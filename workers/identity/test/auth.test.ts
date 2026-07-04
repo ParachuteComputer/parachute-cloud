@@ -19,11 +19,22 @@ import {
   handleSecurityPost,
 } from "../src/auth-handlers.ts";
 import { handleLoginPost } from "../src/console.ts";
+import { handleAuthorizeGet } from "../src/oauth-authorize.ts";
 import { totpCodeAt } from "../src/totp.ts";
 import { getTotpState, isTotpEnrolled } from "../src/two-factor.ts";
 import { getUserByEmail } from "../src/users.ts";
 import { MAGIC_MAX_PER_WINDOW } from "../src/rate-limit.ts";
-import { CSRF, ISSUER, deps, seedSession, seedUser } from "./helpers.ts";
+import {
+  CSRF,
+  ISSUER,
+  REDIRECT_URI,
+  authorizeGetReq,
+  deps,
+  makePkce,
+  seedApprovedClient,
+  seedSession,
+  seedUser,
+} from "./helpers.ts";
 
 function getSetCookies(res: Response): string[] {
   return (res.headers as unknown as { getSetCookie(): string[] }).getSetCookie();
@@ -294,6 +305,174 @@ describe("magic link — send + verify", () => {
       { event: "failed", count: 1 },
       { event: "sent", count: 2 },
     ]);
+  });
+});
+
+// --- magic link ⇄ OAuth authorize resume (launch-flow fix 2) ----------------
+
+describe("magic link resumes a pending authorize request", () => {
+  /** The pending authorize request's params, as the login page's hidden fields
+   *  round-trip them into the magic form (ui.ts renderLogin). `vault:read` is
+   *  an unnamed verb so the resumed flow lands on consent without ownership. */
+  function authorizeFields(clientId: string, challenge: string): Record<string, string> {
+    return {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:read",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "st-resume-1",
+    };
+  }
+
+  function magicAuthorizeReq(email: string, fields: Record<string, string>, ip = "10.7.7.1"): Request {
+    return new Request(`${ISSUER}/auth/magic`, {
+      method: "POST",
+      body: new URLSearchParams({ __csrf: CSRF, email, ...fields }),
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: ISSUER,
+        cookie: `parachute_id_csrf=${CSRF}`,
+        "cf-connecting-ip": ip,
+      },
+    });
+  }
+
+  test("the session-less authorize login page offers the magic-link door, params riding as hidden fields", async () => {
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq(authorizeFields(clientId, challenge)),
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The passwordless door (the signup default has no password).
+    expect(html).toContain('action="/auth/magic"');
+    expect(html).toContain("Email me a sign-in link");
+    // The pending request rides the magic form as hidden fields.
+    expect(html).toContain(`name="client_id" value="${clientId}"`);
+    expect(html).toContain('name="state" value="st-resume-1"');
+    // Password stays available (headless/dev flows depend on it).
+    expect(html).toContain('name="password"');
+  });
+
+  test("the emailed link RESUMES the exact authorize request: verify → 302 to the authorize URL → consent", async () => {
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const { challenge } = await makePkce();
+    const now = new Date("2026-07-04T10:00:00Z");
+    const sender = captureSender();
+
+    const send = await handleMagicRequestPost(
+      env.DB,
+      magicAuthorizeReq("resume@example.com", authorizeFields(clientId, challenge)),
+      deps(() => now),
+      sender,
+    );
+    expect(send.status).toBe(200);
+    expect(await send.text()).toContain("Check your email"); // same neutral page as a plain send
+    // The emailed link is an OPAQUE handle — no OAuth params ride the email.
+    const link = sender.sent[0]!.link;
+    expect(new URL(link).pathname).toBe("/auth/verify");
+    expect([...new URL(link).searchParams.keys()]).toEqual(["token"]);
+
+    const verify = await handleMagicVerifyGet(env.DB, verifyReq(tokenFromLink(link)), deps(() => now));
+    expect(verify.status).toBe(302);
+    const loc = new URL(verify.headers.get("location")!);
+    expect(loc.origin).toBe(new URL(ISSUER).origin);
+    expect(loc.pathname).toBe("/oauth/authorize");
+    // EVERY param of the pending request round-trips exactly.
+    expect(loc.searchParams.get("client_id")).toBe(clientId);
+    expect(loc.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
+    expect(loc.searchParams.get("response_type")).toBe("code");
+    expect(loc.searchParams.get("scope")).toBe("vault:read");
+    expect(loc.searchParams.get("code_challenge")).toBe(challenge);
+    expect(loc.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(loc.searchParams.get("state")).toBe("st-resume-1");
+    const sessionId = cookieVal(verify, "parachute_id_session");
+    expect(sessionId).toBeTruthy();
+
+    // Following the redirect WITH the fresh session lands on consent for that
+    // exact request (vault:read → the vault-pick consent).
+    const resumed = await handleAuthorizeGet(
+      env.DB,
+      new Request(loc.toString(), { headers: { cookie: `parachute_id_session=${sessionId}` } }),
+      deps(() => now),
+    );
+    expect(resumed.status).toBe(200);
+    const html = await resumed.text();
+    expect(html).toContain("Authorize Claude");
+    expect(html).toContain('name="state" value="st-resume-1"');
+    expect(html).toContain('name="vault_pick"');
+  });
+
+  test("the resume handle is SINGLE-USE: a second verify of the same link → 400", async () => {
+    const { clientId } = await seedApprovedClient();
+    const { challenge } = await makePkce();
+    const now = new Date("2026-07-04T10:00:00Z");
+    const sender = captureSender();
+    await handleMagicRequestPost(
+      env.DB,
+      magicAuthorizeReq("resume-once@example.com", authorizeFields(clientId, challenge), "10.7.7.2"),
+      deps(() => now),
+      sender,
+    );
+    const token = tokenFromLink(sender.sent[0]!.link);
+    const first = await handleMagicVerifyGet(env.DB, verifyReq(token), deps(() => now));
+    expect(first.status).toBe(302);
+    const second = await handleMagicVerifyGet(env.DB, verifyReq(token), deps(() => now));
+    expect(second.status).toBe(400);
+  });
+
+  test("an EXPIRED resume handle is refused with the same dead-link page (no resume)", async () => {
+    const { clientId } = await seedApprovedClient();
+    const { challenge } = await makePkce();
+    const sent = new Date("2026-07-04T10:00:00Z");
+    const later = new Date(sent.getTime() + 11 * 60 * 1000); // TTL is 10 min
+    const sender = captureSender();
+    await handleMagicRequestPost(
+      env.DB,
+      magicAuthorizeReq("resume-stale@example.com", authorizeFields(clientId, challenge), "10.7.7.3"),
+      deps(() => sent),
+      sender,
+    );
+    const res = await handleMagicVerifyGet(env.DB, verifyReq(tokenFromLink(sender.sent[0]!.link)), deps(() => later));
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain("Link expired");
+  });
+
+  test("an INCOMPLETE params rider is ignored: the link lands on /console like a plain sign-in", async () => {
+    const now = new Date("2026-07-04T10:00:00Z");
+    const sender = captureSender();
+    await handleMagicRequestPost(
+      env.DB,
+      magicAuthorizeReq("resume-partial@example.com", { client_id: "someclient" }, "10.7.7.4"),
+      deps(() => now),
+      sender,
+    );
+    const verify = await handleMagicVerifyGet(env.DB, verifyReq(tokenFromLink(sender.sent[0]!.link)), deps(() => now));
+    expect(verify.status).toBe(302);
+    expect(verify.headers.get("location")).toBe("/console");
+  });
+
+  test("an invalid email on the authorize magic form re-renders THE AUTHORIZE login (the pending request survives)", async () => {
+    const { clientId } = await seedApprovedClient();
+    const { challenge } = await makePkce();
+    const sender = captureSender();
+    const res = await handleMagicRequestPost(
+      env.DB,
+      magicAuthorizeReq("not-an-email", authorizeFields(clientId, challenge), "10.7.7.5"),
+      deps(),
+      sender,
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Enter a valid email address.");
+    expect(html).toContain('action="/auth/magic"');
+    expect(html).toContain(`name="client_id" value="${clientId}"`);
+    expect(sender.sent).toHaveLength(0);
   });
 });
 

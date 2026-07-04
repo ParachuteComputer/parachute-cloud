@@ -64,10 +64,17 @@ workers/identity/   the OAuth issuer (authorize/token/DCR/JWKS/revocation on D1)
                     D1 `vault_snapshots` (migration 0013), and the console's
                     History section restores paid users' snapshots into NEW
                     vaults (src/snapshots.ts + POST /console/vaults/restore).
-                    306 tests.
+                    ALSO the launch-flow doors (0.0.8-rc.24): the console
+                    export door (POST /console/vaults/export — streams the
+                    vault worker's export tarball back as a download through
+                    a read-verb first-party mint, the packs-button seam) and
+                    magic-link sign-in ON the OAuth authorize login page,
+                    where the emailed link RESUMES the pending authorize
+                    request (`magic_links.next`, migration 0017 — the
+                    passwordless-user reconnect fix). 369 tests.
 src/                the OLD control plane (Worker + D1 + Stripe). Dormant; billing
                     lifecycle design gets harvested into the control-plane revival.
-scripts/            deploy-staging.sh + smoke-staging.ts (full 69-step live smoke,
+scripts/            deploy-staging.sh + smoke-staging.ts (full 118-step live smoke,
                     creates throwaway accounts/vaults — incl. the guided-arrival
                     headless walk + drip and usage-rollup ticks via the
                     staging-only triggers) for STAGING; deploy-prod.sh +
@@ -81,7 +88,7 @@ bun install                         # ALSO refreshes the copied core dep (see go
 bun run test                        # control-plane tests (src/) — 123
 bun run typecheck                   # root tsc
 cd workers/vault && bun run typecheck && bun x vitest run    # 203+1 todo under workerd
-cd workers/identity && bun run typecheck && bun x vitest run # 332
+cd workers/identity && bun run typecheck && bun x vitest run # 369
 bash scripts/deploy-staging.sh      # deploy both workers -e staging + migrate + seed
 bun scripts/smoke-staging.ts        # FULL live smoke vs staging (creates test debris)
 bash scripts/deploy-prod.sh         # deploy both workers top-level + migrate (NO seed)

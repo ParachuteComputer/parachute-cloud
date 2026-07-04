@@ -216,6 +216,34 @@ describe("redemption — the happy path", () => {
     const expected = Date.now() + 90 * DAY_MS;
     expect(Math.abs(new Date(user.planDowngradeAt!).getTime() - expected)).toBeLessThan(60_000);
   });
+
+  test("CHURNED subscriber (free plan + stale subscription id from a cancelled sub) redeems fine", async () => {
+    // The #73-review regression: a past subscriber who cancelled and was swept
+    // back to free keeps their stale stripe_subscription_id forever (nothing
+    // clears it — billing-lifecycle.ts runBillingSweep touches only the plan
+    // pair). The old grant CAS's `AND stripe_subscription_id IS NULL` clause
+    // permanently locked those users out of any promo; `plan = 'free'` alone
+    // is the guard (a LIVE subscription always rides a paid plan).
+    const { id, sessionId } = await seedFreeUser("promo-churned@example.com");
+    await env.DB.prepare(
+      "UPDATE users SET stripe_customer_id = 'cus_churned', stripe_subscription_id = 'sub_cancelled_long_ago' WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+
+    const res = await handlePromoRedeemPost(env.DB, redeemReq("INDEPENDENCE", sessionId), promoDeps(T0));
+    expect(redirectTarget(res)).toBe("/console?promo_redeemed=1");
+
+    const user = (await getUserById(env.DB, id))!;
+    expect(user.plan).toBe("parachute");
+    expect(user.pendingPlan).toBe("free");
+    expect(user.planDowngradeAt).toBe(new Date(T0.getTime() + 90 * DAY_MS).toISOString());
+    // The stale Stripe linkage is untouched — the comp never edits billing ids.
+    expect(user.stripeCustomerId).toBe("cus_churned");
+    expect(user.stripeSubscriptionId).toBe("sub_cancelled_long_ago");
+    expect(await promoCount("INDEPENDENCE")).toBe(1);
+    expect((await redemptionRow(id))!.code).toBe("INDEPENDENCE");
+  });
 });
 
 // --- the trust boundary ----------------------------------------------------------
@@ -359,8 +387,9 @@ describe("redemption — the CAS races (the #72 lesson)", () => {
   test("GRANT lost to a concurrent real payment: the comp unwinds completely (no downgrade for a paying customer)", async () => {
     // Simulate the checkout webhook landing between the pre-check and the
     // grant: the user's row turns paid-with-subscription mid-flight. The
-    // grant CAS (`WHERE plan='free' AND stripe_subscription_id IS NULL`)
-    // misses → redemption row deleted, slot released, friendly already-paid.
+    // grant CAS (`WHERE plan = 'free'` — the webhook's write flips the plan
+    // paid in the same statement that records the subscription id) misses →
+    // redemption row deleted, slot released, friendly already-paid.
     const { id, sessionId } = await seedFreeUser("promo-grantrace@example.com");
     const flipping: D1Database = {
       prepare(sql: string) {

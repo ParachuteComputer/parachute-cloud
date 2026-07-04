@@ -55,9 +55,11 @@ import {
 import { generateTotpSecret, otpauthUrl, verifyTotp } from "./totp.ts";
 import { qrSvg } from "./qr.ts";
 import { EMAIL_RE, PASSWORD_MIN, normalizeEmail } from "./validation.ts";
+import { authorizeParamsFromForm, buildAuthorizeUrl } from "./oauth-authorize.ts";
 import {
   renderConsoleLogin,
   renderError,
+  renderLogin,
   renderLogin2fa,
   renderMagicSent,
   renderSecurity,
@@ -117,9 +119,31 @@ export async function handleMagicRequestPost(
   sender: EmailSender,
 ): Promise<Response> {
   const form = await req.formData();
+  // The authorize-resume rider (launch-flow fix 2): a send from the OAuth
+  // authorize login page carries the pending request's params as hidden fields
+  // (ui.ts renderLogin — the same round-trip the password form uses). When a
+  // complete set is present, the post-verify destination becomes the
+  // reconstructed authorize URL, stored SERVER-SIDE on the magic_links row
+  // (migration 0017) — the emailed link stays an opaque token handle, exactly
+  // like the password login's 2FA divert stores its resume in pending_logins.
+  const authorizeParams = authorizeParamsFromForm(form);
+  const next = authorizeParams ? buildAuthorizeUrl(deps.issuer, authorizeParams) : null;
   if (!checkForm(req, form, deps)) return magicError(req, "Your session expired. Please try again.", "");
   const email = normalizeEmail(String(form.get("email") ?? ""));
-  if (!EMAIL_RE.test(email)) return magicError(req, "Enter a valid email address.", email);
+  if (!EMAIL_RE.test(email)) {
+    // Re-render the page the user is actually on: the authorize login when the
+    // rider is present (so the pending request survives the retry), else the
+    // console login.
+    if (authorizeParams) {
+      const csrf = ensureCsrfToken(req);
+      return htmlResponse(
+        renderLogin({ params: authorizeParams, csrfToken: csrf.token, error: "Enter a valid email address.", showPassword: false }),
+        200,
+        csrfExtra(csrf.setCookie),
+      );
+    }
+    return magicError(req, "Enter a valid email address.", email);
+  }
 
   const now = deps.now?.() ?? new Date();
   const throttle = await checkAndBumpMagic(deps.rateLimiter, clientIp(req), email, now);
@@ -131,7 +155,7 @@ export async function handleMagicRequestPost(
     // every other outcome (no oracle), but nothing is minted or sent — no
     // magic_links row, no email, and no dev echo header (there is no link).
     if (existing?.suspendedAt) return htmlResponse(renderMagicSent({ email }), 200);
-    const { rawToken } = await createMagicLink(db, email, existing?.id ?? null, now);
+    const { rawToken } = await createMagicLink(db, email, existing?.id ?? null, now, next);
     const link = `${deps.issuer}/auth/verify?token=${encodeURIComponent(rawToken)}`;
     const sent = await sender.sendMagicLink(email, link);
     if (!sent.ok) {
@@ -178,7 +202,12 @@ export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: O
   } else {
     userId = (await createUser(db, consumed.email, "", now, { emailVerified: true })).id;
   }
-  return finishPrimaryAuth(db, deps, userId, "/console");
+  // Follow the stored resume target (the authorize URL for sends from the
+  // OAuth login page — single-use + expiry came free with the token consume
+  // above), re-validated against the issuer origin; null → /console. A
+  // 2FA-enrolled account keeps the same destination through the code prompt
+  // (finishPrimaryAuth threads it into pending_logins.next).
+  return finishPrimaryAuth(db, deps, userId, safeNext(consumed.next ?? "/console", deps));
 }
 
 /** The one neutral response every unusable magic link gets (invalid, used, expired — or suspended). */
