@@ -663,8 +663,13 @@ describe("console — the export door (POST /console/vaults/export)", () => {
     const sessionId = await seedSession(userId);
     await seedVault("exportme", userId);
 
-    // Deterministic clock → deterministic filename date.
-    const now = new Date("2026-07-04T09:30:00.000Z");
+    // Clock pinned to one Date object so the filename assertion below derives
+    // from the SAME instant the mint uses — but anchored to REAL time, because
+    // validateAccessToken verifies `exp` against the real clock (jose), not the
+    // injected one. A hardcoded absolute date here is a time bomb: it passes
+    // until that minute is 60s in the past, then fails every run forever
+    // (caught 2026-07-04 when exactly that happened).
+    const now = new Date();
     let seen: { url: string; auth: string | null } | null = null;
     const boundDeps = {
       ...deps(() => now),
@@ -683,7 +688,9 @@ describe("console — the export door (POST /console/vaults/export)", () => {
     );
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/x-tar");
-    expect(res.headers.get("content-disposition")).toBe('attachment; filename="exportme-export-2026-07-04.tar"');
+    expect(res.headers.get("content-disposition")).toBe(
+      `attachment; filename="exportme-export-${now.toISOString().slice(0, 10)}.tar"`,
+    );
     expect(res.headers.get("content-length")).toBe(String(TAR_BYTES.length));
     // The bytes stream through unmodified.
     expect(await res.text()).toBe(TAR_BYTES);
