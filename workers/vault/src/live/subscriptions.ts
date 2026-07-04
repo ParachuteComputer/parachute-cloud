@@ -1,8 +1,22 @@
 /**
- * Live-query subscription registry — the DO backend of vault's live-query SSE
+ * Live-query subscription registry — the DO backend of vault's live-query fan-out
  * (`parachute-vault/src/subscriptions.ts`). A second consumer of core's
  * post-commit hook dispatcher, alongside the durable webhook sink; a
  * subscription is ephemeral (connection-scoped, drives a live UI).
+ *
+ * ## Two transports, one contract (WS-hibernation migration, 2026-07-04)
+ *
+ * The manager is transport-agnostic: it emits abstract `(event, data)` tuples
+ * and a {@link SubscriptionSink} renders them for its wire.
+ *   - {@link SseSink} renders `event:`/`data:` frames — bytes UNCHANGED from the
+ *     original SSE contract (surface-client parses them identically).
+ *   - {@link WsSink} renders a WebSocket message `{ type: event, ...data }` — the
+ *     SSE `event:` name folds into a `type` discriminator; the inner payload
+ *     (`note` / `id` / `notes`) serializes byte-for-byte identically to the SSE
+ *     `data:` body. That parity is pinned by the shared frame-corpus fixture.
+ * Both share ONE {@link SubscriptionManager}; the WS binding adds hibernation on
+ * the cloud (an idle-but-open socket evicts the DO → ~$0 idle), invisible on the
+ * wire. See `docs/live-query-ws.md`.
  *
  * ## The single-writer simplification (design §3)
  *
@@ -34,14 +48,18 @@ export const DEFAULT_MAX_SUBSCRIPTIONS_PER_VAULT = 100;
 /**
  * Default bound on a single subscription's pending (unflushed) event buffer.
  * Past this, the stream is closed — it reconnects and re-snapshots rather than
- * the DO growing memory unbounded.
+ * the DO growing memory unbounded. Only enforced for flush-tracking sinks (SSE);
+ * the WS transport delegates outgoing-buffer bounds to the runtime.
  */
 export const DEFAULT_MAX_BUFFERED_EVENTS = 1000;
 
-type SseFrame = string;
-
+/**
+ * The abstract sink an event is rendered to. The manager calls `send(event,
+ * data)`; each transport formats for its wire. Returns `false` when the sink is
+ * gone (the manager then drops the subscription).
+ */
 export interface SubscriptionSink {
-  write(frame: SseFrame): boolean;
+  send(event: string, data: unknown): boolean;
   close(): void;
 }
 
@@ -51,13 +69,74 @@ interface Subscription {
   readonly tagScopeAllowed: Set<string> | null;
   readonly tagScopeRaw: string[] | null;
   readonly sink: SubscriptionSink;
+  /** SSE tracks unflushed frames to bound DO memory; WS delegates to the runtime. */
+  readonly tracksFlush: boolean;
+  /** Whether this sub counts against the per-vault manager cap (SSE) — the WS
+   *  transport enforces its own cap via `getWebSockets().length` at upgrade. */
+  readonly countsTowardCap: boolean;
   buffered: number;
   readonly maxBuffered: number;
   closed: boolean;
 }
 
-function sseEvent(event: string, data: unknown): SseFrame {
+/** SSE wire frame: `event: <name>\ndata: <json>\n\n`. The ONE place SSE bytes
+ *  are formatted (route + tests + SseSink all route through it). */
+export function sseFrame(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/** WebSocket message: `{ type: <event>, ...data }`. The SSE `event:` name folds
+ *  into `type`; the inner payload serializes identically to the SSE `data:`
+ *  body. The ONE place WS bytes are formatted. */
+export function wsFrame(event: string, data: unknown): string {
+  const body = data && typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>) : {};
+  return JSON.stringify({ type: event, ...body });
+}
+
+/** SSE sink: renders `(event, data)` to an SSE frame and hands it to `push`
+ *  (the route's stream-queue writer). `push` returns false when the stream is
+ *  gone. `comment()` emits a raw `:` keepalive (SSE-only; not part of the
+ *  abstract contract). Bytes are byte-identical to the pre-migration SSE path. */
+export class SseSink implements SubscriptionSink {
+  constructor(
+    private readonly push: (frame: string) => boolean,
+    private readonly onClose: () => void,
+  ) {}
+  send(event: string, data: unknown): boolean {
+    return this.push(sseFrame(event, data));
+  }
+  comment(text = ""): boolean {
+    return this.push(`:${text}\n\n`);
+  }
+  close(): void {
+    this.onClose();
+  }
+}
+
+/** WebSocket sink: renders `(event, data)` to a `{ type, ...data }` message and
+ *  sends it on the (hibernatable) socket. `sendRaw` is for pre-formatted frames
+ *  (chunked snapshots the DO builds directly). A send on a dead socket returns
+ *  false → the manager drops the sub. */
+export class WsSink implements SubscriptionSink {
+  constructor(private readonly ws: WebSocket) {}
+  send(event: string, data: unknown): boolean {
+    return this.sendRaw(wsFrame(event, data));
+  }
+  sendRaw(frame: string): boolean {
+    try {
+      this.ws.send(frame);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  close(): void {
+    try {
+      this.ws.close(1011, "subscription closed");
+    } catch {
+      /* already closing/closed */
+    }
+  }
 }
 
 export interface SubscriptionHandle {
@@ -104,9 +183,15 @@ export class SubscriptionManager {
     tagScopeRaw: string[] | null;
     sink: SubscriptionSink;
     maxBuffered?: number;
+    /** SSE (default true) tracks unflushed frames; WS passes false. */
+    tracksFlush?: boolean;
+    /** SSE (default true) counts against the per-vault manager cap; WS passes
+     *  false — the WS transport caps via `getWebSockets().length` at upgrade. */
+    countsTowardCap?: boolean;
   }): SubscriptionHandle | null {
+    const countsTowardCap = args.countsTowardCap ?? true;
     const current = this.countForVault(args.vaultName);
-    if (current >= this.maxPerVault) return null;
+    if (countsTowardCap && current >= this.maxPerVault) return null;
 
     this.ensureHooks();
 
@@ -116,12 +201,14 @@ export class SubscriptionManager {
       tagScopeAllowed: args.tagScopeAllowed,
       tagScopeRaw: args.tagScopeRaw,
       sink: args.sink,
+      tracksFlush: args.tracksFlush ?? true,
+      countsTowardCap,
       buffered: 0,
       maxBuffered: args.maxBuffered ?? DEFAULT_MAX_BUFFERED_EVENTS,
       closed: false,
     };
     this.subs.add(sub);
-    this.perVaultCount.set(args.vaultName, current + 1);
+    if (countsTowardCap) this.perVaultCount.set(args.vaultName, current + 1);
 
     return {
       flushed: () => {
@@ -135,9 +222,11 @@ export class SubscriptionManager {
     if (sub.closed) return;
     sub.closed = true;
     this.subs.delete(sub);
-    const n = this.perVaultCount.get(sub.vaultName) ?? 0;
-    if (n <= 1) this.perVaultCount.delete(sub.vaultName);
-    else this.perVaultCount.set(sub.vaultName, n - 1);
+    if (sub.countsTowardCap) {
+      const n = this.perVaultCount.get(sub.vaultName) ?? 0;
+      if (n <= 1) this.perVaultCount.delete(sub.vaultName);
+      else this.perVaultCount.set(sub.vaultName, n - 1);
+    }
     try {
       sub.sink.close();
     } catch {
@@ -145,18 +234,18 @@ export class SubscriptionManager {
     }
   }
 
-  private emit(sub: Subscription, frame: SseFrame): void {
+  private emit(sub: Subscription, event: string, data: unknown): void {
     if (sub.closed) return;
-    if (sub.buffered >= sub.maxBuffered) {
+    if (sub.tracksFlush && sub.buffered >= sub.maxBuffered) {
       this.remove(sub);
       return;
     }
-    const ok = sub.sink.write(frame);
+    const ok = sub.sink.send(event, data);
     if (!ok) {
       this.remove(sub);
       return;
     }
-    sub.buffered++;
+    if (sub.tracksFlush) sub.buffered++;
   }
 
   private ensureHooks(): void {
@@ -184,7 +273,7 @@ export class SubscriptionManager {
 
       if (event === "deleted") {
         const ref = payload as DeletedNoteRef;
-        this.emit(sub, sseEvent("remove", { id: ref.id }));
+        this.emit(sub, "remove", { id: ref.id });
         continue;
       }
 
@@ -193,22 +282,34 @@ export class SubscriptionManager {
       const matches = sub.matcher.match(note) && inScope;
 
       if (matches) {
-        this.emit(sub, sseEvent("upsert", { note }));
+        this.emit(sub, "upsert", { note });
       } else if (event === "updated" && inScope) {
-        this.emit(sub, sseEvent("remove", { id: note.id }));
+        this.emit(sub, "remove", { id: note.id });
       }
     }
   }
 
   shutdown(): void {
+    this.detachHooks();
+    for (const sub of Array.from(this.subs)) this.remove(sub);
+  }
+
+  /**
+   * Unregister the post-commit hook callbacks WITHOUT closing any sink. Used to
+   * simulate a hibernation eviction in tests: in production the DO teardown
+   * discards the whole manager (and the store's hook registry with it), but in
+   * the vitest harness the store persists, so a fresh manager must first detach
+   * the stale one's hooks or they'd double-dispatch to abandoned subs. Distinct
+   * from {@link shutdown}, which ALSO closes every sink (a real teardown).
+   */
+  detachHooks(): void {
     for (const u of this.unregisters) u();
     this.unregisters = [];
     this.hooksRegistered = false;
-    for (const sub of Array.from(this.subs)) this.remove(sub);
   }
 }
 
-/** Serialize a snapshot frame (exported for the route + tests). */
-export function snapshotFrame(notes: Note[]): SseFrame {
-  return sseEvent("snapshot", { notes });
+/** Serialize a snapshot SSE frame (exported for the SSE route + tests). */
+export function snapshotFrame(notes: Note[]): string {
+  return sseFrame("snapshot", { notes });
 }
