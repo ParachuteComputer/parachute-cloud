@@ -81,7 +81,7 @@ bun install                         # ALSO refreshes the copied core dep (see go
 bun run test                        # control-plane tests (src/) — 123
 bun run typecheck                   # root tsc
 cd workers/vault && bun run typecheck && bun x vitest run    # 203+1 todo under workerd
-cd workers/identity && bun run typecheck && bun x vitest run # 331
+cd workers/identity && bun run typecheck && bun x vitest run # 332
 bash scripts/deploy-staging.sh      # deploy both workers -e staging + migrate + seed
 bun scripts/smoke-staging.ts        # FULL live smoke vs staging (creates test debris)
 bash scripts/deploy-prod.sh         # deploy both workers top-level + migrate (NO seed)

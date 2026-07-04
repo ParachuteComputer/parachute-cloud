@@ -82,6 +82,15 @@ export const BILLING_TRAIL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 /** Bound one sweep run (the drip/usage per-run-cap pattern). */
 export const BILLING_SWEEP_CAP = 50;
 
+/**
+ * Bound the checkout-completed CAS loop (cloud#64, the concurrent-race note
+ * on {@link handleCheckoutSessionCompleted}): each retry means the users row
+ * changed between our read and our conditional write — one concurrent
+ * competitor per attempt. Three attempts tolerates a double- AND triple-tab
+ * pileup; beyond that we ack + log rather than spin.
+ */
+export const CHECKOUT_CAS_MAX_ATTEMPTS = 3;
+
 // ─── event handlers ──────────────────────────────────────────────────────────
 
 /**
@@ -109,6 +118,22 @@ export const BILLING_SWEEP_CAP = 50;
  * fails the upgrade. (The checkout door also refuses a session while an
  * active subscription exists — billing.ts — but that belt can't see two
  * sessions minted before either completes; this is the backstop.)
+ *
+ * CONCURRENT deliveries need more than the mismatch check: the identity
+ * worker is stateless, so two `checkout.session.completed` invocations for
+ * the same user can BOTH read the row before EITHER writes (e.g. both see
+ * NULL on a first purchase) — neither computes a mismatch and a plain
+ * last-writer-wins UPDATE would re-create the orphan silently. So the write
+ * is a COMPARE-AND-SWAP on the snapshot it was computed from
+ * (`WHERE ... AND stripe_subscription_id IS ?` — `IS`, not `=`, so a NULL
+ * expectation matches NULL; SQLite executes each statement atomically). A
+ * missed CAS means the row moved underneath us: log
+ * `billing_stale_subscription_race_retry` (never silent), re-read, and
+ * re-run the idempotency + mismatch logic — the loser's re-read now SEES the
+ * winner's subscription id and cancels it. Bounded at
+ * {@link CHECKOUT_CAS_MAX_ATTEMPTS}; exhaustion (would take N interleaved
+ * races) logs an error and acks with a distinct action so the outcome
+ * column flags it for the operator.
  */
 export async function handleCheckoutSessionCompleted(
   db: D1Database,
@@ -129,12 +154,6 @@ export async function handleCheckoutSessionCompleted(
       headers: { "content-type": "application/json" },
     });
   }
-  const user = await getUserById(db, userId);
-  if (!user) {
-    // Row deleted since checkout; ack so Stripe stops retrying.
-    return { ok: true, userId: null, action: "checkout_completed_unknown_user" };
-  }
-
   const customerId = typeof session.customer === "string" ? session.customer : null;
   const subscriptionId = typeof session.subscription === "string" ? session.subscription : null;
 
@@ -146,63 +165,96 @@ export async function handleCheckoutSessionCompleted(
   const metaPlan = coercePlanId(session.metadata?.plan);
   const boughtPlan: PlanId = isPaidPlan(metaPlan) ? metaPlan : "parachute";
 
-  if (isPaidPlan(user.plan) && user.plan === boughtPlan && user.stripeSubscriptionId !== null && user.stripeSubscriptionId === subscriptionId) {
-    return { ok: true, userId: user.id, action: "checkout_completed_idempotent" };
-  }
+  // Read → idempotency-check → CAS-write → repair, re-run on a CAS miss (the
+  // concurrent-race note in the function doc). One pass through this loop is
+  // the entire pre-fix handler; the loop only exists so a lost write RACE
+  // re-reads instead of silently last-writer-winning.
+  for (let attempt = 1; attempt <= CHECKOUT_CAS_MAX_ATTEMPTS; attempt++) {
+    const user = await getUserById(db, userId);
+    if (!user) {
+      // Row deleted since checkout; ack so Stripe stops retrying.
+      return { ok: true, userId: null, action: "checkout_completed_unknown_user" };
+    }
 
-  // The row's PRIOR subscription id, read before the flip — if it's a
-  // different live subscription, this checkout is the second leg of a
-  // double-checkout race and the prior one must be canceled (see the
-  // function doc), not silently orphaned.
-  const staleSubscriptionId = user.stripeSubscriptionId;
+    // Idempotency layer 2 — also the exit for a CAS loser whose re-read finds
+    // its OWN subscription already applied (a same-content replay race).
+    if (isPaidPlan(user.plan) && user.plan === boughtPlan && user.stripeSubscriptionId !== null && user.stripeSubscriptionId === subscriptionId) {
+      return { ok: true, userId: user.id, action: "checkout_completed_idempotent" };
+    }
 
-  await db
-    .prepare(
-      `UPDATE users SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = ?,
-         pending_plan = NULL, plan_downgrade_at = NULL
-       WHERE id = ?`,
-    )
-    .bind(customerId, subscriptionId, boughtPlan, user.id)
-    .run();
+    // The row's PRIOR subscription id, from the snapshot this iteration's
+    // write is conditioned on — if it's a different live subscription, this
+    // checkout is the second leg of a double-checkout race and the prior one
+    // must be canceled (see the function doc), not silently orphaned.
+    const staleSubscriptionId = user.stripeSubscriptionId;
 
-  // Cancel-on-mismatch (cloud#64) — AFTER the row flip (ordering rationale in
-  // the function doc). Retrieve-then-cancel: a legit re-subscribe during the
-  // downgrade grace leaves an already-canceled stale id on the row — nothing
-  // to cancel there, and blind-canceling it would just error.
-  if (staleSubscriptionId && subscriptionId && staleSubscriptionId !== subscriptionId) {
-    try {
-      const stale = await stripe.subscriptions.retrieve(staleSubscriptionId);
-      if (stale.status === "canceled") {
-        console.log(
-          `event=billing_stale_subscription_already_canceled user=${user.id} stale=${staleSubscriptionId}`,
-        );
-      } else {
-        await stripe.subscriptions.cancel(staleSubscriptionId);
-        console.warn(
-          `event=billing_stale_subscription_canceled user=${user.id} stale=${staleSubscriptionId} active=${subscriptionId}`,
+    // COMPARE-AND-SWAP: only write over the snapshot we read (`IS`, not `=`,
+    // so a NULL expectation matches NULL). changes=0 → the row moved under us
+    // → loudly retry from the re-read.
+    const write = await db
+      .prepare(
+        `UPDATE users SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = ?,
+           pending_plan = NULL, plan_downgrade_at = NULL
+         WHERE id = ? AND stripe_subscription_id IS ?`,
+      )
+      .bind(customerId, subscriptionId, boughtPlan, user.id, staleSubscriptionId)
+      .run();
+    if ((write.meta.changes ?? 0) === 0) {
+      console.warn(
+        `event=billing_stale_subscription_race_retry user=${user.id} attempt=${attempt} expected=${staleSubscriptionId ?? "null"} incoming=${subscriptionId ?? "null"}`,
+      );
+      continue;
+    }
+
+    // Cancel-on-mismatch (cloud#64) — AFTER the row flip (ordering rationale
+    // in the function doc). Retrieve-then-cancel: a legit re-subscribe during
+    // the downgrade grace leaves an already-canceled stale id on the row —
+    // nothing to cancel there, and blind-canceling it would just error.
+    if (staleSubscriptionId && subscriptionId && staleSubscriptionId !== subscriptionId) {
+      try {
+        const stale = await stripe.subscriptions.retrieve(staleSubscriptionId);
+        if (stale.status === "canceled") {
+          console.log(
+            `event=billing_stale_subscription_already_canceled user=${user.id} stale=${staleSubscriptionId}`,
+          );
+        } else {
+          await stripe.subscriptions.cancel(staleSubscriptionId);
+          console.warn(
+            `event=billing_stale_subscription_canceled user=${user.id} stale=${staleSubscriptionId} active=${subscriptionId}`,
+          );
+        }
+      } catch (err) {
+        // Best-effort: the upgrade must never fail on the repair. The orphan
+        // is loud in the logs (and visible in the Stripe dashboard) for
+        // operator follow-up — likely a manual cancel + first-period refund.
+        console.error(
+          `event=billing_stale_subscription_cancel_failed user=${user.id} stale=${staleSubscriptionId} error=${err instanceof Error ? err.message : String(err)}`,
         );
       }
-    } catch (err) {
-      // Best-effort: the upgrade must never fail on the repair. The orphan is
-      // loud in the logs (and visible in the Stripe dashboard) for operator
-      // follow-up — likely a manual cancel + first-period refund.
-      console.error(
-        `event=billing_stale_subscription_cancel_failed user=${user.id} stale=${staleSubscriptionId} error=${err instanceof Error ? err.message : String(err)}`,
+    }
+
+    // Caps + voice entitlement lift immediately (best-effort per vault; a miss
+    // self-heals via the backfill script / the next plan event — vault-call.ts).
+    const results = await applyPlanToVaults(db, deps, user.id);
+    const failed = results.filter((r) => !r.ok);
+    if (failed.length > 0) {
+      console.warn(
+        `event=billing_cap_push_partial user=${user.id} plan=${boughtPlan} failed=${failed.map((f) => f.vault).join(",")}`,
       );
     }
+    console.log(`event=billing_upgraded user=${user.id} plan=${boughtPlan} subscription=${subscriptionId ?? "-"} vaults=${results.length}`);
+    return { ok: true, userId: user.id, action: "checkout_completed_upgraded" };
   }
 
-  // Caps + voice entitlement lift immediately (best-effort per vault; a miss
-  // self-heals via the backfill script / the next plan event — vault-call.ts).
-  const results = await applyPlanToVaults(db, deps, user.id);
-  const failed = results.filter((r) => !r.ok);
-  if (failed.length > 0) {
-    console.warn(
-      `event=billing_cap_push_partial user=${user.id} plan=${boughtPlan} failed=${failed.map((f) => f.vault).join(",")}`,
-    );
-  }
-  console.log(`event=billing_upgraded user=${user.id} plan=${boughtPlan} subscription=${subscriptionId ?? "-"} vaults=${results.length}`);
-  return { ok: true, userId: user.id, action: "checkout_completed_upgraded" };
+  // CAS exhausted — would take CHECKOUT_CAS_MAX_ATTEMPTS interleaved races on
+  // one row (beyond-astronomical for real Stripe delivery jitter). Ack 200 so
+  // Stripe stops retrying into the dedup wall; the error log + the distinct
+  // action (recorded on the dedup row's `outcome`) flag it for the operator:
+  // this subscription's ids never landed and it may need a manual cancel.
+  console.error(
+    `event=billing_stale_subscription_cas_exhausted user=${userId} attempts=${CHECKOUT_CAS_MAX_ATTEMPTS} incoming=${subscriptionId ?? "null"}`,
+  );
+  return { ok: true, userId, action: "checkout_completed_cas_exhausted" };
 }
 
 /**

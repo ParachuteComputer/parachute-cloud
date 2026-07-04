@@ -178,6 +178,61 @@ async function userRow(id: string) {
   return env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first<Record<string, unknown>>();
 }
 
+/**
+ * A one-shot N-party barrier: `arrive()` resolves for everyone only once all
+ * `parties` have arrived (and immediately thereafter). Drives the concurrent
+ * read-read-write-write interleaving in the CAS race test.
+ */
+function makeBarrier(parties: number): { arrive: () => Promise<void> } {
+  let arrived = 0;
+  let release!: () => void;
+  const released = new Promise<void>((r) => (release = r));
+  return {
+    arrive: () => {
+      arrived += 1;
+      if (arrived >= parties) release();
+      return released;
+    },
+  };
+}
+
+/**
+ * Wrap a D1Database so THIS invocation's FIRST `getUserById` read resolves its
+ * row, then blocks on the shared barrier until every party holds its snapshot
+ * — after which everything (including CAS-retry re-reads) passes straight
+ * through to the real DB. Each racing invocation gets its own wrapper around
+ * the same underlying database.
+ */
+function readBarrierDb(real: D1Database, barrier: { arrive: () => Promise<void> }): D1Database {
+  let gated = false;
+  return {
+    prepare(sql: string) {
+      const stmt = real.prepare(sql);
+      if (gated || sql !== "SELECT * FROM users WHERE id = ?") return stmt;
+      gated = true;
+      return {
+        bind: (...args: unknown[]) => {
+          const bound = stmt.bind(...args);
+          return {
+            first: async (...a: unknown[]) => {
+              const row = await (bound.first as (...x: unknown[]) => Promise<unknown>)(...a);
+              await barrier.arrive(); // hold until all parties have read
+              return row;
+            },
+            run: () => bound.run(),
+            all: () => bound.all(),
+            raw: () => bound.raw(),
+          };
+        },
+      };
+    },
+    batch: (stmts: D1PreparedStatement[]) => real.batch(stmts),
+    exec: (sql: string) => real.exec(sql),
+    dump: () => real.dump(),
+    withSession: (constraint?: string) => real.withSession(constraint as never),
+  } as unknown as D1Database;
+}
+
 /** Seed a paid user wired to Stripe (the post-checkout shape). */
 async function seedPaidUser(
   email: string,
@@ -719,6 +774,53 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
     );
     expect(((await deleted.json()) as { action: string }).action).toBe("subscription_deleted_unknown_user");
     expect((await getUserById(env.DB, id))!.pendingPlan).toBeNull(); // no downgrade scheduled
+  });
+
+  test("CONCURRENT race (read-read-write-write): the CAS catches the lost update — loser retries loudly + cancels the winner-turned-stale sub", async () => {
+    // The interleaving the sequential mismatch check CANNOT see: both
+    // deliveries read the row BEFORE either writes (both see sub=NULL on a
+    // first purchase), so neither computes a mismatch — an unconditional
+    // UPDATE would last-writer-win and SILENTLY re-create the #64 orphan.
+    // The barrier below holds each invocation's first users-read until BOTH
+    // have their snapshot, forcing exactly read-read-write-write; the CAS
+    // (`WHERE stripe_subscription_id IS ?`) makes the second writer miss,
+    // re-read, and repair.
+    const { id } = await seedUser("race-concurrent@example.com");
+    const canceled: string[] = [];
+    const stripeStub = {
+      subscriptions: {
+        retrieve: async (subId: string) => ({ id: subId, status: "active" }),
+        cancel: async (subId: string) => {
+          canceled.push(subId);
+          return { id: subId, status: "canceled" };
+        },
+      },
+    } as unknown as Stripe;
+
+    const barrier = makeBarrier(2);
+    const eventFor = (sub: string) =>
+      JSON.parse(
+        makeEventPayload(
+          "checkout.session.completed",
+          checkoutCompletedObject({ userId: id, customer: "cus_cc", subscription: sub }),
+        ),
+      ) as Stripe.Event;
+
+    const [a, b] = await Promise.all([
+      handleCheckoutSessionCompleted(readBarrierDb(env.DB, barrier), deps(), eventFor("sub_cc_a"), stripeStub),
+      handleCheckoutSessionCompleted(readBarrierDb(env.DB, barrier), deps(), eventFor("sub_cc_b"), stripeStub),
+    ]);
+    expect((a as { action: string }).action).toBe("checkout_completed_upgraded");
+    expect((b as { action: string }).action).toBe("checkout_completed_upgraded");
+
+    // Exactly ONE subscription survives on the row and the OTHER was canceled
+    // — no orphan, whichever invocation won the first CAS (the winner is
+    // scheduling-dependent; the INVARIANT isn't).
+    const user = (await getUserById(env.DB, id))!;
+    expect(user.plan).toBe("parachute");
+    expect(canceled).toHaveLength(1);
+    expect(user.stripeSubscriptionId).not.toBeNull();
+    expect(new Set([user.stripeSubscriptionId, ...canceled])).toEqual(new Set(["sub_cc_a", "sub_cc_b"]));
   });
 
   test("RACE repair skips an already-canceled stale sub (legit re-subscribe during grace): no cancel call", async () => {

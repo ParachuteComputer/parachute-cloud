@@ -151,11 +151,20 @@ export async function handleStripeWebhookPost(
   }
 
   // Forensics: stamp the dispatch outcome on the dedup row (see the module
-  // note). Best-effort by position — a handler that THREW never reaches this,
-  // leaving the row's NULL outcome as the "never completed" marker.
-  await env.DB.prepare("UPDATE processed_stripe_events SET outcome = ? WHERE event_id = ?")
-    .bind(outcome, event.id)
-    .run();
+  // note). Best-effort in BOTH directions — a handler that THREW never
+  // reaches this (NULL outcome = the "never completed" marker), and a
+  // transient D1 error on this write must never turn an already-applied
+  // billing action into a 500 (Stripe's retry would just hit the layer-1
+  // dedup; the action succeeded, only the forensic stamp is lost).
+  try {
+    await env.DB.prepare("UPDATE processed_stripe_events SET outcome = ? WHERE event_id = ?")
+      .bind(outcome, event.id)
+      .run();
+  } catch (err) {
+    console.error(
+      `event=billing_webhook_outcome_write_failed event_id=${event.id} outcome=${outcome} error=${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 
   return response;
 }

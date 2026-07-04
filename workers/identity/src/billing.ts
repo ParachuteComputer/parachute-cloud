@@ -110,6 +110,12 @@ export async function handleCheckoutPost(
   // cancel-on-mismatch, billing-lifecycle.ts, is the backstop that unwinds
   // the race this belt can't see: two sessions minted before either
   // completes). First-time buyers have no customer id — no extra API call.
+  //
+  // Status scope: `active` only. `trialing` isn't covered because no plan
+  // configures a trial today (a future trials feature must widen this — a
+  // trialing sub is just as double-billable); `past_due`/`unpaid` aren't
+  // because a dunning user still has `plan` paid, so the `isPaidPlan` gate
+  // above already refuses them before this call.
   if (user.stripeCustomerId) {
     try {
       const subs = await stripe.subscriptions.list({
