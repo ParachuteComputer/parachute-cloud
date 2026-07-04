@@ -4,13 +4,14 @@
  * These need no DO/R2/AI binding — the provider takes an injected
  * `WorkersAiLike` stub, and the body transforms are pure. They pin the
  * spike's hard-won constraints (base64-STRING input, duration metering, the
- * ~45 MB rejection, the 4002/too-long terminal mapping) and the "never destroy
- * content" marker policy.
+ * 25 MB ceiling incl. its exact boundary (cloud#67), the 4002/too-long
+ * terminal mapping) and the "never destroy content" marker policy.
  */
 import { describe, expect, it } from "vitest";
 import {
   WorkersAiProvider,
   WHISPER_MODEL,
+  MAX_TRANSCRIBE_BYTES,
   type WorkersAiLike,
 } from "../src/transcription/workers-ai.ts";
 import {
@@ -85,6 +86,27 @@ describe("WorkersAiProvider", () => {
       retriable: false,
     });
     expect(ai.calls).toHaveLength(0); // never touched the model
+  });
+
+  it("cloud#67: near-ceiling boundary at the REAL constant — exactly MAX_TRANSCRIBE_BYTES passes, one byte over is gated", async () => {
+    // The committed version of the manual live-staging boundary check
+    // (24 MB passed / 26 MB gated): the ceiling is a strict `>` against the
+    // exported constant, so drifting it (or flipping `>` to `>=`) fails here.
+    // Memory note: at-ceiling is the DESIGNED production peak (~25 MB raw +
+    // ~33 MB base64 — see the constant's memory math), safe in the test isolate.
+    const ai = stubAi(() => ({ text: "at the ceiling" }));
+    const provider = new WorkersAiProvider(ai); // default ceiling — no override
+
+    const atCeiling = await provider.transcribe(input(new Uint8Array(MAX_TRANSCRIBE_BYTES)));
+    expect(atCeiling.text).toBe("at the ceiling");
+    expect(ai.calls).toHaveLength(1);
+
+    await expect(provider.transcribe(input(new Uint8Array(MAX_TRANSCRIBE_BYTES + 1)))).rejects.toMatchObject({
+      name: "TranscriptionError",
+      code: "audio_too_large",
+      retriable: false,
+    });
+    expect(ai.calls).toHaveLength(1); // the model never saw the oversized one
   });
 
   it("maps a 4002 / too-long inference error to a non-retriable audio_too_long", async () => {

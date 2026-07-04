@@ -100,6 +100,42 @@ export async function handleCheckoutPost(
   }
 
   const stripe = overrides?.stripe ?? makeStripe(config.secretKey);
+
+  // Belt against the double-checkout race (cloud#64): when the plan row lags
+  // a completed payment (webhook in flight/delayed), `isPaidPlan` above can't
+  // see it — but Stripe can. For a user we already know the customer for,
+  // refuse a new session while an ACTIVE subscription exists (a second one
+  // would double-bill). FAIL OPEN on a list error (availability over
+  // strictness — session creation would likely fail too, and the webhook's
+  // cancel-on-mismatch, billing-lifecycle.ts, is the backstop that unwinds
+  // the race this belt can't see: two sessions minted before either
+  // completes). First-time buyers have no customer id — no extra API call.
+  //
+  // Status scope: `active` only. `trialing` isn't covered because no plan
+  // configures a trial today (a future trials feature must widen this — a
+  // trialing sub is just as double-billable); `past_due`/`unpaid` aren't
+  // because a dunning user still has `plan` paid, so the `isPaidPlan` gate
+  // above already refuses them before this call.
+  if (user.stripeCustomerId) {
+    try {
+      const subs = await stripe.subscriptions.list({
+        customer: user.stripeCustomerId,
+        status: "active",
+        limit: 1,
+      });
+      if (subs.data.length > 0) {
+        console.warn(
+          `event=billing_checkout_refused_active_subscription user=${user.id} subscription=${subs.data[0]!.id}`,
+        );
+        return redirectResponse("/console?billing_err=already");
+      }
+    } catch (err) {
+      console.error(
+        `event=billing_checkout_subscription_list_failed user=${user.id} error=${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   try {
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",

@@ -20,6 +20,7 @@ import { base, freshVault, mintToken, op } from "./helpers.ts";
 import { r2Key } from "../src/rest/notes.ts";
 import type { TranscriptionProvider, TranscribeInput, TranscribeResult } from "@openparachute/core/src/transcription/provider.ts";
 import { TranscriptionError } from "@openparachute/core/src/transcription/provider.ts";
+import { MAX_TRANSCRIBE_BYTES } from "../src/transcription/workers-ai.ts";
 import type { TextGeneratorLike } from "../src/transcription/cleanup.ts";
 
 /** First-party admin token — exactly what identity's plan push mints. */
@@ -270,6 +271,34 @@ describe("voice transcription pipeline (cloud#56)", () => {
     // Attachment recorded failed (not pending forever).
     const atts = (await (await op(v, `/api/notes/${noteId}/attachments`)).json()) as any[];
     expect(atts[0].metadata.transcribe_status).toBe("failed");
+  });
+
+  it("cloud#67: over-ceiling audio is HEAD-gated terminal BEFORE the R2 read — the provider never runs", async () => {
+    // The uncatchable-OOM guard: an oversized file must fail on `head.size >
+    // MAX_TRANSCRIBE_BYTES` before its bytes ever land in DO memory (the
+    // base64 encode OOM tears the isolate down uncatchably — workers-ai.ts).
+    const v = freshVault("tx");
+    await pushEntitlement(v, true, 600);
+    const { noteId, audioPath } = await setupVoiceNote(v);
+    // Swap the stored object for one just over the ceiling, straight into R2
+    // (skips a 25 MB multipart upload; the gate only reads head.size).
+    await env.ATTACHMENTS.put(r2Key(v, audioPath), new Uint8Array(MAX_TRANSCRIBE_BYTES + 1));
+
+    let providerCalls = 0;
+    await runAlarmWith(
+      v,
+      stubProvider(() => {
+        providerCalls++;
+        return { text: "must never be reached" };
+      }),
+    );
+
+    expect(providerCalls).toBe(0); // gated before the read, encode, and provider
+    const body = await noteBody(v, noteId);
+    expect(body).toContain("_Transcription unavailable._");
+    expect(body).not.toContain("_Transcript pending._");
+    const atts = (await (await op(v, `/api/notes/${noteId}/attachments`)).json()) as any[];
+    expect(atts[0].metadata.transcribe_status).toBe("failed"); // terminal, not a retry loop
   });
 
   it("retention=until_transcribed drops the R2 audio + frees the storage meter on success", async () => {
