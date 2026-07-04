@@ -524,6 +524,13 @@ export interface ConsoleProps {
   /** The user's plan — the header line + the at-cap create card render from plans.ts. */
   plan: PlanId;
   /**
+   * ISO timestamp when a scheduled downgrade to free lands (pending_plan =
+   * 'free' + plan_downgrade_at — a promo comp's expiry, or a real
+   * subscription's scheduled cancel). Non-null → the plan line shows
+   * "until <date>" so the paid period's edge is never a silent cliff.
+   */
+  planUntil?: string | null;
+  /**
    * Across-vaults total of the latest recorded usage rows (bytes). Null until
    * the first rollup lands — the plan line then omits the usage segment
    * rather than claiming a misleading zero.
@@ -801,6 +808,7 @@ export function renderConsole(props: ConsoleProps): string {
     showChecklistRestore,
     firstRun,
     plan,
+    planUntil,
     totalUsedBytes,
     atVaultCap,
     isOperator,
@@ -868,7 +876,29 @@ export function renderConsole(props: ConsoleProps): string {
     plan === "free" && !billingConfigured && !mockBillingEnabled
       ? ` <span style="opacity:.75">&middot; ${esc(parachuteTeaser())}</span>`
       : "";
-  const planHtml = `${esc(planLine(plan))}${usageHtml}${teaserHtml}${upgradeHtml}${voiceUpgradeHtml}${mockNoteHtml}${manageBillingHtml}`;
+  // A scheduled downgrade's date (promo comp expiry / real cancel) rides the
+  // plan line — quiet, honest, always visible while the clock runs.
+  const planUntilHtml =
+    isPaidPlan(plan) && planUntil
+      ? ` <span data-testid="plan-until">&middot; until ${esc(planUntil.slice(0, 10))}</span>`
+      : "";
+  const planHtml = `${esc(planLine(plan))}${planUntilHtml}${usageHtml}${teaserHtml}${upgradeHtml}${voiceUpgradeHtml}${mockNoteHtml}${manageBillingHtml}`;
+  // "Have a code?" — promo redemption (promo.ts), free accounts only (a paid
+  // account has nothing to redeem onto; the POST refuses regardless). A quiet
+  // disclosure under the plan line: present for launch codes, invisible noise
+  // otherwise. Inline styles undo the details/input defaults (those are sized
+  // for the card sections, not a one-line header affordance).
+  const promoHtml =
+    plan === "free"
+      ? `<details data-testid="promo-code" style="margin:-.9rem 0 1.2rem;border-top:0;padding-top:0;font-size:.88rem">
+       <summary class="muted" style="font-weight:500">Have a code?</summary>
+       <form method="post" action="/console/promo" style="display:flex;gap:.5rem;align-items:center;margin-top:.45rem;max-width:22rem">
+         <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+         <input name="code" type="text" placeholder="Your code" required aria-label="Promo code" autocomplete="off" spellcheck="false" style="text-transform:uppercase;font-size:.92rem;padding:.45rem .6rem">
+         <button class="secondary" type="submit" style="width:auto;margin-top:0;font-size:.92rem;padding:.45rem .9rem;white-space:nowrap">Redeem</button>
+       </form>
+     </details>`
+      : "";
   // The Admin link renders ONLY for operators — everyone else never learns the
   // route exists (it answers 404 to them anyway; admin.ts).
   const header = (title: string) => `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">
@@ -877,7 +907,8 @@ export function renderConsole(props: ConsoleProps): string {
        <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}"><button class="linkbtn" type="submit">Sign out</button></form></span>
      </div>
      <p class="muted" style="margin:.15rem 0 .2rem">${esc(email)}</p>
-     <p class="muted" data-testid="plan-line" style="margin:0 0 1.2rem;font-size:.88rem">${planHtml}</p>`;
+     <p class="muted" data-testid="plan-line" style="margin:0 0 1.2rem;font-size:.88rem">${planHtml}</p>
+     ${promoHtml}`;
 
   if (vaults.length === 0) {
     return page(

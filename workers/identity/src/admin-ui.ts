@@ -62,10 +62,12 @@ export interface AdminOverviewProps {
   signupsByDay: Array<{ day: string; count: number }>;
   /** Latest ops alert rows (ops_alerts), newest first. */
   latestAlerts: Array<{ key: string; lastAlertAt: string }>;
+  /** Promo codes with redemption counts (promo.ts listPromoCodes) — read-only. */
+  promoCodes: import("./promo.ts").PromoCodeRow[];
 }
 
 export function renderAdminOverview(props: AdminOverviewProps): string {
-  const { stats, dripEvents7d, signupsByDay, latestAlerts } = props;
+  const { stats, dripEvents7d, signupsByDay, latestAlerts, promoCodes } = props;
   const stat = (k: string, v: number | string, sub = "") =>
     `<div class="stat"><div class="k">${esc(k)}</div><div class="v">${esc(String(v))}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ""}</div>`;
 
@@ -93,6 +95,22 @@ export function renderAdminOverview(props: AdminOverviewProps): string {
           .map((r) => `<tr><td><code>${esc(r.key)}</code></td><td>${esc(r.lastAlertAt)}</td></tr>`)
           .join("\n");
 
+  // Promo codes — read-only redemption tallies (the levers are D1 UPDATEs;
+  // migration 0016's header has the statements).
+  const promoRows =
+    promoCodes.length === 0
+      ? `<tr><td colspan="4" class="muted">No promo codes seeded.</td></tr>`
+      : promoCodes
+          .map(
+            (p) => `<tr data-testid="admin-promo-row">
+        <td><code>${esc(p.code)}</code></td>
+        <td style="text-align:right">${p.compDays}</td>
+        <td style="text-align:right">${p.redeemedCount} / ${p.maxRedemptions}</td>
+        <td>${p.active ? `<span class="badge badge-on">active</span>` : `<span class="badge badge-warn">inactive</span>`}</td>
+      </tr>`,
+          )
+          .join("\n");
+
   return page(
     "Admin — Parachute",
     `${ADMIN_STYLE}
@@ -109,6 +127,11 @@ export function renderAdminOverview(props: AdminOverviewProps): string {
      <div class="card">
        <h2>Drip sends — last 7 days</h2>
        <div class="tablewrap"><table class="fleet"><thead><tr><th>Event</th><th style="text-align:right">Count</th></tr></thead><tbody>${dripRows}</tbody></table></div>
+     </div>
+     <div class="card">
+       <h2>Promo codes</h2>
+       <p class="muted" style="margin:.1rem 0 .3rem">Redemptions per code (one code per account, comp expires via the hourly sweep). Tune rows with D1 UPDATEs — see migration 0016.</p>
+       <div class="tablewrap"><table class="fleet"><thead><tr><th>Code</th><th style="text-align:right">Comp days</th><th style="text-align:right">Redeemed</th><th>Status</th></tr></thead><tbody>${promoRows}</tbody></table></div>
      </div>
      <div class="card">
        <h2>Latest ops alerts</h2>

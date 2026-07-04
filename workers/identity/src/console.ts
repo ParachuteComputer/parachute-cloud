@@ -57,7 +57,7 @@ import {
   listVaultsForOwner,
   userOwnsVault,
 } from "./vaults.ts";
-import { PLAN_SPECS, restoreAtCapMessage, transcriptionEntitlement, vaultCapMessage } from "./plans.ts";
+import { PLAN_SPECS, isPaidPlan, restoreAtCapMessage, transcriptionEntitlement, vaultCapMessage } from "./plans.ts";
 import { callVaultApi, pushVaultCap } from "./vault-call.ts";
 import {
   callVaultRestore,
@@ -279,6 +279,10 @@ async function renderConsoleFor(
       showChecklistRestore: checklistHidden,
       firstRun: opts.firstRun,
       plan: user.plan,
+      // Honest paid-until surface: a scheduled downgrade to free (promo comp
+      // expiry, or a real subscription's scheduled cancel) shows its date on
+      // the plan line — never a silent cliff.
+      planUntil: user.pendingPlan === "free" && user.planDowngradeAt ? user.planDowngradeAt : null,
       totalUsedBytes,
       // Billing doors (Wave 4d): Upgrade for free users / Manage billing for
       // paid users WITH a Stripe customer (comped accounts have none) — both
@@ -317,6 +321,18 @@ const BILLING_ERRORS: Record<string, string> = {
   stripe: "Couldn't reach the payment provider just now. Please try again in a moment.",
 };
 
+/**
+ * Promo-code feedback (promo.ts handlePromoRedeemPost) — same allowlisted-code
+ * pattern; the four distinct refusals each get their own honest copy.
+ */
+const PROMO_ERRORS: Record<string, string> = {
+  session: "Your session expired. Please try again.",
+  invalid: "That code isn't one we recognize — check the spelling and try again.",
+  exhausted: "That code has been fully redeemed — every spot is taken. Write hello@parachute.computer if you think that's wrong.",
+  "already-used": "This account has already redeemed a code — codes are one per account.",
+  "already-paid": "You're already on a paid plan, so there's nothing for a code to add.",
+};
+
 export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
@@ -333,20 +349,29 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
   // rides the success message: honesty at the exact moment it matters.
   const restoredParam = params.get("restored");
   const restoredVault = restoredParam && vaults.some((v) => v.name === restoredParam) ? restoredParam : null;
+  // Promo success copy renders from the ROW (plan + plan_downgrade_at), never
+  // from the query string — the param only picks the message; the date is the
+  // stored truth (honest even on a stale/replayed URL).
+  const promoRedeemed =
+    params.get("promo_redeemed") && isPaidPlan(user.plan) && user.planDowngradeAt
+      ? `Code redeemed — you're on the ${PLAN_SPECS[user.plan].label} plan until ${user.planDowngradeAt.slice(0, 10)}. Welcome aboard.`
+      : null;
   const notice = created
     ? `Your vault "${created}" is ready — open your notes, or connect your AI below.`
     : restoredVault
       ? `Snapshot restored into "${restoredVault}" — a new vault; the original is untouched. Heads up: v1 snapshots don't include attachment files, so notes and their attachment references are back but the files themselves aren't.`
       : packVault
       ? `Surface Starter added to ${packVault} — ask your connected AI to read it.`
-      : params.get("mock_upgraded")
+      : promoRedeemed
+        ? promoRedeemed
+        : params.get("mock_upgraded")
         ? `Test purchase complete — no real charge. You're on the ${PLAN_SPECS[user.plan].label} plan now (mock billing; the caps and any voice entitlement lifted exactly as a real payment would).`
         : params.get("upgraded")
           ? "Thanks — payment received. Your Parachute plan activates the moment Stripe's confirmation lands (usually seconds)."
           : params.get("checkout_canceled")
             ? "Checkout canceled — nothing changed."
             : undefined;
-  const error = BILLING_ERRORS[params.get("billing_err") ?? ""];
+  const error = BILLING_ERRORS[params.get("billing_err") ?? ""] ?? PROMO_ERRORS[params.get("promo_err") ?? ""];
   return renderConsoleFor(db, req, deps, user, { notice, error });
 }
 

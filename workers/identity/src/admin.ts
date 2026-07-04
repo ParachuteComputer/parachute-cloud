@@ -30,6 +30,7 @@ import { PLAN_SPECS, coercePlanId, isPlanId } from "./plans.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 import { collectDigestStats } from "./ops.ts";
 import { latestUsageForVaults } from "./usage.ts";
+import { listPromoCodes } from "./promo.ts";
 import {
   type AdminUserRow,
   type AdminVaultRow,
@@ -126,7 +127,11 @@ export async function handleAdminOverviewGet(db: D1Database, req: Request, deps:
     .all<{ key: string; last_alert_at: string }>();
   const latestAlerts = (alertRes.results ?? []).map((r) => ({ key: r.key, lastAlertAt: r.last_alert_at }));
 
-  return htmlResponse(renderAdminOverview({ stats, dripEvents7d, signupsByDay, latestAlerts }));
+  // Promo codes (July 4th launch) — read-only redemption visibility; the rows
+  // themselves are tuned via D1 statements (migration 0016's header).
+  const promoCodes = await listPromoCodes(db);
+
+  return htmlResponse(renderAdminOverview({ stats, dripEvents7d, signupsByDay, latestAlerts, promoCodes }));
 }
 
 // --- GET /admin/users --------------------------------------------------------
