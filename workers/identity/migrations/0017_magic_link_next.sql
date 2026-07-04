@@ -1,0 +1,13 @@
+-- 0017: magic-link resume target (launch-flow fix 2).
+--
+-- A magic link minted from the OAuth authorize login page must RESUME the
+-- pending authorize request after verify — otherwise a passwordless user
+-- (the signup default) whose session lapsed dead-ends at /console and their
+-- AI client never gets its code. The full authorize URL is reconstructed
+-- SERVER-SIDE at send time (oauth-authorize.ts buildAuthorizeUrl — the same
+-- mechanism the password login's 2FA divert uses for pending_logins.next)
+-- and stored here, keyed by the token hash; the emailed link itself stays an
+-- opaque `/auth/verify?token=…` handle and never carries OAuth params.
+-- NULL (every pre-existing row, and every plain console sign-in) keeps the
+-- old destination: /console.
+ALTER TABLE magic_links ADD COLUMN next TEXT;

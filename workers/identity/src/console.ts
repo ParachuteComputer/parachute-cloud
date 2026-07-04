@@ -21,6 +21,9 @@
  *   POST /console/packs      apply a seed pack to an owned vault (server-side
  *                            call to the vault worker with an internally minted
  *                            scoped token) → /console?pack_added=<name>
+ *   POST /console/vaults/export  stream an owned vault's portable-md export
+ *                            tarball back as a download (the same mint seam,
+ *                            read verb — see handleExportPost)
  *   POST /console/checklist  mark a getting-started item done (or `hidden` to
  *                            dismiss the card) → 302 to the item's destination
  *                            (door items) or /console
@@ -462,11 +465,75 @@ async function writeFirstNote(
   }
 }
 
+// --- the export door (launch-flow fix 1) -------------------------------------
+
+/**
+ * POST /console/vaults/export — the "export anytime" promise, delivered as a
+ * console door: stream the vault worker's `GET /api/export` tarball back to
+ * the browser as a download.
+ *
+ * Same trust boundary as every console write (session + CSRF + same-origin +
+ * ownership), then THE SAME MINT SEAM as the packs button ({@link callVaultApi}
+ * — a 60s aud-pinned first-party token, here `vault:<name>:read`, spent on one
+ * server-side GET). Chosen over a 302-with-token: no bearer token ever lands
+ * in a URL / browser history / access log, and the browser needs no CORS or
+ * redirect handling — the POST's response IS the file
+ * (`Content-Disposition: attachment`, streamed through, not buffered).
+ *
+ * An unowned/unknown vault gets the router-shaped 404 (one response for both —
+ * no ownership oracle; only a crafted request can reach it, the UI only offers
+ * owned vaults).
+ */
+export async function handleExportPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const user = await sessionUser(db, req, deps);
+  if (!user) return redirectResponse("/login");
+  const form = await req.formData();
+  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+    return consoleError(db, req, deps, user, "Your session expired. Please try again.");
+  }
+  const vaultName = String(form.get("vault") ?? "").trim().toLowerCase();
+  if (!vaultName || !(await userOwnsVault(db, user.id, vaultName))) {
+    return routerNotFound();
+  }
+
+  let res: Response;
+  try {
+    res = await callVaultApi(db, deps, {
+      userId: user.id,
+      vaultName,
+      method: "GET",
+      apiPath: "/api/export",
+      verb: "read",
+    });
+  } catch (err) {
+    console.warn(
+      `event=export_unreachable vault=${vaultName} error=${err instanceof Error ? err.message : String(err)}`,
+    );
+    return consoleError(db, req, deps, user, "Couldn't reach your vault just now. Please try again.");
+  }
+  if (!res.ok || !res.body) {
+    console.warn(`event=export_failed vault=${vaultName} status=${res.status}`);
+    return consoleError(db, req, deps, user, "Couldn't export just now. Please try again.");
+  }
+
+  // <vault>-export-<date>.tar — vault names are validated slugs ([a-z0-9-],
+  // vaults.ts), so the filename needs no further escaping.
+  const day = (deps.now?.() ?? new Date()).toISOString().slice(0, 10);
+  const headers = new Headers({
+    "content-type": "application/x-tar",
+    "content-disposition": `attachment; filename="${vaultName}-export-${day}.tar"`,
+  });
+  const len = res.headers.get("content-length");
+  if (len) headers.set("content-length", len);
+  return new Response(res.body, { status: 200, headers });
+}
+
 // --- snapshot restore (Wave 4e — paid plans only) -----------------------------
 
-/** Mirrors the admin router's own 404 — the restore surface doesn't exist for
- *  plans without the entitlement (free), same as it doesn't for anonymous. */
-function restoreNotFound(): Response {
+/** The router's own 404 shape (the admin pattern) — for surfaces that don't
+ *  exist for this caller: restore without the plan entitlement, export of a
+ *  vault the session doesn't own. */
+function routerNotFound(): Response {
   return new Response("404 Not Found", {
     status: 404,
     headers: { "content-type": "text/plain; charset=UTF-8" },
@@ -497,7 +564,7 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
   const spec = PLAN_SPECS[user.plan];
-  if (!spec.restore) return restoreNotFound();
+  if (!spec.restore) return routerNotFound();
 
   const form = await req.formData();
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {

@@ -12,7 +12,7 @@
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import app from "../src/index.ts";
-import { handleAddPackPost } from "../src/console.ts";
+import { handleAddPackPost, handleExportPost } from "../src/console.ts";
 import { validateAccessToken } from "../src/tokens.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "../src/oauth-authorize.ts";
 import { handleToken } from "../src/oauth-token.ts";
@@ -640,6 +640,162 @@ describe("console — Surface Starter pack button (POST /console/packs)", () => 
     );
     expect(noCsrf.status).toBe(200);
     expect(await noCsrf.text()).toContain("session expired");
+  });
+});
+
+// --- console: the export door (launch-flow fix 1) ---------------------------
+
+describe("console — the export door (POST /console/vaults/export)", () => {
+  beforeAll(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+  afterEach(() => fetchMock.assertNoPendingInterceptors());
+
+  function sessionCookie(sessionId: string): string {
+    return `parachute_id_csrf=${CSRF}; parachute_id_session=${sessionId}`;
+  }
+
+  const TAR_BYTES = "fake-tar-bytes-\0\0-padded-like-a-real-one";
+
+  test("happy path: mints a 60s READ token through the seam, streams the tarball back as an attachment", async () => {
+    const { id: userId } = await seedUser("export@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("exportme", userId);
+
+    // Deterministic clock → deterministic filename date.
+    const now = new Date("2026-07-04T09:30:00.000Z");
+    let seen: { url: string; auth: string | null } | null = null;
+    const boundDeps = {
+      ...deps(() => now),
+      vaultFetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        seen = { url: String(input), auth: new Headers(init?.headers).get("authorization") };
+        return new Response(TAR_BYTES, {
+          status: 200,
+          headers: { "content-type": "application/x-tar", "content-length": String(TAR_BYTES.length) },
+        });
+      },
+    };
+    const res = await handleExportPost(
+      env.DB,
+      post("/console/vaults/export", { __csrf: CSRF, vault: "exportme" }, sessionCookie(sessionId)),
+      boundDeps,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/x-tar");
+    expect(res.headers.get("content-disposition")).toBe('attachment; filename="exportme-export-2026-07-04.tar"');
+    expect(res.headers.get("content-length")).toBe(String(TAR_BYTES.length));
+    // The bytes stream through unmodified.
+    expect(await res.text()).toBe(TAR_BYTES);
+    // The vault worker saw one GET /api/export carrying THE MINT SEAM's token:
+    // read verb (least privilege — strictly narrower than the packs button's
+    // write), aud strict-pinned, vault_scope pinned, 60s, first-party client.
+    expect(seen!.url).toBe(`https://exportme.${VAULT_BASE}/api/export`);
+    const token = seen!.auth!.replace(/^Bearer /, "");
+    const { payload } = await validateAccessToken(env.DB, token, ISSUER);
+    expect(payload.aud).toBe("vault.exportme");
+    expect(payload.scope).toBe("vault:exportme:read");
+    expect(payload.vault_scope).toEqual(["exportme"]);
+    expect(payload.sub).toBe(userId);
+    expect(payload.client_id).toBe("parachute-console");
+    expect((payload.exp as number) - (payload.iat as number)).toBe(60);
+  });
+
+  test("route-level wiring: the real router proxies the tarball end-to-end", async () => {
+    const { id: userId } = await seedUser("export-route@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("routetar", userId);
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: "/vault/routetar/api/export", method: "GET" })
+      .reply(200, TAR_BYTES, { headers: { "content-type": "application/x-tar" } });
+
+    const res = await app.fetch(
+      post("/console/vaults/export", { __csrf: CSRF, vault: "routetar" }, sessionCookie(sessionId)),
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-disposition")).toMatch(/^attachment; filename="routetar-export-\d{4}-\d{2}-\d{2}\.tar"$/);
+    expect(await res.text()).toBe(TAR_BYTES);
+  });
+
+  test("auth required: anonymous → /login; missing CSRF → refused with no outbound call", async () => {
+    const anon = await app.fetch(
+      post("/console/vaults/export", { __csrf: CSRF, vault: "exportme" }, `parachute_id_csrf=${CSRF}`),
+      env,
+    );
+    expect(anon.status).toBe(302);
+    expect(anon.headers.get("location")).toBe("/login");
+
+    const { id: userId } = await seedUser("export-csrf@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("exportcsrf", userId);
+    // No interceptor + disableNetConnect: an outbound call would throw, not
+    // render the session-expired page.
+    const noCsrf = await app.fetch(
+      new Request(`${ISSUER}/console/vaults/export`, {
+        method: "POST",
+        body: new URLSearchParams({ vault: "exportcsrf" }),
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: ISSUER,
+          cookie: `parachute_id_session=${sessionId}`,
+        },
+      }),
+      env,
+    );
+    expect(noCsrf.status).toBe(200);
+    expect(await noCsrf.text()).toContain("session expired");
+  });
+
+  test("a vault the session does NOT own → the router-shaped 404, before any mint or outbound call", async () => {
+    const { id: owner } = await seedUser("export-owner@example.com");
+    const { id: other } = await seedUser("export-other@example.com");
+    await seedVault("owners-tar", owner);
+    const sessionId = await seedSession(other);
+    const res = await app.fetch(
+      post("/console/vaults/export", { __csrf: CSRF, vault: "owners-tar" }, sessionCookie(sessionId)),
+      env,
+    );
+    expect(res.status).toBe(404);
+
+    // Unknown vault: the SAME response — no ownership oracle.
+    const unknown = await app.fetch(
+      post("/console/vaults/export", { __csrf: CSRF, vault: "no-such-vault" }, sessionCookie(sessionId)),
+      env,
+    );
+    expect(unknown.status).toBe(404);
+  });
+
+  test("a vault-worker failure surfaces as a console error, never a broken download", async () => {
+    const { id: userId } = await seedUser("export-fail@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("failtar", userId);
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: "/vault/failtar/api/export", method: "GET" })
+      .reply(500, { error: "Internal server error" }, { headers: { "content-type": "application/json" } });
+    const res = await app.fetch(
+      post("/console/vaults/export", { __csrf: CSRF, vault: "failtar" }, sessionCookie(sessionId)),
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Couldn&#39;t export just now");
+  });
+
+  test("the vault card carries the download form", async () => {
+    const { id: userId } = await seedUser("export-card@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("cardtar", userId);
+    const res = await app.fetch(
+      new Request(`${ISSUER}/console`, { headers: { cookie: sessionCookie(sessionId) } }),
+      env,
+    );
+    const html = await res.text();
+    expect(html).toContain('data-testid="vault-export"');
+    expect(html).toContain('action="/console/vaults/export"');
+    expect(html).toContain("Download everything (.tar)");
+    expect(html).toContain('name="vault" value="cardtar"');
   });
 });
 

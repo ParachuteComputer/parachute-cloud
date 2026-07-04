@@ -330,15 +330,21 @@ async function main() {
     const conPage = await fetch(`${IDENTITY}/console`, { headers: { cookie: `parachute_id_session=${newSession}` } });
     const conHtml = await conPage.text();
     assert(conHtml.includes(newVault) && conHtml.includes(`parachute-${newVault}`), "console shows the vault + connect card", "");
+    // Launch-flow fix 1: every vault card carries the export door.
+    assert(
+      conHtml.includes('action="/console/vaults/export"') && conHtml.includes("Download everything (.tar)"),
+      "console card carries the export door",
+      "",
+    );
     // The free plan line renders, plus a billing affordance whose SHAPE depends
     // on the deploy state: the mock Upgrade UI ("test mode" — staging today,
     // no Stripe), the real Upgrade buttons (Stripe configured), or the
-    // copy-only teaser ("coming this week" — prod, no keys). Any is a pass.
+    // copy-only teaser ("paid plans arriving" — prod, no keys). Any is a pass.
     assert(
       conHtml.includes("Free plan — 1 vault, 100 MB") &&
         (conHtml.includes('data-testid="mock-billing-note"') ||
           conHtml.includes('data-testid="upgrade-billing"') ||
-          conHtml.includes("coming this week")),
+          conHtml.includes("paid plans arriving")),
       "console shows the free plan line + a billing affordance (mock / real Upgrade / teaser)",
       "",
     );
@@ -455,6 +461,40 @@ async function main() {
       });
       const wj = (await w.json()) as { id?: string };
       assert(w.status === 201 && !!wj.id, "new user writes a note in their vault", `status ${w.status}`);
+
+      // Launch-flow fix 1 — the export door, live: the console session POSTs
+      // /console/vaults/export; the identity worker mints a read token
+      // server-side and streams the vault worker's tarball back as an
+      // attachment. The bytes must be a REAL tar holding the note just written.
+      const exRes = await fetch(`${IDENTITY}/console/vaults/export`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${newSession}; parachute_id_csrf=${conCsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: conCsrf!, vault: newVault }),
+      });
+      const exCd = exRes.headers.get("content-disposition") ?? "";
+      const exBytes = new Uint8Array(await exRes.arrayBuffer());
+      assert(
+        exRes.status === 200 &&
+          (exRes.headers.get("content-type") ?? "").includes("tar") &&
+          exCd.startsWith(`attachment; filename="${newVault}-export-`),
+        "console export door → 200 tar attachment with the vault-named filename",
+        `status ${exRes.status}, ${exBytes.length} bytes, cd=${exCd}`,
+      );
+      const exEntries = untar(exBytes);
+      assert(
+        exEntries.length > 0 && exEntries.some((e) => e.text.includes(`owner note ${MARKER}`)),
+        "export download unpacks as a real tar containing the owner's note",
+        `${exEntries.length} entries`,
+      );
+      // A vault this session does NOT own → the router-shaped 404 (no oracle).
+      const exDenied = await fetch(`${IDENTITY}/console/vaults/export`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${newSession}; parachute_id_csrf=${conCsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: conCsrf!, vault: VAULT_NAME }),
+      });
+      assert(exDenied.status === 404, "export of an unowned vault → 404", `status ${exDenied.status}`);
     }
 
     // The DEV user is REFUSED a token for the new user's vault.
@@ -508,6 +548,75 @@ async function main() {
 
     const reuse = await fetch(magicLink!, { redirect: "manual" });
     assert(reuse.status === 400, "magic-link is single-use (second verify → 400)", `status ${reuse.status}`);
+
+    // Launch-flow fix 2 — the authorize login's magic door RESUMES the pending
+    // authorize request (the passwordless-user dead-end fix): start a fresh
+    // authorize with NO session, send the magic link WITH the pending params
+    // riding the form, follow the emailed link — verify must 302 to the exact
+    // authorize URL and the consent page must render for it.
+    {
+      const resumeEmail = `resume+${Date.now()}@example.com`;
+      const { challenge: rChallenge } = await pkce();
+      const rState = `resume-${MARKER}`;
+      const rParams: Record<string, string> = {
+        client_id: clientId,
+        redirect_uri: REDIRECT_URI,
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: rChallenge,
+        code_challenge_method: "S256",
+        state: rState,
+      };
+      const rLogin = await fetch(`${IDENTITY}/oauth/authorize?${form(rParams)}`, { redirect: "manual" });
+      const rCsrf = cookieVal(rLogin.headers.getSetCookie(), "parachute_id_csrf");
+      const rHtml = await rLogin.text();
+      assert(
+        rLogin.status === 200 && rHtml.includes('action="/auth/magic"') && rHtml.includes("Email me a sign-in link"),
+        "session-less authorize login offers the magic-link door",
+        `status ${rLogin.status}`,
+      );
+      const rSend = await fetch(`${IDENTITY}/auth/magic`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${rCsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: rCsrf!, email: resumeEmail, ...rParams }),
+      });
+      const rLink = rSend.headers.get("x-parachute-dev-magic-link");
+      assert(
+        rSend.status === 200 && !!rLink && !rLink.includes("client_id"),
+        "authorize magic send → neutral 200 + OPAQUE dev link (no OAuth params in the email)",
+        `status ${rSend.status}`,
+      );
+      const rVerify = await fetch(rLink!, { redirect: "manual" });
+      const rSession = cookieVal(rVerify.headers.getSetCookie(), "parachute_id_session");
+      const rLoc = rVerify.headers.get("location") ?? "";
+      let locOk = false;
+      try {
+        const u = new URL(rLoc);
+        locOk =
+          u.pathname === "/oauth/authorize" &&
+          u.searchParams.get("client_id") === clientId &&
+          u.searchParams.get("state") === rState &&
+          u.searchParams.get("code_challenge") === rChallenge;
+      } catch {
+        locOk = false;
+      }
+      assert(
+        rVerify.status === 302 && !!rSession && locOk,
+        "magic verify → 302 RESUMES the exact authorize request (params round-trip)",
+        `loc ${rLoc.slice(0, 100)}`,
+      );
+      const rResumed = await fetch(rLoc, {
+        headers: { cookie: `parachute_id_session=${rSession}` },
+        redirect: "manual",
+      });
+      const rConsent = await rResumed.text();
+      assert(
+        rResumed.status === 200 && /Authorize|Approve/.test(rConsent) && rConsent.includes(rState),
+        "resumed authorize renders consent for the pending request",
+        `status ${rResumed.status}`,
+      );
+    }
 
     // 11. TOTP enroll on this (passwordless) account, then confirm a re-login
     //     requires the code. Codes are computed from the shown secret; the ±1
@@ -864,7 +973,7 @@ async function main() {
         conHtml.includes('data-testid="upgrade-billing"') &&
           conHtml.includes('data-testid="upgrade-voice"') &&
           conHtml.includes('data-testid="mock-billing-note"') &&
-          !conHtml.includes("coming this week"),
+          !conHtml.includes("paid plans arriving"),
         "billing MOCK: the arrival free user's console shows mock Upgrade buttons (parachute + voice) + 'test mode' label, no teaser",
       );
       // The mock endpoint keeps the console write boundary (session-gated).

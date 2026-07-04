@@ -110,7 +110,7 @@ describe("PLAN_SPECS — the ratified plan shape", () => {
     expect(planLine("parachute")).toBe("Parachute plan — 5 vaults, 10 GiB");
     expect(parachuteTeaser()).toContain("$3/mo or $30/yr");
     expect(parachuteTeaser()).toContain("5 vaults, 10 GiB");
-    expect(vaultCapMessage("free")).toBe("Your plan includes 1 vault. More room is coming with the paid plan.");
+    expect(vaultCapMessage("free")).toBe("Your plan includes 1 vault. Paid plans add more room — have a code? Redeem it under your plan line above.");
     expect(vaultCapMessage("parachute")).toContain("5 vaults");
   });
 });
@@ -161,7 +161,7 @@ describe("console plan display", () => {
     expect(html).toContain('data-testid="plan-line"');
     expect(html).toContain("Free plan — 1 vault, 100 MB");
     expect(html).toContain("$3/mo or $30/yr");
-    expect(html).toContain("coming this week");
+    expect(html).toContain("paid plans arriving");
     // No payment link yet — the teaser is copy only.
     expect(html).not.toContain("stripe");
   });
@@ -172,7 +172,7 @@ describe("console plan display", () => {
     await seedVault("planline2-box", id);
     const html = await consoleHtml(await seedSession(id));
     expect(html).toContain("Parachute plan — 5 vaults, 10 GiB");
-    expect(html).not.toContain("coming this week");
+    expect(html).not.toContain("paid plans arriving");
   });
 
   test("free user at the vault cap: the create form yields to the friendly note", async () => {
@@ -180,7 +180,7 @@ describe("console plan display", () => {
     await seedVault("atcap-box", id);
     const html = await consoleHtml(await seedSession(id));
     expect(html).toContain('data-testid="vault-cap"');
-    expect(html).toContain("Your plan includes 1 vault. More room is coming with the paid plan.");
+    expect(html).toContain("Your plan includes 1 vault. Paid plans add more room");
     // The create form input is gone (the first-run hero isn't rendered either
     // — the user has a vault).
     expect(html).not.toContain('id="name" name="name"');
@@ -264,7 +264,7 @@ describe("vault-count enforcement + storage-cap push", () => {
       env,
     );
     expect(refused.status).toBe(200);
-    expect(await refused.text()).toContain("Your plan includes 1 vault. More room is coming with the paid plan.");
+    expect(await refused.text()).toContain("Your plan includes 1 vault. Paid plans add more room");
     expect(await vaultRowCount(userId)).toBe(1);
   });
 

@@ -56,8 +56,9 @@ export async function callVaultApi(
     vaultName: string;
     method: "GET" | "POST" | "PUT";
     apiPath: string;
-    /** "write" for content calls (packs, notes); "admin" for the internal config seam. */
-    verb: "write" | "admin";
+    /** "read" for read-only calls (the console export door); "write" for
+     *  content calls (packs, notes); "admin" for the internal config seam. */
+    verb: "read" | "write" | "admin";
     jsonBody?: unknown;
   },
 ): Promise<Response> {

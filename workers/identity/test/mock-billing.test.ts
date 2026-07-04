@@ -122,7 +122,7 @@ describe("console rendering — the three clean states", () => {
     expect(html).toContain('data-testid="mock-billing-note"');
     expect(html).toContain("test mode");
     // Mock replaces BOTH the teaser and the real Checkout action.
-    expect(html).not.toContain("coming this week");
+    expect(html).not.toContain("paid plans arriving");
     expect(html).not.toContain('action="/billing/checkout"');
   });
 

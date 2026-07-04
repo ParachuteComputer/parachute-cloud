@@ -14,6 +14,7 @@ import {
   handleChecklistRestorePost,
   handleConsoleGet,
   handleCreateVaultPost,
+  handleExportPost,
   handleLoginGet,
   handleLoginPost,
   handleLogoutPost,
@@ -119,6 +120,11 @@ app.post("/console/vaults", (c) => handleCreateVaultPost(c.env.DB, c.req.raw, de
 // ownership + vault-count cap, then the target DO replays the tarball through
 // the mint seam. Restore always creates a NEW vault — never overwrites.
 app.post("/console/vaults/restore", (c) => handleRestorePost(c.env.DB, c.req.raw, depsFor(c.env)));
+// The export door ("Download everything (.tar)"): session + CSRF + ownership,
+// then the identity worker mints a 60s vault:<name>:read token (the same mint
+// seam as the packs button) and streams the vault worker's export tarball back
+// with Content-Disposition: attachment — no token ever lands in a URL.
+app.post("/console/vaults/export", (c) => handleExportPost(c.env.DB, c.req.raw, depsFor(c.env)));
 // Seed-pack apply (the "Add the Surface Starter guide" button): session + CSRF
 // + ownership, then a server-side call to the vault worker with an internally
 // minted 60s vault:<name>:write token (the mint seam — see handleAddPackPost).

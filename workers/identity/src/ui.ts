@@ -154,23 +154,50 @@ export function page(title: string, inner: string): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>${FONT_LINK}<style>${STYLE}</style></head><body><div class="brand">Parachute</div>${inner}</body></html>`;
 }
 
-export function renderLogin(opts: { params: AuthorizeParams; csrfToken: string; error?: string }): string {
-  const { params, csrfToken, error } = opts;
+/**
+ * The OAuth authorize login (session-less GET /oauth/authorize). Magic-link
+ * FIRST — it's the signup default, so most accounts have no password; before
+ * this form existed, a passwordless user re-connecting an AI after their
+ * session lapsed hit a password-only dead end (launch-flow fix 2). The magic
+ * form rides the pending authorize params as hidden fields (the same
+ * round-trip the password form uses); /auth/magic stores the reconstructed
+ * authorize URL server-side so the emailed link RESUMES this exact request.
+ * `showPassword` mirrors renderConsoleLogin: which form the error belongs to.
+ */
+export function renderLogin(opts: {
+  params: AuthorizeParams;
+  csrfToken: string;
+  error?: string;
+  showPassword?: boolean;
+}): string {
+  const { params, csrfToken, error, showPassword } = opts;
   return page(
     "Sign in — Parachute",
     `<h1>Sign in to Parachute</h1>
      <div class="card">
-       <form method="post" action="/oauth/authorize">
-         <input type="hidden" name="__action" value="login">
+       <form method="post" action="/auth/magic">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
          ${hiddenParams(params)}
          <label for="email">Email</label>
-         <input id="email" name="email" type="email" autocomplete="username" required autofocus>
-         <label for="password">Password</label>
-         <input id="password" name="password" type="password" autocomplete="current-password" required>
-         ${error ? `<div class="err">${esc(error)}</div>` : ""}
-         <button class="primary" type="submit">Sign in</button>
+         <input id="email" name="email" type="email" autocomplete="email" required autofocus>
+         ${!showPassword && error ? `<div class="err">${esc(error)}</div>` : ""}
+         <button class="primary" type="submit">Email me a sign-in link</button>
        </form>
+       <p class="muted" style="margin:.7rem 0 0">We'll email you a link that signs you in and continues connecting your app — no password needed.</p>
+       <details${showPassword ? " open" : ""}>
+         <summary>Use a password instead</summary>
+         <form method="post" action="/oauth/authorize">
+           <input type="hidden" name="__action" value="login">
+           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+           ${hiddenParams(params)}
+           <label for="pw-email">Email</label>
+           <input id="pw-email" name="email" type="email" autocomplete="username" required>
+           <label for="password">Password</label>
+           <input id="password" name="password" type="password" autocomplete="current-password" required>
+           ${showPassword && error ? `<div class="err">${esc(error)}</div>` : ""}
+           <button class="secondary" type="submit">Sign in with a password</button>
+         </form>
+       </details>
      </div>`,
   );
 }
@@ -263,7 +290,7 @@ export function renderSignup(opts: { csrfToken: string; error?: string; email?: 
   return page(
     "Create your account — Parachute",
     `<h1>Create your account</h1>
-     <p class="muted" style="margin:0 0 1.1rem">A vault of your own, hosted. Free while in beta — no card needed.</p>
+     <p class="muted" style="margin:0 0 1.1rem">A vault of your own, hosted. Start free — no card needed.</p>
      <div class="card">
        ${magicForm(csrfToken, email, "Email me a sign-in link", showPassword ? undefined : error)}
        <p class="muted" style="margin:.7rem 0 0">We'll email you a link — no password to choose. It signs you in and creates your account.</p>
@@ -291,6 +318,7 @@ export function renderConsoleLogin(opts: { csrfToken: string; error?: string; em
   return page(
     "Sign in — Parachute",
     `<h1>Sign in</h1>
+     <p class="muted" style="margin:.15rem 0 1.1rem">Parachute Cloud — your notes, and everything you want your AI to remember, in a vault of your own. Open format, export anytime.</p>
      <div class="card">
        ${magicForm(csrfToken, email, "Email me a sign-in link", showPassword ? undefined : error)}
        <p class="muted" style="margin:.7rem 0 0">We'll email you a link that signs you in — no password needed.</p>
@@ -307,7 +335,7 @@ export function renderConsoleLogin(opts: { csrfToken: string; error?: string; em
          </form>
        </details>
      </div>
-     <div class="foot"><span class="muted">New here?</span> <a href="/signup">Create an account</a></div>`,
+     <div class="foot" data-testid="login-signup-door">New to Parachute? <a href="/signup"><strong>Create your free account</strong></a></div>`,
   );
 }
 
@@ -668,6 +696,12 @@ function vaultCard(v: ConsoleVaultCard, csrfToken: string, planCapBytes: number)
       </form>
     </details>
     ${historySection(v, csrfToken)}
+    <form method="post" action="/console/vaults/export" data-testid="vault-export" style="margin-top:.8rem">
+      <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+      <input type="hidden" name="vault" value="${esc(v.name)}">
+      <button class="linkbtn" type="submit">Download everything (.tar)</button>
+      <span class="muted" style="font-size:.8rem">— portable Markdown; attachment files aren&#39;t included yet</span>
+    </form>
   </div>`;
 }
 
