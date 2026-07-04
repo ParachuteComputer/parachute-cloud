@@ -113,8 +113,17 @@ sweep. A ticket-endpoint is a contract-compatible retrofit if abuse appears.
 
 ## Caps & limits
 
-- **100** concurrent subscriptions per vault (`getWebSockets().length` at
-  upgrade) → over → **503** `SUBSCRIPTION_CAP_REACHED`.
+- **100** concurrent subscriptions per vault, counted at upgrade over the LIVE
+  sockets (`getWebSockets()` filtered to readyState CONNECTING/OPEN) → over →
+  **503** `SUBSCRIPTION_CAP_REACHED`. **Pending (accepted-but-unauthed) sockets
+  count toward the cap** — a socket that only ever pings (auto-response, never
+  wakes the DO) would otherwise sit forever. This **self-heals**: every upgrade
+  runs `sweepWsSockets` (which closes pending sockets past the ~10s auth
+  deadline, 4408) BEFORE the cap check, and a just-closed socket is CLOSING
+  (readyState 2), so it no longer counts — freeing the slot for the new
+  connection on the same wake. (Counting raw `getWebSockets().length` would keep
+  the cap "full" of the sockets the sweep just closed; the live-only count is
+  what makes the self-heal immediate.)
 - Attachment ≤ **~15 KB** serialized (under workerd's 16,384-byte hard limit).
 - Snapshot chunk budget **512 KB** / **200 notes** per frame (conservative under
   the ~1 MiB WS message ceiling — the real ceiling is verified on staging with a

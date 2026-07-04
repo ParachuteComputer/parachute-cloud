@@ -169,6 +169,17 @@ function isWebSocketUpgrade(request: Request): boolean {
 }
 
 /**
+ * Count only LIVE sockets (readyState CONNECTING=0 / OPEN=1) toward the per-vault
+ * cap. `getWebSockets()` also returns sockets in the CLOSING (2) / CLOSED (3)
+ * state — including ones the sweep just closed on this same wake — so counting
+ * raw length would keep the cap "full" of already-departing sockets and defeat
+ * the pending-socket self-heal (sweep-before-cap-check runs on every fetch).
+ */
+function liveSocketCount(sockets: WebSocket[]): number {
+  return sockets.filter((ws) => ws.readyState < 2).length;
+}
+
+/**
  * Isolate-wide revocation tracker for the WS sweep — shared across every DO in
  * the isolate (the revocation list is keyed per ISSUER_ORIGIN, so one fetch
  * serves all vaults). Best-effort, fail-open for already-authed sockets — see
@@ -896,9 +907,11 @@ export class VaultDO extends DurableObject {
     const validated = validateWsSubscribeQuery(url);
     if ("error" in validated) return validated.error;
 
-    // Cap via getWebSockets() (counts pending + ready + closing). A 503 the
-    // client can retry — byte-identical code to the SSE cap.
-    if (this.ctx.getWebSockets().length >= MAX_WS_SUBSCRIPTIONS) {
+    // Cap via the LIVE socket count (excludes CLOSING/CLOSED — see
+    // liveSocketCount). The sweep at the top of this fetch already closed any
+    // stale pending sockets, so their slots are free here. A 503 the client can
+    // retry — byte-identical body to the SSE cap.
+    if (liveSocketCount(this.ctx.getWebSockets()) >= MAX_WS_SUBSCRIPTIONS) {
       return subscriptionCapResponse();
     }
 

@@ -12,6 +12,7 @@ import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
 import { MAX_WS_SUBSCRIPTIONS, WS_CLOSE } from "../src/live/ws-subscribe.ts";
+import { SubscriptionManager } from "../src/live/subscriptions.ts";
 
 // ---------------------------------------------------------------------------
 // WS client helpers (the vitest-pool-workers WebSocket-over-fetch shape).
@@ -234,6 +235,82 @@ describe("ws-subscribe — per-vault cap", () => {
       const over = inst.handleWsUpgrade(req, v);
       expect(over.status).toBe(503);
       expect((await over.json()).code).toBe("SUBSCRIPTION_CAP_REACHED");
+    });
+  });
+});
+
+describe("ws-subscribe — error-body parity WS ⇄ SSE (drift guard)", () => {
+  // The search/near 400 bodies + the 503 cap body are DUPLICATED between the SSE
+  // route (subscribe.ts) and the WS binding (ws-subscribe.ts) — byte-identical
+  // today, but only `.code` was asserted, so a future edit to one copy would go
+  // uncaught. These diff the FULL bodies across both real transports.
+
+  for (const { name, query } of [
+    { name: "search", query: "?search=foo" },
+    { name: "near", query: "?near[note_id]=abc" },
+  ]) {
+    it(`${name} 400: WS body === SSE body (byte-for-byte)`, async () => {
+      const v = freshVault();
+      // SSE (auth runs first → needs a token); WS (validated pre-auth at upgrade).
+      const sse = await SELF.fetch(`${base(v)}/api/subscribe${query}`, { headers: { Authorization: `Bearer ${OP}` } });
+      const ws = await SELF.fetch(`${base(v)}/api/subscribe${query}`, { headers: { Upgrade: "websocket" } });
+      expect(sse.status).toBe(400);
+      expect(ws.status).toBe(400);
+      const sseBody = await sse.text();
+      const wsBody = await ws.text();
+      expect(wsBody).toBe(sseBody); // full body, not just .code
+    });
+  }
+
+  it("503 cap: WS body === SSE body (byte-for-byte)", async () => {
+    const v = freshVault();
+
+    // SSE 503: force the SSE manager's per-vault cap to 0 so the next subscribe
+    // trips the cap (no need to hold 100 real streams open).
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      inst.subManager = new SubscriptionManager(inst.store.hooks, {
+        resolveVault: () => inst.config?.name ?? "",
+        maxPerVault: 0,
+      });
+    });
+    const sse = await SELF.fetch(`${base(v)}/api/subscribe?tag=watch`, { headers: { Authorization: `Bearer ${OP}` } });
+    expect(sse.status).toBe(503);
+    const sseBody = await sse.text();
+
+    // WS 503: fill getWebSockets() to the cap, then read the over-cap body.
+    let wsBody = "";
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      const req = new Request(`${base(v)}/api/subscribe?tag=watch`, { headers: { Upgrade: "websocket" } });
+      for (let i = 0; i < MAX_WS_SUBSCRIPTIONS; i++) inst.handleWsUpgrade(req, v);
+      const over = inst.handleWsUpgrade(req, v);
+      expect(over.status).toBe(503);
+      wsBody = await over.text();
+    });
+
+    expect(wsBody).toBe(sseBody); // full body, not just .code
+  });
+});
+
+describe("ws-subscribe — pending-socket cap self-heal", () => {
+  it("stale pending (never-authed, past-deadline) sockets are swept, freeing cap slots for a new upgrade", async () => {
+    const v = freshVault();
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      const req = new Request(`${base(v)}/api/subscribe?tag=watch`, { headers: { Upgrade: "websocket" } });
+      // Fill the cap with PENDING sockets (a ping-only client never authenticates,
+      // and auto-response never wakes the DO to sweep them).
+      for (let i = 0; i < MAX_WS_SUBSCRIPTIONS; i++) expect(inst.handleWsUpgrade(req, v).status).toBe(101);
+      // Age them all past the auth deadline.
+      for (const ws of inst.ctx.getWebSockets()) {
+        const att = ws.deserializeAttachment();
+        ws.serializeAttachment({ ...att, connectedAt: 1 }); // epoch 1 → long past
+      }
+      // Cap is full → a fresh upgrade is refused BEFORE any sweep.
+      expect(inst.handleWsUpgrade(req, v).status).toBe(503);
+      // The sweep runs at the TOP of every real fetch, BEFORE the cap check —
+      // it closes the stale pending sockets (4408), freeing their slots.
+      await inst.sweepWsSockets();
+      // The self-heal: a subsequent upgrade's cap check now passes.
+      expect(inst.handleWsUpgrade(req, v).status).toBe(101);
     });
   });
 });
