@@ -28,11 +28,13 @@
  */
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
+import type Stripe from "stripe";
 import app from "../src/index.ts";
 import { PLAN_SPECS } from "../src/plans.ts";
 import {
   BILLING_SWEEP_CAP,
   DOWNGRADE_GRACE_PERIOD_MS,
+  handleCheckoutSessionCompleted,
   runBillingSweep,
 } from "../src/billing-lifecycle.ts";
 import { billingConfig } from "../src/billing-config.ts";
@@ -298,6 +300,19 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
       });
   }
 
+  /** The cloud#64 belt: checkout for a known Stripe customer first LISTS the
+   *  customer's active subscriptions. Path carries the query string. */
+  function interceptSubscriptionList(subs: Array<Record<string, unknown>>, status = 200) {
+    fetchMock
+      .get("https://api.stripe.com")
+      .intercept({ path: (p: string) => p.startsWith("/v1/subscriptions?"), method: "GET" })
+      .reply(
+        status,
+        status === 200 ? { object: "list", data: subs, has_more: false, url: "/v1/subscriptions" } : { error: { message: "boom" } },
+        { headers: { "content-type": "application/json" } },
+      );
+  }
+
   test("free user + monthly → subscription-mode session with client_reference_id, env price, tax, URLs; 302 to Stripe", async () => {
     const { id } = await seedUser("checkout1@example.com");
     const sessionId = await seedSession(id);
@@ -338,10 +353,12 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
 
   test("re-subscribe: an existing Stripe customer is REUSED (customer + address auto, no customer_email)", async () => {
     // A user who cancelled and came back: plan free again, customer retained.
+    // The cloud#64 belt lists their subscriptions first — none active → proceed.
     const { id } = await seedUser("checkout3@example.com");
     await env.DB.prepare("UPDATE users SET stripe_customer_id = 'cus_prior' WHERE id = ?").bind(id).run();
     const sessionId = await seedSession(id);
     let raw = "";
+    interceptSubscriptionList([]);
     interceptCheckoutCreate((b) => (raw = b));
     const res = await app.fetch(
       post("/billing/checkout", { __csrf: CSRF, interval: "monthly" }, sessionCookie(sessionId)),
@@ -352,6 +369,37 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
     expect(params.get("customer")).toBe("cus_prior");
     expect(params.get("customer_update[address]")).toBe("auto"); // tax needs a saved address
     expect(params.get("customer_email")).toBeNull();
+  });
+
+  test("cloud#64 BELT: an ACTIVE subscription already exists in Stripe (plan row lagging the webhook) → already, no session minted", async () => {
+    const { id } = await seedUser("checkout-race-belt@example.com");
+    await env.DB.prepare("UPDATE users SET stripe_customer_id = 'cus_lagging' WHERE id = ?").bind(id).run();
+    const sessionId = await seedSession(id);
+    interceptSubscriptionList([{ id: "sub_live_1", object: "subscription", status: "active" }]);
+    // NO /v1/checkout/sessions interceptor: minting a session here would hit
+    // the disabled network and surface as billing_err=stripe, not =already.
+
+    const res = await app.fetch(
+      post("/billing/checkout", { __csrf: CSRF, interval: "monthly" }, sessionCookie(sessionId)),
+      BILLING_ENV,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?billing_err=already");
+  });
+
+  test("cloud#64 BELT fails OPEN: a subscriptions.list error never blocks checkout", async () => {
+    const { id } = await seedUser("checkout-belt-open@example.com");
+    await env.DB.prepare("UPDATE users SET stripe_customer_id = 'cus_listboom' WHERE id = ?").bind(id).run();
+    const sessionId = await seedSession(id);
+    interceptSubscriptionList([], 500);
+    interceptCheckoutCreate(() => {});
+
+    const res = await app.fetch(
+      post("/billing/checkout", { __csrf: CSRF, interval: "monthly" }, sessionCookie(sessionId)),
+      BILLING_ENV,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("https://checkout.stripe.com/c/test");
   });
 
   test("gates: no session → /login; bad CSRF → billing_err=session; bogus interval → invalid; already paid → already", async () => {
@@ -576,17 +624,141 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
     expect(((await second.json()) as { action: string }).action).toBe("checkout_completed_idempotent");
   });
 
-  test("missing client_reference_id → 400; unknown user → 200 ack (stop retries)", async () => {
+  test("missing client_reference_id → 400 (outcome http_400 recorded — cloud#64 forensics); unknown user → 200 ack", async () => {
     const noRef = await postWebhook(
-      makeEventPayload("checkout.session.completed", { id: "cs_x", object: "checkout.session", client_reference_id: null }),
+      makeEventPayload(
+        "checkout.session.completed",
+        { id: "cs_x", object: "checkout.session", client_reference_id: null },
+        "evt_noref_1",
+      ),
     );
     expect(noRef.status).toBe(400);
+    // The dedup row can't be silent about the failure any more: outcome is the
+    // forensic trail (Stripe's retry of this id will ack 200/deduped).
+    const row = await env.DB.prepare("SELECT outcome FROM processed_stripe_events WHERE event_id = 'evt_noref_1'").first<{
+      outcome: string | null;
+    }>();
+    expect(row?.outcome).toBe("http_400");
 
     const unknown = await postWebhook(
-      makeEventPayload("checkout.session.completed", checkoutCompletedObject({ userId: "no-such-user" })),
+      makeEventPayload("checkout.session.completed", checkoutCompletedObject({ userId: "no-such-user" }), "evt_unknown_1"),
     );
     expect(unknown.status).toBe(200);
     expect(((await unknown.json()) as { action: string }).action).toBe("checkout_completed_unknown_user");
+    const unknownRow = await env.DB.prepare(
+      "SELECT outcome FROM processed_stripe_events WHERE event_id = 'evt_unknown_1'",
+    ).first<{ outcome: string | null }>();
+    expect(unknownRow?.outcome).toBe("checkout_completed_unknown_user");
+  });
+
+  // --- the double-checkout race (cloud#64) ---------------------------------
+
+  test("DOUBLE-CHECKOUT RACE: the second completed session flips the row AND cancels the stale subscription (never orphans it)", async () => {
+    // Leg 1 already landed: the row carries sub_race_old. Leg 2 (the other
+    // tab's checkout) completes with a DIFFERENT subscription.
+    const { id } = await seedPaidUser("race@example.com", { customer: "cus_race", subscription: "sub_race_old" });
+    fetchMock
+      .get("https://api.stripe.com")
+      .intercept({ path: "/v1/subscriptions/sub_race_old", method: "GET" })
+      .reply(200, { id: "sub_race_old", object: "subscription", status: "active" }, {
+        headers: { "content-type": "application/json" },
+      });
+    fetchMock
+      .get("https://api.stripe.com")
+      .intercept({ path: "/v1/subscriptions/sub_race_old", method: "DELETE" })
+      .reply(200, { id: "sub_race_old", object: "subscription", status: "canceled" }, {
+        headers: { "content-type": "application/json" },
+      });
+
+    const res = await postWebhook(
+      makeEventPayload(
+        "checkout.session.completed",
+        checkoutCompletedObject({ userId: id, customer: "cus_race", subscription: "sub_race_new" }),
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { action: string }).action).toBe("checkout_completed_upgraded");
+
+    const user = (await getUserById(env.DB, id))!;
+    expect(user.plan).toBe("parachute");
+    expect(user.stripeSubscriptionId).toBe("sub_race_new"); // the latest payment wins the row
+    // Both Stripe calls (retrieve + cancel of the STALE sub) are pinned by
+    // afterEach's assertNoPendingInterceptors — without the cloud#64 fix the
+    // DELETE interceptor goes unconsumed and this test fails.
+  });
+
+  test("RACE ordering: the row points at the NEW subscription BEFORE the stale cancel fires (its deleted-webhook must miss)", async () => {
+    // The cancel triggers customer.subscription.deleted for the STALE id; if
+    // the row still carried it, that event would schedule a downgrade for the
+    // user who JUST PAID. Pin the order with a stripe stub that reads D1 at
+    // cancel time.
+    const { id } = await seedPaidUser("race-order@example.com", { subscription: "sub_order_old" });
+    let rowAtCancel: unknown = "cancel-never-fired";
+    const stripeStub = {
+      subscriptions: {
+        retrieve: async () => ({ id: "sub_order_old", status: "active" }),
+        cancel: async () => {
+          rowAtCancel = (await userRow(id))?.stripe_subscription_id;
+          return { id: "sub_order_old", status: "canceled" };
+        },
+      },
+    } as unknown as Stripe;
+    const event = JSON.parse(
+      makeEventPayload(
+        "checkout.session.completed",
+        checkoutCompletedObject({ userId: id, subscription: "sub_order_new" }),
+      ),
+    ) as Stripe.Event;
+
+    const result = await handleCheckoutSessionCompleted(env.DB, deps(), event, stripeStub);
+    expect((result as { action: string }).action).toBe("checkout_completed_upgraded");
+    expect(rowAtCancel).toBe("sub_order_new");
+    // And the stale sub's deleted-webhook now resolves to no row → no-op:
+    const deleted = await postWebhook(
+      makeEventPayload("customer.subscription.deleted", subscriptionObject({ id: "sub_order_old" })),
+    );
+    expect(((await deleted.json()) as { action: string }).action).toBe("subscription_deleted_unknown_user");
+    expect((await getUserById(env.DB, id))!.pendingPlan).toBeNull(); // no downgrade scheduled
+  });
+
+  test("RACE repair skips an already-canceled stale sub (legit re-subscribe during grace): no cancel call", async () => {
+    const { id } = await seedPaidUser("race-grace@example.com", { subscription: "sub_grace_old" });
+    fetchMock
+      .get("https://api.stripe.com")
+      .intercept({ path: "/v1/subscriptions/sub_grace_old", method: "GET" })
+      .reply(200, { id: "sub_grace_old", object: "subscription", status: "canceled" }, {
+        headers: { "content-type": "application/json" },
+      });
+    // NO DELETE interceptor: a cancel attempt would hit the disabled network.
+
+    const res = await postWebhook(
+      makeEventPayload(
+        "checkout.session.completed",
+        checkoutCompletedObject({ userId: id, subscription: "sub_grace_new" }),
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect((await getUserById(env.DB, id))!.stripeSubscriptionId).toBe("sub_grace_new");
+  });
+
+  test("RACE repair is BEST-EFFORT: a Stripe error during the repair never fails the upgrade", async () => {
+    const { id } = await seedPaidUser("race-boom@example.com", { subscription: "sub_boom_old" });
+    fetchMock
+      .get("https://api.stripe.com")
+      .intercept({ path: "/v1/subscriptions/sub_boom_old", method: "GET" })
+      .reply(500, { error: { message: "boom" } }, { headers: { "content-type": "application/json" } });
+
+    const res = await postWebhook(
+      makeEventPayload(
+        "checkout.session.completed",
+        checkoutCompletedObject({ userId: id, subscription: "sub_boom_new" }),
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { action: string }).action).toBe("checkout_completed_upgraded");
+    const user = (await getUserById(env.DB, id))!;
+    expect(user.plan).toBe("parachute");
+    expect(user.stripeSubscriptionId).toBe("sub_boom_new");
   });
 
   test("BEST-EFFORT cap push: a 500 from the vault never fails the upgrade (plan still flips)", async () => {

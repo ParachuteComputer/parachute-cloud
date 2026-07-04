@@ -1,0 +1,11 @@
+-- Webhook forensics (cloud#64): record each Stripe event's dispatch OUTCOME on
+-- its dedup row. The layer-1 dedup INSERT runs BEFORE dispatch (it must — see
+-- billing-webhook.ts), so a row used to mean only "delivery seen", muddying
+-- log forensics: a 400-failed event (e.g. missing client_reference_id) looked
+-- identical to a processed one, and Stripe's retry of it acks 200/deduped.
+--
+-- `outcome` is the handler's action tag (`checkout_completed_upgraded`,
+-- `payment_failed`, `ignored`, ...) or `http_<status>` for an error Response.
+-- NULL means "no recorded completion": a pre-migration row, or a dispatch that
+-- threw before the outcome write — itself forensically meaningful.
+ALTER TABLE processed_stripe_events ADD COLUMN outcome TEXT;

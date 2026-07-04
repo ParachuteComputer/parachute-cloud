@@ -34,6 +34,13 @@
  *      same subscription id). Catches anomalies like hand-replayed events
  *      that bypass the dedup table.
  *
+ * Outcome forensics (cloud#64, migration 0015): the dedup INSERT necessarily
+ * runs BEFORE dispatch, so a bare row can't distinguish "processed" from
+ * "dispatched and failed" (e.g. the 400 on a missing client_reference_id —
+ * whose Stripe retry then acks 200/deduped). After dispatch we record the
+ * handler's action tag (or `http_<status>` for an error Response) on the
+ * row's `outcome` column; NULL outcome = the dispatch never completed.
+ *
  * NOT CONFIGURED (billing-config.ts): a clean 503 — Stripe can't be calling
  * if no webhook endpoint/secret exists, so anything arriving here is a probe.
  */
@@ -99,20 +106,56 @@ export async function handleStripeWebhookPost(
     return jsonResponse({ ok: true, deduped: event.id });
   }
 
+  let response: Response;
+  let outcome: string;
   switch (event.type) {
     case "checkout.session.completed": {
-      const result = await handleCheckoutSessionCompleted(env.DB, deps, event);
-      return result instanceof Response ? result : jsonResponse(result);
+      const result = await handleCheckoutSessionCompleted(env.DB, deps, event, stripe);
+      if (result instanceof Response) {
+        response = result;
+        outcome = `http_${result.status}`;
+      } else {
+        response = jsonResponse(result);
+        outcome = result.action;
+      }
+      break;
     }
-    case "invoice.paid":
-      return jsonResponse(await handleInvoicePaid(env.DB, event, now));
-    case "invoice.payment_failed":
-      return jsonResponse(await handleInvoicePaymentFailed(env.DB, event, now));
-    case "customer.subscription.deleted":
-      return jsonResponse(await handleSubscriptionDeleted(env.DB, event, now));
-    case "customer.subscription.updated":
-      return jsonResponse(await handleSubscriptionUpdated(env.DB, deps, event, config));
-    default:
-      return jsonResponse({ ok: true, ignored: event.type });
+    case "invoice.paid": {
+      const result = await handleInvoicePaid(env.DB, event, now);
+      response = jsonResponse(result);
+      outcome = result.action;
+      break;
+    }
+    case "invoice.payment_failed": {
+      const result = await handleInvoicePaymentFailed(env.DB, event, now);
+      response = jsonResponse(result);
+      outcome = result.action;
+      break;
+    }
+    case "customer.subscription.deleted": {
+      const result = await handleSubscriptionDeleted(env.DB, event, now);
+      response = jsonResponse(result);
+      outcome = result.action;
+      break;
+    }
+    case "customer.subscription.updated": {
+      const result = await handleSubscriptionUpdated(env.DB, deps, event, config);
+      response = jsonResponse(result);
+      outcome = result.action;
+      break;
+    }
+    default: {
+      response = jsonResponse({ ok: true, ignored: event.type });
+      outcome = "ignored";
+    }
   }
+
+  // Forensics: stamp the dispatch outcome on the dedup row (see the module
+  // note). Best-effort by position — a handler that THREW never reaches this,
+  // leaving the row's NULL outcome as the "never completed" marker.
+  await env.DB.prepare("UPDATE processed_stripe_events SET outcome = ? WHERE event_id = ?")
+    .bind(outcome, event.id)
+    .run();
+
+  return response;
 }

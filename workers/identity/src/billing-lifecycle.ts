@@ -93,17 +93,37 @@ export const BILLING_SWEEP_CAP = 50;
  * Idempotency layer 2 (defense in depth behind the event-id dedup): a user
  * already on parachute with this same subscription id is a replay that
  * bypassed the dedup table (hand-replayed event, restored DB) — no-op.
+ *
+ * DOUBLE-CHECKOUT RACE (cloud#64): two concurrent Checkout sessions
+ * (double-tab) can BOTH complete — Stripe creates two live subscriptions and
+ * this handler runs twice. Without repair, the second write would overwrite
+ * `stripe_subscription_id` and ORPHAN the first subscription: Stripe keeps
+ * billing it, and its future lifecycle events resolve to no row (no-op as
+ * unknown_user). The repair is cancel-on-mismatch: when the row already
+ * carries a DIFFERENT subscription id, flip the row to the newly-paid
+ * subscription FIRST, then cancel the stale one in Stripe. Ordering is
+ * load-bearing — the cancel triggers a `customer.subscription.deleted` for
+ * the STALE id, which must find no matching row (it no longer does, post-
+ * flip) rather than schedule a downgrade for the user who just paid.
+ * Best-effort: a cancel failure logs loudly for operator follow-up and never
+ * fails the upgrade. (The checkout door also refuses a session while an
+ * active subscription exists — billing.ts — but that belt can't see two
+ * sessions minted before either completes; this is the backstop.)
  */
 export async function handleCheckoutSessionCompleted(
   db: D1Database,
   deps: OAuthDeps,
   event: Stripe.Event,
+  stripe: Stripe,
 ): Promise<LifecycleResult | Response> {
   const session = event.data.object as Stripe.Checkout.Session;
   const userId = session.client_reference_id ?? "";
   if (userId.length === 0) {
-    // We can't route the session — 400 so Stripe retries/surfaces it (this
-    // would mean a checkout we didn't mint; worth the noise).
+    // We can't route the session — 400 so Stripe surfaces the delivery as
+    // failed (this would mean a checkout we didn't mint; worth the noise).
+    // NOTE: Stripe's RETRY of this event acks 200/deduped (the layer-1 dedup
+    // row was already inserted); the row's `outcome` column records the
+    // http_400 for forensics (cloud#64, migration 0015).
     return new Response(JSON.stringify({ error: "missing_client_reference_id" }), {
       status: 400,
       headers: { "content-type": "application/json" },
@@ -130,6 +150,12 @@ export async function handleCheckoutSessionCompleted(
     return { ok: true, userId: user.id, action: "checkout_completed_idempotent" };
   }
 
+  // The row's PRIOR subscription id, read before the flip — if it's a
+  // different live subscription, this checkout is the second leg of a
+  // double-checkout race and the prior one must be canceled (see the
+  // function doc), not silently orphaned.
+  const staleSubscriptionId = user.stripeSubscriptionId;
+
   await db
     .prepare(
       `UPDATE users SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = ?,
@@ -138,6 +164,33 @@ export async function handleCheckoutSessionCompleted(
     )
     .bind(customerId, subscriptionId, boughtPlan, user.id)
     .run();
+
+  // Cancel-on-mismatch (cloud#64) — AFTER the row flip (ordering rationale in
+  // the function doc). Retrieve-then-cancel: a legit re-subscribe during the
+  // downgrade grace leaves an already-canceled stale id on the row — nothing
+  // to cancel there, and blind-canceling it would just error.
+  if (staleSubscriptionId && subscriptionId && staleSubscriptionId !== subscriptionId) {
+    try {
+      const stale = await stripe.subscriptions.retrieve(staleSubscriptionId);
+      if (stale.status === "canceled") {
+        console.log(
+          `event=billing_stale_subscription_already_canceled user=${user.id} stale=${staleSubscriptionId}`,
+        );
+      } else {
+        await stripe.subscriptions.cancel(staleSubscriptionId);
+        console.warn(
+          `event=billing_stale_subscription_canceled user=${user.id} stale=${staleSubscriptionId} active=${subscriptionId}`,
+        );
+      }
+    } catch (err) {
+      // Best-effort: the upgrade must never fail on the repair. The orphan is
+      // loud in the logs (and visible in the Stripe dashboard) for operator
+      // follow-up — likely a manual cancel + first-period refund.
+      console.error(
+        `event=billing_stale_subscription_cancel_failed user=${user.id} stale=${staleSubscriptionId} error=${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 
   // Caps + voice entitlement lift immediately (best-effort per vault; a miss
   // self-heals via the backfill script / the next plan event — vault-call.ts).
