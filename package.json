@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/cloud",
-  "version": "0.0.8-rc.24",
+  "version": "0.0.8-rc.25",
   "private": true,
   "description": "Open Parachute PBC's Vault Cloud — one Durable Object per vault on Cloudflare, OAuth issuer + self-serve console (accounts + vault ownership).",
   "license": "AGPL-3.0",
@@ -13,7 +13,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "test": "bun test src",
+    "test": "bun test src test-bun",
     "db:generate": "drizzle-kit generate",
     "db:migrate:local": "wrangler d1 migrations apply parachute-cloud-control --local",
     "db:migrate:remote": "wrangler d1 migrations apply parachute-cloud-control --remote"

@@ -700,7 +700,7 @@ function vaultCard(v: ConsoleVaultCard, csrfToken: string, planCapBytes: number)
       <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
       <input type="hidden" name="vault" value="${esc(v.name)}">
       <button class="linkbtn" type="submit">Download everything (.tar)</button>
-      <span class="muted" style="font-size:.8rem">— portable Markdown; attachment files aren&#39;t included yet</span>
+      <span class="muted" style="font-size:.8rem">— portable Markdown, attachment files included</span>
     </form>
   </div>`;
 }

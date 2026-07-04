@@ -35,7 +35,15 @@ import { handleMcp } from "./mcp.js";
 import { mcpWwwAuthenticate } from "./discovery.js";
 import { handleSubscribe } from "./live/subscribe.js";
 import { SubscriptionManager } from "./live/subscriptions.js";
-import { collectExportEntries, exportPrefix, pruneExportTarballs, toTar } from "./export.js";
+import {
+  buildAttachmentIndex,
+  collectExportEntries,
+  exportPrefix,
+  pruneExportTarballs,
+  streamTar,
+  tarSize,
+  toTar,
+} from "./export.js";
 import {
   loadManifest,
   pruneSnapshotTarballs,
@@ -356,12 +364,21 @@ export class VaultDO extends DurableObject {
         audio_retention: this.config!.audio_retention,
         auto_transcribe: this.config!.auto_transcribe,
       };
-      const res = await handleVault(request, this.store, cfg, () => {
-        this.config!.description = cfg.description ?? null;
-        this.config!.audio_retention = cfg.audio_retention ?? "keep";
-        this.config!.auto_transcribe = { enabled: cfg.auto_transcribe?.enabled ?? false };
-        void this.ctx.storage.put("config", this.config);
-      });
+      const res = await handleVault(
+        request,
+        this.store,
+        cfg,
+        () => {
+          this.config!.description = cfg.description ?? null;
+          this.config!.audio_retention = cfg.audio_retention ?? "keep";
+          this.config!.auto_transcribe = { enabled: cfg.auto_transcribe?.enabled ?? false };
+          void this.ctx.storage.put("config", this.config);
+        },
+        // Cross-door capability parity: the SAME transcription object the bare
+        // landing carries (self-host declares it on /api/vault too — notes-ui
+        // must not need its landing-fallback probe against cloud).
+        this.transcriptionCapability(),
+      );
       return res;
     }
     if (apiPath.startsWith("/storage")) {
@@ -1267,14 +1284,23 @@ export class VaultDO extends DurableObject {
     };
   }
 
-  /** GET /api/export — stream the shared export engine into a tar, store it to
-   *  R2 (the nightly-backup artifact, §3.3), and return it as a download. */
+  /** GET /api/export — stream the shared export engine into a tar (attachment
+   *  binaries included, streamed straight out of R2 — never whole-buffered;
+   *  the DO has a 128 MB ceiling and voice attachments run tens of MB), store
+   *  it to R2 (the backup artifact, §3.3), and return it as a download. */
   private async handleExport(request: Request, vaultName: string): Promise<Response> {
     const url = new URL(request.url);
     const since = url.searchParams.get("since") ?? undefined;
     const exportedAt = url.searchParams.get("exported_at") ?? undefined;
-    const { entries } = await collectExportEntries(this.store, this.exportOpts(vaultName, { since, exportedAt }));
-    const tar = toTar(entries);
+    // One R2 list pass builds the attachment size index (tar headers + the
+    // fixed-length R2 write both need every size before any byte flows).
+    const attachments = await buildAttachmentIndex(this.env.ATTACHMENTS, vaultName);
+    const { entries } = await collectExportEntries(
+      this.store,
+      this.exportOpts(vaultName, { since, exportedAt }),
+      attachments,
+    );
+    const total = tarSize(entries);
     // The R2 key is ALWAYS server-time-derived (fixed-width ISO with `:`/`.`
     // mapped to `-`, so lexicographic key order is chronological). The
     // caller-controlled `exported_at` param flows ONLY into the tarball
@@ -1284,11 +1310,32 @@ export class VaultDO extends DurableObject {
     // below. Two exports inside the same millisecond overwrite one key —
     // benign: last-write-wins between equivalent backup artifacts.
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const key = `${exportPrefix(vaultName)}${ts}.tar`;
     // Export tarballs are operational backup artifacts, NOT user content: they
     // are deliberately EXCLUDED from the r2_bytes cap meter (no meterAdd here),
     // so exports never eat the tenant's storage quota. The prune below matches
     // (no meterSub) — see pruneExportTarballs.
-    await this.env.ATTACHMENTS.put(`${exportPrefix(vaultName)}${ts}.tar`, tar);
+    //
+    // Memory-safe by construction: the tar is assembled INTO the R2 write
+    // through a FixedLengthStream (R2 needs a known length for stream puts —
+    // tarSize gives it exactly), with each attachment pumped R2→R2 chunk-wise
+    // by streamTar. The response is then served from the stored object's
+    // stream, so the full tarball never exists in DO memory. put() consumes
+    // the readable CONCURRENTLY with streamTar's writes — start it first,
+    // await both after.
+    const fixed = new FixedLengthStream(total);
+    const putPromise = this.env.ATTACHMENTS.put(key, fixed.readable);
+    try {
+      await streamTar(entries, fixed.writable, (k) => this.env.ATTACHMENTS.get(k));
+      await putPromise;
+    } catch (e) {
+      // Settle the put (it rejects when the writable aborted) so nothing leaks
+      // as an unhandled rejection, then fail honestly — a clean error beats a
+      // silently corrupt archive.
+      await putPromise.catch(() => {});
+      console.error(`[export ${vaultName}] failed: ${errText(e)}`);
+      return json({ error: "export_failed", message: "Export could not be assembled. Please retry." }, 500);
+    }
     // Retention: keep only the newest EXPORT_KEEP tarballs. Best-effort — a
     // prune failure is logged and never fails the export response (the caller
     // gets their bytes either way; a leaked tarball is caught by the next
@@ -1303,22 +1350,33 @@ export class VaultDO extends DurableObject {
     // snapshots/` with its own GFS retention manifest. That prefix is
     // intentionally OUTSIDE this prune (which touches only `exports/`), so
     // the two retention regimes can't interfere.
-    return new Response(tar, {
+    //
+    // Serve the download from the just-stored object's stream (chunk-wise,
+    // same memory posture as the write above).
+    const stored = await this.env.ATTACHMENTS.get(key);
+    if (!stored) {
+      // Only reachable if a concurrent prune raced us out — retrying re-writes.
+      console.error(`[export ${vaultName}] stored tarball vanished before serving (${key})`);
+      return json({ error: "export_failed", message: "Export could not be assembled. Please retry." }, 500);
+    }
+    return new Response(stored.body, {
       status: 200,
       headers: {
         "Content-Type": "application/x-tar",
         "Content-Disposition": `attachment; filename="vault-${vaultName}-${ts}.tar"`,
-        "Content-Length": String(tar.byteLength),
+        "Content-Length": String(total),
       },
     });
   }
 
   /**
-   * Test RPC: the export engine's entries as `{name,text}`, WITHOUT tar framing.
-   * The conformance suite asserts the HTTP tarball unpacks to exactly this,
-   * pinning that the portable-md serializer runs through the same core seam on
-   * both paths (so the tar packaging can't silently drift). Same `exportOpts` as
-   * the HTTP handler.
+   * Test RPC: the export engine's TEXT entries as `{name,text}`, WITHOUT tar
+   * framing (markdown-only — no attachment index wired, exactly a bun export
+   * with no assetsDir). The conformance suite asserts the HTTP tarball's text
+   * entries unpack to exactly this, pinning that the portable-md serializer
+   * runs through the same core seam on both paths (so the tar packaging can't
+   * silently drift); the binary sidecar entries are pinned separately against
+   * the R2 objects themselves. Same `exportOpts` as the HTTP handler.
    */
   async exportEntries(
     vaultName: string,
