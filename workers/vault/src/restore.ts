@@ -12,11 +12,13 @@
  * code path — the no-lock-in promise runs in both directions.
  *
  * v1 honesty (documented everywhere user-facing): snapshots carry NO
- * attachment binaries (the export sink is markdown-only — export.ts module
- * note), so a restore recreates every attachment ROW (notes reference their
- * files exactly as before) but the binaries are absent from the restored
- * vault's storage. `attachmentsEnabled` is false; the engine restores rows
- * and skips the copy phase.
+ * attachment binaries (the snapshot path runs the export engine WITHOUT the
+ * attachment index — unlike `/api/export`, which streams binaries since
+ * 0.0.8-rc.25), so a restore recreates every attachment ROW (notes reference
+ * their files exactly as before) but the binaries are absent from the
+ * restored vault's storage. `attachmentsEnabled` is false; the engine
+ * restores rows and skips the copy phase. Wiring snapshots+restore for
+ * binaries is a deliberate follow-up (metering + restore-copy semantics).
  */
 import {
   SIDECAR_DIR,

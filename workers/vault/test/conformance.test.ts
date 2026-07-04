@@ -403,6 +403,33 @@ describe("vault landing + config", () => {
     expect(bad.status).toBe(400);
     expect((await bad.json() as any).error).toBe("invalid_audio_retention");
   });
+
+  // Cross-door capability parity — self-host declares `transcription` on BOTH
+  // the landing and /api/vault (routes.ts handleVault); cloud must match so
+  // notes-ui's /api/vault probe works without its landing-fallback workaround.
+  it("GET /api/vault carries the transcription capability, shape-equal to the landing's (voice off)", async () => {
+    const v = freshVault();
+    const apiVault = (await (await op(v, "/api/vault")).json()) as any;
+    const landing = (await (await op(v, "")).json()) as any;
+    expect(apiVault.transcription).toEqual({ enabled: false, minutes_remaining: 0 });
+    expect(apiVault.transcription).toEqual(landing.transcription);
+  });
+
+  it("GET /api/vault mirrors the landing's transcription after a voice-entitlement push (voice on)", async () => {
+    const v = freshVault();
+    // Operator bearer passes the internal-config gate (the control-plane seam).
+    const push = await op(v, "/api/internal/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transcription: { enabled: true, minutes_limit: 600 } }),
+    });
+    expect(push.status).toBe(200);
+
+    const apiVault = (await (await op(v, "/api/vault")).json()) as any;
+    const landing = (await (await op(v, "")).json()) as any;
+    expect(apiVault.transcription).toEqual({ enabled: true, minutes_remaining: 600 });
+    expect(apiVault.transcription).toEqual(landing.transcription);
+  });
 });
 
 describe("CORS", () => {

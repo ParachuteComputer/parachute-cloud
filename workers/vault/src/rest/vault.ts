@@ -32,11 +32,21 @@ export async function handleVault(
   store: Store,
   vaultConfig: VaultConfigLike,
   persist?: () => void,
+  /**
+   * Transcription capability for the GET response — the SAME object the bare
+   * landing carries (vault-do.ts `transcriptionCapability()`), mirroring
+   * self-host's routes.ts which declares `transcription` on /api/vault.
+   * Keeping both doors in lock-step is what lets notes-ui probe /api/vault
+   * without its cross-door fallback. GET-only, like self-host (the PATCH
+   * response omits it there too).
+   */
+  transcription?: { enabled: boolean; minutes_remaining: number },
 ): Promise<Response> {
   const url = new URL(req.url);
 
   if (req.method === "GET") {
     const result: Record<string, unknown> = vaultResponse(vaultConfig);
+    if (transcription) result.transcription = transcription;
     if (parseBool(parseQuery(url, "include_stats"), false)) {
       result.stats = await store.getVaultStats();
     }

@@ -1220,6 +1220,42 @@ async function main() {
         "voice: minutes_remaining metered down after the transcription",
         `${land.transcription.minutes_remaining} → ${land2.transcription.minutes_remaining}`,
       );
+
+      // --- Cross-door capability parity (rc.25): /api/vault carries the SAME
+      // transcription object as the landing (self-host declares it there too —
+      // notes-ui's /api/vault probe must work without its landing fallback).
+      // Back-to-back reads + a tolerance on the metered number: the staging
+      // __test drain and the DO's own armed alarm can each meter a
+      // transcription between two reads (observed live), and the parity claim
+      // is about the DOORS agreeing, not the meter being frozen.
+      const apiVault = (await (await fetch(`${VAULT}/vault/${arrivalVault}/api/vault`, { headers: AUTH })).json()) as any;
+      const land3 = (await (await fetch(`${VAULT}/vault/${arrivalVault}`, { headers: AUTH })).json()) as any;
+      assert(
+        apiVault.transcription?.enabled === true &&
+          apiVault.transcription.enabled === land3.transcription?.enabled &&
+          typeof apiVault.transcription?.minutes_remaining === "number" &&
+          Math.abs(apiVault.transcription.minutes_remaining - land3.transcription.minutes_remaining) < 1,
+        "voice: GET /api/vault mirrors the landing's transcription capability (cross-door parity)",
+        `api=${JSON.stringify(apiVault.transcription)} landing=${JSON.stringify(land3.transcription)}`,
+      );
+
+      // --- Export carries the audio BINARY byte-intact (rc.25) — the
+      // door-switching promise for voice users: the tarball's portable-md
+      // sidecar (.parachute/attachments/<id>/<file>) equals the uploaded wav.
+      const attId = vAtts[0]?.id as string | undefined;
+      const exp = await fetch(`${VAULT}/vault/${arrivalVault}/api/export`, { headers: AUTH });
+      const expEntries = untar(new Uint8Array(await exp.arrayBuffer()));
+      // Sidecar basename = basename(attachment.path) — the storage door mints
+      // <date>/<ts>-<uuid>.wav, NOT the original upload filename.
+      const sidecar = expEntries.find((e) => e.name === `.parachute/attachments/${attId}/${upPath.split("/").pop()}`);
+      const wavBytes = new Uint8Array(wav.buffer, wav.byteOffset, wav.byteLength);
+      const byteIntact =
+        !!sidecar && sidecar.bytes.length === wavBytes.length && sidecar.bytes.every((b, i) => b === wavBytes[i]);
+      assert(
+        exp.status === 200 && byteIntact,
+        "voice: export tar carries the audio attachment BYTE-INTACT at the portable-md sidecar path",
+        `status ${exp.status} entry=${sidecar ? `${sidecar.bytes.length}B` : "MISSING"} fixture=${wavBytes.length}B`,
+      );
     }
   }
 
@@ -1395,8 +1431,9 @@ async function authorizeFor(email: string, password: string, vaultName: string):
 }
 
 // Minimal POSIX ustar reader (mirror of export.ts toTar): 512-byte blocks.
-function untar(buf: Uint8Array): { name: string; text: string }[] {
-  const out: { name: string; text: string }[] = [];
+// `bytes` carries the raw entry data — attachment binaries compare byte-wise.
+function untar(buf: Uint8Array): { name: string; text: string; bytes: Uint8Array }[] {
+  const out: { name: string; text: string; bytes: Uint8Array }[] = [];
   const dec = new TextDecoder();
   let off = 0;
   while (off + 512 <= buf.length) {
@@ -1407,8 +1444,8 @@ function untar(buf: Uint8Array): { name: string; text: string }[] {
     const sizeStr = dec.decode(header.subarray(124, 136)).replace(/\0.*$/, "").trim();
     const size = parseInt(sizeStr, 8) || 0;
     off += 512;
-    const text = dec.decode(buf.subarray(off, off + size));
-    out.push({ name: prefix ? `${prefix}/${name}` : name, text });
+    const bytes = buf.subarray(off, off + size).slice();
+    out.push({ name: prefix ? `${prefix}/${name}` : name, text: dec.decode(bytes), bytes });
     off += Math.ceil(size / 512) * 512;
   }
   return out;

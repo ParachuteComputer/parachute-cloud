@@ -9,14 +9,28 @@
  * format / ordering / case-collision / since decision; the sink only persists
  * bytes. `FsExportSink` (bun) is golden-pinned in the vault repo, so a
  * cross-runtime byte match here chains that guarantee — and the conformance
- * test asserts the tar's entries equal what the same engine emits into a plain
- * map (the DO RPC `exportEntries`), so the tar packaging can't silently drift.
+ * test asserts the tar's TEXT entries equal what the same engine emits into a
+ * plain map (the DO RPC `exportEntries`), so the tar packaging can't silently
+ * drift.
  *
- * v1 divergence (documented): the `ExportSink` interface is synchronous, so a
- * key-addressed sink can't `await` R2 to copy attachment BINARIES —
- * `attachmentsEnabled` is false, exactly like a bun markdown-only export with no
- * `assetsDir`. The frontmatter attachment refs are still emitted (structurally
- * complete + importable); copying the binaries out of R2 is a follow-up.
+ * Attachment binaries (the door-switching promise, closes the export.ts v1
+ * divergence): the tar carries `.parachute/attachments/<id>/<basename>` sidecar
+ * entries exactly like a bun export with `assetsDir` wired, so a cloud export
+ * imports cleanly into self-host with files intact. The `ExportSink` interface
+ * is synchronous, so the sink can't `await` R2 mid-engine — instead the caller
+ * pre-lists the vault's attachment prefix ONCE ({@link buildAttachmentIndex}:
+ * R2 `list` returns sizes, and tar headers need sizes up front anyway) and the
+ * sink answers `copyAttachment` from that index, recording a DEFERRED entry
+ * (`{key, size}`) in emission order. Packing then happens in
+ * {@link streamTar}: each R2 object is streamed through the tar output
+ * chunk-by-chunk — **no whole attachment is ever buffered** (the DO has a
+ * 128 MB ceiling and voice attachments run tens of MB; buffering audio is the
+ * exact OOM class the 25 MB transcribe gate exists for). An attachment row
+ * whose binary is absent from R2 (e.g. audio dropped under
+ * `audio_retention: until_transcribed`) is skipped-with-reason via the
+ * engine's own `skipped_attachments` machinery — byte-for-byte the same
+ * behavior as a bun export whose assets file was evicted while the row
+ * persisted.
  */
 import {
   exportVault,
@@ -26,10 +40,29 @@ import {
   type SinkWriteResult,
 } from "@openparachute/core/src/portable-md.js";
 import type { Store } from "@openparachute/core/src/types.js";
+import { r2Key } from "./rest/notes.js";
 
-interface TarEntry {
+/** A buffered text entry (notes / schemas / sidecars — small by nature). */
+export interface TarEntry {
   name: string;
   bytes: Uint8Array;
+}
+
+/** A deferred attachment entry — bytes stay in R2 until pack time and stream
+ *  through the tar without ever being whole-buffered. `size` comes from the
+ *  pre-listed index and doubles as the tar header size field. */
+export interface TarR2Entry {
+  name: string;
+  /** Full R2 object key the bytes stream from at pack time. */
+  key: string;
+  /** Byte size (from R2 list) — the tar header needs it before the bytes. */
+  size: number;
+}
+
+export type TarEntrySpec = TarEntry | TarR2Entry;
+
+export function isR2Entry(e: TarEntrySpec): e is TarR2Entry {
+  return "key" in e;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,25 +120,68 @@ export async function pruneExportTarballs(bucket: R2Bucket, vaultName: string, k
   return stale;
 }
 
+// ---------------------------------------------------------------------------
+// Attachment index — one R2 list pass, so the (synchronous) sink can answer
+// copyAttachment truthfully and the tar/R2-put know every size up front.
+// ---------------------------------------------------------------------------
+
+export interface AttachmentIndex {
+  /** Vault-relative attachment path (the `attachments[].path` value) → size. */
+  readonly sizes: ReadonlyMap<string, number>;
+  /** Full R2 key for a vault-relative attachment path. */
+  keyFor(relPath: string): string;
+}
+
+/** Walk `vault-<name>/attachments/` once (paginated) into a size map — one
+ *  subrequest per 1000 objects instead of a head per attachment. */
+export async function buildAttachmentIndex(bucket: R2Bucket, vaultName: string): Promise<AttachmentIndex> {
+  const prefix = r2Key(vaultName, ""); // "vault-<name>/attachments/"
+  const sizes = new Map<string, number>();
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, ...(cursor ? { cursor } : {}) });
+    for (const obj of page.objects) sizes.set(obj.key.slice(prefix.length), obj.size);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return { sizes, keyFor: (relPath: string) => `${prefix}${relPath}` };
+}
+
 /**
  * In-DO `ExportSink` that collects the engine's writes in emission order. A
- * key-addressed namespace is always case-sensitive (no fs collision path);
- * attachment binaries are out (sync sink can't await R2 — see the module note).
+ * key-addressed namespace is always case-sensitive (no fs collision path).
+ * Text writes buffer (notes are small); attachment copies defer — the sink
+ * records `{key, size}` from the pre-listed index and the binary streams at
+ * pack time ({@link streamTar}). A path absent from the index answers
+ * `{ok: false}` so the engine's `skipped_attachments` stays truthful.
  */
 class TarCollectingSink implements ExportSink {
   readonly caseSensitive = true;
-  readonly attachmentsEnabled = false;
-  readonly entries: TarEntry[] = [];
+  readonly attachmentsEnabled: boolean;
+  readonly entries: TarEntrySpec[] = [];
   private readonly enc = new TextEncoder();
+
+  constructor(private readonly attachments?: AttachmentIndex) {
+    this.attachmentsEnabled = !!attachments;
+  }
 
   writeText(relPath: string, content: string): SinkWriteResult {
     this.entries.push({ name: normalizeTarPath(relPath), bytes: this.enc.encode(content) });
     return { ok: true };
   }
 
-  // Never called (attachmentsEnabled === false), but the interface requires it.
-  copyAttachment(): SinkWriteResult {
-    return { ok: false, reason: "attachment binaries are not exported in cloud v1 (frontmatter refs retained)" };
+  copyAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult {
+    // Never reached when attachmentsEnabled === false, but keep it honest.
+    if (!this.attachments) {
+      return { ok: false, reason: "attachment binaries are not wired for this export" };
+    }
+    const size = this.attachments.sizes.get(srcRelPath);
+    if (size === undefined) {
+      // Row persisted, binary gone (e.g. audio dropped under audio_retention)
+      // — the same skip-with-reason a bun export emits for an evicted file.
+      return { ok: false, reason: `attachment binary not found in storage: "${srcRelPath}"` };
+    }
+    this.entries.push({ name: normalizeTarPath(destRelPath), key: this.attachments.keyFor(srcRelPath), size });
+    return { ok: true };
   }
 }
 
@@ -118,20 +194,36 @@ function normalizeTarPath(p: string): string {
  * Run the shared export engine into a tar-collecting sink. Returns the ordered
  * entries + the engine's stats. Both the HTTP handler and the test RPC call
  * this, so the tar and the golden comparison come from one code path.
+ *
+ * Without an {@link AttachmentIndex} the export is markdown-only (snapshots,
+ * the `exportEntries` test RPC — frontmatter refs still emitted, binaries
+ * skipped exactly like a bun export with no `assetsDir`); with one, deferred
+ * attachment entries interleave in engine emission order.
  */
 export async function collectExportEntries(
   store: Store,
   opts: ExportEngineOptions,
-): Promise<{ entries: TarEntry[]; stats: ExportStats }> {
-  const sink = new TarCollectingSink();
+): Promise<{ entries: TarEntry[]; stats: ExportStats }>;
+export async function collectExportEntries(
+  store: Store,
+  opts: ExportEngineOptions,
+  attachments: AttachmentIndex,
+): Promise<{ entries: TarEntrySpec[]; stats: ExportStats }>;
+export async function collectExportEntries(
+  store: Store,
+  opts: ExportEngineOptions,
+  attachments?: AttachmentIndex,
+): Promise<{ entries: TarEntrySpec[]; stats: ExportStats }> {
+  const sink = new TarCollectingSink(attachments);
   const stats = await exportVault(store, sink, opts);
   return { entries: sink.entries, stats };
 }
 
 // ---------------------------------------------------------------------------
-// Minimal POSIX ustar encoder — enough to pack UTF-8 text entries. No external
-// tar dep (nothing tar-shaped exists under workerd); `parachute-vault import`
-// reads any conformant tar via its untar path.
+// Minimal POSIX ustar encoder — enough to pack UTF-8 text entries + streamed
+// binary entries. No external tar dep (nothing tar-shaped exists under
+// workerd); `parachute-vault import` reads any conformant tar via its untar
+// path.
 // ---------------------------------------------------------------------------
 
 const BLOCK = 512;
@@ -165,15 +257,15 @@ function splitName(path: string): { name: string; prefix: string } {
   throw new Error(`export: path too long for tar (name >100 bytes, unsplittable): ${path}`);
 }
 
-function tarHeader(entry: TarEntry): Uint8Array {
+function tarHeader(entryName: string, size: number): Uint8Array {
   const header = new Uint8Array(BLOCK);
-  const { name, prefix } = splitName(entry.name);
+  const { name, prefix } = splitName(entryName);
 
   writeAscii(header, 0, name, 100);
   writeAscii(header, 100, octalField(0o644, 8), 8); // mode
   writeAscii(header, 108, octalField(0, 8), 8); // uid
   writeAscii(header, 116, octalField(0, 8), 8); // gid
-  writeAscii(header, 124, octalField(entry.bytes.length, 12), 12); // size
+  writeAscii(header, 124, octalField(size, 12), 12); // size
   writeAscii(header, 136, octalField(0, 12), 12); // mtime (0 → byte-stable across runs)
   // chksum (148, 8) filled after summing, with 8 spaces as placeholder.
   header.fill(0x20, 148, 156);
@@ -190,12 +282,27 @@ function tarHeader(entry: TarEntry): Uint8Array {
   return header;
 }
 
-/** Pack ordered text entries into a POSIX ustar archive. */
+/** Exact archive size for a set of entries — header + padded data per entry
+ *  + the two-block trailer. `FixedLengthStream` (the R2 streaming write) and
+ *  the HTTP `Content-Length` both need it before any byte flows. */
+export function tarSize(entries: readonly TarEntrySpec[]): number {
+  let total = BLOCK * 2; // trailer
+  for (const e of entries) {
+    const size = isR2Entry(e) ? e.size : e.bytes.length;
+    total += BLOCK + Math.ceil(size / BLOCK) * BLOCK;
+  }
+  return total;
+}
+
+/** Pack ordered TEXT entries into a buffered POSIX ustar archive (snapshots +
+ *  unit tests — small by construction). Attachment-bearing exports go through
+ *  {@link streamTar} instead; buffering R2 binaries here would reintroduce the
+ *  DO-OOM class this module exists to avoid. */
 export function toTar(entries: TarEntry[]): Uint8Array {
   const blocks: Uint8Array[] = [];
   let total = 0;
   for (const entry of entries) {
-    const header = tarHeader(entry);
+    const header = tarHeader(entry.name, entry.bytes.length);
     blocks.push(header);
     total += BLOCK;
     blocks.push(entry.bytes);
@@ -219,4 +326,69 @@ export function toTar(entries: TarEntry[]): Uint8Array {
     off += b.length;
   }
   return out;
+}
+
+/** The slice of `R2ObjectBody` streaming needs — narrow on purpose so tests
+ *  (and the bun round-trip suite) can fake it without an R2 binding. */
+export interface StreamableObject {
+  size: number;
+  body: ReadableStream<Uint8Array>;
+}
+
+/**
+ * Pack ordered entries into `writable` as a POSIX ustar archive, streaming
+ * binary entries chunk-by-chunk from `getObject` — the memory-safe pack path
+ * (peak extra memory = one transport chunk, never a whole attachment). Emits
+ * exactly {@link tarSize} bytes then closes; on ANY inconsistency (object
+ * vanished or changed size between the index list and the pack — the tar
+ * header already promised `size`) it aborts the writable and throws, so a
+ * failed export is a clean error, never a silently corrupt archive.
+ */
+export async function streamTar(
+  entries: readonly TarEntrySpec[],
+  writable: WritableStream<Uint8Array>,
+  getObject: (key: string) => Promise<StreamableObject | null>,
+): Promise<void> {
+  const writer = writable.getWriter();
+  try {
+    for (const e of entries) {
+      const size = isR2Entry(e) ? e.size : e.bytes.length;
+      await writer.write(tarHeader(e.name, size));
+      if (isR2Entry(e)) {
+        const obj = await getObject(e.key);
+        if (!obj || obj.size !== e.size) {
+          throw new Error(
+            `export: attachment object "${e.key}" ${obj ? `changed size (${obj.size} != ${e.size})` : "vanished"} during export`,
+          );
+        }
+        let written = 0;
+        const reader = obj.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          written += value.byteLength;
+          if (written > e.size) {
+            throw new Error(`export: attachment object "${e.key}" streamed past its indexed size (${e.size})`);
+          }
+          await writer.write(value);
+        }
+        if (written !== e.size) {
+          throw new Error(`export: attachment object "${e.key}" streamed ${written} bytes, expected ${e.size}`);
+        }
+      } else if (e.bytes.length > 0) {
+        await writer.write(e.bytes);
+      }
+      const rem = size % BLOCK;
+      if (rem !== 0) await writer.write(new Uint8Array(BLOCK - rem));
+    }
+    await writer.write(new Uint8Array(BLOCK * 2));
+    await writer.close();
+  } catch (err) {
+    try {
+      await writer.abort(err);
+    } catch {
+      // already errored/closed — the original err is what matters
+    }
+    throw err;
+  }
 }
