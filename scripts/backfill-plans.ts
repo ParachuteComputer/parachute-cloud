@@ -31,7 +31,7 @@
  */
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PLAN_SPECS, coercePlanId, type PlanId } from "../workers/identity/src/plans.ts";
+import { coercePlanId, planTotalBytes, type PlanId } from "../workers/identity/src/plans.ts";
 import { signInternalAdminToken } from "../workers/identity/scripts/sign-internal-token.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -112,17 +112,17 @@ async function main() {
       console.log(`  comp ${email}: NOT PRESENT in ${targetName} — skipped`);
       continue;
     }
-    if (user.plan === "parachute") {
-      console.log(`  comp ${email}: already plan=parachute`);
+    if (user.plan === "standard") {
+      console.log(`  comp ${email}: already plan=standard`);
       continue;
     }
     if (DRY) {
-      console.log(`  comp ${email}: would set plan=parachute (currently ${user.plan})`);
+      console.log(`  comp ${email}: would set plan=standard (currently ${user.plan})`);
     } else {
-      d1(`UPDATE users SET plan = 'parachute' WHERE id = '${user.id.replace(/'/g, "''")}'`);
-      console.log(`  comp ${email}: plan ${user.plan} → parachute`);
+      d1(`UPDATE users SET plan = 'standard' WHERE id = '${user.id.replace(/'/g, "''")}'`);
+      console.log(`  comp ${email}: plan ${user.plan} → standard`);
     }
-    user.plan = "parachute"; // local view drives the cap pushes below
+    user.plan = "standard"; // local view drives the cap pushes below
   }
 
   // 2. Push per-plan caps into every existing vault DO.
@@ -142,8 +142,10 @@ async function main() {
   for (const v of vaults) {
     const owner = byId.get(v.owner_user_id);
     const plan: PlanId = coercePlanId(owner?.plan);
-    const cap = PLAN_SPECS[plan].total_bytes;
-    const who = owner ? `${owner.email} plan=${plan}` : `ORPHAN owner ${v.owner_user_id} → free`;
+    // NB: PR-A pushes the legacy summed `cap_bytes` here (back-compat path); the
+    // two-meter `caps` backfill is PR-B. planTotalBytes = notes + attachment sum.
+    const cap = planTotalBytes(plan);
+    const who = owner ? `${owner.email} plan=${plan}` : `ORPHAN owner ${v.owner_user_id} → expired`;
     if (DRY) {
       console.log(`  vault ${v.name} (${who}): would set cap_bytes=${cap} (${fmt(cap)})`);
       continue;

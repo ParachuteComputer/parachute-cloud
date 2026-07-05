@@ -175,11 +175,13 @@ afterEach(() => fetchMock.assertNoPendingInterceptors());
 // --- plan policy (the single source of truth) -----------------------------------
 
 describe("plan snapshot policy (plans.ts)", () => {
-  test("paid: 14/8/12 + restore; free: the internal rolling weekly, NO restore", () => {
-    expect(PLAN_SPECS.parachute.snapshot_retention).toEqual({ daily: 14, weekly: 8, monthly: 12 });
-    expect(PLAN_SPECS.parachute.restore).toBe(true);
-    expect(PLAN_SPECS.free.snapshot_retention).toEqual({ daily: 0, weekly: 1, monthly: 0 });
-    expect(PLAN_SPECS.free.restore).toBe(false);
+  test("paid + trial: 14/8/12 + restore; expired: the internal rolling weekly, NO restore", () => {
+    expect(PLAN_SPECS.standard.snapshot_retention).toEqual({ daily: 14, weekly: 8, monthly: 12 });
+    expect(PLAN_SPECS.standard.restore).toBe(true);
+    expect(PLAN_SPECS.trial.snapshot_retention).toEqual({ daily: 14, weekly: 8, monthly: 12 });
+    expect(PLAN_SPECS.trial.restore).toBe(true);
+    expect(PLAN_SPECS.expired.snapshot_retention).toEqual({ daily: 0, weekly: 1, monthly: 0 });
+    expect(PLAN_SPECS.expired.restore).toBe(false);
   });
 });
 
@@ -207,21 +209,22 @@ describe("snapshot cron routing", () => {
 
 describe("runSnapshotSweep", () => {
   test("sends each owner's PLAN retention and mirrors the returned manifest into D1", async () => {
-    const { id: freeOwner } = await seedUser("sweep-free@example.com");
+    const { id: expiredOwner } = await seedUser("sweep-expired@example.com");
     const { id: paidOwner } = await seedUser("sweep-paid@example.com");
-    await env.DB.prepare("UPDATE users SET plan = 'parachute' WHERE id = ?").bind(paidOwner).run();
-    await seedVault("sweep-a-free", freeOwner);
+    await env.DB.prepare("UPDATE users SET plan = 'expired' WHERE id = ?").bind(expiredOwner).run();
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(paidOwner).run();
+    await seedVault("sweep-a-expired", expiredOwner);
     await seedVault("sweep-b-paid", paidOwner);
 
-    let freeBody = "";
+    let expiredBody = "";
     let paidBody = "";
     let auth: string | undefined;
-    const freeManifest = [wireEntry("sweep-a-free", "2026-06-29T04:00:00.000Z", { ranks: ["daily", "weekly"] })];
+    const expiredManifest = [wireEntry("sweep-a-expired", "2026-06-29T04:00:00.000Z", { ranks: ["daily", "weekly"] })];
     const paidManifest = [
       wireEntry("sweep-b-paid", "2026-07-02T04:00:00.000Z"),
       wireEntry("sweep-b-paid", "2026-07-03T04:00:00.000Z", { ranks: ["daily", "monthly"] }),
     ];
-    interceptSnapshotPost("sweep-a-free", { skipped: false, manifest: freeManifest }, { captureBody: (b) => (freeBody = b), captureAuth: (a) => (auth = a) });
+    interceptSnapshotPost("sweep-a-expired", { skipped: false, manifest: expiredManifest }, { captureBody: (b) => (expiredBody = b), captureAuth: (a) => (auth = a) });
     interceptSnapshotPost("sweep-b-paid", { skipped: false, manifest: paidManifest }, { captureBody: (b) => (paidBody = b) });
 
     // REAL clock: the minted 60s token is validated against wall time below.
@@ -237,13 +240,13 @@ describe("runSnapshotSweep", () => {
     });
 
     // The retention policy in the body IS the owner's plan policy.
-    expect(JSON.parse(freeBody)).toEqual({ retention: { daily: 0, weekly: 1, monthly: 0 } });
+    expect(JSON.parse(expiredBody)).toEqual({ retention: { daily: 0, weekly: 1, monthly: 0 } });
     expect(JSON.parse(paidBody)).toEqual({ retention: { daily: 14, weekly: 8, monthly: 12 } });
 
     // The D1 mirror equals the returned manifests.
     const rows = await mirrorRows();
     expect(rows.map((r) => [r.vault_name, r.key])).toEqual([
-      ["sweep-a-free", freeManifest[0]!.key],
+      ["sweep-a-expired", expiredManifest[0]!.key],
       ["sweep-b-paid", paidManifest[0]!.key],
       ["sweep-b-paid", paidManifest[1]!.key],
     ]);
@@ -252,14 +255,14 @@ describe("runSnapshotSweep", () => {
     // The mint-seam contract: first-party client, admin verb, aud-pinned, 60s.
     const token = auth!.replace(/^Bearer /, "");
     const { payload } = await validateAccessToken(env.DB, token, ISSUER);
-    expect(payload.aud).toBe("vault.sweep-a-free");
-    expect(payload.scope).toBe("vault:sweep-a-free:admin");
+    expect(payload.aud).toBe("vault.sweep-a-expired");
+    expect(payload.scope).toBe("vault:sweep-a-expired:admin");
     expect(payload.client_id).toBe("parachute-console");
-    expect(payload.sub).toBe(freeOwner);
+    expect(payload.sub).toBe(expiredOwner);
     expect((payload.exp as number) - (payload.iat as number)).toBe(60);
   });
 
-  test("a skipped snapshot (free mid-week) still refreshes the mirror and counts as skipped", async () => {
+  test("a skipped snapshot (mid-week, any entitled tier) still refreshes the mirror and counts as skipped", async () => {
     const { id: owner } = await seedUser("sweep-skip@example.com");
     await seedVault("sweep-skip-v", owner);
     const manifest = [wireEntry("sweep-skip-v", "2026-06-29T04:00:00.000Z", { ranks: ["daily", "weekly"] })];
@@ -364,7 +367,7 @@ describe("console History", () => {
 
   test("paid: restore points render with human dates, sizes, ranks, restore doors, and the attachments caveat", async () => {
     const { id: userId } = await seedUser("hist-paid@example.com");
-    await env.DB.prepare("UPDATE users SET plan = 'parachute' WHERE id = ?").bind(userId).run();
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
     await seedVault("hist-v", userId);
     const entry = wireEntry("hist-v", "2026-07-03T04:00:12.345Z", { bytes: 2 * 1024 * 1024, ranks: ["daily", "weekly"] });
     await seedMirrorRow("hist-v", entry);
@@ -385,7 +388,7 @@ describe("console History", () => {
 
   test('paid with no rows yet → "snapshots begin within a day"', async () => {
     const { id: userId } = await seedUser("hist-fresh@example.com");
-    await env.DB.prepare("UPDATE users SET plan = 'parachute' WHERE id = ?").bind(userId).run();
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
     await seedVault("hist-fresh-v", userId);
     const html = await consoleHtml(await seedSession(userId));
     expect(html).toContain('data-testid="vault-history"');
@@ -393,17 +396,18 @@ describe("console History", () => {
     expect(html).not.toContain('data-testid="restore-point"');
   });
 
-  test("free: the teaser renders and the internal DR snapshot NEVER leaks (no key, no restore door)", async () => {
-    const { id: userId } = await seedUser("hist-free@example.com");
-    await seedVault("hist-free-v", userId);
-    // The free vault DOES have an internal rolling weekly in the mirror.
-    const entry = wireEntry("hist-free-v", "2026-06-29T04:00:00.000Z", { ranks: ["daily", "weekly"] });
-    await seedMirrorRow("hist-free-v", entry);
+  test("expired: the teaser renders and the internal DR snapshot NEVER leaks (no key, no restore door)", async () => {
+    const { id: userId } = await seedUser("hist-expired@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'expired' WHERE id = ?").bind(userId).run();
+    await seedVault("hist-expired-v", userId);
+    // The expired vault DOES have an internal rolling weekly in the mirror.
+    const entry = wireEntry("hist-expired-v", "2026-06-29T04:00:00.000Z", { ranks: ["daily", "weekly"] });
+    await seedMirrorRow("hist-expired-v", entry);
 
     const html = await consoleHtml(await seedSession(userId));
     expect(html).toContain('data-testid="vault-history"');
     expect(html).toContain('data-testid="history-teaser"');
-    expect(html).toContain("come with the Parachute plan");
+    expect(html).toContain("come with the Parachute plan"); // static marketing copy, unchanged in ui.ts
     expect(html).not.toContain(entry.key); // ours, never surfaced
     expect(html).not.toContain('data-testid="restore-point"');
     expect(html).not.toContain("Restore to a new vault");
@@ -413,13 +417,14 @@ describe("console History", () => {
 // --- POST /console/vaults/restore -------------------------------------------------------
 
 describe("restore POST", () => {
-  test("free plan → the router-shaped 404, even with a valid session + key (pinned)", async () => {
-    const { id: userId } = await seedUser("rp-free@example.com");
-    await seedVault("rp-free-v", userId);
-    const entry = wireEntry("rp-free-v", "2026-06-29T04:00:00.000Z");
-    await seedMirrorRow("rp-free-v", entry);
+  test("expired plan → the router-shaped 404, even with a valid session + key (pinned)", async () => {
+    const { id: userId } = await seedUser("rp-expired@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'expired' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-expired-v", userId);
+    const entry = wireEntry("rp-expired-v", "2026-06-29T04:00:00.000Z");
+    await seedMirrorRow("rp-expired-v", entry);
     const res = await app.fetch(
-      restoreReq({ vault: "rp-free-v", key: entry.key }, sessionCookie(await seedSession(userId))),
+      restoreReq({ vault: "rp-expired-v", key: entry.key }, sessionCookie(await seedSession(userId))),
       env,
     );
     expect(res.status).toBe(404);
@@ -428,7 +433,7 @@ describe("restore POST", () => {
 
   test("paid happy path: creates <vault>-restored-<date>, pushes the cap, drives the DO restore, redirects", async () => {
     const { id: userId } = await seedUser("rp-paid@example.com");
-    await env.DB.prepare("UPDATE users SET plan = 'parachute' WHERE id = ?").bind(userId).run();
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
     await seedVault("rp-v", userId);
     const entry = wireEntry("rp-v", "2026-07-02T04:00:00.000Z");
     await seedMirrorRow("rp-v", entry);
@@ -471,7 +476,7 @@ describe("restore POST", () => {
 
   test("a same-day re-restore REUSES the target vault (no second slot burned, no duplicate row)", async () => {
     const { id: userId } = await seedUser("rp-again@example.com");
-    await env.DB.prepare("UPDATE users SET plan = 'parachute' WHERE id = ?").bind(userId).run();
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
     await seedVault("rp-again-v", userId);
     const entry = wireEntry("rp-again-v", "2026-07-02T04:00:00.000Z");
     await seedMirrorRow("rp-again-v", entry);
@@ -497,8 +502,8 @@ describe("restore POST", () => {
 
   test("at the plan's vault cap → the friendly refusal; NO vault created, NO DO call", async () => {
     const { id: userId } = await seedUser("rp-cap@example.com");
-    await env.DB.prepare("UPDATE users SET plan = 'parachute' WHERE id = ?").bind(userId).run();
-    // Fill all 5 parachute slots.
+    await env.DB.prepare("UPDATE users SET plan = 'plus' WHERE id = ?").bind(userId).run();
+    // Fill all 5 Plus-tier slots.
     for (let i = 0; i < 5; i++) await seedVault(`rp-cap-${i}`, userId);
     const entry = wireEntry("rp-cap-0", "2026-07-02T04:00:00.000Z");
     await seedMirrorRow("rp-cap-0", entry);
@@ -518,7 +523,7 @@ describe("restore POST", () => {
   test("a vault the user doesn't own / an unknown key / a foreign-prefix key are all refused", async () => {
     const { id: userId } = await seedUser("rp-guard@example.com");
     const { id: other } = await seedUser("rp-guard-other@example.com");
-    await env.DB.prepare("UPDATE users SET plan = 'parachute' WHERE id IN (?, ?)").bind(userId, other).run();
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id IN (?, ?)").bind(userId, other).run();
     await seedVault("rp-mine", userId);
     await seedVault("rp-theirs", other);
     const mine = wireEntry("rp-mine", "2026-07-02T04:00:00.000Z");
@@ -543,7 +548,7 @@ describe("restore POST", () => {
 
   test("CSRF / same-origin failures re-render with the session-expired error", async () => {
     const { id: userId } = await seedUser("rp-csrf@example.com");
-    await env.DB.prepare("UPDATE users SET plan = 'parachute' WHERE id = ?").bind(userId).run();
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
     await seedVault("rp-csrf-v", userId);
     const entry = wireEntry("rp-csrf-v", "2026-07-02T04:00:00.000Z");
     await seedMirrorRow("rp-csrf-v", entry);
@@ -574,7 +579,7 @@ describe("restore POST", () => {
 
   test("a failed DO restore keeps the target row and reports honestly", async () => {
     const { id: userId } = await seedUser("rp-fail@example.com");
-    await env.DB.prepare("UPDATE users SET plan = 'parachute' WHERE id = ?").bind(userId).run();
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
     await seedVault("rp-fail-v", userId);
     const entry = wireEntry("rp-fail-v", "2026-07-02T04:00:00.000Z");
     await seedMirrorRow("rp-fail-v", entry);

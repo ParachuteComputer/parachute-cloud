@@ -40,7 +40,7 @@ import { verifyCsrfToken } from "./csrf.ts";
 import { sessionUser } from "./session-user.ts";
 import { billingConfig, billingNotConfiguredResponse } from "./billing-config.ts";
 import { makeStripe } from "./stripe-client.ts";
-import { type PlanId, isPaidPlan } from "./plans.ts";
+import { type PaidTier, canStartCheckout, isPaidTier } from "./plans.ts";
 import { setUserPlan } from "./users.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 
@@ -48,17 +48,38 @@ export interface BillingOverrides {
   stripe?: Stripe;
 }
 
-/** The two Parachute Upgrade buttons — form field `interval`. */
+/** The Upgrade buttons' billing period — form field `interval`. */
 export type BillingInterval = "monthly" | "yearly";
 
 function isBillingInterval(raw: string): raw is BillingInterval {
   return raw === "monthly" || raw === "yearly";
 }
 
-/** Which paid plan the Upgrade button buys — form field `plan` (default
- *  parachute for back-compat with the pre-voice buttons). Voice is monthly-only. */
-function checkoutPlan(raw: string): PlanId {
-  return raw === "voice" ? "voice" : "parachute";
+/** Which purchasable tier the Upgrade button buys — form field `plan`. Any
+ *  unrecognized value defaults to `standard` (the anchor tier). The MOCK path
+ *  applies this directly; the REAL Stripe path resolves it to a Price below
+ *  (only the tiers with a configured Price can complete — PR-C wires the rest). */
+function checkoutPlan(raw: string): PaidTier {
+  return isPaidTier(raw as PaidTier) ? (raw as PaidTier) : "standard";
+}
+
+/**
+ * Resolve the Stripe Price for a (tier, interval) — the REAL checkout path.
+ * PR-A's billing-config carries the anchor prices only: `priceMonthly`/
+ * `priceYearly` back `standard`, and the additive `priceVoiceMonthly` backs
+ * `plus` (monthly-only). Tiers without a configured Price (entry, power) return
+ * null → the caller answers a clean `billing_err=invalid` until PR-C ships the
+ * per-tier price sets. (The MOCK path never calls this — it applies the tier
+ * directly with no Stripe round-trip.)
+ */
+function resolvePrice(
+  tier: PaidTier,
+  interval: BillingInterval,
+  config: { priceMonthly: string; priceYearly: string; priceVoiceMonthly?: string },
+): string | null {
+  if (tier === "standard") return interval === "yearly" ? config.priceYearly : config.priceMonthly;
+  if (tier === "plus") return config.priceVoiceMonthly ?? null; // monthly-only in PR-A
+  return null; // entry / power — no Price configured yet (PR-C)
 }
 
 /**
@@ -80,30 +101,26 @@ export async function handleCheckoutPost(
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
     return redirectResponse("/console?billing_err=session");
   }
-  const plan = checkoutPlan(String(form.get("plan") ?? "parachute"));
-  if (isPaidPlan(user.plan)) {
-    // Already paid (or comped) — the portal is the door for changes; a second
-    // subscription would double-bill.
+  const plan = checkoutPlan(String(form.get("plan") ?? "standard"));
+  if (!canStartCheckout(user.plan)) {
+    // Already on a paid tier (or a live subscription) — the portal is the door
+    // for changes; a second subscription would double-bill. Trial/expired pass.
     return redirectResponse("/console?billing_err=already");
   }
 
-  // Resolve the Stripe Price. Voice is monthly-only (its price is additive and
-  // may be unset even while Parachute billing is live — refuse cleanly then).
-  let price: string;
-  if (plan === "voice") {
-    if (!config.priceVoiceMonthly) return redirectResponse("/console?billing_err=invalid");
-    price = config.priceVoiceMonthly;
-  } else {
-    const interval = String(form.get("interval") ?? "");
-    if (!isBillingInterval(interval)) return redirectResponse("/console?billing_err=invalid");
-    price = interval === "monthly" ? config.priceMonthly : config.priceYearly;
-  }
+  // Resolve the Stripe Price for the chosen tier + interval. `plus` is
+  // monthly-only in PR-A; `entry`/`power` have no Price configured yet → clean
+  // refusal (PR-C ships the per-tier price sets).
+  const interval = String(form.get("interval") ?? "monthly");
+  if (!isBillingInterval(interval)) return redirectResponse("/console?billing_err=invalid");
+  const price = resolvePrice(plan, interval, config);
+  if (!price) return redirectResponse("/console?billing_err=invalid");
 
   const stripe = overrides?.stripe ?? makeStripe(config.secretKey);
 
   // Belt against the double-checkout race (cloud#64): when the plan row lags
-  // a completed payment (webhook in flight/delayed), `isPaidPlan` above can't
-  // see it — but Stripe can. For a user we already know the customer for,
+  // a completed payment (webhook in flight/delayed), the `canStartCheckout`
+  // gate above can't see it — but Stripe can. For a user we already know the customer for,
   // refuse a new session while an ACTIVE subscription exists (a second one
   // would double-bill). FAIL OPEN on a list error (availability over
   // strictness — session creation would likely fail too, and the webhook's
@@ -114,8 +131,8 @@ export async function handleCheckoutPost(
   // Status scope: `active` only. `trialing` isn't covered because no plan
   // configures a trial today (a future trials feature must widen this — a
   // trialing sub is just as double-billable); `past_due`/`unpaid` aren't
-  // because a dunning user still has `plan` paid, so the `isPaidPlan` gate
-  // above already refuses them before this call.
+  // because a dunning user still has `plan` paid, so the `canStartCheckout`
+  // gate above already refuses them before this call.
   if (user.stripeCustomerId) {
     try {
       const subs = await stripe.subscriptions.list({
@@ -204,17 +221,20 @@ export async function handleMockCheckoutPost(db: D1Database, req: Request, deps:
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
     return redirectResponse("/console?billing_err=session");
   }
-  const plan = checkoutPlan(String(form.get("plan") ?? "parachute"));
-  if (isPaidPlan(user.plan)) {
-    // Already paid/comped — the real flow refuses a second checkout here too.
+  const plan = checkoutPlan(String(form.get("plan") ?? "standard"));
+  if (!canStartCheckout(user.plan)) {
+    // Already on a paid tier (or a live sub) — the real flow refuses here too.
     return redirectResponse("/console?billing_err=already");
   }
 
   // Apply the plan through the REAL lifecycle code (NOT a fork): flip the plan,
-  // then push the plan's caps + voice entitlement into every owned vault DO —
-  // the exact seam checkout.session.completed calls. Best-effort per vault
-  // (vault-call.ts); a miss reconciles via the backfill script / next change.
+  // CLEAR the trial/downgrade clock (a conversion cancels the pending 'expired'
+  // downgrade — exactly what checkout.session.completed does; without this the
+  // hourly sweep would revert the mock-upgraded user at day 30), then push the
+  // plan's caps + voice + frozen:false into every owned vault DO — the exact
+  // seam checkout.session.completed calls. Best-effort per vault (vault-call.ts).
   await setUserPlan(db, user.id, plan);
+  await db.prepare("UPDATE users SET pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?").bind(user.id).run();
   const results = await applyPlanToVaults(db, deps, user.id);
   const failed = results.filter((r) => !r.ok);
   if (failed.length > 0) {

@@ -6,14 +6,14 @@
  * nothing, charges nothing), so there is deliberately NO env/config gate.
  *
  * THE GRANT RIDES THE EXISTING PLAN MACHINERY, not a parallel system:
- *   - plan → 'parachute' + applyPlanToVaults (caps lift immediately — the
- *     exact seam checkout.session.completed / the admin comp lever call);
+ *   - plan → PROMO_COMP_PLAN (Plus) + applyPlanToVaults (caps lift immediately
+ *     — the exact seam checkout.session.completed / the admin comp lever call);
  *   - expiry = the deferred-downgrade pair (migration 0012): pending_plan =
- *     'free' + plan_downgrade_at = now + comp_days. The hourly billing sweep
+ *     'expired' + plan_downgrade_at = now + comp_days. The hourly billing sweep
  *     (billing-lifecycle.ts runBillingSweep — rides DRIP_CRON, NOT gated on
- *     Stripe config) applies it when due: plan back to free, caps pushed,
- *     DATA NEVER DELETED (over-cap vaults go write-limited; reads/export
- *     untouched; extra vaults are grandfathered — only NEW creation refuses).
+ *     Stripe config) applies it when due: plan to the expired floor, caps +
+ *     frozen pushed, DATA NEVER DELETED (writes freeze; reads/export untouched;
+ *     extra vaults are grandfathered — only NEW creation refuses).
  *   - a comped user who later subscribes for real is safe: the checkout
  *     webhook's CAS write clears pending_plan + plan_downgrade_at, so a real
  *     subscription is never clawed back by a stale comp expiry.
@@ -26,15 +26,16 @@
  *   2. one-promo-per-account is the `promo_redemptions` PRIMARY KEY(user_id)
  *      — a concurrent double-redeem loses at the INSERT, and the loser gives
  *      the claimed slot back (counter decrement) before answering friendly;
- *   3. the grant itself is a CAS on "still free" (`WHERE plan = 'free'`) — if
- *      a real payment landed between our read and our write, the comp unwinds
- *      completely instead of stomping a paying customer's row. `plan='free'`
- *      alone is the right guard: every path that records a live subscription
- *      (checkout-completed's CAS, subscription.updated) flips the plan paid in
- *      the same write, while a CHURNED subscriber keeps a stale
- *      stripe_subscription_id on their free row forever (the sweep never
- *      clears it) — the earlier extra `AND stripe_subscription_id IS NULL`
- *      clause permanently locked those users out (#73 review).
+ *   3. the grant itself is a CAS on "still trial/expired" (`WHERE plan IN
+ *      ('trial','expired')`) — if a real payment landed between our read and
+ *      our write it flipped the plan to a paid TIER, so the comp unwinds
+ *      completely instead of stomping a paying customer's row. The plan guard
+ *      alone is right: every path that records a live subscription
+ *      (checkout-completed's CAS, subscription.updated) flips the plan to a paid
+ *      tier in the same write, while a CHURNED subscriber falls back to the
+ *      expired floor keeping a stale stripe_subscription_id (the sweep never
+ *      clears it) — hence the redeem gate keys on canStartCheckout, which is
+ *      PLAN-ONLY (trial|expired): a stale id must NOT block redemption (#73).
  *
  * TRUST BOUNDARY: session + CSRF + same-origin — the console's write
  * boundary, exactly like /billing/checkout and /console/vaults (cookie
@@ -44,11 +45,14 @@
 import { verifyCsrfToken } from "./csrf.ts";
 import { sessionUser } from "./session-user.ts";
 import { type OAuthDeps, isSameOriginRequest, redirectResponse, resolveBoundOrigins } from "./oauth-shared.ts";
-import { type PlanId, isPaidPlan } from "./plans.ts";
+import { type PlanId, canStartCheckout } from "./plans.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 
-/** The plan a promo comp grants. One place, so copy + grant can't drift. */
-export const PROMO_COMP_PLAN: PlanId = "parachute";
+/** The plan a promo comp grants — the launch codes are the GENEROUS comp, so
+ *  they land on Plus (the full trial-equivalent experience: voice + attachments),
+ *  redeemable FROM a trial (a comp just extends the runway). One place, so copy
+ *  + grant can't drift. */
+export const PROMO_COMP_PLAN: PlanId = "plus";
 
 /** Codes are short human strings; refuse absurd input before touching D1. */
 const MAX_CODE_LENGTH = 64;
@@ -92,9 +96,14 @@ export async function handlePromoRedeemPost(db: D1Database, req: Request, deps: 
     return redirectResponse("/console?promo_err=invalid");
   }
 
-  // A paid (or already-comped) account has nothing to redeem onto — refuse
-  // BEFORE claiming a slot so lookie-loos never burn the counter.
-  if (isPaidPlan(user.plan)) return redirectResponse("/console?promo_err=already-paid");
+  // Only a trial/expired account can redeem — a paid tier has nothing to comp
+  // onto. Refuse BEFORE claiming a slot so lookie-loos never burn the counter.
+  // A trial user CAN redeem (a comp extends their runway); a CHURNED subscriber
+  // (expired + a stale stripe id) CAN too — canStartCheckout is plan-only, so
+  // #73's "stale id locks redemption" bug stays fixed.
+  if (!canStartCheckout(user.plan)) {
+    return redirectResponse("/console?promo_err=already-paid");
+  }
 
   // Friendly fast path for the common repeat-submit; the PRIMARY KEY on the
   // INSERT below stays the authority under concurrency.
@@ -143,17 +152,17 @@ export async function handlePromoRedeemPost(db: D1Database, req: Request, deps: 
   }
 
   // 3. GRANT THE COMP — plan flips now; expiry is the EXISTING deferred-
-  //    downgrade pair the hourly sweep applies (module note). CAS on "still
-  //    free": if a real checkout completed since our read it flipped the plan
-  //    paid, so this misses and we unwind entirely rather than schedule a
-  //    downgrade for a paying customer (the strand/over-charge failure class).
-  //    Deliberately NOT conditioned on stripe_subscription_id — a churned
-  //    subscriber's free row keeps its stale id (module note, point 3).
+  //    downgrade pair the hourly sweep applies (pending_plan='expired', the new
+  //    floor). CAS on "still trial/expired": if a real checkout completed since
+  //    our read it flipped the plan to a paid TIER, so this misses and we unwind
+  //    entirely rather than schedule a downgrade for a paying customer (the
+  //    strand/over-charge failure class). Trial and expired are BOTH redeemable
+  //    (a trial redeeming just extends its runway onto the comp).
   const until = new Date(now.getTime() + promo.comp_days * 86_400_000).toISOString();
   const grant = await db
     .prepare(
-      `UPDATE users SET plan = ?, pending_plan = 'free', plan_downgrade_at = ?
-       WHERE id = ? AND plan = 'free'`,
+      `UPDATE users SET plan = ?, pending_plan = 'expired', plan_downgrade_at = ?
+       WHERE id = ? AND plan IN ('trial', 'expired')`,
     )
     .bind(PROMO_COMP_PLAN, until, user.id)
     .run();

@@ -324,9 +324,8 @@ async function main() {
     assert(cvRes.status === 302 && (cvRes.headers.get("location") ?? "").includes(`created=${newVault}`), "console create vault → claimed", `status ${cvRes.status}`);
 
     // The console page shows the connect card with the reachable URL shape,
-    // plus the Wave-4 plan line (fresh signup = free plan) rendered from
-    // PLAN_SPECS, and the at-cap note in place of the create form (free = 1
-    // vault, just used).
+    // plus the plan line (fresh signup = the 30-day no-card TRIAL, which mirrors
+    // PLUS entitlements) rendered from PLAN_SPECS.
     const conPage = await fetch(`${IDENTITY}/console`, { headers: { cookie: `parachute_id_session=${newSession}` } });
     const conHtml = await conPage.text();
     assert(conHtml.includes(newVault) && conHtml.includes(`parachute-${newVault}`), "console shows the vault + connect card", "");
@@ -336,31 +335,32 @@ async function main() {
       "console card carries the export door",
       "",
     );
-    // The free plan line renders, plus a billing affordance whose SHAPE depends
-    // on the deploy state: the mock Upgrade UI ("test mode" — staging today,
-    // no Stripe), the real Upgrade buttons (Stripe configured), or the
-    // copy-only teaser ("paid plans arriving" — prod, no keys). Any is a pass.
+    // The TRIAL plan line renders, plus a billing affordance whose SHAPE depends
+    // on the deploy state: the mock tier buttons ("test mode" — staging today,
+    // no Stripe), the real Upgrade buttons (Stripe configured), or the copy-only
+    // teaser ("from $1/mo" — prod, no keys). Any is a pass. And the trial's
+    // 30-day countdown ("until <date>") rides the plan line.
     assert(
-      conHtml.includes("Free plan — 1 vault, 100 MB") &&
+      conHtml.includes("Free trial — 5 vaults, 2 GiB notes + 8 GiB attachments") &&
+        conHtml.includes('data-testid="plan-until"') &&
         (conHtml.includes('data-testid="mock-billing-note"') ||
           conHtml.includes('data-testid="upgrade-billing"') ||
-          conHtml.includes("paid plans arriving")),
-      "console shows the free plan line + a billing affordance (mock / real Upgrade / teaser)",
+          conHtml.includes("from $1/mo")),
+      "console shows the trial plan line + countdown + a billing affordance (mock / real Upgrade / teaser)",
       "",
     );
 
-    // Plan vault-count enforcement: the free plan includes 1 vault, so a 2nd
-    // create is refused with the friendly message and claims nothing.
+    // Trial vault-count: the trial includes 5 vaults, so a 2nd create SUCCEEDS
+    // (the full paid experience during the trial).
     const cv2 = await fetch(`${IDENTITY}/console/vaults`, {
       method: "POST",
       headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${newSession}; parachute_id_csrf=${conCsrf}` },
       redirect: "manual",
       body: form({ __csrf: conCsrf!, name: `${newVault}-two` }),
     });
-    const cv2Html = cv2.status === 200 ? await cv2.text() : "";
     assert(
-      cv2.status === 200 && cv2Html.includes("Your plan includes 1 vault"),
-      "2nd vault create on the free plan → refused with the friendly at-cap message",
+      cv2.status === 302 && (cv2.headers.get("location") ?? "").includes(`created=${newVault}-two`),
+      "2nd vault create on the trial → succeeds (trial includes 5 vaults)",
       `status ${cv2.status}`,
     );
 
@@ -371,17 +371,25 @@ async function main() {
     if (owner.token) {
       const OWN_AUTH = { authorization: `Bearer ${owner.token}` };
 
-      // Wave-4 storage-cap push, verified end-to-end through the REAL staging
-      // transport (identity minted a first-party admin token and PUT the cap
-      // through the VAULT_SERVICE binding at creation): the vault landing
-      // surfaces the RESOLVED cap — the free plan's 100 MB, not the 1 GiB
-      // env default.
+      // The TWO-METER entitlement push, verified end-to-end through the REAL
+      // staging transport (identity minted a first-party admin token and PUT the
+      // entitlement through the VAULT_SERVICE binding at creation): the vault
+      // landing surfaces the RESOLVED summed cap (trial = PLUS: 2 GiB notes +
+      // 8 GiB attach = 10 GiB) PLUS the additive two-meter `caps` split, not the
+      // 1 GiB env default.
       const landing = await fetch(`${VAULT}/vault/${newVault}`, { headers: OWN_AUTH });
-      const landingJson = (await landing.json()) as { cap_bytes?: number };
+      const landingJson = (await landing.json()) as {
+        cap_bytes?: number;
+        caps?: { notes_bytes: number; attachment_bytes: number; attachments_enabled: boolean };
+      };
       assert(
-        landing.status === 200 && landingJson.cap_bytes === 104_857_600,
-        "create-time cap push landed in the DO (landing cap_bytes = 100 MB)",
-        `status ${landing.status}, cap_bytes=${landingJson.cap_bytes}`,
+        landing.status === 200 &&
+          landingJson.cap_bytes === 10_737_418_240 &&
+          landingJson.caps?.notes_bytes === 2_147_483_648 &&
+          landingJson.caps?.attachment_bytes === 8_589_934_592 &&
+          landingJson.caps?.attachments_enabled === true,
+        "create-time two-meter push landed in the DO (landing caps = trial/Plus: 2 GiB notes + 8 GiB attach)",
+        `status ${landing.status}, cap_bytes=${landingJson.cap_bytes}, caps=${JSON.stringify(landingJson.caps)}`,
       );
 
       // The fresh vault materialized with the DEFAULT SEED PACKS (core's
@@ -899,7 +907,9 @@ async function main() {
     }
     const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
     assert(
-      conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 100 MB/.test(conHtml),
+      // The arrival user is on the 30-day trial (mirrors Plus): the card cap
+      // renders "of 10 GiB" (2 GiB notes + 8 GiB attachments, summed).
+      conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 10 GiB/.test(conHtml),
       "usage: the vault card shows 'Using X of Y' from the rollup row",
       arrivalVault,
     );
@@ -971,10 +981,11 @@ async function main() {
       assert(realProbe.status === 503, "billing MOCK: the real /billing/checkout stays 503 (config-gated)", `status ${realProbe.status}`);
       assert(
         conHtml.includes('data-testid="upgrade-billing"') &&
-          conHtml.includes('data-testid="upgrade-voice"') &&
+          conHtml.includes('value="entry"') &&
+          conHtml.includes('value="power"') &&
           conHtml.includes('data-testid="mock-billing-note"') &&
-          !conHtml.includes("paid plans arriving"),
-        "billing MOCK: the arrival free user's console shows mock Upgrade buttons (parachute + voice) + 'test mode' label, no teaser",
+          !conHtml.includes("from $1/mo"),
+        "billing MOCK: the arrival trial user's console shows the mock tier buttons (entry…power) + 'test mode' label, no teaser",
       );
       // The mock endpoint keeps the console write boundary (session-gated).
       const noSess = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
@@ -1004,35 +1015,18 @@ async function main() {
     }
   }
 
-  // 17. GFS snapshots + paid restore (Wave 4e). Flow: pin the FREE contract
-  //     first (History teaser, restore POST → 404), drive one snapshot sweep
-  //     via the staging-only trigger (POST /__test/snapshot-run, 404 in
-  //     production), comp the arrival user to Parachute through the shipped
-  //     admin lever, then walk the paid contract live: History lists the
-  //     restore point → "Restore to a new vault" → the restored vault's
-  //     notes round-trip (this run's marker note included, count intact).
-  {
-    // FREE, before anything else: the teaser renders, no restore points leak,
-    // and the restore POST answers the router-shaped 404 (the surface doesn't
-    // exist for free plans).
-    const freeHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
-    assert(
-      freeHtml.includes('data-testid="vault-history"') &&
-        freeHtml.includes('data-testid="history-teaser"') &&
-        !freeHtml.includes('data-testid="restore-point"'),
-      "snapshots: FREE console shows the History teaser, no restore points",
-    );
+  // 17. GFS snapshots + restore (Wave 4e). The arrival user is on the 30-day
+  //     trial, which mirrors PLUS entitlements — so restore is ENABLED (the
+  //     new no-restore floor is `expired`, exercised in §20). Flow: drive one
+  //     snapshot sweep via the staging-only trigger (POST /__test/snapshot-run,
+  //     404 in production), then walk the restore contract live: History lists
+  //     the restore point → "Restore to a new vault" → the restored vault's
+  //     notes round-trip. The live restore round-trip is wrapped so a slow DO
+  //     import can't abort the sections that follow.
+  try {
     const arrivalCsrf = /parachute_id_csrf=([^;]+)/.exec(arrivalCookie)?.[1] ?? "";
-    const freePost = await fetch(`${IDENTITY}/console/vaults/restore`, {
-      method: "POST",
-      headers: { ...FORM, origin: IDENTITY, cookie: arrivalCookie },
-      redirect: "manual",
-      body: form({ __csrf: arrivalCsrf, vault: arrivalVault, key: `vault-${arrivalVault}/snapshots/x.tar` }),
-    });
-    assert(freePost.status === 404, "snapshots: FREE restore POST → 404 (pinned)", `status ${freePost.status}`);
-
     // One sweep tick via the staging-only trigger. The arrival vault is fresh
-    // this run → its (free-policy) rolling weekly is taken now.
+    // this run → its snapshot (paid retention) is taken now.
     const runSweep = async (): Promise<{ day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean } | null> => {
       const r = await fetch(`${IDENTITY}/__test/snapshot-run`, { method: "POST" });
       return r.status === 200 ? ((await r.json()) as { day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean }) : null;
@@ -1047,32 +1041,13 @@ async function main() {
       );
     }
 
-    // Comp the arrival user to Parachute via the shipped admin lever (the
-    // operator session from section 15). Double-submit CSRF: any matching
-    // cookie/field pair.
-    const usersHtml = await (await fetch(`${IDENTITY}/admin/users`, { headers: { cookie: `parachute_id_session=${session}` } })).text();
-    const rowMatch = usersHtml.split("<tr>").find((r) => r.includes(arrivalEmail));
-    const userId = rowMatch ? /name="user_id" value="([^"]+)"/.exec(rowMatch)?.[1] : undefined;
-    assert(!!userId, "snapshots: scraped the arrival user's id from /admin/users", userId ?? "not found");
-    const compCsrf = `smoke-csrf-${Date.now()}`;
-    const compRes = await fetch(`${IDENTITY}/admin/users/plan`, {
-      method: "POST",
-      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${session}; parachute_id_csrf=${compCsrf}` },
-      redirect: "manual",
-      body: form({ __csrf: compCsrf, user_id: userId ?? "", plan: "parachute" }),
-    });
+    // TRIAL (restore-enabled): History lists the restore point (mirrored by the
+    // sweep) — no comp needed, the trial already has the paid restore contract.
+    const histHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
+    const keyMatch = new RegExp(`name="key" value="(vault-${arrivalVault}/snapshots/[^"]+\\.tar)"`).exec(histHtml);
     assert(
-      compRes.status === 302 && (compRes.headers.get("location") ?? "").includes("notice=plan"),
-      "snapshots: admin comp lever flips the arrival user to Parachute",
-      `status ${compRes.status} → ${compRes.headers.get("location")}`,
-    );
-
-    // PAID: History now lists the restore point (mirrored by the sweep).
-    const paidHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
-    const keyMatch = new RegExp(`name="key" value="(vault-${arrivalVault}/snapshots/[^"]+\\.tar)"`).exec(paidHtml);
-    assert(
-      paidHtml.includes('data-testid="restore-point"') && !!keyMatch && paidHtml.includes("Restore to a new vault"),
-      "snapshots: PAID console History lists the restore point with a restore door",
+      histHtml.includes('data-testid="restore-point"') && !!keyMatch && histHtml.includes("Restore to a new vault"),
+      "snapshots: TRIAL console History lists the restore point with a restore door",
       keyMatch?.[1] ?? "no key found",
     );
 
@@ -1086,8 +1061,7 @@ async function main() {
         body: form({ __csrf: arrivalCsrf, vault: arrivalVault, key: keyMatch[1]! }),
       });
       const loc = restoreRes.headers.get("location") ?? "";
-      restoredName = /restored=([^&]+)/.exec(loc)?.[1] ?? "";
-      restoredName = decodeURIComponent(restoredName);
+      restoredName = decodeURIComponent(/restored=([^&]+)/.exec(loc)?.[1] ?? "");
       assert(
         restoreRes.status === 302 && restoredName.startsWith(`${arrivalVault}-restored-`),
         "snapshots: restore POST creates the new vault and redirects",
@@ -1118,15 +1092,17 @@ async function main() {
         );
       }
     }
+  } catch (err) {
+    fail("snapshots: live restore round-trip threw (non-fatal — sections continue)", String(err));
   }
 
-  // 18. Voice transcription (cloud#56) — comp the arrival user to the VOICE
-  //     tier, upload the committed real-speech fixture, link transcribe:true,
+  // 18. Voice transcription (cloud#56) — comp the arrival user to the PLUS
+  //     tier (voice-enabled), upload the committed real-speech fixture, link transcribe:true,
   //     drive the DO drain via the staging __test hook, and assert the note
   //     resolves to a REAL transcript (not eternal pending, not a failure/limit
   //     marker). This exercises the live Workers AI path at deploy time. (The
   //     MOCK-upgraded user's own transcription is proven back-to-back in §16.)
-  if (arrivalVault && arrivalEmail) {
+  if (arrivalVault && arrivalEmail) try {
     const vCsrf = `smoke-voice-${Date.now()}`;
     const usersHtml = await (await fetch(`${IDENTITY}/admin/users`, { headers: { cookie: `parachute_id_session=${session}` } })).text();
     const row = usersHtml.split("<tr>").find((r) => r.includes(arrivalEmail));
@@ -1135,9 +1111,9 @@ async function main() {
       method: "POST",
       headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${session}; parachute_id_csrf=${vCsrf}` },
       redirect: "manual",
-      body: form({ __csrf: vCsrf, user_id: uid ?? "", plan: "voice" }),
+      body: form({ __csrf: vCsrf, user_id: uid ?? "", plan: "plus" }),
     });
-    assert(compVoice.status === 302, "voice: admin comp lever flips the arrival user to Voice", `status ${compVoice.status}`);
+    assert(compVoice.status === 302, "voice: admin comp lever flips the arrival user to Plus (voice-enabled)", `status ${compVoice.status}`);
 
     const owner = await authorizeFor(arrivalEmail, arrivalPassword, arrivalVault);
     if (!owner.token) {
@@ -1257,17 +1233,19 @@ async function main() {
         `status ${exp.status} entry=${sidecar ? `${sidecar.bytes.length}B` : "MISSING"} fixture=${wavBytes.length}B`,
       );
     }
+  } catch (err) {
+    fail("voice: live transcription section threw (non-fatal — sections continue)", String(err));
   }
 
   // 19. MOCK-upgrade E2E (mock-payments) — the live end-to-end proof, run LAST
   //     so its throwaway vault + Workers-AI inference can't perturb §17/§18's
   //     arrival-user snapshot/voice flow. Only in MOCK mode (real Stripe
   //     absent — detected by the mock endpoint being session-gated, not 404).
-  //     Fresh signup → mock-checkout(VOICE) → plan=Voice + landing
-  //     {enabled, minutes_remaining:600} + the 10 GiB voice cap → a REAL
+  //     Fresh signup (trial) → mock-checkout(PLUS) → plan=Plus + landing
+  //     {enabled, minutes_remaining:300} + the 10 GiB cap → a REAL
   //     transcription resolves. Proves the whole interim checkout → upgrade →
   //     cap/voice-lift flow, no live charge.
-  {
+  try {
     const detect = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
     const mockMode = detect.status === 302 && detect.headers.get("location") === "/login";
     if (mockMode) {
@@ -1286,11 +1264,11 @@ async function main() {
       assert(mSu.status === 302 && !!mSession, "mock E2E: fresh signup → session", `status ${mSu.status}`);
       const mCookie = `parachute_id_session=${mSession}; parachute_id_csrf=${mCsrf}`;
 
-      // The fresh free user's console shows the mock Upgrade buttons + label.
+      // The fresh trial user's console shows the mock tier buttons + label.
       const mFreeCon = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: mCookie } })).text();
       assert(
         mFreeCon.includes('action="/billing/mock-checkout"') && mFreeCon.includes('data-testid="mock-billing-note"'),
-        "mock E2E: the fresh free user's console shows mock Upgrade buttons + 'test mode' label",
+        "mock E2E: the fresh trial user's console shows mock tier buttons + 'test mode' label",
       );
 
       const mCv = await fetch(`${IDENTITY}/console/vaults`, {
@@ -1305,17 +1283,17 @@ async function main() {
         method: "POST",
         headers: { ...FORM, origin: IDENTITY, cookie: mCookie },
         redirect: "manual",
-        body: form({ __csrf: mCsrf!, plan: "voice" }),
+        body: form({ __csrf: mCsrf!, plan: "plus" }),
       });
       assert(
         mUp.status === 302 && (mUp.headers.get("location") ?? "").includes("mock_upgraded=1"),
-        "mock E2E: mock-checkout(voice) → 302 mock_upgraded",
+        "mock E2E: mock-checkout(plus) → 302 mock_upgraded",
         `status ${mUp.status} → ${mUp.headers.get("location")}`,
       );
       const mCon = await (await fetch(`${IDENTITY}/console?mock_upgraded=1`, { headers: { cookie: mCookie } })).text();
       assert(
-        mCon.includes("Voice plan") && mCon.includes("Test purchase complete") && !mCon.includes('data-testid="upgrade-billing"'),
-        "mock E2E: console shows the Voice plan line + the test-purchase notice, Upgrade gone",
+        mCon.includes("Plus plan") && mCon.includes("Test purchase complete") && !mCon.includes('data-testid="upgrade-billing"'),
+        "mock E2E: console shows the Plus plan line + the test-purchase notice, Upgrade gone",
       );
 
       const mOwner = await authorizeFor(mEmail, mPass, mVault);
@@ -1325,13 +1303,13 @@ async function main() {
         const mAuth = { authorization: `Bearer ${mOwner.token}` };
         const mLand = (await (await fetch(`${VAULT}/vault/${mVault}`, { headers: mAuth })).json()) as any;
         assert(
-          mLand.transcription?.enabled === true && mLand.transcription?.minutes_remaining === 600,
-          "mock E2E: landing reports voice transcription enabled + 600 minutes_remaining",
+          mLand.transcription?.enabled === true && mLand.transcription?.minutes_remaining === 300,
+          "mock E2E: landing reports voice transcription enabled + 300 minutes_remaining (Plus)",
           JSON.stringify(mLand.transcription),
         );
         assert(
           mLand.cap_bytes === 10 * 1024 * 1024 * 1024,
-          "mock E2E: landing cap_bytes reflects the Voice tier (10 GiB)",
+          "mock E2E: landing cap_bytes reflects the Plus tier (2 GiB notes + 8 GiB attach = 10 GiB)",
           `cap_bytes=${mLand.cap_bytes}`,
         );
 
@@ -1367,6 +1345,135 @@ async function main() {
             !mFinal.includes("Monthly voice limit"),
           "mock E2E: the mock-upgraded user's voice memo resolved to a REAL transcript",
           mFinal.replace(/\n/g, " ").slice(0, 120),
+        );
+      }
+    }
+  } catch (err) {
+    fail("mock E2E: live section threw (non-fatal — sections continue)", String(err));
+  }
+
+  // 20. Pricing-model ENFORCEMENT E2E (the two-meter caps + the frozen floor) —
+  //     the load-bearing new behavior, driven live. Fresh trial signup →
+  //     mock-checkout(ENTRY, the notes-only tier) → the vault's attachment
+  //     budget is 0 → a file upload 403s `attachments_not_included` while note
+  //     writes still work; then an admin comp to EXPIRED freezes the vault →
+  //     writes 402 `plan_required` while reads stay 200 (the trust flex).
+  {
+    const detect = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
+    const mockMode = detect.status === 302 && detect.headers.get("location") === "/login";
+    if (mockMode) {
+      const eEmail = `enforce-${Date.now()}@smoke.test`;
+      const ePass = b64url(crypto.getRandomValues(new Uint8Array(18)));
+      const eVault = `enforcebox-${Date.now()}`;
+      const eSuGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
+      const eCsrf = cookieVal(eSuGet.headers.getSetCookie(), "parachute_id_csrf");
+      const eSu = await fetch(`${IDENTITY}/signup`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${eCsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: eCsrf!, email: eEmail, password: ePass }),
+      });
+      const eSession = cookieVal(eSu.headers.getSetCookie(), "parachute_id_session");
+      const eCookie = `parachute_id_session=${eSession}; parachute_id_csrf=${eCsrf}`;
+
+      // Trial → mock-checkout(entry): the notes-only $1 tier.
+      const eUp = await fetch(`${IDENTITY}/billing/mock-checkout`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: eCookie },
+        redirect: "manual",
+        body: form({ __csrf: eCsrf!, plan: "entry" }),
+      });
+      assert(
+        eUp.status === 302 && (eUp.headers.get("location") ?? "").includes("mock_upgraded=1"),
+        "enforcement: mock-checkout(entry) → 302 mock_upgraded",
+        `status ${eUp.status}`,
+      );
+
+      // Create a vault on Entry → the two-meter push lands attachment_bytes:0.
+      const eCv = await fetch(`${IDENTITY}/console/vaults`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: eCookie },
+        redirect: "manual",
+        body: form({ __csrf: eCsrf!, name: eVault }),
+      });
+      assert(eCv.status === 302 && (eCv.headers.get("location") ?? "").includes(`created=${eVault}`), "enforcement: entry user created a vault", `status ${eCv.status}`);
+
+      const eOwner = await authorizeFor(eEmail, ePass, eVault);
+      if (!eOwner.token) {
+        fail("enforcement: entry user mints a token for their vault", eOwner.error ?? "no token");
+      } else {
+        const eAuth = { authorization: `Bearer ${eOwner.token}` };
+        const eLand = (await (await fetch(`${VAULT}/vault/${eVault}`, { headers: eAuth })).json()) as any;
+        assert(
+          eLand.caps?.attachment_bytes === 0 && eLand.caps?.attachments_enabled === false && eLand.caps?.notes_bytes === 262_144_000,
+          "enforcement: Entry landing shows the notes-only two-meter caps (250 MB notes, 0 attachments)",
+          JSON.stringify(eLand.caps),
+        );
+
+        // Attachment upload → 403 attachments_not_included (BEFORE cap math).
+        const eFd = new FormData();
+        eFd.set("file", new File([new Uint8Array(64)], "nope.bin", { type: "application/octet-stream" }));
+        const eBlocked = await fetch(`${VAULT}/vault/${eVault}/api/storage/upload`, { method: "POST", headers: eAuth, body: eFd });
+        const eBlockedBody = (await eBlocked.json()) as { error_type?: string };
+        assert(
+          eBlocked.status === 403 && eBlockedBody.error_type === "attachments_not_included",
+          "enforcement: an attachment upload on Entry → 403 attachments_not_included",
+          `status ${eBlocked.status} type=${eBlockedBody.error_type}`,
+        );
+
+        // Note writes still work (the notes meter is independent + generous).
+        const eNote = await fetch(`${VAULT}/vault/${eVault}/api/notes`, {
+          method: "POST",
+          headers: { ...eAuth, "content-type": "application/json" },
+          body: JSON.stringify({ content: "notes still write on a notes-only plan" }),
+        });
+        assert(eNote.status === 201, "enforcement: note writes still work on Entry (notes meter is separate)", `status ${eNote.status}`);
+
+        // Admin comp the Entry user → EXPIRED → applyPlanToVaults pushes frozen.
+        const eFCsrf = `smoke-frozen-${Date.now()}`;
+        const usersHtml = await (await fetch(`${IDENTITY}/admin/users`, { headers: { cookie: `parachute_id_session=${session}` } })).text();
+        const eRow = usersHtml.split("<tr>").find((r) => r.includes(eEmail));
+        const eUid = eRow ? /name="user_id" value="([^"]+)"/.exec(eRow)?.[1] : undefined;
+        const compExpired = await fetch(`${IDENTITY}/admin/users/plan`, {
+          method: "POST",
+          headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${session}; parachute_id_csrf=${eFCsrf}` },
+          redirect: "manual",
+          body: form({ __csrf: eFCsrf, user_id: eUid ?? "", plan: "expired" }),
+        });
+        assert(compExpired.status === 302, "enforcement: admin comp lever flips the user to EXPIRED (frozen)", `status ${compExpired.status}`);
+
+        // A write now → 402 plan_required; a read stays 200 with frozen:true.
+        const frozenWrite = await fetch(`${VAULT}/vault/${eVault}/api/notes`, {
+          method: "POST",
+          headers: { ...eAuth, "content-type": "application/json" },
+          body: JSON.stringify({ content: "this should be frozen out" }),
+        });
+        const frozenBody = (await frozenWrite.json()) as { error_type?: string };
+        assert(
+          frozenWrite.status === 402 && frozenBody.error_type === "plan_required",
+          "enforcement: a write on an EXPIRED (frozen) vault → 402 plan_required",
+          `status ${frozenWrite.status} type=${frozenBody.error_type}`,
+        );
+        const frozenLand = await fetch(`${VAULT}/vault/${eVault}`, { headers: eAuth });
+        const frozenLandBody = (await frozenLand.json()) as { frozen?: boolean };
+        assert(
+          frozenLand.status === 200 && frozenLandBody.frozen === true,
+          "enforcement: reads on a frozen vault stay 200 and advertise frozen:true (notes are safe)",
+          `status ${frozenLand.status} frozen=${frozenLandBody.frozen}`,
+        );
+
+        // The no-restore FLOOR moved from 'free' to 'expired' (restore:false):
+        // an expired user's restore POST answers the router-shaped 404.
+        const expiredRestore = await fetch(`${IDENTITY}/console/vaults/restore`, {
+          method: "POST",
+          headers: { ...FORM, origin: IDENTITY, cookie: eCookie },
+          redirect: "manual",
+          body: form({ __csrf: eCsrf!, vault: eVault, key: `vault-${eVault}/snapshots/x.tar` }),
+        });
+        assert(
+          expiredRestore.status === 404,
+          "enforcement: an EXPIRED user's restore POST → 404 (restore is a paid entitlement)",
+          `status ${expiredRestore.status}`,
         );
       }
     }

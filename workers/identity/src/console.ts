@@ -60,7 +60,7 @@ import {
   listVaultsForOwner,
   userOwnsVault,
 } from "./vaults.ts";
-import { PLAN_SPECS, isPaidPlan, restoreAtCapMessage, transcriptionEntitlement, vaultCapMessage } from "./plans.ts";
+import { PLAN_SPECS, canStartCheckout, isPaidTier, planEntitlement, restoreAtCapMessage, vaultCapMessage } from "./plans.ts";
 import { callVaultApi, pushVaultCap } from "./vault-call.ts";
 import {
   callVaultRestore,
@@ -282,10 +282,10 @@ async function renderConsoleFor(
       showChecklistRestore: checklistHidden,
       firstRun: opts.firstRun,
       plan: user.plan,
-      // Honest paid-until surface: a scheduled downgrade to free (promo comp
-      // expiry, or a real subscription's scheduled cancel) shows its date on
-      // the plan line — never a silent cliff.
-      planUntil: user.pendingPlan === "free" && user.planDowngradeAt ? user.planDowngradeAt : null,
+      // Honest paid-until surface: a scheduled downgrade to the expired floor
+      // (the 30-day trial clock, a promo comp's expiry, or a real subscription's
+      // scheduled cancel) shows its date on the plan line — never a silent cliff.
+      planUntil: user.pendingPlan === "expired" && user.planDowngradeAt ? user.planDowngradeAt : null,
       totalUsedBytes,
       // Billing doors (Wave 4d): Upgrade for free users / Manage billing for
       // paid users WITH a Stripe customer (comped accounts have none) — both
@@ -298,6 +298,9 @@ async function renderConsoleFor(
       // endpoint + a "test mode" label; ALWAYS false in production.
       mockBillingEnabled: deps.mockBillingEnabled === true,
       hasBillingAccount: user.stripeCustomerId !== null,
+      // Trial/expired with no live subscription → the tier chooser + promo box
+      // render; a paid tier gets Manage-billing; a live sub gets neither.
+      canCheckout: canStartCheckout(user.plan),
       // At (or over — grandfathered) the plan's vault count: the create form
       // gives way to the friendly at-cap note. The POST handler is the real
       // gate; this just keeps the UI honest.
@@ -319,7 +322,7 @@ async function renderConsoleFor(
 const BILLING_ERRORS: Record<string, string> = {
   session: "Your session expired. Please try again.",
   invalid: "Invalid request. Please try again.",
-  already: "You're already on the Parachute plan — use Manage billing to make changes.",
+  already: "You're already on a paid plan — use Manage billing to make changes.",
   "no-billing": "This account has no billing profile to manage. Write hello@parachute.computer if something looks off.",
   stripe: "Couldn't reach the payment provider just now. Please try again in a moment.",
 };
@@ -356,7 +359,7 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
   // from the query string — the param only picks the message; the date is the
   // stored truth (honest even on a stale/replayed URL).
   const promoRedeemed =
-    params.get("promo_redeemed") && isPaidPlan(user.plan) && user.planDowngradeAt
+    params.get("promo_redeemed") && isPaidTier(user.plan) && user.planDowngradeAt
       ? `Code redeemed — you're on the ${PLAN_SPECS[user.plan].label} plan until ${user.planDowngradeAt.slice(0, 10)}. Welcome aboard.`
       : null;
   const notice = created
@@ -370,7 +373,7 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
         : params.get("mock_upgraded")
         ? `Test purchase complete — no real charge. You're on the ${PLAN_SPECS[user.plan].label} plan now (mock billing; the caps and any voice entitlement lifted exactly as a real payment would).`
         : params.get("upgraded")
-          ? "Thanks — payment received. Your Parachute plan activates the moment Stripe's confirmation lands (usually seconds)."
+          ? "Thanks — payment received. Your plan activates the moment Stripe's confirmation lands (usually seconds)."
           : params.get("checkout_canceled")
             ? "Checkout canceled — nothing changed."
             : undefined;
@@ -406,7 +409,7 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
     // config (the internal seam — vault-call.ts). Best-effort by the same
     // contract as the first note: a hiccup leaves the DO on the (more generous)
     // env default, never fails creation; applyPlanToVaults / the backfill reconcile.
-    await pushVaultCap(db, deps, user.id, vault.name, spec.total_bytes, transcriptionEntitlement(user.plan));
+    await pushVaultCap(db, deps, user.id, vault.name, planEntitlement(user.plan));
     // (a) research answer → user row. Allowlisted inside; unknown values no-op.
     if (notesApp) await setNotesApp(db, user.id, notesApp);
     // (b) their first note → INTO the new vault, verbatim. Best-effort by
@@ -601,9 +604,9 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
       }
       throw err;
     }
-    // Same best-effort cap + voice-entitlement push as any vault creation (a
-    // miss leaves the more-generous env default; applyPlanToVaults reconciles).
-    await pushVaultCap(db, deps, user.id, targetName, spec.total_bytes, transcriptionEntitlement(user.plan));
+    // Same best-effort entitlement push as any vault creation (a miss leaves the
+    // vault on its prior caps; applyPlanToVaults reconciles).
+    await pushVaultCap(db, deps, user.id, targetName, planEntitlement(user.plan));
   }
 
   try {

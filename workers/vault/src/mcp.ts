@@ -92,6 +92,49 @@ function requiredVerbForTool(tool: { requiredVerb?: VaultVerb }): VaultVerb {
 }
 
 /**
+ * The per-tool write gate — the paywall + cap PARITY with the REST write path.
+ * The DO passes `() => this.capBlockIfFull()`, i.e. the SAME frozen-then-cap
+ * check the REST POST/PATCH/PUT gate applies, and MCP invokes it BEFORE running
+ * a forward-mutating tool. Returns the REST Response (402 `plan_required` when
+ * frozen / 413 `storage_cap_exceeded` when a meter is full) or null when the
+ * write is allowed. All MCP is POST JSON-RPC, so the gate CANNOT live at the
+ * HTTP layer (that would wrongly block reads) — it is applied per tool.
+ */
+export type McpWriteGate = () => Response | null;
+
+/**
+ * MCP tools whose REST equivalent is a DELETE. The REST cap/frozen gate exempts
+ * DELETE (a tenant at the cap — or an expired/frozen one — must always be able
+ * to delete their way back down; the frozen floor leaves reads + export + DELETE
+ * untouched, see caps.ts). We mirror that here so MCP is neither stricter nor
+ * looser than REST: read-class tools AND these delete-class tools pass through
+ * the gate; every other forward-mutating write/admin tool is gated.
+ */
+const DELETE_CLASS_TOOLS = new Set(["delete-note", "delete-tag"]);
+
+/** A forward-mutating tool (create/update/prune) — the class the REST
+ *  POST/PATCH/PUT cap+frozen gate covers. Read tools and DELETE-class tools are
+ *  exempt (REST exempts both), so this is the exact "should the write gate run"
+ *  predicate. */
+function isGatedWrite(tool: McpToolDef): boolean {
+  return requiredVerbForTool(tool) !== "read" && !DELETE_CLASS_TOOLS.has(tool.name);
+}
+
+/**
+ * Convert a REST cap/frozen Response (402 `plan_required` / 413
+ * `storage_cap_exceeded`) into the mirrored JSON-RPC error: the REST body rides
+ * verbatim in `data` so an agent keys off the SAME `error_type` discriminator on
+ * either runtime, and the REST `message` becomes the JSON-RPC message. Reusing
+ * the REST Response body (never a hand-rolled shape) keeps MCP and REST from
+ * drifting.
+ */
+async function gateError(id: JsonRpcId, blocked: Response): Promise<JsonRpcMessage> {
+  const data = (await blocked.json().catch(() => ({}))) as Record<string, unknown>;
+  const message = typeof data.message === "string" ? data.message : "This write is not permitted.";
+  return rpcError(id, INVALID_REQUEST, message, data);
+}
+
+/**
  * The connect-time server instruction (bun sends the vault's projection as the
  * MCP `instructions`; the vault teaches the AI how to use it). Cloud v1 sends a
  * faithful-but-simple brief built from the vault description — the rich schema
@@ -176,6 +219,7 @@ async function handleToolCall(
   id: JsonRpcId,
   params: Record<string, unknown> | undefined,
   tools: McpToolDef[],
+  writeGate: McpWriteGate,
 ): Promise<JsonRpcMessage> {
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
@@ -184,6 +228,15 @@ async function handleToolCall(
   // callers can't distinguish "hidden admin tool" from "no such tool".
   if (!tool) {
     return result(id, { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true });
+  }
+  // The paywall + cap gate — a forward-mutating verb (create/update/prune) gets
+  // the SAME frozen-then-cap enforcement the REST write path applies; read-class
+  // AND delete-class verbs pass through (REST exempts both). MCP is the flagship
+  // write door, so without this an expired (frozen) tenant's connected AI could
+  // keep writing forever and a two-meter notes-cap-full vault could keep growing.
+  if (isGatedWrite(tool)) {
+    const blocked = writeGate();
+    if (blocked) return gateError(id, blocked);
   }
   try {
     const out = await tool.execute(args);
@@ -198,7 +251,7 @@ async function handleToolCall(
 
 async function handleOne(
   m: JsonRpcMessage,
-  ctx: { tools: McpToolDef[]; vaultName: string; description: string | null },
+  ctx: { tools: McpToolDef[]; vaultName: string; description: string | null; writeGate: McpWriteGate },
 ): Promise<JsonRpcMessage> {
   const { id = null, method, params } = m;
   try {
@@ -220,7 +273,7 @@ async function handleOne(
           tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
         });
       case "tools/call":
-        return handleToolCall(id, params, ctx.tools);
+        return handleToolCall(id, params, ctx.tools, ctx.writeGate);
       case "ping":
         return result(id, {});
       default:
@@ -242,6 +295,7 @@ export async function handleMcp(
   vaultName: string,
   auth: AuthResult,
   description: string | null,
+  writeGate: McpWriteGate,
 ): Promise<Response> {
   if (req.method === "DELETE") return new Response(null, { status: 200 });
   if (req.method !== "POST") {
@@ -304,7 +358,7 @@ export async function handleMcp(
   }
 
   const tools = visibleTools(store, vaultName, auth);
-  const ctx = { tools, vaultName, description };
+  const ctx = { tools, vaultName, description, writeGate };
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));
 

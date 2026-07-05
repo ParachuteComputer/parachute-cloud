@@ -32,7 +32,7 @@
  */
 import { signAccessToken } from "./tokens.ts";
 import { type OAuthDeps, vaultInstanceUrl } from "./oauth-shared.ts";
-import { PLAN_SPECS, transcriptionEntitlement } from "./plans.ts";
+import { type VaultEntitlement, planEntitlement } from "./plans.ts";
 import { getUserById } from "./users.ts";
 import { listVaultsForOwner } from "./vaults.ts";
 
@@ -124,7 +124,9 @@ export async function readVaultUsage(
   return { dbBytes: body.db_bytes, r2Bytes: body.r2_bytes, transcribeMinutes };
 }
 
-/** One vault's outcome from a cap push. `status` absent = transport error. */
+/** One vault's outcome from a cap push. `status` absent = transport error.
+ *  `capBytes` = the two-meter budgets summed (notes + attachment) — the legacy
+ *  single-number view kept for logging/tests; the DO stores both meters. */
 export interface CapPushResult {
   vault: string;
   capBytes: number;
@@ -133,24 +135,26 @@ export interface CapPushResult {
 }
 
 /**
- * Push a per-vault storage cap into the vault DO's config via the internal
- * seam (`PUT /api/internal/config`, first-party admin token — see the module
- * note). NO-THROW by contract: callers ride user-facing flows (vault creation)
- * where a cap-push hiccup must never fail the operation. A missed push leaves
- * the DO on the env default (1 GiB — MORE generous than any plan, so the
- * failure direction is safe); `applyPlanToVaults` / the backfill script are
- * the reconcilers.
+ * Push a per-vault ENTITLEMENT into the vault DO's config via the internal seam
+ * (`PUT /api/internal/config`, first-party admin token — see the module note):
+ * the TWO-METER caps `{ notes_bytes, attachment_bytes }`, the voice entitlement,
+ * and the `frozen` flag (the expired floor — the DO returns 402 plan_required
+ * on writes when true, reads/export untouched).
+ *
+ * NO-THROW by contract: callers ride user-facing flows (vault creation) where a
+ * push hiccup must never fail the operation. A missed push leaves the DO on
+ * whatever it already had (a fresh vault → the more-generous env default; an
+ * existing vault → its prior caps) — the safe direction; `applyPlanToVaults` /
+ * the backfill script are the reconcilers.
  */
 export async function pushVaultCap(
   db: D1Database,
   deps: OAuthDeps,
   userId: string,
   vaultName: string,
-  capBytes: number,
-  /** Voice entitlement to push alongside the cap (cloud#56). Omitted → cap only
-   *  (back-compat; the DO leaves any prior entitlement untouched). */
-  transcription?: { enabled: boolean; minutes_limit: number },
+  entitlement: VaultEntitlement,
 ): Promise<CapPushResult> {
+  const capBytes = entitlement.caps.notes_bytes + entitlement.caps.attachment_bytes;
   try {
     const res = await callVaultApi(db, deps, {
       userId,
@@ -158,7 +162,11 @@ export async function pushVaultCap(
       method: "PUT",
       apiPath: "/api/internal/config",
       verb: "admin",
-      jsonBody: transcription ? { cap_bytes: capBytes, transcription } : { cap_bytes: capBytes },
+      jsonBody: {
+        caps: entitlement.caps,
+        transcription: entitlement.transcription,
+        frozen: entitlement.frozen,
+      },
     });
     if (!res.ok) {
       console.warn(`event=plan_cap_push_failed vault=${vaultName} cap_bytes=${capBytes} status=${res.status}`);
@@ -174,14 +182,12 @@ export async function pushVaultCap(
 }
 
 /**
- * Re-apply the owner's CURRENT plan cap to every vault they own — the seam a
- * plan change calls (admin / Stripe webhook, later PRs: `setUserPlan` then
- * this). Per-vault cap = the plan's `total_bytes` (v1 semantics — see the
- * plans.ts module note; the daily usage rollup now RECORDS per-vault usage in
- * D1 `vault_usage`, so a true cross-vault aggregate is computable here — the
- * enforcement change itself ships with the billing PR, deliberately not
- * before). Best-effort per vault; the per-vault results let the caller
- * report/retry.
+ * Re-apply the owner's CURRENT plan entitlement to every vault they own — the
+ * seam every plan change calls (`setUserPlan` then this: admin comp, Stripe
+ * webhook, promo, the billing sweep). Pushes the two-meter caps + voice + the
+ * frozen flag derived from the plan (expired → frozen:true; every other plan →
+ * frozen:false, which UN-freezes a vault on upgrade out of expired). Best-effort
+ * per vault; the per-vault results let the caller report/retry.
  */
 export async function applyPlanToVaults(
   db: D1Database,
@@ -190,14 +196,13 @@ export async function applyPlanToVaults(
 ): Promise<CapPushResult[]> {
   const user = await getUserById(db, userId);
   if (!user) return [];
-  const capBytes = PLAN_SPECS[user.plan].total_bytes;
-  // Push the voice entitlement in the SAME hop as the cap (cloud#56) — a plan
-  // change (comp / Stripe) flips both the storage cap and voice at once.
-  const transcription = transcriptionEntitlement(user.plan);
+  // One entitlement for all the owner's vaults: the two-meter caps, the voice
+  // entitlement, and frozen — a plan change flips them together.
+  const entitlement = planEntitlement(user.plan);
   const vaults = await listVaultsForOwner(db, userId);
   const results: CapPushResult[] = [];
   for (const v of vaults) {
-    results.push(await pushVaultCap(db, deps, userId, v.name, capBytes, transcription));
+    results.push(await pushVaultCap(db, deps, userId, v.name, entitlement));
   }
   return results;
 }

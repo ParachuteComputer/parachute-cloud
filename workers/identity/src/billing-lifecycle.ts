@@ -23,17 +23,17 @@
  *
  * DOWNGRADE SEMANTICS (the old lifecycle.ts, faithfully ported):
  *   - `customer.subscription.deleted` NEVER flips the plan at webhook time.
- *     It records pending_plan='free' + plan_downgrade_at = max(now,
+ *     It records pending_plan='expired' + plan_downgrade_at = max(now,
  *     paid-through period end) + DOWNGRADE_GRACE_PERIOD_MS — exactly the old
  *     "terminating + terminating_at, reaper acts 3 days later" shape. The
  *     hourly billing sweep ({@link runBillingSweep}) applies due downgrades.
  *   - An IMMEDIATE mid-period cancel therefore keeps the paid entitlements
  *     through the period the user already paid for, plus the grace.
- *   - DOWNGRADE NEVER DELETES DATA: applying it pushes the free cap into the
- *     user's vault DOs — over-cap vaults become write-limited by the
- *     existing cap machinery; reads and export are untouched. (The old
- *     reaper DESTROYED a Fly VM; the DO-per-vault world has nothing to
- *     destroy, which is the point.)
+ *   - DOWNGRADE NEVER DELETES DATA: applying it pushes the downgraded plan's
+ *     entitlement into the user's vault DOs (to the expired floor: writes
+ *     freeze via the existing cap machinery); reads and export are untouched.
+ *     (The old reaper DESTROYED a Fly VM; the DO-per-vault world has nothing
+ *     to destroy, which is the point.)
  *
  * DUNNING (old contract, unchanged): `invoice.payment_failed` FLAGS the row
  * (payment_failed_at + count — surfaced as a badge on /admin/users) and
@@ -42,7 +42,7 @@
  */
 import type Stripe from "stripe";
 import type { OAuthDeps } from "./oauth-shared.ts";
-import { type PlanId, coercePlanId, isPaidPlan } from "./plans.ts";
+import { type PlanId, coercePlanId, isPaidTier } from "./plans.ts";
 import { getUserById, getUserByStripeCustomerId, getUserByStripeSubscriptionId, setUserPlan } from "./users.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 import type { BillingConfig } from "./billing-config.ts";
@@ -95,12 +95,12 @@ export const CHECKOUT_CAS_MAX_ATTEMPTS = 3;
 
 /**
  * `checkout.session.completed` — payment landed for a new subscription. The
- * one UPGRADE path: persist the Stripe ids, flip plan → parachute, clear any
+ * one UPGRADE path: persist the Stripe ids, flip plan → the bought tier, clear any
  * pending downgrade, and push the new caps into the user's vault DOs (the
  * #57 seam — caps lift immediately).
  *
  * Idempotency layer 2 (defense in depth behind the event-id dedup): a user
- * already on parachute with this same subscription id is a replay that
+ * already on the bought tier with this same subscription id is a replay that
  * bypassed the dedup table (hand-replayed event, restored DB) — no-op.
  *
  * DOUBLE-CHECKOUT RACE (cloud#64): two concurrent Checkout sessions
@@ -157,13 +157,12 @@ export async function handleCheckoutSessionCompleted(
   const customerId = typeof session.customer === "string" ? session.customer : null;
   const subscriptionId = typeof session.subscription === "string" ? session.subscription : null;
 
-  // Which paid plan did they buy? The checkout stamps the chosen plan into
+  // Which paid tier did they buy? The checkout stamps the chosen tier into
   // session metadata (billing.ts) so we don't need to expand line_items here.
-  // Coerce (unknown → free), then floor to a paid plan — a completed paid
-  // checkout is never "free"; a missing/garbled tag defaults to parachute
-  // (back-compat with sessions minted before the voice tier).
+  // Coerce, then floor to a purchasable TIER — a completed paid checkout is
+  // never trial/expired; a missing/garbled tag defaults to `standard`.
   const metaPlan = coercePlanId(session.metadata?.plan);
-  const boughtPlan: PlanId = isPaidPlan(metaPlan) ? metaPlan : "parachute";
+  const boughtPlan: PlanId = isPaidTier(metaPlan) ? metaPlan : "standard";
 
   // Read → idempotency-check → CAS-write → repair, re-run on a CAS miss (the
   // concurrent-race note in the function doc). One pass through this loop is
@@ -178,7 +177,7 @@ export async function handleCheckoutSessionCompleted(
 
     // Idempotency layer 2 — also the exit for a CAS loser whose re-read finds
     // its OWN subscription already applied (a same-content replay race).
-    if (isPaidPlan(user.plan) && user.plan === boughtPlan && user.stripeSubscriptionId !== null && user.stripeSubscriptionId === subscriptionId) {
+    if (isPaidTier(user.plan) && user.plan === boughtPlan && user.stripeSubscriptionId !== null && user.stripeSubscriptionId === subscriptionId) {
       return { ok: true, userId: user.id, action: "checkout_completed_idempotent" };
     }
 
@@ -322,11 +321,11 @@ function periodEndOf(subscription: Stripe.Subscription): number | null {
 /**
  * `customer.subscription.deleted` — the subscription is fully gone (cancel
  * effective immediately, or at-period-end having reached the period end).
- * Record pending_plan='free' + plan_downgrade_at = max(now, paid-through
+ * Record pending_plan='expired' + plan_downgrade_at = max(now, paid-through
  * period end) + the 3-day grace; the hourly sweep applies it. The plan is
  * NOT flipped here (see the module note — old semantics, faithfully).
  *
- * Idempotent: a row already free with no pending change is left alone.
+ * Idempotent: a row already expired with no pending change is left alone.
  */
 export async function handleSubscriptionDeleted(
   db: D1Database,
@@ -336,7 +335,7 @@ export async function handleSubscriptionDeleted(
   const subscription = event.data.object as Stripe.Subscription;
   const user = await getUserByStripeSubscriptionId(db, subscription.id);
   if (!user) return { ok: true, userId: null, action: "subscription_deleted_unknown_user" };
-  if (user.plan === "free" && !user.pendingPlan) {
+  if (user.plan === "expired" && !user.pendingPlan) {
     return { ok: true, userId: user.id, action: "subscription_deleted_idempotent" };
   }
 
@@ -344,8 +343,10 @@ export async function handleSubscriptionDeleted(
   const paidThroughMs = Math.max(now.getTime(), periodEndSec !== null ? periodEndSec * 1000 : now.getTime());
   const downgradeAt = new Date(paidThroughMs + DOWNGRADE_GRACE_PERIOD_MS).toISOString();
 
+  // Schedule a downgrade to the EXPIRED floor (the new post-paid floor — writes
+  // freeze, reads/export stay). The sweep applies it; the plan is NOT flipped here.
   await db
-    .prepare("UPDATE users SET pending_plan = 'free', plan_downgrade_at = ? WHERE id = ?")
+    .prepare("UPDATE users SET pending_plan = 'expired', plan_downgrade_at = ? WHERE id = ?")
     .bind(downgradeAt, user.id)
     .run();
   console.log(`event=billing_downgrade_scheduled user=${user.id} at=${downgradeAt}`);
@@ -353,10 +354,12 @@ export async function handleSubscriptionDeleted(
   return { ok: true, userId: user.id, action: "subscription_deleted_downgrade_scheduled" };
 }
 
-/** Map a Stripe Price id to the plan it buys (env-configured, never hardcoded). */
+/** Map a Stripe Price id to the tier it buys (env-configured, never hardcoded).
+ *  PR-A's anchor prices: the monthly/yearly Prices back `standard`, the additive
+ *  voice-monthly Price backs `plus`. PR-C expands this to the full per-tier map. */
 export function planForPrice(priceId: string, config: BillingConfig): PlanId | null {
-  if (priceId === config.priceMonthly || priceId === config.priceYearly) return "parachute";
-  if (config.priceVoiceMonthly && priceId === config.priceVoiceMonthly) return "voice";
+  if (priceId === config.priceMonthly || priceId === config.priceYearly) return "standard";
+  if (config.priceVoiceMonthly && priceId === config.priceVoiceMonthly) return "plus";
   return null;
 }
 
@@ -370,7 +373,7 @@ export function planForPrice(priceId: string, config: BillingConfig): PlanId | n
  *
  *   - price maps to a plan ≠ the user's → apply now (portal re-subscribe /
  *     future multi-plan switches), clearing any pending downgrade.
- *   - same plan + `cancel_at_period_end: true` → pending_plan='free'
+ *   - same plan + `cancel_at_period_end: true` → pending_plan='expired'
  *     (informational until `deleted` stamps plan_downgrade_at; the console
  *     and /admin can surface "downgrade scheduled").
  *   - same plan + cancel revoked → clear pending_plan + plan_downgrade_at
@@ -402,8 +405,8 @@ export async function handleSubscriptionUpdated(
   }
 
   if (subscription.cancel_at_period_end === true) {
-    if (user.pendingPlan !== "free") {
-      await db.prepare("UPDATE users SET pending_plan = 'free' WHERE id = ?").bind(user.id).run();
+    if (user.pendingPlan !== "expired") {
+      await db.prepare("UPDATE users SET pending_plan = 'expired' WHERE id = ?").bind(user.id).run();
       console.log(`event=billing_cancel_scheduled user=${user.id}`);
     }
     return { ok: true, userId: user.id, action: "subscription_updated_cancel_scheduled" };

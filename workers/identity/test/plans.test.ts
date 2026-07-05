@@ -1,23 +1,20 @@
 /**
- * Plans — the Wave 4 entitlement layer (plan column + cap wiring; payments
- * come in a later PR).
+ * Plans — the pricing-model entitlement layer (the new ladder + two-meter caps
+ * + the 30-day trial state machine; payments are billing.test.ts).
  *
  * Pins:
- *   - migration 0009 is additive: every user (new signup, raw legacy INSERT)
- *     defaults to 'free'; unknown stored values coerce to 'free',
- *   - PLAN_SPECS carries the ratified numbers (free 1 vault/100 MB;
- *     parachute 5 vaults/10 GiB) and is the SINGLE SOURCE the console
- *     renders from,
- *   - vault-count enforcement at create (free=1, parachute=5) with the
- *     friendly per-plan message — including the GRANDFATHER contract: a user
- *     already over a cap keeps and can mint tokens for every vault they own;
- *     only NEW creation is refused,
- *   - the storage-cap push on creation through the real transport
- *     (fetchMock over global fetch, exactly production's path): a first-party
- *     60s `vault:<name>:admin` token PUTs `{cap_bytes}` to the vault worker's
- *     internal config seam — and is BEST-EFFORT (a 500 / unreachable vault
- *     never fails creation),
- *   - applyPlanToVaults — the plan-change seam admin/Stripe will call.
+ *   - PLAN_SPECS carries the ratified ladder numbers (entry|standard|plus|power)
+ *     and is the SINGLE SOURCE the console renders from,
+ *   - EVERY new signup starts on the 30-day no-card TRIAL (plan='trial',
+ *     pending_plan='expired', plan_downgrade_at≈now+30d); a legacy/garbage plan
+ *     coerces to the 'expired' FLOOR (never grants unknown entitlements),
+ *   - vault-count enforcement at create with the friendly per-plan message —
+ *     including the GRANDFATHER contract,
+ *   - the TWO-METER entitlement push on creation through the real transport
+ *     (fetchMock over global fetch): a first-party 60s `vault:<name>:admin`
+ *     token PUTs `{ caps:{notes_bytes,attachment_bytes}, transcription, frozen }`
+ *     — and is BEST-EFFORT (a 500 / unreachable vault never fails creation),
+ *   - applyPlanToVaults — the plan-change seam admin/Stripe/promo/sweep call.
  */
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
@@ -25,11 +22,15 @@ import app from "../src/index.ts";
 import { validateAccessToken } from "../src/tokens.ts";
 import {
   PLAN_SPECS,
+  canStartCheckout,
   coercePlanId,
   formatPlanBytes,
   formatUsageBytes,
-  parachuteTeaser,
+  isEntitled,
+  isPaidTier,
+  planEntitlement,
   planLine,
+  upgradeTeaser,
   vaultCapMessage,
 } from "../src/plans.ts";
 import { FIRST_PARTY_CLIENT_ID, applyPlanToVaults } from "../src/vault-call.ts";
@@ -46,6 +47,9 @@ import {
   seedUser,
   seedVault,
 } from "./helpers.ts";
+
+const MiB = 1024 * 1024;
+const GiB = 1024 * MiB;
 
 function post(path: string, fields: Record<string, string>, cookie: string): Request {
   return new Request(`${ISSUER}${path}`, {
@@ -70,10 +74,9 @@ async function consoleHtml(sessionId: string, testEnv: typeof env = env): Promis
 
 /**
  * PRODUCTION env (no Stripe): the plain test env pins ENVIRONMENT="test", which
- * auto-enables the interim mock billing path (billing-config.ts) — so a free
- * user's console now shows mock Upgrade buttons, NOT the teaser. The teaser is
- * the PRODUCTION-no-keys state; render it under a prod env. (The mock path is
- * pinned in mock-billing.test.ts.)
+ * auto-enables the interim mock billing path (billing-config.ts) — so a
+ * checkout-eligible user's console shows the mock tier buttons, NOT the teaser.
+ * The teaser is the PRODUCTION-no-keys state; render it under a prod env.
  */
 const PROD_ENV = { ...env, ENVIRONMENT: "production" };
 
@@ -84,111 +87,173 @@ async function vaultRowCount(userId: string): Promise<number> {
   return row?.n ?? 0;
 }
 
-// --- the ratified plan shape (single source of truth) ------------------------
+// --- the ratified ladder (single source of truth) ----------------------------
 
-describe("PLAN_SPECS — the ratified plan shape", () => {
-  test("free: 1 vault, 100 MB; parachute: 5 vaults, 10 GiB", () => {
-    expect(PLAN_SPECS.free.vault_count).toBe(1);
-    expect(PLAN_SPECS.free.total_bytes).toBe(104_857_600); // 100 MiB, rendered "100 MB"
-    expect(PLAN_SPECS.parachute.vault_count).toBe(5);
-    expect(PLAN_SPECS.parachute.total_bytes).toBe(10_737_418_240); // 10 GiB
-    expect(formatPlanBytes(PLAN_SPECS.free.total_bytes)).toBe("100 MB");
-    expect(formatPlanBytes(PLAN_SPECS.parachute.total_bytes)).toBe("10 GiB");
+describe("PLAN_SPECS — the ratified ladder", () => {
+  test("the four purchasable tiers carry the locked numbers", () => {
+    expect(PLAN_SPECS.entry.vault_count).toBe(1);
+    expect(PLAN_SPECS.entry.notes_bytes).toBe(250 * MiB);
+    expect(PLAN_SPECS.entry.attachment_bytes).toBe(0); // notes-only
+
+    expect(PLAN_SPECS.standard.vault_count).toBe(3);
+    expect(PLAN_SPECS.standard.notes_bytes).toBe(1 * GiB);
+    expect(PLAN_SPECS.standard.attachment_bytes).toBe(2 * GiB);
+    expect(PLAN_SPECS.standard.transcribe_minutes).toBe(60);
+
+    expect(PLAN_SPECS.plus.vault_count).toBe(5);
+    expect(PLAN_SPECS.plus.notes_bytes).toBe(2 * GiB);
+    expect(PLAN_SPECS.plus.attachment_bytes).toBe(8 * GiB);
+    expect(PLAN_SPECS.plus.transcribe_minutes).toBe(300);
+
+    expect(PLAN_SPECS.power.vault_count).toBe(10);
+    expect(PLAN_SPECS.power.notes_bytes).toBe(5 * GiB);
+    expect(PLAN_SPECS.power.attachment_bytes).toBe(50 * GiB);
+    expect(PLAN_SPECS.power.transcribe_minutes).toBe(1200);
   });
 
-  test("formatUsageBytes: one decimal, MB below a GiB, GB from there — binary under everyday labels", () => {
+  test("trial mirrors PLUS entitlements; expired is the frozen floor", () => {
+    expect(PLAN_SPECS.trial.vault_count).toBe(PLAN_SPECS.plus.vault_count);
+    expect(PLAN_SPECS.trial.notes_bytes).toBe(PLAN_SPECS.plus.notes_bytes);
+    expect(PLAN_SPECS.trial.attachment_bytes).toBe(PLAN_SPECS.plus.attachment_bytes);
+    expect(PLAN_SPECS.trial.voice_enabled).toBe(true);
+
+    expect(PLAN_SPECS.expired.vault_count).toBe(0);
+    expect(PLAN_SPECS.expired.voice_enabled).toBe(false);
+    expect(planEntitlement("expired").frozen).toBe(true);
+    expect(planEntitlement("trial").frozen).toBe(false);
+    expect(planEntitlement("standard").frozen).toBe(false);
+  });
+
+  test("planEntitlement carries the two-meter caps + voice + frozen", () => {
+    expect(planEntitlement("standard")).toEqual({
+      caps: { notes_bytes: 1 * GiB, attachment_bytes: 2 * GiB },
+      transcription: { enabled: true, minutes_limit: 60 },
+      frozen: false,
+    });
+    expect(planEntitlement("entry")).toEqual({
+      caps: { notes_bytes: 250 * MiB, attachment_bytes: 0 },
+      transcription: { enabled: false, minutes_limit: 0 },
+      frozen: false,
+    });
+  });
+
+  test("formatPlanBytes + formatUsageBytes render binary units under everyday labels", () => {
+    expect(formatPlanBytes(250 * MiB)).toBe("250 MB");
+    expect(formatPlanBytes(1 * GiB)).toBe("1 GiB");
+    expect(formatPlanBytes(50 * GiB)).toBe("50 GiB");
     expect(formatUsageBytes(0)).toBe("0.0 MB");
-    expect(formatUsageBytes(209_715)).toBe("0.2 MB"); // a fresh vault's ~200 KB
-    expect(formatUsageBytes(1_048_576)).toBe("1.0 MB");
-    expect(formatUsageBytes(PLAN_SPECS.free.total_bytes)).toBe("100.0 MB"); // at-cap reads "100.0 MB of 100 MB"
-    expect(formatUsageBytes(1_288_490_189)).toBe("1.2 GB"); // 1.2 GiB
-    expect(formatUsageBytes(PLAN_SPECS.parachute.total_bytes)).toBe("10.0 GB");
+    expect(formatUsageBytes(209_715)).toBe("0.2 MB");
+    expect(formatUsageBytes(1_288_490_189)).toBe("1.2 GB");
   });
 
   test("display copy derives from the specs", () => {
-    expect(planLine("free")).toBe("Free plan — 1 vault, 100 MB");
-    expect(planLine("parachute")).toBe("Parachute plan — 5 vaults, 10 GiB");
-    expect(parachuteTeaser()).toContain("$3/mo or $30/yr");
-    expect(parachuteTeaser()).toContain("5 vaults, 10 GiB");
-    expect(vaultCapMessage("free")).toBe("Your plan includes 1 vault. Paid plans add more room — have a code? Redeem it under your plan line above.");
-    expect(vaultCapMessage("parachute")).toContain("5 vaults");
+    expect(planLine("entry")).toBe("Entry plan — 1 vault, 250 MB notes (notes only)");
+    expect(planLine("standard")).toBe("Standard plan — 3 vaults, 1 GiB notes + 2 GiB attachments");
+    expect(planLine("trial")).toBe("Free trial — 5 vaults, 2 GiB notes + 8 GiB attachments");
+    expect(planLine("expired")).toBe(
+      "Trial ended — your notes are safe to read and export; pick a plan to write again",
+    );
+    expect(upgradeTeaser()).toContain("from $1/mo");
+    expect(vaultCapMessage("entry")).toContain("Entry plan includes 1 vault");
+    expect(vaultCapMessage("expired")).toContain("trial has ended");
+  });
+
+  test("the entitlement/checkout split — isEntitled, canStartCheckout, isPaidTier", () => {
+    expect(isEntitled("trial")).toBe(true);
+    expect(isEntitled("plus")).toBe(true);
+    expect(isEntitled("expired")).toBe(false);
+
+    expect(canStartCheckout("trial")).toBe(true);
+    expect(canStartCheckout("expired")).toBe(true); // incl. a churned subscriber w/ a stale id (#73)
+    expect(canStartCheckout("standard")).toBe(false); // a paid tier changes via the portal
+    expect(canStartCheckout("power")).toBe(false);
+
+    expect(isPaidTier("standard")).toBe(true);
+    expect(isPaidTier("trial")).toBe(false);
+    expect(isPaidTier("expired")).toBe(false);
   });
 });
 
-// --- plan defaults (migration 0009 is additive) ------------------------------
+// --- signup → trial; coercion → the expired floor ----------------------------
 
-describe("plan defaults", () => {
-  test("a fresh signup lands on plan 'free' via the column DEFAULT", async () => {
+describe("plan defaults — signup starts the 30-day trial", () => {
+  test("a fresh signup lands on plan 'trial' with pending_plan='expired' + a ~30d clock", async () => {
     const res = await app.fetch(
-      post("/signup", { __csrf: CSRF, email: "plandefault@example.com", password: "longenough1" }, `parachute_id_csrf=${CSRF}`),
+      post("/signup", { __csrf: CSRF, email: "trialstart@example.com", password: "longenough1" }, `parachute_id_csrf=${CSRF}`),
       env,
     );
     expect(res.status).toBe(302);
-    const row = await env.DB.prepare("SELECT plan FROM users WHERE email = ?")
-      .bind("plandefault@example.com")
-      .first<{ plan: string }>();
-    expect(row!.plan).toBe("free");
-    const user = await getUserByEmail(env.DB, "plandefault@example.com");
-    expect(user!.plan).toBe("free");
+    const row = await env.DB.prepare("SELECT plan, pending_plan, plan_downgrade_at FROM users WHERE email = ?")
+      .bind("trialstart@example.com")
+      .first<{ plan: string; pending_plan: string | null; plan_downgrade_at: string | null }>();
+    expect(row!.plan).toBe("trial");
+    expect(row!.pending_plan).toBe("expired");
+    const daysOut = (Date.parse(row!.plan_downgrade_at!) - Date.now()) / 86_400_000;
+    expect(daysOut).toBeGreaterThan(29);
+    expect(daysOut).toBeLessThan(31);
+    const user = await getUserByEmail(env.DB, "trialstart@example.com");
+    expect(user!.plan).toBe("trial");
   });
 
-  test("a legacy-shaped INSERT (no plan column named) reads back 'free' — the migration is additive", async () => {
+  test("a legacy-shaped INSERT (no plan named) reads back the 'expired' floor (coercion; DEFAULT is 'free')", async () => {
     await env.DB.prepare(
       "INSERT INTO users (id, email, password_hash, created_at) VALUES ('legacy-1', 'legacy@example.com', '', ?)",
     )
       .bind(new Date().toISOString())
       .run();
+    const raw = await env.DB.prepare("SELECT plan FROM users WHERE email = ?")
+      .bind("legacy@example.com")
+      .first<{ plan: string }>();
+    expect(raw!.plan).toBe("free"); // the un-migrated column DEFAULT
     const user = await getUserByEmail(env.DB, "legacy@example.com");
-    expect(user!.plan).toBe("free");
+    expect(user!.plan).toBe("expired"); // coerced to the safe floor
   });
 
-  test("an unknown stored plan value coerces to 'free' (never grants unknown entitlements)", async () => {
+  test("an unknown stored plan value coerces to 'expired' (never grants unknown entitlements)", async () => {
     const { id } = await seedUser("weirdplan@example.com");
     await env.DB.prepare("UPDATE users SET plan = 'enterprise-mega' WHERE id = ?").bind(id).run();
     const user = await getUserByEmail(env.DB, "weirdplan@example.com");
-    expect(user!.plan).toBe("free");
-    expect(coercePlanId("enterprise-mega")).toBe("free");
+    expect(user!.plan).toBe("expired");
+    expect(coercePlanId("enterprise-mega")).toBe("expired");
+    expect(coercePlanId("free")).toBe("expired"); // legacy id → floor
   });
 });
 
 // --- console rendering (from PLAN_SPECS) --------------------------------------
 
 describe("console plan display", () => {
-  test("free user (prod, no keys): the plan line + the Parachute teaser render from PLAN_SPECS", async () => {
-    const { id } = await seedUser("planline@example.com");
+  test("trial user (prod, no keys): the plan line + the upgrade teaser render from PLAN_SPECS", async () => {
+    const { id } = await seedUser("planline@example.com"); // seedUser → trial
     await seedVault("planline-box", id);
     const html = await consoleHtml(await seedSession(id), PROD_ENV);
     expect(html).toContain('data-testid="plan-line"');
-    expect(html).toContain("Free plan — 1 vault, 100 MB");
-    expect(html).toContain("$3/mo or $30/yr");
-    expect(html).toContain("paid plans arriving");
-    // No payment link yet — the teaser is copy only.
+    expect(html).toContain("Free trial — 5 vaults, 2 GiB notes + 8 GiB attachments");
+    expect(html).toContain("from $1/mo");
     expect(html).not.toContain("stripe");
   });
 
-  test("parachute user: their plan line, no teaser", async () => {
+  test("standard user: their plan line, no teaser", async () => {
     const { id } = await seedUser("planline2@example.com");
-    await setUserPlan(env.DB, id, "parachute");
+    await setUserPlan(env.DB, id, "standard");
     await seedVault("planline2-box", id);
     const html = await consoleHtml(await seedSession(id));
-    expect(html).toContain("Parachute plan — 5 vaults, 10 GiB");
-    expect(html).not.toContain("paid plans arriving");
+    expect(html).toContain("Standard plan — 3 vaults, 1 GiB notes + 2 GiB attachments");
+    expect(html).not.toContain("from $1/mo");
   });
 
-  test("free user at the vault cap: the create form yields to the friendly note", async () => {
+  test("entry user at the vault cap: the create form yields to the friendly note", async () => {
     const { id } = await seedUser("atcap@example.com");
+    await setUserPlan(env.DB, id, "entry"); // 1-vault tier
     await seedVault("atcap-box", id);
     const html = await consoleHtml(await seedSession(id));
     expect(html).toContain('data-testid="vault-cap"');
-    expect(html).toContain("Your plan includes 1 vault. Paid plans add more room");
-    // The create form input is gone (the first-run hero isn't rendered either
-    // — the user has a vault).
+    expect(html).toContain("Entry plan includes 1 vault");
     expect(html).not.toContain('id="name" name="name"');
   });
 
-  test("parachute user under the cap still sees the create form", async () => {
+  test("plus user under the cap still sees the create form", async () => {
     const { id } = await seedUser("undercap@example.com");
-    await setUserPlan(env.DB, id, "parachute");
+    await setUserPlan(env.DB, id, "plus");
     await seedVault("undercap-box", id);
     const html = await consoleHtml(await seedSession(id));
     expect(html).not.toContain('data-testid="vault-cap"');
@@ -196,17 +261,18 @@ describe("console plan display", () => {
   });
 });
 
-// --- vault-count enforcement + the cap push (real transport) ------------------
+// --- vault-count enforcement + the two-meter entitlement push -----------------
 
-describe("vault-count enforcement + storage-cap push", () => {
+describe("vault-count enforcement + entitlement push", () => {
   beforeAll(() => {
     fetchMock.activate();
     fetchMock.disableNetConnect();
   });
   afterEach(() => fetchMock.assertNoPendingInterceptors());
 
-  test("first create pushes the free cap through the mint seam; the 2nd is refused with the friendly message", async () => {
+  test("first create pushes the two-meter entitlement (entry, notes-only); the 2nd is refused", async () => {
     const { id: userId } = await seedUser("capflow@example.com");
+    await setUserPlan(env.DB, userId, "entry"); // 1-vault, notes-only tier
     const sessionId = await seedSession(userId);
 
     let auth: string | undefined;
@@ -227,7 +293,7 @@ describe("vault-count enforcement + storage-cap push", () => {
       })
       .reply(
         200,
-        { name: "capflow-box", cap_bytes: PLAN_SPECS.free.total_bytes, resolved_cap_bytes: PLAN_SPECS.free.total_bytes, used_bytes: 0 },
+        { name: "capflow-box", resolved_cap_bytes: 250 * MiB, used_bytes: 0 },
         { headers: { "content-type": "application/json" } },
       );
 
@@ -238,12 +304,12 @@ describe("vault-count enforcement + storage-cap push", () => {
     expect(created.status).toBe(302);
     expect(created.headers.get("location")).toBe("/console?created=capflow-box");
 
-    // The pushed body is the plan's total_bytes (v1 semantics: per-vault cap
-    // = plan total; the usage-rollup PR tightens to a true aggregate) PLUS the
-    // voice entitlement (cloud#56 — free = disabled, 0 minutes).
+    // The pushed body is the TWO-METER entitlement (entry: 250 MB notes, 0
+    // attachments, voice off, not frozen).
     expect(JSON.parse(body!)).toEqual({
-      cap_bytes: PLAN_SPECS.free.total_bytes,
+      caps: { notes_bytes: 250 * MiB, attachment_bytes: 0 },
       transcription: { enabled: false, minutes_limit: 0 },
+      frozen: false,
     });
 
     // The mint seam, pinned end-to-end: first-party client, ADMIN verb,
@@ -257,20 +323,19 @@ describe("vault-count enforcement + storage-cap push", () => {
     expect(payload.client_id).toBe(FIRST_PARTY_CLIENT_ID);
     expect((payload.exp as number) - (payload.iat as number)).toBe(60);
 
-    // Second create: refused BEFORE any row or outbound call (no interceptor
-    // registered for it + disableNetConnect would surface one as a warning).
+    // Second create: refused BEFORE any row or outbound call.
     const refused = await app.fetch(
       post("/console/vaults", { __csrf: CSRF, name: "capflow-two" }, sessionCookie(sessionId)),
       env,
     );
     expect(refused.status).toBe(200);
-    expect(await refused.text()).toContain("Your plan includes 1 vault. Paid plans add more room");
+    expect(await refused.text()).toContain("Entry plan includes 1 vault");
     expect(await vaultRowCount(userId)).toBe(1);
   });
 
-  test("parachute: 5 vaults fit, the 6th is refused with the paid-plan message", async () => {
+  test("plus: 5 vaults fit, the 6th is refused with the paid-plan message", async () => {
     const { id: userId } = await seedUser("fiveboxes@example.com");
-    await setUserPlan(env.DB, userId, "parachute");
+    await setUserPlan(env.DB, userId, "plus");
     for (let i = 1; i <= 5; i++) await seedVault(`fiver-${i}`, userId);
     const sessionId = await seedSession(userId);
     const refused = await app.fetch(
@@ -279,40 +344,37 @@ describe("vault-count enforcement + storage-cap push", () => {
     );
     expect(refused.status).toBe(200);
     const html = await refused.text();
-    expect(html).toContain(vaultCapMessage("parachute").replace(/'/g, "&#39;").slice(0, 40));
+    expect(html).toContain(vaultCapMessage("plus").replace(/'/g, "&#39;").slice(0, 40));
     expect(await vaultRowCount(userId)).toBe(5);
   });
 
-  test("GRANDFATHER: a free user already over the cap keeps everything — list, token mint — but can't create", async () => {
+  test("GRANDFATHER: an entry user already over the cap keeps everything — list, token mint — but can't create", async () => {
     const { id: userId } = await seedUser("grandfathered@example.com");
-    // Pre-plans account shape: three vaults on a free plan (cap is 1).
+    await setUserPlan(env.DB, userId, "entry"); // cap is 1
     for (const name of ["gf-alpha", "gf-beta", "gf-gamma"]) await seedVault(name, userId);
     const sessionId = await seedSession(userId);
 
-    // 1. The console still lists ALL their vaults (nothing is hidden/lost).
     const html = await consoleHtml(sessionId);
     for (const name of ["gf-alpha", "gf-beta", "gf-gamma"]) expect(html).toContain(name);
     expect(html).toContain('data-testid="vault-cap"');
 
-    // 2. Token mint for an over-cap vault still works — access is never
-    //    revoked by a plan cap (the OAuth ownership gate is untouched).
     const { clientId } = await seedApprovedClient();
     const pair = await mintInitialPair(clientId, userId, { scope: "vault:gf-beta:read vault:gf-beta:write" });
     expect(pair.access_token).toBeTruthy();
     expect(decodeJwtPayload(pair.access_token).aud).toBe("vault.gf-beta");
 
-    // 3. Creation is refused until they're under the cap.
     const refused = await app.fetch(
       post("/console/vaults", { __csrf: CSRF, name: "gf-delta" }, sessionCookie(sessionId)),
       env,
     );
     expect(refused.status).toBe(200);
-    expect(await refused.text()).toContain("Your plan includes 1 vault");
+    expect(await refused.text()).toContain("Entry plan includes 1 vault");
     expect(await vaultRowCount(userId)).toBe(3);
   });
 
-  test("BEST-EFFORT: a 500 from the vault worker on the cap push never fails creation", async () => {
+  test("BEST-EFFORT: a 500 from the vault worker on the push never fails creation", async () => {
     const { id: userId } = await seedUser("pushfail@example.com");
+    await setUserPlan(env.DB, userId, "plus");
     const sessionId = await seedSession(userId);
     const warn = vi.spyOn(console, "warn");
     fetchMock
@@ -332,10 +394,9 @@ describe("vault-count enforcement + storage-cap push", () => {
 
   test("BEST-EFFORT: an UNREACHABLE vault worker never fails creation (logged)", async () => {
     const { id: userId } = await seedUser("pushgone@example.com");
+    await setUserPlan(env.DB, userId, "plus");
     const sessionId = await seedSession(userId);
     const warn = vi.spyOn(console, "warn");
-    // No interceptor + disableNetConnect → the push fetch throws; the seam
-    // catches, warns, and creation completes.
     const res = await app.fetch(
       post("/console/vaults", { __csrf: CSRF, name: "pushgone-box" }, sessionCookie(sessionId)),
       env,
@@ -348,10 +409,10 @@ describe("vault-count enforcement + storage-cap push", () => {
 
 // --- applyPlanToVaults (the plan-change seam) ---------------------------------
 
-describe("applyPlanToVaults — the seam admin/Stripe will call", () => {
-  test("pushes the owner's CURRENT plan cap to every owned vault via the bound dispatcher", async () => {
+describe("applyPlanToVaults — the seam admin/Stripe/promo/sweep call", () => {
+  test("pushes the owner's CURRENT plan entitlement to every owned vault via the bound dispatcher", async () => {
     const { id: userId } = await seedUser("applier@example.com");
-    await setUserPlan(env.DB, userId, "parachute");
+    await setUserPlan(env.DB, userId, "standard");
     await seedVault("apply-one", userId);
     await seedVault("apply-two", userId);
 
@@ -372,10 +433,9 @@ describe("applyPlanToVaults — the seam admin/Stripe will call", () => {
     const results = await applyPlanToVaults(env.DB, boundDeps, userId);
     expect(results).toHaveLength(2);
     expect(results.every((r) => r.ok)).toBe(true);
-    expect(results.map((r) => r.capBytes)).toEqual([
-      PLAN_SPECS.parachute.total_bytes,
-      PLAN_SPECS.parachute.total_bytes,
-    ]);
+    // capBytes = the two-meter budgets summed (notes + attachment).
+    const standardSum = PLAN_SPECS.standard.notes_bytes + PLAN_SPECS.standard.attachment_bytes;
+    expect(results.map((r) => r.capBytes)).toEqual([standardSum, standardSum]);
 
     expect(calls.map((c) => c.url).sort()).toEqual([
       `https://apply-one.${VAULT_BASE}/api/internal/config`,
@@ -384,8 +444,9 @@ describe("applyPlanToVaults — the seam admin/Stripe will call", () => {
     for (const c of calls) {
       expect(c.method).toBe("PUT");
       expect(c.body).toEqual({
-        cap_bytes: PLAN_SPECS.parachute.total_bytes,
-        transcription: { enabled: false, minutes_limit: 0 },
+        caps: { notes_bytes: 1 * GiB, attachment_bytes: 2 * GiB },
+        transcription: { enabled: true, minutes_limit: 60 },
+        frozen: false,
       });
       const payload = decodeJwtPayload(c.auth!.replace(/^Bearer /, ""));
       expect(payload.client_id).toBe(FIRST_PARTY_CLIENT_ID);
@@ -393,8 +454,26 @@ describe("applyPlanToVaults — the seam admin/Stripe will call", () => {
     }
   });
 
+  test("expired owner: the push carries frozen:true (the sweep's un-write flip)", async () => {
+    const { id: userId } = await seedUser("expiredapply@example.com");
+    await setUserPlan(env.DB, userId, "expired");
+    await seedVault("expired-box", userId);
+    let body: unknown;
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+        body = init?.body ? JSON.parse(String(init.body)) : null;
+        return Response.json({ ok: true });
+      },
+    };
+    await applyPlanToVaults(env.DB, boundDeps, userId);
+    expect((body as { frozen: boolean }).frozen).toBe(true);
+    expect((body as { transcription: { enabled: boolean } }).transcription.enabled).toBe(false);
+  });
+
   test("reports per-vault failures without throwing (the caller can retry)", async () => {
     const { id: userId } = await seedUser("applier2@example.com");
+    await setUserPlan(env.DB, userId, "plus");
     await seedVault("apply-ok", userId);
     await seedVault("apply-bad", userId);
     const boundDeps = {
@@ -410,8 +489,8 @@ describe("applyPlanToVaults — the seam admin/Stripe will call", () => {
     expect(byVault["apply-ok"]!.ok).toBe(true);
     expect(byVault["apply-bad"]!.ok).toBe(false);
     expect(byVault["apply-bad"]!.status).toBe(500);
-    // Free plan (default): the pushed cap is the free total.
-    expect(byVault["apply-ok"]!.capBytes).toBe(PLAN_SPECS.free.total_bytes);
+    const plusSum = PLAN_SPECS.plus.notes_bytes + PLAN_SPECS.plus.attachment_bytes;
+    expect(byVault["apply-ok"]!.capBytes).toBe(plusSum);
   });
 
   test("unknown user → empty result set", async () => {

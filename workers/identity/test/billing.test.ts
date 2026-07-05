@@ -10,12 +10,13 @@
  *     stale-timestamp replay refusal;
  *   - idempotency BOTH layers: event-id dedup (processed_stripe_events
  *     INSERT OR IGNORE) and the status short-circuit behind it;
- *   - checkout.session.completed → ids + plan=parachute + the cap push
- *     through the real transport (fetchMock over global fetch — the #57
- *     seam: caps lift immediately);
+ *   - checkout.session.completed → ids + plan=standard (the default bought
+ *     tier when no metadata names one) + the two-meter cap push through the
+ *     real transport (fetchMock over global fetch — the #57 seam: caps lift
+ *     immediately);
  *   - soft dunning: invoice.payment_failed FLAGS (never suspends),
  *     invoice.paid clears;
- *   - customer.subscription.deleted → pending_plan + plan_downgrade_at =
+ *   - customer.subscription.deleted → pending_plan='expired' + plan_downgrade_at =
  *     paid-through end + 3-day grace, plan NOT flipped at webhook time; the
  *     sweep applies due downgrades and NEVER deletes anything;
  *   - customer.subscription.updated → scheduled-cancel bookkeeping, un-cancel
@@ -30,7 +31,7 @@ import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import type Stripe from "stripe";
 import app from "../src/index.ts";
-import { PLAN_SPECS } from "../src/plans.ts";
+import { planEntitlement } from "../src/plans.ts";
 import {
   BILLING_SWEEP_CAP,
   DOWNGRADE_GRACE_PERIOD_MS,
@@ -44,8 +45,11 @@ import { CSRF, ISSUER, deps, seedSession, seedUser, seedVault } from "./helpers.
 // --- the configured test environment -----------------------------------------
 
 const WEBHOOK_SECRET = "whsec_test_secret_aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const PRICE_MONTHLY = "price_test_parachute_monthly";
-const PRICE_YEARLY = "price_test_parachute_yearly";
+// These back the `standard` tier (planForPrice maps monthly/yearly → standard).
+// The env var NAMES are unchanged (billing-config.ts) even though the tier
+// they resolve to is no longer called "parachute".
+const PRICE_MONTHLY = "price_test_standard_monthly";
+const PRICE_YEARLY = "price_test_standard_yearly";
 
 /** env + the full Stripe config — billing ACTIVE. Plain `env` = not configured. */
 const BILLING_ENV = {
@@ -233,14 +237,20 @@ function readBarrierDb(real: D1Database, barrier: { arrive: () => Promise<void> 
   } as unknown as D1Database;
 }
 
-/** Seed a paid user wired to Stripe (the post-checkout shape). */
+/** Seed a paid user wired to Stripe (the post-checkout shape) — lands on the
+ *  `standard` tier, the anchor purchasable tier the monthly/yearly Prices back.
+ *  Clears pending_plan/plan_downgrade_at too: seedUser's createUser stamps
+ *  EVERY fresh signup with the 30-day trial pair (pending_plan='expired',
+ *  plan_downgrade_at=+30d) — a real checkout webhook's CAS write clears both
+ *  (billing-lifecycle.ts), so this fixture mirrors that "settled, no pending
+ *  change" post-checkout shape rather than leaking the pre-purchase trial clock. */
 async function seedPaidUser(
   email: string,
   opts: { customer?: string; subscription?: string } = {},
 ): Promise<{ id: string }> {
   const { id } = await seedUser(email);
   await env.DB.prepare(
-    "UPDATE users SET plan = 'parachute', stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ?",
+    "UPDATE users SET plan = 'standard', stripe_customer_id = ?, stripe_subscription_id = ?, pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?",
   )
     .bind(opts.customer ?? "cus_test_1", opts.subscription ?? "sub_test_1", id)
     .run();
@@ -267,8 +277,8 @@ describe("NOT CONFIGURED — the clean degradation (today's deploy)", () => {
     },
   );
 
-  test("PRODUCTION, no keys: free user's console hides every billing door (incl. mock); the teaser stays", async () => {
-    const { id } = await seedUser("noconfig@example.com");
+  test("PRODUCTION, no keys: a trial user's console hides every billing door (incl. mock); the teaser stays", async () => {
+    const { id } = await seedUser("noconfig@example.com"); // seedUser → trial
     await seedVault("noconfig-box", id);
     const html = await consoleHtml(await seedSession(id), PROD_UNCONFIGURED_ENV);
     expect(html).not.toContain('data-testid="upgrade-billing"');
@@ -276,7 +286,7 @@ describe("NOT CONFIGURED — the clean degradation (today's deploy)", () => {
     expect(html).not.toContain('data-testid="mock-billing-note"'); // the mock 404s in prod
     expect(html).not.toContain("/billing/checkout");
     expect(html).not.toContain("/billing/mock-checkout");
-    expect(html).toContain("paid plans arriving"); // the copy-only teaser, unchanged
+    expect(html).toContain("Paid plans from $1/mo"); // the copy-only teaser (upgradeTeaser), unchanged
   });
 
   test("paid user's console hides Manage billing while unconfigured", async () => {
@@ -289,17 +299,25 @@ describe("NOT CONFIGURED — the clean degradation (today's deploy)", () => {
 // --- console rendering, configured ---------------------------------------------
 
 describe("console billing doors (configured)", () => {
-  test("free user: Upgrade buttons (monthly + yearly) POST /billing/checkout; no teaser", async () => {
-    const { id } = await seedUser("upgradeui@example.com");
+  test("trial user: one Upgrade button per purchasable tier POSTs /billing/checkout; no teaser", async () => {
+    const { id } = await seedUser("upgradeui@example.com"); // seedUser → trial
     await seedVault("upgradeui-box", id);
     const html = await consoleHtml(await seedSession(id), BILLING_ENV);
     expect(html).toContain('data-testid="upgrade-billing"');
     expect(html).toContain('action="/billing/checkout"');
-    expect(html).toContain('value="monthly"');
-    expect(html).toContain('value="yearly"');
+    expect(html).toContain('name="interval" value="monthly"');
+    // One button per purchasable tier (entry/standard/plus/power), each its
+    // own TIER_PRICE_LABEL — the ladder replaces the old monthly/yearly toggle.
+    expect(html).toContain('name="plan" value="entry"');
+    expect(html).toContain('name="plan" value="standard"');
+    expect(html).toContain('name="plan" value="plus"');
+    expect(html).toContain('name="plan" value="power"');
+    expect(html).toContain("$1/mo");
     expect(html).toContain("$3/mo");
-    expect(html).toContain("$30/yr");
-    expect(html).not.toContain("paid plans arriving");
+    expect(html).toContain("$5/mo");
+    expect(html).toContain("$10/mo");
+    // The teaser is the UNCONFIGURED state only — billing IS configured here.
+    expect(html).not.toContain("keep writing after your trial");
     expect(html).not.toContain('data-testid="manage-billing"');
   });
 
@@ -311,9 +329,9 @@ describe("console billing doors (configured)", () => {
     expect(html).not.toContain('data-testid="upgrade-billing"');
   });
 
-  test("COMPED parachute user (no Stripe customer): neither door renders", async () => {
+  test("COMPED plus-tier user (no Stripe customer): neither door renders", async () => {
     const { id } = await seedUser("comped@example.com");
-    await setUserPlan(env.DB, id, "parachute");
+    await setUserPlan(env.DB, id, "plus");
     const html = await consoleHtml(await seedSession(id), BILLING_ENV);
     expect(html).not.toContain('data-testid="manage-billing"');
     expect(html).not.toContain('data-testid="upgrade-billing"');
@@ -324,7 +342,7 @@ describe("console billing doors (configured)", () => {
     const sessionId = await seedSession(id);
     expect(await consoleHtml(sessionId, BILLING_ENV, "?upgraded=1")).toContain("payment received");
     expect(await consoleHtml(sessionId, BILLING_ENV, "?checkout_canceled=1")).toContain("Checkout canceled");
-    expect(await consoleHtml(sessionId, BILLING_ENV, "?billing_err=already")).toContain("already on the Parachute plan");
+    expect(await consoleHtml(sessionId, BILLING_ENV, "?billing_err=already")).toContain("already on a paid plan");
     // Unknown codes render nothing (allowlist, not echo).
     expect(await consoleHtml(sessionId, BILLING_ENV, "?billing_err=<script>alert(1)</script>")).not.toContain("alert(1)");
   });
@@ -368,7 +386,7 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
       );
   }
 
-  test("free user + monthly → subscription-mode session with client_reference_id, env price, tax, URLs; 302 to Stripe", async () => {
+  test("trial user + monthly (default tier=standard) → subscription-mode session with client_reference_id, env price, tax, URLs; 302 to Stripe", async () => {
     const { id } = await seedUser("checkout1@example.com");
     const sessionId = await seedSession(id);
     let raw = "";
@@ -391,6 +409,7 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
     expect(params.get("cancel_url")).toBe(`${ISSUER}/console?checkout_canceled=1`);
     expect(params.get("automatic_tax[enabled]")).toBe("true"); // Stripe Tax
     expect(params.get("subscription_data[metadata][user_id]")).toBe(id);
+    expect(params.get("metadata[plan]")).toBe("standard");
   });
 
   test("yearly button → the yearly env price", async () => {
@@ -406,9 +425,38 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
     expect(new URLSearchParams(raw).get("line_items[0][price]")).toBe(PRICE_YEARLY);
   });
 
+  test("the plus tier resolves to the voice-monthly price (monthly-only in PR-A)", async () => {
+    const { id } = await seedUser("checkout-plus@example.com");
+    const sessionId = await seedSession(id);
+    let raw = "";
+    interceptCheckoutCreate((b) => (raw = b));
+    const res = await app.fetch(
+      post("/billing/checkout", { __csrf: CSRF, interval: "monthly", plan: "plus" }, sessionCookie(sessionId)),
+      { ...BILLING_ENV, STRIPE_PRICE_VOICE_MONTHLY: "price_test_plus_monthly" },
+    );
+    expect(res.status).toBe(302);
+    const params = new URLSearchParams(raw);
+    expect(params.get("line_items[0][price]")).toBe("price_test_plus_monthly");
+    expect(params.get("metadata[plan]")).toBe("plus");
+  });
+
+  test("entry/power have no configured Price yet → billing_err=invalid, no session minted", async () => {
+    const { id } = await seedUser("checkout-entry@example.com");
+    const sessionId = await seedSession(id);
+    // NO /v1/checkout/sessions interceptor: a session mint here would hit the
+    // disabled network and surface as billing_err=stripe, not =invalid.
+    const res = await app.fetch(
+      post("/billing/checkout", { __csrf: CSRF, interval: "monthly", plan: "entry" }, sessionCookie(sessionId)),
+      BILLING_ENV,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?billing_err=invalid");
+  });
+
   test("re-subscribe: an existing Stripe customer is REUSED (customer + address auto, no customer_email)", async () => {
-    // A user who cancelled and came back: plan free again, customer retained.
-    // The cloud#64 belt lists their subscriptions first — none active → proceed.
+    // A user who cancelled and came back: plan back to trial-equivalent (no
+    // active sub), customer retained. The cloud#64 belt lists their
+    // subscriptions first — none active → proceed.
     const { id } = await seedUser("checkout3@example.com");
     await env.DB.prepare("UPDATE users SET stripe_customer_id = 'cus_prior' WHERE id = ?").bind(id).run();
     const sessionId = await seedSession(id);
@@ -480,7 +528,7 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
     );
     expect(badInterval.headers.get("location")).toBe("/console?billing_err=invalid");
 
-    await setUserPlan(env.DB, id, "parachute");
+    await setUserPlan(env.DB, id, "standard");
     const already = await app.fetch(
       post("/billing/checkout", { __csrf: CSRF, interval: "monthly" }, sessionCookie(sessionId)),
       BILLING_ENV,
@@ -539,7 +587,7 @@ describe("POST /billing/portal — the Customer Portal door", () => {
 
   test("comped user (no Stripe customer) → billing_err=no-billing, no Stripe call", async () => {
     const { id } = await seedUser("portal2@example.com");
-    await setUserPlan(env.DB, id, "parachute");
+    await setUserPlan(env.DB, id, "standard");
     const sessionId = await seedSession(id);
     const res = await app.fetch(post("/billing/portal", { __csrf: CSRF }, sessionCookie(sessionId)), BILLING_ENV);
     expect(res.status).toBe(302);
@@ -609,7 +657,7 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
       .reply(200, { ok: true }, { headers: { "content-type": "application/json" } });
   }
 
-  test("upgrade: ids + plan=parachute + the parachute cap pushed to every owned vault", async () => {
+  test("upgrade: ids + plan=standard (the default bought tier) + the two-meter cap pushed to every owned vault", async () => {
     const { id } = await seedUser("upgrade@example.com");
     await seedVault("upgrade-box", id);
     let pushed = "";
@@ -624,19 +672,18 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
     expect(((await res.json()) as { action: string }).action).toBe("checkout_completed_upgraded");
 
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("parachute");
+    expect(user.plan).toBe("standard");
     expect(user.stripeCustomerId).toBe("cus_up_1");
     expect(user.stripeSubscriptionId).toBe("sub_up_1");
     expect(user.pendingPlan).toBeNull();
-    expect(JSON.parse(pushed)).toEqual({
-      cap_bytes: PLAN_SPECS.parachute.total_bytes,
-      transcription: { enabled: false, minutes_limit: 0 },
-    });
+    // standard carries voice (60 min) — unlike the old "parachute" plan, the
+    // new ladder's paid tiers all include voice; only entry is notes-only.
+    expect(JSON.parse(pushed)).toEqual(planEntitlement("standard"));
   });
 
   test("an upgrade CLEARS a pending downgrade (re-subscribe during grace)", async () => {
     const { id } = await seedUser("regrace@example.com");
-    await env.DB.prepare("UPDATE users SET pending_plan = 'free', plan_downgrade_at = ? WHERE id = ?")
+    await env.DB.prepare("UPDATE users SET pending_plan = 'expired', plan_downgrade_at = ? WHERE id = ?")
       .bind(new Date(Date.now() + 86_400_000).toISOString(), id)
       .run();
     const payload = makeEventPayload(
@@ -645,7 +692,7 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
     );
     expect((await postWebhook(payload)).status).toBe(200);
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("parachute");
+    expect(user.plan).toBe("standard");
     expect(user.pendingPlan).toBeNull();
     expect(user.planDowngradeAt).toBeNull();
   });
@@ -735,7 +782,7 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
     expect(((await res.json()) as { action: string }).action).toBe("checkout_completed_upgraded");
 
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("parachute");
+    expect(user.plan).toBe("standard");
     expect(user.stripeSubscriptionId).toBe("sub_race_new"); // the latest payment wins the row
     // Both Stripe calls (retrieve + cancel of the STALE sub) are pinned by
     // afterEach's assertNoPendingInterceptors — without the cloud#64 fix the
@@ -817,7 +864,7 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
     // — no orphan, whichever invocation won the first CAS (the winner is
     // scheduling-dependent; the INVARIANT isn't).
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("parachute");
+    expect(user.plan).toBe("standard");
     expect(canceled).toHaveLength(1);
     expect(user.stripeSubscriptionId).not.toBeNull();
     expect(new Set([user.stripeSubscriptionId, ...canceled])).toEqual(new Set(["sub_cc_a", "sub_cc_b"]));
@@ -859,7 +906,7 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
     expect(res.status).toBe(200);
     expect(((await res.json()) as { action: string }).action).toBe("checkout_completed_upgraded");
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("parachute");
+    expect(user.plan).toBe("standard");
     expect(user.stripeSubscriptionId).toBe("sub_boom_new");
   });
 
@@ -874,7 +921,7 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
       makeEventPayload("checkout.session.completed", checkoutCompletedObject({ userId: id })),
     );
     expect(res.status).toBe(200);
-    expect((await getUserById(env.DB, id))!.plan).toBe("parachute");
+    expect((await getUserById(env.DB, id))!.plan).toBe("standard");
   });
 });
 
@@ -895,7 +942,7 @@ describe("invoice.paid / invoice.payment_failed — soft dunning", () => {
     expect(user.paymentFailedCount).toBe(2);
     // The soft-dunning pins: no suspension, no plan change, no data action.
     expect(user.suspendedAt).toBeNull();
-    expect(user.plan).toBe("parachute");
+    expect(user.plan).toBe("standard");
 
     const paid = await postWebhook(makeEventPayload("invoice.paid", invoice));
     expect(((await paid.json()) as { action: string }).action).toBe("invoice_paid");
@@ -934,7 +981,7 @@ describe("invoice.paid / invoice.payment_failed — soft dunning", () => {
 // --- webhook: subscription deleted/updated + the sweep ---------------------------
 
 describe("customer.subscription.deleted — the deferred downgrade", () => {
-  test("records pending_plan + plan_downgrade_at = period end + 3d grace; plan NOT flipped", async () => {
+  test("records pending_plan='expired' + plan_downgrade_at = period end + 3d grace; plan NOT flipped", async () => {
     const { id } = await seedPaidUser("cancel@example.com", { subscription: "sub_cancel_1" });
     const periodEnd = Math.floor(Date.now() / 1000) + 7 * 86_400; // paid a week ahead (immediate cancel mid-period)
     const res = await postWebhook(
@@ -946,8 +993,8 @@ describe("customer.subscription.deleted — the deferred downgrade", () => {
     expect(((await res.json()) as { action: string }).action).toBe("subscription_deleted_downgrade_scheduled");
 
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("parachute"); // paid-through entitlements keep working
-    expect(user.pendingPlan).toBe("free");
+    expect(user.plan).toBe("standard"); // paid-through entitlements keep working
+    expect(user.pendingPlan).toBe("expired");
     expect(user.planDowngradeAt).toBe(new Date(periodEnd * 1000 + DOWNGRADE_GRACE_PERIOD_MS).toISOString());
   });
 
@@ -966,9 +1013,15 @@ describe("customer.subscription.deleted — the deferred downgrade", () => {
     expect(at).toBeLessThanOrEqual(Date.now() + DOWNGRADE_GRACE_PERIOD_MS + 5_000);
   });
 
-  test("idempotent: an already-free user with no pending change is left alone", async () => {
+  test("idempotent: an already-expired user with no pending change is left alone", async () => {
     const { id } = await seedUser("cancel3@example.com");
-    await env.DB.prepare("UPDATE users SET stripe_subscription_id = 'sub_cancel_3' WHERE id = ?").bind(id).run();
+    // Also clear the trial pair createUser stamps at signup — this simulates
+    // an account genuinely settled at the expired floor, not a fresh trial.
+    await env.DB.prepare(
+      "UPDATE users SET plan = 'expired', pending_plan = NULL, plan_downgrade_at = NULL, stripe_subscription_id = 'sub_cancel_3' WHERE id = ?",
+    )
+      .bind(id)
+      .run();
     const res = await postWebhook(
       makeEventPayload("customer.subscription.deleted", subscriptionObject({ id: "sub_cancel_3" })),
     );
@@ -978,7 +1031,7 @@ describe("customer.subscription.deleted — the deferred downgrade", () => {
 });
 
 describe("customer.subscription.updated — cancels, un-cancels, plan syncs", () => {
-  test("cancel_at_period_end → pending_plan='free' (informational; deleted stamps the time)", async () => {
+  test("cancel_at_period_end → pending_plan='expired' (informational; deleted stamps the time)", async () => {
     const { id } = await seedPaidUser("upd1@example.com", { subscription: "sub_upd_1" });
     const res = await postWebhook(
       makeEventPayload(
@@ -988,14 +1041,14 @@ describe("customer.subscription.updated — cancels, un-cancels, plan syncs", ()
     );
     expect(((await res.json()) as { action: string }).action).toBe("subscription_updated_cancel_scheduled");
     const user = (await getUserById(env.DB, id))!;
-    expect(user.pendingPlan).toBe("free");
+    expect(user.pendingPlan).toBe("expired");
     expect(user.planDowngradeAt).toBeNull();
-    expect(user.plan).toBe("parachute");
+    expect(user.plan).toBe("standard");
   });
 
   test("un-cancel clears the pending downgrade", async () => {
     const { id } = await seedPaidUser("upd2@example.com", { subscription: "sub_upd_2" });
-    await env.DB.prepare("UPDATE users SET pending_plan = 'free', plan_downgrade_at = ? WHERE id = ?")
+    await env.DB.prepare("UPDATE users SET pending_plan = 'expired', plan_downgrade_at = ? WHERE id = ?")
       .bind(new Date(Date.now() + 86_400_000).toISOString(), id)
       .run();
     const res = await postWebhook(
@@ -1019,12 +1072,12 @@ describe("customer.subscription.updated — cancels, un-cancels, plan syncs", ()
       ),
     );
     expect(((await res.json()) as { action: string }).action).toBe("subscription_updated_unknown_price");
-    expect((await getUserById(env.DB, id))!.plan).toBe("parachute");
+    expect((await getUserById(env.DB, id))!.plan).toBe("standard");
   });
 
   test("a real plan change applies immediately (portal re-activation of a downgraded user)", async () => {
     const { id } = await seedUser("upd4@example.com");
-    await env.DB.prepare("UPDATE users SET stripe_subscription_id = 'sub_upd_4', pending_plan = 'free' WHERE id = ?")
+    await env.DB.prepare("UPDATE users SET stripe_subscription_id = 'sub_upd_4', pending_plan = 'expired' WHERE id = ?")
       .bind(id)
       .run();
     const res = await postWebhook(
@@ -1035,7 +1088,7 @@ describe("customer.subscription.updated — cancels, un-cancels, plan syncs", ()
     );
     expect(((await res.json()) as { action: string }).action).toBe("subscription_updated_plan_applied");
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("parachute");
+    expect(user.plan).toBe("standard");
     expect(user.pendingPlan).toBeNull();
   });
 });
@@ -1051,10 +1104,10 @@ describe("runBillingSweep — the hourly downgrade pass", () => {
     };
   }
 
-  test("applies a due downgrade: plan flips, pair clears, the FREE cap pushes; data untouched", async () => {
+  test("applies a due downgrade: plan flips, pair clears, the EXPIRED (frozen) cap pushes; data untouched", async () => {
     const { id } = await seedPaidUser("sweep1@example.com");
     await seedVault("sweep1-box", id);
-    await env.DB.prepare("UPDATE users SET pending_plan = 'free', plan_downgrade_at = ? WHERE id = ?")
+    await env.DB.prepare("UPDATE users SET pending_plan = 'expired', plan_downgrade_at = ? WHERE id = ?")
       .bind(new Date(Date.now() - 1000).toISOString(), id)
       .run();
 
@@ -1063,29 +1116,26 @@ describe("runBillingSweep — the hourly downgrade pass", () => {
     expect(summary).toEqual({ due: 1, applied: 1 });
 
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("free");
+    expect(user.plan).toBe("expired");
     expect(user.pendingPlan).toBeNull();
     expect(user.planDowngradeAt).toBeNull();
     // Stripe linkage retained (BILLING_TRAIL_RETENTION_MS rationale: refund
     // window + re-subscribe matching) — nothing deleted anywhere.
     expect(user.stripeCustomerId).toBe("cus_test_1");
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.body).toEqual({
-      cap_bytes: PLAN_SPECS.free.total_bytes,
-      transcription: { enabled: false, minutes_limit: 0 },
-    });
+    expect(calls[0]!.body).toEqual(planEntitlement("expired"));
     const vaultRow = await env.DB.prepare("SELECT name FROM vaults WHERE name = 'sweep1-box'").first();
     expect(vaultRow).not.toBeNull(); // downgrade NEVER deletes data
   });
 
   test("a future plan_downgrade_at is NOT applied (the grace holds)", async () => {
     const { id } = await seedPaidUser("sweep2@example.com");
-    await env.DB.prepare("UPDATE users SET pending_plan = 'free', plan_downgrade_at = ? WHERE id = ?")
+    await env.DB.prepare("UPDATE users SET pending_plan = 'expired', plan_downgrade_at = ? WHERE id = ?")
       .bind(new Date(Date.now() + 86_400_000).toISOString(), id)
       .run();
     const summary = await runBillingSweep(env.DB, sweepDeps(), new Date());
     expect(summary).toEqual({ due: 0, applied: 0 });
-    expect((await getUserById(env.DB, id))!.plan).toBe("parachute");
+    expect((await getUserById(env.DB, id))!.plan).toBe("standard");
   });
 
   test("a run is bounded by BILLING_SWEEP_CAP", () => {

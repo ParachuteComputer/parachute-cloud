@@ -1,6 +1,7 @@
 import { SELF } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import { base, freshVault, mintToken, op, OP } from "./helpers.ts";
+import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
+import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
 
 /**
  * MCP endpoint conformance (design §3.1). Reproduces the byte-shape facts a
@@ -190,5 +191,98 @@ describe("MCP — tools", () => {
     const v = freshVault();
     const res = await mcpPost(v, OP, { jsonrpc: "2.0", id: 6, method: "does/not/exist" });
     expect((await res.json() as any).error.code).toBe(-32601);
+  });
+});
+
+/**
+ * The MCP write gate — the paywall + cap PARITY with the REST write path
+ * (the correctness hole reviewed on the pricing PR: the REST 402 `frozen` floor
+ * and the two-meter notes cap bit on `/api/notes` but NOT on `/mcp`, so an
+ * expired tenant's connected AI could keep writing forever through the flagship
+ * door). Each MCP write verb now gets the SAME frozen-then-cap enforcement REST
+ * applies; read AND delete verbs pass through, mirroring REST's exemptions.
+ */
+describe("MCP — write gate (frozen + cap parity)", () => {
+  /** First-party admin token — exactly what identity's pushVaultCap mints. */
+  function firstPartyToken(vault: string): Promise<string> {
+    return mintToken({ vault, scopes: `vault:${vault}:admin`, vaultScope: [vault], clientId: FIRST_PARTY_CLIENT_ID });
+  }
+  function putConfig(vault: string, token: string, body: unknown): Promise<Response> {
+    return SELF.fetch(`${base(vault)}/api/internal/config`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+  function writeReadToken(vault: string): Promise<string> {
+    return mintToken({ vault, scopes: `vault:${vault}:write vault:${vault}:read` });
+  }
+
+  it("FROZEN: a write verb is blocked (402-equivalent plan_required); a read verb still works", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "seed before the freeze" }); // materialize + a note to read back
+    const froze = await putConfig(v, await firstPartyToken(v), { frozen: true });
+    expect(froze.status).toBe(200);
+
+    const token = await writeReadToken(v);
+
+    // WRITE (create-note) → JSON-RPC error mirroring the REST 402 plan_required.
+    const blocked = await mcpPost(v, token, {
+      jsonrpc: "2.0",
+      id: 20,
+      method: "tools/call",
+      params: { name: "create-note", arguments: { content: "frozen — no writes via MCP" } },
+    });
+    expect(blocked.status).toBe(200); // JSON-RPC transport is 200; the error is in-body
+    const berr = (await blocked.json()) as any;
+    expect(berr.error).toBeTruthy();
+    expect(berr.error.data.error_type).toBe("plan_required");
+
+    // READ (query-notes) is untouched — the paywall must not block reads.
+    const ok = await mcpPost(v, token, {
+      jsonrpc: "2.0",
+      id: 21,
+      method: "tools/call",
+      params: { name: "query-notes", arguments: {} },
+    });
+    const okBody = (await ok.json()) as any;
+    expect(okBody.error).toBeUndefined();
+    expect(okBody.result.isError).toBeFalsy();
+  });
+
+  it("FROZEN: delete-note is EXEMPT (REST leaves DELETE untouched) — parity, not stricter", async () => {
+    const v = freshVault();
+    const note = await createNote(v, { content: "to be deleted while frozen" });
+    await putConfig(v, await firstPartyToken(v), { frozen: true });
+
+    const del = await mcpPost(v, await writeReadToken(v), {
+      jsonrpc: "2.0",
+      id: 22,
+      method: "tools/call",
+      params: { name: "delete-note", arguments: { id: note.id } },
+    });
+    const body = (await del.json()) as any;
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBeFalsy();
+  });
+
+  it("NOTES CAP FULL: a write verb is blocked with the REST cap shape (meter=notes)", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "baseline so the SQLite db has a real size" });
+    // Notes budget below the current db size → instantly over (attachments generous).
+    await putConfig(v, await firstPartyToken(v), {
+      caps: { notes_bytes: 1024, attachment_bytes: 10 * 1024 * 1024 },
+    });
+
+    const blocked = await mcpPost(v, await writeReadToken(v), {
+      jsonrpc: "2.0",
+      id: 23,
+      method: "tools/call",
+      params: { name: "create-note", arguments: { content: "no room in the notes budget" } },
+    });
+    const err = (await blocked.json()) as any;
+    expect(err.error.data.error_type).toBe("storage_cap_exceeded");
+    expect(err.error.data.meter).toBe("notes");
+    expect(err.error.data.cap_bytes).toBe(1024);
   });
 });
