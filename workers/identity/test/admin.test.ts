@@ -274,6 +274,41 @@ describe("POST /admin/users/plan — the comp lever", () => {
     expect(JSON.parse(body!)).toEqual(planEntitlement("standard"));
   });
 
+  test("the comp CLEARS the trial clock (pending_plan + plan_downgrade_at) — the day-30 revert can't re-enter", async () => {
+    const { cookie } = await seedOperator("comp-clock-op@example.com");
+    const { id } = await seedUser("comp-clock-user@example.com");
+    await seedVault("comp-clock-box", id);
+
+    // A fresh signup is a trial with the 30-day clock armed (createUser).
+    const before = (await getUserById(env.DB, id))!;
+    expect(before.pendingPlan).toBe("expired");
+    expect(before.planDowngradeAt).not.toBeNull();
+
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: "/vault/comp-clock-box/api/internal/config", method: "PUT" })
+      .reply(200, { ok: true }, { headers: { "content-type": "application/json" } });
+
+    const res = await app.fetch(post("/admin/users/plan", { __csrf: CSRF, user_id: id, plan: "plus" }, cookie), env);
+    expect(res.status).toBe(302);
+
+    const after = (await getUserById(env.DB, id))!;
+    expect(after.plan).toBe("plus");
+    // Without the clock-clear (admin.ts) the hourly sweep would revert this
+    // comped user to expired at day 30.
+    expect(after.pendingPlan).toBeNull();
+    expect(after.planDowngradeAt).toBeNull();
+  });
+
+  test("comp to `trial` is REFUSED (err=invalid) — the clock-clear would make a comped trial eternal + clockless", async () => {
+    const { cookie } = await seedOperator("comp-trial-op@example.com");
+    const { id } = await seedUser("comp-trial-user@example.com");
+    const res = await app.fetch(post("/admin/users/plan", { __csrf: CSRF, user_id: id, plan: "trial" }, cookie), env);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/admin/users?err=invalid");
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial"); // unchanged
+  });
+
   test("a failed cap push still comps the plan and reports partially", async () => {
     const { cookie } = await seedOperator("comp2-op@example.com");
     const { id } = await seedUser("comp2-user@example.com");

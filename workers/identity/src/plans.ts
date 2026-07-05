@@ -186,6 +186,18 @@ export function isPaidTier(plan: PlanId): plan is PaidTier {
 }
 
 /**
+ * The plans an operator may COMP a user to via the admin lever: the paid tiers
+ * plus the expired floor. `trial` is deliberately EXCLUDED — the comp lever
+ * clears pending_plan + plan_downgrade_at (admin.ts), so a comped 'trial' would
+ * be an eternal clockless trial: it never converts and never expires. To grant
+ * the full trial experience, comp to `plus` (trial mirrors plus's entitlements);
+ * to floor a user, comp to `expired`.
+ */
+export function isCompPlan(plan: PlanId): boolean {
+  return isPaidTier(plan) || plan === "expired";
+}
+
+/**
  * Whether the plan grants live entitlements (writes, its caps, its voice).
  * trial = yes (full paid experience); expired = no (writes frozen); every paid
  * tier = yes. The replacement for the OLD isPaidPlan on the "does this plan

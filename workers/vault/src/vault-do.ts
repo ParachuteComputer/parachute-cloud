@@ -344,7 +344,14 @@ export class VaultDO extends DurableObject {
         headers.set("WWW-Authenticate", mcpWwwAuthenticate(request, vaultName));
         return new Response(mauth.error.body, { status: mauth.error.status, headers });
       }
-      return handleMcp(request, this.store, vaultName, mauth, this.config!.description);
+      // The write gate: MCP is the flagship write door, so the paywall (frozen
+      // → 402) + the two-meter notes cap MUST bite on MCP write verbs exactly as
+      // on REST. handleMcp applies it per-tool (write-class only; read + DELETE
+      // verbs pass, mirroring the REST exemptions) — POST-JSON-RPC can't gate at
+      // the HTTP layer without wrongly blocking reads.
+      return handleMcp(request, this.store, vaultName, mauth, this.config!.description, () =>
+        this.capBlockIfFull(),
+      );
     }
 
     // Bare landing — GET /vault/<name>. Read-scoped. `cap_bytes` is the

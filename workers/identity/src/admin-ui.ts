@@ -9,7 +9,7 @@
  */
 import { esc, page } from "./ui.ts";
 import { CHECKLIST_ITEMS } from "./checklist.ts";
-import { PLAN_SPECS, type PlanId, formatPlanBytes, formatUsageBytes } from "./plans.ts";
+import { PLAN_SPECS, type PlanId, formatPlanBytes, formatUsageBytes, isCompPlan } from "./plans.ts";
 import type { DigestStats } from "./ops.ts";
 
 /** Widen the ui.ts shell (30rem is right for forms, not fleet tables). */
@@ -181,12 +181,14 @@ export function renderAdminUsers(props: AdminUsersProps): string {
   const { users, page: current, totalPages, totalUsers, csrfToken, notice, error } = props;
   const rows = users
     .map((u) => {
-      // Comp lever — a button per OTHER plan (entry / standard / plus / power /
-      // trial / expired), so an operator can grant any tier directly while
-      // Stripe keys are pending. setUserPlan + applyPlanToVaults pushes the
-      // two-meter caps + voice + frozen into the owner's vault DOs immediately.
+      // Comp lever — a button per OTHER comp-able plan (paid tiers + expired),
+      // so an operator can grant any tier directly while Stripe keys are pending.
+      // `trial` is excluded (isCompPlan): the handler clears the trial clock, so
+      // a comped trial would never convert or expire. setUserPlan +
+      // applyPlanToVaults pushes the two-meter caps + voice + frozen into the
+      // owner's vault DOs immediately.
       const planForm = (Object.keys(PLAN_SPECS) as PlanId[])
-        .filter((p) => p !== u.plan)
+        .filter((p) => p !== u.plan && isCompPlan(p))
         .map(
           (p) => `<form class="inline" method="post" action="/admin/users/plan">
           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">

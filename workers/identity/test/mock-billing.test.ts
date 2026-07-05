@@ -217,6 +217,28 @@ describe("mock upgrade applies the plan + caps + voice entitlement (real seam)",
     expect(JSON.parse(pushed)).toEqual(planEntitlement("entry"));
   });
 
+  test("the conversion CLEARS the trial clock (pending_plan + plan_downgrade_at) — the day-30 revert can't re-enter", async () => {
+    const { id } = await seedUser("mock-clock@example.com");
+    await seedVault("mock-clock-box", id);
+    interceptCapPush("mock-clock-box");
+
+    // A fresh signup is a trial with the 30-day clock armed (createUser).
+    const before = (await getUserById(env.DB, id))!;
+    expect(before.pendingPlan).toBe("expired");
+    expect(before.planDowngradeAt).not.toBeNull();
+
+    const res = await app.fetch(post({ __csrf: CSRF, plan: "plus" }, sessionCookie(await seedSession(id))), MOCK_ENV);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?mock_upgraded=1");
+
+    const after = (await getUserById(env.DB, id))!;
+    expect(after.plan).toBe("plus");
+    // Without the clock-clear (billing.ts handleMockCheckoutPost) the hourly
+    // sweep would revert this converted user to expired at day 30.
+    expect(after.pendingPlan).toBeNull();
+    expect(after.planDowngradeAt).toBeNull();
+  });
+
   test("the mock-upgraded notice renders on the console return (test-purchase copy)", async () => {
     const { id } = await seedUser("mock-notice@example.com");
     await setUserPlan(env.DB, id, "plus"); // land on /console?mock_upgraded=1 already-plus

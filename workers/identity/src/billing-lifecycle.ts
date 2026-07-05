@@ -325,7 +325,7 @@ function periodEndOf(subscription: Stripe.Subscription): number | null {
  * period end) + the 3-day grace; the hourly sweep applies it. The plan is
  * NOT flipped here (see the module note — old semantics, faithfully).
  *
- * Idempotent: a row already free with no pending change is left alone.
+ * Idempotent: a row already expired with no pending change is left alone.
  */
 export async function handleSubscriptionDeleted(
   db: D1Database,

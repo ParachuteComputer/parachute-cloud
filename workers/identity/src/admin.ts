@@ -26,7 +26,7 @@ import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { sessionUser } from "./session-user.ts";
 import { deleteSessionsForUser } from "./sessions.ts";
 import { getUserById, setUserPlan, setUserSuspended, type User } from "./users.ts";
-import { coercePlanId, isPlanId, planTotalBytes } from "./plans.ts";
+import { coercePlanId, isCompPlan, isPlanId, planTotalBytes } from "./plans.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 import { collectDigestStats } from "./ops.ts";
 import { latestUsageForVaults } from "./usage.ts";
@@ -294,7 +294,10 @@ export async function handleAdminSetPlanPost(db: D1Database, req: Request, deps:
   const { form, back } = ctx;
 
   const plan = String(form.get("plan") ?? "");
-  if (!isPlanId(plan)) return back("err=invalid");
+  // Comp-able plans only: paid tiers + `expired`. `trial` is refused — the
+  // clock-clear below would make a comped trial eternal + clockless (it would
+  // never convert and never expire). Comp to `plus` for the trial experience.
+  if (!isPlanId(plan) || !isCompPlan(plan)) return back("err=invalid");
   const target = await getUserById(db, String(form.get("user_id") ?? ""));
   if (!target) return back("err=not-found");
 
