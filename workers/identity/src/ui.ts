@@ -10,16 +10,16 @@ import { NOTES_APP_OPTIONS } from "./checklist.ts";
 // Plan copy renders from plans.ts (the single source of truth for
 // entitlements + display strings) — the console can never drift from it.
 import {
-  PARACHUTE_PRICE_MONTHLY_LABEL,
-  PARACHUTE_PRICE_YEARLY_LABEL,
-  VOICE_PRICE_MONTHLY_LABEL,
+  PAID_TIERS,
   PLAN_SPECS,
+  TIER_PRICE_LABEL,
   type PlanId,
   formatPlanBytes,
   formatUsageBytes,
-  isPaidPlan,
-  parachuteTeaser,
+  isPaidTier,
   planLine,
+  planTotalBytes,
+  upgradeTeaser,
   vaultCapMessage,
 } from "./plans.ts";
 
@@ -579,14 +579,22 @@ export interface ConsoleProps {
   voiceBillingConfigured?: boolean;
   /**
    * Interim MOCK billing active (billing-config.ts `mockBillingEnabled`):
-   * non-prod + no real Stripe (or MOCK_BILLING=1). Free users get the Upgrade
-   * buttons wired to the mock endpoint + a "test mode" label; both tiers are
-   * offered (the mock applies any tier). Takes precedence over the teaser and,
-   * when set, over the real Checkout action. ALWAYS false in production.
+   * non-prod + no real Stripe (or MOCK_BILLING=1). Checkout-eligible users get
+   * the tier buttons wired to the mock endpoint + a "test mode" label (the mock
+   * applies any tier). Takes precedence over the teaser and, when set, over the
+   * real Checkout action. ALWAYS false in production.
    */
   mockBillingEnabled?: boolean;
-  /** The user has a Stripe customer (false for comped parachute accounts). */
+  /** The user has a Stripe customer (false for comped accounts). */
   hasBillingAccount?: boolean;
+  /**
+   * Whether the account may START a checkout / redeem a promo (plans.ts
+   * canStartCheckout: a trial or expired account with no live subscription).
+   * Gates the tier chooser, the mock/teaser affordances, and the "Have a code?"
+   * box. A paid-tier account gets Manage-billing instead; a live-sub account
+   * neither.
+   */
+  canCheckout?: boolean;
 }
 
 /**
@@ -847,83 +855,76 @@ export function renderConsole(props: ConsoleProps): string {
     atVaultCap,
     isOperator,
     billingConfigured,
-    voiceBillingConfigured,
     mockBillingEnabled,
     hasBillingAccount,
+    canCheckout,
   } = props;
   // Plan display. The across-vaults usage total (latest rollup rows) rides the
-  // plan line. Billing doors (Wave 4d) render only while billing is CONFIGURED
-  // (billing-config.ts): free users get the two Upgrade buttons (hosted
-  // Checkout, POST /billing/checkout), paid users with a real Stripe customer
-  // get Manage billing (the portal, POST /billing/portal — comped accounts
-  // have no customer, so no door). Unconfigured — today's deploy — free users
-  // see the copy-only teaser exactly as before.
+  // plan line. Billing doors render off `canCheckout` (plans.ts — a trial or
+  // expired account with no live subscription): those users get the tier
+  // buttons (hosted Checkout / mock, POST /billing/checkout|mock-checkout);
+  // paid-tier users with a real Stripe customer get Manage billing (the portal;
+  // comped accounts have no customer, so no door). Unconfigured — today's
+  // deploy — checkout-eligible users see the copy-only teaser.
+  //
+  // (This is PR-A's FUNCTIONAL plan line — a compact per-tier chooser. PR-B
+  // replaces it with the full 4-tier cards + billing-interval choice.)
   const usageHtml =
     totalUsedBytes != null
       ? ` <span data-testid="usage-total">&middot; Using ${esc(formatUsageBytes(totalUsedBytes))}</span>`
       : "";
-  // A free user's Upgrade has THREE clean states, mutually exclusive:
+  // The tier chooser has THREE clean states, mutually exclusive:
   //   1. MOCK    (mockBillingEnabled — non-prod, no real Stripe / MOCK_BILLING=1):
   //      the buttons POST the mock endpoint + a "test mode — no real charge"
-  //      label, so the caps/voice-lift flow is demoable now with no live charge.
-  //      Both tiers offered (the mock applies any tier).
-  //   2. REAL    (billingConfigured): the buttons POST hosted Checkout (#63);
-  //      the Voice button needs the Voice Price too (voiceBillingConfigured).
+  //      label, so the upgrade → caps/voice-lift flow is demoable with no charge.
+  //   2. REAL    (billingConfigured): the buttons POST hosted Checkout.
   //   3. NEITHER (prod, no keys — today's deploy): the copy-only teaser.
   // Mock wins when active (non-prod only); when real keys land without
   // MOCK_BILLING the mock goes inert and REAL takes over with no code change.
-  const showParachuteUpgrade = plan === "free" && (mockBillingEnabled || billingConfigured);
+  const showUpgrade = canCheckout === true && (mockBillingEnabled === true || billingConfigured === true);
   const checkoutAction = mockBillingEnabled ? "/billing/mock-checkout" : "/billing/checkout";
-  // Voice: the real path needs the Voice Price configured; the mock applies any
-  // tier, so it always offers voice.
-  const showVoiceUpgrade = plan === "free" && (mockBillingEnabled || voiceBillingConfigured);
   const mockNoteHtml =
-    plan === "free" && mockBillingEnabled
+    canCheckout && mockBillingEnabled
       ? ` <span class="muted" data-testid="mock-billing-note">&middot; test mode &mdash; no real charge</span>`
       : "";
-  const upgradeHtml = showParachuteUpgrade
+  // One Upgrade button per purchasable tier. `interval=monthly` is the default;
+  // the MOCK path applies the chosen tier directly, the REAL path resolves it to
+  // a Stripe Price (standard/plus today; entry/power land with PR-C's prices).
+  const tierButtons = PAID_TIERS.map((tier) => {
+    const spec = PLAN_SPECS[tier];
+    return `<button class="linkbtn" type="submit" name="plan" value="${tier}">${esc(spec.label)} &mdash; ${esc(TIER_PRICE_LABEL[tier])}</button>`;
+  }).join(`<span class="muted"> · </span>`);
+  const upgradeHtml = showUpgrade
     ? `<form class="inline" method="post" action="${checkoutAction}" data-testid="upgrade-billing" style="margin-left:.35rem">
            <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
-           <span style="opacity:.85">&middot; ${esc(PLAN_SPECS.parachute.label)}: ${PLAN_SPECS.parachute.vault_count} vaults, ${esc(formatPlanBytes(PLAN_SPECS.parachute.total_bytes))} —</span>
-           <button class="linkbtn" type="submit" name="interval" value="monthly">Upgrade &mdash; ${esc(PARACHUTE_PRICE_MONTHLY_LABEL)}</button>
-           <span class="muted">or</span>
-           <button class="linkbtn" type="submit" name="interval" value="yearly">${esc(PARACHUTE_PRICE_YEARLY_LABEL)}</button>
-         </form>`
-    : "";
-  // The $5 Voice tier Upgrade (cloud#56) — voice transcription; monthly only.
-  const voiceUpgradeHtml = showVoiceUpgrade
-    ? `<form class="inline" method="post" action="${checkoutAction}" data-testid="upgrade-voice" style="margin-left:.35rem">
-           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
-           <input type="hidden" name="plan" value="voice">
-           <span style="opacity:.85">&middot; ${esc(PLAN_SPECS.voice.label)}: voice transcription —</span>
-           <button class="linkbtn" type="submit">Upgrade &mdash; ${esc(VOICE_PRICE_MONTHLY_LABEL)}</button>
+           <input type="hidden" name="interval" value="monthly">
+           <span style="opacity:.85">&middot; Pick a plan:</span> ${tierButtons}
          </form>`
     : "";
   const manageBillingHtml =
-    isPaidPlan(plan) && billingConfigured && hasBillingAccount
+    isPaidTier(plan) && billingConfigured && hasBillingAccount
       ? ` <form class="inline" method="post" action="/billing/portal" data-testid="manage-billing">
            <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
            <span style="opacity:.75">&middot;</span> <button class="linkbtn" type="submit">Manage billing</button>
          </form>`
       : "";
   const teaserHtml =
-    plan === "free" && !billingConfigured && !mockBillingEnabled
-      ? ` <span style="opacity:.75">&middot; ${esc(parachuteTeaser())}</span>`
+    canCheckout && !billingConfigured && !mockBillingEnabled
+      ? ` <span style="opacity:.75">&middot; ${esc(upgradeTeaser())}</span>`
       : "";
-  // A scheduled downgrade's date (promo comp expiry / real cancel) rides the
-  // plan line — quiet, honest, always visible while the clock runs.
-  const planUntilHtml =
-    isPaidPlan(plan) && planUntil
-      ? ` <span data-testid="plan-until">&middot; until ${esc(planUntil.slice(0, 10))}</span>`
-      : "";
-  const planHtml = `${esc(planLine(plan))}${planUntilHtml}${usageHtml}${teaserHtml}${upgradeHtml}${voiceUpgradeHtml}${mockNoteHtml}${manageBillingHtml}`;
-  // "Have a code?" — promo redemption (promo.ts), free accounts only (a paid
-  // account has nothing to redeem onto; the POST refuses regardless). A quiet
-  // disclosure under the plan line: present for launch codes, invisible noise
-  // otherwise. Inline styles undo the details/input defaults (those are sized
-  // for the card sections, not a one-line header affordance).
+  // A scheduled downgrade's date (the 30-day trial clock, a promo comp expiry,
+  // or a real cancel) rides the plan line — quiet, honest, always visible while
+  // the clock runs (trial + paid alike).
+  const planUntilHtml = planUntil
+    ? ` <span data-testid="plan-until">&middot; until ${esc(planUntil.slice(0, 10))}</span>`
+    : "";
+  const planHtml = `${esc(planLine(plan))}${planUntilHtml}${usageHtml}${teaserHtml}${upgradeHtml}${mockNoteHtml}${manageBillingHtml}`;
+  // "Have a code?" — promo redemption (promo.ts), checkout-eligible accounts
+  // only (a paid tier has nothing to redeem onto; the POST refuses regardless).
+  // A quiet disclosure under the plan line: present for launch codes, invisible
+  // noise otherwise. Inline styles undo the details/input defaults.
   const promoHtml =
-    plan === "free"
+    canCheckout
       ? `<details data-testid="promo-code" style="margin:-.9rem 0 1.2rem;border-top:0;padding-top:0;font-size:.88rem">
        <summary class="muted" style="font-weight:500">Have a code?</summary>
        <form method="post" action="/console/promo" style="display:flex;gap:.5rem;align-items:center;margin-top:.45rem;max-width:22rem">
@@ -953,7 +954,7 @@ export function renderConsole(props: ConsoleProps): string {
     );
   }
 
-  const list = vaults.map((v) => vaultCard(v, csrfToken, PLAN_SPECS[plan].total_bytes)).join("\n");
+  const list = vaults.map((v) => vaultCard(v, csrfToken, planTotalBytes(plan))).join("\n");
   // At the plan's vault cap the create form yields to the friendly note (the
   // POST handler enforces regardless — this keeps the door honest). An error
   // still renders inside whichever card is shown.

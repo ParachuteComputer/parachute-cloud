@@ -181,10 +181,10 @@ export function renderAdminUsers(props: AdminUsersProps): string {
   const { users, page: current, totalPages, totalUsers, csrfToken, notice, error } = props;
   const rows = users
     .map((u) => {
-      // Comp lever — a button per OTHER plan (free / parachute / voice), so an
-      // operator can grant the $5 Voice tier directly while Stripe keys are
-      // pending (cloud#56). setUserPlan + applyPlanToVaults pushes the storage
-      // cap AND the voice entitlement into the owner's vault DOs immediately.
+      // Comp lever — a button per OTHER plan (entry / standard / plus / power /
+      // trial / expired), so an operator can grant any tier directly while
+      // Stripe keys are pending. setUserPlan + applyPlanToVaults pushes the
+      // two-meter caps + voice + frozen into the owner's vault DOs immediately.
       const planForm = (Object.keys(PLAN_SPECS) as PlanId[])
         .filter((p) => p !== u.plan)
         .map(

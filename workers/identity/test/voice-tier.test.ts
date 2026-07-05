@@ -1,20 +1,25 @@
 /**
- * Voice tier (cloud#56) — the plan entitlement + Stripe price mapping, pure.
+ * Voice entitlement (cloud#56, folded into the pricing-model ladder) — the
+ * plan entitlement + Stripe price mapping, pure.
  *
- * The $5 Voice tier is what the vault DO's transcription gate reads (via the
- * entitlement pushed by vault-call.ts). These pin: voice is a known paid plan
- * with Parachute's storage + voice on; only voice enables the pushed
- * entitlement; the voice Stripe price maps to the voice plan (and is ignored
- * when unconfigured — the additive-price contract).
+ * Voice is no longer its own plan id — it's a PER-TIER FLAG on the ladder
+ * (plans.ts PLAN_SPECS): standard/plus/power all carry voice (60/300/1200
+ * min respectively); entry is notes-only (no voice, no attachments). These
+ * pin: which tiers carry voice + their own storage/vault-count/restore
+ * entitlements; only voice-enabled tiers push a live transcription
+ * entitlement into vault DOs; legacy/unknown plan ids (incl. the retired
+ * "free"/"parachute"/"voice") coerce to the 'expired' floor; the voice
+ * Stripe price maps to the `plus` tier (and is ignored when unconfigured —
+ * the additive-price contract).
  */
 import { describe, expect, it } from "vitest";
 import {
   PLAN_SPECS,
-  VOICE_MONTHLY_MINUTES,
   coercePlanId,
-  isPaidPlan,
+  isPaidTier,
   isPlanId,
   planLine,
+  planTotalBytes,
   transcriptionEntitlement,
 } from "../src/plans.ts";
 import { planForPrice } from "../src/billing-lifecycle.ts";
@@ -23,50 +28,62 @@ import type { BillingConfig } from "../src/billing-config.ts";
 const baseConfig: BillingConfig = {
   secretKey: "sk_test",
   webhookSecret: "whsec_test",
-  priceMonthly: "price_parachute_monthly",
-  priceYearly: "price_parachute_yearly",
+  priceMonthly: "price_standard_monthly",
+  priceYearly: "price_standard_yearly",
 };
 
-describe("voice tier (cloud#56)", () => {
-  it("voice is a known, PAID plan: Parachute storage + voice enabled + restore", () => {
-    expect(isPlanId("voice")).toBe(true);
-    expect(isPaidPlan("voice")).toBe(true);
-    expect(isPaidPlan("free")).toBe(false);
-    expect(isPaidPlan("parachute")).toBe(true);
+describe("voice entitlement (cloud#56) — folded into the ladder", () => {
+  it("standard/plus/power are known PAID tiers carrying voice; entry is notes-only (no voice)", () => {
+    expect(isPlanId("plus")).toBe(true);
+    expect(isPaidTier("plus")).toBe(true);
+    expect(isPaidTier("entry")).toBe(true);
 
-    const v = PLAN_SPECS.voice;
-    expect(v.voice_enabled).toBe(true);
-    expect(v.transcribe_minutes).toBe(VOICE_MONTHLY_MINUTES);
-    expect(v.vault_count).toBe(PLAN_SPECS.parachute.vault_count);
-    expect(v.total_bytes).toBe(PLAN_SPECS.parachute.total_bytes);
-    expect(v.restore).toBe(true);
+    expect(PLAN_SPECS.entry.voice_enabled).toBe(false);
+    expect(PLAN_SPECS.standard.voice_enabled).toBe(true);
+    expect(PLAN_SPECS.plus.voice_enabled).toBe(true);
+    expect(PLAN_SPECS.power.voice_enabled).toBe(true);
+
+    const plus = PLAN_SPECS.plus;
+    expect(plus.transcribe_minutes).toBe(300);
+    expect(plus.vault_count).toBe(5);
+    expect(planTotalBytes("plus")).toBe(plus.notes_bytes + plus.attachment_bytes);
+    expect(plus.restore).toBe(true);
   });
 
-  it("ONLY voice enables the entitlement pushed into vault DOs", () => {
-    expect(transcriptionEntitlement("free")).toEqual({ enabled: false, minutes_limit: 0 });
-    expect(transcriptionEntitlement("parachute")).toEqual({ enabled: false, minutes_limit: 0 });
-    expect(transcriptionEntitlement("voice")).toEqual({ enabled: true, minutes_limit: VOICE_MONTHLY_MINUTES });
+  it("ONLY voice-enabled tiers push a live transcription entitlement into vault DOs", () => {
+    expect(transcriptionEntitlement("entry")).toEqual({ enabled: false, minutes_limit: 0 });
+    expect(transcriptionEntitlement("expired")).toEqual({ enabled: false, minutes_limit: 0 });
+    expect(transcriptionEntitlement("standard")).toEqual({ enabled: true, minutes_limit: 60 });
+    expect(transcriptionEntitlement("plus")).toEqual({ enabled: true, minutes_limit: 300 });
+    expect(transcriptionEntitlement("power")).toEqual({ enabled: true, minutes_limit: 1200 });
+    // Trial mirrors Plus's entitlement exactly.
+    expect(transcriptionEntitlement("trial")).toEqual({ enabled: true, minutes_limit: 300 });
   });
 
-  it("coerces unknown plan values to free, keeps voice", () => {
-    expect(coercePlanId("nonsense")).toBe("free");
-    expect(coercePlanId("voice")).toBe("voice");
-    expect(coercePlanId(null)).toBe("free");
+  it("coerces unknown/legacy plan values (incl. the retired free/parachute/voice ids) to the expired floor", () => {
+    expect(coercePlanId("nonsense")).toBe("expired");
+    expect(coercePlanId("free")).toBe("expired"); // pre-refactor legacy id
+    expect(coercePlanId("parachute")).toBe("expired"); // pre-refactor legacy id
+    expect(coercePlanId("voice")).toBe("expired"); // voice was its own plan id pre-refactor
+    expect(coercePlanId(null)).toBe("expired");
+    expect(coercePlanId("plus")).toBe("plus"); // a real tier passes through unchanged
   });
 
-  it("planForPrice maps the voice price to the voice plan when configured", () => {
-    const config: BillingConfig = { ...baseConfig, priceVoiceMonthly: "price_voice_monthly" };
-    expect(planForPrice("price_parachute_monthly", config)).toBe("parachute");
-    expect(planForPrice("price_parachute_yearly", config)).toBe("parachute");
-    expect(planForPrice("price_voice_monthly", config)).toBe("voice");
+  it("planForPrice maps monthly/yearly to standard, and the voice-monthly price to plus, when configured", () => {
+    const config: BillingConfig = { ...baseConfig, priceVoiceMonthly: "price_plus_monthly" };
+    expect(planForPrice("price_standard_monthly", config)).toBe("standard");
+    expect(planForPrice("price_standard_yearly", config)).toBe("standard");
+    expect(planForPrice("price_plus_monthly", config)).toBe("plus");
     expect(planForPrice("price_unknown", config)).toBeNull();
   });
 
-  it("planForPrice ignores the voice price when it isn't configured (additive contract)", () => {
-    expect(planForPrice("price_voice_monthly", baseConfig)).toBeNull();
+  it("planForPrice ignores the voice-monthly price when it isn't configured (additive contract)", () => {
+    expect(planForPrice("price_plus_monthly", baseConfig)).toBeNull();
   });
 
-  it("the plan line reads Voice", () => {
-    expect(planLine("voice")).toContain("Voice");
+  it("the plan line reads each tier's own label", () => {
+    expect(planLine("plus")).toContain("Plus");
+    expect(planLine("standard")).toContain("Standard");
+    expect(planLine("entry")).toContain("Entry");
   });
 });

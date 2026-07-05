@@ -21,7 +21,7 @@ import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import app from "../src/index.ts";
 import { ADMIN_PAGE_SIZE } from "../src/admin.ts";
-import { PLAN_SPECS } from "../src/plans.ts";
+import { PLAN_SPECS, planEntitlement } from "../src/plans.ts";
 import { findActiveSession } from "../src/sessions.ts";
 import { getUserById } from "../src/users.ts";
 import { CSRF, ISSUER, seedSession, seedUser, seedVault } from "./helpers.ts";
@@ -78,7 +78,7 @@ describe("role gate — 404 for everyone but an operator", () => {
       expect((await app.fetch(get(path, cookie), env)).status, path).toBe(404);
     }
     for (const path of ADMIN_POSTS) {
-      const res = await app.fetch(post(path, { __csrf: CSRF, user_id: id, plan: "parachute", act: "suspend" }, cookie), env);
+      const res = await app.fetch(post(path, { __csrf: CSRF, user_id: id, plan: "standard", act: "suspend" }, cookie), env);
       expect(res.status, path).toBe(404);
     }
     // And no state changed: the user did not suspend themselves.
@@ -164,7 +164,7 @@ describe("GET /admin/users — the accounts table", () => {
 
     const html = await (await app.fetch(get("/admin/users", cookie), env)).text();
     expect(html).toContain("table-user@example.com");
-    expect(html).toContain(">Free<");
+    expect(html).toContain(">Trial<"); // seedUser → the 30-day trial default
     expect(html).toContain(">2</td>"); // vault count
     expect(html).toContain(">2/5</td>"); // checklist progress, hidden excluded
     expect(html).toContain("drip-unsub");
@@ -210,7 +210,7 @@ describe("GET /admin/vaults — the fleet table", () => {
   test("rows carry owner email, latest rollup usage, and the owner's plan cap", async () => {
     const { cookie } = await seedOperator("vt-op@example.com");
     const { id } = await seedUser("vt-owner@example.com");
-    await env.DB.prepare("UPDATE users SET plan = 'parachute' WHERE id = ?").bind(id).run();
+    await env.DB.prepare("UPDATE users SET plan = 'plus' WHERE id = ?").bind(id).run();
     await seedVault("vt-box", id);
     const today = new Date().toISOString().slice(0, 10);
     await env.DB.prepare("INSERT INTO vault_usage (vault_name, day, db_bytes, r2_bytes) VALUES ('vt-box', ?, 2097152, 1048576)")
@@ -221,16 +221,16 @@ describe("GET /admin/vaults — the fleet table", () => {
     expect(html).toContain("vt-box");
     expect(html).toContain("vt-owner@example.com");
     expect(html).toContain("3.0 MB"); // db 2 MiB + r2 1 MiB
-    expect(html).toContain("10 GiB"); // the parachute cap
+    expect(html).toContain("10 GiB"); // the plus-tier cap (2 GiB notes + 8 GiB attach)
   });
 
   test("a vault with no rollup row yet says so instead of inventing a zero", async () => {
     const { cookie } = await seedOperator("vt2-op@example.com");
-    const { id } = await seedUser("vt2-owner@example.com");
+    const { id } = await seedUser("vt2-owner@example.com"); // seedUser → trial
     await seedVault("vt2-box", id);
     const html = await (await app.fetch(get("/admin/vaults", cookie), env)).text();
     expect(html).toContain("no rollup row yet");
-    expect(html).toContain("100 MB"); // the free cap
+    expect(html).toContain("10 GiB"); // the trial cap (mirrors plus: 2 GiB + 8 GiB)
   });
 });
 
@@ -259,18 +259,19 @@ describe("POST /admin/users/plan — the comp lever", () => {
           return true;
         },
       })
-      .reply(200, { resolved_cap_bytes: PLAN_SPECS.parachute.total_bytes }, { headers: { "content-type": "application/json" } });
+      .reply(
+        200,
+        { resolved_cap_bytes: PLAN_SPECS.standard.notes_bytes + PLAN_SPECS.standard.attachment_bytes },
+        { headers: { "content-type": "application/json" } },
+      );
 
-    const res = await app.fetch(post("/admin/users/plan", { __csrf: CSRF, user_id: id, plan: "parachute" }, cookie), env);
+    const res = await app.fetch(post("/admin/users/plan", { __csrf: CSRF, user_id: id, plan: "standard" }, cookie), env);
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/admin/users?notice=plan-updated");
-    expect((await getUserById(env.DB, id))!.plan).toBe("parachute");
-    // The pushed cap is the NEW plan's total — the comp takes effect now — plus
-    // the voice entitlement (cloud#56; parachute = voice off).
-    expect(JSON.parse(body!)).toEqual({
-      cap_bytes: PLAN_SPECS.parachute.total_bytes,
-      transcription: { enabled: false, minutes_limit: 0 },
-    });
+    expect((await getUserById(env.DB, id))!.plan).toBe("standard");
+    // The pushed body is the NEW plan's full two-meter entitlement — the comp
+    // takes effect now (standard carries voice: 60 min).
+    expect(JSON.parse(body!)).toEqual(planEntitlement("standard"));
   });
 
   test("a failed cap push still comps the plan and reports partially", async () => {
@@ -281,16 +282,16 @@ describe("POST /admin/users/plan — the comp lever", () => {
       .get(env.VAULT_ORIGIN!)
       .intercept({ path: "/vault/comp2-box/api/internal/config", method: "PUT" })
       .reply(500, "nope");
-    const res = await app.fetch(post("/admin/users/plan", { __csrf: CSRF, user_id: id, plan: "parachute" }, cookie), env);
+    const res = await app.fetch(post("/admin/users/plan", { __csrf: CSRF, user_id: id, plan: "standard" }, cookie), env);
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/admin/users?notice=plan-partial");
-    expect((await getUserById(env.DB, id))!.plan).toBe("parachute");
+    expect((await getUserById(env.DB, id))!.plan).toBe("standard");
   });
 
   test("IDOR-safe: unknown target or unknown plan changes nothing", async () => {
     const { cookie } = await seedOperator("idor-op@example.com");
     const missing = await app.fetch(
-      post("/admin/users/plan", { __csrf: CSRF, user_id: "no-such-user", plan: "parachute" }, cookie),
+      post("/admin/users/plan", { __csrf: CSRF, user_id: "no-such-user", plan: "standard" }, cookie),
       env,
     );
     expect(missing.status).toBe(302);
@@ -303,24 +304,24 @@ describe("POST /admin/users/plan — the comp lever", () => {
     );
     expect(badPlan.status).toBe(302);
     expect(badPlan.headers.get("location")).toBe("/admin/users?err=invalid");
-    expect((await getUserById(env.DB, id))!.plan).toBe("free");
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial"); // seedUser default, untouched
   });
 
   test("CSRF + same-origin gate the action (no state change without both)", async () => {
     const { cookie } = await seedOperator("csrf-op@example.com");
     const { id } = await seedUser("csrf-user@example.com");
     // Missing CSRF field.
-    const noCsrf = await app.fetch(post("/admin/users/plan", { user_id: id, plan: "parachute" }, cookie), env);
+    const noCsrf = await app.fetch(post("/admin/users/plan", { user_id: id, plan: "standard" }, cookie), env);
     expect(noCsrf.status).toBe(302);
     expect(noCsrf.headers.get("location")).toBe("/admin/users?err=csrf");
     // Foreign origin.
     const foreign = await app.fetch(
-      post("/admin/users/plan", { __csrf: CSRF, user_id: id, plan: "parachute" }, cookie, "https://evil.example"),
+      post("/admin/users/plan", { __csrf: CSRF, user_id: id, plan: "standard" }, cookie, "https://evil.example"),
       env,
     );
     expect(foreign.status).toBe(302);
     expect(foreign.headers.get("location")).toBe("/admin/users?err=csrf");
-    expect((await getUserById(env.DB, id))!.plan).toBe("free");
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial"); // seedUser default, untouched
   });
 });
 

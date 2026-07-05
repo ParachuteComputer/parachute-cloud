@@ -4,9 +4,10 @@
  * expiry through the hourly billing sweep, and the console/admin surfaces.
  *
  * Pins:
- *   - happy path: code (case-insensitively) → plan=parachute + the deferred-
- *     downgrade pair (pending_plan='free', plan_downgrade_at = now + comp_days)
- *     + the cap push through the plan-change seam + the redemption row;
+ *   - happy path: code (case-insensitively) → plan=PROMO_COMP_PLAN ('plus') +
+ *     the deferred-downgrade pair (pending_plan='expired', plan_downgrade_at =
+ *     now + comp_days) + the two-meter cap push through the plan-change seam
+ *     + the redemption row;
  *   - the CAS race: two concurrent redeemers of the LAST slot → exactly one
  *     wins (single conditional UPDATE — the #72 lesson, by construction);
  *   - double-redeem: the promo_redemptions PRIMARY KEY rejects, and the loser
@@ -15,21 +16,23 @@
  *   - distinct friendly refusals: invalid / inactive / exhausted /
  *     already-used / already-paid — each its own allowlisted code;
  *   - EXPIRY: runBillingSweep (the existing hourly sweep, not Stripe-gated)
- *     downgrades a due comp to free + pushes free caps + never deletes; the
- *     redemption row survives expiry (one promo per account, forever);
+ *     downgrades a due comp to the 'expired' floor + pushes the frozen caps +
+ *     never deletes; the redemption row survives expiry (one promo per
+ *     account, forever);
  *   - Stripe tolerance: a comped user whose real checkout later completes has
  *     the pending pair CLEARED by the webhook handler — the comp's expiry can
  *     never claw back a paid subscription;
- *   - the console "Have a code?" affordance (free accounts only), the honest
- *     "until <date>" plan line, the row-derived success notice;
+ *   - the console "Have a code?" affordance (canStartCheckout accounts only —
+ *     trial or expired, no live sub), the honest "until <date>" plan line,
+ *     the row-derived success notice;
  *   - /admin overview: read-only redemption tallies per code.
  */
 import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import type Stripe from "stripe";
 import app from "../src/index.ts";
-import { handlePromoRedeemPost } from "../src/promo.ts";
-import { PLAN_SPECS } from "../src/plans.ts";
+import { handlePromoRedeemPost, PROMO_COMP_PLAN } from "../src/promo.ts";
+import { PLAN_SPECS, planEntitlement } from "../src/plans.ts";
 import { handleCheckoutSessionCompleted, runBillingSweep } from "../src/billing-lifecycle.ts";
 import { getUserById, setUserPlan } from "../src/users.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
@@ -56,8 +59,9 @@ function redeemReq(code: string, sessionId: string, opts: { csrf?: string; origi
   });
 }
 
-/** A free user with a live session (the redemption prerequisites). */
-async function seedFreeUser(email: string): Promise<{ id: string; sessionId: string }> {
+/** A fresh trial user with a live session (the redemption prerequisites —
+ *  every new account starts the 30-day no-card trial, which IS redeem-eligible). */
+async function seedTrialUser(email: string): Promise<{ id: string; sessionId: string }> {
   const { id } = await seedUser(email);
   const sessionId = await seedSession(id);
   return { id, sessionId };
@@ -171,8 +175,8 @@ describe("migration 0016 seeds", () => {
 // --- the happy path -------------------------------------------------------------
 
 describe("redemption — the happy path", () => {
-  test("free user redeems: plan flips, the deferred-downgrade pair stamps +90d, caps push, row + counter record", async () => {
-    const { id, sessionId } = await seedFreeUser("promo-happy@example.com");
+  test("trial user redeems: plan flips to PROMO_COMP_PLAN, the deferred-downgrade pair stamps +90d, caps push, row + counter record", async () => {
+    const { id, sessionId } = await seedTrialUser("promo-happy@example.com");
     await seedVault("promo-happy-box", id);
     const calls: Array<{ url: string; body: unknown }> = [];
 
@@ -180,17 +184,18 @@ describe("redemption — the happy path", () => {
     expect(redirectTarget(res)).toBe("/console?promo_redeemed=1");
 
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("parachute");
-    expect(user.pendingPlan).toBe("free");
+    expect(user.plan).toBe(PROMO_COMP_PLAN);
+    expect(user.pendingPlan).toBe("expired");
     expect(user.planDowngradeAt).toBe(new Date(T0.getTime() + 90 * DAY_MS).toISOString());
     // No Stripe anything was touched (pure comp machinery).
     expect(user.stripeCustomerId).toBeNull();
     expect(user.stripeSubscriptionId).toBeNull();
 
-    // The cap push went through the plan-change seam with the PAID cap.
+    // The cap push went through the plan-change seam with the comp plan's
+    // full two-meter entitlement (caps + voice — PROMO_COMP_PLAN is Plus).
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toContain("promo-happy-box");
-    expect(calls[0]!.body).toMatchObject({ cap_bytes: PLAN_SPECS.parachute.total_bytes });
+    expect(calls[0]!.body).toEqual(planEntitlement(PROMO_COMP_PLAN));
 
     expect(await promoCount("INDEPENDENCE")).toBe(1);
     const row = await redemptionRow(id);
@@ -198,7 +203,7 @@ describe("redemption — the happy path", () => {
   });
 
   test("codes normalize case-insensitively (lowercase + whitespace input)", async () => {
-    const { id, sessionId } = await seedFreeUser("promo-case@example.com");
+    const { id, sessionId } = await seedTrialUser("promo-case@example.com");
     const res = await handlePromoRedeemPost(env.DB, redeemReq("  interdependence ", sessionId), promoDeps(T0));
     expect(redirectTarget(res)).toBe("/console?promo_redeemed=1");
     expect((await redemptionRow(id))!.code).toBe("INTERDEPENDENCE");
@@ -206,27 +211,27 @@ describe("redemption — the happy path", () => {
   });
 
   test("route-level wiring: POST /console/promo through the real router", async () => {
-    const { id, sessionId } = await seedFreeUser("promo-route@example.com");
+    const { id, sessionId } = await seedTrialUser("promo-route@example.com");
     const res = await app.fetch(redeemReq("INDEPENDENCE", sessionId), env);
     expect(redirectTarget(res)).toBe("/console?promo_redeemed=1");
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("parachute");
-    expect(user.pendingPlan).toBe("free");
+    expect(user.plan).toBe(PROMO_COMP_PLAN);
+    expect(user.pendingPlan).toBe("expired");
     // Real clock on the route: the stamp is ~now + 90 days.
     const expected = Date.now() + 90 * DAY_MS;
     expect(Math.abs(new Date(user.planDowngradeAt!).getTime() - expected)).toBeLessThan(60_000);
   });
 
-  test("CHURNED subscriber (free plan + stale subscription id from a cancelled sub) redeems fine", async () => {
-    // The #73-review regression: a past subscriber who cancelled and was swept
-    // back to free keeps their stale stripe_subscription_id forever (nothing
-    // clears it — billing-lifecycle.ts runBillingSweep touches only the plan
-    // pair). The old grant CAS's `AND stripe_subscription_id IS NULL` clause
-    // permanently locked those users out of any promo; `plan = 'free'` alone
-    // is the guard (a LIVE subscription always rides a paid plan).
-    const { id, sessionId } = await seedFreeUser("promo-churned@example.com");
+  test("CHURNED subscriber (expired + a stale, long-cancelled subscription id) CAN redeem (#73 stays fixed)", async () => {
+    // The #73 lesson: the sweep flips a lapsed subscriber to the expired floor
+    // but NEVER clears their stale stripe_subscription_id. The redeem gate is
+    // `canStartCheckout(plan)` — PLAN-ONLY — precisely so a dead id does NOT
+    // lock them out of redeeming (the over-strict `stripe_subscription_id IS
+    // NULL` clause was exactly what #73 removed). So this churned account
+    // redeems directly, stale ids untouched.
+    const { id, sessionId } = await seedTrialUser("promo-churned@example.com");
     await env.DB.prepare(
-      "UPDATE users SET stripe_customer_id = 'cus_churned', stripe_subscription_id = 'sub_cancelled_long_ago' WHERE id = ?",
+      "UPDATE users SET plan = 'expired', stripe_customer_id = 'cus_churned', stripe_subscription_id = 'sub_cancelled_long_ago' WHERE id = ?",
     )
       .bind(id)
       .run();
@@ -235,10 +240,10 @@ describe("redemption — the happy path", () => {
     expect(redirectTarget(res)).toBe("/console?promo_redeemed=1");
 
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("parachute");
-    expect(user.pendingPlan).toBe("free");
+    expect(user.plan).toBe(PROMO_COMP_PLAN);
+    expect(user.pendingPlan).toBe("expired");
     expect(user.planDowngradeAt).toBe(new Date(T0.getTime() + 90 * DAY_MS).toISOString());
-    // The stale Stripe linkage is untouched — the comp never edits billing ids.
+    // The stale billing ids are untouched — the comp never edits them.
     expect(user.stripeCustomerId).toBe("cus_churned");
     expect(user.stripeSubscriptionId).toBe("sub_cancelled_long_ago");
     expect(await promoCount("INDEPENDENCE")).toBe(1);
@@ -256,7 +261,7 @@ describe("redemption — the console write boundary", () => {
   });
 
   test("bad CSRF → promo_err=session; counter untouched", async () => {
-    const { sessionId } = await seedFreeUser("promo-csrf@example.com");
+    const { sessionId } = await seedTrialUser("promo-csrf@example.com");
     const res = await handlePromoRedeemPost(
       env.DB,
       redeemReq("INDEPENDENCE", sessionId, { csrf: "wrong" }),
@@ -267,7 +272,7 @@ describe("redemption — the console write boundary", () => {
   });
 
   test("cross-origin → promo_err=session", async () => {
-    const { sessionId } = await seedFreeUser("promo-origin@example.com");
+    const { sessionId } = await seedTrialUser("promo-origin@example.com");
     const res = await handlePromoRedeemPost(
       env.DB,
       redeemReq("INDEPENDENCE", sessionId, { origin: "https://evil.example" }),
@@ -281,23 +286,23 @@ describe("redemption — the console write boundary", () => {
 // --- the distinct refusals --------------------------------------------------------
 
 describe("redemption — friendly refusals, each distinct", () => {
-  test("unknown code → invalid; user stays free", async () => {
-    const { id, sessionId } = await seedFreeUser("promo-nope@example.com");
+  test("unknown code → invalid; user stays on trial", async () => {
+    const { id, sessionId } = await seedTrialUser("promo-nope@example.com");
     const res = await handlePromoRedeemPost(env.DB, redeemReq("FREEDOM2026", sessionId), promoDeps(T0));
     expect(redirectTarget(res)).toBe("/console?promo_err=invalid");
-    expect((await getUserById(env.DB, id))!.plan).toBe("free");
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial");
     expect(await redemptionRow(id)).toBeNull();
   });
 
   test("empty code → invalid", async () => {
-    const { sessionId } = await seedFreeUser("promo-empty@example.com");
+    const { sessionId } = await seedTrialUser("promo-empty@example.com");
     const res = await handlePromoRedeemPost(env.DB, redeemReq("   ", sessionId), promoDeps(T0));
     expect(redirectTarget(res)).toBe("/console?promo_err=invalid");
   });
 
   test("deactivated code (the kill switch) → invalid; counter untouched", async () => {
     await env.DB.prepare("UPDATE promo_codes SET active = 0 WHERE code = 'INDEPENDENCE'").run();
-    const { sessionId } = await seedFreeUser("promo-inactive@example.com");
+    const { sessionId } = await seedTrialUser("promo-inactive@example.com");
     const res = await handlePromoRedeemPost(env.DB, redeemReq("INDEPENDENCE", sessionId), promoDeps(T0));
     expect(redirectTarget(res)).toBe("/console?promo_err=invalid");
     expect(await promoCount("INDEPENDENCE")).toBe(0);
@@ -305,16 +310,16 @@ describe("redemption — friendly refusals, each distinct", () => {
 
   test("fully-redeemed code → exhausted; counter never exceeds max", async () => {
     await env.DB.prepare("UPDATE promo_codes SET redeemed_count = max_redemptions WHERE code = 'INDEPENDENCE'").run();
-    const { id, sessionId } = await seedFreeUser("promo-full@example.com");
+    const { id, sessionId } = await seedTrialUser("promo-full@example.com");
     const res = await handlePromoRedeemPost(env.DB, redeemReq("INDEPENDENCE", sessionId), promoDeps(T0));
     expect(redirectTarget(res)).toBe("/console?promo_err=exhausted");
     expect(await promoCount("INDEPENDENCE")).toBe(100);
-    expect((await getUserById(env.DB, id))!.plan).toBe("free");
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial");
   });
 
   test("already on a paid plan → already-paid, BEFORE any slot is claimed", async () => {
-    const { id, sessionId } = await seedFreeUser("promo-paid@example.com");
-    await setUserPlan(env.DB, id, "voice");
+    const { id, sessionId } = await seedTrialUser("promo-paid@example.com");
+    await setUserPlan(env.DB, id, "plus");
     const res = await handlePromoRedeemPost(env.DB, redeemReq("INDEPENDENCE", sessionId), promoDeps(T0));
     expect(redirectTarget(res)).toBe("/console?promo_err=already-paid");
     expect(await promoCount("INDEPENDENCE")).toBe(0);
@@ -322,13 +327,14 @@ describe("redemption — friendly refusals, each distinct", () => {
   });
 
   test("second code after a successful redemption → already-used (one promo per account TOTAL); counter untouched", async () => {
-    const { id, sessionId } = await seedFreeUser("promo-second@example.com");
+    const { id, sessionId } = await seedTrialUser("promo-second@example.com");
     expect(redirectTarget(await handlePromoRedeemPost(env.DB, redeemReq("INDEPENDENCE", sessionId), promoDeps(T0)))).toBe(
       "/console?promo_redeemed=1",
     );
-    // The comp makes them paid — force the plan back to free to isolate the
-    // ledger gate from the already-paid gate.
-    await setUserPlan(env.DB, id, "free");
+    // The comp makes them paid — force the plan back to the expired floor to
+    // isolate the ledger gate from the already-paid gate (both trial and
+    // expired pass canStartCheckout).
+    await setUserPlan(env.DB, id, "expired");
     const res = await handlePromoRedeemPost(env.DB, redeemReq("INTERDEPENDENCE", sessionId), promoDeps(T0));
     expect(redirectTarget(res)).toBe("/console?promo_err=already-used");
     expect(await promoCount("INTERDEPENDENCE")).toBe(0);
@@ -343,8 +349,8 @@ describe("redemption — the CAS races (the #72 lesson)", () => {
     await env.DB.prepare(
       "UPDATE promo_codes SET redeemed_count = max_redemptions - 1 WHERE code = 'INDEPENDENCE'",
     ).run();
-    const a = await seedFreeUser("promo-race-a@example.com");
-    const b = await seedFreeUser("promo-race-b@example.com");
+    const a = await seedTrialUser("promo-race-a@example.com");
+    const b = await seedTrialUser("promo-race-b@example.com");
 
     // Hold both invocations after their pre-check read (both see "no prior
     // redemption", both see a slot free) — then both race the conditional
@@ -361,13 +367,13 @@ describe("redemption — the CAS races (the #72 lesson)", () => {
 
     const userA = (await getUserById(env.DB, a.id))!;
     const userB = (await getUserById(env.DB, b.id))!;
-    expect([userA.plan, userB.plan].sort()).toEqual(["free", "parachute"]);
+    expect([userA.plan, userB.plan].sort()).toEqual([PROMO_COMP_PLAN, "trial"].sort());
     const rows = await env.DB.prepare("SELECT user_id FROM promo_redemptions").all();
     expect(rows.results).toHaveLength(1);
   });
 
   test("SAME USER, two concurrent submits: the UNIQUE ledger rejects the loser, who RESTORES the claimed slot", async () => {
-    const { id, sessionId } = await seedFreeUser("promo-double@example.com");
+    const { id, sessionId } = await seedTrialUser("promo-double@example.com");
     const barrier = makeBarrier(2);
     const [ra, rb] = await Promise.all([
       handlePromoRedeemPost(preCheckBarrierDb(env.DB, barrier), redeemReq("INDEPENDENCE", sessionId), promoDeps(T0)),
@@ -379,7 +385,7 @@ describe("redemption — the CAS races (the #72 lesson)", () => {
     // counter records exactly ONE burned slot.
     expect(targets).toEqual(["/console?promo_err=already-used", "/console?promo_redeemed=1"]);
     expect(await promoCount("INDEPENDENCE")).toBe(1);
-    expect((await getUserById(env.DB, id))!.plan).toBe("parachute");
+    expect((await getUserById(env.DB, id))!.plan).toBe(PROMO_COMP_PLAN);
     const rows = await env.DB.prepare("SELECT user_id FROM promo_redemptions").all();
     expect(rows.results).toHaveLength(1);
   });
@@ -387,10 +393,11 @@ describe("redemption — the CAS races (the #72 lesson)", () => {
   test("GRANT lost to a concurrent real payment: the comp unwinds completely (no downgrade for a paying customer)", async () => {
     // Simulate the checkout webhook landing between the pre-check and the
     // grant: the user's row turns paid-with-subscription mid-flight. The
-    // grant CAS (`WHERE plan = 'free'` — the webhook's write flips the plan
-    // paid in the same statement that records the subscription id) misses →
-    // redemption row deleted, slot released, friendly already-paid.
-    const { id, sessionId } = await seedFreeUser("promo-grantrace@example.com");
+    // grant CAS (`WHERE plan IN ('trial','expired')` — the webhook's write
+    // flips the plan to a paid TIER in the same statement that records the
+    // subscription id) misses → redemption row deleted, slot released,
+    // friendly already-paid.
+    const { id, sessionId } = await seedTrialUser("promo-grantrace@example.com");
     const flipping: D1Database = {
       prepare(sql: string) {
         if (sql === "SELECT code FROM promo_redemptions WHERE user_id = ?") {
@@ -401,9 +408,12 @@ describe("redemption — the CAS races (the #72 lesson)", () => {
               return {
                 first: async (...a: unknown[]) => {
                   const row = await (bound.first as (...x: unknown[]) => Promise<unknown>)(...a);
-                  // The "webhook" wins the race right after our snapshot.
+                  // The "webhook" wins the race right after our snapshot — the
+                  // real handler's CAS write also clears the trial pair
+                  // (billing-lifecycle.ts handleCheckoutSessionCompleted), so
+                  // this simulation mirrors that rather than leaking it.
                   await env.DB.prepare(
-                    "UPDATE users SET plan = 'parachute', stripe_subscription_id = 'sub_race' WHERE id = ?",
+                    "UPDATE users SET plan = 'standard', stripe_subscription_id = 'sub_race', pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?",
                   )
                     .bind(id)
                     .run();
@@ -437,29 +447,29 @@ describe("redemption — the CAS races (the #72 lesson)", () => {
 // --- expiry: the existing sweep degrades the comp gracefully -------------------------
 
 describe("comp expiry — the hourly billing sweep (not Stripe-gated)", () => {
-  test("before the stamp: nothing happens; after: plan → free, pair cleared, free caps pushed, data untouched", async () => {
-    const { id, sessionId } = await seedFreeUser("promo-expiry@example.com");
+  test("before the stamp: nothing happens; after: plan → expired, pair cleared, frozen caps pushed, data untouched", async () => {
+    const { id, sessionId } = await seedTrialUser("promo-expiry@example.com");
     await seedVault("promo-expiry-box", id);
     const grantCalls: Array<{ url: string; body: unknown }> = [];
     await handlePromoRedeemPost(env.DB, redeemReq("INDEPENDENCE", sessionId), promoDeps(T0, grantCalls));
-    expect((await getUserById(env.DB, id))!.plan).toBe("parachute");
+    expect((await getUserById(env.DB, id))!.plan).toBe(PROMO_COMP_PLAN);
 
     // Day 89: not due.
     const early = await runBillingSweep(env.DB, promoDeps(T0), new Date(T0.getTime() + 89 * DAY_MS));
     expect(early).toEqual({ due: 0, applied: 0 });
-    expect((await getUserById(env.DB, id))!.plan).toBe("parachute");
+    expect((await getUserById(env.DB, id))!.plan).toBe(PROMO_COMP_PLAN);
 
     // Day 91: due — the downgrade applies through the same seam as a real
-    // subscription end. Caps drop to free; nothing is deleted.
+    // subscription end. Caps drop to the expired (frozen) floor; nothing is deleted.
     const sweepCalls: Array<{ url: string; body: unknown }> = [];
     const late = await runBillingSweep(env.DB, promoDeps(T0, sweepCalls), new Date(T0.getTime() + 91 * DAY_MS));
     expect(late).toEqual({ due: 1, applied: 1 });
     const user = (await getUserById(env.DB, id))!;
-    expect(user.plan).toBe("free");
+    expect(user.plan).toBe("expired");
     expect(user.pendingPlan).toBeNull();
     expect(user.planDowngradeAt).toBeNull();
     expect(sweepCalls).toHaveLength(1);
-    expect(sweepCalls[0]!.body).toMatchObject({ cap_bytes: PLAN_SPECS.free.total_bytes });
+    expect(sweepCalls[0]!.body).toEqual(planEntitlement("expired"));
 
     // The ledger survives expiry: one promo per account is FOREVER.
     expect((await redemptionRow(id))!.code).toBe("INDEPENDENCE");
@@ -472,14 +482,15 @@ describe("comp expiry — the hourly billing sweep (not Stripe-gated)", () => {
 
 describe("comp × real billing — the machinery interacts sanely", () => {
   test("checkout.session.completed on a comped row CLEARS the pending pair — the sweep never claws back a paid plan", async () => {
-    const { id, sessionId } = await seedFreeUser("promo-then-pay@example.com");
+    const { id, sessionId } = await seedTrialUser("promo-then-pay@example.com");
     await handlePromoRedeemPost(env.DB, redeemReq("INDEPENDENCE", sessionId), promoDeps(T0));
     const comped = (await getUserById(env.DB, id))!;
-    expect(comped.pendingPlan).toBe("free");
+    expect(comped.pendingPlan).toBe("expired");
 
     // The user subscribes for real during the comp (the webhook is the same
     // one Stripe will send; no stale subscription exists, so the stripe stub
-    // is never called).
+    // is never called). They buy `standard` — a DIFFERENT tier than the
+    // comp's Plus, showing a real purchase is independent of the comp tier.
     const event = {
       id: "evt_promo_pay_1",
       type: "checkout.session.completed",
@@ -491,7 +502,7 @@ describe("comp × real billing — the machinery interacts sanely", () => {
           customer: "cus_promo_1",
           subscription: "sub_promo_1",
           mode: "subscription",
-          metadata: { plan: "parachute" },
+          metadata: { plan: "standard" },
         },
       },
     } as unknown as Stripe.Event;
@@ -499,7 +510,7 @@ describe("comp × real billing — the machinery interacts sanely", () => {
     expect((result as { action: string }).action).toBe("checkout_completed_upgraded");
 
     const paid = (await getUserById(env.DB, id))!;
-    expect(paid.plan).toBe("parachute");
+    expect(paid.plan).toBe("standard");
     expect(paid.stripeSubscriptionId).toBe("sub_promo_1");
     expect(paid.pendingPlan).toBeNull();
     expect(paid.planDowngradeAt).toBeNull();
@@ -507,15 +518,15 @@ describe("comp × real billing — the machinery interacts sanely", () => {
     // The comp's old expiry date passes — nothing is due, nothing downgrades.
     const sweep = await runBillingSweep(env.DB, promoDeps(T0), new Date(T0.getTime() + 91 * DAY_MS));
     expect(sweep).toEqual({ due: 0, applied: 0 });
-    expect((await getUserById(env.DB, id))!.plan).toBe("parachute");
+    expect((await getUserById(env.DB, id))!.plan).toBe("standard");
   });
 });
 
 // --- the console surfaces --------------------------------------------------------------
 
 describe("console — the Have-a-code affordance + honest plan state", () => {
-  test("a free account sees the disclosure wired to POST /console/promo", async () => {
-    const { sessionId } = await seedFreeUser("promo-ui-free@example.com");
+  test("a trial account sees the disclosure wired to POST /console/promo", async () => {
+    const { sessionId } = await seedTrialUser("promo-ui-trial@example.com");
     const html = await consoleHtml(sessionId);
     expect(html).toContain('data-testid="promo-code"');
     expect(html).toContain("Have a code?");
@@ -523,35 +534,35 @@ describe("console — the Have-a-code affordance + honest plan state", () => {
   });
 
   test("a paid account does not see it", async () => {
-    const { id, sessionId } = await seedFreeUser("promo-ui-paid@example.com");
-    await setUserPlan(env.DB, id, "parachute");
+    const { id, sessionId } = await seedTrialUser("promo-ui-paid@example.com");
+    await setUserPlan(env.DB, id, "standard");
     const html = await consoleHtml(sessionId);
     expect(html).not.toContain('data-testid="promo-code"');
   });
 
   test("a comped account's plan line shows the honest until-date; the success notice renders from the ROW", async () => {
-    const { id, sessionId } = await seedFreeUser("promo-ui-comped@example.com");
+    const { id, sessionId } = await seedTrialUser("promo-ui-comped@example.com");
     await handlePromoRedeemPost(env.DB, redeemReq("INDEPENDENCE", sessionId), promoDeps(T0));
     const untilDay = new Date(T0.getTime() + 90 * DAY_MS).toISOString().slice(0, 10);
 
     const html = await consoleHtml(sessionId, "?promo_redeemed=1");
     expect(html).toContain('data-testid="plan-until"');
     expect(html).toContain(`until ${untilDay}`);
-    expect(html).toContain(`Parachute plan until ${untilDay}`);
+    expect(html).toContain(`${PLAN_SPECS[PROMO_COMP_PLAN].label} plan until ${untilDay}`);
     expect(html).toContain("Welcome aboard.");
     // Paid now → the redeem affordance is gone.
     expect(html).not.toContain('data-testid="promo-code"');
     void id;
   });
 
-  test("a crafted ?promo_redeemed=1 on a plain free account paints NO success banner", async () => {
-    const { sessionId } = await seedFreeUser("promo-ui-crafted@example.com");
+  test("a crafted ?promo_redeemed=1 on a plain trial account paints NO success banner", async () => {
+    const { sessionId } = await seedTrialUser("promo-ui-crafted@example.com");
     const html = await consoleHtml(sessionId, "?promo_redeemed=1");
     expect(html).not.toContain("Code redeemed");
   });
 
   test("each refusal code renders its own copy; unknown codes render nothing", async () => {
-    const { sessionId } = await seedFreeUser("promo-ui-errs@example.com");
+    const { sessionId } = await seedTrialUser("promo-ui-errs@example.com");
     expect(await consoleHtml(sessionId, "?promo_err=invalid")).toContain("isn&#39;t one we recognize");
     expect(await consoleHtml(sessionId, "?promo_err=exhausted")).toContain("fully redeemed");
     expect(await consoleHtml(sessionId, "?promo_err=already-used")).toContain("one per account");
@@ -565,8 +576,8 @@ describe("console — the Have-a-code affordance + honest plan state", () => {
 
 describe("/admin — read-only promo tallies", () => {
   test("the overview shows each code's redeemed/max", async () => {
-    const { sessionId: freeSession } = await seedFreeUser("promo-admin-user@example.com");
-    await handlePromoRedeemPost(env.DB, redeemReq("INDEPENDENCE", freeSession), promoDeps(T0));
+    const { sessionId: trialSession } = await seedTrialUser("promo-admin-user@example.com");
+    await handlePromoRedeemPost(env.DB, redeemReq("INDEPENDENCE", trialSession), promoDeps(T0));
 
     const { id: opId } = await seedUser("promo-admin-op@example.com");
     await env.DB.prepare("UPDATE users SET role = 'operator' WHERE id = ?").bind(opId).run();

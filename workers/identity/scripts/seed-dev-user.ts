@@ -74,16 +74,18 @@ const esc = (s: string) => s.replace(/'/g, "''");
 // before this seed on the deployed D1).
 // email_verified = 1: the dev address is known/owned, and INSERT OR REPLACE would
 // otherwise reset it to the column default (0) on every re-seed.
-// plan = 'parachute': the dev/operator account is a comp (Wave 4, matching the
-// scripts/backfill-plans.ts comp list) — INSERT OR REPLACE would otherwise
-// reset it to 'free' on every re-seed.
-// role = 'operator': the dev account IS the operator login (Wave 4c /admin —
+// plan = 'standard': the dev/operator account is a comp (matching the
+// scripts/backfill-plans.ts comp list — the parachute→standard rename). The
+// seed runs AFTER migration 0018, so it must write a NEW plan id ('parachute'
+// would coerce to the 'expired' floor). INSERT OR REPLACE would otherwise reset
+// it to the column default on every re-seed.
+// role = 'operator': the dev account IS the operator login (/admin —
 // smoke-staging.ts asserts it sees the console) — INSERT OR REPLACE would
 // otherwise reset it to 'user' on every re-seed. suspended_at stays unnamed
 // (→ NULL default): a re-seed never leaves the operator suspended.
 const sql = `-- DEV-ONLY generated seed — do not commit. Regenerate with \`bun run seed:dev\`.
 INSERT OR REPLACE INTO users (id, email, password_hash, created_at, email_verified, plan, role)
-VALUES ('${esc(DEV_USER_ID)}', '${esc(email)}', '${esc(passwordHash)}', '${esc(createdAt)}', 1, 'parachute', 'operator');
+VALUES ('${esc(DEV_USER_ID)}', '${esc(email)}', '${esc(passwordHash)}', '${esc(createdAt)}', 1, 'standard', 'operator');
 INSERT OR REPLACE INTO vaults (name, owner_user_id, created_at)
 VALUES ('demo', '${esc(DEV_USER_ID)}', '${esc(createdAt)}');
 `;

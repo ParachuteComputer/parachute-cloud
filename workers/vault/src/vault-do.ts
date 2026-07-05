@@ -32,7 +32,14 @@ import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
 import { handleTags, handleFindPath } from "./rest/tags.js";
 import { handleVault, type VaultConfigLike } from "./rest/vault.js";
-import { R2_METER_KEY, capExceededResponse, resolveCap, usedBytes } from "./caps.js";
+import {
+  R2_METER_KEY,
+  attachmentsNotIncludedResponse,
+  capExceededResponse,
+  planRequiredResponse,
+  resolveCap,
+  usedBytes,
+} from "./caps.js";
 import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./rest/storage-constants.js";
 import { handleMcp } from "./mcp.js";
 import { mcpWwwAuthenticate } from "./discovery.js";
@@ -128,6 +135,16 @@ type TranscriptionEntitlement = {
   minutes_limit: number;
 };
 
+/** The two-meter storage caps the Identity Worker pushes per plan (the pricing
+ *  model, 2026-07-05) — the SQLite graph budget + the R2 attachment budget as
+ *  SEPARATE meters. Absent → the legacy single `cap_bytes` (or env) applies. */
+type PlanCaps = {
+  /** SQLite-graph (notes/tags/links/schemas) budget in bytes. */
+  notes_bytes: number;
+  /** R2 attachment budget in bytes. 0 = notes-only (uploads 403). */
+  attachment_bytes: number;
+};
+
 /** Persisted per-vault config (DO storage key "config"). */
 type VaultConfigState = {
   name: string;
@@ -135,7 +152,14 @@ type VaultConfigState = {
   createdAt: string;
   audio_retention: "keep" | "until_transcribed" | "never";
   auto_transcribe: { enabled: boolean };
+  /** Legacy single summed cap (pre-two-meter). Kept for back-compat: applies
+   *  only when `caps` is absent. */
   cap_bytes?: number;
+  /** Two-meter storage caps (plan-pushed). Present → the DO enforces two-meter. */
+  caps?: PlanCaps;
+  /** The expired floor (plan-pushed): true → writes return 402 plan_required;
+   *  reads + export + DELETE untouched. */
+  frozen?: boolean;
   /** Voice entitlement (plan-pushed via PUT /api/internal/config). */
   transcription?: TranscriptionEntitlement;
 };
@@ -332,11 +356,19 @@ export class VaultDO extends DurableObject {
       if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
       const auth = await authenticateVaultRequest(request, this.env, vaultName);
       if ("error" in auth) return auth.error;
+      const caps = this.capsCapability();
       return json({
         name: this.config!.name,
         description: this.config!.description,
         createdAt: this.config!.createdAt,
+        // Legacy back-compat: the SUMMED effective cap (notes + attachment).
         cap_bytes: this.capBytes(),
+        // Two-meter split (ADDITIVE, 2026-07-05) — Notes gates the attachment
+        // button on `attachments_enabled`. Present only for two-meter vaults; a
+        // legacy/un-pushed vault omits it (landing shape unchanged).
+        ...(caps ? { caps } : {}),
+        // The expired floor: writes are frozen (reads/export stay). Additive.
+        ...(this.isFrozen() ? { frozen: true } : {}),
         // Voice-transcription capability (cloud#56) — Notes gates the mic on
         // `enabled`. Populated from the owner's plan (pushed into config via
         // the internal seam): free → { enabled: false }; the $5 Voice tier →
@@ -581,8 +613,35 @@ export class VaultDO extends DurableObject {
     });
   }
 
+  /** The effective SUMMED cap (notes + attachment in two-meter mode; else the
+   *  legacy single cap / env). Back-compat surface for the landing's `cap_bytes`
+   *  and the internal-config `resolved_cap_bytes`. */
   private capBytes(): number {
+    const caps = this.config?.caps;
+    if (caps) return caps.notes_bytes + caps.attachment_bytes;
     return resolveCap(this.config?.cap_bytes, this.env.CAP_BYTES);
+  }
+
+  /** The two-meter caps if this vault is in two-meter mode, else null (legacy). */
+  private planCaps(): PlanCaps | null {
+    return this.config?.caps ?? null;
+  }
+
+  /** Whether writes are frozen (the expired floor). */
+  private isFrozen(): boolean {
+    return this.config?.frozen === true;
+  }
+
+  /** The additive `caps` object on the landing (two-meter vaults only; a legacy
+   *  / un-pushed vault omits it, keeping its landing shape unchanged). */
+  private capsCapability(): { notes_bytes: number; attachment_bytes: number; attachments_enabled: boolean } | null {
+    const caps = this.planCaps();
+    if (!caps) return null;
+    return {
+      notes_bytes: caps.notes_bytes,
+      attachment_bytes: caps.attachment_bytes,
+      attachments_enabled: caps.attachment_bytes > 0,
+    };
   }
 
   /**
@@ -617,20 +676,30 @@ export class VaultDO extends DurableObject {
   }
 
   /**
-   * PUT/GET /api/internal/config — PLATFORM-owned per-vault config (today:
-   * `cap_bytes`, the plan storage cap the Identity Worker pushes on vault
-   * creation / plan change / backfill). Authorization: {@link internalForbidden}
-   * (already enforced by the /api/internal/* dispatcher).
+   * PUT/GET /api/internal/config — PLATFORM-owned per-vault config: the plan
+   * entitlement the Identity Worker pushes on vault creation / plan change /
+   * backfill. Fields (all OPTIONAL + independently applied):
+   *   - `caps: { notes_bytes, attachment_bytes }` — the TWO-METER budgets;
+   *   - `cap_bytes` — the LEGACY single summed cap (back-compat; ignored once
+   *     `caps` is set — the DO prefers two-meter);
+   *   - `frozen: boolean` — the expired floor (writes → 402);
+   *   - `transcription: { enabled, minutes_limit }` — the voice entitlement.
+   * Authorization: {@link internalForbidden} (already enforced by the dispatcher).
    */
   private async handleInternalConfig(request: Request): Promise<Response> {
     const shape = () => {
       const dbBytes = Number(this.raw().databaseSize);
       const ent = this.config!.transcription;
+      const caps = this.config!.caps;
       return {
         name: this.config!.name,
-        /** The per-DO override (null = none; the env default applies). */
+        /** The per-DO legacy override (null = none). */
         cap_bytes: this.config!.cap_bytes ?? null,
-        /** The effective cap after resolution (override → env default → 1 GiB). */
+        /** The two-meter budgets (null when the vault is legacy/un-pushed). */
+        caps: caps ?? null,
+        /** The expired floor — writes return 402 plan_required. */
+        frozen: this.isFrozen(),
+        /** The effective SUMMED cap (two-meter sum → legacy → env → 1 GiB). */
         resolved_cap_bytes: this.capBytes(),
         used_bytes: usedBytes(dbBytes, this.r2Bytes),
         /**
@@ -655,20 +724,33 @@ export class VaultDO extends DurableObject {
     if (request.method === "GET") return json(shape());
     if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
 
-    let body: { cap_bytes?: unknown; transcription?: unknown };
+    let body: { cap_bytes?: unknown; caps?: unknown; frozen?: unknown; transcription?: unknown };
     try {
-      body = (await request.json()) as { cap_bytes?: unknown; transcription?: unknown };
+      body = (await request.json()) as {
+        cap_bytes?: unknown;
+        caps?: unknown;
+        frozen?: unknown;
+        transcription?: unknown;
+      };
     } catch {
       return json({ error: "Invalid JSON body" }, 400);
     }
 
-    // Both fields are OPTIONAL and independently applied — a plan change pushes
-    // both; the vault-creation cap push sends only cap_bytes. At least one must
-    // be present so an empty PUT is an obvious client error.
+    // Every field is OPTIONAL and independently applied — a plan change pushes
+    // caps + transcription + frozen; older callers may send only cap_bytes. At
+    // least one must be present so an empty PUT is an obvious client error.
     const hasCap = body.cap_bytes !== undefined;
+    const hasCaps = body.caps !== undefined;
+    const hasFrozen = body.frozen !== undefined;
     const hasTranscription = body.transcription !== undefined;
-    if (!hasCap && !hasTranscription) {
-      return json({ error: "provide cap_bytes and/or transcription" }, 400);
+    if (!hasCap && !hasCaps && !hasFrozen && !hasTranscription) {
+      return json({ error: "provide caps, cap_bytes, frozen, and/or transcription" }, 400);
+    }
+
+    if (hasCaps) {
+      const parsed = this.parsePlanCaps(body.caps);
+      if ("error" in parsed) return json({ error: parsed.error }, 400);
+      this.config!.caps = parsed.value;
     }
 
     if (hasCap) {
@@ -679,6 +761,11 @@ export class VaultDO extends DurableObject {
       this.config!.cap_bytes = cap;
     }
 
+    if (hasFrozen) {
+      if (typeof body.frozen !== "boolean") return json({ error: "frozen must be a boolean" }, 400);
+      this.config!.frozen = body.frozen;
+    }
+
     if (hasTranscription) {
       const ent = this.parseTranscriptionEntitlement(body.transcription);
       if ("error" in ent) return json({ error: ent.error }, 400);
@@ -687,6 +774,25 @@ export class VaultDO extends DurableObject {
 
     await this.ctx.storage.put("config", this.config);
     return json(shape());
+  }
+
+  /** Validate the pushed two-meter `{ notes_bytes, attachment_bytes }`. Notes
+   *  must be a positive integer; attachment a NON-negative integer (0 = the
+   *  notes-only tier). */
+  private parsePlanCaps(raw: unknown): { value: PlanCaps } | { error: string } {
+    if (typeof raw !== "object" || raw === null) {
+      return { error: "caps must be an object { notes_bytes, attachment_bytes }" };
+    }
+    const r = raw as { notes_bytes?: unknown; attachment_bytes?: unknown };
+    const notes = r.notes_bytes;
+    const attach = r.attachment_bytes;
+    if (typeof notes !== "number" || !Number.isSafeInteger(notes) || notes <= 0) {
+      return { error: "caps.notes_bytes must be a positive integer" };
+    }
+    if (typeof attach !== "number" || !Number.isSafeInteger(attach) || attach < 0) {
+      return { error: "caps.attachment_bytes must be a non-negative integer" };
+    }
+    return { value: { notes_bytes: notes, attachment_bytes: attach } };
   }
 
   /** Validate the pushed `{ enabled, minutes_limit }` entitlement. */
@@ -856,9 +962,25 @@ export class VaultDO extends DurableObject {
     });
   }
 
-  /** 413 when the tenant is already at/over its cap (blocks growth writes). */
+  /**
+   * The write gate for byte-growing NON-storage writes (notes/tags/packs).
+   * Order (each fires BEFORE the next):
+   *   1. FROZEN (the expired floor) → 402 plan_required (before any cap math).
+   *   2. TWO-METER: the SQLite graph against `notes_bytes` → 413 meter=notes.
+   *   3. LEGACY: db + r2 against the single summed cap → 413 (no meter field).
+   * DELETE never reaches here (the dispatcher exempts it).
+   */
   private capBlockIfFull(): Response | null {
-    const used = usedBytes(Number(this.raw().databaseSize), this.r2Bytes);
+    if (this.isFrozen()) return planRequiredResponse();
+    const dbBytes = Number(this.raw().databaseSize);
+    const caps = this.planCaps();
+    if (caps) {
+      // Two-meter: notes writes are gated by the SQLite-graph budget alone.
+      if (dbBytes >= caps.notes_bytes) return capExceededResponse(dbBytes, caps.notes_bytes, 0, "notes");
+      return null;
+    }
+    // Legacy single summed cap (un-pushed / not-yet-migrated vault) — unchanged.
+    const used = usedBytes(dbBytes, this.r2Bytes);
     const cap = this.capBytes();
     if (used >= cap) return capExceededResponse(used, cap, 0);
     return null;
@@ -1695,10 +1817,25 @@ export class VaultDO extends DurableObject {
       if (BLOCKED_EXTENSIONS.has(ext)) {
         return json({ error: `File type ${ext} not allowed (active/executable content)` }, 400);
       }
-      // Precise cap check (SQLite size + R2 meter + this file).
-      const used = usedBytes(Number(this.raw().databaseSize), this.r2Bytes);
-      const cap = this.capBytes();
-      if (used + file.size > cap) return capExceededResponse(used, cap, file.size);
+      // The attachment write gate. Order (each fires BEFORE the next):
+      //   1. FROZEN (the expired floor) → 402 plan_required.
+      //   2. TWO-METER: `attachment_bytes === 0` → 403 attachments_not_included
+      //      (the notes-only tier — an ENTITLEMENT refusal, BEFORE cap math);
+      //      else r2 + this file against `attachment_bytes` → 413 meter=attachments.
+      //   3. LEGACY: db + r2 + this file against the single summed cap → 413.
+      if (this.isFrozen()) return planRequiredResponse();
+      const caps = this.planCaps();
+      if (caps) {
+        if (caps.attachment_bytes === 0) return attachmentsNotIncludedResponse();
+        if (this.r2Bytes + file.size > caps.attachment_bytes) {
+          return capExceededResponse(this.r2Bytes, caps.attachment_bytes, file.size, "attachments");
+        }
+      } else {
+        // Legacy single summed cap (un-pushed / not-yet-migrated vault).
+        const used = usedBytes(Number(this.raw().databaseSize), this.r2Bytes);
+        const cap = this.capBytes();
+        if (used + file.size > cap) return capExceededResponse(used, cap, file.size);
+      }
 
       const date = new Date().toISOString().split("T")[0]!;
       const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;

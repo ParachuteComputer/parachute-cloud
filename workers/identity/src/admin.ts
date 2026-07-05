@@ -26,7 +26,7 @@ import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { sessionUser } from "./session-user.ts";
 import { deleteSessionsForUser } from "./sessions.ts";
 import { getUserById, setUserPlan, setUserSuspended, type User } from "./users.ts";
-import { PLAN_SPECS, coercePlanId, isPlanId } from "./plans.ts";
+import { coercePlanId, isPlanId, planTotalBytes } from "./plans.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 import { collectDigestStats } from "./ops.ts";
 import { latestUsageForVaults } from "./usage.ts";
@@ -252,9 +252,9 @@ export async function handleAdminVaultsGet(db: D1Database, req: Request, deps: O
       ownerEmail: r.owner_email,
       createdAt: r.created_at,
       usage: u ? { dbBytes: u.dbBytes, r2Bytes: u.r2Bytes, day: u.day, transcribeMinutes: u.transcribeMinutes } : null,
-      // v1 cap semantics: per-vault cap = the owner's plan total (plans.ts).
-      // An orphan owner coerces to 'free' — the conservative read.
-      capBytes: PLAN_SPECS[coercePlanId(r.owner_plan)].total_bytes,
+      // Per-vault cap = the owner's plan two-meter budgets summed (plans.ts).
+      // An orphan owner coerces to the expired floor — the conservative read.
+      capBytes: planTotalBytes(coercePlanId(r.owner_plan)),
     };
   });
 
@@ -299,6 +299,11 @@ export async function handleAdminSetPlanPost(db: D1Database, req: Request, deps:
   if (!target) return back("err=not-found");
 
   await setUserPlan(db, target.id, plan);
+  // An operator's explicit plan set is authoritative: clear any pending
+  // downgrade / trial clock so the hourly sweep doesn't revert the comp (the
+  // subscription.updated "plan applied" semantics). A comp is indefinite until
+  // the operator changes it again.
+  await db.prepare("UPDATE users SET pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?").bind(target.id).run();
   // Push the new entitlement into the vault DOs NOW — a comp must take effect
   // while the person is looking. Best-effort per vault (vault-call.ts); a miss
   // is reported and reconciled by the backfill script / next plan change.

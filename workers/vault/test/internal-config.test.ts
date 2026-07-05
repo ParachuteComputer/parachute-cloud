@@ -37,6 +37,22 @@ function putConfig(vault: string, token: string, body: unknown): Promise<Respons
   });
 }
 
+/** Upload a file of `size` bytes via the operator (full-permission) token. */
+function upload(vault: string, size: number, name = "clip.bin"): Promise<Response> {
+  const fd = new FormData();
+  fd.append("file", new File([new Uint8Array(size)], name, { type: "application/octet-stream" }));
+  return op(vault, "/api/storage/upload", { method: "POST", body: fd });
+}
+
+/** POST a note via the operator token (returns the raw Response, not JSON). */
+function postNote(vault: string, content: string): Promise<Response> {
+  return op(vault, "/api/notes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+}
+
 describe("internal config — authorization matrix", () => {
   it("first-party admin token (issuer mint shape) sets cap_bytes", async () => {
     const v = freshVault("ic");
@@ -191,5 +207,145 @@ describe("internal config — the cap is real", () => {
     const landing = await SELF.fetch(`${base(v)}`, { headers: { authorization: `Bearer ${token}` } });
     expect(landing.status).toBe(200);
     expect(((await landing.json()) as any).cap_bytes).toBe(104_857_600);
+  });
+});
+
+describe("two-meter caps — the pricing model", () => {
+  it("pushes { caps } and the landing surfaces the split + summed cap_bytes", async () => {
+    const v = freshVault("ic");
+    const res = await putConfig(v, await firstPartyToken(v), {
+      caps: { notes_bytes: 50 * 1024 * 1024, attachment_bytes: 2 * 1024 * 1024 * 1024 },
+      transcription: { enabled: true, minutes_limit: 60 },
+      frozen: false,
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.caps).toEqual({ notes_bytes: 50 * 1024 * 1024, attachment_bytes: 2 * 1024 * 1024 * 1024 });
+    expect(body.frozen).toBe(false);
+    // resolved_cap_bytes = the two-meter budgets summed.
+    expect(body.resolved_cap_bytes).toBe(50 * 1024 * 1024 + 2 * 1024 * 1024 * 1024);
+
+    // Read-scoped landing: cap_bytes = sum + the additive caps object.
+    const token = await mintToken({ vault: v, scopes: `vault:${v}:read`, vaultScope: [v] });
+    const landing = await SELF.fetch(`${base(v)}`, { headers: { authorization: `Bearer ${token}` } });
+    const l = (await landing.json()) as any;
+    expect(l.cap_bytes).toBe(50 * 1024 * 1024 + 2 * 1024 * 1024 * 1024);
+    expect(l.caps).toEqual({
+      notes_bytes: 50 * 1024 * 1024,
+      attachment_bytes: 2 * 1024 * 1024 * 1024,
+      attachments_enabled: true,
+    });
+  });
+
+  it("the NOTES meter gates note writes (413 meter=notes); the attachment meter is INDEPENDENT", async () => {
+    const v = freshVault("ic");
+    await createNote(v, { content: "baseline so the SQLite db has a real size" });
+    // Notes budget below the current db size → instantly over; attachments generous.
+    await putConfig(v, await firstPartyToken(v), {
+      caps: { notes_bytes: 1024, attachment_bytes: 10 * 1024 * 1024 },
+    });
+
+    const blockedNote = await postNote(v, "no room in the notes budget");
+    expect(blockedNote.status).toBe(413);
+    const err = (await blockedNote.json()) as any;
+    expect(err.error_type).toBe("storage_cap_exceeded");
+    expect(err.meter).toBe("notes");
+    expect(err.cap_bytes).toBe(1024);
+
+    // The attachment meter is a SEPARATE budget — a small upload still lands
+    // even though the notes budget is blown.
+    const okUpload = await upload(v, 4096);
+    expect(okUpload.status).toBe(201);
+  });
+
+  it("attachment_bytes:0 → the storage upload 403s attachments_not_included (before cap math)", async () => {
+    const v = freshVault("ic");
+    // Notes-only tier (Entry): generous notes budget, ZERO attachment budget.
+    await putConfig(v, await firstPartyToken(v), {
+      caps: { notes_bytes: 100 * 1024 * 1024, attachment_bytes: 0 },
+    });
+    const blocked = await upload(v, 8);
+    expect(blocked.status).toBe(403);
+    expect(((await blocked.json()) as any).error_type).toBe("attachments_not_included");
+
+    // Notes writes are unaffected — the meters are independent.
+    const note = await postNote(v, "notes still work on a notes-only plan");
+    expect(note.status).toBe(201);
+  });
+
+  it("the ATTACHMENT meter gates uploads (413 meter=attachments)", async () => {
+    const v = freshVault("ic");
+    await putConfig(v, await firstPartyToken(v), {
+      caps: { notes_bytes: 100 * 1024 * 1024, attachment_bytes: 1024 },
+    });
+    // A file larger than the 1 KiB attachment budget.
+    const blocked = await upload(v, 4096);
+    expect(blocked.status).toBe(413);
+    const err = (await blocked.json()) as any;
+    expect(err.error_type).toBe("storage_cap_exceeded");
+    expect(err.meter).toBe("attachments");
+    expect(err.cap_bytes).toBe(1024);
+  });
+});
+
+describe("frozen — the expired floor (402 plan_required)", () => {
+  it("frozen blocks writes with 402; reads + DELETE untouched; un-freeze restores writes", async () => {
+    const v = freshVault("ic");
+    const note = await createNote(v, { content: "written before the freeze" });
+    await putConfig(v, await firstPartyToken(v), {
+      caps: { notes_bytes: 100 * 1024 * 1024, attachment_bytes: 8 * 1024 * 1024 },
+      frozen: true,
+    });
+
+    // WRITE → 402 plan_required (before any cap math).
+    const blockedNote = await postNote(v, "frozen — no writes");
+    expect(blockedNote.status).toBe(402);
+    expect(((await blockedNote.json()) as any).error_type).toBe("plan_required");
+
+    // Attachment upload → 402 too.
+    const blockedUpload = await upload(v, 16);
+    expect(blockedUpload.status).toBe(402);
+    expect(((await blockedUpload.json()) as any).error_type).toBe("plan_required");
+
+    // READ (landing) is untouched, and the landing advertises frozen:true.
+    const readTok = await mintToken({ vault: v, scopes: `vault:${v}:read`, vaultScope: [v] });
+    const landing = await SELF.fetch(`${base(v)}`, { headers: { authorization: `Bearer ${readTok}` } });
+    expect(landing.status).toBe(200);
+    expect(((await landing.json()) as any).frozen).toBe(true);
+
+    // DELETE is exempt — a frozen tenant can still delete their way down.
+    const del = await op(v, `/api/notes/${note.id}`, { method: "DELETE" });
+    expect([200, 204]).toContain(del.status);
+
+    // Un-freeze → writes work again (the upgrade-out-of-expired path).
+    await putConfig(v, await firstPartyToken(v), { frozen: false });
+    const unblocked = await postNote(v, "writing again after picking a plan");
+    expect(unblocked.status).toBe(201);
+  });
+});
+
+describe("two-meter validation", () => {
+  it("rejects malformed caps (missing/negative notes, non-integer, non-object)", async () => {
+    const v = freshVault("ic");
+    const token = await firstPartyToken(v);
+    for (const bad of [
+      { notes_bytes: 0, attachment_bytes: 10 }, // notes must be > 0
+      { notes_bytes: 100, attachment_bytes: -1 }, // attachment must be >= 0
+      { notes_bytes: 1.5, attachment_bytes: 10 }, // integer
+      { attachment_bytes: 10 }, // missing notes
+      "nope",
+    ]) {
+      const res = await putConfig(v, token, { caps: bad });
+      expect(res.status).toBe(400);
+    }
+    // attachment_bytes:0 IS legal (the notes-only tier).
+    const ok = await putConfig(v, token, { caps: { notes_bytes: 100, attachment_bytes: 0 } });
+    expect(ok.status).toBe(200);
+  });
+
+  it("frozen must be a boolean", async () => {
+    const v = freshVault("ic");
+    const res = await putConfig(v, await firstPartyToken(v), { frozen: "yes" });
+    expect(res.status).toBe(400);
   });
 });

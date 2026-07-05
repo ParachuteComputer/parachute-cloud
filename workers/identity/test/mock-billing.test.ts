@@ -10,9 +10,11 @@
  *     404 in production — belt (ENVIRONMENT="production") beats even the
  *     explicit MOCK_BILLING=1 flag; and it 404s once real Stripe is configured
  *     (the real path takes over). A free self-upgrade in prod is impossible.
- *   - the mock upgrade applies the plan + pushes the plan's caps + voice
- *     entitlement into the vault DOs (the REAL applyPlanToVaults seam — the
- *     cap PUT is asserted at the wire), for BOTH paid tiers;
+ *   - the mock upgrade applies ANY tier directly (checkoutPlan defaults to
+ *     `standard`) and pushes that tier's two-meter caps + voice entitlement
+ *     into the vault DOs (the REAL applyPlanToVaults seam — the cap PUT is
+ *     asserted at the wire), gated by canStartCheckout the same as real
+ *     checkout;
  *   - session + CSRF + same-origin on the POST (the console write boundary);
  *   - the console's three clean states: MOCK (mock buttons + "test mode"
  *     label), REAL (hosted-Checkout buttons), and — with the flag — mock
@@ -21,7 +23,7 @@
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import app from "../src/index.ts";
-import { PLAN_SPECS } from "../src/plans.ts";
+import { PLAN_SPECS, planEntitlement } from "../src/plans.ts";
 import { mockBillingEnabled } from "../src/billing-config.ts";
 import { getUserById, setUserPlan } from "../src/users.ts";
 import { CSRF, ISSUER, seedSession, seedUser, seedVault } from "./helpers.ts";
@@ -90,43 +92,44 @@ describe("SECURITY: POST /billing/mock-checkout 404s wherever mock is off", () =
     const { id } = await seedUser("mock-prod@example.com");
     const res = await app.fetch(post({ __csrf: CSRF }, sessionCookie(await seedSession(id))), PROD_UNCONFIGURED);
     expect(res.status).toBe(404);
-    // The plan did NOT change — the endpoint never ran.
-    expect((await getUserById(env.DB, id))!.plan).toBe("free");
+    // The plan did NOT change — the endpoint never ran (seedUser → trial).
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial");
   });
 
   test("PRODUCTION + MOCK_BILLING=1 → STILL 404 (the belt beats the flag)", async () => {
     const { id } = await seedUser("mock-prodflag@example.com");
     const res = await app.fetch(post({ __csrf: CSRF }, sessionCookie(await seedSession(id))), PROD_MOCK_FLAG);
     expect(res.status).toBe(404);
-    expect((await getUserById(env.DB, id))!.plan).toBe("free");
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial");
   });
 
   test("real Stripe configured (non-prod) → 404: the real Checkout path has taken over", async () => {
     const { id } = await seedUser("mock-configured@example.com");
     const res = await app.fetch(post({ __csrf: CSRF }, sessionCookie(await seedSession(id))), CONFIGURED_ENV);
     expect(res.status).toBe(404);
-    expect((await getUserById(env.DB, id))!.plan).toBe("free");
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial");
   });
 });
 
 // --- console rendering: the three states --------------------------------------
 
 describe("console rendering — the three clean states", () => {
-  test("MOCK: both Upgrade buttons POST the mock endpoint + a 'test mode' label; no teaser", async () => {
+  test("MOCK: the tier-ladder buttons POST the mock endpoint + a 'test mode' label; no teaser", async () => {
     const { id } = await seedUser("mock-ui@example.com");
     await seedVault("mock-ui-box", id);
     const html = await consoleHtml(await seedSession(id), MOCK_ENV);
     expect(html).toContain('data-testid="upgrade-billing"');
-    expect(html).toContain('data-testid="upgrade-voice"');
     expect(html).toContain('action="/billing/mock-checkout"');
     expect(html).toContain('data-testid="mock-billing-note"');
     expect(html).toContain("test mode");
+    // Voice is folded into the ladder now — no separate upgrade-voice button.
+    expect(html).not.toContain('data-testid="upgrade-voice"');
     // Mock replaces BOTH the teaser and the real Checkout action.
-    expect(html).not.toContain("paid plans arriving");
+    expect(html).not.toContain("keep writing after your trial");
     expect(html).not.toContain('action="/billing/checkout"');
   });
 
-  test("REAL (configured): the Parachute Upgrade POSTs hosted Checkout; no mock endpoint/label", async () => {
+  test("REAL (configured): the Upgrade ladder POSTs hosted Checkout; no mock endpoint/label", async () => {
     const { id } = await seedUser("real-ui@example.com");
     await seedVault("real-ui-box", id);
     const html = await consoleHtml(await seedSession(id), CONFIGURED_ENV);
@@ -169,43 +172,54 @@ describe("mock upgrade applies the plan + caps + voice entitlement (real seam)",
       .reply(200, { ok: true }, { headers: { "content-type": "application/json" } });
   }
 
-  test("PARACHUTE tier: plan flips + the parachute cap (voice OFF) pushes to every owned vault", async () => {
-    const { id } = await seedUser("mock-parachute@example.com");
-    await seedVault("mock-parachute-box", id);
+  test("STANDARD tier (the default when no plan field is sent): plan flips + the two-meter cap (voice ON, 60 min) pushes to every owned vault", async () => {
+    const { id } = await seedUser("mock-standard@example.com");
+    await seedVault("mock-standard-box", id);
     let pushed = "";
-    interceptCapPush("mock-parachute-box", (b) => (pushed = b));
+    interceptCapPush("mock-standard-box", (b) => (pushed = b));
 
     const res = await app.fetch(post({ __csrf: CSRF }, sessionCookie(await seedSession(id))), MOCK_ENV);
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/console?mock_upgraded=1");
 
-    expect((await getUserById(env.DB, id))!.plan).toBe("parachute");
-    expect(JSON.parse(pushed)).toEqual({
-      cap_bytes: PLAN_SPECS.parachute.total_bytes,
-      transcription: { enabled: false, minutes_limit: 0 },
-    });
+    expect((await getUserById(env.DB, id))!.plan).toBe("standard");
+    expect(JSON.parse(pushed)).toEqual(planEntitlement("standard"));
   });
 
-  test("VOICE tier: plan flips + the voice entitlement (enabled + 600 min) pushes with the cap", async () => {
-    const { id } = await seedUser("mock-voice@example.com");
-    await seedVault("mock-voice-box", id);
+  test("PLUS tier: plan flips + the voice entitlement (enabled + 300 min) pushes with the cap", async () => {
+    const { id } = await seedUser("mock-plus@example.com");
+    await seedVault("mock-plus-box", id);
     let pushed = "";
-    interceptCapPush("mock-voice-box", (b) => (pushed = b));
+    interceptCapPush("mock-plus-box", (b) => (pushed = b));
 
-    const res = await app.fetch(post({ __csrf: CSRF, plan: "voice" }, sessionCookie(await seedSession(id))), MOCK_ENV);
+    const res = await app.fetch(post({ __csrf: CSRF, plan: "plus" }, sessionCookie(await seedSession(id))), MOCK_ENV);
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/console?mock_upgraded=1");
 
-    expect((await getUserById(env.DB, id))!.plan).toBe("voice");
+    expect((await getUserById(env.DB, id))!.plan).toBe("plus");
     expect(JSON.parse(pushed)).toEqual({
-      cap_bytes: PLAN_SPECS.voice.total_bytes,
-      transcription: { enabled: true, minutes_limit: PLAN_SPECS.voice.transcribe_minutes },
+      caps: { notes_bytes: PLAN_SPECS.plus.notes_bytes, attachment_bytes: PLAN_SPECS.plus.attachment_bytes },
+      transcription: { enabled: true, minutes_limit: PLAN_SPECS.plus.transcribe_minutes },
+      frozen: false,
     });
+  });
+
+  test("ENTRY tier: a notes-only mock upgrade pushes a ZERO attachment budget + voice off", async () => {
+    const { id } = await seedUser("mock-entry@example.com");
+    await seedVault("mock-entry-box", id);
+    let pushed = "";
+    interceptCapPush("mock-entry-box", (b) => (pushed = b));
+
+    const res = await app.fetch(post({ __csrf: CSRF, plan: "entry" }, sessionCookie(await seedSession(id))), MOCK_ENV);
+    expect(res.status).toBe(302);
+
+    expect((await getUserById(env.DB, id))!.plan).toBe("entry");
+    expect(JSON.parse(pushed)).toEqual(planEntitlement("entry"));
   });
 
   test("the mock-upgraded notice renders on the console return (test-purchase copy)", async () => {
     const { id } = await seedUser("mock-notice@example.com");
-    await setUserPlan(env.DB, id, "voice"); // land on /console?mock_upgraded=1 already-voice
+    await setUserPlan(env.DB, id, "plus"); // land on /console?mock_upgraded=1 already-plus
     const res = await app.fetch(
       new Request(`${ISSUER}/console?mock_upgraded=1`, { headers: { cookie: `parachute_id_session=${await seedSession(id)}` } }),
       MOCK_ENV,
@@ -213,6 +227,7 @@ describe("mock upgrade applies the plan + caps + voice entitlement (real seam)",
     const html = await res.text();
     expect(html).toContain("Test purchase complete");
     expect(html).toContain("no real charge");
+    expect(html).toContain(`${PLAN_SPECS.plus.label} plan now`);
   });
 });
 
@@ -235,7 +250,7 @@ describe("mock checkout — session + CSRF + same-origin", () => {
     expect(crossOrigin.headers.get("location")).toBe("/console?billing_err=session");
 
     // Already paid — a second "purchase" is refused (the real-checkout parity).
-    await setUserPlan(env.DB, id, "parachute");
+    await setUserPlan(env.DB, id, "standard");
     const already = await app.fetch(post({ __csrf: CSRF }, sessionCookie(sessionId)), MOCK_ENV);
     expect(already.headers.get("location")).toBe("/console?billing_err=already");
   });

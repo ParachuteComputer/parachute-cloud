@@ -11,7 +11,7 @@
  * login password is stored differs, and that never crosses the wire to a client.
  */
 import { bytesToBase64url, randomUUID, timingSafeEqualString } from "./crypto.ts";
-import { type PlanId, coercePlanId } from "./plans.ts";
+import { type PlanId, TRIAL_DURATION_DAYS, coercePlanId } from "./plans.ts";
 
 const encoder = new TextEncoder();
 // KDF POSTURE (#28, settled 2026-07-02 — the honest version):
@@ -202,6 +202,17 @@ function base64urlToBytes(s: string): Uint8Array {
  * account — stored as an empty hash, which `verifyPassword` rejects, so password
  * login fails until one is set via {@link setPassword}. `emailVerified` starts
  * true for a magic-link signup (the link proves the address).
+ *
+ * EVERY new account STARTS THE 30-DAY NO-CARD TRIAL (the pricing model — there
+ * is no perpetual free tier; self-host is the free-forever option). We write
+ * the full trial state machine right here so BOTH signup paths (password
+ * /signup and the first magic-link, auth-handlers.ts) land on it identically:
+ *   - plan            = 'trial'   (mirrors PLUS entitlements — full experience)
+ *   - pending_plan    = 'expired' (the floor the hourly sweep flips to at day 30)
+ *   - plan_downgrade_at = now + 30d (when the sweep applies it)
+ * A fresh account owns no vaults yet, so there is nothing to push caps into
+ * here — the vault-creation path (console.ts) pushes the trial entitlement as
+ * each vault is made; the sweep + any checkout/comp re-push on a plan change.
  */
 export async function createUser(
   db: D1Database,
@@ -217,11 +228,16 @@ export async function createUser(
   const passwordHash = password.length > 0 ? await hashPassword(password) : "";
   const emailVerified = opts.emailVerified ?? false;
   const createdAt = now.toISOString();
-  // `plan` and `role` are deliberately NOT in the INSERT: every signup lands
-  // on the migration DEFAULTs ('free' / 'user'), which the test suites pin.
+  const planDowngradeAt = new Date(now.getTime() + TRIAL_DURATION_DAYS * 86_400_000).toISOString();
+  // `role` is deliberately NOT in the INSERT (migration DEFAULT 'user'); `plan`
+  // + the trial pair ARE written explicitly so the state machine is set the
+  // same way regardless of the migration DEFAULT.
   await db
-    .prepare("INSERT INTO users (id, email, password_hash, created_at, email_verified) VALUES (?, ?, ?, ?, ?)")
-    .bind(id, email, passwordHash, createdAt, emailVerified ? 1 : 0)
+    .prepare(
+      `INSERT INTO users (id, email, password_hash, created_at, email_verified, plan, pending_plan, plan_downgrade_at)
+       VALUES (?, ?, ?, ?, ?, 'trial', 'expired', ?)`,
+    )
+    .bind(id, email, passwordHash, createdAt, emailVerified ? 1 : 0, planDowngradeAt)
     .run();
   return {
     id,
@@ -229,13 +245,13 @@ export async function createUser(
     passwordHash,
     createdAt,
     emailVerified,
-    plan: "free",
+    plan: "trial",
     role: "user",
     suspendedAt: null,
     stripeCustomerId: null,
     stripeSubscriptionId: null,
-    pendingPlan: null,
-    planDowngradeAt: null,
+    pendingPlan: "expired",
+    planDowngradeAt,
     lastInvoicePaidAt: null,
     paymentFailedAt: null,
     paymentFailedCount: 0,
