@@ -22,9 +22,9 @@ import { GETTING_STARTED_PACK, welcomePack } from "@openparachute/core/src/seed-
  * pre-existing vaults, ordinary/deletable notes, exported like any other note.
  *
  * The guides ring (vault#544): six seeded notes, all `#guide` skill files
- * (Welcome also `#pinned`), each carrying `metadata.written_for` — "human" on
- * the five welcome guides, "ai" on Getting Started. The `guide` tag carries the
- * `written_for` enum schema (ai|human|both). The `capture` tag assertion still
+ * (Welcome also `#pinned`). Guides are AI-first + human-readable markdown, so
+ * the `#guide` tag carries no per-guide audience schema (written_for dropped
+ * 2026-07-06). The `capture` tag assertion still
  * mirrors notes-ui's audit equality exactly (schema-audit.ts diffs
  * `description` + `parent_names` verbatim against NOTES_REQUIRED_SCHEMA), so
  * green there means the PWA banner clears for the right reason. The parity
@@ -41,8 +41,8 @@ const ALL_PATHS = [
   YOURS_TO_KEEP_PATH,
   GETTING_STARTED_PATH,
 ];
-// The five welcome guides carry written_for: "human"; Getting Started: "ai".
-const HUMAN_GUIDES = [WELCOME_PATH, CAPTURE_ANYTHING_PATH, TAGS_GRAPH_PATH, CONNECT_AI_PATH, YOURS_TO_KEEP_PATH];
+// The five welcome guides (vs the AI-facing Getting Started); all tagged #guide.
+const WELCOME_GUIDES = [WELCOME_PATH, CAPTURE_ANYTHING_PATH, TAGS_GRAPH_PATH, CONNECT_AI_PATH, YOURS_TO_KEEP_PATH];
 
 async function listNotes(v: string): Promise<any[]> {
   const res = await op(v, "/api/notes?include_content=true");
@@ -74,20 +74,17 @@ describe("default seed — a new vault's first materialization", () => {
     const gettingStarted = notes.find((n) => n.path === GETTING_STARTED_PATH)!;
     expect(gettingStarted.content).toContain("start-here guide");
 
-    // The guides carry #guide (Welcome also #pinned); written_for splits
-    // human (the five welcome guides) vs ai (Getting Started).
-    for (const path of HUMAN_GUIDES) {
+    // The guides all carry #guide (Welcome also #pinned).
+    for (const path of WELCOME_GUIDES) {
       const note = notes.find((n) => n.path === path)!;
       expect(note.tags, `${path} tagged #guide`).toContain("guide");
-      expect(note.metadata?.written_for, `${path} written_for`).toBe("human");
     }
     expect(welcome.tags, "Welcome is pinned").toContain("pinned");
     // Only Welcome is pinned — the other guides are not.
-    for (const path of HUMAN_GUIDES.filter((p) => p !== WELCOME_PATH)) {
+    for (const path of WELCOME_GUIDES.filter((p) => p !== WELCOME_PATH)) {
       expect(notes.find((n) => n.path === path)!.tags).not.toContain("pinned");
     }
     expect(gettingStarted.tags).toContain("guide");
-    expect(gettingStarted.metadata?.written_for).toBe("ai");
 
     // Exactly core's declared seed-tag set — dynamic (the welcome pack's tags:
     // capture + guide + pinned), so the assertion follows core@main rather than
@@ -106,12 +103,12 @@ describe("default seed — a new vault's first materialization", () => {
       expect(row.count).toBe(0);
     }
 
-    // guide carries the written_for enum schema (ai|human|both), and it
-    // PERSISTED through the DO store (this is the guides-ring behavioral check —
-    // the schema round-trips workerd's transactionSync seam, not just the pins).
+    // guide is the skill-file tag — it PERSISTED through the DO store (the
+    // behavioral check: the tag round-trips workerd's transactionSync seam, not
+    // just the pins). written_for was dropped — no per-guide audience schema.
     const guideRow = tags.find((t) => t.name === "guide")!;
     expect(guideRow, "guide tag exists").toBeTruthy();
-    expect(guideRow.fields?.written_for?.enum).toEqual(["ai", "human", "both"]);
+    expect(guideRow.fields?.written_for).toBeUndefined();
     // Six #guide notes seeded → the count reflects them (5 welcome + Getting Started).
     expect(guideRow.count).toBe(6);
     // pinned: identity row, one pinned note (Welcome).
