@@ -30,7 +30,9 @@
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import type Stripe from "stripe";
+import type { OAuthDeps } from "../src/oauth-shared.ts";
 import app from "../src/index.ts";
+import { handleChoosePlanPost } from "../src/console.ts";
 import { planEntitlement } from "../src/plans.ts";
 import {
   BILLING_SWEEP_CAP,
@@ -181,6 +183,51 @@ function post(path: string, fields: Record<string, string>, cookie: string): Req
 
 function sessionCookie(sessionId: string): string {
   return `parachute_id_csrf=${CSRF}; parachute_id_session=${sessionId}`;
+}
+
+/**
+ * A D1 proxy that runs `inject` exactly once, immediately BEFORE the prepared
+ * statement whose SQL contains `sqlNeedle` executes `.run()` — deterministically
+ * simulating a concurrent write landing inside a handler's read→write window
+ * (the F1 pick-a-plan TOCTOU). Every other statement passes straight through.
+ */
+function dbInjectingBeforeRun(realDb: D1Database, sqlNeedle: string, inject: () => Promise<void>): D1Database {
+  return new Proxy(realDb, {
+    get(target, prop) {
+      if (prop !== "prepare") {
+        const v = (target as unknown as Record<string | symbol, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      }
+      return (sql: string): D1PreparedStatement => {
+        const stmt = target.prepare(sql);
+        if (!sql.includes(sqlNeedle)) return stmt;
+        // Wrap only the matching statement so its .run() is preceded by inject().
+        return new Proxy(stmt, {
+          get(s, p) {
+            if (p !== "bind") {
+              const v = (s as unknown as Record<string | symbol, unknown>)[p];
+              return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(s) : v;
+            }
+            return (...args: unknown[]): D1PreparedStatement => {
+              const bound = s.bind(...(args as [])) as D1PreparedStatement;
+              return new Proxy(bound, {
+                get(b, bp) {
+                  if (bp === "run") {
+                    return async () => {
+                      await inject();
+                      return b.run();
+                    };
+                  }
+                  const v = (b as unknown as Record<string | symbol, unknown>)[bp];
+                  return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(b) : v;
+                },
+              });
+            };
+          },
+        });
+      };
+    },
+  }) as unknown as D1Database;
 }
 
 async function consoleHtml(sessionId: string, testEnv: typeof env = env, query = ""): Promise<string> {
@@ -363,6 +410,40 @@ describe("NOT CONFIGURED — the clean degradation (today's deploy)", () => {
     expect(html).not.toContain("/billing/mock-checkout");
   });
 
+  test("RENDER: an EXPIRED user's console shows NO free /console/plan form + the reactivate line; a TRIAL user shows the form + no-card line (the launch-facing contrast)", async () => {
+    // EXPIRED — the launch promise the F1 server guard protects, now pinned at the
+    // UI too: the free pick-a-plan door must be ABSENT (they must pay to
+    // reactivate), and the calm reactivate line stands in for it.
+    const { id: expiredId } = await seedUser("render-expired@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'expired', pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?")
+      .bind(expiredId)
+      .run();
+    await seedVault("render-expired-box", expiredId);
+    const expiredHtml = await consoleHtml(await seedSession(expiredId), PROD_UNCONFIGURED_ENV);
+    // The plan cards still render (checkout-eligible section) — expired isn't a
+    // blank console, it's a reactivate console.
+    expect(expiredHtml).toContain('data-testid="plans"');
+    expect(expiredHtml).toContain('data-testid="plan-card-power"');
+    // THE UI GUARD: no free /console/plan door at all (no form, no choose-* button).
+    expect(expiredHtml).not.toContain('action="/console/plan"');
+    expect(expiredHtml).not.toContain('data-testid="choose-');
+    // The reactivate line stands in (billing unconfigured → no checkout button either).
+    expect(expiredHtml).toContain('data-testid="reactivate-line"');
+    expect(expiredHtml).toContain("reactivate");
+    expect(expiredHtml).not.toContain('data-testid="no-card-line"');
+    expect(expiredHtml).not.toContain('data-testid="upgrade-billing"');
+
+    // TRIAL contrast — same keyless deploy, but a live trial DOES get the free
+    // pick-a-plan form + the no-card line (never the reactivate line).
+    const { id: trialId } = await seedUser("render-trial@example.com"); // seedUser → trial
+    await seedVault("render-trial-box", trialId);
+    const trialHtml = await consoleHtml(await seedSession(trialId), PROD_UNCONFIGURED_ENV);
+    expect(trialHtml).toContain('action="/console/plan"');
+    expect(trialHtml).toContain('data-testid="choose-power"');
+    expect(trialHtml).toContain('data-testid="no-card-line"');
+    expect(trialHtml).not.toContain('data-testid="reactivate-line"');
+  });
+
   test("paid user's console hides Manage billing while unconfigured", async () => {
     const { id } = await seedPaidUser("noconfig-paid@example.com");
     const html = await consoleHtml(await seedSession(id), PROD_UNCONFIGURED_ENV);
@@ -499,24 +580,93 @@ describe("POST /console/plan — pick/change your trial tier (no Stripe)", () =>
     expect((await getUserById(env.DB, id))!.pendingPlan).toBe("power");
   });
 
-  test("SECURITY: an EXPIRED user's POST /console/plan does NOT grant a free paid tier — no un-freeze, redirect to reactivate, no cap push", async () => {
+  test("SECURITY: an EXPIRED user's POST /console/plan does NOT grant a free paid tier — no un-freeze, redirect to reactivate, and (positive control) NO cap push fires", async () => {
     const { id } = await seedUser("plan-expired@example.com");
     await env.DB.prepare("UPDATE users SET plan = 'expired', pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?")
       .bind(id)
       .run();
     await seedVault("plan-expired-box", id);
-    // NO interceptCapPush registered: applyPlanToVaults must NOT run — a stray
-    // push here would hit the disabled network (net.connect off) and fail. The
-    // absence of any pending interceptor (afterEach) proves no entitlement applied.
-    const res = await app.fetch(
+    // POSITIVE CONTROL, not the vacuous "no interceptor registered": pushVaultCap
+    // is no-throw, so relying on disableNetConnect alone would SWALLOW a stray
+    // push rather than fail on it. Spy the vault-call seam (deps.vaultFetch, the
+    // single fetch every cap push routes through) and RECORD any cap-push PUT
+    // /api/internal/config — the exact request that would un-freeze the expired
+    // user's vaults at paid caps. A future refactor that pushed from the
+    // request-tier instead of the row is caught by the capPushes assertion below.
+    const capPushes: Array<{ method: string; url: string }> = [];
+    const spiedDeps = {
+      ...deps(),
+      vaultFetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        if (method === "PUT" && url.includes("/api/internal/config")) capPushes.push({ method, url });
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) satisfies NonNullable<OAuthDeps["vaultFetch"]>,
+    };
+    const res = await handleChoosePlanPost(
+      env.DB,
       post("/console/plan", { __csrf: CSRF, plan: "power" }, sessionCookie(await seedSession(id))),
-      env,
+      spiedDeps,
     );
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/console?plan_err=reactivate");
+    // The load-bearing proof: NO entitlement push reached any vault DO.
+    expect(capPushes).toEqual([]);
     const after = (await getUserById(env.DB, id))!;
     expect(after.plan).toBe("expired"); // still frozen — never a free paid tier
     expect(after.pendingPlan).toBeNull(); // untouched
+  });
+
+  test("SECURITY (F1 TOCTOU): the day-30 sweep floors the trial to expired INSIDE the read→write window → the conditional write matches 0 rows → reactivate + NO cap push (never un-freeze at paid caps)", async () => {
+    const { id } = await seedUser("plan-toctou@example.com"); // trial, clock armed
+    await seedVault("plan-toctou-box", id);
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial"); // trial when the handler reads it
+
+    // Positive control on the push seam: a stray push here IS the bug — the
+    // chosen tier's paid caps applied to a row the sweep already floored.
+    const capPushes: string[] = [];
+    const spiedDeps = {
+      ...deps(),
+      vaultFetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        if (method === "PUT" && url.includes("/api/internal/config")) capPushes.push(url);
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) satisfies NonNullable<OAuthDeps["vaultFetch"]>,
+    };
+
+    // Fire the sweep's floor-to-expired the instant BEFORE the conditional
+    // `pending_plan` UPDATE runs. sessionUser already read `trial` (so every
+    // UPSTREAM guard — isPaidTier/canStartCheckout/plan!=='trial' — passed):
+    // ONLY the `WHERE plan = 'trial'` clause can catch this race. Without the
+    // conditional write the handler would set pending_plan='power' and push
+    // power's caps into the now-expired (frozen) vault. `changes===0` is the
+    // ONLY thing standing between the race and that un-freeze.
+    let swept = 0;
+    const racingDb = dbInjectingBeforeRun(env.DB, "SET pending_plan = ?", async () => {
+      if (swept++ > 0) return; // once, defensively (only the one UPDATE matches the needle)
+      await env.DB.prepare("UPDATE users SET plan = 'expired', pending_plan = 'expired' WHERE id = ?").bind(id).run();
+    });
+
+    const res = await handleChoosePlanPost(
+      racingDb,
+      post("/console/plan", { __csrf: CSRF, plan: "power" }, sessionCookie(await seedSession(id))),
+      spiedDeps,
+    );
+    expect(swept).toBe(1); // the race actually fired (the branch under test was reached)
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?plan_err=reactivate"); // NOT plan_chosen
+    // THE LOAD-BEARING PROOF: caps were NEVER pushed to the raced-to-expired row.
+    expect(capPushes).toEqual([]);
+    const after = (await getUserById(env.DB, id))!;
+    expect(after.plan).toBe("expired"); // the sweep's floor stands
+    expect(after.pendingPlan).toBe("expired"); // the chosen 'power' NEVER overwrote it
   });
 
   test("a live/paid subscriber can't use /console/plan (they use the portal) → plan_err=already, plan unchanged", async () => {

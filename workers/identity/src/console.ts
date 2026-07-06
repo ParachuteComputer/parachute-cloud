@@ -500,7 +500,20 @@ export async function handleChoosePlanPost(db: D1Database, req: Request, deps: O
     return redirectResponse("/console?plan_err=reactivate");
   }
   // Set the chosen tier as the pending plan — KEEP the plan_downgrade_at clock.
-  await db.prepare("UPDATE users SET pending_plan = ? WHERE id = ?").bind(raw, user.id).run();
+  // CONDITIONAL WRITE AS GUARD (the runBillingSweep #84 pattern): the `plan !=
+  // 'trial'` check above was read from the session snapshot, so the day-30 sweep
+  // could FLOOR this user to `expired` in the read→write window. Pin the write to
+  // `plan = 'trial'` so a raced-to-expired row can't be re-mirrored to a paid
+  // tier — changes=0 means the sweep won reading, we must NOT push the chosen
+  // tier's caps (that would un-freeze the now-expired vault at paid caps: the
+  // exact bug). Point them at checkout instead, row untouched.
+  const write = await db
+    .prepare("UPDATE users SET pending_plan = ? WHERE id = ? AND plan = 'trial'")
+    .bind(raw, user.id)
+    .run();
+  if ((write.meta.changes ?? 0) === 0) {
+    return redirectResponse("/console?plan_err=reactivate");
+  }
   // Re-push the (now chosen-tier) entitlement into every owned vault so caps +
   // voice update immediately (applyPlanToVaults reads the fresh row →
   // entitlementPlanFor(trial, <tier>) = <tier>'s spec). Best-effort per vault.
