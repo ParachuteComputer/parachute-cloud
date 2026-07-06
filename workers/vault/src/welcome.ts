@@ -8,17 +8,17 @@
  *     the guides-ring rewrite, vault#544) + the `capture` / `guide` / `pinned`
  *     tags. `capture` is the sacred raw-input tag Notes' schema audit requires
  *     (ONE tag since vault#528; entry method lives in note metadata.source);
- *     `guide` is the skill-file tag carrying a `written_for` enum schema
- *     (ai|human|both); `pinned` sits Welcome at the top of the Notes app. The
+ *     `guide` is the skill-file tag (no schema — guides are AI-first + human-
+ *     readable markdown); `pinned` sits Welcome at the top of the Notes app. The
  *     five guides are ordinary notes tagged `#guide` (Welcome also `#pinned`),
- *     each `metadata.written_for: "human"`, forming a small linked web (Welcome
- *     → all four; the rest chain, Connect-your-AI also links [[Getting Started]]).
+ *     forming a small linked web (Welcome → all four; the rest chain,
+ *     Connect-your-AI also links [[Getting Started]]).
  *     The Connect-your-AI note names the console origin (ISSUER_ORIGIN). This
  *     content used to live verbatim in this file; it was ported INTO core
  *     (test-pinned byte-equal there) and is now imported back.
  *
  *  2. The `getting-started` pack — the AI-facing start-here guide, itself a
- *     `#guide` note (`metadata.written_for: "ai"`). Seeding it makes core's
+ *     `#guide` note. Seeding it makes core's
  *     vault-projection emit its `getting_started` pointer, so an MCP client
  *     connecting to a cloud vault gets the same "Start here" orientation a
  *     self-hosted bun vault gets.
