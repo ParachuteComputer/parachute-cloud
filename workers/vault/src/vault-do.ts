@@ -90,7 +90,13 @@ import {
 } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, type WelcomeSeedResult } from "./welcome.js";
-import { SEED_PACK_NAMES, applySeedPack, getSeedPack } from "@openparachute/core/src/seed-packs.js";
+import {
+  SEED_PACK_NAMES,
+  applySeedPack,
+  getSeedPack,
+  DEFAULT_VAULT_DESCRIPTION,
+  IMPORTED_VAULT_DESCRIPTION,
+} from "@openparachute/core/src/seed-packs.js";
 import type { Attachment } from "@openparachute/core/src/types.js";
 import {
   TranscriptionError,
@@ -554,7 +560,14 @@ export class VaultDO extends DurableObject {
     const stored = (await this.ctx.storage.get<VaultConfigState>("config")) ?? null;
     this.config = stored ?? {
       name: vaultName,
-      description: null,
+      // A brand-new vault ships with core's DEFAULT_VAULT_DESCRIPTION so a
+      // connected AI is oriented from the first session (on cloud the
+      // connect-time MCP instruction is essentially just this description —
+      // a null here left the assistant with no onboarding brief). EXISTING
+      // vaults are untouched: they already carry a stored config, so this
+      // default only applies at first materialization. An import/restore
+      // overwrites it with IMPORTED_VAULT_DESCRIPTION (learn-not-seed).
+      description: DEFAULT_VAULT_DESCRIPTION,
       createdAt: new Date().toISOString(),
       audio_retention: "keep",
       auto_transcribe: { enabled: false },
@@ -970,6 +983,12 @@ export class VaultDO extends DurableObject {
     const tarBytes = new Uint8Array(await obj.arrayBuffer());
 
     const stats = await restoreFromTar(this.store, tarBytes);
+    // Like import: the blow-away wiped the fresh target's welcome seed +
+    // DEFAULT_VAULT_DESCRIPTION, and this vault now carries a snapshot's worth of
+    // real content — so the connected AI should LEARN it, not re-seed. Flip the
+    // vault-info description to IMPORTED_VAULT_DESCRIPTION (same config seam).
+    this.config!.description = IMPORTED_VAULT_DESCRIPTION;
+    await this.ctx.storage.put("config", this.config);
     console.log(
       `[restore ${vaultName}] from=${key} notes_created=${stats.notes_created} notes_wiped=${stats.notes_wiped} ` +
         `schemas=${stats.schemas_restored} links=${stats.links_restored} attachments_referenced=${stats.attachments_restored}`,
@@ -1052,6 +1071,14 @@ export class VaultDO extends DurableObject {
     await this.purgeAttachments(vaultName);
     this.r2Bytes = 0;
     await this.ctx.storage.put(R2_METER_KEY, 0);
+
+    // The blow-away import replaced ALL content (including the fresh vault's
+    // welcome seed + its DEFAULT_VAULT_DESCRIPTION), so re-point the vault-info
+    // description at IMPORTED_VAULT_DESCRIPTION: this vault ARRIVED with its own
+    // notes/tags/history, so a connected AI's first job is to LEARN the shape,
+    // not seed one. Same config-write seam as PUT /api/internal/config.
+    this.config!.description = IMPORTED_VAULT_DESCRIPTION;
+    await this.ctx.storage.put("config", this.config);
 
     // Write attachment binaries to R2 + meter storage — deferred past the
     // synchronous restoreAttachment seam (the DO can't await R2 mid-engine).

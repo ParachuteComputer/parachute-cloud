@@ -410,6 +410,7 @@ async function main() {
       const landingJson = (await landing.json()) as {
         cap_bytes?: number;
         caps?: { notes_bytes: number; attachment_bytes: number; attachments_enabled: boolean };
+        description?: string | null;
       };
       assert(
         landing.status === 200 &&
@@ -419,6 +420,18 @@ async function main() {
           landingJson.caps?.attachments_enabled === true,
         "create-time two-meter push landed in the DO (landing caps = trial/Plus: 2 GiB notes + 8 GiB attach)",
         `status ${landing.status}, cap_bytes=${landingJson.cap_bytes}, caps=${JSON.stringify(landingJson.caps)}`,
+      );
+
+      // LAUNCH-CRITICAL: a fresh vault ships with core's DEFAULT_VAULT_DESCRIPTION
+      // (not null) so the connect-time MCP instruction orients the AI. On cloud
+      // that instruction is essentially just this description — a null here left
+      // every connected assistant unoriented. Would've caught the gap at deploy.
+      assert(
+        typeof landingJson.description === "string" &&
+          landingJson.description.length > 0 &&
+          landingJson.description.includes("Getting Started"),
+        "fresh vault carries the default vault-info description (non-empty, mentions Getting Started)",
+        `description=${JSON.stringify(landingJson.description)}`,
       );
 
       // The fresh vault materialized with the DEFAULT SEED PACKS (core's
