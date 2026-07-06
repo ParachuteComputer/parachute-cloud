@@ -38,7 +38,7 @@ import { fileURLToPath } from "node:url";
 import { totpCodeAt } from "../workers/identity/src/totp.ts";
 // core resolves from the sibling parachute-vault checkout, copied into the vault
 // worker's node_modules by `bun install` (the same explicit path test-bun uses).
-import { welcomePack } from "../workers/vault/node_modules/@openparachute/core/src/seed-packs.js";
+import { GETTING_STARTED_PACK, welcomePack } from "../workers/vault/node_modules/@openparachute/core/src/seed-packs.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.aaron-d5d.workers.dev").replace(/\/$/, "");
@@ -419,7 +419,7 @@ async function main() {
       // declared seed tags (capture + guide + pinned), before this user writes
       // anything. Asserted dynamically against the import so core-side
       // vocabulary changes can't strand a stale literal pin here again.
-      const expectedSeedPaths = welcomePack().notes.map((n) => n.path).concat("Getting Started");
+      const expectedSeedPaths = welcomePack().notes.map((n) => n.path).concat(GETTING_STARTED_PACK.notes.map((n) => n.path));
       const seededRes = await fetch(`${VAULT}/vault/${newVault}/api/notes`, { headers: OWN_AUTH });
       const seeded = (await seededRes.json()) as Array<{ path?: string }>;
       const seededPaths = seeded.map((n) => n.path).sort();
