@@ -720,6 +720,29 @@ function vaultCard(v: ConsoleVaultCard, csrfToken: string, planCapBytes: number)
  */
 const VAULT_NAME_PATTERN = "[a-z0-9][a-z0-9\\-]{1,62}";
 
+/**
+ * The "Import a vault" disclosure — the other half of the export door: upload a
+ * Parachute export (.tar) and get a NEW vault with those notes. Multipart form
+ * (a file upload), so it needs `enctype="multipart/form-data"`. Rendered
+ * alongside the create-vault form (first-run hero + the create card) and, like
+ * that form, only when the account is under its vault-count cap — an import
+ * creates a vault, so the POST is refused at the cap regardless.
+ */
+function importDetails(csrfToken: string): string {
+  return `<details data-testid="vault-import" style="margin-top:.9rem">
+    <summary>Import a vault</summary>
+    <p class="muted" style="margin:.35rem 0 .5rem">Upload a Parachute export (.tar) — from self-host, another account, or another provider's export we can read.</p>
+    <form method="post" action="/console/vaults/import" enctype="multipart/form-data">
+      <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+      <label for="import-name">New vault name</label>
+      <input id="import-name" name="vault_name" type="text" placeholder="e.g. imported-notes" pattern="${VAULT_NAME_PATTERN}" required>
+      <label for="import-file" style="margin-top:.5rem">Export file (.tar)</label>
+      <input id="import-file" name="tarball" type="file" accept=".tar,application/x-tar" required>
+      <button class="secondary" type="submit" style="margin-top:.7rem">Import into a new vault</button>
+    </form>
+  </details>`;
+}
+
 // --- the getting-started checklist card -------------------------------------
 
 /** A checklist door that navigates: POST marks it done, then 302s onward. */
@@ -802,6 +825,7 @@ function firstRunHero(csrfToken: string, values: FirstRunValues, error?: string)
         ${error ? `<div class="err">${esc(error)}</div>` : ""}
         <button class="primary" type="submit">Create my vault</button>
       </form>
+      ${importDetails(csrfToken)}
     </div>`;
 }
 
@@ -980,6 +1004,7 @@ export function renderConsole(props: ConsoleProps): string {
          ${error ? `<div class="err">${esc(error)}</div>` : ""}
          <button class="primary" type="submit">Create vault</button>
        </form>
+       ${importDetails(csrfToken)}
      </div>`;
   // The dismissed checklist's way back: a quiet footer link, never a banner —
   // guidance stays reachable without ever re-imposing itself.

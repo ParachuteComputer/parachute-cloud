@@ -15,6 +15,7 @@ import {
   handleConsoleGet,
   handleCreateVaultPost,
   handleExportPost,
+  handleImportPost,
   handleLoginGet,
   handleLoginPost,
   handleLogoutPost,
@@ -125,6 +126,11 @@ app.post("/console/vaults/restore", (c) => handleRestorePost(c.env.DB, c.req.raw
 // seam as the packs button) and streams the vault worker's export tarball back
 // with Content-Disposition: attachment — no token ever lands in a URL.
 app.post("/console/vaults/export", (c) => handleExportPost(c.env.DB, c.req.raw, depsFor(c.env)));
+// The import door (the other half of the export door): session + CSRF + vault-
+// name validation + plan vault-count cap (an import CREATES a vault), then the
+// uploaded tar is forwarded to the new vault's DO via the internal-import mint
+// seam. A failed forward rolls the vault row back. Multipart form upload.
+app.post("/console/vaults/import", (c) => handleImportPost(c.env.DB, c.req.raw, depsFor(c.env)));
 // Seed-pack apply (the "Add the Surface Starter guide" button): session + CSRF
 // + ownership, then a server-side call to the vault worker with an internally
 // minted 60s vault:<name>:write token (the mint seam — see handleAddPackPost).

@@ -60,9 +60,13 @@ export async function callVaultApi(
      *  content calls (packs, notes); "admin" for the internal config seam. */
     verb: "read" | "write" | "admin";
     jsonBody?: unknown;
+    /** Raw (non-JSON) request body — the import door forwards tar bytes.
+     *  Mutually exclusive with jsonBody; `rawContentType` sets its header. */
+    rawBody?: BodyInit;
+    rawContentType?: string;
   },
 ): Promise<Response> {
-  const { userId, vaultName, method, apiPath, verb, jsonBody } = opts;
+  const { userId, vaultName, method, apiPath, verb, jsonBody, rawBody, rawContentType } = opts;
   const signed = await signAccessToken(db, {
     sub: userId,
     scopes: [`vault:${vaultName}:${verb}`],
@@ -75,11 +79,45 @@ export async function callVaultApi(
   });
   const fetchFn = deps.vaultFetch ?? fetch;
   const headers: Record<string, string> = { authorization: `Bearer ${signed.token}` };
-  if (jsonBody !== undefined) headers["content-type"] = "application/json";
+  let body: BodyInit | undefined;
+  if (jsonBody !== undefined) {
+    headers["content-type"] = "application/json";
+    body = JSON.stringify(jsonBody);
+  } else if (rawBody !== undefined) {
+    if (rawContentType) headers["content-type"] = rawContentType;
+    body = rawBody;
+  }
   return fetchFn(`${vaultInstanceUrl(vaultName, deps)}${apiPath}`, {
     method,
     headers,
-    ...(jsonBody !== undefined ? { body: JSON.stringify(jsonBody) } : {}),
+    ...(body !== undefined ? { body } : {}),
+  });
+}
+
+/**
+ * Forward an uploaded portable-md export tarball to the target vault's DO
+ * (`POST /api/internal/import` — the same first-party admin mint seam as
+ * restore/snapshot, here carrying RAW tar bytes rather than JSON). The console
+ * import door (console.ts handleImportPost) enforces the user-facing boundary
+ * FIRST (session + CSRF + same-origin + vault-name validation + plan cap) and
+ * creates the target vault before calling here. Not best-effort: the caller
+ * inspects the response (and rolls back the vault row on failure).
+ */
+export async function callVaultImport(
+  db: D1Database,
+  deps: OAuthDeps,
+  userId: string,
+  vaultName: string,
+  tarBytes: ArrayBuffer | Uint8Array,
+): Promise<Response> {
+  return callVaultApi(db, deps, {
+    userId,
+    vaultName,
+    method: "POST",
+    apiPath: "/api/internal/import",
+    verb: "admin",
+    rawBody: tarBytes,
+    rawContentType: "application/x-tar",
   });
 }
 

@@ -56,6 +56,7 @@ import {
   VaultNameTakenError,
   countVaultsForOwner,
   createVault,
+  deleteVault,
   getVault,
   listVaultsForOwner,
   userOwnsVault,
@@ -69,7 +70,7 @@ import {
   restoreAtCapMessage,
   vaultCapMessage,
 } from "./plans.ts";
-import { callVaultApi, pushVaultCap } from "./vault-call.ts";
+import { callVaultApi, callVaultImport, pushVaultCap } from "./vault-call.ts";
 import {
   callVaultRestore,
   isKnownSnapshot,
@@ -362,6 +363,19 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
   // rides the success message: honesty at the exact moment it matters.
   const restoredParam = params.get("restored");
   const restoredVault = restoredParam && vaults.some((v) => v.name === restoredParam) ? restoredParam : null;
+  // Import success notice — only for a vault this user actually owns (the param
+  // is user-editable; same rule as restored/pack_added). The note count + any
+  // attachment caveat ride the redirect as numbers (clamped defensively).
+  const importedParam = params.get("imported");
+  const importedVault = importedParam && vaults.some((v) => v.name === importedParam) ? importedParam : null;
+  const importedNotes = Math.max(0, Math.trunc(Number(params.get("notes") ?? "")) || 0);
+  const importedSkipped = Math.max(0, Math.trunc(Number(params.get("skipped") ?? "")) || 0);
+  const importNotice = importedVault
+    ? `Imported into "${importedVault}" — ${importedNotes} ${importedNotes === 1 ? "note is" : "notes are"} ready.` +
+      (importedSkipped > 0
+        ? ` Heads up: ${importedSkipped} attachment ${importedSkipped === 1 ? "file" : "files"} couldn't be carried over — the notes and their references are in, but ${importedSkipped === 1 ? "the file itself is" : "the files themselves are"} not.`
+        : "")
+    : null;
   // Promo success copy renders from the ROW (plan + plan_downgrade_at), never
   // from the query string — the param only picks the message; the date is the
   // stored truth (honest even on a stale/replayed URL).
@@ -371,6 +385,8 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
       : null;
   const notice = created
     ? `Your vault "${created}" is ready — open your notes, or connect your AI below.`
+    : importNotice
+    ? importNotice
     : restoredVault
       ? `Snapshot restored into "${restoredVault}" — a new vault; the original is untouched. Heads up: v1 snapshots don't include attachment files, so notes and their attachment references are back but the files themselves aren't.`
       : packVault
@@ -538,6 +554,152 @@ export async function handleExportPost(db: D1Database, req: Request, deps: OAuth
   const len = res.headers.get("content-length");
   if (len) headers.set("content-length", len);
   return new Response(res.body, { status: 200, headers });
+}
+
+// --- the import door (the other half of the portability promise) -------------
+
+/**
+ * The cloud import ceiling — must equal the vault worker's `MAX_IMPORT_BYTES`
+ * (restore.ts). Separate Workers, no shared module; keep the two identical.
+ */
+const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
+const MAX_IMPORT_MIB = 50;
+
+function importTooLargeMessage(): string {
+  return `That export is over the ${MAX_IMPORT_MIB} MiB import limit. For a larger vault, write hello@parachute.computer — or use the CLI import on self-host.`;
+}
+
+/**
+ * POST /console/vaults/import — upload a Parachute export (.tar), get a NEW
+ * vault with those notes. The other half of the export door: the portability
+ * promise runs in both directions.
+ *
+ * The user-facing trust boundary mirrors the create door (an import CREATES a
+ * vault): session + CSRF + same-origin + vault-name validation identical to
+ * create (createVault throws on a bad/taken slug) + the plan vault-count cap
+ * (reused verbatim — expired, vault_count 0, is refused here exactly as create
+ * refuses it). Then: create the target vault → push the plan cap → forward the
+ * tar to the target DO's `POST /api/internal/import` through the mint seam
+ * (first-party admin, aud-pinned, 60s — same seam as restore/packs, carrying
+ * raw bytes). On ANY forward failure DELETE the vault row — don't leak a broken
+ * half-vault. On success: redirect with the note count for the success notice.
+ *
+ * Body-size: an oversize upload is refused early on Content-Length (before the
+ * multipart parse), again on the extracted file size, and finally by the vault
+ * worker's own 413 — three fences, one friendly message.
+ */
+export async function handleImportPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const user = await sessionUser(db, req, deps);
+  if (!user) return redirectResponse("/login");
+
+  // Refuse an oversize upload before parsing the multipart body (item 8). A
+  // browser always sends Content-Length for a file POST; an absent/spoofed one
+  // is caught again below and by the vault worker.
+  const declaredLen = Number(req.headers.get("content-length") ?? "");
+  if (Number.isFinite(declaredLen) && declaredLen > MAX_IMPORT_BYTES) {
+    return consoleError(db, req, deps, user, importTooLargeMessage());
+  }
+
+  const form = await req.formData();
+  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+    return consoleError(db, req, deps, user, "Your session expired. Please try again.");
+  }
+  const rawName = String(form.get("vault_name") ?? "");
+  const file = form.get("tarball");
+
+  // Plan vault-count gate — verbatim from the create door. `>=` grandfathers
+  // accounts already over a cap; expired (vault_count 0) is refused here.
+  const spec = PLAN_SPECS[user.plan];
+  if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
+    return consoleError(db, req, deps, user, vaultCapMessage(user.plan));
+  }
+
+  // workers-types under-types FormData.get as `string | null` (no File), but a
+  // multipart file field is a Blob-like at runtime. Guard the string/null cases;
+  // treat the remainder as a Blob (arrayBuffer() reads the bytes).
+  if (file === null || typeof file === "string") {
+    return consoleError(db, req, deps, user, "Choose a Parachute export file (.tar) to import.");
+  }
+  const buf = await (file as unknown as Blob).arrayBuffer();
+  if (buf.byteLength === 0) {
+    return consoleError(db, req, deps, user, "That file was empty — choose a Parachute export (.tar).");
+  }
+  if (buf.byteLength > MAX_IMPORT_BYTES) {
+    return consoleError(db, req, deps, user, importTooLargeMessage());
+  }
+
+  // Create the target vault — name validation identical to the create door.
+  const now = deps.now?.() ?? new Date();
+  let vaultName: string;
+  try {
+    const vault = await createVault(db, rawName, user.id, now);
+    vaultName = vault.name;
+  } catch (err) {
+    if (err instanceof VaultNameInvalidError) {
+      const msg =
+        err.reason === "reserved"
+          ? "That name is reserved. Please choose another."
+          : "Use 2–63 characters: lowercase letters, numbers, and hyphens (starting with a letter or number).";
+      return consoleError(db, req, deps, user, msg);
+    }
+    if (err instanceof VaultNameTakenError) {
+      return consoleError(db, req, deps, user, "That vault name is already taken.");
+    }
+    throw err;
+  }
+
+  // Push the plan's caps + voice entitlement (best-effort, as any creation).
+  await pushVaultCap(db, deps, user.id, vaultName, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan)));
+
+  // Forward the tar. Any failure → roll the vault row back (don't leak a broken
+  // half-vault; log loudly).
+  let res: Response;
+  try {
+    res = await callVaultImport(db, deps, user.id, vaultName, buf);
+  } catch (err) {
+    await deleteVault(db, vaultName, user.id);
+    console.warn(
+      `event=import_unreachable vault=${vaultName} error=${err instanceof Error ? err.message : String(err)}`,
+    );
+    return consoleError(
+      db,
+      req,
+      deps,
+      user,
+      "Couldn't reach your vault to finish the import — nothing was created. Please try again.",
+    );
+  }
+  if (!res.ok) {
+    await deleteVault(db, vaultName, user.id);
+    if (res.status === 413) {
+      console.warn(`event=import_too_large vault=${vaultName}`);
+      return consoleError(db, req, deps, user, importTooLargeMessage());
+    }
+    console.warn(`event=import_failed vault=${vaultName} status=${res.status}`);
+    return consoleError(
+      db,
+      req,
+      deps,
+      user,
+      "That file didn't look like a Parachute export we could read — nothing was created. Check the file and try again.",
+    );
+  }
+
+  const summary = (await res.json().catch(() => ({}))) as {
+    notes?: unknown;
+    stats?: { notes_created?: unknown; skipped_attachments?: unknown };
+  };
+  const notes =
+    typeof summary.notes === "number"
+      ? summary.notes
+      : typeof summary.stats?.notes_created === "number"
+        ? summary.stats.notes_created
+        : 0;
+  const skipped = typeof summary.stats?.skipped_attachments === "number" ? summary.stats.skipped_attachments : 0;
+  console.log(`event=import_completed vault=${vaultName} notes=${notes} skipped_attachments=${skipped}`);
+  return redirectResponse(
+    `/console?imported=${encodeURIComponent(vaultName)}&notes=${notes}&skipped=${skipped}`,
+  );
 }
 
 // --- snapshot restore (Wave 4e — paid plans only) -----------------------------

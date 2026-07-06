@@ -12,7 +12,7 @@
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import app from "../src/index.ts";
-import { handleAddPackPost, handleExportPost } from "../src/console.ts";
+import { handleAddPackPost, handleExportPost, handleImportPost } from "../src/console.ts";
 import { validateAccessToken } from "../src/tokens.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "../src/oauth-authorize.ts";
 import { handleToken } from "../src/oauth-token.ts";
@@ -803,6 +803,257 @@ describe("console — the export door (POST /console/vaults/export)", () => {
     expect(html).toContain('action="/console/vaults/export"');
     expect(html).toContain("Download everything (.tar)");
     expect(html).toContain('name="vault" value="cardtar"');
+  });
+});
+
+// --- console: the import door (the other half of the portability promise) ----
+
+describe("console — the import door (POST /console/vaults/import)", () => {
+  beforeAll(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+  afterEach(() => fetchMock.assertNoPendingInterceptors());
+
+  function sessionCookie(sessionId: string): string {
+    return `parachute_id_csrf=${CSRF}; parachute_id_session=${sessionId}`;
+  }
+
+  // A small stand-in tar (its bytes are forwarded verbatim; the vault worker,
+  // mocked here, owns the actual replay — pinned end-to-end in the vault suite).
+  const TAR = new Uint8Array([...new TextEncoder().encode("fake-tar-bytes"), 0, 0]);
+
+  /** A multipart import upload (vault_name + tarball file). `tar: null` omits
+   *  the file (the choose-a-file case). */
+  function importReq(
+    vaultName: string,
+    tar: Uint8Array | null,
+    cookie: string,
+    opts: { csrf?: string; origin?: string } = {},
+  ): Request {
+    const fd = new FormData();
+    fd.set("__csrf", opts.csrf ?? CSRF);
+    fd.set("vault_name", vaultName);
+    if (tar !== null) fd.set("tarball", new File([tar], "export.tar", { type: "application/x-tar" }));
+    return new Request(`${ISSUER}/console/vaults/import`, {
+      method: "POST",
+      body: fd,
+      headers: { origin: opts.origin ?? ISSUER, cookie },
+    });
+  }
+
+  test("happy path: creates the vault, forwards the tar with a 60s ADMIN token, redirects with the note count", async () => {
+    const { id: userId } = await seedUser("import@example.com");
+    const sessionId = await seedSession(userId);
+    // Real-time clock (validateAccessToken checks exp against the real clock).
+    const now = new Date();
+    let seen: { url: string; auth: string | null; ct: string | null; body: Uint8Array } | null = null;
+    const boundDeps = {
+      ...deps(() => now),
+      vaultFetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const body = new Uint8Array(await new Response(init?.body as BodyInit).arrayBuffer());
+        seen = {
+          url: String(input),
+          auth: new Headers(init?.headers).get("authorization"),
+          ct: new Headers(init?.headers).get("content-type"),
+          body,
+        };
+        return new Response(
+          JSON.stringify({ imported: true, notes: 3, stats: { notes_created: 3, skipped_attachments: 0 } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    };
+    const res = await handleImportPost(env.DB, importReq("imported-box", TAR, sessionCookie(sessionId)), boundDeps);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?imported=imported-box&notes=3&skipped=0");
+
+    // The vault now exists and is owned by the importer.
+    const v = await getVault(env.DB, "imported-box");
+    expect(v?.ownerUserId).toBe(userId);
+
+    // The forward: POST /api/internal/import, RAW tar bytes, admin token.
+    expect(seen!.url).toBe(`https://imported-box.${VAULT_BASE}/api/internal/import`);
+    expect(seen!.ct).toBe("application/x-tar");
+    expect(seen!.body).toEqual(TAR);
+    const token = seen!.auth!.replace(/^Bearer /, "");
+    const { payload } = await validateAccessToken(env.DB, token, ISSUER);
+    expect(payload.aud).toBe("vault.imported-box");
+    expect(payload.scope).toBe("vault:imported-box:admin");
+    expect(payload.vault_scope).toEqual(["imported-box"]);
+    expect(payload.sub).toBe(userId);
+    expect(payload.client_id).toBe("parachute-console");
+    expect((payload.exp as number) - (payload.iat as number)).toBe(60);
+  });
+
+  test("route-level wiring: the real router creates + forwards end-to-end", async () => {
+    const { id: userId } = await seedUser("import-route@example.com");
+    const sessionId = await seedSession(userId);
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: "/vault/routeimport/api/internal/import", method: "POST" })
+      .reply(200, { imported: true, notes: 2, stats: { notes_created: 2, skipped_attachments: 0 } }, {
+        headers: { "content-type": "application/json" },
+      });
+    const res = await app.fetch(importReq("routeimport", TAR, sessionCookie(sessionId)), env);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?imported=routeimport&notes=2&skipped=0");
+    expect(await getVault(env.DB, "routeimport")).not.toBeNull();
+  });
+
+  test("a vault-worker failure rolls the vault row back (no broken half-vault) and reports honestly", async () => {
+    const { id: userId } = await seedUser("import-fail@example.com");
+    const sessionId = await seedSession(userId);
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async () =>
+        new Response(JSON.stringify({ error_type: "import_unreadable" }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+    };
+    const res = await handleImportPost(env.DB, importReq("broken-import", TAR, sessionCookie(sessionId)), boundDeps);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("didn&#39;t look like a Parachute export");
+    // Rolled back — the name is free again, no half-vault left behind.
+    expect(await getVault(env.DB, "broken-import")).toBeNull();
+  });
+
+  test("the vault worker's 413 surfaces the too-large message and rolls back", async () => {
+    const { id: userId } = await seedUser("import-413@example.com");
+    const sessionId = await seedSession(userId);
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async () =>
+        new Response(JSON.stringify({ error_type: "import_too_large" }), {
+          status: 413,
+          headers: { "content-type": "application/json" },
+        }),
+    };
+    const res = await handleImportPost(env.DB, importReq("toobig-vault", TAR, sessionCookie(sessionId)), boundDeps);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("over the 50 MiB import limit");
+    expect(await getVault(env.DB, "toobig-vault")).toBeNull();
+  });
+
+  test("an upload over 50 MiB is refused early on Content-Length — no vault, no outbound call", async () => {
+    const { id: userId } = await seedUser("import-big@example.com");
+    const sessionId = await seedSession(userId);
+    let called = false;
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async () => {
+        called = true;
+        return new Response("{}");
+      },
+    };
+    const req = new Request(`${ISSUER}/console/vaults/import`, {
+      method: "POST",
+      body: "x",
+      headers: {
+        origin: ISSUER,
+        cookie: sessionCookie(sessionId),
+        "content-length": String(50 * 1024 * 1024 + 1),
+      },
+    });
+    const res = await handleImportPost(env.DB, req, boundDeps);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("over the 50 MiB import limit");
+    expect(called).toBe(false);
+    expect(await getVault(env.DB, "any-big-vault")).toBeNull();
+  });
+
+  test("auth required: anonymous → /login; a bad CSRF is refused with no vault created", async () => {
+    const anon = await app.fetch(importReq("anon-vault", TAR, `parachute_id_csrf=${CSRF}`), env);
+    expect(anon.status).toBe(302);
+    expect(anon.headers.get("location")).toBe("/login");
+
+    const { id: userId } = await seedUser("import-csrf@example.com");
+    const sessionId = await seedSession(userId);
+    const badCsrf = await app.fetch(
+      importReq("csrf-vault", TAR, sessionCookie(sessionId), { csrf: "wrong-token" }),
+      env,
+    );
+    expect(badCsrf.status).toBe(200);
+    expect(await badCsrf.text()).toContain("session expired");
+    expect(await getVault(env.DB, "csrf-vault")).toBeNull();
+  });
+
+  test("the plan vault-count cap refuses (create-door parity) — no vault, no outbound call", async () => {
+    const { id: userId } = await seedUser("import-cap@example.com");
+    // Expired → vault_count 0: the create-door cap refuses any new vault.
+    await env.DB.prepare("UPDATE users SET plan = 'expired' WHERE id = ?").bind(userId).run();
+    const sessionId = await seedSession(userId);
+    const res = await app.fetch(importReq("capped-vault", TAR, sessionCookie(sessionId)), env);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("pick a plan to create vaults again");
+    expect(await getVault(env.DB, "capped-vault")).toBeNull();
+  });
+
+  test("a missing file → the choose-a-file error, no vault created", async () => {
+    const { id: userId } = await seedUser("import-nofile@example.com");
+    const sessionId = await seedSession(userId);
+    const res = await app.fetch(importReq("nofile-vault", null, sessionCookie(sessionId)), env);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Choose a Parachute export");
+    expect(await getVault(env.DB, "nofile-vault")).toBeNull();
+  });
+
+  test("a taken vault name is refused with the create-door message (no forward)", async () => {
+    const { id: userId } = await seedUser("import-taken@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("already-here", userId);
+    // disableNetConnect + no interceptor: a forward would throw, not render.
+    const res = await app.fetch(importReq("already-here", TAR, sessionCookie(sessionId)), env);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("already taken");
+  });
+
+  test("the success notice renders for an owned vault; the attachment caveat rides a skipped count", async () => {
+    const { id: userId } = await seedUser("import-notice@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("notice-box", userId);
+
+    const clean = await app.fetch(
+      new Request(`${ISSUER}/console?imported=notice-box&notes=5&skipped=0`, {
+        headers: { cookie: sessionCookie(sessionId) },
+      }),
+      env,
+    );
+    const cleanHtml = await clean.text();
+    expect(cleanHtml).toContain("Imported into &quot;notice-box&quot;");
+    expect(cleanHtml).toContain("5 notes are ready");
+    expect(cleanHtml).not.toContain("couldn&#39;t be carried over");
+
+    const caveat = await app.fetch(
+      new Request(`${ISSUER}/console?imported=notice-box&notes=5&skipped=2`, {
+        headers: { cookie: sessionCookie(sessionId) },
+      }),
+      env,
+    );
+    expect(await caveat.text()).toContain("2 attachment files couldn&#39;t be carried over");
+
+    // A crafted imported= for a vault the user does NOT own paints no banner.
+    const spoof = await app.fetch(
+      new Request(`${ISSUER}/console?imported=not-mine&notes=99`, { headers: { cookie: sessionCookie(sessionId) } }),
+      env,
+    );
+    expect(await spoof.text()).not.toContain("Imported into");
+  });
+
+  test("the console renders the import door alongside the create form", async () => {
+    const { id: userId } = await seedUser("import-card@example.com");
+    const sessionId = await seedSession(userId);
+    await seedVault("has-a-vault", userId);
+    const res = await app.fetch(
+      new Request(`${ISSUER}/console`, { headers: { cookie: sessionCookie(sessionId) } }),
+      env,
+    );
+    const html = await res.text();
+    expect(html).toContain('data-testid="vault-import"');
+    expect(html).toContain('action="/console/vaults/import"');
+    expect(html).toContain('enctype="multipart/form-data"');
+    expect(html).toContain('name="tarball"');
   });
 });
 
