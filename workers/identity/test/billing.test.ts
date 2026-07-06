@@ -835,6 +835,44 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
     expect(JSON.parse(pushed)).toEqual(planEntitlement("standard"));
   });
 
+  test("junk metadata.plan but a POWER line-item price → resolves Power via planForPrice (not the standard default)", async () => {
+    // A completed PAID checkout whose metadata.plan tag is garbled must not
+    // silently floor the buyer to `standard`. The webhook falls back to the
+    // session's line-item PRICE id → tier (planForPrice). Here the buyer paid
+    // for Power — they get Power, and Power's entitlement pushes to their vault.
+    const { id } = await seedUser("junkmeta-power@example.com");
+    await seedVault("junkmeta-power-box", id);
+    let pushed = "";
+    interceptCapPush("junkmeta-power-box", (b) => (pushed = b));
+    // The metadata-fallback line-item lookup: GET /v1/checkout/sessions/:id/line_items.
+    fetchMock
+      .get("https://api.stripe.com")
+      .intercept({ path: (p: string) => p.startsWith("/v1/checkout/sessions/cs_test_1/line_items"), method: "GET" })
+      .reply(
+        200,
+        {
+          object: "list",
+          has_more: false,
+          url: "/v1/checkout/sessions/cs_test_1/line_items",
+          data: [{ id: "li_1", object: "item", price: { id: "price_test_power_monthly", object: "price" } }],
+        },
+        { headers: { "content-type": "application/json" } },
+      );
+
+    const res = await postWebhook(
+      makeEventPayload("checkout.session.completed", {
+        ...checkoutCompletedObject({ userId: id, customer: "cus_junk_1", subscription: "sub_junk_1" }),
+        metadata: { plan: "definitely-not-a-tier" },
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { action: string }).action).toBe("checkout_completed_upgraded");
+
+    const user = (await getUserById(env.DB, id))!;
+    expect(user.plan).toBe("power"); // the line-item price resolved it, NOT the standard default
+    expect(JSON.parse(pushed)).toEqual(planEntitlement("power"));
+  });
+
   test("TRIAL CONVERSION lands IMMEDIATELY at session completion: metadata.plan routes the tier, the pair clears, the tier's caps push (while the Stripe-trial still runs)", async () => {
     // The card-on-file flow: checkout.session.completed fires when the card is
     // entered — the Stripe subscription is still TRIALING (trial_end = day 30)
@@ -991,7 +1029,7 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
       ),
     ) as Stripe.Event;
 
-    const result = await handleCheckoutSessionCompleted(env.DB, deps(), event, stripeStub);
+    const result = await handleCheckoutSessionCompleted(env.DB, deps(), event, stripeStub, billingConfig(BILLING_ENV)!);
     expect((result as { action: string }).action).toBe("checkout_completed_upgraded");
     expect(rowAtCancel).toBe("sub_order_new");
     // And the stale sub's deleted-webhook now resolves to no row → no-op:
@@ -1032,9 +1070,10 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
         ),
       ) as Stripe.Event;
 
+    const config = billingConfig(BILLING_ENV)!;
     const [a, b] = await Promise.all([
-      handleCheckoutSessionCompleted(readBarrierDb(env.DB, barrier), deps(), eventFor("sub_cc_a"), stripeStub),
-      handleCheckoutSessionCompleted(readBarrierDb(env.DB, barrier), deps(), eventFor("sub_cc_b"), stripeStub),
+      handleCheckoutSessionCompleted(readBarrierDb(env.DB, barrier), deps(), eventFor("sub_cc_a"), stripeStub, config),
+      handleCheckoutSessionCompleted(readBarrierDb(env.DB, barrier), deps(), eventFor("sub_cc_b"), stripeStub, config),
     ]);
     expect((a as { action: string }).action).toBe("checkout_completed_upgraded");
     expect((b as { action: string }).action).toBe("checkout_completed_upgraded");

@@ -71,7 +71,7 @@ workers/identity/   the OAuth issuer (authorize/token/DCR/JWKS/revocation on D1)
                     magic-link sign-in ON the OAuth authorize login page,
                     where the emailed link RESUMES the pending authorize
                     request (`magic_links.next`, migration 0017 — the
-                    passwordless-user reconnect fix). 387 tests.
+                    passwordless-user reconnect fix). 407 tests.
 src/                the OLD control plane (Worker + D1 + Stripe). Dormant; billing
                     lifecycle design gets harvested into the control-plane revival.
 scripts/            deploy-staging.sh + smoke-staging.ts (full 118-step live smoke,
@@ -88,7 +88,7 @@ bun install                         # ALSO refreshes the copied core dep (see go
 bun run test                        # control-plane tests (src/) + the export→import round-trip (test-bun/) — 124
 bun run typecheck                   # root tsc
 cd workers/vault && bun run typecheck && bun x vitest run    # 260+1 todo under workerd
-cd workers/identity && bun run typecheck && bun x vitest run # 387
+cd workers/identity && bun run typecheck && bun x vitest run # 407
 bash scripts/deploy-staging.sh      # deploy both workers -e staging + migrate + seed
 bun scripts/smoke-staging.ts        # FULL live smoke vs staging (creates test debris)
 bash scripts/deploy-prod.sh         # deploy both workers top-level + migrate (NO seed)

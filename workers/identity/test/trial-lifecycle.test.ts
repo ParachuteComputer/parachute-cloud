@@ -26,6 +26,48 @@ function recordingDeps() {
   return { d, pushes };
 }
 
+/**
+ * Wrap the DB so the sweep's due-rows SELECT (`.all`), the instant after it
+ * resolves, runs `convert()` — a webhook conversion write — BEFORE returning.
+ * This forces the exact interleave the race guard defends: the sweep SELECTs the
+ * still-due row, the conversion lands (paid plan + pending pair cleared), THEN
+ * the sweep's per-row conditional write executes against the now-converted row.
+ * Fires once; every other statement (the conditional UPDATE, applyPlanToVaults'
+ * reads) passes straight through to the real DB.
+ */
+function convertBetweenSelectAndWrite(real: D1Database, convert: () => Promise<void>): D1Database {
+  let fired = false;
+  return {
+    prepare(sql: string) {
+      const stmt = real.prepare(sql);
+      // Gate ONLY the sweep's due-rows SELECT (its unique WHERE shape).
+      if (fired || !sql.includes("pending_plan IS NOT NULL AND plan_downgrade_at IS NOT NULL")) return stmt;
+      return {
+        bind: (...args: unknown[]) => {
+          const bound = stmt.bind(...args);
+          return {
+            all: async (...a: unknown[]) => {
+              const rows = await (bound.all as (...x: unknown[]) => Promise<unknown>)(...a);
+              if (!fired) {
+                fired = true;
+                await convert(); // the conversion lands AFTER the SELECT, BEFORE the write
+              }
+              return rows;
+            },
+            first: (...a: unknown[]) => (bound.first as (...x: unknown[]) => Promise<unknown>)(...a),
+            run: () => bound.run(),
+            raw: (...a: unknown[]) => (bound.raw as (...x: unknown[]) => unknown)(...a),
+          };
+        },
+      };
+    },
+    batch: (stmts: D1PreparedStatement[]) => real.batch(stmts),
+    exec: (sql: string) => real.exec(sql),
+    dump: () => real.dump(),
+    withSession: (constraint?: string) => real.withSession(constraint as never),
+  } as unknown as D1Database;
+}
+
 describe("trial → expired sweep", () => {
   test("a DUE trial is flipped to expired and its vaults get frozen:true", async () => {
     const { id } = await seedUser("sweepdue@example.com"); // seedUser → trial (pending expired, +30d)
@@ -69,6 +111,46 @@ describe("trial → expired sweep", () => {
     expect(user!.pendingPlan).toBeNull();
     expect(pushes.length).toBe(1);
     expect((pushes[0] as { frozen: boolean }).frozen).toBe(true); // the floor pushed
+  });
+
+  test("SWEEP vs CONVERSION race: a trial that PAYS between the sweep's SELECT and its write keeps the paid plan — never floored, no frozen push", async () => {
+    // The race the cloud#84 review flagged: the sweep SELECTs a due trial, then
+    // checkout.session.completed lands and converts the row (paid plan + pending
+    // pair cleared atomically), then the sweep goes to write. The pre-fix
+    // UNCONDITIONAL write would floor the just-paid user to 'expired' and push
+    // frozen:true caps over the ones the webhook already set. The conditional
+    // write matches 0 rows (the pending pair is gone), so nothing is applied.
+    const { id } = await seedUser("sweep-convert-race@example.com"); // trial, pending expired
+    await seedVault("sweep-convert-race-box", id);
+    // Backdate the clock so the sweep's SELECT sees the row as due.
+    await env.DB.prepare("UPDATE users SET plan_downgrade_at = ? WHERE id = ?")
+      .bind(new Date(Date.now() - 60_000).toISOString(), id)
+      .run();
+
+    // The conversion the webhook's CAS performs (handleCheckoutSessionCompleted):
+    // flip to the bought PAID tier AND clear the pending pair, atomically.
+    const convert = async () => {
+      await env.DB.prepare(
+        "UPDATE users SET plan = 'power', stripe_subscription_id = 'sub_paid_race', pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ? AND stripe_subscription_id IS NULL",
+      )
+        .bind(id)
+        .run();
+    };
+
+    const { d, pushes } = recordingDeps();
+    const summary = await runBillingSweep(convertBetweenSelectAndWrite(env.DB, convert), d, new Date());
+
+    // Due at SELECT time (due:1), but the conversion cleared the pending pair
+    // before the write → the conditional UPDATE matched 0 rows → applied:0.
+    expect(summary).toEqual({ due: 1, applied: 0 });
+
+    const user = await getUserById(env.DB, id);
+    expect(user!.plan).toBe("power"); // the plan the buyer PAID for — NOT floored to 'expired'
+    expect(user!.pendingPlan).toBeNull();
+    expect(user!.planDowngradeAt).toBeNull();
+    // The exact bug: the pre-fix write pushed frozen:true caps over the caps the
+    // webhook already set. The fix pushes NOTHING for this row.
+    expect(pushes).toHaveLength(0);
   });
 
   test("a trial whose clock hasn't struck is left ALONE (still trial, still ticking)", async () => {
