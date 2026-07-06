@@ -7,11 +7,11 @@
 # (Aaron's ledger). When any is missing it warns loudly and SKIPS the deploy,
 # exiting green — merges to main must not be red-gated on a pending ops step.
 #
-#   CLOUDFLARE_API_TOKEN   API token in the "Unforced Development" CF account:
+#   CLOUDFLARE_API_TOKEN   API token in the new Parachute CF account (d5d7c864…):
 #                          Account → Workers Scripts: Edit; Account → D1: Edit;
 #                          Account → Workers R2 Storage: Edit;
 #                          Zone (parachute.computer) → Workers Routes: Edit.
-#   CLOUDFLARE_ACCOUNT_ID  8f2a7eb9d5e21ffa902a76cf62975c82 (the deploy scripts
+#   CLOUDFLARE_ACCOUNT_ID  d5d7c8646c3b69ce9f16bfd12ecbe98a (the deploy scripts
 #                          also hardcode this — the secret is belt+suspenders
 #                          and future-proofs the scripts dropping the hardcode).
 #   DEV_SECRETS            The literal contents of workers/identity/.dev-secrets

@@ -1,6 +1,6 @@
 # Vault DO + edge router — the wire contract on Durable Objects (Phase 2).
 # Tests drive it via @cloudflare/vitest-pool-workers inside workerd; typecheck
-# via tsc. Deployed to the Unforced Development CF account — see
+# via tsc. Deployed to the new Parachute account — see
 # workers/vault/README.md.
 #
 # ENVIRONMENTS: the TOP LEVEL of this file IS production (scripts/deploy-prod.sh;
@@ -66,13 +66,13 @@ tag = "v1"
 new_sqlite_classes = ["VaultDO"]
 
 # Attachment bytes + (later) export tarballs. Keys: vault-<name>/attachments/...
-# The PRODUCTION bucket (created via `wrangler r2 bucket create parachute-vault-dev`
-# back when this deploy was "dev"; the name is grandfathered — it holds the live
-# data, so it stays). vitest ignores bucket_name (local R2 sim by binding).
+# The PRODUCTION bucket (`wrangler r2 bucket create parachute-vault` on the new
+# Parachute account — clean name; dropped the grandfathered "-dev" suffix at the
+# 2026-07-05 account migration). vitest ignores bucket_name (local R2 sim by binding).
 # Staging has its own bucket in [env.staging] below.
 [[r2_buckets]]
 binding = "ATTACHMENTS"
-bucket_name = "parachute-vault-dev"
+bucket_name = "parachute-vault"
 
 # Workers AI — the cloud voice-transcription backend (cloud#56). The DO alarm
 # resolves a WorkersAiProvider over this binding and calls
@@ -142,8 +142,8 @@ binding = "AI"
 # staging identity worker's ISSUER ([env.staging.vars] in
 # workers/identity/wrangler.toml) — staging vaults trust the STAGING issuer.
 [env.staging.vars]
-ISSUER_ORIGIN = "https://parachute-identity-staging.unforced.workers.dev"
-VAULT_BASE_DOMAIN = "parachute-vault-do-staging.unforced.workers.dev"
+ISSUER_ORIGIN = "https://parachute-identity-staging.aaron-d5d.workers.dev"
+VAULT_BASE_DOMAIN = "parachute-vault-do-staging.aaron-d5d.workers.dev"
 CAP_BYTES = "1073741824"
 # "staging" ≠ "test": the TEST_JWKS double-gate stays closed here too.
 ENVIRONMENT = "staging"
