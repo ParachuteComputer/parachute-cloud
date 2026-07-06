@@ -82,8 +82,13 @@ workers/identity/   the OAuth issuer (authorize/token/DCR/JWKS/revocation on D1)
                     target's R2 attachments so re-imports converge + don't
                     double-meter); a failed forward KEEPS the ownership row
                     (restore-door parity — never free a name whose DO may still
-                    hold the upload; the owner retries into the same vault). 50
-                    MiB `MAX_IMPORT_BYTES` ceiling. 420 tests.
+                    hold the upload; the owner retries into the same vault).
+                    Retry-reuse is GATED by `vaults.import_pending_at`
+                    (migration 0019: stamped at import-create, cleared on
+                    success) — only a still-pending row may be re-imported
+                    into; a populated same-owner vault gets "already taken",
+                    never a blow-away. 50 MiB `MAX_IMPORT_BYTES` ceiling.
+                    421 tests.
 src/                the OLD control plane (Worker + D1 + Stripe). Dormant; billing
                     lifecycle design gets harvested into the control-plane revival.
 scripts/            deploy-staging.sh + smoke-staging.ts (full 118-step live smoke,
@@ -100,7 +105,7 @@ bun install                         # ALSO refreshes the copied core dep (see go
 bun run test                        # control-plane tests (src/) + the export→import round-trip (test-bun/) — 125
 bun run typecheck                   # root tsc
 cd workers/vault && bun run typecheck && bun x vitest run    # 271+1 todo under workerd
-cd workers/identity && bun run typecheck && bun x vitest run # 420
+cd workers/identity && bun run typecheck && bun x vitest run # 421
 bash scripts/deploy-staging.sh      # deploy both workers -e staging + migrate + seed
 bun scripts/smoke-staging.ts        # FULL live smoke vs staging (creates test debris)
 bash scripts/deploy-prod.sh         # deploy both workers top-level + migrate (NO seed)

@@ -919,7 +919,11 @@ describe("console — the import door (POST /console/vaults/import)", () => {
     expect(await res.text()).toContain("is reserved for you");
     // NEVER freed — a freed name whose DO may still hold the upload would be
     // claimable by another account (cross-account exposure). The owner retries.
-    expect((await getVault(env.DB, "broken-import"))?.ownerUserId).toBe(userId);
+    const row = await getVault(env.DB, "broken-import");
+    expect(row?.ownerUserId).toBe(userId);
+    // Still import-pending (migration 0019) — the flag that authorizes the retry
+    // to reuse this row (and ONLY this kind of row) stays set on failure.
+    expect(row?.importPendingAt).not.toBeNull();
   });
 
   test("a forward-unreachable failure (vaultFetch throws) also KEEPS the row (never 500s)", async () => {
@@ -989,19 +993,56 @@ describe("console — the import door (POST /console/vaults/import)", () => {
         return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
       },
     };
-    // Attempt 1 — fails, but the name is now reserved for this owner.
+    // Attempt 1 — fails, but the name is now reserved for this owner, flagged
+    // import-pending (the retry-reuse authorization, migration 0019).
     const first = await handleImportPost(env.DB, importReq("retry-box", TAR, sessionCookie(sessionId)), boundDeps);
     expect(first.status).toBe(200);
     expect(await first.text()).toContain("is reserved for you");
-    expect((await getVault(env.DB, "retry-box"))?.ownerUserId).toBe(userId);
+    const afterFail = await getVault(env.DB, "retry-box");
+    expect(afterFail?.ownerUserId).toBe(userId);
+    expect(afterFail?.importPendingAt).not.toBeNull();
     expect(await countVaultsForOwner(env.DB, userId)).toBe(1);
 
-    // Attempt 2 — reuses the SAME name (no VaultNameTaken wall) and succeeds.
+    // Attempt 2 — the flag authorizes reuse of the SAME name; succeeds.
     const second = await handleImportPost(env.DB, importReq("retry-box", TAR, sessionCookie(sessionId)), boundDeps);
     expect(second.status).toBe(302);
     expect(second.headers.get("location")).toBe("/console?imported=retry-box&notes=4&skipped=0");
     // Still ONE vault — the retry reused the reserved name, didn't create a second.
     expect(await countVaultsForOwner(env.DB, userId)).toBe(1);
+    // Success CLEARED the flag — the vault is real content now.
+    expect((await getVault(env.DB, "retry-box"))?.importPendingAt).toBeNull();
+
+    // Attempt 3 — the gate is closed: the now-populated vault refuses reuse
+    // ("already taken"), and no third forward reaches the vault worker.
+    const third = await handleImportPost(env.DB, importReq("retry-box", TAR, sessionCookie(sessionId)), boundDeps);
+    expect(third.status).toBe(200);
+    expect(await third.text()).toContain("already taken");
+    expect(importCalls).toBe(2);
+    expect(await countVaultsForOwner(env.DB, userId)).toBe(1);
+  });
+
+  test("a same-owner POPULATED vault name (no import-pending flag) is refused — never blown away", async () => {
+    const { id: userId } = await seedUser("import-populated@example.com");
+    const sessionId = await seedSession(userId);
+    // A REAL vault (create door / pre-existing): seeded WITHOUT the flag.
+    await seedVault("my-real-notes", userId);
+    let forwarded = false;
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async () => {
+        forwarded = true;
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      },
+    };
+    const res = await handleImportPost(env.DB, importReq("my-real-notes", TAR, sessionCookie(sessionId)), boundDeps);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("already taken");
+    // The populated vault was NEVER touched: no forward reached the vault worker
+    // (no blow-away could have run), and the row is exactly as seeded.
+    expect(forwarded).toBe(false);
+    const row = await getVault(env.DB, "my-real-notes");
+    expect(row?.ownerUserId).toBe(userId);
+    expect(row?.importPendingAt).toBeNull();
   });
 
   test("an upload over 50 MiB is refused early on Content-Length — no vault, no outbound call", async () => {

@@ -54,6 +54,7 @@ import { createUser, getUserByEmail, needsRehash, setPassword, verifyPassword, t
 import {
   VaultNameInvalidError,
   VaultNameTakenError,
+  clearImportPending,
   countVaultsForOwner,
   createVault,
   getVault,
@@ -640,8 +641,16 @@ async function importFailureResponse(
  * create door and — the welcome seed already spent — read the previous
  * uploader's notes (cross-account exposure, the exact class this door prevents).
  * The name stays the caller's; a retry re-imports into the SAME vault and
- * converges via the DO's blow-away purge. Reuse-vs-create resolves like restore:
- * a name this user already owns is reused, a name owned by anyone else is refused.
+ * converges via the DO's blow-away purge.
+ *
+ * Reuse is GATED by `vaults.import_pending_at` (migration 0019): the create
+ * branch stamps it, import success clears it, and ONLY a still-flagged row —
+ * one that exists solely because a previous import attempt failed — may be
+ * reused. A same-owner name WITHOUT the flag is a real, populated vault the
+ * user typed by accident; blow-away importing into it would be same-account
+ * data loss, so it gets the same "already taken" refusal as a cross-account
+ * name. A flagged row whose earlier attempt PARTIALLY imported is exactly the
+ * retry case — blow-away converges.
  *
  * Body-size: an oversize upload is refused early on Content-Length (before the
  * multipart parse), again on the extracted file size, and finally by the vault
@@ -680,25 +689,27 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
     return consoleError(db, req, deps, user, importTooLargeMessage());
   }
 
-  // Resolve reuse-vs-create like the restore door. We NEVER free a vault name on
-  // a failed import (see the forward block below), so a RETRY must be able to
-  // reclaim the row it already owns: a name this user ALREADY owns is REUSED
-  // (the retry re-imports into the same vault and converges via the DO's
-  // blow-away purge); a name owned by ANOTHER account is refused with the
-  // create-door message (no cross-account touch). A new name is created here,
-  // with name validation identical to the create door.
+  // Resolve reuse-vs-create. We NEVER free a vault name on a failed import (see
+  // the forward block below), so a RETRY must be able to reclaim the row it
+  // already owns — but ONLY a row still flagged `import_pending_at` (created by
+  // the import door, no successful import yet). A same-owner name WITHOUT the
+  // flag is a real, populated vault: blow-away importing into it would be
+  // same-account data loss, so it's refused exactly like a cross-account name.
+  // A new name is created below, with name validation identical to the create
+  // door.
   const now = deps.now?.() ?? new Date();
   const canonicalName = rawName.trim().toLowerCase();
   const existing = canonicalName ? await getVault(db, canonicalName) : null;
-  if (existing && existing.ownerUserId !== user.id) {
+  if (existing && (existing.ownerUserId !== user.id || existing.importPendingAt === null)) {
     return consoleError(db, req, deps, user, "That vault name is already taken.");
   }
 
   let vaultName: string;
   if (existing) {
-    // Retry into a name the caller already owns — reuse it. No NEW vault, so the
-    // plan vault-count cap doesn't apply and the caps were already pushed at its
-    // creation; the DO's blow-away purge makes the re-import converge.
+    // Retry into this caller's own still-import-pending row — reuse it. No NEW
+    // vault, so the plan vault-count cap doesn't apply and the caps were already
+    // pushed at its creation; the DO's blow-away purge makes the re-import
+    // converge (a partial earlier attempt is exactly this case).
     vaultName = existing.name;
   } else {
     // A NEW vault — the plan vault-count gate, verbatim from the create door.
@@ -709,7 +720,10 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
       return consoleError(db, req, deps, user, vaultCapMessage(user.plan));
     }
     try {
-      const vault = await createVault(db, rawName, user.id, now);
+      // `importPending: true` stamps `import_pending_at` atomically in the
+      // insert — the flag that authorizes a retry to reuse this row (cleared
+      // below on success). Atomic so a crash can't strand a flagless row.
+      const vault = await createVault(db, rawName, user.id, now, { importPending: true });
       vaultName = vault.name;
     } catch (err) {
       if (err instanceof VaultNameInvalidError) {
@@ -763,6 +777,16 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
         ? summary.stats.notes_created
         : 0;
   const skipped = typeof summary.stats?.skipped_attachments === "number" ? summary.stats.skipped_attachments : 0;
+  // Import succeeded — the vault now holds real content, so CLOSE the retry-
+  // reuse gate (a later import naming this vault must get "already taken",
+  // never a blow-away). Guarded: a D1 hiccup here must not turn a successful
+  // import into a 500 — log loudly instead (the residual, a still-flagged
+  // populated vault, is same-account-only and self-inflicted on reuse).
+  try {
+    await clearImportPending(db, vaultName, user.id);
+  } catch (err) {
+    logImportForwardFailed(user.id, vaultName, `flag_clear_failed:${err instanceof Error ? err.message : String(err)}`);
+  }
   console.log(`event=import_completed vault=${vaultName} notes=${notes} skipped_attachments=${skipped}`);
   return redirectResponse(
     `/console?imported=${encodeURIComponent(vaultName)}&notes=${notes}&skipped=${skipped}`,
