@@ -328,9 +328,13 @@ describe("MCP — vault-info (server-layer override)", () => {
     const proj = await callVaultInfo(v, await READ(v), {});
     expect(proj.name).toBe(v);
     expect(proj.description).toBeNull(); // fresh vault has no description yet
-    // The default welcome pack seeds the sacred `capture` tag (with a schema).
+    // The default welcome pack seeds the sacred `capture` tag plus the
+    // guides-ring tags (`guide` — schema-carrying — and `pinned`). `toContain`
+    // keeps the assertion robust to a growing seed set (the #86 robustness shape).
     const tagNames = (proj.tags as any[]).map((t) => t.name);
     expect(tagNames).toContain("capture");
+    expect(tagNames).toContain("guide");
+    expect(tagNames).toContain("pinned");
     expect(Array.isArray(proj.indexed_fields)).toBe(true);
     expect((proj.query_hints as string[]).length).toBeGreaterThan(0);
     // Cloud always knows its public origin → absolute coordinates.

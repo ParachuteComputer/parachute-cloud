@@ -2,31 +2,47 @@ import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { base, freshVault, op } from "./helpers.ts";
 import {
+  CAPTURE_ANYTHING_PATH,
   CONNECT_AI_PATH,
   GETTING_STARTED_PATH,
   NOTES_REQUIRED_TAGS,
-  TRY_LINKING_PATH,
+  TAGS_GRAPH_PATH,
   WELCOME_PATH,
+  YOURS_TO_KEEP_PATH,
 } from "../src/welcome.ts";
 import { GETTING_STARTED_PACK, welcomePack } from "@openparachute/core/src/seed-packs.js";
 
 /**
  * Default-seed conformance: a brand-new vault materializes with the two
- * default core packs — the three-note welcome web + core's declared capture
- * tags (the `welcome` pack; the set is NOTES_REQUIRED_TAGS, asserted
- * dynamically so this suite tracks core@main) and the AI-facing Getting
- * Started guide (the `getting-started` pack) — and NOTHING else. The seed must be invisible to
+ * default core packs — the five-guide welcome ring + core's declared seed tags
+ * (the `welcome` pack: capture/guide/pinned, asserted dynamically so this suite
+ * tracks core@main) and the AI-facing Getting Started guide (the
+ * `getting-started` pack) — and NOTHING else. The seed must be invisible to
  * everything that already exists: idempotent on re-entry, absent for
  * pre-existing vaults, ordinary/deletable notes, exported like any other note.
  *
- * The tag assertions mirror notes-ui's audit equality exactly
- * (schema-audit.ts diffs `description` + `parent_names` verbatim against
- * NOTES_REQUIRED_SCHEMA), so green here means the PWA banner clears for the
- * right reason. The parity block pins that the seeded bytes are exactly
- * core's pack content — this repo no longer carries its own copy.
+ * The guides ring (vault#544): six seeded notes, all `#guide` skill files
+ * (Welcome also `#pinned`), each carrying `metadata.written_for` — "human" on
+ * the five welcome guides, "ai" on Getting Started. The `guide` tag carries the
+ * `written_for` enum schema (ai|human|both). The `capture` tag assertion still
+ * mirrors notes-ui's audit equality exactly (schema-audit.ts diffs
+ * `description` + `parent_names` verbatim against NOTES_REQUIRED_SCHEMA), so
+ * green there means the PWA banner clears for the right reason. The parity
+ * block pins that the seeded bytes are exactly core's pack content — this repo
+ * no longer carries its own copy.
  */
 
-const ALL_PATHS = [WELCOME_PATH, TRY_LINKING_PATH, CONNECT_AI_PATH, GETTING_STARTED_PATH];
+// The six default-seeded note paths: the five-guide welcome ring + Getting Started.
+const ALL_PATHS = [
+  WELCOME_PATH,
+  CAPTURE_ANYTHING_PATH,
+  TAGS_GRAPH_PATH,
+  CONNECT_AI_PATH,
+  YOURS_TO_KEEP_PATH,
+  GETTING_STARTED_PATH,
+];
+// The five welcome guides carry written_for: "human"; Getting Started: "ai".
+const HUMAN_GUIDES = [WELCOME_PATH, CAPTURE_ANYTHING_PATH, TAGS_GRAPH_PATH, CONNECT_AI_PATH, YOURS_TO_KEEP_PATH];
 
 async function listNotes(v: string): Promise<any[]> {
   const res = await op(v, "/api/notes?include_content=true");
@@ -41,37 +57,66 @@ async function listTagsWithSchema(v: string): Promise<any[]> {
 }
 
 describe("default seed — a new vault's first materialization", () => {
-  it("contains exactly the 4 seeded notes and exactly core's declared capture tags", async () => {
+  it("contains exactly the 6 seeded guides and exactly core's declared seed tags", async () => {
     const v = freshVault("w");
     const notes = await listNotes(v);
-    expect(notes).toHaveLength(4);
+    expect(notes).toHaveLength(6);
     expect(notes.map((n) => n.path).sort()).toEqual([...ALL_PATHS].sort());
 
     const welcome = notes.find((n) => n.path === WELCOME_PATH)!;
     expect(welcome.content).toContain("This vault is yours.");
-    expect(welcome.content).toContain(`[[${TRY_LINKING_PATH}]]`);
+    expect(welcome.content).toContain(`[[${CAPTURE_ANYTHING_PATH}]]`);
     const connect = notes.find((n) => n.path === CONNECT_AI_PATH)!;
     // The console origin is the deploy's ISSUER_ORIGIN (test env: TEST config).
     expect(connect.content).toContain(env.ISSUER_ORIGIN);
-    expect(connect.content).toContain(`[[${WELCOME_PATH}]]`);
+    // Connect-your-AI points the human at the AI-facing Getting Started guide.
+    expect(connect.content).toContain(`[[${GETTING_STARTED_PATH}]]`);
     const gettingStarted = notes.find((n) => n.path === GETTING_STARTED_PATH)!;
     expect(gettingStarted.content).toContain("start-here guide");
 
-    // Exactly core's declared set (NOTES_REQUIRED_TAGS) — dynamic, so the
-    // assertion follows core@main rather than pinning a count that a core
-    // seed-schema change would silently strand.
+    // The guides carry #guide (Welcome also #pinned); written_for splits
+    // human (the five welcome guides) vs ai (Getting Started).
+    for (const path of HUMAN_GUIDES) {
+      const note = notes.find((n) => n.path === path)!;
+      expect(note.tags, `${path} tagged #guide`).toContain("guide");
+      expect(note.metadata?.written_for, `${path} written_for`).toBe("human");
+    }
+    expect(welcome.tags, "Welcome is pinned").toContain("pinned");
+    // Only Welcome is pinned — the other guides are not.
+    for (const path of HUMAN_GUIDES.filter((p) => p !== WELCOME_PATH)) {
+      expect(notes.find((n) => n.path === path)!.tags).not.toContain("pinned");
+    }
+    expect(gettingStarted.tags).toContain("guide");
+    expect(gettingStarted.metadata?.written_for).toBe("ai");
+
+    // Exactly core's declared seed-tag set — dynamic (the welcome pack's tags:
+    // capture + guide + pinned), so the assertion follows core@main rather than
+    // pinning a count that a core seed-schema change would silently strand.
+    const declaredTags = welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string }).tags;
     const tags = await listTagsWithSchema(v);
-    expect(tags.map((t) => t.name).sort()).toEqual(NOTES_REQUIRED_TAGS.map((d) => d.name).sort());
+    expect(tags.map((t) => t.name).sort()).toEqual(declaredTags.map((d) => d.name).sort());
+
+    // capture: notes-ui's schema-audit compares description + parent_names.
     for (const decl of NOTES_REQUIRED_TAGS) {
       const row = tags.find((t) => t.name === decl.name);
       expect(row, `tag ${decl.name} exists`).toBeTruthy();
-      // Exactly what notes-ui's schema-audit compares (description +
-      // parent_names, null/[] normalized).
       expect(row.description ?? "").toBe(decl.description);
       expect(row.parent_names ?? []).toEqual(decl.parent_names ?? []);
-      // Seeded tags are identity rows only — no notes carry them yet.
+      // capture is an identity row only — no notes carry it yet.
       expect(row.count).toBe(0);
     }
+
+    // guide carries the written_for enum schema (ai|human|both), and it
+    // PERSISTED through the DO store (this is the guides-ring behavioral check —
+    // the schema round-trips workerd's transactionSync seam, not just the pins).
+    const guideRow = tags.find((t) => t.name === "guide")!;
+    expect(guideRow, "guide tag exists").toBeTruthy();
+    expect(guideRow.fields?.written_for?.enum).toEqual(["ai", "human", "both"]);
+    // Six #guide notes seeded → the count reflects them (5 welcome + Getting Started).
+    expect(guideRow.count).toBe(6);
+    // pinned: identity row, one pinned note (Welcome).
+    const pinnedRow = tags.find((t) => t.name === "pinned")!;
+    expect(pinnedRow.count).toBe(1);
   });
 
   it("seeded content is byte-equal to core's packs (no cloud-side fork)", async () => {
@@ -81,7 +126,7 @@ describe("default seed — a new vault's first materialization", () => {
       ...welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string }).notes,
       ...GETTING_STARTED_PACK.notes,
     ];
-    expect(expected).toHaveLength(4);
+    expect(expected).toHaveLength(6);
     for (const { path, content } of expected) {
       const note = notes.find((n) => n.path === path);
       expect(note, `${path} seeded`).toBeTruthy();
@@ -100,12 +145,17 @@ describe("default seed — a new vault's first materialization", () => {
       return (await res.json()) as { path: string[]; relationships: string[] } | null;
     };
 
-    // The three seeded edges: welcome → try-linking, try-linking → welcome,
-    // connect-AI → welcome. Each resolves as a direct (2-node) graph path.
+    // A sample of the seeded ring's direct edges: welcome → capture-anything,
+    // the guides chain (capture → tags, tags → connect, connect → yours-to-keep),
+    // the ring closure (yours-to-keep → welcome), and connect → getting-started.
+    // Each resolves as a direct (2-node) graph path.
     for (const [source, target] of [
-      [WELCOME_PATH, TRY_LINKING_PATH],
-      [TRY_LINKING_PATH, WELCOME_PATH],
-      [CONNECT_AI_PATH, WELCOME_PATH],
+      [WELCOME_PATH, CAPTURE_ANYTHING_PATH],
+      [CAPTURE_ANYTHING_PATH, TAGS_GRAPH_PATH],
+      [TAGS_GRAPH_PATH, CONNECT_AI_PATH],
+      [CONNECT_AI_PATH, YOURS_TO_KEEP_PATH],
+      [YOURS_TO_KEEP_PATH, WELCOME_PATH],
+      [CONNECT_AI_PATH, GETTING_STARTED_PATH],
     ] as const) {
       const found = await findPath(source, target);
       expect(found, `${source} → ${target}`).not.toBeNull();
@@ -131,23 +181,25 @@ describe("default seed — a new vault's first materialization", () => {
     expect(again.seededNotes).toEqual([]);
     expect(again.skippedNotes.sort()).toEqual([...ALL_PATHS].sort());
 
-    expect(await listNotes(v)).toHaveLength(4);
-    expect(await listTagsWithSchema(v)).toHaveLength(NOTES_REQUIRED_TAGS.length);
+    expect(await listNotes(v)).toHaveLength(6);
+    // capture + guide + pinned — the welcome pack's full declared tag set.
+    const declaredTags = welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string }).tags;
+    expect(await listTagsWithSchema(v)).toHaveLength(declaredTags.length);
   });
 
   it("seeded notes are ordinary notes — deletable, and never re-seeded after delete", async () => {
     const v = freshVault("w");
     const notes = await listNotes(v);
-    const tryNote = notes.find((n) => n.path === TRY_LINKING_PATH)!;
+    const guideNote = notes.find((n) => n.path === CAPTURE_ANYTHING_PATH)!;
 
-    const del = await op(v, `/api/notes/${tryNote.id}`, { method: "DELETE" });
+    const del = await op(v, `/api/notes/${guideNote.id}`, { method: "DELETE" });
     expect(del.status).toBe(200);
-    expect((await del.json()) as any).toEqual({ deleted: true, id: tryNote.id });
+    expect((await del.json()) as any).toEqual({ deleted: true, id: guideNote.id });
 
-    expect(await listNotes(v)).toHaveLength(3);
+    expect(await listNotes(v)).toHaveLength(5);
     // Subsequent requests don't resurrect it (the seed ran once).
     await op(v, "/api/health");
-    expect(await listNotes(v)).toHaveLength(3);
+    expect(await listNotes(v)).toHaveLength(5);
   });
 
   it("export carries the seeded notes as ordinary portable-md entries", async () => {

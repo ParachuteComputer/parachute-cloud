@@ -3,18 +3,25 @@
  * seed packs (core/src/seed-packs.ts, the single source of truth for pack
  * content across BOTH runtimes since vault#526). A brand-new cloud vault seeds:
  *
- *  1. The `welcome` pack — the `capture` tag Notes' schema audit requires
- *     (ONE tag since vault#528; entry method lives in note metadata.source)
- *     + the three-note welcome web (welcome → try-linking → back,
- *     connect-AI → welcome), person-voiced, with the console origin
- *     (ISSUER_ORIGIN) named in the Connect-your-AI note. This content used to
- *     live verbatim in this file; it was ported INTO core (test-pinned
- *     byte-equal there) and is now imported back.
+ *  1. The `welcome` pack — the five-guide welcome ring (Welcome to your vault,
+ *     Capture anything, Tags and the graph, Connect your AI, Yours to keep;
+ *     the guides-ring rewrite, vault#544) + the `capture` / `guide` / `pinned`
+ *     tags. `capture` is the sacred raw-input tag Notes' schema audit requires
+ *     (ONE tag since vault#528; entry method lives in note metadata.source);
+ *     `guide` is the skill-file tag carrying a `written_for` enum schema
+ *     (ai|human|both); `pinned` sits Welcome at the top of the Notes app. The
+ *     five guides are ordinary notes tagged `#guide` (Welcome also `#pinned`),
+ *     each `metadata.written_for: "human"`, forming a small linked web (Welcome
+ *     → all four; the rest chain, Connect-your-AI also links [[Getting Started]]).
+ *     The Connect-your-AI note names the console origin (ISSUER_ORIGIN). This
+ *     content used to live verbatim in this file; it was ported INTO core
+ *     (test-pinned byte-equal there) and is now imported back.
  *
- *  2. The `getting-started` pack — the AI-facing start-here guide. Seeding it
- *     makes core's vault-projection emit its `getting_started` pointer, so an
- *     MCP client connecting to a cloud vault gets the same "Start here"
- *     orientation a self-hosted bun vault gets.
+ *  2. The `getting-started` pack — the AI-facing start-here guide, itself a
+ *     `#guide` note (`metadata.written_for: "ai"`). Seeding it makes core's
+ *     vault-projection emit its `getting_started` pointer, so an MCP client
+ *     connecting to a cloud vault gets the same "Start here" orientation a
+ *     self-hosted bun vault gets.
  *
  * (`surface-starter` is deliberately NOT default-seeded — ratified 2026-07-02.
  * It's applied on demand via POST /api/packs/surface-starter, which the
@@ -36,13 +43,20 @@ import {
 } from "@openparachute/core/src/seed-packs.js";
 
 // Re-exported so the conformance tests assert against the SAME constants the
-// seed writes (single import site; content lives in core).
+// seed writes (single import site; content lives in core). The guides-ring set
+// (vault#544): the five welcome paths + Getting Started, plus the seeded tag
+// declarations (capture via NOTES_REQUIRED_TAGS, the schema-carrying GUIDE_TAG,
+// and PINNED_TAG).
 export {
+  CAPTURE_ANYTHING_PATH,
   CONNECT_AI_PATH,
   GETTING_STARTED_PATH,
+  GUIDE_TAG,
   NOTES_REQUIRED_TAGS,
-  TRY_LINKING_PATH,
+  PINNED_TAG,
+  TAGS_GRAPH_PATH,
   WELCOME_PATH,
+  YOURS_TO_KEEP_PATH,
 } from "@openparachute/core/src/seed-packs.js";
 
 /** Storage key for the per-DO "welcome seed already ran" marker. */

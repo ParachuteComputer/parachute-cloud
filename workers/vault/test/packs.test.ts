@@ -6,8 +6,16 @@ import {
   SEED_PACK_NAMES,
   SURFACE_STARTER_CONTENT,
   SURFACE_STARTER_PATH,
+  welcomePack,
 } from "@openparachute/core/src/seed-packs.js";
-import { GETTING_STARTED_PATH, NOTES_REQUIRED_TAGS, WELCOME_PATH } from "../src/welcome.ts";
+import {
+  CAPTURE_ANYTHING_PATH,
+  CONNECT_AI_PATH,
+  GETTING_STARTED_PATH,
+  TAGS_GRAPH_PATH,
+  WELCOME_PATH,
+  YOURS_TO_KEEP_PATH,
+} from "../src/welcome.ts";
 
 /**
  * POST /api/packs/<name> — the on-demand seam for core's seed packs.
@@ -40,7 +48,9 @@ describe("POST /api/packs/:name", () => {
     expect(body.pack).toBe("surface-starter");
     expect(body.applied).toEqual([SURFACE_STARTER_PATH]);
     expect(body.skipped).toEqual([]);
-    expect(body.tags).toEqual([]);
+    // Surface Starter is a #guide too (guides-ring, vault#544) — it declares
+    // GUIDE_TAG, so the applier upserts it and reports it.
+    expect(body.tags).toEqual(["guide"]);
 
     // Byte-equal to core's pack content (no cloud-side fork).
     const after = await listNotes(v);
@@ -81,12 +91,15 @@ describe("POST /api/packs/:name", () => {
     await op(v, "/api/health"); // materialize → default seed ran
     const w = (await (await applyPack(v, "welcome")).json()) as any;
     expect(w.applied).toEqual([]);
-    expect(w.skipped.sort()).toEqual([WELCOME_PATH, "Connect your AI", "Try linking notes"].sort());
-    expect(w.tags).toEqual(NOTES_REQUIRED_TAGS.map((t) => t.name)); // upserts, idempotent — core's declared set
+    expect(w.skipped.sort()).toEqual(
+      [WELCOME_PATH, CAPTURE_ANYTHING_PATH, TAGS_GRAPH_PATH, CONNECT_AI_PATH, YOURS_TO_KEEP_PATH].sort(),
+    );
+    // upserts, idempotent — core's declared set (capture + guide + pinned).
+    expect(w.tags).toEqual(welcomePack().tags.map((t) => t.name));
     const g = (await (await applyPack(v, "getting-started")).json()) as any;
     expect(g.applied).toEqual([]);
     expect(g.skipped).toEqual([GETTING_STARTED_PATH]);
-    expect(await listNotes(v)).toHaveLength(4);
+    expect(await listNotes(v)).toHaveLength(6);
   });
 
   it("unknown pack → 404 listing the available names", async () => {

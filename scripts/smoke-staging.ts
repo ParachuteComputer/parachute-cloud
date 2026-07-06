@@ -36,7 +36,9 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { totpCodeAt } from "../workers/identity/src/totp.ts";
-import { NOTES_REQUIRED_TAGS } from "../workers/vault/src/welcome.ts";
+// core resolves from the sibling parachute-vault checkout, copied into the vault
+// worker's node_modules by `bun install` (the same explicit path test-bun uses).
+import { GETTING_STARTED_PACK, welcomePack } from "../workers/vault/node_modules/@openparachute/core/src/seed-packs.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.aaron-d5d.workers.dev").replace(/\/$/, "");
@@ -412,26 +414,25 @@ async function main() {
       );
 
       // The fresh vault materialized with the DEFAULT SEED PACKS (core's
-      // welcome + getting-started): exactly 4 notes + core's declared tag set
-      // (NOTES_REQUIRED_TAGS — ONE #capture tag since vault#528; entry method
-      // lives in note metadata.source), before this user writes anything.
-      // Asserted dynamically against the import so core-side vocabulary
-      // changes can't strand a stale literal pin here again.
+      // welcome + getting-started): exactly 6 notes (the five-guide welcome
+      // ring + Getting Started, the guides-ring rewrite vault#544) + core's
+      // declared seed tags (capture + guide + pinned), before this user writes
+      // anything. Asserted dynamically against the import so core-side
+      // vocabulary changes can't strand a stale literal pin here again.
+      const expectedSeedPaths = welcomePack().notes.map((n) => n.path).concat(GETTING_STARTED_PACK.notes.map((n) => n.path));
       const seededRes = await fetch(`${VAULT}/vault/${newVault}/api/notes`, { headers: OWN_AUTH });
       const seeded = (await seededRes.json()) as Array<{ path?: string }>;
       const seededPaths = seeded.map((n) => n.path).sort();
       assert(
         seededRes.status === 200 &&
-          seeded.length === 4 &&
-          ["Connect your AI", "Getting Started", "Try linking notes", "Welcome to your vault 🪂"].every((p) =>
-            seededPaths.includes(p),
-          ),
-        "fresh vault seeds the default packs (4 notes: welcome web + Getting Started)",
+          seeded.length === 6 &&
+          expectedSeedPaths.every((p) => seededPaths.includes(p)),
+        "fresh vault seeds the default packs (6 notes: five-guide welcome ring + Getting Started)",
         `${seeded.length} notes: ${seededPaths.join(", ")}`,
       );
       const tagRes = await fetch(`${VAULT}/vault/${newVault}/api/tags`, { headers: OWN_AUTH });
       const tagRows = (await tagRes.json()) as Array<{ name: string }>;
-      const expectedTagNames = NOTES_REQUIRED_TAGS.map((t) => t.name).sort();
+      const expectedTagNames = welcomePack().tags.map((t) => t.name).sort();
       assert(
         tagRes.status === 200 &&
           tagRows.map((r) => r.name).sort().join(",") === expectedTagNames.join(","),
@@ -800,7 +801,7 @@ async function main() {
       `status ${cvRes.status}`,
     );
 
-    // The first note exists IN the vault (verbatim), alongside the 4 seed notes.
+    // The first note exists IN the vault (verbatim), alongside the 6 seed notes.
     const owner = await authorizeFor(email, password, vaultName);
     assert(!!owner.token, "arrival: owner mints a token for the new vault", owner.error ? `error=${owner.error}` : "ok");
     if (owner.token) {
@@ -815,8 +816,8 @@ async function main() {
         `${notes.length} notes: ${notes.map((n) => n.path).join(", ")}`,
       );
       assert(
-        notes.length === 5 && notes.some((n) => n.path === "Welcome to your vault 🪂"),
-        "arrival: the first note JOINS the welcome seed (4 seed notes + theirs)",
+        notes.length === 7 && notes.some((n) => n.path === "Welcome to your vault 🪂"),
+        "arrival: the first note JOINS the welcome seed (6 seed notes + theirs)",
         `${notes.length} notes`,
       );
     }
@@ -1146,8 +1147,8 @@ async function main() {
         const notes = (await notesRes.json()) as Array<{ path?: string; content?: string }>;
         const mine = notes.find((n) => n.path === "My first note");
         assert(
-          notesRes.status === 200 && notes.length === 5 && !!mine && (mine.content ?? "").includes(MARKER),
-          "snapshots: restored vault round-trips — 5 notes incl. the marker note, verbatim",
+          notesRes.status === 200 && notes.length === 7 && !!mine && (mine.content ?? "").includes(MARKER),
+          "snapshots: restored vault round-trips — 7 notes (6 seed + the marker note), verbatim",
           `${notes.length} notes: ${notes.map((n) => n.path).join(", ")}`,
         );
       }
