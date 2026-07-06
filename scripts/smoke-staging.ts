@@ -990,8 +990,8 @@ async function main() {
     const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
     assert(
       // The arrival user is on the 30-day trial (mirrors Plus): the card cap
-      // renders "of 10 GiB" (2 GiB notes + 8 GiB attachments, summed).
-      conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 10 GiB/.test(conHtml),
+      // renders "of 8.5 GiB" (500 MB notes + 8 GiB attachments, summed).
+      conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 8\.5 GiB/.test(conHtml),
       "usage: the vault card shows 'Using X of Y' from the rollup row",
       arrivalVault,
     );
@@ -1100,7 +1100,7 @@ async function main() {
   // 16b. Pick/change the TRIAL tier (POST /console/plan — NO Stripe). A FRESH
   //      throwaway user (so it can't perturb the arrival user's §17/§18 flow):
   //      signup (trial, mirrors Plus) → POST /console/plan(power) → the vault
-  //      landing's caps FLIP to Power (5 GiB notes + 50 GiB attach = 55 GiB), and
+  //      landing's caps FLIP to Power (1 GiB notes + 50 GiB attach = 51 GiB), and
   //      the trial clock is unchanged. Then change to standard and assert the
   //      caps flip again — proving the free tier-change re-pushes entitlements.
   try {
@@ -1400,7 +1400,7 @@ async function main() {
   //     arrival-user snapshot/voice flow. Only in MOCK mode (real Stripe
   //     absent — detected by the mock endpoint being session-gated, not 404).
   //     Fresh signup (trial) → mock-checkout(PLUS) → plan=Plus + landing
-  //     {enabled, minutes_remaining:300} + the 10 GiB cap → a REAL
+  //     {enabled, minutes_remaining:300} + the 8.5 GiB cap → a REAL
   //     transcription resolves. Proves the whole interim checkout → upgrade →
   //     cap/voice-lift flow, no live charge.
   try {
