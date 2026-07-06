@@ -223,9 +223,9 @@ service = "parachute-vault-do-staging"
 # workers.dev origins. ISSUER is staging's own origin (tokens minted here carry
 # iss=<staging identity>, and the staging vault worker's ISSUER_ORIGIN matches).
 [env.staging.vars]
-ISSUER = "https://parachute-identity-staging.aaron-d5d.workers.dev"
-VAULT_BASE_DOMAIN = "parachute-vault-do-staging.aaron-d5d.workers.dev"
-VAULT_ORIGIN = "https://parachute-vault-do-staging.aaron-d5d.workers.dev"
+ISSUER = "https://parachute-identity-staging.openparachute.workers.dev"
+VAULT_BASE_DOMAIN = "parachute-vault-do-staging.openparachute.workers.dev"
+VAULT_ORIGIN = "https://parachute-vault-do-staging.openparachute.workers.dev"
 ENVIRONMENT = "staging"
 EMAIL_FROM = "noreply@parachute.computer"
 # Same operator address as production — but staging has no send_email binding,
