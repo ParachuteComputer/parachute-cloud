@@ -403,8 +403,8 @@ async function main() {
       // The TWO-METER entitlement push, verified end-to-end through the REAL
       // staging transport (identity minted a first-party admin token and PUT the
       // entitlement through the VAULT_SERVICE binding at creation): the vault
-      // landing surfaces the RESOLVED summed cap (trial = PLUS: 2 GiB notes +
-      // 8 GiB attach = 10 GiB) PLUS the additive two-meter `caps` split, not the
+      // landing surfaces the RESOLVED summed cap (trial = PLUS: 500 MB notes +
+      // 8 GiB attach = 8.5 GiB) PLUS the additive two-meter `caps` split, not the
       // 1 GiB env default.
       const landing = await fetch(`${VAULT}/vault/${newVault}`, { headers: OWN_AUTH });
       const landingJson = (await landing.json()) as {
@@ -414,11 +414,11 @@ async function main() {
       };
       assert(
         landing.status === 200 &&
-          landingJson.cap_bytes === 10_737_418_240 &&
-          landingJson.caps?.notes_bytes === 2_147_483_648 &&
+          landingJson.cap_bytes === 9_114_222_592 &&
+          landingJson.caps?.notes_bytes === 524_288_000 &&
           landingJson.caps?.attachment_bytes === 8_589_934_592 &&
           landingJson.caps?.attachments_enabled === true,
-        "create-time two-meter push landed in the DO (landing caps = trial/Plus: 2 GiB notes + 8 GiB attach)",
+        "create-time two-meter push landed in the DO (landing caps = trial/Plus: 500 MB notes + 8 GiB attach)",
         `status ${landing.status}, cap_bytes=${landingJson.cap_bytes}, caps=${JSON.stringify(landingJson.caps)}`,
       );
 
@@ -990,8 +990,8 @@ async function main() {
     const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
     assert(
       // The arrival user is on the 30-day trial (mirrors Plus): the card cap
-      // renders "of 10 GiB" (2 GiB notes + 8 GiB attachments, summed).
-      conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 10 GiB/.test(conHtml),
+      // renders "of 8.5 GiB" (500 MB notes + 8 GiB attachments, summed).
+      conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 8\.5 GiB/.test(conHtml),
       "usage: the vault card shows 'Using X of Y' from the rollup row",
       arrivalVault,
     );
@@ -1100,7 +1100,7 @@ async function main() {
   // 16b. Pick/change the TRIAL tier (POST /console/plan — NO Stripe). A FRESH
   //      throwaway user (so it can't perturb the arrival user's §17/§18 flow):
   //      signup (trial, mirrors Plus) → POST /console/plan(power) → the vault
-  //      landing's caps FLIP to Power (5 GiB notes + 50 GiB attach = 55 GiB), and
+  //      landing's caps FLIP to Power (1 GiB notes + 50 GiB attach = 51 GiB), and
   //      the trial clock is unchanged. Then change to standard and assert the
   //      caps flip again — proving the free tier-change re-pushes entitlements.
   try {
@@ -1146,11 +1146,11 @@ async function main() {
       const tAuth = { authorization: `Bearer ${tOwner.token}` };
       const powerLand = (await (await fetch(`${VAULT}/vault/${tVault}`, { headers: tAuth })).json()) as { cap_bytes?: number };
       assert(
-        powerLand.cap_bytes === 55 * 1024 * 1024 * 1024,
-        "tier-change: landing caps FLIPPED to Power (5 GiB notes + 50 GiB attach = 55 GiB)",
+        powerLand.cap_bytes === 51 * 1024 * 1024 * 1024,
+        "tier-change: landing caps FLIPPED to Power (1 GiB notes + 50 GiB attach = 51 GiB)",
         `cap_bytes=${powerLand.cap_bytes}`,
       );
-      // Change again to STANDARD — the caps flip once more (1 GiB + 2 GiB = 3 GiB).
+      // Change again to STANDARD — the caps flip once more (250 MB + 2 GiB = 2.25 GiB).
       const toStd = await fetch(`${IDENTITY}/console/plan`, {
         method: "POST",
         headers: { ...FORM, origin: IDENTITY, cookie: tCookie },
@@ -1164,8 +1164,8 @@ async function main() {
       );
       const stdLand = (await (await fetch(`${VAULT}/vault/${tVault}`, { headers: tAuth })).json()) as { cap_bytes?: number };
       assert(
-        stdLand.cap_bytes === 3 * 1024 * 1024 * 1024,
-        "tier-change: landing caps FLIPPED again to Standard (1 GiB notes + 2 GiB attach = 3 GiB)",
+        stdLand.cap_bytes === 262_144_000 + 2 * 1024 * 1024 * 1024,
+        "tier-change: landing caps FLIPPED again to Standard (250 MB notes + 2 GiB attach = 2.25 GiB)",
         `cap_bytes=${stdLand.cap_bytes}`,
       );
     }
@@ -1400,7 +1400,7 @@ async function main() {
   //     arrival-user snapshot/voice flow. Only in MOCK mode (real Stripe
   //     absent — detected by the mock endpoint being session-gated, not 404).
   //     Fresh signup (trial) → mock-checkout(PLUS) → plan=Plus + landing
-  //     {enabled, minutes_remaining:300} + the 10 GiB cap → a REAL
+  //     {enabled, minutes_remaining:300} + the 8.5 GiB cap → a REAL
   //     transcription resolves. Proves the whole interim checkout → upgrade →
   //     cap/voice-lift flow, no live charge.
   try {
@@ -1466,8 +1466,8 @@ async function main() {
           JSON.stringify(mLand.transcription),
         );
         assert(
-          mLand.cap_bytes === 10 * 1024 * 1024 * 1024,
-          "mock E2E: landing cap_bytes reflects the Plus tier (2 GiB notes + 8 GiB attach = 10 GiB)",
+          mLand.cap_bytes === 524_288_000 + 8 * 1024 * 1024 * 1024,
+          "mock E2E: landing cap_bytes reflects the Plus tier (500 MB notes + 8 GiB attach = 8.5 GiB)",
           `cap_bytes=${mLand.cap_bytes}`,
         );
 

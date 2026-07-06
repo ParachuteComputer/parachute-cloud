@@ -292,7 +292,7 @@ describe("console usage display", () => {
     await seedRow("shows-v", "2026-07-02", 150_000, 59_715); // ≈0.2 MiB total
     const html = await consoleHtml(await seedSession(userId));
     expect(html).toContain('data-testid="vault-usage"');
-    expect(html).toContain("Using 0.2 MB of 10 GiB"); // trial cap (mirrors plus: 2 GiB + 8 GiB)
+    expect(html).toContain("Using 0.2 MB of 8.5 GiB"); // trial cap (mirrors plus: 500 MB + 8 GiB)
     // The plan line carries the across-vaults total.
     expect(html).toContain('data-testid="usage-total"');
     expect(html).toMatch(/usage-total[^<]*>&middot; Using 0\.2 MB/);
@@ -313,18 +313,18 @@ describe("console usage display", () => {
     await seedRow("two-a", "2026-07-02", 1_048_576, 0); // 1.0 MB
     await seedRow("two-b", "2026-07-02", 2_097_152, 1_048_576); // 3.0 MB
     const html = await consoleHtml(await seedSession(userId));
-    expect(html).toContain("Using 1.0 MB of 10 GiB"); // trial cap
-    expect(html).toContain("Using 3.0 MB of 10 GiB");
+    expect(html).toContain("Using 1.0 MB of 8.5 GiB"); // trial cap (500 MB notes + 8 GiB attach)
+    expect(html).toContain("Using 3.0 MB of 8.5 GiB");
     expect(html).toMatch(/usage-total[^<]*>&middot; Using 4\.0 MB/);
   });
 
-  test("a power-plan card reads against its 55 GiB cap (distinct from the trial default's 10 GiB)", async () => {
+  test("a power-plan card reads against its 51 GiB cap (distinct from the trial default's 8.5 GiB)", async () => {
     const { id: userId } = await seedUser("paid@example.com");
     await env.DB.prepare("UPDATE users SET plan = 'power' WHERE id = ?").bind(userId).run();
     await seedVault("paid-v", userId);
     await seedRow("paid-v", "2026-07-02", 3_221_225_472, 0); // 3 GiB
     const html = await consoleHtml(await seedSession(userId));
-    expect(html).toContain("Using 3.0 GB of 55 GiB");
+    expect(html).toContain("Using 3.0 GB of 51 GiB");
   });
 });
 

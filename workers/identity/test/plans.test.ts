@@ -93,21 +93,21 @@ async function vaultRowCount(userId: string): Promise<number> {
 describe("PLAN_SPECS — the ratified ladder", () => {
   test("the four purchasable tiers carry the locked numbers", () => {
     expect(PLAN_SPECS.entry.vault_count).toBe(1);
-    expect(PLAN_SPECS.entry.notes_bytes).toBe(250 * MiB);
+    expect(PLAN_SPECS.entry.notes_bytes).toBe(100 * MiB);
     expect(PLAN_SPECS.entry.attachment_bytes).toBe(0); // notes-only
 
     expect(PLAN_SPECS.standard.vault_count).toBe(3);
-    expect(PLAN_SPECS.standard.notes_bytes).toBe(1 * GiB);
+    expect(PLAN_SPECS.standard.notes_bytes).toBe(250 * MiB);
     expect(PLAN_SPECS.standard.attachment_bytes).toBe(2 * GiB);
     expect(PLAN_SPECS.standard.transcribe_minutes).toBe(60);
 
     expect(PLAN_SPECS.plus.vault_count).toBe(5);
-    expect(PLAN_SPECS.plus.notes_bytes).toBe(2 * GiB);
+    expect(PLAN_SPECS.plus.notes_bytes).toBe(500 * MiB);
     expect(PLAN_SPECS.plus.attachment_bytes).toBe(8 * GiB);
     expect(PLAN_SPECS.plus.transcribe_minutes).toBe(300);
 
     expect(PLAN_SPECS.power.vault_count).toBe(10);
-    expect(PLAN_SPECS.power.notes_bytes).toBe(5 * GiB);
+    expect(PLAN_SPECS.power.notes_bytes).toBe(1 * GiB);
     expect(PLAN_SPECS.power.attachment_bytes).toBe(50 * GiB);
     expect(PLAN_SPECS.power.transcribe_minutes).toBe(1200);
   });
@@ -127,12 +127,12 @@ describe("PLAN_SPECS — the ratified ladder", () => {
 
   test("planEntitlement carries the two-meter caps + voice + frozen", () => {
     expect(planEntitlement("standard")).toEqual({
-      caps: { notes_bytes: 1 * GiB, attachment_bytes: 2 * GiB },
+      caps: { notes_bytes: 250 * MiB, attachment_bytes: 2 * GiB },
       transcription: { enabled: true, minutes_limit: 60 },
       frozen: false,
     });
     expect(planEntitlement("entry")).toEqual({
-      caps: { notes_bytes: 250 * MiB, attachment_bytes: 0 },
+      caps: { notes_bytes: 100 * MiB, attachment_bytes: 0 },
       transcription: { enabled: false, minutes_limit: 0 },
       frozen: false,
     });
@@ -148,9 +148,9 @@ describe("PLAN_SPECS — the ratified ladder", () => {
   });
 
   test("display copy derives from the specs", () => {
-    expect(planLine("entry")).toBe("Entry plan — 1 vault, 250 MB notes (notes only)");
-    expect(planLine("standard")).toBe("Standard plan — 3 vaults, 1 GiB notes + 2 GiB attachments");
-    expect(planLine("trial")).toBe("Free trial — 5 vaults, 2 GiB notes + 8 GiB attachments");
+    expect(planLine("entry")).toBe("Entry plan — 1 vault, 100 MB notes (notes only)");
+    expect(planLine("standard")).toBe("Standard plan — 3 vaults, 250 MB notes + 2 GiB attachments");
+    expect(planLine("trial")).toBe("Free trial — 5 vaults, 500 MB notes + 8 GiB attachments");
     expect(planLine("expired")).toBe(
       "Trial ended — your notes are safe to read and export; pick a plan to write again",
     );
@@ -250,7 +250,7 @@ describe("console plan display", () => {
     expect(html).toContain('data-testid="plans"');
     expect(html).toContain('data-testid="plan-card-power"');
     expect(html).toContain("$1/mo");
-    expect(html).toContain("5 GiB notes"); // Power's caps, from PLAN_SPECS
+    expect(html).toContain("1 GiB notes"); // Power's caps, from PLAN_SPECS
     expect(html).toContain('action="/console/plan"'); // pick a tier — no card
     expect(html).not.toContain("stripe");
     expect(html).not.toContain("/billing/checkout");
@@ -261,7 +261,7 @@ describe("console plan display", () => {
     await setUserPlan(env.DB, id, "standard");
     await seedVault("planline2-box", id);
     const html = await consoleHtml(await seedSession(id));
-    expect(html).toContain("Standard plan — 3 vaults, 1 GiB notes + 2 GiB attachments");
+    expect(html).toContain("Standard plan — 3 vaults, 250 MB notes + 2 GiB attachments");
     expect(html).not.toContain("from $1/mo");
   });
 
@@ -317,7 +317,7 @@ describe("vault-count enforcement + entitlement push", () => {
       })
       .reply(
         200,
-        { name: "capflow-box", resolved_cap_bytes: 250 * MiB, used_bytes: 0 },
+        { name: "capflow-box", resolved_cap_bytes: 100 * MiB, used_bytes: 0 },
         { headers: { "content-type": "application/json" } },
       );
 
@@ -328,10 +328,10 @@ describe("vault-count enforcement + entitlement push", () => {
     expect(created.status).toBe(302);
     expect(created.headers.get("location")).toBe("/console?created=capflow-box");
 
-    // The pushed body is the TWO-METER entitlement (entry: 250 MB notes, 0
+    // The pushed body is the TWO-METER entitlement (entry: 100 MB notes, 0
     // attachments, voice off, not frozen).
     expect(JSON.parse(body!)).toEqual({
-      caps: { notes_bytes: 250 * MiB, attachment_bytes: 0 },
+      caps: { notes_bytes: 100 * MiB, attachment_bytes: 0 },
       transcription: { enabled: false, minutes_limit: 0 },
       frozen: false,
     });
@@ -418,7 +418,7 @@ describe("vault-count enforcement + entitlement push", () => {
     );
     expect(created.status).toBe(302);
     expect(JSON.parse(body!)).toEqual({
-      caps: { notes_bytes: 250 * MiB, attachment_bytes: 0 },
+      caps: { notes_bytes: 100 * MiB, attachment_bytes: 0 },
       transcription: { enabled: false, minutes_limit: 0 },
       frozen: false,
     });
@@ -496,7 +496,7 @@ describe("applyPlanToVaults — the seam admin/Stripe/promo/sweep call", () => {
     for (const c of calls) {
       expect(c.method).toBe("PUT");
       expect(c.body).toEqual({
-        caps: { notes_bytes: 1 * GiB, attachment_bytes: 2 * GiB },
+        caps: { notes_bytes: 250 * MiB, attachment_bytes: 2 * GiB },
         transcription: { enabled: true, minutes_limit: 60 },
         frozen: false,
       });
