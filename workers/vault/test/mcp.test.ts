@@ -286,3 +286,169 @@ describe("MCP — write gate (frozen + cap parity)", () => {
     expect(err.error.data.cap_bytes).toBe(1024);
   });
 });
+
+/**
+ * vault-info — the server-layer override (the launch-critical bug: core ships a
+ * placeholder execute — "vault-info must be configured by the server layer" — and
+ * the cloud DO never overrode it, so EVERY cloud vault answered that error on the
+ * FIRST call most connected AIs make). The override reuses core's
+ * buildVaultProjection (zero fork) + the door's own name/coordinates/description.
+ * Bun parity: parachute-vault/src/mcp-tools.ts overrideVaultInfo.
+ */
+describe("MCP — vault-info (server-layer override)", () => {
+  function firstPartyToken(vault: string): Promise<string> {
+    return mintToken({ vault, scopes: `vault:${vault}:admin`, vaultScope: [vault], clientId: FIRST_PARTY_CLIENT_ID });
+  }
+  function putConfig(vault: string, token: string, body: unknown): Promise<Response> {
+    return SELF.fetch(`${base(vault)}/api/internal/config`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+  const READ = (v: string) => mintToken({ vault: v, scopes: `vault:${v}:read` });
+  const WRITE = (v: string) => mintToken({ vault: v, scopes: `vault:${v}:write vault:${v}:read` });
+
+  /** Call vault-info and return the parsed projection (throws on any error). */
+  async function callVaultInfo(vault: string, token: string, args: Record<string, unknown>): Promise<any> {
+    const res = await mcpPost(vault, token, {
+      jsonrpc: "2.0",
+      id: 30,
+      method: "tools/call",
+      params: { name: "vault-info", arguments: args },
+    });
+    const body = (await res.json()) as any;
+    if (body.error) throw new Error(`vault-info → JSON-RPC error: ${JSON.stringify(body.error)}`);
+    if (body.result?.isError) throw new Error(`vault-info → tool error: ${body.result.content[0].text}`);
+    return JSON.parse(body.result.content[0].text);
+  }
+
+  it("read-scoped token → a REAL projection (name + seeded tag + coordinates, no placeholder)", async () => {
+    const v = freshVault();
+    const proj = await callVaultInfo(v, await READ(v), {});
+    expect(proj.name).toBe(v);
+    expect(proj.description).toBeNull(); // fresh vault has no description yet
+    // The default welcome pack seeds the sacred `capture` tag (with a schema).
+    const tagNames = (proj.tags as any[]).map((t) => t.name);
+    expect(tagNames).toContain("capture");
+    expect(Array.isArray(proj.indexed_fields)).toBe(true);
+    expect((proj.query_hints as string[]).length).toBeGreaterThan(0);
+    // Cloud always knows its public origin → absolute coordinates.
+    expect(proj.coordinates.name).toBe(v);
+    expect(proj.coordinates.base_url).toBe(base(v));
+    expect(proj.coordinates.mcp).toBe(`${base(v)}/mcp`);
+    expect(proj.coordinates.rest_api).toBe(`${base(v)}/api`);
+    // The bug: the placeholder must be gone.
+    expect(JSON.stringify(proj)).not.toContain("must be configured by the server layer");
+  });
+
+  it("projection surfaces a schema tag declared via MCP (effective fields + indexed catalog, core buildVaultProjection)", async () => {
+    const v = freshVault();
+    // Declare a schema-carrying tag through the MCP write path, then confirm
+    // vault-info reflects it — proving the override runs core's real projection
+    // (not a stub) against the live vault, independent of seed content.
+    const decl = await mcpPost(v, await WRITE(v), {
+      jsonrpc: "2.0",
+      id: 34,
+      method: "tools/call",
+      params: {
+        name: "update-tag",
+        arguments: {
+          tag: "project",
+          description: "A tracked project.",
+          fields: { status: { type: "string", enum: ["active", "done"], indexed: true } },
+        },
+      },
+    });
+    expect((await decl.json() as any).result?.isError).toBeFalsy();
+
+    const proj = await callVaultInfo(v, await READ(v), {});
+    const project = (proj.tags as any[]).find((t) => t.name === "project");
+    expect(project).toBeTruthy();
+    expect(project.description).toBe("A tracked project.");
+    expect(project.effective_fields.status).toBeTruthy();
+    // The indexed field `status` shows up in the queryable-fields catalog.
+    expect((proj.indexed_fields as any[]).map((f) => f.name)).toContain("status");
+  });
+
+  it("include_stats: true → counts consistent with the vault (matches the landing stats)", async () => {
+    const v = freshVault();
+    const landing = (await (await op(v, "")).json()) as any; // materializes + seeds
+    const proj = await callVaultInfo(v, OP, { include_stats: true });
+    expect(proj.stats).toBeTruthy();
+    expect(proj.stats.totalNotes).toBeGreaterThan(0);
+    expect(proj.stats.totalNotes).toBe(landing.stats.totalNotes);
+    expect(proj.stats.tagCount).toBe(landing.stats.tagCount);
+    // Live consistency: a new note bumps the count the projection reports.
+    await createNote(v, { content: "one more #x" });
+    const after = await callVaultInfo(v, OP, { include_stats: true });
+    expect(after.stats.totalNotes).toBe(proj.stats.totalNotes + 1);
+  });
+
+  it("description update: write token persists; a later read reflects it", async () => {
+    const v = freshVault();
+    const updated = await callVaultInfo(v, await WRITE(v), { description: "A curated research vault." });
+    expect(updated.description).toBe("A curated research vault.");
+    // Persisted across calls — a read-only token sees it too.
+    const reread = await callVaultInfo(v, await READ(v), {});
+    expect(reread.description).toBe("A curated research vault.");
+  });
+
+  it("description update: read-only token → refused (Forbidden / vault:write), description unchanged", async () => {
+    const v = freshVault();
+    const res = await mcpPost(v, await READ(v), {
+      jsonrpc: "2.0",
+      id: 31,
+      method: "tools/call",
+      params: { name: "vault-info", arguments: { description: "should not stick" } },
+    });
+    const body = (await res.json()) as any;
+    // The inner write-scope check throws → surfaced as an in-band tool error.
+    expect(body.result?.isError).toBe(true);
+    const text = body.result.content[0].text as string;
+    expect(text).toContain("Forbidden");
+    expect(text).toContain("vault:write");
+    // And nothing was persisted.
+    const proj = await callVaultInfo(v, OP, {});
+    expect(proj.description).toBeNull();
+  });
+
+  it("FROZEN vault: a description update is refused by the #82 write gate (402 plan_required); a READ still works", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "seed before the freeze" });
+    const froze = await putConfig(v, await firstPartyToken(v), { frozen: true });
+    expect(froze.status).toBe(200);
+    const writeToken = await WRITE(v);
+
+    // UPDATE (description present) → gated as a write → JSON-RPC 402-mirror.
+    const blocked = await mcpPost(v, writeToken, {
+      jsonrpc: "2.0",
+      id: 32,
+      method: "tools/call",
+      params: { name: "vault-info", arguments: { description: "frozen — no write" } },
+    });
+    const berr = (await blocked.json()) as any;
+    expect(berr.error).toBeTruthy();
+    expect(berr.error.data.error_type).toBe("plan_required");
+
+    // READ (no description) is sacred — vault-info still works on a frozen vault.
+    const proj = await callVaultInfo(v, writeToken, { include_stats: true });
+    expect(proj.name).toBe(v);
+    expect(proj.stats.totalNotes).toBeGreaterThan(0);
+    // The blocked update never landed.
+    expect(proj.description).toBeNull();
+  });
+
+  it("REGRESSION canary: the placeholder string never rides in a vault-info response (read + operator)", async () => {
+    const v = freshVault();
+    for (const token of [OP, await READ(v)]) {
+      const res = await mcpPost(v, token, {
+        jsonrpc: "2.0",
+        id: 33,
+        method: "tools/call",
+        params: { name: "vault-info", arguments: { include_stats: true } },
+      });
+      expect(await res.text()).not.toContain("must be configured by the server layer");
+    }
+  });
+});

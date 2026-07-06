@@ -356,8 +356,23 @@ export class VaultDO extends DurableObject {
       // on REST. handleMcp applies it per-tool (write-class only; read + DELETE
       // verbs pass, mirroring the REST exemptions) — POST-JSON-RPC can't gate at
       // the HTTP layer without wrongly blocking reads.
-      return handleMcp(request, this.store, vaultName, mauth, this.config!.description, () =>
-        this.capBlockIfFull(),
+      return handleMcp(
+        request,
+        this.store,
+        vaultName,
+        mauth,
+        this.config!.description,
+        () => this.capBlockIfFull(),
+        {
+          // vault-info's server-layer override needs a db handle (for core's
+          // buildVaultProjection) + a way to persist a description update into
+          // the DO config store (same seam as PUT /api/internal/config).
+          db: this.store.db,
+          updateDescription: (description: string) => {
+            this.config!.description = description;
+            return this.ctx.storage.put("config", this.config);
+          },
+        },
       );
     }
 

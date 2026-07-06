@@ -256,6 +256,25 @@ async function main() {
   const callText = call.json?.result?.content?.[0]?.text ?? "";
   assert(call.status === 200 && !call.json?.result?.isError && callText.includes("id"), "MCP tools/call create-note → created", callText.slice(0, 60).replace(/\n/g, " "));
 
+  // vault-info — the FIRST call most connected AIs make. This is the deploy-time
+  // catch for the server-layer-override bug (core ships a placeholder execute; a
+  // door that never overrides it answers "must be configured by the server
+  // layer" on EVERY vault). Assert a real projection + the canary string absent.
+  const infoRes = await mcp({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "vault-info", arguments: { include_stats: true } } });
+  const infoText: string = infoRes.json?.result?.content?.[0]?.text ?? "";
+  let info: any = null;
+  try { info = JSON.parse(infoText); } catch { /* leave null → assert fails below */ }
+  assert(
+    infoRes.status === 200 &&
+      !infoRes.json?.result?.isError &&
+      !infoText.includes("must be configured by the server layer") &&
+      info?.name === VAULT_NAME &&
+      Array.isArray(info?.tags) &&
+      typeof info?.stats?.totalNotes === "number",
+    "MCP tools/call vault-info → real projection (name + tags + stats, no placeholder)",
+    info ? `name=${info.name} tags=${info.tags?.length} notes=${info.stats?.totalNotes}` : infoText.slice(0, 80).replace(/\n/g, " "),
+  );
+
   // 7. SSE — subscribe, snapshot arrives.
   {
     const ctl = new AbortController();

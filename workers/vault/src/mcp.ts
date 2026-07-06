@@ -33,7 +33,9 @@
  * precondition_required carrying structured `data`) mirrors mcp-http.ts so an
  * agent keys off the same discriminators on either runtime.
  */
+import type { Database } from "bun:sqlite";
 import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.js";
+import { buildVaultProjection } from "@openparachute/core/src/vault-projection.js";
 import type { Store } from "@openparachute/core/src/types.js";
 import { hasScopeForVault, type AuthResult, type VaultVerb } from "./auth.js";
 
@@ -115,8 +117,17 @@ const DELETE_CLASS_TOOLS = new Set(["delete-note", "delete-tag"]);
 /** A forward-mutating tool (create/update/prune) — the class the REST
  *  POST/PATCH/PUT cap+frozen gate covers. Read tools and DELETE-class tools are
  *  exempt (REST exempts both), so this is the exact "should the write gate run"
- *  predicate. */
-function isGatedWrite(tool: McpToolDef): boolean {
+ *  predicate.
+ *
+ *  vault-info is the one read-verb tool that can ALSO mutate: it is
+ *  `requiredVerb: "read"` (a read-only caller must keep the stats projection and
+ *  reads stay sacred on a frozen vault), but a call carrying `description`
+ *  UPDATES the vault description — a real write. So gate it exactly when
+ *  `description` is present. The inner write-SCOPE check lives in
+ *  overrideVaultInfo; this is the paywall/cap half (frozen → 402, cap-full →
+ *  413), mirroring the REST write path. */
+function isGatedWrite(tool: McpToolDef, args: Record<string, unknown>): boolean {
+  if (tool.name === "vault-info") return args.description !== undefined;
   return requiredVerbForTool(tool) !== "read" && !DELETE_CLASS_TOOLS.has(tool.name);
 }
 
@@ -148,6 +159,108 @@ export function serverInstruction(vaultName: string, description: string | null)
     `traverse with find-path; orient with vault-info.`;
   const d = description?.trim();
   return d ? `${d}\n\n${base}` : base;
+}
+
+/**
+ * Server-layer context the DO supplies so vault-info can build a REAL projection
+ * and persist description updates. core's vault-info `execute` is a placeholder
+ * ("vault-info must be configured by the server layer", core/src/mcp.ts) that
+ * EVERY door must override with its own vault config + db handle. The bun door
+ * does this in mcp-tools.ts (`overrideVaultInfo`); this is the cloud DO's
+ * equivalent seam.
+ */
+export interface VaultInfoContext {
+  /** The bun:sqlite-`Database`-shaped DB handle (the DO's DatabaseShim / store.db)
+   *  for `buildVaultProjection`. */
+  db: Database;
+  /** Persist a new vault description into the DO's config store. Called only on
+   *  the write-gated description-update branch (after the inner write-scope
+   *  check passes and the dispatch-layer frozen/cap gate has cleared). Resolves
+   *  after the config `put` lands. */
+  updateDescription: (description: string) => void | Promise<void>;
+}
+
+/** Public-facing origin, honoring a proxy's X-Forwarded-* (Cloudflare sets Host).
+ *  Mirrors discovery.ts so vault-info coordinates match the discovery-chain URLs. */
+function publicOrigin(req: Request): string {
+  const fwdHost = req.headers.get("x-forwarded-host");
+  const fwdProto = req.headers.get("x-forwarded-proto");
+  if (fwdHost) return `${fwdProto || "https"}://${fwdHost}`;
+  return new URL(req.url).origin;
+}
+
+/**
+ * Override core's placeholder vault-info `execute` with a real projection —
+ * mirroring bun's `overrideVaultInfo` (parachute-vault/src/mcp-tools.ts). Reuses
+ * core's `buildVaultProjection` (ZERO fork) for tags-with-schemas (own + effective
+ * inheritance), the indexed-metadata-field catalog, query hints, the
+ * getting-started pointer, and optional stats; the door adds its own vault NAME,
+ * public coordinates, and the description get/update.
+ *
+ * The description-UPDATE branch is a write: it (1) requires `vault:write` for THIS
+ * vault (the inner check here — vault-info stays `requiredVerb: "read"` so
+ * read-only callers keep the stats projection) and (2) is separately routed
+ * through the #82 write gate at the dispatch layer (`isGatedWrite` treats
+ * vault-info-with-`description` as a gated write → a frozen vault refuses with the
+ * SAME 402 `plan_required` shape as create-note; a plain read carries no
+ * `description`, skips the gate, and works on a frozen vault — reads stay sacred).
+ */
+function overrideVaultInfo(
+  tools: McpToolDef[],
+  opts: {
+    vaultName: string;
+    auth: AuthResult;
+    description: string | null;
+    origin: string;
+    ctx: VaultInfoContext;
+  },
+): void {
+  const { vaultName, auth, ctx } = opts;
+  const vaultInfo = tools.find((t) => t.name === "vault-info");
+  if (!vaultInfo) return;
+
+  vaultInfo.execute = async (params) => {
+    let description = opts.description;
+
+    if (params.description !== undefined) {
+      // Inner write-check (parity with bun's overrideVaultInfo): vault-info is
+      // read-gated so read-only callers can fetch stats, but MUTATING the
+      // description requires write for THIS vault. Without this a `vault:read`
+      // token could slip a write past a tool the outer gate considers a read.
+      // (The frozen/cap paywall is applied at the dispatch layer — see
+      // isGatedWrite/handleToolCall — so this only guards SCOPE.)
+      if (!hasScopeForVault(auth.scopes, vaultName, "write")) {
+        throw new Error(
+          `Forbidden: updating the vault description requires the 'vault:write' scope (or 'vault:${vaultName}:write'). Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
+        );
+      }
+      description = params.description as string;
+      await ctx.updateDescription(description);
+    }
+
+    const includeStats = Boolean(params.include_stats);
+    const projection = buildVaultProjection(ctx.db, { includeStats });
+
+    // Cloud always knows its public origin (the request arrived through it), so
+    // base_url is always absolute — unlike bun's loopback-fallback null case.
+    const base = opts.origin.replace(/\/$/, "");
+    const result: Record<string, unknown> = {
+      name: vaultName,
+      description: description ?? null,
+      coordinates: {
+        name: vaultName,
+        base_url: `${base}/vault/${vaultName}`,
+        rest_api: `${base}/vault/${vaultName}/api`,
+        mcp: `${base}/vault/${vaultName}/mcp`,
+      },
+      tags: projection.tags,
+      indexed_fields: projection.indexed_fields,
+      query_hints: projection.query_hints,
+    };
+    if (projection.getting_started) result.getting_started = projection.getting_started;
+    if (projection.stats) result.stats = projection.stats;
+    return result;
+  };
 }
 
 /** Map a core domain error to its JSON-RPC error shape (mirrors mcp-http.ts). */
@@ -234,7 +347,7 @@ async function handleToolCall(
   // AND delete-class verbs pass through (REST exempts both). MCP is the flagship
   // write door, so without this an expired (frozen) tenant's connected AI could
   // keep writing forever and a two-meter notes-cap-full vault could keep growing.
-  if (isGatedWrite(tool)) {
+  if (isGatedWrite(tool, args)) {
     const blocked = writeGate();
     if (blocked) return gateError(id, blocked);
   }
@@ -296,6 +409,7 @@ export async function handleMcp(
   auth: AuthResult,
   description: string | null,
   writeGate: McpWriteGate,
+  vaultInfo: VaultInfoContext,
 ): Promise<Response> {
   if (req.method === "DELETE") return new Response(null, { status: 200 });
   if (req.method !== "POST") {
@@ -358,6 +472,10 @@ export async function handleMcp(
   }
 
   const tools = visibleTools(store, vaultName, auth);
+  // Wire the server-layer vault-info override onto the caller-visible tool set
+  // (core ships a placeholder execute — "must be configured by the server
+  // layer"). Parity with bun's mcp-tools.ts overrideVaultInfo.
+  overrideVaultInfo(tools, { vaultName, auth, description, origin: publicOrigin(req), ctx: vaultInfo });
   const ctx = { tools, vaultName, description, writeGate };
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));
