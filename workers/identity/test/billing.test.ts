@@ -30,7 +30,9 @@
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import type Stripe from "stripe";
+import type { OAuthDeps } from "../src/oauth-shared.ts";
 import app from "../src/index.ts";
+import { handleChoosePlanPost } from "../src/console.ts";
 import { planEntitlement } from "../src/plans.ts";
 import {
   BILLING_SWEEP_CAP,
@@ -181,6 +183,51 @@ function post(path: string, fields: Record<string, string>, cookie: string): Req
 
 function sessionCookie(sessionId: string): string {
   return `parachute_id_csrf=${CSRF}; parachute_id_session=${sessionId}`;
+}
+
+/**
+ * A D1 proxy that runs `inject` exactly once, immediately BEFORE the prepared
+ * statement whose SQL contains `sqlNeedle` executes `.run()` — deterministically
+ * simulating a concurrent write landing inside a handler's read→write window
+ * (the F1 pick-a-plan TOCTOU). Every other statement passes straight through.
+ */
+function dbInjectingBeforeRun(realDb: D1Database, sqlNeedle: string, inject: () => Promise<void>): D1Database {
+  return new Proxy(realDb, {
+    get(target, prop) {
+      if (prop !== "prepare") {
+        const v = (target as unknown as Record<string | symbol, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      }
+      return (sql: string): D1PreparedStatement => {
+        const stmt = target.prepare(sql);
+        if (!sql.includes(sqlNeedle)) return stmt;
+        // Wrap only the matching statement so its .run() is preceded by inject().
+        return new Proxy(stmt, {
+          get(s, p) {
+            if (p !== "bind") {
+              const v = (s as unknown as Record<string | symbol, unknown>)[p];
+              return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(s) : v;
+            }
+            return (...args: unknown[]): D1PreparedStatement => {
+              const bound = s.bind(...(args as [])) as D1PreparedStatement;
+              return new Proxy(bound, {
+                get(b, bp) {
+                  if (bp === "run") {
+                    return async () => {
+                      await inject();
+                      return b.run();
+                    };
+                  }
+                  const v = (b as unknown as Record<string | symbol, unknown>)[bp];
+                  return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(b) : v;
+                },
+              });
+            };
+          },
+        });
+      };
+    },
+  }) as unknown as D1Database;
 }
 
 async function consoleHtml(sessionId: string, testEnv: typeof env = env, query = ""): Promise<string> {
@@ -337,16 +384,64 @@ describe("NOT CONFIGURED — the clean degradation (today's deploy)", () => {
     },
   );
 
-  test("PRODUCTION, no keys: a trial user's console hides every billing door (incl. mock); the teaser stays", async () => {
+  test("PRODUCTION, no keys: a trial user STILL sees the 4 plan cards + the free 'Choose this plan' path; no Stripe/mock checkout button (the regression fix)", async () => {
     const { id } = await seedUser("noconfig@example.com"); // seedUser → trial
     await seedVault("noconfig-box", id);
     const html = await consoleHtml(await seedSession(id), PROD_UNCONFIGURED_ENV);
+    // THE FIX: the plan cards render even with no Stripe — a trial user used to
+    // see NOTHING here (the old chooser was gated on billingConfigured).
+    expect(html).toContain('data-testid="plans"');
+    expect(html).toContain('data-testid="plan-card-entry"');
+    expect(html).toContain('data-testid="plan-card-power"');
+    expect(html).toContain("$1/mo");
+    expect(html).toContain("$10/mo");
+    // Picking a tier needs NO card — the free /console/plan affordance is present.
+    expect(html).toContain('action="/console/plan"');
+    expect(html).toContain('data-testid="choose-plus"');
+    // The calm no-card line stands in for the (absent) checkout button.
+    expect(html).toContain('data-testid="no-card-line"');
+    expect(html).toContain("no card needed");
+    // No Stripe: neither the real nor the mock checkout affordance renders — and
+    // no broken/500-ing checkout button is drawn.
     expect(html).not.toContain('data-testid="upgrade-billing"');
     expect(html).not.toContain('data-testid="manage-billing"');
     expect(html).not.toContain('data-testid="mock-billing-note"'); // the mock 404s in prod
     expect(html).not.toContain("/billing/checkout");
     expect(html).not.toContain("/billing/mock-checkout");
-    expect(html).toContain("Paid plans from $1/mo"); // the copy-only teaser (upgradeTeaser), unchanged
+  });
+
+  test("RENDER: an EXPIRED user's console shows NO free /console/plan form + the reactivate line; a TRIAL user shows the form + no-card line (the launch-facing contrast)", async () => {
+    // EXPIRED — the launch promise the F1 server guard protects, now pinned at the
+    // UI too: the free pick-a-plan door must be ABSENT (they must pay to
+    // reactivate), and the calm reactivate line stands in for it.
+    const { id: expiredId } = await seedUser("render-expired@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'expired', pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?")
+      .bind(expiredId)
+      .run();
+    await seedVault("render-expired-box", expiredId);
+    const expiredHtml = await consoleHtml(await seedSession(expiredId), PROD_UNCONFIGURED_ENV);
+    // The plan cards still render (checkout-eligible section) — expired isn't a
+    // blank console, it's a reactivate console.
+    expect(expiredHtml).toContain('data-testid="plans"');
+    expect(expiredHtml).toContain('data-testid="plan-card-power"');
+    // THE UI GUARD: no free /console/plan door at all (no form, no choose-* button).
+    expect(expiredHtml).not.toContain('action="/console/plan"');
+    expect(expiredHtml).not.toContain('data-testid="choose-');
+    // The reactivate line stands in (billing unconfigured → no checkout button either).
+    expect(expiredHtml).toContain('data-testid="reactivate-line"');
+    expect(expiredHtml).toContain("reactivate");
+    expect(expiredHtml).not.toContain('data-testid="no-card-line"');
+    expect(expiredHtml).not.toContain('data-testid="upgrade-billing"');
+
+    // TRIAL contrast — same keyless deploy, but a live trial DOES get the free
+    // pick-a-plan form + the no-card line (never the reactivate line).
+    const { id: trialId } = await seedUser("render-trial@example.com"); // seedUser → trial
+    await seedVault("render-trial-box", trialId);
+    const trialHtml = await consoleHtml(await seedSession(trialId), PROD_UNCONFIGURED_ENV);
+    expect(trialHtml).toContain('action="/console/plan"');
+    expect(trialHtml).toContain('data-testid="choose-power"');
+    expect(trialHtml).toContain('data-testid="no-card-line"');
+    expect(trialHtml).not.toContain('data-testid="reactivate-line"');
   });
 
   test("paid user's console hides Manage billing while unconfigured", async () => {
@@ -414,6 +509,212 @@ describe("console billing doors (configured)", () => {
     expect(await consoleHtml(sessionId, BILLING_ENV, "?billing_err=already")).toContain("already on a paid plan");
     // Unknown codes render nothing (allowlist, not echo).
     expect(await consoleHtml(sessionId, BILLING_ENV, "?billing_err=<script>alert(1)</script>")).not.toContain("alert(1)");
+  });
+});
+
+// --- POST /console/plan — pick/change the trial tier (NO Stripe) ---------------
+
+describe("POST /console/plan — pick/change your trial tier (no Stripe)", () => {
+  beforeAll(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+  afterEach(() => fetchMock.assertNoPendingInterceptors());
+
+  function interceptCapPush(vault: string, capture?: (body: string) => void) {
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({
+        path: `/vault/${vault}/api/internal/config`,
+        method: "PUT",
+        body: (raw: string) => {
+          capture?.(raw);
+          return true;
+        },
+      })
+      .reply(200, { ok: true }, { headers: { "content-type": "application/json" } });
+  }
+
+  test("a TRIAL user picks a tier: pending_plan set, the CHOSEN tier's caps push to every vault, the 30-day clock is KEPT, 302 plan_chosen", async () => {
+    const { id } = await seedUser("plan-pick@example.com"); // trial, clock armed
+    await seedVault("plan-pick-box", id);
+    const before = (await getUserById(env.DB, id))!;
+    expect(before.plan).toBe("trial");
+    expect(before.pendingPlan).toBe("expired"); // the signup default (Plus-mirror)
+
+    let pushed = "";
+    interceptCapPush("plan-pick-box", (b) => (pushed = b));
+    const res = await app.fetch(
+      post("/console/plan", { __csrf: CSRF, plan: "power" }, sessionCookie(await seedSession(id))),
+      env,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?plan_chosen=power");
+
+    const after = (await getUserById(env.DB, id))!;
+    expect(after.plan).toBe("trial"); // still a trial — a free preview, not a purchase
+    expect(after.pendingPlan).toBe("power"); // now mirrors Power
+    expect(after.planDowngradeAt).toBe(before.planDowngradeAt); // the 30-day clock is UNTOUCHED
+    // The re-push carried the CHOSEN tier's two-meter caps + voice (Power: 5 GiB
+    // notes / 50 GiB attach / 1200 min), not the plus-mirroring trial default.
+    expect(JSON.parse(pushed)).toEqual(planEntitlement("power"));
+  });
+
+  test("changing tier ENTRY↔POWER flips the pushed caps each time", async () => {
+    const { id } = await seedUser("plan-flip@example.com");
+    await seedVault("plan-flip-box", id);
+    const sessionId = await seedSession(id);
+
+    let entryPush = "";
+    interceptCapPush("plan-flip-box", (b) => (entryPush = b));
+    const toEntry = await app.fetch(post("/console/plan", { __csrf: CSRF, plan: "entry" }, sessionCookie(sessionId)), env);
+    expect(toEntry.headers.get("location")).toBe("/console?plan_chosen=entry");
+    expect(JSON.parse(entryPush)).toEqual(planEntitlement("entry")); // notes-only, voice off, attachment_bytes:0
+    expect((await getUserById(env.DB, id))!.pendingPlan).toBe("entry");
+
+    let powerPush = "";
+    interceptCapPush("plan-flip-box", (b) => (powerPush = b));
+    const toPower = await app.fetch(post("/console/plan", { __csrf: CSRF, plan: "power" }, sessionCookie(sessionId)), env);
+    expect(toPower.headers.get("location")).toBe("/console?plan_chosen=power");
+    expect(JSON.parse(powerPush)).toEqual(planEntitlement("power"));
+    expect((await getUserById(env.DB, id))!.pendingPlan).toBe("power");
+  });
+
+  test("SECURITY: an EXPIRED user's POST /console/plan does NOT grant a free paid tier — no un-freeze, redirect to reactivate, and (positive control) NO cap push fires", async () => {
+    const { id } = await seedUser("plan-expired@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'expired', pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?")
+      .bind(id)
+      .run();
+    await seedVault("plan-expired-box", id);
+    // POSITIVE CONTROL, not the vacuous "no interceptor registered": pushVaultCap
+    // is no-throw, so relying on disableNetConnect alone would SWALLOW a stray
+    // push rather than fail on it. Spy the vault-call seam (deps.vaultFetch, the
+    // single fetch every cap push routes through) and RECORD any cap-push PUT
+    // /api/internal/config — the exact request that would un-freeze the expired
+    // user's vaults at paid caps. A future refactor that pushed from the
+    // request-tier instead of the row is caught by the capPushes assertion below.
+    const capPushes: Array<{ method: string; url: string }> = [];
+    const spiedDeps = {
+      ...deps(),
+      vaultFetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        if (method === "PUT" && url.includes("/api/internal/config")) capPushes.push({ method, url });
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) satisfies NonNullable<OAuthDeps["vaultFetch"]>,
+    };
+    const res = await handleChoosePlanPost(
+      env.DB,
+      post("/console/plan", { __csrf: CSRF, plan: "power" }, sessionCookie(await seedSession(id))),
+      spiedDeps,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?plan_err=reactivate");
+    // The load-bearing proof: NO entitlement push reached any vault DO.
+    expect(capPushes).toEqual([]);
+    const after = (await getUserById(env.DB, id))!;
+    expect(after.plan).toBe("expired"); // still frozen — never a free paid tier
+    expect(after.pendingPlan).toBeNull(); // untouched
+  });
+
+  test("SECURITY (F1 TOCTOU): the day-30 sweep floors the trial to expired INSIDE the read→write window → the conditional write matches 0 rows → reactivate + NO cap push (never un-freeze at paid caps)", async () => {
+    const { id } = await seedUser("plan-toctou@example.com"); // trial, clock armed
+    await seedVault("plan-toctou-box", id);
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial"); // trial when the handler reads it
+
+    // Positive control on the push seam: a stray push here IS the bug — the
+    // chosen tier's paid caps applied to a row the sweep already floored.
+    const capPushes: string[] = [];
+    const spiedDeps = {
+      ...deps(),
+      vaultFetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        if (method === "PUT" && url.includes("/api/internal/config")) capPushes.push(url);
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) satisfies NonNullable<OAuthDeps["vaultFetch"]>,
+    };
+
+    // Fire the sweep's floor-to-expired the instant BEFORE the conditional
+    // `pending_plan` UPDATE runs. sessionUser already read `trial` (so every
+    // UPSTREAM guard — isPaidTier/canStartCheckout/plan!=='trial' — passed):
+    // ONLY the `WHERE plan = 'trial'` clause can catch this race. Without the
+    // conditional write the handler would set pending_plan='power' and push
+    // power's caps into the now-expired (frozen) vault. `changes===0` is the
+    // ONLY thing standing between the race and that un-freeze.
+    let swept = 0;
+    const racingDb = dbInjectingBeforeRun(env.DB, "SET pending_plan = ?", async () => {
+      if (swept++ > 0) return; // once, defensively (only the one UPDATE matches the needle)
+      await env.DB.prepare("UPDATE users SET plan = 'expired', pending_plan = 'expired' WHERE id = ?").bind(id).run();
+    });
+
+    const res = await handleChoosePlanPost(
+      racingDb,
+      post("/console/plan", { __csrf: CSRF, plan: "power" }, sessionCookie(await seedSession(id))),
+      spiedDeps,
+    );
+    expect(swept).toBe(1); // the race actually fired (the branch under test was reached)
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?plan_err=reactivate"); // NOT plan_chosen
+    // THE LOAD-BEARING PROOF: caps were NEVER pushed to the raced-to-expired row.
+    expect(capPushes).toEqual([]);
+    const after = (await getUserById(env.DB, id))!;
+    expect(after.plan).toBe("expired"); // the sweep's floor stands
+    expect(after.pendingPlan).toBe("expired"); // the chosen 'power' NEVER overwrote it
+  });
+
+  test("a live/paid subscriber can't use /console/plan (they use the portal) → plan_err=already, plan unchanged", async () => {
+    const { id } = await seedPaidUser("plan-paid@example.com");
+    const res = await app.fetch(
+      post("/console/plan", { __csrf: CSRF, plan: "power" }, sessionCookie(await seedSession(id))),
+      env,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?plan_err=already");
+    expect((await getUserById(env.DB, id))!.plan).toBe("standard");
+  });
+
+  test("gates: no session → /login; bad CSRF → plan_err=session; cross-origin → session; a non-paid-tier plan → invalid", async () => {
+    const { id } = await seedUser("plan-gates@example.com");
+    const sessionId = await seedSession(id);
+
+    const noSession = await app.fetch(post("/console/plan", { __csrf: CSRF, plan: "power" }, `parachute_id_csrf=${CSRF}`), env);
+    expect(noSession.headers.get("location")).toBe("/login");
+
+    const badCsrf = await app.fetch(post("/console/plan", { __csrf: "wrong", plan: "power" }, sessionCookie(sessionId)), env);
+    expect(badCsrf.headers.get("location")).toBe("/console?plan_err=session");
+
+    const crossOrigin = new Request(`${ISSUER}/console/plan`, {
+      method: "POST",
+      body: new URLSearchParams({ __csrf: CSRF, plan: "power" }),
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: "https://evil.example",
+        cookie: sessionCookie(sessionId),
+      },
+    });
+    expect((await app.fetch(crossOrigin, env)).headers.get("location")).toBe("/console?plan_err=session");
+
+    // A valid PlanId that isn't a purchasable tier (trial/expired) → invalid.
+    const badPlan = await app.fetch(post("/console/plan", { __csrf: CSRF, plan: "trial" }, sessionCookie(sessionId)), env);
+    expect(badPlan.headers.get("location")).toBe("/console?plan_err=invalid");
+  });
+
+  test("the plan-chosen confirmation renders from the STORED pending_plan, never the query string", async () => {
+    const { id } = await seedUser("plan-notice@example.com");
+    await env.DB.prepare("UPDATE users SET pending_plan = 'power' WHERE id = ?").bind(id).run();
+    const sessionId = await seedSession(id);
+    // Honest: pending IS power → the confirmation notice is honored (the
+    // apostrophe is HTML-escaped, so match the apostrophe-free segment).
+    expect(await consoleHtml(sessionId, env, "?plan_chosen=power")).toContain("now trying Power");
+    // Mismatched claim (pending is power, param says entry) → no Entry notice.
+    expect(await consoleHtml(sessionId, env, "?plan_chosen=entry")).not.toContain("now trying Entry");
   });
 });
 

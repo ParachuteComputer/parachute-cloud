@@ -337,6 +337,39 @@ export function upgradeTeaser(): string {
   return "Paid plans from $1/mo — pick a plan to keep writing after your trial. Have a code? Redeem it below.";
 }
 
+/** One tier's key caps as a short "250 MB notes · 8 GiB attachments · 300 voice
+ *  min/mo" line — the plan card body + the pick-a-plan confirmation both read it. */
+export function tierCapSummary(tier: PaidTier): string {
+  const spec = PLAN_SPECS[tier];
+  const attach = spec.attachment_bytes > 0 ? `${formatPlanBytes(spec.attachment_bytes)} attachments` : "notes only";
+  const voice = spec.voice_enabled ? `${spec.transcribe_minutes} voice min/mo` : "no voice";
+  return `${formatPlanBytes(spec.notes_bytes)} notes · ${attach} · ${voice}`;
+}
+
+/**
+ * The confirmation copy after a TRIAL user picks/changes their tier with no
+ * Stripe (POST /console/plan) — the trial now mirrors this tier's caps for the
+ * rest of the 30 days (the clock is unchanged; the day-30 sweep still floors).
+ */
+export function trialTierChosenMessage(tier: PaidTier): string {
+  return `You're now trying ${PLAN_SPECS[tier].label} — ${tierCapSummary(tier)} — for the rest of your trial.`;
+}
+
+/**
+ * The trial-tier BANNER on the plan line: which tier the trial currently mirrors
+ * (entitlementPlanFor, mapped back to a label) + days left. `isDefault` = the
+ * signup default (pending='expired'/null → mirrors Plus, an honest "you haven't
+ * picked yet"), rendered distinctly from an explicit choice.
+ */
+export function trialBannerLine(tierLabel: string, isDefault: boolean, daysLeft: number | null): string {
+  const days =
+    daysLeft === null ? "" : ` — ${daysLeft} day${daysLeft === 1 ? "" : "s"} left`;
+  if (isDefault) {
+    return `Free trial — trying ${tierLabel} (default)${days}. Pick the plan that fits.`;
+  }
+  return `You're trying ${tierLabel} free${days}.`;
+}
+
 /**
  * The friendly refusal when a restore would need a vault slot the plan doesn't
  * have (restore always creates a NEW vault — it never overwrites).

@@ -356,18 +356,26 @@ async function main() {
       "console card carries the export door",
       "",
     );
-    // The TRIAL plan line renders, plus a billing affordance whose SHAPE depends
-    // on the deploy state: the mock tier buttons ("test mode" — staging today,
-    // no Stripe), the real Upgrade buttons (Stripe configured), or the copy-only
-    // teaser ("from $1/mo" — prod, no keys). Any is a pass. And the trial's
-    // 30-day countdown ("until <date>") rides the plan line.
+    // The trial banner (mirrored tier + days left) renders on the plan line, and
+    // the ALWAYS-VISIBLE plan cards render REGARDLESS of billing state — the four
+    // purchasable tiers with their prices + caps + the free "Choose this plan"
+    // path (POST /console/plan, no Stripe). The Stripe "Add a card" affordance is
+    // additive on top when billing is available (mock buttons on staging today,
+    // real Upgrade once keys land).
     assert(
-      conHtml.includes("Free trial — 5 vaults, 2 GiB notes + 8 GiB attachments") &&
-        conHtml.includes('data-testid="plan-until"') &&
-        (conHtml.includes('data-testid="mock-billing-note"') ||
-          conHtml.includes('data-testid="upgrade-billing"') ||
-          conHtml.includes("from $1/mo")),
-      "console shows the trial plan line + countdown + a billing affordance (mock / real Upgrade / teaser)",
+      conHtml.includes('data-testid="trial-banner"') && conHtml.includes("days left"),
+      "console shows the trial banner (mirrored tier + days left)",
+      "",
+    );
+    assert(
+      conHtml.includes('data-testid="plans"') &&
+        conHtml.includes('data-testid="plan-card-entry"') &&
+        conHtml.includes('data-testid="plan-card-power"') &&
+        conHtml.includes("$1/mo") &&
+        conHtml.includes("$10/mo") &&
+        conHtml.includes('action="/console/plan"') &&
+        conHtml.includes('data-testid="choose-plus"'),
+      "console shows all four plan cards + prices + the free 'Choose this plan' path (no Stripe needed)",
       "",
     );
 
@@ -1074,6 +1082,82 @@ async function main() {
       const mock = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
       assert(mock.status === 404, "billing CONFIGURED: the mock endpoint 404s (the real path is active)", `status ${mock.status}`);
     }
+  }
+
+  // 16b. Pick/change the TRIAL tier (POST /console/plan — NO Stripe). A FRESH
+  //      throwaway user (so it can't perturb the arrival user's §17/§18 flow):
+  //      signup (trial, mirrors Plus) → POST /console/plan(power) → the vault
+  //      landing's caps FLIP to Power (5 GiB notes + 50 GiB attach = 55 GiB), and
+  //      the trial clock is unchanged. Then change to standard and assert the
+  //      caps flip again — proving the free tier-change re-pushes entitlements.
+  try {
+    const tEmail = `tier-${Date.now()}@smoke.test`;
+    const tPass = b64url(crypto.getRandomValues(new Uint8Array(18)));
+    const tVault = `tierbox-${Date.now()}`;
+    const tSuGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
+    const tCsrf = cookieVal(tSuGet.headers.getSetCookie(), "parachute_id_csrf");
+    const tSu = await fetch(`${IDENTITY}/signup`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${tCsrf}` },
+      redirect: "manual",
+      body: form({ __csrf: tCsrf!, email: tEmail, password: tPass }),
+    });
+    const tSession = cookieVal(tSu.headers.getSetCookie(), "parachute_id_session");
+    assert(tSu.status === 302 && !!tSession, "tier-change: fresh signup → session", `status ${tSu.status}`);
+    const tCookie = `parachute_id_session=${tSession}; parachute_id_csrf=${tCsrf}`;
+
+    const tCv = await fetch(`${IDENTITY}/console/vaults`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: tCookie },
+      redirect: "manual",
+      body: form({ __csrf: tCsrf!, name: tVault }),
+    });
+    assert(tCv.status === 302 && (tCv.headers.get("location") ?? "").includes(`created=${tVault}`), "tier-change: created a vault", `status ${tCv.status}`);
+
+    // Pick POWER — no card. Sets pending_plan=power; the caps re-push immediately.
+    const toPower = await fetch(`${IDENTITY}/console/plan`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: tCookie },
+      redirect: "manual",
+      body: form({ __csrf: tCsrf!, plan: "power" }),
+    });
+    assert(
+      toPower.status === 302 && (toPower.headers.get("location") ?? "").includes("plan_chosen=power"),
+      "tier-change: POST /console/plan(power) → 302 plan_chosen (no Stripe)",
+      `status ${toPower.status} → ${toPower.headers.get("location")}`,
+    );
+    const tOwner = await authorizeFor(tEmail, tPass, tVault);
+    if (!tOwner.token) {
+      fail("tier-change: the trial user mints a token for their vault", tOwner.error ?? "no token");
+    } else {
+      const tAuth = { authorization: `Bearer ${tOwner.token}` };
+      const powerLand = (await (await fetch(`${VAULT}/vault/${tVault}`, { headers: tAuth })).json()) as { cap_bytes?: number };
+      assert(
+        powerLand.cap_bytes === 55 * 1024 * 1024 * 1024,
+        "tier-change: landing caps FLIPPED to Power (5 GiB notes + 50 GiB attach = 55 GiB)",
+        `cap_bytes=${powerLand.cap_bytes}`,
+      );
+      // Change again to STANDARD — the caps flip once more (1 GiB + 2 GiB = 3 GiB).
+      const toStd = await fetch(`${IDENTITY}/console/plan`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: tCookie },
+        redirect: "manual",
+        body: form({ __csrf: tCsrf!, plan: "standard" }),
+      });
+      assert(
+        toStd.status === 302 && (toStd.headers.get("location") ?? "").includes("plan_chosen=standard"),
+        "tier-change: POST /console/plan(standard) → 302 plan_chosen",
+        `status ${toStd.status}`,
+      );
+      const stdLand = (await (await fetch(`${VAULT}/vault/${tVault}`, { headers: tAuth })).json()) as { cap_bytes?: number };
+      assert(
+        stdLand.cap_bytes === 3 * 1024 * 1024 * 1024,
+        "tier-change: landing caps FLIPPED again to Standard (1 GiB notes + 2 GiB attach = 3 GiB)",
+        `cap_bytes=${stdLand.cap_bytes}`,
+      );
+    }
+  } catch (err) {
+    fail("tier-change: live section threw (non-fatal — sections continue)", String(err));
   }
 
   // 17. GFS snapshots + restore (Wave 4e). The arrival user is on the 30-day

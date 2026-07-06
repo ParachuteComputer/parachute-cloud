@@ -12,6 +12,7 @@ import {
   handleAddPackPost,
   handleChecklistPost,
   handleChecklistRestorePost,
+  handleChoosePlanPost,
   handleConsoleGet,
   handleCreateVaultPost,
   handleExportPost,
@@ -116,6 +117,11 @@ app.post("/login", (c) => handleLoginPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/logout", (c) => handleLogoutPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/console", (c) => handleConsoleGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/vaults", (c) => handleCreateVaultPost(c.env.DB, c.req.raw, depsFor(c.env)));
+// Pick/change the tier a TRIAL mirrors — NO Stripe (it only sets the internal
+// pending_plan that drives the mirrored caps). Session + CSRF + same-origin.
+// Load-bearing: an EXPIRED user gets plan_err=reactivate, never a free tier
+// (console.ts handleChoosePlanPost); a paid tier / live sub uses the portal.
+app.post("/console/plan", (c) => handleChoosePlanPost(c.env.DB, c.req.raw, depsFor(c.env)));
 // Snapshot restore (Wave 4e — PAID plans only): session + plan entitlement
 // (free → the router-shaped 404; the surface doesn't exist for them) + CSRF +
 // ownership + vault-count cap, then the target DO replays the tarball through
