@@ -7,8 +7,8 @@
 #
 # STAGING SHAPE (since 2026-07-02, the production/staging split):
 #   - workers.dev URLs ONLY (no custom domains — those belong to production):
-#       console + OAuth issuer:  https://parachute-identity-staging.unforced.workers.dev
-#       vaults (path routing):   https://parachute-vault-do-staging.unforced.workers.dev/vault/<name>/...
+#       console + OAuth issuer:  https://parachute-identity-staging.aaron-d5d.workers.dev
+#       vaults (path routing):   https://parachute-vault-do-staging.aaron-d5d.workers.dev/vault/<name>/...
 #   - its OWN D1 (parachute-identity-staging) + R2 (parachute-vault-staging) +
 #     a fresh DO namespace (a different worker = different Durable Objects).
 #   - ENVIRONMENT="staging": POST /auth/magic echoes the link in the
@@ -22,10 +22,10 @@
 # throwaway accounts/vaults, which is exactly what staging is for)
 set -euo pipefail
 
-export CLOUDFLARE_ACCOUNT_ID=8f2a7eb9d5e21ffa902a76cf62975c82   # "Unforced Development"
+export CLOUDFLARE_ACCOUNT_ID=d5d7c8646c3b69ce9f16bfd12ecbe98a   # new Parachute account
 
-IDENTITY_STAGING="https://parachute-identity-staging.unforced.workers.dev"
-VAULT_STAGING="https://parachute-vault-do-staging.unforced.workers.dev"
+IDENTITY_STAGING="https://parachute-identity-staging.aaron-d5d.workers.dev"
+VAULT_STAGING="https://parachute-vault-do-staging.aaron-d5d.workers.dev"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Refresh the copied file: dep FIRST — bun snapshots @openparachute/core into

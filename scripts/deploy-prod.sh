@@ -27,7 +27,7 @@
 # account/vault-creating smoke belongs on staging: scripts/smoke-staging.ts)
 set -euo pipefail
 
-export CLOUDFLARE_ACCOUNT_ID=8f2a7eb9d5e21ffa902a76cf62975c82   # "Unforced Development"
+export CLOUDFLARE_ACCOUNT_ID=d5d7c8646c3b69ce9f16bfd12ecbe98a   # new Parachute account
 
 ISSUER_ORIGIN="https://cloud.parachute.computer"   # console + OAuth issuer (iss)
 VAULT_PUBLIC="https://u.parachute.computer"        # vault host (path routing)

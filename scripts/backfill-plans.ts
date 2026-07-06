@@ -36,7 +36,7 @@ import { signInternalAdminToken } from "../workers/identity/scripts/sign-interna
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY_DIR = join(HERE, "..", "workers", "identity");
-const ACCOUNT_ID = "8f2a7eb9d5e21ffa902a76cf62975c82"; // "Unforced Development" (same as deploy scripts)
+const ACCOUNT_ID = "d5d7c8646c3b69ce9f16bfd12ecbe98a"; // new Parachute account (same as deploy scripts)
 
 /** Comp accounts (Aaron's own) — everyone else stays on 'free'. */
 const COMP_EMAILS = ["dev@parachute.computer", "ag@unforced.org"];
@@ -45,8 +45,8 @@ const TARGETS = {
   staging: {
     db: "parachute-identity-staging",
     envFlags: ["--env", "staging"],
-    issuer: "https://parachute-identity-staging.unforced.workers.dev",
-    vaultOrigin: "https://parachute-vault-do-staging.unforced.workers.dev",
+    issuer: "https://parachute-identity-staging.aaron-d5d.workers.dev",
+    vaultOrigin: "https://parachute-vault-do-staging.aaron-d5d.workers.dev",
   },
   prod: {
     db: "parachute-identity",

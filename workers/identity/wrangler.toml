@@ -20,7 +20,7 @@ compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
 # Branded front door: the console + OAuth issuer serve at cloud.parachute.computer
-# (zone parachute.computer, in the Unforced Development account). Declared here so
+# (zone parachute.computer, in the new Parachute account). Declared here so
 # `wrangler deploy` adopts (never strips) the custom domain; workers.dev stays
 # enabled as a fallback. Custom Domains can't be wildcards — per-vault subdomains
 # (*.u.parachute.computer) need proxied wildcard DNS (Enterprise); see TRYIT for
@@ -66,13 +66,13 @@ crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *", "30 3 * * *", "0 4 * * *"]
 # Control-plane state: users, clients, auth_codes, tokens, grants, sessions,
 # signing_keys. The revocation list is DERIVED from the tokens table (exactly
 # like the hub) — no separate KV needed. database_id is the real D1 in the
-# Unforced Development CF account (`wrangler d1 create parachute-cloud-identity`
+# new Parachute account (`wrangler d1 create parachute-cloud-identity`
 # → database_name parachute-identity). vitest ignores it (local D1 simulation by
 # binding name); the real deploy connects to it.
 [[d1_databases]]
 binding = "DB"
 database_name = "parachute-identity"
-database_id = "893b353e-697a-407b-8fd9-5e1ce440135a"
+database_id = "5d2b6bbf-727d-4052-9b88-570778e766f6"
 migrations_dir = "migrations"
 
 # The rate-limiter DO (#30): one instance per rate key (signup:<ip>,
@@ -184,7 +184,7 @@ routes = []
 [[env.staging.d1_databases]]
 binding = "DB"
 database_name = "parachute-identity-staging"
-database_id = "e1079d62-b571-4647-a333-ab4fd902d80d"
+database_id = "6930c39f-36a0-463c-b3b6-d6213d647891"
 migrations_dir = "migrations"
 
 # Bindings are non-inheritable: restate the rate-limiter DO. Same class; a
@@ -212,9 +212,9 @@ service = "parachute-vault-do-staging"
 # workers.dev origins. ISSUER is staging's own origin (tokens minted here carry
 # iss=<staging identity>, and the staging vault worker's ISSUER_ORIGIN matches).
 [env.staging.vars]
-ISSUER = "https://parachute-identity-staging.unforced.workers.dev"
-VAULT_BASE_DOMAIN = "parachute-vault-do-staging.unforced.workers.dev"
-VAULT_ORIGIN = "https://parachute-vault-do-staging.unforced.workers.dev"
+ISSUER = "https://parachute-identity-staging.aaron-d5d.workers.dev"
+VAULT_BASE_DOMAIN = "parachute-vault-do-staging.aaron-d5d.workers.dev"
+VAULT_ORIGIN = "https://parachute-vault-do-staging.aaron-d5d.workers.dev"
 ENVIRONMENT = "staging"
 EMAIL_FROM = "noreply@parachute.computer"
 # Same operator address as production — but staging has no send_email binding,

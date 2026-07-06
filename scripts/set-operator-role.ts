@@ -29,7 +29,7 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY_DIR = join(HERE, "..", "workers", "identity");
-const ACCOUNT_ID = "8f2a7eb9d5e21ffa902a76cf62975c82"; // "Unforced Development" (same as deploy scripts)
+const ACCOUNT_ID = "d5d7c8646c3b69ce9f16bfd12ecbe98a"; // new Parachute account (same as deploy scripts)
 
 /** The operator accounts (Aaron's own) — everyone else stays role='user'. */
 const OPERATOR_EMAILS = ["dev@parachute.computer", "ag@unforced.org"];

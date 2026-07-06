@@ -39,8 +39,8 @@ import { totpCodeAt } from "../workers/identity/src/totp.ts";
 import { NOTES_REQUIRED_TAGS } from "../workers/vault/src/welcome.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.unforced.workers.dev").replace(/\/$/, "");
-const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.unforced.workers.dev").replace(/\/$/, "");
+const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.aaron-d5d.workers.dev").replace(/\/$/, "");
+const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.aaron-d5d.workers.dev").replace(/\/$/, "");
 const VAULT_NAME = process.env.VAULT_NAME ?? "demo";
 const REDIRECT_URI = "http://localhost:8976/callback";
 const MARKER = `smoke-${Date.now()}`;
