@@ -24,6 +24,7 @@ import {
   PLAN_SPECS,
   canStartCheckout,
   coercePlanId,
+  entitlementPlanFor,
   formatPlanBytes,
   formatUsageBytes,
   isEntitled,
@@ -156,6 +157,21 @@ describe("PLAN_SPECS — the ratified ladder", () => {
     expect(upgradeTeaser()).toContain("from $1/mo");
     expect(vaultCapMessage("entry")).toContain("Entry plan includes 1 vault");
     expect(vaultCapMessage("expired")).toContain("trial has ended");
+  });
+
+  test("entitlementPlanFor — the trial mirrors the CHOSEN tier (pending_plan), else its plus-mirroring self", () => {
+    // "Try any plan free for 30 days": an Entry trialist experiences Entry,
+    // a Power trialist Power.
+    expect(entitlementPlanFor("trial", "entry")).toBe("entry");
+    expect(entitlementPlanFor("trial", "power")).toBe("power");
+    // No chosen tier (signup stamps pending_plan='expired' — the day-30 floor,
+    // not a choice) → the trial spec (mirrors plus).
+    expect(entitlementPlanFor("trial", "expired")).toBe("trial");
+    expect(entitlementPlanFor("trial", null)).toBe("trial");
+    // Non-trial plans are their own spec — pending never leaks entitlements
+    // (a paid user with a scheduled cancel keeps their paid spec until the sweep).
+    expect(entitlementPlanFor("standard", "expired")).toBe("standard");
+    expect(entitlementPlanFor("expired", "power")).toBe("expired");
   });
 
   test("the entitlement/checkout split — isEntitled, canStartCheckout, isPaidTier", () => {
@@ -372,6 +388,34 @@ describe("vault-count enforcement + entitlement push", () => {
     expect(await vaultRowCount(userId)).toBe(3);
   });
 
+  test("an ENTRY trialist's vault creation pushes entry's spec (trial mirrors the chosen tier at the console seam too)", async () => {
+    const { id: userId } = await seedUser("trialpick@example.com"); // trial
+    await env.DB.prepare("UPDATE users SET pending_plan = 'entry' WHERE id = ?").bind(userId).run();
+    const sessionId = await seedSession(userId);
+    let body: string | undefined;
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({
+        path: "/vault/trialpick-box/api/internal/config",
+        method: "PUT",
+        body: (raw: string) => {
+          body = raw;
+          return true;
+        },
+      })
+      .reply(200, { ok: true }, { headers: { "content-type": "application/json" } });
+    const created = await app.fetch(
+      post("/console/vaults", { __csrf: CSRF, name: "trialpick-box" }, sessionCookie(sessionId)),
+      env,
+    );
+    expect(created.status).toBe(302);
+    expect(JSON.parse(body!)).toEqual({
+      caps: { notes_bytes: 250 * MiB, attachment_bytes: 0 },
+      transcription: { enabled: false, minutes_limit: 0 },
+      frozen: false,
+    });
+  });
+
   test("BEST-EFFORT: a 500 from the vault worker on the push never fails creation", async () => {
     const { id: userId } = await seedUser("pushfail@example.com");
     await setUserPlan(env.DB, userId, "plus");
@@ -495,5 +539,55 @@ describe("applyPlanToVaults — the seam admin/Stripe/promo/sweep call", () => {
 
   test("unknown user → empty result set", async () => {
     expect(await applyPlanToVaults(env.DB, deps(), "no-such-user")).toEqual([]);
+  });
+
+  test("TRIAL MIRRORS THE CHOSEN TIER: an ENTRY trialist's push is entry's spec (no attachments, no voice — the honest preview)", async () => {
+    const { id: userId } = await seedUser("trial-entry@example.com"); // trial
+    await env.DB.prepare("UPDATE users SET pending_plan = 'entry' WHERE id = ?").bind(userId).run();
+    await seedVault("trial-entry-box", userId);
+    let body: unknown;
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+        body = init?.body ? JSON.parse(String(init.body)) : null;
+        return Response.json({ ok: true });
+      },
+    };
+    await applyPlanToVaults(env.DB, boundDeps, userId);
+    expect(body).toEqual(planEntitlement("entry"));
+    expect((body as { frozen: boolean }).frozen).toBe(false); // trialing, not expired
+    expect((body as { caps: { attachment_bytes: number } }).caps.attachment_bytes).toBe(0);
+  });
+
+  test("TRIAL MIRRORS THE CHOSEN TIER: a POWER trialist's push is power's spec", async () => {
+    const { id: userId } = await seedUser("trial-power@example.com");
+    await env.DB.prepare("UPDATE users SET pending_plan = 'power' WHERE id = ?").bind(userId).run();
+    await seedVault("trial-power-box", userId);
+    let body: unknown;
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+        body = init?.body ? JSON.parse(String(init.body)) : null;
+        return Response.json({ ok: true });
+      },
+    };
+    await applyPlanToVaults(env.DB, boundDeps, userId);
+    expect(body).toEqual(planEntitlement("power"));
+  });
+
+  test("a DEFAULT trial (pending_plan='expired' from signup) still pushes the plus-mirroring trial spec", async () => {
+    const { id: userId } = await seedUser("trial-default@example.com"); // pending 'expired'
+    await seedVault("trial-default-box", userId);
+    let body: unknown;
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+        body = init?.body ? JSON.parse(String(init.body)) : null;
+        return Response.json({ ok: true });
+      },
+    };
+    await applyPlanToVaults(env.DB, boundDeps, userId);
+    expect(body).toEqual(planEntitlement("trial")); // NOT the expired floor
+    expect((body as { frozen: boolean }).frozen).toBe(false);
   });
 });

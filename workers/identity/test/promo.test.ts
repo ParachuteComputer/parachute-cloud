@@ -34,6 +34,7 @@ import app from "../src/index.ts";
 import { handlePromoRedeemPost, PROMO_COMP_PLAN } from "../src/promo.ts";
 import { PLAN_SPECS, planEntitlement } from "../src/plans.ts";
 import { handleCheckoutSessionCompleted, runBillingSweep } from "../src/billing-lifecycle.ts";
+import type { BillingConfig } from "../src/billing-config.ts";
 import { getUserById, setUserPlan } from "../src/users.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
 import { CSRF, ISSUER, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
@@ -506,7 +507,9 @@ describe("comp × real billing — the machinery interacts sanely", () => {
         },
       },
     } as unknown as Stripe.Event;
-    const result = await handleCheckoutSessionCompleted(env.DB, deps(), event, {} as Stripe);
+    // metadata.plan routes the tier here, so the config-driven price fallback is
+    // never reached — a bare cast is enough for the (unused) fifth argument.
+    const result = await handleCheckoutSessionCompleted(env.DB, deps(), event, {} as Stripe, {} as BillingConfig);
     expect((result as { action: string }).action).toBe("checkout_completed_upgraded");
 
     const paid = (await getUserById(env.DB, id))!;

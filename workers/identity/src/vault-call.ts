@@ -32,7 +32,7 @@
  */
 import { signAccessToken } from "./tokens.ts";
 import { type OAuthDeps, vaultInstanceUrl } from "./oauth-shared.ts";
-import { type VaultEntitlement, planEntitlement } from "./plans.ts";
+import { type VaultEntitlement, entitlementPlanFor, planEntitlement } from "./plans.ts";
 import { getUserById } from "./users.ts";
 import { listVaultsForOwner } from "./vaults.ts";
 
@@ -197,8 +197,10 @@ export async function applyPlanToVaults(
   const user = await getUserById(db, userId);
   if (!user) return [];
   // One entitlement for all the owner's vaults: the two-meter caps, the voice
-  // entitlement, and frozen — a plan change flips them together.
-  const entitlement = planEntitlement(user.plan);
+  // entitlement, and frozen — a plan change flips them together. A TRIAL
+  // mirrors the CHOSEN tier when pending_plan names one (plans.ts
+  // entitlementPlanFor — "try any plan free for 30 days").
+  const entitlement = planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan));
   const vaults = await listVaultsForOwner(db, userId);
   const results: CapPushResult[] = [];
   for (const v of vaults) {

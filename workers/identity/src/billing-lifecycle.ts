@@ -42,10 +42,10 @@
  */
 import type Stripe from "stripe";
 import type { OAuthDeps } from "./oauth-shared.ts";
-import { type PlanId, coercePlanId, isPaidTier } from "./plans.ts";
+import { PAID_TIERS, type PaidTier, type PlanId, coercePlanId, isPaidTier } from "./plans.ts";
 import { getUserById, getUserByStripeCustomerId, getUserByStripeSubscriptionId, setUserPlan } from "./users.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
-import type { BillingConfig } from "./billing-config.ts";
+import { BILLING_INTERVALS, type BillingConfig } from "./billing-config.ts";
 
 export interface LifecycleResult {
   ok: true;
@@ -94,6 +94,34 @@ export const CHECKOUT_CAS_MAX_ATTEMPTS = 3;
 // ─── event handlers ──────────────────────────────────────────────────────────
 
 /**
+ * Resolve the bought tier from a completed session's line-item PRICE — the
+ * fallback for when `metadata.plan` is missing/garbled (the checkout normally
+ * stamps it, billing.ts). Lists the session's line items (one GET) and maps the
+ * first Price id through the configured matrix ({@link planForPrice}). Best-
+ * effort: any Stripe/read failure — or a session with no resolvable price —
+ * returns null so the caller falls back to its loud default, never throwing
+ * into the webhook. `planForPrice` is a function declaration (hoisted), so it's
+ * available here despite being defined further down.
+ */
+async function planFromSessionPrice(
+  session: Stripe.Checkout.Session,
+  stripe: Stripe,
+  config: BillingConfig,
+): Promise<PaidTier | null> {
+  try {
+    const items = await stripe.checkout.sessions.listLineItems(session.id, { limit: 1 });
+    const priceId = items.data[0]?.price?.id;
+    if (!priceId) return null;
+    return planForPrice(priceId, config);
+  } catch (err) {
+    console.error(
+      `event=billing_checkout_line_item_lookup_failed session=${session.id} error=${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
+/**
  * `checkout.session.completed` — payment landed for a new subscription. The
  * one UPGRADE path: persist the Stripe ids, flip plan → the bought tier, clear any
  * pending downgrade, and push the new caps into the user's vault DOs (the
@@ -140,6 +168,7 @@ export async function handleCheckoutSessionCompleted(
   deps: OAuthDeps,
   event: Stripe.Event,
   stripe: Stripe,
+  config: BillingConfig,
 ): Promise<LifecycleResult | Response> {
   const session = event.data.object as Stripe.Checkout.Session;
   const userId = session.client_reference_id ?? "";
@@ -158,11 +187,27 @@ export async function handleCheckoutSessionCompleted(
   const subscriptionId = typeof session.subscription === "string" ? session.subscription : null;
 
   // Which paid tier did they buy? The checkout stamps the chosen tier into
-  // session metadata (billing.ts) so we don't need to expand line_items here.
-  // Coerce, then floor to a purchasable TIER — a completed paid checkout is
-  // never trial/expired; a missing/garbled tag defaults to `standard`.
+  // session metadata (billing.ts) — the happy path, no line-item expansion.
+  // When that tag is missing or garbled (a hand-crafted session, a future
+  // checkout that forgot to stamp it), fall back to the session's line-item
+  // PRICE id → tier (planForPrice) so a buyer who paid for Power isn't silently
+  // floored to `standard`. Only when BOTH resolve to nothing do we default —
+  // and LOUDLY: a completed PAID checkout we can't attribute is worth an error.
   const metaPlan = coercePlanId(session.metadata?.plan);
-  const boughtPlan: PlanId = isPaidTier(metaPlan) ? metaPlan : "standard";
+  let boughtPlan: PlanId;
+  if (isPaidTier(metaPlan)) {
+    boughtPlan = metaPlan;
+  } else {
+    const pricedTier = await planFromSessionPrice(session, stripe, config);
+    if (pricedTier) {
+      boughtPlan = pricedTier;
+    } else {
+      console.error(
+        `event=billing_checkout_plan_unresolved user=${userId} session=${session.id} — metadata.plan and line-item price both unresolved, defaulting to standard`,
+      );
+      boughtPlan = "standard";
+    }
+  }
 
   // Read → idempotency-check → CAS-write → repair, re-run on a CAS miss (the
   // concurrent-race note in the function doc). One pass through this loop is
@@ -354,12 +399,18 @@ export async function handleSubscriptionDeleted(
   return { ok: true, userId: user.id, action: "subscription_deleted_downgrade_scheduled" };
 }
 
-/** Map a Stripe Price id to the tier it buys (env-configured, never hardcoded).
- *  PR-A's anchor prices: the monthly/yearly Prices back `standard`, the additive
- *  voice-monthly Price backs `plus`. PR-C expands this to the full per-tier map. */
-export function planForPrice(priceId: string, config: BillingConfig): PlanId | null {
-  if (priceId === config.priceMonthly || priceId === config.priceYearly) return "standard";
-  if (config.priceVoiceMonthly && priceId === config.priceVoiceMonthly) return "plus";
+/** Map a Stripe Price id to the tier it buys (env-configured, never
+ *  hardcoded) — the full 4-tier × interval matrix: ANY of a tier's configured
+ *  Prices (monthly/quarterly/yearly) resolves to that tier, so a Customer
+ *  Portal upgrade/downgrade landing as `customer.subscription.updated` with a
+ *  price change applies the right plan. Unknown price → null (the caller
+ *  falls back to subscription metadata, then no-ops). */
+export function planForPrice(priceId: string, config: BillingConfig): PaidTier | null {
+  for (const tier of PAID_TIERS) {
+    for (const interval of BILLING_INTERVALS) {
+      if (config.prices[tier][interval] === priceId) return tier;
+    }
+  }
   return null;
 }
 
@@ -393,7 +444,12 @@ export async function handleSubscriptionUpdated(
   const priceId = subscription.items?.data?.[0]?.price?.id;
   if (!priceId) return { ok: true, userId: user.id, action: "subscription_updated_no_price" };
 
-  const newPlan = planForPrice(priceId, config);
+  // Price → tier through the configured matrix; when the price isn't ours
+  // (e.g. a Price rotated out of the env vars), fall back to the `plan` tag
+  // checkout stamped into subscription metadata (billing.ts) — the same tag
+  // checkout.session.completed trusts. Both missing → no-op + telemetry.
+  const metaTier = coercePlanId(subscription.metadata?.plan);
+  const newPlan = planForPrice(priceId, config) ?? (isPaidTier(metaTier) ? metaTier : null);
   if (!newPlan) return { ok: true, userId: user.id, action: "subscription_updated_unknown_price" };
 
   if (newPlan !== user.plan) {
@@ -430,6 +486,7 @@ export interface BillingSweepSummary {
 
 interface DueRow {
   id: string;
+  plan: string;
   pending_plan: string | null;
 }
 
@@ -441,21 +498,58 @@ interface DueRow {
  * drip/usage posture — self-heals next hour). NEVER deletes anything.
  */
 export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date): Promise<BillingSweepSummary> {
+  // Bind the SELECT and every per-row conditional write to the SAME instant, so
+  // the write's `plan_downgrade_at <= ?` guard means exactly "still due as of
+  // the moment we selected it" (the sweep-vs-conversion race guard below).
+  const nowIso = now.toISOString();
   const res = await db
     .prepare(
-      `SELECT id, pending_plan FROM users
+      `SELECT id, plan, pending_plan FROM users
        WHERE pending_plan IS NOT NULL AND plan_downgrade_at IS NOT NULL AND plan_downgrade_at <= ?
        ORDER BY plan_downgrade_at ASC LIMIT ?`,
     )
-    .bind(now.toISOString(), BILLING_SWEEP_CAP)
+    .bind(nowIso, BILLING_SWEEP_CAP)
     .all<DueRow>();
   const dueRows = res.results ?? [];
   let applied = 0;
   for (const row of dueRows) {
     try {
-      const plan = coercePlanId(row.pending_plan);
-      await setUserPlan(db, row.id, plan);
-      await db.prepare("UPDATE users SET pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?").bind(row.id).run();
+      const pending = coercePlanId(row.pending_plan);
+      // TRIAL FLOOR GUARD: the sweep applies DOWNGRADES — a due, card-less
+      // trial always lands on the expired floor. A trial's pending_plan is
+      // 'expired' from signup, but the tier-picker path may stamp the CHOSEN
+      // paid tier there for entitlement mirroring (plans.ts
+      // entitlementPlanFor); a real conversion clears the pair via
+      // checkout.session.completed long before the sweep sees it, so applying
+      // a paid pending tier here would be a FREE upgrade at day 30 — floor it.
+      // Folded into the `plan` bound into the CONDITIONAL write below, never a
+      // separate read-then-write.
+      const plan: PlanId = coercePlanId(row.plan) === "trial" && isPaidTier(pending) ? "expired" : pending;
+      // RACE GUARD (cloud#84 review): the SELECT→write window can overlap a
+      // `checkout.session.completed` that converted this user — the webhook's
+      // CAS flips the plan to the bought tier AND clears the pending pair
+      // atomically (billing-lifecycle handleCheckoutSessionCompleted). If we
+      // wrote `plan` unconditionally here we'd overwrite the just-paid plan
+      // with the 'expired' floor and push frozen caps over the ones the webhook
+      // already pushed — flooring a person who paid at the day-30 deadline. So
+      // the sweep's OWN write is the guard: it applies ONLY while the pending
+      // pair is still set and still due (same `now` the SELECT used). A
+      // conversion that won the race leaves this UPDATE matching 0 rows.
+      const write = await db
+        .prepare(
+          `UPDATE users SET plan = ?, pending_plan = NULL, plan_downgrade_at = NULL
+             WHERE id = ? AND pending_plan IS NOT NULL AND plan_downgrade_at <= ?`,
+        )
+        .bind(plan, row.id, nowIso)
+        .run();
+      if ((write.meta.changes ?? 0) === 0) {
+        // The row moved under us (a conversion, or any write that cleared the
+        // pending pair) — it's no longer a due downgrade. Skip the cap push:
+        // the webhook already pushed the right caps; re-pushing the floor here
+        // is the exact bug this guards. Not counted as applied.
+        console.log(`event=billing_downgrade_skipped_raced user=${row.id}`);
+        continue;
+      }
       const results = await applyPlanToVaults(db, deps, row.id);
       const failedPushes = results.filter((r) => !r.ok).length;
       console.log(

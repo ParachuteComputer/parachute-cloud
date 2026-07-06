@@ -241,6 +241,22 @@ export interface VaultEntitlement {
   frozen: boolean;
 }
 
+/**
+ * The plan whose SPEC drives a user's live entitlements — "try any plan free
+ * for 30 days": a TRIAL user's entitlement mirrors the tier they CHOSE
+ * (`pending_plan` when it names a purchasable tier — an Entry trialist
+ * experiences Entry (no attachments: an honest preview, no data-loss trap at
+ * conversion), a Power trialist experiences Power). When no tier is chosen —
+ * signup stamps pending_plan='expired', the day-30 floor, which is NOT a
+ * chosen tier — the trial keeps its plus-mirroring spec (PLAN_SPECS.trial).
+ * Every non-trial plan is its own spec. Callers: applyPlanToVaults
+ * (vault-call.ts) + the console's vault-creation cap pushes.
+ */
+export function entitlementPlanFor(plan: PlanId, pendingPlan: PlanId | null): PlanId {
+  if (plan === "trial" && pendingPlan !== null && isPaidTier(pendingPlan)) return pendingPlan;
+  return plan;
+}
+
 /** The entitlement pushed to every vault DO for a plan (vault-call.ts). */
 export function planEntitlement(plan: PlanId): VaultEntitlement {
   const spec = PLAN_SPECS[plan];

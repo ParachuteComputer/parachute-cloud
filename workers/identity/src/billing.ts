@@ -38,7 +38,13 @@ import type { Env } from "./env.ts";
 import { type OAuthDeps, isSameOriginRequest, redirectResponse, resolveBoundOrigins } from "./oauth-shared.ts";
 import { verifyCsrfToken } from "./csrf.ts";
 import { sessionUser } from "./session-user.ts";
-import { billingConfig, billingNotConfiguredResponse } from "./billing-config.ts";
+import {
+  type BillingConfig,
+  type BillingInterval,
+  billingConfig,
+  billingNotConfiguredResponse,
+  priceFor,
+} from "./billing-config.ts";
 import { makeStripe } from "./stripe-client.ts";
 import { type PaidTier, canStartCheckout, isPaidTier } from "./plans.ts";
 import { setUserPlan } from "./users.ts";
@@ -48,38 +54,39 @@ export interface BillingOverrides {
   stripe?: Stripe;
 }
 
-/** The Upgrade buttons' billing period — form field `interval`. */
-export type BillingInterval = "monthly" | "yearly";
+/** Re-exported for callers that reached the interval type through this module
+ *  before it moved to billing-config.ts (the full-matrix wiring). */
+export type { BillingInterval } from "./billing-config.ts";
 
 function isBillingInterval(raw: string): raw is BillingInterval {
-  return raw === "monthly" || raw === "yearly";
+  return raw === "monthly" || raw === "quarterly" || raw === "yearly";
 }
+
+/**
+ * Stripe refuses `subscription_data.trial_end` closer than 48 hours out. A
+ * trial-conversion checkout with less runway than this omits the field and
+ * bills immediately — the honest degradation (the user is days from the cliff
+ * anyway, and a refused session would lose the conversion entirely).
+ */
+export const STRIPE_MIN_TRIAL_END_MS = 48 * 60 * 60 * 1000;
 
 /** Which purchasable tier the Upgrade button buys — form field `plan`. Any
  *  unrecognized value defaults to `standard` (the anchor tier). The MOCK path
- *  applies this directly; the REAL Stripe path resolves it to a Price below
- *  (only the tiers with a configured Price can complete — PR-C wires the rest). */
+ *  applies this directly; the REAL Stripe path resolves it to a Price below. */
 function checkoutPlan(raw: string): PaidTier {
   return isPaidTier(raw as PaidTier) ? (raw as PaidTier) : "standard";
 }
 
 /**
- * Resolve the Stripe Price for a (tier, interval) — the REAL checkout path.
- * PR-A's billing-config carries the anchor prices only: `priceMonthly`/
- * `priceYearly` back `standard`, and the additive `priceVoiceMonthly` backs
- * `plus` (monthly-only). Tiers without a configured Price (entry, power) return
- * null → the caller answers a clean `billing_err=invalid` until PR-C ships the
- * per-tier price sets. (The MOCK path never calls this — it applies the tier
- * directly with no Stripe round-trip.)
+ * Resolve the Stripe Price for a (tier, interval) — the REAL checkout path,
+ * now the full 4-tier × interval matrix (billing-config.ts `priceFor`).
+ * Null = that combination is unavailable — entry×monthly by construction (no
+ * such Price exists), or a combination whose env var isn't set — and the
+ * caller answers a clean `billing_err=invalid`. (The MOCK path never calls
+ * this — it applies the tier directly with no Stripe round-trip.)
  */
-function resolvePrice(
-  tier: PaidTier,
-  interval: BillingInterval,
-  config: { priceMonthly: string; priceYearly: string; priceVoiceMonthly?: string },
-): string | null {
-  if (tier === "standard") return interval === "yearly" ? config.priceYearly : config.priceMonthly;
-  if (tier === "plus") return config.priceVoiceMonthly ?? null; // monthly-only in PR-A
-  return null; // entry / power — no Price configured yet (PR-C)
+function resolvePrice(tier: PaidTier, interval: BillingInterval, config: BillingConfig): string | null {
+  return priceFor(config, tier, interval);
 }
 
 /**
@@ -108,13 +115,32 @@ export async function handleCheckoutPost(
     return redirectResponse("/console?billing_err=already");
   }
 
-  // Resolve the Stripe Price for the chosen tier + interval. `plus` is
-  // monthly-only in PR-A; `entry`/`power` have no Price configured yet → clean
-  // refusal (PR-C ships the per-tier price sets).
+  // Resolve the Stripe Price for the chosen tier + interval (the full matrix;
+  // entry has no monthly) — an unavailable combination is a clean refusal.
   const interval = String(form.get("interval") ?? "monthly");
   if (!isBillingInterval(interval)) return redirectResponse("/console?billing_err=invalid");
   const price = resolvePrice(plan, interval, config);
   if (!price) return redirectResponse("/console?billing_err=invalid");
+
+  // TRIAL-AWARE CHECKOUT (card-on-file conversion): a user still inside their
+  // 30-day trial who picks a plan enters card details TODAY, and the Stripe
+  // subscription starts billing when the free 30 days end —
+  // `subscription_data.trial_end` = the trial clock (plan_downgrade_at). The
+  // webhook conversion path runs UNCHANGED at session completion
+  // (checkout.session.completed → plan flips + pending pair clears
+  // immediately — entitlements from the picked tier while the Stripe-trial
+  // runs is correct: they chose a plan, the subscription exists). Stripe
+  // refuses trial_end closer than 48h out — less runway than that omits the
+  // field and bills immediately (STRIPE_MIN_TRIAL_END_MS). Expired users
+  // (canStartCheckout's other half) have no runway — always bill now.
+  const now = deps.now?.() ?? new Date();
+  let trialEnd: number | null = null;
+  if (user.plan === "trial" && user.planDowngradeAt) {
+    const downgradeAtMs = Date.parse(user.planDowngradeAt);
+    if (Number.isFinite(downgradeAtMs) && downgradeAtMs - now.getTime() >= STRIPE_MIN_TRIAL_END_MS) {
+      trialEnd = Math.floor(downgradeAtMs / 1000);
+    }
+  }
 
   const stripe = overrides?.stripe ?? makeStripe(config.secretKey);
 
@@ -173,13 +199,22 @@ export async function handleCheckoutPost(
       // Stripe Tax (see the module note — the account-side enablement is an
       // Aaron step next to the keys).
       automatic_tax: { enabled: true },
-      // Surfaces the user id in subscription metadata too — handy if a
-      // lifecycle webhook ever fires before the ids are cross-referenced
-      // (the old checkout.ts pattern, tenant_id → user_id).
-      subscription_data: { metadata: { user_id: user.id } },
+      // Surfaces the user id + bought plan in subscription metadata too —
+      // handy if a lifecycle webhook ever fires before the ids are
+      // cross-referenced (the old checkout.ts pattern, tenant_id → user_id),
+      // and the `plan` tag is the webhook's fallback when a subscription's
+      // price isn't in the configured matrix (billing-lifecycle.ts
+      // handleSubscriptionUpdated). trial_end = the card-on-file conversion
+      // (see the trial-aware note above); omitted when there's no runway.
+      subscription_data: {
+        metadata: { user_id: user.id, plan },
+        ...(trialEnd !== null ? { trial_end: trialEnd } : {}),
+      },
     });
     if (!session.url) throw new Error("stripe_checkout_no_url");
-    console.log(`event=billing_checkout_started user=${user.id} plan=${plan} session=${session.id}`);
+    console.log(
+      `event=billing_checkout_started user=${user.id} plan=${plan} interval=${interval} trial_end=${trialEnd ?? "-"} session=${session.id}`,
+    );
     return redirectResponse(session.url);
   } catch (err) {
     console.error(

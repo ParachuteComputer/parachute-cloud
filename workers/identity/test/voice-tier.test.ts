@@ -28,8 +28,12 @@ import type { BillingConfig } from "../src/billing-config.ts";
 const baseConfig: BillingConfig = {
   secretKey: "sk_test",
   webhookSecret: "whsec_test",
-  priceMonthly: "price_standard_monthly",
-  priceYearly: "price_standard_yearly",
+  prices: {
+    entry: { quarterly: "price_entry_quarterly" },
+    standard: { monthly: "price_standard_monthly", yearly: "price_standard_yearly" },
+    plus: { monthly: "price_plus_monthly" },
+    power: { monthly: "price_power_monthly" },
+  },
 };
 
 describe("voice entitlement (cloud#56) — folded into the ladder", () => {
@@ -69,16 +73,18 @@ describe("voice entitlement (cloud#56) — folded into the ladder", () => {
     expect(coercePlanId("plus")).toBe("plus"); // a real tier passes through unchanged
   });
 
-  it("planForPrice maps monthly/yearly to standard, and the voice-monthly price to plus, when configured", () => {
-    const config: BillingConfig = { ...baseConfig, priceVoiceMonthly: "price_plus_monthly" };
-    expect(planForPrice("price_standard_monthly", config)).toBe("standard");
-    expect(planForPrice("price_standard_yearly", config)).toBe("standard");
-    expect(planForPrice("price_plus_monthly", config)).toBe("plus");
-    expect(planForPrice("price_unknown", config)).toBeNull();
+  it("planForPrice maps each configured Price to its own tier (the matrix; full-coverage pins live in billing.test.ts)", () => {
+    expect(planForPrice("price_entry_quarterly", baseConfig)).toBe("entry");
+    expect(planForPrice("price_standard_monthly", baseConfig)).toBe("standard");
+    expect(planForPrice("price_standard_yearly", baseConfig)).toBe("standard");
+    expect(planForPrice("price_plus_monthly", baseConfig)).toBe("plus");
+    expect(planForPrice("price_power_monthly", baseConfig)).toBe("power");
+    expect(planForPrice("price_unknown", baseConfig)).toBeNull();
   });
 
-  it("planForPrice ignores the voice-monthly price when it isn't configured (additive contract)", () => {
-    expect(planForPrice("price_plus_monthly", baseConfig)).toBeNull();
+  it("planForPrice ignores a Price whose (tier, interval) isn't configured (additive contract)", () => {
+    // plus×yearly isn't in baseConfig's matrix — an id claiming to be it maps nowhere.
+    expect(planForPrice("price_plus_yearly", baseConfig)).toBeNull();
   });
 
   it("the plan line reads each tier's own label", () => {

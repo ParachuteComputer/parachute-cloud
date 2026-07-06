@@ -121,9 +121,12 @@ ENVIRONMENT = "production"
 EMAIL_FROM = "noreply@parachute.computer"
 # Where the scheduled health-check alerts + weekly ops digest go (src/ops.ts).
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
-# --- Stripe billing (Wave 4d) -------------------------------------------------
-# Billing activates only when ALL FOUR values exist (src/billing-config.ts);
-# until then /billing/* answers 503 and the console shows no billing UI.
+# --- Stripe billing (Wave 4d; full 4-tier × interval matrix) -------------------
+# Billing activates only when the two secrets + the four per-tier ANCHOR Prices
+# (standard/plus/power monthly + entry quarterly) exist (src/billing-config.ts);
+# until then /billing/* answers 503 and the console shows no billing UI. The
+# non-anchor Prices are additive — a missing one only disables that ONE
+# (tier, interval) combination (checkout → billing_err=invalid).
 #   Secrets (NEVER in this file — per environment):
 #     wrangler secret put STRIPE_SECRET_KEY                (sk_live_… here; sk_test_… on staging)
 #     wrangler secret put STRIPE_WEBHOOK_SECRET            (whsec_… from the dashboard webhook
@@ -132,14 +135,21 @@ OPERATOR_ALERT_EMAIL = "ag@unforced.org"
 #                                                           invoice.paid, invoice.payment_failed,
 #                                                           customer.subscription.deleted,
 #                                                           customer.subscription.updated)
-#   Price ids (not secret — uncomment + fill once the Stripe product exists;
-#   the Parachute plan: $3/mo + $30/yr, amounts live on the Prices):
-# STRIPE_PRICE_PARACHUTE_MONTHLY = "price_..."
-# STRIPE_PRICE_PARACHUTE_YEARLY = "price_..."
-#   Voice tier ($5/mo — voice transcription, cloud#56). ADDITIVE: its absence
-#   does NOT block Parachute billing; set once the Voice Price exists and the
-#   voice Upgrade button + voice checkout light up on their own.
-# STRIPE_PRICE_VOICE_MONTHLY = "price_..."
+#   Price ids (not secret — uncomment + fill once the LIVE-mode Stripe catalog
+#   exists; today only the TEST-mode catalog does, wired into [env.staging.vars]
+#   below. Amounts live on the Prices; entry has NO monthly — Stripe's flat fee
+#   eats a $1 charge, so entry bills quarterly/yearly):
+# STRIPE_PRICE_ENTRY_QUARTERLY = "price_..."
+# STRIPE_PRICE_ENTRY_YEARLY = "price_..."
+# STRIPE_PRICE_STANDARD_MONTHLY = "price_..."
+# STRIPE_PRICE_STANDARD_QUARTERLY = "price_..."
+# STRIPE_PRICE_STANDARD_YEARLY = "price_..."
+# STRIPE_PRICE_PLUS_MONTHLY = "price_..."
+# STRIPE_PRICE_PLUS_QUARTERLY = "price_..."
+# STRIPE_PRICE_PLUS_YEARLY = "price_..."
+# STRIPE_PRICE_POWER_MONTHLY = "price_..."
+# STRIPE_PRICE_POWER_QUARTERLY = "price_..."
+# STRIPE_PRICE_POWER_YEARLY = "price_..."
 # --- interim MOCK billing (mock-payments PR) ----------------------------------
 # The mock checkout demos the full upgrade → cap/voice-lift flow BEFORE real
 # Stripe keys land. It is HARD-gated to non-production (billing-config.ts
@@ -221,22 +231,28 @@ EMAIL_FROM = "noreply@parachute.computer"
 # Same operator address as production — but staging has no send_email binding,
 # so ops alerts/digests land in the worker log (devlog sender), never an inbox.
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
-# Stripe billing (staging = TEST-mode keys): `wrangler secret put
-# STRIPE_SECRET_KEY -e staging` + `wrangler secret put STRIPE_WEBHOOK_SECRET
-# -e staging`, then uncomment the TEST-mode price ids. See the production
-# [vars] block for the full seam; unset = billing degrades cleanly (503 +
-# hidden console UI — pinned by smoke-staging).
-# STRIPE_PRICE_PARACHUTE_MONTHLY = "price_..."
-# STRIPE_PRICE_PARACHUTE_YEARLY = "price_..."
-# STRIPE_PRICE_VOICE_MONTHLY = "price_..."   # $5/mo Voice tier (cloud#56; additive)
-# Interim MOCK billing (mock-payments PR): staging has no Stripe keys and
-# ENVIRONMENT="staging" (!= production), so the mock checkout AUTO-ACTIVATES
-# here — the console's Upgrade buttons drive /billing/mock-checkout and the
-# full cap/voice-lift flow is demoable now, no live charge. Nothing to set: the
-# moment the TEST-mode Stripe keys above are uncommented + set, the mock goes
-# inert and the real Checkout path takes over (no code change). MOCK_BILLING="1"
-# would force the mock ON even alongside real keys (staging-only demo escape
-# hatch) — normally leave it unset.
+# Stripe billing (staging = TEST-mode catalog, account "Open Parachute PBC
+# sandbox"). The secrets are already set (`wrangler secret put STRIPE_SECRET_KEY
+# -e staging` + `STRIPE_WEBHOOK_SECRET -e staging`; the webhook endpoint points
+# at staging /billing/webhook), and the TEST-mode Price ids below complete the
+# config — staging billing is REAL (test-mode) Checkout. The ids also carry
+# `metadata.plan`/`metadata.interval` + lookup keys `<plan>_<interval>` on the
+# Stripe side. See the production [vars] block for the anchor/additive split.
+STRIPE_PRICE_ENTRY_QUARTERLY = "price_1TqDRbEzI43yjgruVRBKGVhB"    # $3 / 3 months
+STRIPE_PRICE_ENTRY_YEARLY = "price_1TqDRbEzI43yjgrukqPkNDLs"       # $10 / yr
+STRIPE_PRICE_STANDARD_MONTHLY = "price_1TqDRbEzI43yjgruNJ0q9lLJ"   # $3 / mo
+STRIPE_PRICE_STANDARD_QUARTERLY = "price_1TqDRbEzI43yjgruFwplGZP8" # $7 / 3 months
+STRIPE_PRICE_STANDARD_YEARLY = "price_1TqDRbEzI43yjgruxCDggYoE"    # $25 / yr
+STRIPE_PRICE_PLUS_MONTHLY = "price_1TqDRcEzI43yjgru2a3W8iiR"       # $5 / mo
+STRIPE_PRICE_PLUS_QUARTERLY = "price_1TqDRcEzI43yjgruKTZ0SjrW"     # $12 / 3 months
+STRIPE_PRICE_PLUS_YEARLY = "price_1TqDRcEzI43yjgruWhWtyBMm"        # $40 / yr
+STRIPE_PRICE_POWER_MONTHLY = "price_1TqDRcEzI43yjgrua4AO4ewF"      # $10 / mo
+STRIPE_PRICE_POWER_QUARTERLY = "price_1TqDRdEzI43yjgru9VAzmMKh"    # $25 / 3 months
+STRIPE_PRICE_POWER_YEARLY = "price_1TqDRdEzI43yjgru1qOvsRns"       # $80 / yr
+# Interim MOCK billing (mock-payments PR): with the full TEST-mode Stripe
+# config above, the mock checkout is INERT here — the real (test-mode) Checkout
+# path is active and /billing/mock-checkout 404s. MOCK_BILLING="1" would force
+# the mock back ON (staging-only demo escape hatch) — normally leave it unset.
 
 # Workers Logs for staging too (explicit per-env restatement; see the top-level
 # [observability] note).

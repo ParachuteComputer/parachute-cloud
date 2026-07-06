@@ -110,7 +110,7 @@ export async function handleStripeWebhookPost(
   let outcome: string;
   switch (event.type) {
     case "checkout.session.completed": {
-      const result = await handleCheckoutSessionCompleted(env.DB, deps, event, stripe);
+      const result = await handleCheckoutSessionCompleted(env.DB, deps, event, stripe, config);
       if (result instanceof Response) {
         response = result;
         outcome = `http_${result.status}`;

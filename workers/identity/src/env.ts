@@ -58,19 +58,27 @@ export interface Env {
    */
   STRIPE_WEBHOOK_SECRET?: string;
   /**
-   * Stripe Price ids for the Parachute plan ($3/mo, $30/yr — the amounts live
-   * in plans.ts copy + the Stripe dashboard; the ids come from env, NEVER
-   * hardcoded). Set in [vars] once the product exists (see wrangler.toml).
+   * Stripe Price ids for the 4-tier × interval matrix (entry|standard|plus|
+   * power × monthly|quarterly|yearly; entry has NO monthly — Stripe's flat fee
+   * eats a $1 charge). The amounts live in plans.ts copy + on the Stripe
+   * Prices; the ids come from env, NEVER hardcoded. Set in [vars] once the
+   * catalog exists (see wrangler.toml). Billing is CONFIGURED when the two
+   * secrets + the four per-tier ANCHORS (standard/plus/power monthly +
+   * entry quarterly) exist; any other missing Price only makes that ONE
+   * (tier, interval) unavailable (checkout → billing_err=invalid) — see
+   * billing-config.ts.
    */
-  STRIPE_PRICE_PARACHUTE_MONTHLY?: string;
-  STRIPE_PRICE_PARACHUTE_YEARLY?: string;
-  /**
-   * Stripe Price id for the $5/mo Voice tier (cloud#56). OPTIONAL + additive:
-   * absent → the voice Upgrade button hides and voice checkout is refused, but
-   * the rest of billing (the Parachute prices) still gates normally. Set in
-   * [vars] once the Voice product exists.
-   */
-  STRIPE_PRICE_VOICE_MONTHLY?: string;
+  STRIPE_PRICE_ENTRY_QUARTERLY?: string;
+  STRIPE_PRICE_ENTRY_YEARLY?: string;
+  STRIPE_PRICE_STANDARD_MONTHLY?: string;
+  STRIPE_PRICE_STANDARD_QUARTERLY?: string;
+  STRIPE_PRICE_STANDARD_YEARLY?: string;
+  STRIPE_PRICE_PLUS_MONTHLY?: string;
+  STRIPE_PRICE_PLUS_QUARTERLY?: string;
+  STRIPE_PRICE_PLUS_YEARLY?: string;
+  STRIPE_PRICE_POWER_MONTHLY?: string;
+  STRIPE_PRICE_POWER_QUARTERLY?: string;
+  STRIPE_PRICE_POWER_YEARLY?: string;
   /**
    * Interim MOCK-billing opt-in (the demo path before real Stripe keys land).
    * "1" forces the mock checkout ON — but ONLY in a non-production environment
