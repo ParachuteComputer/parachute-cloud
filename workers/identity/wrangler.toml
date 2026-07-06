@@ -135,21 +135,21 @@ OPERATOR_ALERT_EMAIL = "ag@unforced.org"
 #                                                           invoice.paid, invoice.payment_failed,
 #                                                           customer.subscription.deleted,
 #                                                           customer.subscription.updated)
-#   Price ids (not secret — uncomment + fill once the LIVE-mode Stripe catalog
-#   exists; today only the TEST-mode catalog does, wired into [env.staging.vars]
-#   below. Amounts live on the Prices; entry has NO monthly — Stripe's flat fee
-#   eats a $1 charge, so entry bills quarterly/yearly):
-# STRIPE_PRICE_ENTRY_QUARTERLY = "price_..."
-# STRIPE_PRICE_ENTRY_YEARLY = "price_..."
-# STRIPE_PRICE_STANDARD_MONTHLY = "price_..."
-# STRIPE_PRICE_STANDARD_QUARTERLY = "price_..."
-# STRIPE_PRICE_STANDARD_YEARLY = "price_..."
-# STRIPE_PRICE_PLUS_MONTHLY = "price_..."
-# STRIPE_PRICE_PLUS_QUARTERLY = "price_..."
-# STRIPE_PRICE_PLUS_YEARLY = "price_..."
-# STRIPE_PRICE_POWER_MONTHLY = "price_..."
-# STRIPE_PRICE_POWER_QUARTERLY = "price_..."
-# STRIPE_PRICE_POWER_YEARLY = "price_..."
+#   Price ids (not secret — the LIVE-mode catalog, copied from the sandbox
+#   2026-07-06 and wired below; the TEST-mode catalog stays in [env.staging.vars]
+#   for staging. Amounts live on the Prices; entry has NO monthly — Stripe's flat
+#   fee eats a $1 charge, so entry bills quarterly/yearly):
+STRIPE_PRICE_ENTRY_QUARTERLY = "price_1TqJlPIkisoTdlLqJoCC4RF2"     # $3 / 3 months
+STRIPE_PRICE_ENTRY_YEARLY = "price_1TqJlOIkisoTdlLqtz2FU70t"        # $10 / yr
+STRIPE_PRICE_STANDARD_MONTHLY = "price_1TqJlLIkisoTdlLqwI2s2Dnh"    # $3 / mo
+STRIPE_PRICE_STANDARD_QUARTERLY = "price_1TqJlKIkisoTdlLqCeiVroxd"  # $7 / 3 months
+STRIPE_PRICE_STANDARD_YEARLY = "price_1TqJlKIkisoTdlLqPEzR54PP"     # $25 / yr
+STRIPE_PRICE_PLUS_MONTHLY = "price_1TqJlLIkisoTdlLqeMCZ0LRf"        # $5 / mo
+STRIPE_PRICE_PLUS_QUARTERLY = "price_1TqJlKIkisoTdlLqOWh1edDh"      # $12 / 3 months
+STRIPE_PRICE_PLUS_YEARLY = "price_1TqJlKIkisoTdlLqkyiPNzvZ"         # $40 / yr
+STRIPE_PRICE_POWER_MONTHLY = "price_1TqJlLIkisoTdlLqH0VxbJk7"       # $10 / mo
+STRIPE_PRICE_POWER_QUARTERLY = "price_1TqJlKIkisoTdlLqgrtikZGG"     # $25 / 3 months
+STRIPE_PRICE_POWER_YEARLY = "price_1TqJlJIkisoTdlLq8eE3JSBr"        # $80 / yr
 # --- interim MOCK billing (mock-payments PR) ----------------------------------
 # The mock checkout demos the full upgrade → cap/voice-lift flow BEFORE real
 # Stripe keys land. It is HARD-gated to non-production (billing-config.ts
