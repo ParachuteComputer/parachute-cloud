@@ -13,13 +13,15 @@ import {
   PAID_TIERS,
   PLAN_SPECS,
   TIER_PRICE_LABEL,
+  type PaidTier,
   type PlanId,
   formatPlanBytes,
   formatUsageBytes,
   isPaidTier,
   planLine,
   planTotalBytes,
-  upgradeTeaser,
+  tierCapSummary,
+  trialBannerLine,
   vaultCapMessage,
 } from "./plans.ts";
 import { type BillingInterval } from "./billing-config.ts";
@@ -593,6 +595,21 @@ export interface ConsoleProps {
    * neither.
    */
   canCheckout?: boolean;
+  /**
+   * Trial-state display, non-null only for a `trial` user (console.ts derives it
+   * from entitlementPlanFor + the plan_downgrade_at clock):
+   *   - `tierLabel`   the tier the trial currently mirrors ("Plus"),
+   *   - `isDefault`   pending='expired'/null (the signup default, Plus-mirror),
+   *   - `daysLeft`    days until the trial floors to expired (null if no clock),
+   *   - `currentTier` which plan card to badge as the one they're trying.
+   * Drives the plan-line banner + the "you're trying this" card badge.
+   */
+  trial?: {
+    tierLabel: string;
+    isDefault: boolean;
+    daysLeft: number | null;
+    currentTier: PaidTier;
+  } | null;
 }
 
 /**
@@ -858,6 +875,105 @@ function consoleScript(csrfToken: string): string {
 }
 
 /**
+ * The always-visible plan-cards section — the fix for "a trial/expired user on
+ * a keyless prod deploy sees NO plans at all" (the old chooser was gated on
+ * billingConfigured, so nothing rendered without Stripe). The pricing is now
+ * DECOUPLED from Stripe:
+ *   - "Choose this plan" (a TRIAL user only) POSTs /console/plan — no card; it
+ *     sets the trial's mirrored tier (pending_plan) and re-pushes the caps
+ *     immediately. Load-bearing: NO free /console/plan form is rendered for an
+ *     expired user (they must pay to reactivate — never a free paid tier).
+ *   - "Add a card / subscribe" POSTs the checkout action (hosted Checkout, or
+ *     the mock endpoint in non-prod) — ONLY when billing is available; otherwise
+ *     a calm no-card / reactivate line stands in (never a broken 500-ing button).
+ *   - An EXPIRED user's only affordance is that checkout ("Choose this plan" =
+ *     pay to reactivate).
+ * Rendered only for checkout-eligible (trial/expired) users; a paid tier /
+ * live-sub account uses Manage billing instead and never sees this.
+ */
+function renderPlanCards(opts: {
+  csrfToken: string;
+  plan: PlanId;
+  billingConfigured: boolean;
+  mockBillingEnabled: boolean;
+  trial: ConsoleProps["trial"];
+}): string {
+  const { csrfToken, plan, billingConfigured, mockBillingEnabled, trial } = opts;
+  const isTrial = plan === "trial";
+  const checkoutAvailable = billingConfigured || mockBillingEnabled;
+  const checkoutAction = mockBillingEnabled ? "/billing/mock-checkout" : "/billing/checkout";
+
+  // The billing-interval select (monthly/quarterly/yearly; entry has NO monthly
+  // — Stripe's flat fee eats a $1 charge, so it bills quarterly/yearly and the
+  // server refuses entry×monthly regardless). The MOCK path ignores it.
+  const intervalSelect = (tier: PaidTier): string => {
+    const intervals: readonly BillingInterval[] =
+      tier === "entry" ? ["quarterly", "yearly"] : ["monthly", "quarterly", "yearly"];
+    const options = intervals
+      .map((iv, i) => `<option value="${iv}"${i === 0 ? " selected" : ""}>${iv}</option>`)
+      .join("");
+    return `<select name="interval" aria-label="${esc(PLAN_SPECS[tier].label)} billing interval" style="font-size:.85em;padding:.15rem .2rem">${options}</select>`;
+  };
+
+  // The Stripe-gated checkout form for one tier — trial's "Add a card" and
+  // expired's "Choose this plan" reuse it (same POST, different button label).
+  const checkoutForm = (tier: PaidTier, label: string): string =>
+    `<form class="inline" method="post" action="${checkoutAction}" data-testid="upgrade-${tier}" style="display:flex;gap:.3rem;align-items:center;margin-top:.5rem">
+       <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+       <input type="hidden" name="plan" value="${tier}">
+       <button class="linkbtn" type="submit">${esc(label)}</button>${intervalSelect(tier)}
+     </form>`;
+
+  const cards = PAID_TIERS.map((tier) => {
+    const spec = PLAN_SPECS[tier];
+    const isCurrent = isTrial && trial != null && trial.currentTier === tier;
+    const badge =
+      isCurrent && trial
+        ? `<div data-testid="current-tier-${tier}" style="font-size:.72rem;color:var(--sage-dark);font-weight:600;margin-top:.15rem">${trial.isDefault ? "Default while you decide" : "You're trying this"}</div>`
+        : "";
+    // The FREE "Choose this plan" affordance — TRIAL ONLY. An expired user gets
+    // no /console/plan form at all (their affordance is the checkout below).
+    const chooseFree = isTrial
+      ? `<form class="inline" method="post" action="/console/plan" data-testid="choose-${tier}" style="margin-top:.5rem">
+           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+           <input type="hidden" name="plan" value="${tier}">
+           <button class="linkbtn" type="submit">${isCurrent ? "Keep this plan" : "Choose this plan"}</button>
+         </form>`
+      : "";
+    // The Stripe affordance (only when billing is available): trial = "Add a
+    // card" (subscribe now / convert the trial), expired = "Choose this plan"
+    // (pay to reactivate). Absent → the section-level calm line stands in.
+    const paidAffordance = checkoutAvailable ? checkoutForm(tier, isTrial ? "Add a card" : "Choose this plan") : "";
+    return `<div class="card" data-testid="plan-card-${tier}" style="flex:1 1 12rem;min-width:11rem;margin:0;padding:1rem">
+         <div style="display:flex;justify-content:space-between;align-items:baseline;gap:.5rem">
+           <strong>${esc(spec.label)}</strong><span class="muted">${esc(TIER_PRICE_LABEL[tier])}</span>
+         </div>
+         ${badge}
+         <p class="muted" style="margin:.35rem 0 0">${esc(tierCapSummary(tier))}</p>
+         ${chooseFree}${paidAffordance}
+       </div>`;
+  }).join("");
+
+  // The calm stand-in when billing isn't wired — never a broken checkout button.
+  const noCardLine = checkoutAvailable
+    ? ""
+    : isTrial
+      ? `<p class="muted" data-testid="no-card-line" style="margin:.6rem 0 0">You're on your 30-day free trial — no card needed. We'll ask before it ends.</p>`
+      : `<p class="muted" data-testid="reactivate-line" style="margin:.6rem 0 0">Add a payment method to reactivate a plan — your notes stay readable and exportable anytime.</p>`;
+  const mockNote = mockBillingEnabled
+    ? ` <span class="muted" data-testid="mock-billing-note">test mode &mdash; no real charge</span>`
+    : "";
+  // `upgrade-billing` marks that the Stripe affordance is present (the smokes +
+  // billing tests key off it); absent → the no-card/reactivate line stands in.
+  const billingWrap = checkoutAvailable ? ` data-testid="upgrade-billing"` : "";
+  return `<section id="plans" data-testid="plans"${billingWrap} style="margin:0 0 1.1rem">
+       <h2 style="margin:0 0 .4rem;font-size:1rem">Plans${mockNote}</h2>
+       <div style="display:flex;flex-wrap:wrap;gap:.7rem">${cards}</div>
+       ${noCardLine}
+     </section>`;
+}
+
+/**
  * The console: first-run hero when no vault exists yet; otherwise the
  * getting-started checklist (until dismissed) + vault cards + create form.
  */
@@ -880,57 +996,24 @@ export function renderConsole(props: ConsoleProps): string {
     mockBillingEnabled,
     hasBillingAccount,
     canCheckout,
+    trial,
   } = props;
   // Plan display. The across-vaults usage total (latest rollup rows) rides the
-  // plan line. Billing doors render off `canCheckout` (plans.ts — a trial or
-  // expired account with no live subscription): those users get the tier
-  // buttons (hosted Checkout / mock, POST /billing/checkout|mock-checkout);
-  // paid-tier users with a real Stripe customer get Manage billing (the portal;
-  // comped accounts have no customer, so no door). Unconfigured — today's
-  // deploy — checkout-eligible users see the copy-only teaser.
+  // plan line. The plan-line TEXT depends on state: a trial user gets the
+  // "you're trying <Tier> — N days left" banner (trial.tierLabel from
+  // entitlementPlanFor); expired reads its floor copy; a paid tier reads its
+  // spec + any scheduled-cancel date + the Manage-billing door.
   //
-  // (This is PR-A's FUNCTIONAL plan line — a compact per-tier chooser. PR-B
-  // replaces it with the full 4-tier cards + billing-interval choice.)
+  // The pricing itself now lives in an ALWAYS-VISIBLE plan-cards SECTION below
+  // (renderPlanCards) — decoupled from Stripe: picking a tier during a trial
+  // needs no card (POST /console/plan sets pending_plan; caps re-push). Only the
+  // "Add a card / subscribe" affordance is Stripe-gated. The old
+  // billingConfigured-gated compact chooser (which rendered NOTHING on a
+  // keyless prod deploy — the bug this PR fixes) is gone.
   const usageHtml =
     totalUsedBytes != null
       ? ` <span data-testid="usage-total">&middot; Using ${esc(formatUsageBytes(totalUsedBytes))}</span>`
       : "";
-  // The tier chooser has THREE clean states, mutually exclusive:
-  //   1. MOCK    (mockBillingEnabled — non-prod, no real Stripe / MOCK_BILLING=1):
-  //      the buttons POST the mock endpoint + a "test mode — no real charge"
-  //      label, so the upgrade → caps/voice-lift flow is demoable with no charge.
-  //   2. REAL    (billingConfigured): the buttons POST hosted Checkout.
-  //   3. NEITHER (prod, no keys — today's deploy): the copy-only teaser.
-  // Mock wins when active (non-prod only); when real keys land without
-  // MOCK_BILLING the mock goes inert and REAL takes over with no code change.
-  const showUpgrade = canCheckout === true && (mockBillingEnabled === true || billingConfigured === true);
-  const checkoutAction = mockBillingEnabled ? "/billing/mock-checkout" : "/billing/checkout";
-  const mockNoteHtml =
-    canCheckout && mockBillingEnabled
-      ? ` <span class="muted" data-testid="mock-billing-note">&middot; test mode &mdash; no real charge</span>`
-      : "";
-  // One small form per purchasable tier: the tier's Upgrade button + a billing-
-  // interval select (monthly/quarterly/yearly; entry bills quarterly/yearly
-  // ONLY — Stripe's flat fee eats a $1 monthly charge, so no monthly option
-  // renders and the server refuses entry×monthly regardless). The MOCK path
-  // applies the chosen tier directly (interval ignored); the REAL path resolves
-  // (tier, interval) to a Stripe Price (billing.ts resolvePrice, full matrix).
-  const tierForms = PAID_TIERS.map((tier) => {
-    const spec = PLAN_SPECS[tier];
-    const intervals: readonly BillingInterval[] =
-      tier === "entry" ? ["quarterly", "yearly"] : ["monthly", "quarterly", "yearly"];
-    const options = intervals
-      .map((iv, i) => `<option value="${iv}"${i === 0 ? " selected" : ""}>${iv}</option>`)
-      .join("");
-    return `<form class="inline" method="post" action="${checkoutAction}" data-testid="upgrade-${tier}">
-         <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
-         <input type="hidden" name="plan" value="${tier}">
-         <button class="linkbtn" type="submit">${esc(spec.label)} &mdash; ${esc(TIER_PRICE_LABEL[tier])}</button><select name="interval" aria-label="${esc(spec.label)} billing interval" style="font-size:.85em;padding:.1rem .15rem;margin-left:.2rem">${options}</select>
-       </form>`;
-  }).join(`<span class="muted"> · </span>`);
-  const upgradeHtml = showUpgrade
-    ? `<span data-testid="upgrade-billing" style="margin-left:.35rem"><span style="opacity:.85">&middot; Pick a plan:</span> ${tierForms}</span>`
-    : "";
   const manageBillingHtml =
     isPaidTier(plan) && billingConfigured && hasBillingAccount
       ? ` <form class="inline" method="post" action="/billing/portal" data-testid="manage-billing">
@@ -938,17 +1021,33 @@ export function renderConsole(props: ConsoleProps): string {
            <span style="opacity:.75">&middot;</span> <button class="linkbtn" type="submit">Manage billing</button>
          </form>`
       : "";
-  const teaserHtml =
-    canCheckout && !billingConfigured && !mockBillingEnabled
-      ? ` <span style="opacity:.75">&middot; ${esc(upgradeTeaser())}</span>`
+  // A scheduled downgrade's date (a promo comp expiry, or a real subscription's
+  // scheduled cancel) rides the plan line for NON-trial users — quiet, honest,
+  // never a silent cliff. A trial's clock is shown by its banner (days left)
+  // instead, so it isn't double-rendered here.
+  const planUntilHtml =
+    planUntil && plan !== "trial"
+      ? ` <span data-testid="plan-until">&middot; until ${esc(planUntil.slice(0, 10))}</span>`
       : "";
-  // A scheduled downgrade's date (the 30-day trial clock, a promo comp expiry,
-  // or a real cancel) rides the plan line — quiet, honest, always visible while
-  // the clock runs (trial + paid alike).
-  const planUntilHtml = planUntil
-    ? ` <span data-testid="plan-until">&middot; until ${esc(planUntil.slice(0, 10))}</span>`
-    : "";
-  const planHtml = `${esc(planLine(plan))}${planUntilHtml}${usageHtml}${teaserHtml}${upgradeHtml}${mockNoteHtml}${manageBillingHtml}`;
+  // The plan-line lead text: the trial banner (with a "Change plan" jump to the
+  // cards) when trialing, else the plan's spec line.
+  const planLead =
+    plan === "trial" && trial
+      ? `<span data-testid="trial-banner">${esc(trialBannerLine(trial.tierLabel, trial.isDefault, trial.daysLeft))}</span> <a href="#plans" data-testid="change-plan">Change plan</a>`
+      : esc(planLine(plan));
+  const planHtml = `${planLead}${planUntilHtml}${usageHtml}${manageBillingHtml}`;
+  // The always-visible plan cards — for checkout-eligible (trial/expired) users
+  // only; a paid tier / live-sub account uses Manage billing and never sees it.
+  const plansSectionHtml =
+    canCheckout === true
+      ? renderPlanCards({
+          csrfToken,
+          plan,
+          billingConfigured: billingConfigured === true,
+          mockBillingEnabled: mockBillingEnabled === true,
+          trial,
+        })
+      : "";
   // "Have a code?" — promo redemption (promo.ts), checkout-eligible accounts
   // only (a paid tier has nothing to redeem onto; the POST refuses regardless).
   // A quiet disclosure under the plan line: present for launch codes, invisible
@@ -1018,6 +1117,7 @@ export function renderConsole(props: ConsoleProps): string {
     "Console — Parachute",
     `${header("Your vaults")}
      ${notice ? `<div class="notice">${esc(notice)}</div>` : ""}
+     ${plansSectionHtml}
      ${checklist ? checklistCard(checklist, csrfToken) : ""}
      ${list}
      ${createCard}

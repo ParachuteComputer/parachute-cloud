@@ -87,8 +87,13 @@ workers/identity/   the OAuth issuer (authorize/token/DCR/JWKS/revocation on D1)
                     (migration 0019: stamped at import-create, cleared on
                     success) — only a still-pending row may be re-imported
                     into; a populated same-owner vault gets "already taken",
-                    never a blow-away. 50 MiB `MAX_IMPORT_BYTES` ceiling.
-                    421 tests.
+                    never a blow-away. 50 MiB `MAX_IMPORT_BYTES` ceiling. ALSO
+                    the ALWAYS-VISIBLE plan cards + pick/change-your-trial-tier
+                    (0.0.8-rc.38, src/console.ts handleChoosePlanPost — see the
+                    plans note): the four tiers render regardless of Stripe, and
+                    a trial picks/changes its mirrored tier with NO card via
+                    POST /console/plan (an expired user can't get a free tier
+                    there — reactivate = pay). 427 tests.
 src/                the OLD control plane (Worker + D1 + Stripe). Dormant; billing
                     lifecycle design gets harvested into the control-plane revival.
 scripts/            deploy-staging.sh + smoke-staging.ts (full 118-step live smoke,

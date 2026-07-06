@@ -66,11 +66,13 @@ import {
   canStartCheckout,
   entitlementPlanFor,
   isPaidTier,
+  isPlanId,
   planEntitlement,
   restoreAtCapMessage,
+  trialTierChosenMessage,
   vaultCapMessage,
 } from "./plans.ts";
-import { callVaultApi, callVaultImport, pushVaultCap } from "./vault-call.ts";
+import { applyPlanToVaults, callVaultApi, callVaultImport, pushVaultCap } from "./vault-call.ts";
 import {
   callVaultRestore,
   isKnownSnapshot,
@@ -278,6 +280,27 @@ async function renderConsoleFor(
       };
     }
   }
+  // Trial-tier banner + card-badge state (trial users only). The tier the trial
+  // currently mirrors is entitlementPlanFor(plan, pending) — a paid pending tier
+  // → that tier; the signup default (pending='expired'/null) → Plus (the trial
+  // spec mirrors Plus), flagged `isDefault` so the banner reads honestly. Days
+  // left come from the plan_downgrade_at clock.
+  let trial: {
+    tierLabel: string;
+    isDefault: boolean;
+    daysLeft: number | null;
+    currentTier: "entry" | "standard" | "plus" | "power";
+  } | null = null;
+  if (user.plan === "trial") {
+    const effective = entitlementPlanFor(user.plan, user.pendingPlan);
+    const isDefault = !isPaidTier(effective);
+    const currentTier = isPaidTier(effective) ? effective : "plus";
+    const nowMs = (deps.now?.() ?? new Date()).getTime();
+    const daysLeft = user.planDowngradeAt
+      ? Math.max(0, Math.ceil((Date.parse(user.planDowngradeAt) - nowMs) / 86_400_000))
+      : null;
+    trial = { tierLabel: PLAN_SPECS[currentTier].label, isDefault, daysLeft, currentTier };
+  }
   const csrf = ensureCsrfToken(req);
   return htmlResponse(
     renderConsole({
@@ -287,6 +310,7 @@ async function renderConsoleFor(
       error: opts.error,
       notice: opts.notice,
       checklist,
+      trial,
       // Dismissed → the quiet "Show setup guide" footer link brings it back.
       showChecklistRestore: checklistHidden,
       firstRun: opts.firstRun,
@@ -347,6 +371,19 @@ const PROMO_ERRORS: Record<string, string> = {
   "already-paid": "You're already on a paid plan, so there's nothing for a code to add.",
 };
 
+/**
+ * Pick-a-plan (POST /console/plan) feedback — the same allowlisted-code pattern.
+ * `reactivate` is the load-bearing refusal: an EXPIRED user can't get a free
+ * paid tier here (only a live trial re-mirrors for free), so they're pointed at
+ * checkout instead of being silently un-frozen.
+ */
+const PLAN_ERRORS: Record<string, string> = {
+  session: "Your session expired. Please try again.",
+  invalid: "That plan isn't one we recognize. Please try again.",
+  reactivate: "Your trial has ended — add a payment method to pick a plan again. Your notes stay readable and exportable anytime.",
+  already: "You're already on a paid plan — use Manage billing to change tiers.",
+};
+
 export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
@@ -383,6 +420,18 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
     params.get("promo_redeemed") && isPaidTier(user.plan) && user.planDowngradeAt
       ? `Code redeemed — you're on the ${PLAN_SPECS[user.plan].label} plan until ${user.planDowngradeAt.slice(0, 10)}. Welcome aboard.`
       : null;
+  // Pick-a-plan confirmation (POST /console/plan) — rendered from the STORED
+  // truth, never the query string: only when the user is a trial whose
+  // pending_plan actually names the tier the param claims (an honest banner even
+  // on a stale/replayed URL, the promo pattern).
+  const planChosenParam = params.get("plan_chosen") ?? "";
+  const planChosen =
+    isPlanId(planChosenParam) &&
+    isPaidTier(planChosenParam) &&
+    user.plan === "trial" &&
+    user.pendingPlan === planChosenParam
+      ? trialTierChosenMessage(planChosenParam)
+      : null;
   const notice = created
     ? `Your vault "${created}" is ready — open your notes, or connect your AI below.`
     : importNotice
@@ -393,6 +442,8 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
       ? `Surface Starter added to ${packVault} — ask your connected AI to read it.`
       : promoRedeemed
         ? promoRedeemed
+        : planChosen
+        ? planChosen
         : params.get("mock_upgraded")
         ? `Test purchase complete — no real charge. You're on the ${PLAN_SPECS[user.plan].label} plan now (mock billing; the caps and any voice entitlement lifted exactly as a real payment would).`
         : params.get("upgraded")
@@ -400,8 +451,61 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
           : params.get("checkout_canceled")
             ? "Checkout canceled — nothing changed."
             : undefined;
-  const error = BILLING_ERRORS[params.get("billing_err") ?? ""] ?? PROMO_ERRORS[params.get("promo_err") ?? ""];
+  const error =
+    BILLING_ERRORS[params.get("billing_err") ?? ""] ??
+    PROMO_ERRORS[params.get("promo_err") ?? ""] ??
+    PLAN_ERRORS[params.get("plan_err") ?? ""];
   return renderConsoleFor(db, req, deps, user, { notice, error });
+}
+
+/**
+ * POST /console/plan — pick or change the tier your TRIAL mirrors, with NO
+ * Stripe. Picking a tier only sets the internal `pending_plan` that drives which
+ * caps the trial mirrors (entitlementPlanFor); it needs no card. Card entry
+ * (checkout) is the separate `/billing/*` path.
+ *
+ * Trust boundary: session + CSRF + same-origin (the console write boundary).
+ * Gating (canStartCheckout-shaped): only trial/expired accounts with no live
+ * subscription reach the effect; a paid tier / live-sub uses the Stripe portal.
+ *
+ * THE LOAD-BEARING GUARD: only a live TRIAL user re-mirrors for FREE. An EXPIRED
+ * user must NOT get a free paid tier here — that would silently un-freeze a
+ * churned/lapsed account without payment. They're pointed at checkout
+ * (`plan_err=reactivate`) instead; pending_plan/plan stay untouched (still
+ * frozen). Effect for a trial: set `pending_plan=<tier>` (KEEP plan_downgrade_at
+ * — changing tier mid-trial doesn't reset or extend the 30-day clock), then
+ * re-apply the entitlement so the two-meter caps + voice update immediately
+ * across every owned vault. The day-30 sweep still floors this trial to expired
+ * (billing-lifecycle.ts #84 guard) — picking a paid tier is a preview, not a
+ * free upgrade.
+ */
+export async function handleChoosePlanPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const user = await sessionUser(db, req, deps);
+  if (!user) return redirectResponse("/login");
+  const form = await req.formData();
+  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+    return redirectResponse("/console?plan_err=session");
+  }
+  const raw = String(form.get("plan") ?? "");
+  if (!isPlanId(raw) || !isPaidTier(raw)) {
+    return redirectResponse("/console?plan_err=invalid");
+  }
+  // A paid tier / live subscriber changes plans through the Stripe portal, not
+  // here (canStartCheckout: trial | expired only).
+  if (!canStartCheckout(user.plan)) {
+    return redirectResponse("/console?plan_err=already");
+  }
+  // THE GUARD: only a live trial re-mirrors for free. Expired → pay to reactivate.
+  if (user.plan !== "trial") {
+    return redirectResponse("/console?plan_err=reactivate");
+  }
+  // Set the chosen tier as the pending plan — KEEP the plan_downgrade_at clock.
+  await db.prepare("UPDATE users SET pending_plan = ? WHERE id = ?").bind(raw, user.id).run();
+  // Re-push the (now chosen-tier) entitlement into every owned vault so caps +
+  // voice update immediately (applyPlanToVaults reads the fresh row →
+  // entitlementPlanFor(trial, <tier>) = <tier>'s spec). Best-effort per vault.
+  await applyPlanToVaults(db, deps, user.id);
+  return redirectResponse(`/console?plan_chosen=${encodeURIComponent(raw)}`);
 }
 
 export async function handleCreateVaultPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {

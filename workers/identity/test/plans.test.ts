@@ -238,14 +238,22 @@ describe("plan defaults — signup starts the 30-day trial", () => {
 // --- console rendering (from PLAN_SPECS) --------------------------------------
 
 describe("console plan display", () => {
-  test("trial user (prod, no keys): the plan line + the upgrade teaser render from PLAN_SPECS", async () => {
+  test("trial user (prod, no keys): the trial banner + the ALWAYS-VISIBLE plan cards render from PLAN_SPECS (no Stripe needed)", async () => {
     const { id } = await seedUser("planline@example.com"); // seedUser → trial
     await seedVault("planline-box", id);
     const html = await consoleHtml(await seedSession(id), PROD_ENV);
     expect(html).toContain('data-testid="plan-line"');
-    expect(html).toContain("Free trial — 5 vaults, 2 GiB notes + 8 GiB attachments");
-    expect(html).toContain("from $1/mo");
+    // The trial banner names the mirrored tier (default Plus — pending='expired').
+    expect(html).toContain('data-testid="trial-banner"');
+    expect(html).toContain("trying Plus (default)");
+    // The four plan cards render with their price + caps, no Stripe.
+    expect(html).toContain('data-testid="plans"');
+    expect(html).toContain('data-testid="plan-card-power"');
+    expect(html).toContain("$1/mo");
+    expect(html).toContain("5 GiB notes"); // Power's caps, from PLAN_SPECS
+    expect(html).toContain('action="/console/plan"'); // pick a tier — no card
     expect(html).not.toContain("stripe");
+    expect(html).not.toContain("/billing/checkout");
   });
 
   test("standard user: their plan line, no teaser", async () => {
