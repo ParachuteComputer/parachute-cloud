@@ -182,7 +182,52 @@ describe("import — end to end (upload export → new vault → equality + atta
     expect(await normalizedExport(dst)).toEqual(first);
     expect((await internalConfig(dst)).r2_bytes).toBe(firstCfg.r2_bytes);
   });
+
+  it("the blow-away purge is confined to attachments/ — exports/ + snapshots/ SURVIVE", async () => {
+    const src = freshVault("is");
+    await seedSource(src);
+    const tar = await exportTar(src);
+
+    const dst = freshVault("it");
+    // Materialize the target, then seed R2 under the two SIBLING prefixes the
+    // attachments purge must never touch (exports/ = the export door's staged
+    // tarballs; snapshots/ = the GFS snapshot artifacts).
+    expect((await op(dst, "")).status).toBe(200);
+    const exportKey = `vault-${dst}/exports/staged.tar`;
+    const snapKey = `vault-${dst}/snapshots/2026-01-01T00:00:00.000Z.tar`;
+    await env.ATTACHMENTS.put(exportKey, new Uint8Array([1, 2, 3]));
+    await env.ATTACHMENTS.put(snapKey, new Uint8Array([4, 5, 6]));
+
+    expect((await importInto(dst, tar)).status).toBe(200);
+
+    // The purge cleared prior attachments/ objects but left the sibling prefixes.
+    expect(await env.ATTACHMENTS.get(exportKey)).not.toBeNull();
+    expect(await env.ATTACHMENTS.get(snapKey)).not.toBeNull();
+    // The imported binary DID land under attachments/, and the meter counts ONLY
+    // it (the directly-put exports/snapshots objects never touched the meter).
+    expect((await internalConfig(dst)).r2_bytes).toBe(4);
+  });
 });
+
+/** A tar whose FIRST entry is a PAX extended header ('x', 0x78), followed by
+ *  `payloadAfter` (a real export). Our minimal ustar decoder must REJECT the
+ *  'x' record rather than skip it and mangle the following entry's path. */
+function paxTar(payloadAfter: Uint8Array): Uint8Array {
+  const enc = new TextEncoder();
+  const paxData = enc.encode("30 path=notes/long/ünïcode-name.md\n");
+  const header = new Uint8Array(512);
+  header.set(enc.encode("./PaxHeaders/0"), 0); // name (offset 0)
+  header.set(enc.encode(paxData.length.toString(8).padStart(11, "0") + " "), 124); // size (octal)
+  header[156] = 0x78; // typeflag 'x' (PAX extended header)
+  const dataBlocks = Math.ceil(paxData.length / 512) * 512;
+  const paxBlock = new Uint8Array(512 + dataBlocks);
+  paxBlock.set(header, 0);
+  paxBlock.set(paxData, 512);
+  const out = new Uint8Array(paxBlock.length + payloadAfter.length);
+  out.set(paxBlock, 0);
+  out.set(payloadAfter, paxBlock.length);
+  return out;
+}
 
 describe("import — guards", () => {
   it("a body over MAX_IMPORT_BYTES is refused with 413 import_too_large", async () => {
@@ -219,5 +264,70 @@ describe("import — guards", () => {
     const bad = await importInto(dst, junk);
     expect(bad.status).toBe(400);
     expect(((await bad.json()) as { error_type: string }).error_type).toBe("import_unreadable");
+  });
+
+  it("a foreign tar with a PAX ('x') extended header is REJECTED (not mangled) → 400 import_unreadable", async () => {
+    // A real, valid export appended AFTER the PAX record — if the decoder skipped
+    // the 'x' instead of aborting, it would import the following entry under a
+    // TRUNCATED path. It must reject before that can happen.
+    const src = freshVault("is");
+    await seedSource(src);
+    const realTar = await exportTar(src);
+
+    const dst = freshVault("it");
+    const res = await importInto(dst, paxTar(realTar));
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error_type: string }).error_type).toBe("import_unreadable");
+  });
+
+  it("a plain ustar export still imports (the control for the PAX rejection)", async () => {
+    const src = freshVault("is");
+    await seedSource(src);
+    const dst = freshVault("it");
+    expect((await importInto(dst, await exportTar(src))).status).toBe(200);
+  });
+
+  it("a body with NO Content-Length that exceeds the cap mid-stream → 413 (the readCappedBody fence)", async () => {
+    const dst = freshVault("it");
+    // A streamed body carries no Content-Length (chunked), so the DO's pre-read
+    // CL check can't fire — the ceiling is enforced by readCappedBody as it
+    // accumulates. It exceeds MAX_IMPORT_BYTES a couple of chunks over.
+    const CHUNK = 1024 * 1024; // 1 MiB
+    const chunk = new Uint8Array(CHUNK);
+    const chunkCount = Math.ceil(MAX_IMPORT_BYTES / CHUNK) + 2;
+    let sent = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= chunkCount) {
+          controller.close();
+          return;
+        }
+        sent++;
+        controller.enqueue(chunk);
+      },
+    });
+    const res = await SELF.fetch(`${base(dst)}/api/internal/import`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${await firstPartyToken(dst)}`,
+        "content-type": "application/x-tar",
+      },
+      body,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as { error_type: string }).error_type).toBe("import_too_large");
+  });
+
+  it("an anonymous request (no token) is refused with 401 (not 403)", async () => {
+    const dst = freshVault("it");
+    // The tenant→403 case is pinned above; anonymous must 401 (RFC 9728 challenge
+    // shape) BEFORE the internal first-party gate ever runs.
+    const res = await SELF.fetch(`${base(dst)}/api/internal/import`, {
+      method: "POST",
+      headers: { "content-type": "application/x-tar" },
+      body: new Uint8Array([1, 2, 3]),
+    });
+    expect(res.status).toBe(401);
   });
 });

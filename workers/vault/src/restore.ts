@@ -82,11 +82,27 @@ export interface PendingAttachment {
   bytes: Uint8Array;
 }
 
+/** Signals a foreign tar this minimal decoder can't safely read (a PAX/GNU
+ *  extension record). Surfaced as the existing 400 `import_unreadable` shape. */
+export class UnreadableTarError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnreadableTarError";
+  }
+}
+
 /**
  * Minimal POSIX ustar decoder — regular files only (typeflag '0'/NUL), which
- * is all `toTar`/`streamTar` (export.ts) ever emit. Foreign tars with other
- * entry types (dirs, links) have those entries skipped rather than failing the
- * import. Preserves raw bytes; {@link parseTar} decodes to text on top of it.
+ * is all `toTar`/`streamTar` (export.ts) ever emit. Foreign tars with benign
+ * other entry types (dirs, links) have those entries skipped rather than failing
+ * the import. Preserves raw bytes; {@link parseTar} decodes to text on top of it.
+ *
+ * PAX/GNU EXTENSION records are REJECTED, not skipped: typeflag 'x'/'g' (PAX)
+ * and 'L'/'K' (GNU longname/longlink) carry the real name/metadata for the
+ * FOLLOWING entry out-of-band. Silently skipping the record while keeping the
+ * next entry's truncated 100-byte ustar name would import notes under WRONG
+ * paths. Our exports never emit these (ustar prefix-split), but bsdtar/GNU tar
+ * do for long or non-ASCII paths — so we abort rather than mangle.
  */
 export function parseTarBinary(buf: Uint8Array): TarBinaryFile[] {
   const dec = new TextDecoder();
@@ -101,6 +117,13 @@ export function parseTarBinary(buf: Uint8Array): TarBinaryFile[] {
     const size = parseInt(str(off + 124, 12).trim() || "0", 8);
     const typeflag = header[156];
     off += BLOCK;
+    // PAX ('x'=0x78, 'g'=0x67) / GNU long-name ('L'=0x4C) / long-link ('K'=0x4B)
+    // extension records → we can't apply the out-of-band name, so REJECT.
+    if (typeflag === 0x78 || typeflag === 0x67 || typeflag === 0x4c || typeflag === 0x4b) {
+      throw new UnreadableTarError(
+        "this tar uses an extension we can't read yet (PAX/GNU long names) — re-export with a Parachute export, or contact us",
+      );
+    }
     if (typeflag === 0x30 || typeflag === 0) {
       out.push({ name: prefix ? `${prefix}/${name}` : name, bytes: buf.subarray(off, off + size) });
     }

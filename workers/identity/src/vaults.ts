@@ -138,20 +138,6 @@ export async function createVault(
   return { name, ownerUserId, createdAt };
 }
 
-/**
- * Delete a vault OWNERSHIP row, scoped to its owner (defense-in-depth: a
- * mismatched owner is a no-op). The import door's rollback on a failed forward
- * — don't leak a half-created vault when the replay never lands. The DO's
- * SQLite (if it materialized) is left orphaned + unreachable without an
- * ownership row; a retry re-creates the name and blow-away import converges.
- */
-export async function deleteVault(db: D1Database, name: string, ownerUserId: string): Promise<void> {
-  await db
-    .prepare("DELETE FROM vaults WHERE name = ? AND owner_user_id = ?")
-    .bind(name.toLowerCase(), ownerUserId)
-    .run();
-}
-
 /** The distinct named vaults referenced by a scope set (`vault:<name>:<verb>`). */
 export function namedVaultsInScopes(scopes: readonly string[]): string[] {
   const names = new Set<string>();

@@ -21,6 +21,7 @@ import {
   RESERVED_VAULT_NAMES,
   VaultNameInvalidError,
   VaultNameTakenError,
+  countVaultsForOwner,
   createVault,
   getVault,
   listVaultsForOwner,
@@ -901,7 +902,7 @@ describe("console — the import door (POST /console/vaults/import)", () => {
     expect(await getVault(env.DB, "routeimport")).not.toBeNull();
   });
 
-  test("a vault-worker failure rolls the vault row back (no broken half-vault) and reports honestly", async () => {
+  test("a vault-worker failure KEEPS the vault row (name reserved for a retry) and reports honestly", async () => {
     const { id: userId } = await seedUser("import-fail@example.com");
     const sessionId = await seedSession(userId);
     const boundDeps = {
@@ -914,12 +915,34 @@ describe("console — the import door (POST /console/vaults/import)", () => {
     };
     const res = await handleImportPost(env.DB, importReq("broken-import", TAR, sessionCookie(sessionId)), boundDeps);
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain("didn&#39;t look like a Parachute export");
-    // Rolled back — the name is free again, no half-vault left behind.
-    expect(await getVault(env.DB, "broken-import")).toBeNull();
+    // The friendly copy: nothing kept, the name is reserved, a retry reuses it.
+    expect(await res.text()).toContain("is reserved for you");
+    // NEVER freed — a freed name whose DO may still hold the upload would be
+    // claimable by another account (cross-account exposure). The owner retries.
+    expect((await getVault(env.DB, "broken-import"))?.ownerUserId).toBe(userId);
   });
 
-  test("the vault worker's 413 surfaces the too-large message and rolls back", async () => {
+  test("a forward-unreachable failure (vaultFetch throws) also KEEPS the row (never 500s)", async () => {
+    const { id: userId } = await seedUser("import-unreachable@example.com");
+    const sessionId = await seedSession(userId);
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async () => {
+        throw new Error("connect ECONNREFUSED");
+      },
+    };
+    const res = await handleImportPost(
+      env.DB,
+      importReq("unreachable-box", TAR, sessionCookie(sessionId)),
+      boundDeps,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("is reserved for you");
+    // A thrown forward must neither free the name nor escalate to an unhandled 500.
+    expect((await getVault(env.DB, "unreachable-box"))?.ownerUserId).toBe(userId);
+  });
+
+  test("the vault worker's 413 surfaces the too-large message and KEEPS the row", async () => {
     const { id: userId } = await seedUser("import-413@example.com");
     const sessionId = await seedSession(userId);
     const boundDeps = {
@@ -933,7 +956,52 @@ describe("console — the import door (POST /console/vaults/import)", () => {
     const res = await handleImportPost(env.DB, importReq("toobig-vault", TAR, sessionCookie(sessionId)), boundDeps);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("over the 50 MiB import limit");
-    expect(await getVault(env.DB, "toobig-vault")).toBeNull();
+    // Keep-row posture applies to 413 too — the name is never freed.
+    expect((await getVault(env.DB, "toobig-vault"))?.ownerUserId).toBe(userId);
+  });
+
+  test("retry converges: a failed forward keeps the row; a retry REUSES the same name and succeeds (one vault)", async () => {
+    const { id: userId } = await seedUser("import-retry@example.com");
+    const sessionId = await seedSession(userId);
+    // Key the mock on the IMPORT path — the create branch also calls vaultFetch
+    // for the best-effort cap push (/api/internal/config), which must succeed.
+    let importCalls = 0;
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async (input: RequestInfo | URL) => {
+        if (String(input).includes("/api/internal/import")) {
+          importCalls++;
+          // First forward fails (the DO may have written partial content); we
+          // keep the row. The DO's blow-away purge guarantees the retry
+          // converges — content/metering convergence is pinned in the vault suite.
+          if (importCalls === 1) {
+            return new Response(JSON.stringify({ error_type: "import_unreadable" }), {
+              status: 400,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          return new Response(
+            JSON.stringify({ imported: true, notes: 4, stats: { notes_created: 4, skipped_attachments: 0 } }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        // Cap push (pushVaultCap) and any other internal call → succeed.
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      },
+    };
+    // Attempt 1 — fails, but the name is now reserved for this owner.
+    const first = await handleImportPost(env.DB, importReq("retry-box", TAR, sessionCookie(sessionId)), boundDeps);
+    expect(first.status).toBe(200);
+    expect(await first.text()).toContain("is reserved for you");
+    expect((await getVault(env.DB, "retry-box"))?.ownerUserId).toBe(userId);
+    expect(await countVaultsForOwner(env.DB, userId)).toBe(1);
+
+    // Attempt 2 — reuses the SAME name (no VaultNameTaken wall) and succeeds.
+    const second = await handleImportPost(env.DB, importReq("retry-box", TAR, sessionCookie(sessionId)), boundDeps);
+    expect(second.status).toBe(302);
+    expect(second.headers.get("location")).toBe("/console?imported=retry-box&notes=4&skipped=0");
+    // Still ONE vault — the retry reused the reserved name, didn't create a second.
+    expect(await countVaultsForOwner(env.DB, userId)).toBe(1);
   });
 
   test("an upload over 50 MiB is refused early on Content-Length — no vault, no outbound call", async () => {
@@ -999,14 +1067,17 @@ describe("console — the import door (POST /console/vaults/import)", () => {
     expect(await getVault(env.DB, "nofile-vault")).toBeNull();
   });
 
-  test("a taken vault name is refused with the create-door message (no forward)", async () => {
+  test("a name owned by ANOTHER account is refused with the create-door message (no forward, no touch)", async () => {
     const { id: userId } = await seedUser("import-taken@example.com");
     const sessionId = await seedSession(userId);
-    await seedVault("already-here", userId);
+    const { id: otherId } = await seedUser("import-other-owner@example.com");
+    await seedVault("someone-elses", otherId);
     // disableNetConnect + no interceptor: a forward would throw, not render.
-    const res = await app.fetch(importReq("already-here", TAR, sessionCookie(sessionId)), env);
+    const res = await app.fetch(importReq("someone-elses", TAR, sessionCookie(sessionId)), env);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("already taken");
+    // The other account's vault is untouched — we never forward into it.
+    expect((await getVault(env.DB, "someone-elses"))?.ownerUserId).toBe(otherId);
   });
 
   test("the success notice renders for an owned vault; the attachment caveat rides a skipped count", async () => {
