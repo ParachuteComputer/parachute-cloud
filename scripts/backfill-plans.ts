@@ -45,8 +45,8 @@ const TARGETS = {
   staging: {
     db: "parachute-identity-staging",
     envFlags: ["--env", "staging"],
-    issuer: "https://parachute-identity-staging.aaron-d5d.workers.dev",
-    vaultOrigin: "https://parachute-vault-do-staging.aaron-d5d.workers.dev",
+    issuer: "https://parachute-identity-staging.openparachute.workers.dev",
+    vaultOrigin: "https://parachute-vault-do-staging.openparachute.workers.dev",
   },
   prod: {
     db: "parachute-identity",

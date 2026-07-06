@@ -41,8 +41,8 @@ import { totpCodeAt } from "../workers/identity/src/totp.ts";
 import { GETTING_STARTED_PACK, welcomePack } from "../workers/vault/node_modules/@openparachute/core/src/seed-packs.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.aaron-d5d.workers.dev").replace(/\/$/, "");
-const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.aaron-d5d.workers.dev").replace(/\/$/, "");
+const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.openparachute.workers.dev").replace(/\/$/, "");
+const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.openparachute.workers.dev").replace(/\/$/, "");
 const VAULT_NAME = process.env.VAULT_NAME ?? "demo";
 const REDIRECT_URI = "http://localhost:8976/callback";
 const MARKER = `smoke-${Date.now()}`;

@@ -142,8 +142,8 @@ binding = "AI"
 # staging identity worker's ISSUER ([env.staging.vars] in
 # workers/identity/wrangler.toml) — staging vaults trust the STAGING issuer.
 [env.staging.vars]
-ISSUER_ORIGIN = "https://parachute-identity-staging.aaron-d5d.workers.dev"
-VAULT_BASE_DOMAIN = "parachute-vault-do-staging.aaron-d5d.workers.dev"
+ISSUER_ORIGIN = "https://parachute-identity-staging.openparachute.workers.dev"
+VAULT_BASE_DOMAIN = "parachute-vault-do-staging.openparachute.workers.dev"
 CAP_BYTES = "1073741824"
 # "staging" ≠ "test": the TEST_JWKS double-gate stays closed here too.
 ENVIRONMENT = "staging"
