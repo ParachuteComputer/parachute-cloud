@@ -503,6 +503,47 @@ async function main() {
         body: form({ __csrf: conCsrf!, vault: VAULT_NAME }),
       });
       assert(exDenied.status === 404, "export of an unowned vault → 404", `status ${exDenied.status}`);
+
+      // Launch-flow: the IMPORT door, live — the other half of the export door.
+      // POST exBytes (the export of newVault) as a NEW vault via multipart, then
+      // re-export the imported vault through the console door: note-count parity
+      // across the whole export → import → export loop dogfoods portability.
+      const importVaultName = `imp-${Date.now()}`;
+      const srcMdCount = exEntries.filter((e) => e.name.endsWith(".md")).length;
+      const imFd = new FormData();
+      imFd.set("__csrf", conCsrf!);
+      imFd.set("vault_name", importVaultName);
+      imFd.set("tarball", new File([exBytes], "export.tar", { type: "application/x-tar" }));
+      const imRes = await fetch(`${IDENTITY}/console/vaults/import`, {
+        method: "POST",
+        headers: { origin: IDENTITY, cookie: `parachute_id_session=${newSession}; parachute_id_csrf=${conCsrf}` },
+        redirect: "manual",
+        body: imFd,
+      });
+      const imLoc = imRes.headers.get("location") ?? "";
+      const imNotes = Number(new URLSearchParams(imLoc.split("?")[1] ?? "").get("notes") ?? "-1");
+      assert(
+        imRes.status === 302 && imLoc.includes(`imported=${importVaultName}`) && imNotes === srcMdCount,
+        "console import door → new vault with note-count parity",
+        `status ${imRes.status}, loc ${imLoc}, notes ${imNotes} vs source ${srcMdCount}`,
+      );
+      // Re-export the imported vault through the console door and compare — the
+      // full export → import → export loop round-trips the owner's notes.
+      const reExport = await fetch(`${IDENTITY}/console/vaults/export`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${newSession}; parachute_id_csrf=${conCsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: conCsrf!, vault: importVaultName }),
+      });
+      const reEntries = untar(new Uint8Array(await reExport.arrayBuffer()));
+      const reMdCount = reEntries.filter((e) => e.name.endsWith(".md")).length;
+      assert(
+        reExport.status === 200 &&
+          reMdCount === srcMdCount &&
+          reEntries.some((e) => e.text.includes(`owner note ${MARKER}`)),
+        "imported vault re-exports with the same notes (export → import → export round-trip)",
+        `re-export md ${reMdCount} vs source ${srcMdCount}`,
+      );
     }
 
     // The DEV user is REFUSED a token for the new user's vault.

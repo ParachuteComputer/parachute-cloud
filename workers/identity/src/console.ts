@@ -54,6 +54,7 @@ import { createUser, getUserByEmail, needsRehash, setPassword, verifyPassword, t
 import {
   VaultNameInvalidError,
   VaultNameTakenError,
+  clearImportPending,
   countVaultsForOwner,
   createVault,
   getVault,
@@ -69,7 +70,7 @@ import {
   restoreAtCapMessage,
   vaultCapMessage,
 } from "./plans.ts";
-import { callVaultApi, pushVaultCap } from "./vault-call.ts";
+import { callVaultApi, callVaultImport, pushVaultCap } from "./vault-call.ts";
 import {
   callVaultRestore,
   isKnownSnapshot,
@@ -362,6 +363,19 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
   // rides the success message: honesty at the exact moment it matters.
   const restoredParam = params.get("restored");
   const restoredVault = restoredParam && vaults.some((v) => v.name === restoredParam) ? restoredParam : null;
+  // Import success notice — only for a vault this user actually owns (the param
+  // is user-editable; same rule as restored/pack_added). The note count + any
+  // attachment caveat ride the redirect as numbers (clamped defensively).
+  const importedParam = params.get("imported");
+  const importedVault = importedParam && vaults.some((v) => v.name === importedParam) ? importedParam : null;
+  const importedNotes = Math.max(0, Math.trunc(Number(params.get("notes") ?? "")) || 0);
+  const importedSkipped = Math.max(0, Math.trunc(Number(params.get("skipped") ?? "")) || 0);
+  const importNotice = importedVault
+    ? `Imported into "${importedVault}" — ${importedNotes} ${importedNotes === 1 ? "note is" : "notes are"} ready.` +
+      (importedSkipped > 0
+        ? ` Heads up: ${importedSkipped} attachment ${importedSkipped === 1 ? "file" : "files"} couldn't be carried over — the notes and their references are in, but ${importedSkipped === 1 ? "the file itself is" : "the files themselves are"} not.`
+        : "")
+    : null;
   // Promo success copy renders from the ROW (plan + plan_downgrade_at), never
   // from the query string — the param only picks the message; the date is the
   // stored truth (honest even on a stale/replayed URL).
@@ -371,6 +385,8 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
       : null;
   const notice = created
     ? `Your vault "${created}" is ready — open your notes, or connect your AI below.`
+    : importNotice
+    ? importNotice
     : restoredVault
       ? `Snapshot restored into "${restoredVault}" — a new vault; the original is untouched. Heads up: v1 snapshots don't include attachment files, so notes and their attachment references are back but the files themselves aren't.`
       : packVault
@@ -538,6 +554,243 @@ export async function handleExportPost(db: D1Database, req: Request, deps: OAuth
   const len = res.headers.get("content-length");
   if (len) headers.set("content-length", len);
   return new Response(res.body, { status: 200, headers });
+}
+
+// --- the import door (the other half of the portability promise) -------------
+
+/**
+ * The cloud import ceiling — must equal the vault worker's `MAX_IMPORT_BYTES`
+ * (restore.ts). Separate Workers, no shared module; keep the two identical.
+ */
+// Exported for the cross-worker parity test (test-bun/import-limit-parity):
+// this MUST equal the vault worker's MAX_IMPORT_BYTES (restore.ts).
+export const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
+const MAX_IMPORT_MIB = 50;
+
+function importTooLargeMessage(): string {
+  return `That export is over the ${MAX_IMPORT_MIB} MiB import limit. For a larger vault, write hello@parachute.computer — or use the CLI import on self-host.`;
+}
+
+/**
+ * The friendly copy for a failed import forward/replay. We NEVER free the vault
+ * name on failure, so the message reassures the caller: nothing was kept from
+ * the upload, and the name is theirs — a retry reuses it (and the DO's blow-away
+ * import converges). Vault names are validated slugs (`[a-z0-9-]`), so the name
+ * needs no HTML escaping here.
+ */
+function importFailedMessage(vaultName: string): string {
+  return (
+    `Import failed — nothing was kept from the upload. The vault name "${vaultName}" ` +
+    `is reserved for you; retrying the import will reuse it.`
+  );
+}
+
+/**
+ * Log a failed import forward. Wrapped so a logging failure can NEVER escalate a
+ * handled import error into an unhandled 500 (this worker has no Hono onError).
+ */
+function logImportForwardFailed(userId: string, vaultName: string, detail: string): void {
+  try {
+    console.error(`event=import_forward_failed user=${userId} vault=${vaultName} error=${detail}`);
+  } catch {
+    /* a logging error must not propagate */
+  }
+}
+
+/**
+ * Render a friendly import-failure page, falling back to a dependency-free plain
+ * response if the console re-render itself throws (its DB reads could hiccup, and
+ * there is no Hono onError to catch an escaped exception). Either way the caller
+ * sees the message, never a bare 500.
+ */
+async function importFailureResponse(
+  db: D1Database,
+  req: Request,
+  deps: OAuthDeps,
+  user: User,
+  message: string,
+): Promise<Response> {
+  try {
+    return await consoleError(db, req, deps, user, message);
+  } catch (err) {
+    logImportForwardFailed(user.id, "-", `render_failed:${err instanceof Error ? err.message : String(err)}`);
+    return new Response(message, {
+      status: 200,
+      headers: { "content-type": "text/plain; charset=UTF-8" },
+    });
+  }
+}
+
+/**
+ * POST /console/vaults/import — upload a Parachute export (.tar), get a NEW
+ * vault with those notes. The other half of the export door: the portability
+ * promise runs in both directions.
+ *
+ * The user-facing trust boundary mirrors the create door (an import CREATES a
+ * vault): session + CSRF + same-origin + vault-name validation identical to
+ * create + the plan vault-count cap (expired, vault_count 0, is refused here
+ * exactly as create refuses it). Then: create (or, for a retry, REUSE) the
+ * target vault → push the plan cap → forward the tar to the target DO's
+ * `POST /api/internal/import` through the mint seam (first-party admin,
+ * aud-pinned, 60s — same seam as restore/packs, carrying raw bytes). On success:
+ * redirect with the note count for the success notice.
+ *
+ * Failure posture — restore-door parity, NEVER free the name: on ANY
+ * forward/replay failure the ownership row PERSISTS. Freeing a name whose DO may
+ * still hold the just-uploaded data would let ANOTHER account claim it via the
+ * create door and — the welcome seed already spent — read the previous
+ * uploader's notes (cross-account exposure, the exact class this door prevents).
+ * The name stays the caller's; a retry re-imports into the SAME vault and
+ * converges via the DO's blow-away purge.
+ *
+ * Reuse is GATED by `vaults.import_pending_at` (migration 0019): the create
+ * branch stamps it, import success clears it, and ONLY a still-flagged row —
+ * one that exists solely because a previous import attempt failed — may be
+ * reused. A same-owner name WITHOUT the flag is a real, populated vault the
+ * user typed by accident; blow-away importing into it would be same-account
+ * data loss, so it gets the same "already taken" refusal as a cross-account
+ * name. A flagged row whose earlier attempt PARTIALLY imported is exactly the
+ * retry case — blow-away converges.
+ *
+ * Body-size: an oversize upload is refused early on Content-Length (before the
+ * multipart parse), again on the extracted file size, and finally by the vault
+ * worker's own 413 — three fences, one friendly message.
+ */
+export async function handleImportPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const user = await sessionUser(db, req, deps);
+  if (!user) return redirectResponse("/login");
+
+  // Refuse an oversize upload before parsing the multipart body (item 8). A
+  // browser always sends Content-Length for a file POST; an absent/spoofed one
+  // is caught again below and by the vault worker.
+  const declaredLen = Number(req.headers.get("content-length") ?? "");
+  if (Number.isFinite(declaredLen) && declaredLen > MAX_IMPORT_BYTES) {
+    return consoleError(db, req, deps, user, importTooLargeMessage());
+  }
+
+  const form = await req.formData();
+  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+    return consoleError(db, req, deps, user, "Your session expired. Please try again.");
+  }
+  const rawName = String(form.get("vault_name") ?? "");
+  const file = form.get("tarball");
+
+  // workers-types under-types FormData.get as `string | null` (no File), but a
+  // multipart file field is a Blob-like at runtime. Guard the string/null cases;
+  // treat the remainder as a Blob (arrayBuffer() reads the bytes).
+  if (file === null || typeof file === "string") {
+    return consoleError(db, req, deps, user, "Choose a Parachute export file (.tar) to import.");
+  }
+  const buf = await (file as unknown as Blob).arrayBuffer();
+  if (buf.byteLength === 0) {
+    return consoleError(db, req, deps, user, "That file was empty — choose a Parachute export (.tar).");
+  }
+  if (buf.byteLength > MAX_IMPORT_BYTES) {
+    return consoleError(db, req, deps, user, importTooLargeMessage());
+  }
+
+  // Resolve reuse-vs-create. We NEVER free a vault name on a failed import (see
+  // the forward block below), so a RETRY must be able to reclaim the row it
+  // already owns — but ONLY a row still flagged `import_pending_at` (created by
+  // the import door, no successful import yet). A same-owner name WITHOUT the
+  // flag is a real, populated vault: blow-away importing into it would be
+  // same-account data loss, so it's refused exactly like a cross-account name.
+  // A new name is created below, with name validation identical to the create
+  // door.
+  const now = deps.now?.() ?? new Date();
+  const canonicalName = rawName.trim().toLowerCase();
+  const existing = canonicalName ? await getVault(db, canonicalName) : null;
+  if (existing && (existing.ownerUserId !== user.id || existing.importPendingAt === null)) {
+    return consoleError(db, req, deps, user, "That vault name is already taken.");
+  }
+
+  let vaultName: string;
+  if (existing) {
+    // Retry into this caller's own still-import-pending row — reuse it. No NEW
+    // vault, so the plan vault-count cap doesn't apply and the caps were already
+    // pushed at its creation; the DO's blow-away purge makes the re-import
+    // converge (a partial earlier attempt is exactly this case).
+    vaultName = existing.name;
+  } else {
+    // A NEW vault — the plan vault-count gate, verbatim from the create door.
+    // `>=` grandfathers accounts already over a cap; expired (vault_count 0) is
+    // refused here exactly as create refuses it.
+    const spec = PLAN_SPECS[user.plan];
+    if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
+      return consoleError(db, req, deps, user, vaultCapMessage(user.plan));
+    }
+    try {
+      // `importPending: true` stamps `import_pending_at` atomically in the
+      // insert — the flag that authorizes a retry to reuse this row (cleared
+      // below on success). Atomic so a crash can't strand a flagless row.
+      const vault = await createVault(db, rawName, user.id, now, { importPending: true });
+      vaultName = vault.name;
+    } catch (err) {
+      if (err instanceof VaultNameInvalidError) {
+        const msg =
+          err.reason === "reserved"
+            ? "That name is reserved. Please choose another."
+            : "Use 2–63 characters: lowercase letters, numbers, and hyphens (starting with a letter or number).";
+        return consoleError(db, req, deps, user, msg);
+      }
+      if (err instanceof VaultNameTakenError) {
+        // TOCTOU: a concurrent create claimed it between getVault and here.
+        return consoleError(db, req, deps, user, "That vault name is already taken.");
+      }
+      throw err;
+    }
+    // Push the plan's caps + voice entitlement (best-effort, as any creation).
+    await pushVaultCap(db, deps, user.id, vaultName, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan)));
+  }
+
+  // Forward the tar. On ANY forward/replay failure we KEEP the ownership row —
+  // NEVER free the name (see the handler docstring: a freed name whose DO may
+  // still hold the just-uploaded data would be claimable by another account and
+  // leak the previous uploader's notes). The name stays reserved for the caller;
+  // a retry re-imports into the SAME vault and converges. Log loudly, and guard
+  // the failure render so a logging/DB hiccup can't escalate a handled import
+  // failure into an unhandled 500 (this worker has no Hono onError).
+  let res: Response;
+  try {
+    res = await callVaultImport(db, deps, user.id, vaultName, buf);
+  } catch (err) {
+    logImportForwardFailed(user.id, vaultName, err instanceof Error ? err.message : String(err));
+    return importFailureResponse(db, req, deps, user, importFailedMessage(vaultName));
+  }
+  if (!res.ok) {
+    if (res.status === 413) {
+      logImportForwardFailed(user.id, vaultName, "status=413");
+      return importFailureResponse(db, req, deps, user, importTooLargeMessage());
+    }
+    logImportForwardFailed(user.id, vaultName, `status=${res.status}`);
+    return importFailureResponse(db, req, deps, user, importFailedMessage(vaultName));
+  }
+
+  const summary = (await res.json().catch(() => ({}))) as {
+    notes?: unknown;
+    stats?: { notes_created?: unknown; skipped_attachments?: unknown };
+  };
+  const notes =
+    typeof summary.notes === "number"
+      ? summary.notes
+      : typeof summary.stats?.notes_created === "number"
+        ? summary.stats.notes_created
+        : 0;
+  const skipped = typeof summary.stats?.skipped_attachments === "number" ? summary.stats.skipped_attachments : 0;
+  // Import succeeded — the vault now holds real content, so CLOSE the retry-
+  // reuse gate (a later import naming this vault must get "already taken",
+  // never a blow-away). Guarded: a D1 hiccup here must not turn a successful
+  // import into a 500 — log loudly instead (the residual, a still-flagged
+  // populated vault, is same-account-only and self-inflicted on reuse).
+  try {
+    await clearImportPending(db, vaultName, user.id);
+  } catch (err) {
+    logImportForwardFailed(user.id, vaultName, `flag_clear_failed:${err instanceof Error ? err.message : String(err)}`);
+  }
+  console.log(`event=import_completed vault=${vaultName} notes=${notes} skipped_attachments=${skipped}`);
+  return redirectResponse(
+    `/console?imported=${encodeURIComponent(vaultName)}&notes=${notes}&skipped=${skipped}`,
+  );
 }
 
 // --- snapshot restore (Wave 4e — paid plans only) -----------------------------

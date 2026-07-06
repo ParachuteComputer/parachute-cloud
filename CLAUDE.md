@@ -71,7 +71,24 @@ workers/identity/   the OAuth issuer (authorize/token/DCR/JWKS/revocation on D1)
                     magic-link sign-in ON the OAuth authorize login page,
                     where the emailed link RESUMES the pending authorize
                     request (`magic_links.next`, migration 0017 — the
-                    passwordless-user reconnect fix). 407 tests.
+                    passwordless-user reconnect fix). ALSO the console IMPORT
+                    door (0.0.8-rc.33): POST /console/vaults/import (multipart
+                    vault_name + .tar) CREATES a vault (create-door name +
+                    vault-count-cap parity) and forwards the upload to the new
+                    vault's DO `POST /api/internal/import` through the same
+                    first-party admin mint seam as restore — the other half of
+                    the portability promise. Unlike snapshot restore, import
+                    PRESERVES attachment binaries (blow-away also purges the
+                    target's R2 attachments so re-imports converge + don't
+                    double-meter); a failed forward KEEPS the ownership row
+                    (restore-door parity — never free a name whose DO may still
+                    hold the upload; the owner retries into the same vault).
+                    Retry-reuse is GATED by `vaults.import_pending_at`
+                    (migration 0019: stamped at import-create, cleared on
+                    success) — only a still-pending row may be re-imported
+                    into; a populated same-owner vault gets "already taken",
+                    never a blow-away. 50 MiB `MAX_IMPORT_BYTES` ceiling.
+                    421 tests.
 src/                the OLD control plane (Worker + D1 + Stripe). Dormant; billing
                     lifecycle design gets harvested into the control-plane revival.
 scripts/            deploy-staging.sh + smoke-staging.ts (full 118-step live smoke,
@@ -85,10 +102,10 @@ scripts/            deploy-staging.sh + smoke-staging.ts (full 118-step live smo
 
 ```sh
 bun install                         # ALSO refreshes the copied core dep (see gotcha)
-bun run test                        # control-plane tests (src/) + the export→import round-trip (test-bun/) — 124
+bun run test                        # control-plane tests (src/) + the export→import round-trip (test-bun/) — 125
 bun run typecheck                   # root tsc
-cd workers/vault && bun run typecheck && bun x vitest run    # 260+1 todo under workerd
-cd workers/identity && bun run typecheck && bun x vitest run # 407
+cd workers/vault && bun run typecheck && bun x vitest run    # 271+1 todo under workerd
+cd workers/identity && bun run typecheck && bun x vitest run # 421
 bash scripts/deploy-staging.sh      # deploy both workers -e staging + migrate + seed
 bun scripts/smoke-staging.ts        # FULL live smoke vs staging (creates test debris)
 bash scripts/deploy-prod.sh         # deploy both workers top-level + migrate (NO seed)

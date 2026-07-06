@@ -80,7 +80,14 @@ import {
   wouldRetain,
   type SnapshotEntry,
 } from "./snapshots.js";
-import { restoreFromTar } from "./restore.js";
+import {
+  BodyTooLargeError,
+  MAX_IMPORT_BYTES,
+  MAX_IMPORT_MIB,
+  importFromTar,
+  readCappedBody,
+  restoreFromTar,
+} from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, type WelcomeSeedResult } from "./welcome.js";
 import { SEED_PACK_NAMES, applySeedPack, getSeedPack } from "@openparachute/core/src/seed-packs.js";
@@ -433,6 +440,7 @@ export class VaultDO extends DurableObject {
       if (apiPath === "/internal/snapshot") return this.handleSnapshot(request, vaultName);
       if (apiPath === "/internal/snapshots") return this.handleListSnapshots(request, vaultName);
       if (apiPath === "/internal/restore") return this.handleRestore(request, vaultName);
+      if (apiPath === "/internal/import") return this.handleImport(request, vaultName);
       return json({ error: "Not found" }, 404);
     }
 
@@ -967,6 +975,147 @@ export class VaultDO extends DurableObject {
         skipped_sidecars: stats.skipped_sidecars.length,
       },
     });
+  }
+
+  /**
+   * POST /api/internal/import — the user-facing IMPORT door's engine (the other
+   * half of the export door). Body: the raw bytes of a Parachute portable-md
+   * export tarball (a user upload). Replays it into THIS vault (a freshly
+   * created target) via core's `importVault` with `{ blowAway: true }` — the
+   * SAME engine/source as snapshot restore, differing only in the tar's origin
+   * (upload vs R2) and that this path PRESERVES attachment binaries.
+   *
+   * Trust model: identical to {@link handleRestore} — only the platform reaches
+   * here (the /api/internal/* first-party gate). The identity worker enforces
+   * the user-facing boundary FIRST (session + CSRF + same-origin + vault-name
+   * validation + plan vault-count cap) and creates the target vault before
+   * calling here.
+   *
+   * Size guard: a body over `MAX_IMPORT_BYTES` is refused with a distinct 413
+   * `import_too_large` — Content-Length first (before buffering), and enforced
+   * again while reading for an absent/untrusted length. Blow-away precedes the
+   * cap gate exactly like restore: an import larger than the target's plan cap
+   * lands fully and leaves the vault over-cap → write-limited (reads/export
+   * untouched), the documented downgrade posture.
+   */
+  private async handleImport(request: Request, vaultName: string): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+
+    // Content-Length pre-check: refuse an oversize body before a byte is read.
+    // Discard the (unread) upload stream so nothing dangles once we respond.
+    const declared = Number(request.headers.get("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > MAX_IMPORT_BYTES) {
+      await request.body?.cancel().catch(() => {});
+      return this.importTooLargeResponse();
+    }
+
+    let tarBytes: Uint8Array;
+    try {
+      tarBytes = await readCappedBody(request, MAX_IMPORT_BYTES);
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) return this.importTooLargeResponse();
+      return json({ error: "Could not read the import body", error_type: "import_read_failed" }, 400);
+    }
+    if (tarBytes.byteLength === 0) return json({ error: "Empty import body", error_type: "import_empty" }, 400);
+
+    let result;
+    try {
+      result = await importFromTar(this.store, tarBytes);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[import ${vaultName}] rejected: ${msg}`);
+      return json({ error: "Not a readable Parachute export", error_type: "import_unreadable", detail: msg }, 400);
+    }
+    const { stats, pending } = result;
+
+    // Blow-away replaced the SQLite content; complete it on the R2 side so the
+    // vault ends with EXACTLY the imported binaries. Purge the attachments
+    // prefix (orphans from any prior content — a re-import / same-name retry
+    // would otherwise leak objects AND double-count the meter) and reset the
+    // R2 meter, THEN write the imported binaries fresh. `exports/` + `snapshots/`
+    // are separate prefixes, untouched. A fresh target's purge is a no-op.
+    await this.purgeAttachments(vaultName);
+    this.r2Bytes = 0;
+    await this.ctx.storage.put(R2_METER_KEY, 0);
+
+    // Write attachment binaries to R2 + meter storage — deferred past the
+    // synchronous restoreAttachment seam (the DO can't await R2 mid-engine).
+    // The whole tar is ≤ MAX_IMPORT_BYTES in memory, so this is memory-bounded
+    // (the export side's streaming concern — unbounded audio × many — doesn't
+    // apply to a size-capped upload). Content-type from the extension mirrors
+    // the upload path (the storage GET also falls back to it).
+    let attachmentsWritten = 0;
+    let attachmentBytes = 0;
+    const failedBinaries: string[] = [];
+    for (const p of pending) {
+      const key = r2Key(vaultName, p.destRelPath);
+      const contentType = MIME_TYPES[extLower(p.destRelPath)] ?? "application/octet-stream";
+      try {
+        await this.env.ATTACHMENTS.put(key, p.bytes, { httpMetadata: { contentType } });
+        await this.meterAdd(p.bytes.byteLength);
+        attachmentsWritten++;
+        attachmentBytes += p.bytes.byteLength;
+      } catch (err) {
+        failedBinaries.push(p.destRelPath);
+        console.warn(
+          `[import ${vaultName}] attachment write failed key=${key}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    // skipped_attachments = engine skips (binary absent from the tar — a rows-
+    // only / evicted export) + R2-write failures. 0 on a clean export→import.
+    const skippedAttachments = stats.skipped_attachments.length + failedBinaries.length;
+    console.log(
+      `[import ${vaultName}] notes_created=${stats.notes_created} notes_wiped=${stats.notes_wiped} ` +
+        `schemas=${stats.schemas_restored} links=${stats.links_restored} attachment_rows=${stats.attachments_restored} ` +
+        `attachments_written=${attachmentsWritten} attachment_bytes=${attachmentBytes} skipped_attachments=${skippedAttachments}`,
+    );
+    return json({
+      imported: true,
+      /** Convenience top-level count for the identity worker's redirect. */
+      notes: stats.notes_created,
+      stats: {
+        notes_created: stats.notes_created,
+        notes_updated: stats.notes_updated,
+        notes_wiped: stats.notes_wiped,
+        schemas_restored: stats.schemas_restored,
+        links_restored: stats.links_restored,
+        /** Attachment ROWS restored (from the engine). */
+        attachments_restored: stats.attachments_restored,
+        /** Attachment BINARIES streamed into R2 (this path preserves files). */
+        attachments_written: attachmentsWritten,
+        skipped_attachments: skippedAttachments,
+        skipped_links: stats.skipped_links.length,
+        skipped_sidecars: stats.skipped_sidecars.length,
+      },
+    });
+  }
+
+  /** Delete every object under the vault's attachments prefix (paginated,
+   *  R2 bulk-delete caps at 1000/call). The R2 half of a blow-away import —
+   *  distinct from the `exports/` + `snapshots/` prefixes, which it never
+   *  touches. */
+  private async purgeAttachments(vaultName: string): Promise<void> {
+    const prefix = r2Key(vaultName, "");
+    let cursor: string | undefined;
+    do {
+      const page = await this.env.ATTACHMENTS.list({ prefix, ...(cursor ? { cursor } : {}) });
+      const keys = page.objects.map((o) => o.key);
+      for (let i = 0; i < keys.length; i += 1000) {
+        await this.env.ATTACHMENTS.delete(keys.slice(i, i + 1000));
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+  }
+
+  private importTooLargeResponse(): Response {
+    return json(
+      {
+        error: `Import too large — the upload exceeds the ${MAX_IMPORT_MIB} MiB cloud import limit. For larger vaults, contact us — or use the CLI import on self-host.`,
+        error_type: "import_too_large",
+      },
+      413,
+    );
   }
 
   /**

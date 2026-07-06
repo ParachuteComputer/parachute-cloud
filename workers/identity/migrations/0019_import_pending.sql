@@ -1,0 +1,21 @@
+-- 0019: import-pending marker on vault ownership rows (the gated-reuse fix).
+--
+-- The import door NEVER frees a vault name on a failed forward (rc.34 — a freed
+-- name whose DO may still hold the just-uploaded data would be claimable by
+-- another account: cross-account exposure). That posture needs retries to REUSE
+-- the reserved name — but unconditional same-owner reuse would let the import
+-- form blow away an existing POPULATED vault the user typed by accident
+-- (same-account data loss; "your notes are safe" is the product's moral center).
+--
+-- This column is the gate:
+--   - SET (to the creation timestamp) when the IMPORT door creates the row —
+--     i.e. the row exists solely to receive an import;
+--   - CLEARED on import success (the vault is now real, populated content);
+--   - NULL on every other row (create door, restore door, all pre-existing).
+--
+-- The import door's reuse branch is allowed ONLY while import_pending_at IS NOT
+-- NULL — a same-owner name without the flag gets the "already taken" refusal,
+-- exactly like a cross-account name. A flagged row whose earlier attempt
+-- PARTIALLY imported is precisely the retry case: the DO's blow-away purge
+-- converges the re-import.
+ALTER TABLE vaults ADD COLUMN import_pending_at TEXT;

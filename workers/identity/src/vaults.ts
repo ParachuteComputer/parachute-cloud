@@ -43,16 +43,30 @@ export interface Vault {
   name: string;
   ownerUserId: string;
   createdAt: string;
+  /**
+   * Non-null while the row exists SOLELY to receive an import (stamped by the
+   * import door at creation, cleared on import success — migration 0019). The
+   * import door's retry-reuse gate: only a still-pending row may be re-imported
+   * into; a populated vault (NULL) gets the "already taken" refusal instead of
+   * a blow-away.
+   */
+  importPendingAt: string | null;
 }
 
 interface Row {
   name: string;
   owner_user_id: string;
   created_at: string;
+  import_pending_at: string | null;
 }
 
 function rowToVault(r: Row): Vault {
-  return { name: r.name, ownerUserId: r.owner_user_id, createdAt: r.created_at };
+  return {
+    name: r.name,
+    ownerUserId: r.owner_user_id,
+    createdAt: r.created_at,
+    importPendingAt: r.import_pending_at ?? null,
+  };
 }
 
 export type VaultNameError = "invalid_slug" | "reserved";
@@ -113,21 +127,29 @@ export async function userOwnsVault(db: D1Database, userId: string, name: string
  * Claim a vault name for a user. Validates slug + reserved, then inserts. Throws
  * VaultNameInvalidError (bad name) or VaultNameTakenError (name already owned by
  * anyone — the PK collision). The DO comes into existence on first access.
+ *
+ * `opts.importPending` (import door only): stamp `import_pending_at` IN the
+ * insert — atomically, so a crash can never leave an import-created row without
+ * its flag (a flagless row refuses reuse, stranding the name). Cleared via
+ * {@link clearImportPending} on import success; every other creation path
+ * leaves it NULL.
  */
 export async function createVault(
   db: D1Database,
   rawName: string,
   ownerUserId: string,
   now: Date = new Date(),
+  opts: { importPending?: boolean } = {},
 ): Promise<Vault> {
   const check = validateVaultName(rawName);
   if (!check.ok) throw new VaultNameInvalidError(check.reason, rawName);
   const name = check.name;
   const createdAt = now.toISOString();
+  const importPendingAt = opts.importPending === true ? createdAt : null;
   try {
     await db
-      .prepare("INSERT INTO vaults (name, owner_user_id, created_at) VALUES (?, ?, ?)")
-      .bind(name, ownerUserId, createdAt)
+      .prepare("INSERT INTO vaults (name, owner_user_id, created_at, import_pending_at) VALUES (?, ?, ?, ?)")
+      .bind(name, ownerUserId, createdAt, importPendingAt)
       .run();
   } catch (err) {
     // UNIQUE/PK collision → the name is taken (by this user or another).
@@ -135,7 +157,20 @@ export async function createVault(
     if (/UNIQUE|constraint|PRIMARY/i.test(msg)) throw new VaultNameTakenError(name);
     throw err;
   }
-  return { name, ownerUserId, createdAt };
+  return { name, ownerUserId, createdAt, importPendingAt };
+}
+
+/**
+ * Clear the import-pending marker after a SUCCESSFUL import — the vault now
+ * holds real content, so the import door's retry-reuse gate must close (a later
+ * import naming this vault gets the "already taken" refusal, never a blow-away).
+ * Owner-scoped for defense-in-depth (a mismatched owner is a no-op).
+ */
+export async function clearImportPending(db: D1Database, name: string, ownerUserId: string): Promise<void> {
+  await db
+    .prepare("UPDATE vaults SET import_pending_at = NULL WHERE name = ? AND owner_user_id = ?")
+    .bind(name.toLowerCase(), ownerUserId)
+    .run();
 }
 
 /** The distinct named vaults referenced by a scope set (`vault:<name>:<verb>`). */
