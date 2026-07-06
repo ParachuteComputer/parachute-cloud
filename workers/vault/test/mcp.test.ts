@@ -1,5 +1,6 @@
 import { SELF } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
+import { DEFAULT_VAULT_DESCRIPTION } from "@openparachute/core/src/seed-packs.js";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
 
@@ -327,7 +328,11 @@ describe("MCP — vault-info (server-layer override)", () => {
     const v = freshVault();
     const proj = await callVaultInfo(v, await READ(v), {});
     expect(proj.name).toBe(v);
-    expect(proj.description).toBeNull(); // fresh vault has no description yet
+    // LAUNCH-CRITICAL: a fresh cloud vault ships with core's
+    // DEFAULT_VAULT_DESCRIPTION (not null) so the connect-time instruction /
+    // vault-info actually orients the connected AI (on cloud the MCP server
+    // instruction is essentially just this description).
+    expect(proj.description).toBe(DEFAULT_VAULT_DESCRIPTION);
     // The default welcome pack seeds the sacred `capture` tag plus the
     // guides-ring tags (`guide` — schema-carrying — and `pinned`). `toContain`
     // keeps the assertion robust to a growing seed set (the #86 robustness shape).
@@ -412,9 +417,9 @@ describe("MCP — vault-info (server-layer override)", () => {
     const text = body.result.content[0].text as string;
     expect(text).toContain("Forbidden");
     expect(text).toContain("vault:write");
-    // And nothing was persisted.
+    // And nothing was persisted — still the fresh-vault default.
     const proj = await callVaultInfo(v, OP, {});
-    expect(proj.description).toBeNull();
+    expect(proj.description).toBe(DEFAULT_VAULT_DESCRIPTION);
   });
 
   it("FROZEN vault: a description update is refused by the #82 write gate (402 plan_required); a READ still works", async () => {
@@ -439,8 +444,8 @@ describe("MCP — vault-info (server-layer override)", () => {
     const proj = await callVaultInfo(v, writeToken, { include_stats: true });
     expect(proj.name).toBe(v);
     expect(proj.stats.totalNotes).toBeGreaterThan(0);
-    // The blocked update never landed.
-    expect(proj.description).toBeNull();
+    // The blocked update never landed — still the fresh-vault default.
+    expect(proj.description).toBe(DEFAULT_VAULT_DESCRIPTION);
   });
 
   it("REGRESSION canary: the placeholder string never rides in a vault-info response (read + operator)", async () => {

@@ -16,6 +16,7 @@
  */
 import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { IMPORTED_VAULT_DESCRIPTION } from "@openparachute/core/src/seed-packs.js";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { MAX_IMPORT_BYTES } from "../src/restore.ts";
 import { base, createNote, freshVault, mintToken, op } from "./helpers.ts";
@@ -131,6 +132,12 @@ describe("import — end to end (upload export → new vault → equality + atta
     // THE equality check: portable-md export of source and target match
     // (modulo vault name + re-minted attachment row ids).
     expect(await normalizedExport(dst)).toEqual(await normalizedExport(src));
+
+    // An imported vault ARRIVED with content → its vault-info description flips
+    // from the fresh-vault default to IMPORTED_VAULT_DESCRIPTION (orient the AI
+    // to LEARN the existing shape, not re-seed). Surfaced on the landing.
+    const landing = (await (await op(dst, "")).json()) as { description: string };
+    expect(landing.description).toBe(IMPORTED_VAULT_DESCRIPTION);
 
     // Note ids + tags survive the round-trip.
     const restored = await op(dst, `/api/notes/${noteId}?include_attachments=true`);

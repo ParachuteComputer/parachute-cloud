@@ -15,6 +15,7 @@
  */
 import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { IMPORTED_VAULT_DESCRIPTION } from "@openparachute/core/src/seed-packs.js";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { parseTar, TarImportSource } from "../src/restore.ts";
 import type { SnapshotEntry } from "../src/snapshots.ts";
@@ -126,6 +127,12 @@ describe("restore — end to end (snapshot → new vault → equality)", () => {
     // byte-for-byte (modulo vault name + re-minted attachment row ids) —
     // notes, paths, tags, schemas, metadata, links, timestamps all equal.
     expect(await normalizedExport(dst)).toEqual(await normalizedExport(src));
+
+    // A restored vault ARRIVED with content → its vault-info description flips
+    // from the fresh-vault default to IMPORTED_VAULT_DESCRIPTION (learn-not-seed),
+    // same seam as import. Surfaced on the landing.
+    const restoredLanding = (await (await op(dst, "")).json()) as { description: string };
+    expect(restoredLanding.description).toBe(IMPORTED_VAULT_DESCRIPTION);
 
     // Note ids survive the round-trip (import preserves frontmatter ids).
     const restored = await op(dst, `/api/notes/${noteId}?include_attachments=true`);
