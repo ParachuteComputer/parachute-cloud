@@ -555,7 +555,7 @@ describe("POST /console/plan — pick/change your trial tier (no Stripe)", () =>
     expect(after.plan).toBe("trial"); // still a trial — a free preview, not a purchase
     expect(after.pendingPlan).toBe("power"); // now mirrors Power
     expect(after.planDowngradeAt).toBe(before.planDowngradeAt); // the 30-day clock is UNTOUCHED
-    // The re-push carried the CHOSEN tier's two-meter caps + voice (Power: 5 GiB
+    // The re-push carried the CHOSEN tier's two-meter caps + voice (Power: 1 GiB
     // notes / 50 GiB attach / 1200 min), not the plus-mirroring trial default.
     expect(JSON.parse(pushed)).toEqual(planEntitlement("power"));
   });

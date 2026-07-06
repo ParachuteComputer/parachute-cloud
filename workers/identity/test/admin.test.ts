@@ -221,7 +221,7 @@ describe("GET /admin/vaults — the fleet table", () => {
     expect(html).toContain("vt-box");
     expect(html).toContain("vt-owner@example.com");
     expect(html).toContain("3.0 MB"); // db 2 MiB + r2 1 MiB
-    expect(html).toContain("10 GiB"); // the plus-tier cap (2 GiB notes + 8 GiB attach)
+    expect(html).toContain("8.5 GiB"); // the plus-tier cap (500 MB notes + 8 GiB attach)
   });
 
   test("a vault with no rollup row yet says so instead of inventing a zero", async () => {
@@ -230,7 +230,7 @@ describe("GET /admin/vaults — the fleet table", () => {
     await seedVault("vt2-box", id);
     const html = await (await app.fetch(get("/admin/vaults", cookie), env)).text();
     expect(html).toContain("no rollup row yet");
-    expect(html).toContain("10 GiB"); // the trial cap (mirrors plus: 2 GiB + 8 GiB)
+    expect(html).toContain("8.5 GiB"); // the trial cap (mirrors plus: 500 MB + 8 GiB)
   });
 });
 

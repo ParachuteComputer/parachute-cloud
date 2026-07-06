@@ -5,10 +5,16 @@
  * THE LADDER (locked 2026-07-04, Work/cloud-pricing-identity-model; numbers
  * tunable, shape fixed):
  *
- *   entry     1 vault  · 250 MB notes · NO attachments · NO voice   — $1 (qtr/annual)
- *   standard  3 vaults · 1 GiB notes  · 2 GiB attach   · 60 min     — $3/mo
- *   plus      5 vaults · 2 GiB notes  · 8 GiB attach   · 300 min    — $5/mo
- *   power     10 vaults· 5 GiB notes  · 50 GiB attach  · 1200 min   — $10/mo
+ *   entry     1 vault  · 100 MB notes · NO attachments · NO voice   — $1 (qtr/annual)
+ *   standard  3 vaults · 250 MB notes · 2 GiB attach   · 60 min     — $3/mo
+ *   plus      5 vaults · 500 MB notes · 8 GiB attach   · 300 min    — $5/mo
+ *   power     10 vaults· 1 GiB notes  · 50 GiB attach  · 1200 min   — $10/mo
+ *
+ *   NOTES CAPS ARE DELIBERATELY MODEST (2026-07-06, Aaron): notes are TEXT
+ *   (the SQLite graph — attachments are the SEPARATE R2 meter), so 100 MB is
+ *   already ~25k+ typical notes. Start small + increase later beats start big +
+ *   claw back; the same price points will carry more FEATURES over time, so we
+ *   hold higher margins here. Attachments/voice/vault-count unchanged.
  *   trial     mirrors PLUS entitlements — the 30-day no-card trial every new
  *             account starts on (full paid experience → stickiness)
  *   expired   the post-trial FLOOR: 0 new vaults, notes/attach writes FROZEN
@@ -90,7 +96,7 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
     id: "entry",
     label: "Entry",
     vault_count: 1,
-    notes_bytes: 250 * MiB,
+    notes_bytes: 100 * MiB,
     attachment_bytes: 0, // notes only — attachment uploads 403 attachments_not_included
     snapshot_retention: PAID_RETENTION,
     restore: true,
@@ -101,7 +107,7 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
     id: "standard",
     label: "Standard",
     vault_count: 3,
-    notes_bytes: 1 * GiB,
+    notes_bytes: 250 * MiB,
     attachment_bytes: 2 * GiB,
     snapshot_retention: PAID_RETENTION,
     restore: true,
@@ -112,7 +118,7 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
     id: "plus",
     label: "Plus",
     vault_count: 5,
-    notes_bytes: 2 * GiB,
+    notes_bytes: 500 * MiB,
     attachment_bytes: 8 * GiB,
     snapshot_retention: PAID_RETENTION,
     restore: true,
@@ -123,7 +129,7 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
     id: "power",
     label: "Power",
     vault_count: 10,
-    notes_bytes: 5 * GiB,
+    notes_bytes: 1 * GiB,
     attachment_bytes: 50 * GiB,
     snapshot_retention: PAID_RETENTION,
     restore: true,
@@ -136,7 +142,7 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
     id: "trial",
     label: "Trial",
     vault_count: 5,
-    notes_bytes: 2 * GiB,
+    notes_bytes: 500 * MiB,
     attachment_bytes: 8 * GiB,
     snapshot_retention: PAID_RETENTION,
     restore: true,
@@ -150,7 +156,7 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
     id: "expired",
     label: "Expired",
     vault_count: 0, // no new vaults
-    notes_bytes: 2 * GiB,
+    notes_bytes: 500 * MiB,
     attachment_bytes: 8 * GiB,
     snapshot_retention: FLOOR_RETENTION,
     restore: false,
@@ -299,7 +305,9 @@ export function coercePlanId(raw: string | null | undefined): PlanId {
  * defined on these boundaries.
  */
 export function formatPlanBytes(n: number): string {
-  if (n > 0 && n % GiB === 0) return `${n / GiB} GiB`;
+  // Whole GiB → "8 GiB"; a fractional GiB (a two-meter SUM like 500 MB notes +
+  // 8 GiB attach = 8.5 GiB) → one decimal, never "8692 MB"; sub-GiB → whole MB.
+  if (n >= GiB) return n % GiB === 0 ? `${n / GiB} GiB` : `${(n / GiB).toFixed(1)} GiB`;
   return `${Math.round(n / MiB)} MB`;
 }
 
