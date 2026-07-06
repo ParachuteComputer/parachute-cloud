@@ -1,7 +1,8 @@
 # Cloud Identity Worker — the authorization server for cloud vaults.
 # Reproduces the hub's OAuth issuer contract (authorize / token / register /
-# revoke / JWKS / revocation-list) on Workers + D1. Deployed to the Unforced
-# Development account since Phase 5a (2026-07-02) — see TRYIT-2026-07-02.md.
+# revoke / JWKS / revocation-list) on Workers + D1. Deployed to the new Parachute
+# account since the 2026-07-05 migration (was Unforced Development, Phase 5a
+# 2026-07-02) — see TRYIT-2026-07-02.md.
 #
 # ENVIRONMENTS: the TOP LEVEL of this file IS production (scripts/deploy-prod.sh;
 # custom domain cloud.parachute.computer). It cannot move into an [env.production]

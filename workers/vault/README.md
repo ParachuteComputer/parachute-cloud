@@ -64,7 +64,8 @@ Fly-fallback conversation needed.
 
 Phase 2+ shipped the production DO (REST + MCP + SSE + export) — the spike RPC
 methods above are retained so `test/spike.test.ts` stays green. The worker
-deploys to the **Unforced Development** CF account in two environments:
+deploys to the **new Parachute** CF account (`d5d7c864…`; moved from Unforced
+Development in the 2026-07-05 migration) in two environments:
 **production** is the top-level wrangler.toml config (custom domain
 `u.parachute.computer`, `scripts/deploy-prod.sh` at the repo root) and
 **staging** is `[env.staging]` (workers.dev only, own R2 + fresh DOs,
