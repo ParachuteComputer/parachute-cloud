@@ -3,45 +3,97 @@
  * oauth-shared.ts (depsForEnv) can import it without pulling the SDK into
  * every module graph.
  *
- * THE DEGRADATION CONTRACT (this is what deploys today, before Aaron creates
- * the Stripe account): billing is configured ONLY when all four values are
- * present — the two secrets (`wrangler secret put STRIPE_SECRET_KEY` /
- * `STRIPE_WEBHOOK_SECRET`) and the two Price ids ([vars], set once the
- * Stripe product exists). Anything missing → `billingConfig` returns null,
- * every /billing/* route answers a clean 503 `billing_not_configured`, and
- * the console hides Upgrade / Manage billing (the free-plan teaser stays).
- * The whole feature is invisible until the keys land; nothing else changes.
+ * THE DEGRADATION CONTRACT: billing is configured ONLY when the two secrets
+ * (`wrangler secret put STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET`) AND the
+ * four per-tier ANCHOR Prices exist — standard/plus/power MONTHLY plus entry
+ * QUARTERLY (entry has no monthly; quarterly is its cheapest cycle). Anything
+ * missing there → `billingConfig` returns null, every /billing/* route answers
+ * a clean 503 `billing_not_configured`, and the console hides Upgrade / Manage
+ * billing (the trial teaser stays). The whole feature is invisible until the
+ * keys land; nothing else changes.
+ *
+ * PARTIAL AVAILABILITY (the full-matrix wiring): the NON-anchor Prices
+ * (quarterly/yearly variants) are additive — a missing one only makes that ONE
+ * (tier, interval) unavailable (`priceFor` → null → checkout answers
+ * `billing_err=invalid`), never a whole-billing 503. Entry×monthly is null by
+ * construction (no such Price exists — Stripe's $0.30 flat fee eats a $1
+ * charge, so entry bills quarterly/yearly).
  */
 import type { Env } from "./env.ts";
+import type { PaidTier } from "./plans.ts";
+
+/** The billing cycles a Checkout can buy — form field `interval`. */
+export type BillingInterval = "monthly" | "quarterly" | "yearly";
+export const BILLING_INTERVALS: readonly BillingInterval[] = ["monthly", "quarterly", "yearly"] as const;
+
+/** The (tier, interval) → Stripe Price id matrix. Absent = unavailable. */
+export type PriceMatrix = Record<PaidTier, Partial<Record<BillingInterval, string>>>;
 
 export interface BillingConfig {
   /** Stripe secret key (sk_test_… / sk_live_…) — `wrangler secret put STRIPE_SECRET_KEY`. */
   secretKey: string;
   /** Webhook endpoint signing secret (whsec_…) — `wrangler secret put STRIPE_WEBHOOK_SECRET`. */
   webhookSecret: string;
-  /** Price id for Parachute monthly ($3/mo) — env STRIPE_PRICE_PARACHUTE_MONTHLY. */
-  priceMonthly: string;
-  /** Price id for Parachute yearly ($30/yr) — env STRIPE_PRICE_PARACHUTE_YEARLY. */
-  priceYearly: string;
   /**
-   * Price id for the $5/mo Voice tier (cloud#56). OPTIONAL + additive — its
-   * absence does NOT block billing (the Parachute prices still gate the whole
-   * feature); when unset, the voice Upgrade button hides and voice checkout is
-   * refused. Set once the Voice Stripe Price exists.
+   * Price ids per (tier, interval) from the STRIPE_PRICE_<TIER>_<INTERVAL>
+   * vars. The four anchors are guaranteed present (billingConfig gates on
+   * them); everything else is best-available. Read through {@link priceFor}.
    */
-  priceVoiceMonthly?: string;
+  prices: PriceMatrix;
 }
 
-/** The full Stripe config, or null when any piece is missing (degrade cleanly).
- *  Only the Parachute prices gate configuration — the Voice price is additive
- *  (see the field note), so voice can light up independently once it's set. */
+/** Trim-to-undefined: an empty [vars] value means "not set". */
+function val(raw: string | undefined): string | undefined {
+  return raw && raw.length > 0 ? raw : undefined;
+}
+
+function priceMatrix(env: Env): PriceMatrix {
+  return {
+    entry: {
+      // NO monthly by design (see the module note).
+      quarterly: val(env.STRIPE_PRICE_ENTRY_QUARTERLY),
+      yearly: val(env.STRIPE_PRICE_ENTRY_YEARLY),
+    },
+    standard: {
+      monthly: val(env.STRIPE_PRICE_STANDARD_MONTHLY),
+      quarterly: val(env.STRIPE_PRICE_STANDARD_QUARTERLY),
+      yearly: val(env.STRIPE_PRICE_STANDARD_YEARLY),
+    },
+    plus: {
+      monthly: val(env.STRIPE_PRICE_PLUS_MONTHLY),
+      quarterly: val(env.STRIPE_PRICE_PLUS_QUARTERLY),
+      yearly: val(env.STRIPE_PRICE_PLUS_YEARLY),
+    },
+    power: {
+      monthly: val(env.STRIPE_PRICE_POWER_MONTHLY),
+      quarterly: val(env.STRIPE_PRICE_POWER_QUARTERLY),
+      yearly: val(env.STRIPE_PRICE_POWER_YEARLY),
+    },
+  };
+}
+
+/** The full Stripe config, or null when the secrets or any ANCHOR Price is
+ *  missing (degrade cleanly). Non-anchor Prices are additive — see priceFor. */
 export function billingConfig(env: Env): BillingConfig | null {
   const secretKey = env.STRIPE_SECRET_KEY;
   const webhookSecret = env.STRIPE_WEBHOOK_SECRET;
-  const priceMonthly = env.STRIPE_PRICE_PARACHUTE_MONTHLY;
-  const priceYearly = env.STRIPE_PRICE_PARACHUTE_YEARLY;
-  if (!secretKey || !webhookSecret || !priceMonthly || !priceYearly) return null;
-  return { secretKey, webhookSecret, priceMonthly, priceYearly, priceVoiceMonthly: env.STRIPE_PRICE_VOICE_MONTHLY };
+  if (!secretKey || !webhookSecret) return null;
+  const prices = priceMatrix(env);
+  // The anchors: every purchasable tier's cheapest cycle. Without all four the
+  // ladder can't render honestly — treat billing as not configured at all.
+  if (!prices.standard.monthly || !prices.plus.monthly || !prices.power.monthly || !prices.entry.quarterly) {
+    return null;
+  }
+  return { secretKey, webhookSecret, prices };
+}
+
+/**
+ * The Stripe Price for a (tier, interval), or null when that combination is
+ * unavailable (entry×monthly by construction; any other combination whose
+ * env var isn't set). The caller answers `billing_err=invalid` on null.
+ */
+export function priceFor(config: BillingConfig, tier: PaidTier, interval: BillingInterval): string | null {
+  return config.prices[tier][interval] ?? null;
 }
 
 /**

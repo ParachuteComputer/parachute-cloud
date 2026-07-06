@@ -22,6 +22,7 @@ import {
   upgradeTeaser,
   vaultCapMessage,
 } from "./plans.ts";
+import { type BillingInterval } from "./billing-config.ts";
 
 export interface AuthorizeParams {
   clientId: string;
@@ -574,9 +575,6 @@ export interface ConsoleProps {
    * pre-keys) → the teaser stays and no billing UI renders at all.
    */
   billingConfigured?: boolean;
-  /** Voice Stripe Price present too → free users also see the $5 Voice Upgrade
-   *  button (cloud#56). Additive to `billingConfigured`. */
-  voiceBillingConfigured?: boolean;
   /**
    * Interim MOCK billing active (billing-config.ts `mockBillingEnabled`):
    * non-prod + no real Stripe (or MOCK_BILLING=1). Checkout-eligible users get
@@ -887,19 +885,27 @@ export function renderConsole(props: ConsoleProps): string {
     canCheckout && mockBillingEnabled
       ? ` <span class="muted" data-testid="mock-billing-note">&middot; test mode &mdash; no real charge</span>`
       : "";
-  // One Upgrade button per purchasable tier. `interval=monthly` is the default;
-  // the MOCK path applies the chosen tier directly, the REAL path resolves it to
-  // a Stripe Price (standard/plus today; entry/power land with PR-C's prices).
-  const tierButtons = PAID_TIERS.map((tier) => {
+  // One small form per purchasable tier: the tier's Upgrade button + a billing-
+  // interval select (monthly/quarterly/yearly; entry bills quarterly/yearly
+  // ONLY — Stripe's flat fee eats a $1 monthly charge, so no monthly option
+  // renders and the server refuses entry×monthly regardless). The MOCK path
+  // applies the chosen tier directly (interval ignored); the REAL path resolves
+  // (tier, interval) to a Stripe Price (billing.ts resolvePrice, full matrix).
+  const tierForms = PAID_TIERS.map((tier) => {
     const spec = PLAN_SPECS[tier];
-    return `<button class="linkbtn" type="submit" name="plan" value="${tier}">${esc(spec.label)} &mdash; ${esc(TIER_PRICE_LABEL[tier])}</button>`;
+    const intervals: readonly BillingInterval[] =
+      tier === "entry" ? ["quarterly", "yearly"] : ["monthly", "quarterly", "yearly"];
+    const options = intervals
+      .map((iv, i) => `<option value="${iv}"${i === 0 ? " selected" : ""}>${iv}</option>`)
+      .join("");
+    return `<form class="inline" method="post" action="${checkoutAction}" data-testid="upgrade-${tier}">
+         <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+         <input type="hidden" name="plan" value="${tier}">
+         <button class="linkbtn" type="submit">${esc(spec.label)} &mdash; ${esc(TIER_PRICE_LABEL[tier])}</button><select name="interval" aria-label="${esc(spec.label)} billing interval" style="font-size:.85em;padding:.1rem .15rem;margin-left:.2rem">${options}</select>
+       </form>`;
   }).join(`<span class="muted"> · </span>`);
   const upgradeHtml = showUpgrade
-    ? `<form class="inline" method="post" action="${checkoutAction}" data-testid="upgrade-billing" style="margin-left:.35rem">
-           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
-           <input type="hidden" name="interval" value="monthly">
-           <span style="opacity:.85">&middot; Pick a plan:</span> ${tierButtons}
-         </form>`
+    ? `<span data-testid="upgrade-billing" style="margin-left:.35rem"><span style="opacity:.85">&middot; Pick a plan:</span> ${tierForms}</span>`
     : "";
   const manageBillingHtml =
     isPaidTier(plan) && billingConfigured && hasBillingAccount

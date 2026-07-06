@@ -36,20 +36,35 @@ import {
   BILLING_SWEEP_CAP,
   DOWNGRADE_GRACE_PERIOD_MS,
   handleCheckoutSessionCompleted,
+  planForPrice,
   runBillingSweep,
 } from "../src/billing-lifecycle.ts";
-import { billingConfig } from "../src/billing-config.ts";
+import { billingConfig, priceFor } from "../src/billing-config.ts";
+import { STRIPE_MIN_TRIAL_END_MS } from "../src/billing.ts";
 import { getUserById, setUserPlan } from "../src/users.ts";
 import { CSRF, ISSUER, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 // --- the configured test environment -----------------------------------------
 
 const WEBHOOK_SECRET = "whsec_test_secret_aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-// These back the `standard` tier (planForPrice maps monthly/yearly → standard).
-// The env var NAMES are unchanged (billing-config.ts) even though the tier
-// they resolve to is no longer called "parachute".
+// The full 4-tier × interval Price matrix (billing-config.ts). PRICE_MONTHLY /
+// PRICE_YEARLY keep their old names — they back `standard`, the default tier.
 const PRICE_MONTHLY = "price_test_standard_monthly";
 const PRICE_YEARLY = "price_test_standard_yearly";
+/** The 11 STRIPE_PRICE_<TIER>_<INTERVAL> vars (entry has NO monthly). */
+const PRICE_VARS = {
+  STRIPE_PRICE_ENTRY_QUARTERLY: "price_test_entry_quarterly",
+  STRIPE_PRICE_ENTRY_YEARLY: "price_test_entry_yearly",
+  STRIPE_PRICE_STANDARD_MONTHLY: PRICE_MONTHLY,
+  STRIPE_PRICE_STANDARD_QUARTERLY: "price_test_standard_quarterly",
+  STRIPE_PRICE_STANDARD_YEARLY: PRICE_YEARLY,
+  STRIPE_PRICE_PLUS_MONTHLY: "price_test_plus_monthly",
+  STRIPE_PRICE_PLUS_QUARTERLY: "price_test_plus_quarterly",
+  STRIPE_PRICE_PLUS_YEARLY: "price_test_plus_yearly",
+  STRIPE_PRICE_POWER_MONTHLY: "price_test_power_monthly",
+  STRIPE_PRICE_POWER_QUARTERLY: "price_test_power_quarterly",
+  STRIPE_PRICE_POWER_YEARLY: "price_test_power_yearly",
+} as const;
 
 /** env + the full Stripe config — billing ACTIVE. Plain `env` = not configured. */
 const BILLING_ENV = {
@@ -58,8 +73,7 @@ const BILLING_ENV = {
   // reach the real network (fetchMock intercepts api.stripe.com).
   STRIPE_SECRET_KEY: "sk_test_dummy_for_constructor",
   STRIPE_WEBHOOK_SECRET: WEBHOOK_SECRET,
-  STRIPE_PRICE_PARACHUTE_MONTHLY: PRICE_MONTHLY,
-  STRIPE_PRICE_PARACHUTE_YEARLY: PRICE_YEARLY,
+  ...PRICE_VARS,
 };
 
 /**
@@ -260,11 +274,57 @@ async function seedPaidUser(
 // --- the degradation contract (what deploys today) ----------------------------
 
 describe("NOT CONFIGURED — the clean degradation (today's deploy)", () => {
-  test("billingConfig is null unless all four values are present", () => {
+  test("billingConfig is null without the secrets or ANY of the four anchor Prices", () => {
     expect(billingConfig(env)).toBeNull();
     expect(billingConfig(BILLING_ENV)).not.toBeNull();
+    expect(billingConfig({ ...BILLING_ENV, STRIPE_SECRET_KEY: undefined })).toBeNull();
     expect(billingConfig({ ...BILLING_ENV, STRIPE_WEBHOOK_SECRET: undefined })).toBeNull();
-    expect(billingConfig({ ...BILLING_ENV, STRIPE_PRICE_PARACHUTE_YEARLY: "" })).toBeNull();
+    // The anchors: standard/plus/power MONTHLY + entry QUARTERLY. Any missing
+    // → the whole feature degrades (503 + hidden console UI).
+    expect(billingConfig({ ...BILLING_ENV, STRIPE_PRICE_STANDARD_MONTHLY: "" })).toBeNull();
+    expect(billingConfig({ ...BILLING_ENV, STRIPE_PRICE_PLUS_MONTHLY: undefined })).toBeNull();
+    expect(billingConfig({ ...BILLING_ENV, STRIPE_PRICE_POWER_MONTHLY: undefined })).toBeNull();
+    expect(billingConfig({ ...BILLING_ENV, STRIPE_PRICE_ENTRY_QUARTERLY: undefined })).toBeNull();
+  });
+
+  test("a missing NON-anchor Price does NOT unconfigure billing — only that (tier, interval) goes unavailable", () => {
+    const partial = billingConfig({ ...BILLING_ENV, STRIPE_PRICE_POWER_YEARLY: undefined });
+    expect(partial).not.toBeNull();
+    expect(priceFor(partial!, "power", "yearly")).toBeNull(); // this one combo is off
+    expect(priceFor(partial!, "power", "monthly")).toBe("price_test_power_monthly");
+    expect(priceFor(partial!, "standard", "quarterly")).toBe("price_test_standard_quarterly");
+  });
+
+  test("priceFor resolves the FULL matrix — 11 combinations, and entry×monthly is null by construction", () => {
+    const config = billingConfig(BILLING_ENV)!;
+    expect(priceFor(config, "entry", "monthly")).toBeNull(); // no such Price exists
+    expect(priceFor(config, "entry", "quarterly")).toBe("price_test_entry_quarterly");
+    expect(priceFor(config, "entry", "yearly")).toBe("price_test_entry_yearly");
+    expect(priceFor(config, "standard", "monthly")).toBe(PRICE_MONTHLY);
+    expect(priceFor(config, "standard", "quarterly")).toBe("price_test_standard_quarterly");
+    expect(priceFor(config, "standard", "yearly")).toBe(PRICE_YEARLY);
+    expect(priceFor(config, "plus", "monthly")).toBe("price_test_plus_monthly");
+    expect(priceFor(config, "plus", "quarterly")).toBe("price_test_plus_quarterly");
+    expect(priceFor(config, "plus", "yearly")).toBe("price_test_plus_yearly");
+    expect(priceFor(config, "power", "monthly")).toBe("price_test_power_monthly");
+    expect(priceFor(config, "power", "quarterly")).toBe("price_test_power_quarterly");
+    expect(priceFor(config, "power", "yearly")).toBe("price_test_power_yearly");
+  });
+
+  test("planForPrice maps ALL 11 Prices back to their tier (the webhook side of the matrix)", () => {
+    const config = billingConfig(BILLING_ENV)!;
+    expect(planForPrice("price_test_entry_quarterly", config)).toBe("entry");
+    expect(planForPrice("price_test_entry_yearly", config)).toBe("entry");
+    expect(planForPrice(PRICE_MONTHLY, config)).toBe("standard");
+    expect(planForPrice("price_test_standard_quarterly", config)).toBe("standard");
+    expect(planForPrice(PRICE_YEARLY, config)).toBe("standard");
+    expect(planForPrice("price_test_plus_monthly", config)).toBe("plus");
+    expect(planForPrice("price_test_plus_quarterly", config)).toBe("plus");
+    expect(planForPrice("price_test_plus_yearly", config)).toBe("plus");
+    expect(planForPrice("price_test_power_monthly", config)).toBe("power");
+    expect(planForPrice("price_test_power_quarterly", config)).toBe("power");
+    expect(planForPrice("price_test_power_yearly", config)).toBe("power");
+    expect(planForPrice("price_someone_elses", config)).toBeNull();
   });
 
   test.each(["/billing/checkout", "/billing/portal", "/billing/webhook"])(
@@ -299,15 +359,14 @@ describe("NOT CONFIGURED — the clean degradation (today's deploy)", () => {
 // --- console rendering, configured ---------------------------------------------
 
 describe("console billing doors (configured)", () => {
-  test("trial user: one Upgrade button per purchasable tier POSTs /billing/checkout; no teaser", async () => {
+  test("trial user: one Upgrade form per purchasable tier (with interval choice) POSTs /billing/checkout; no teaser", async () => {
     const { id } = await seedUser("upgradeui@example.com"); // seedUser → trial
     await seedVault("upgradeui-box", id);
     const html = await consoleHtml(await seedSession(id), BILLING_ENV);
     expect(html).toContain('data-testid="upgrade-billing"');
     expect(html).toContain('action="/billing/checkout"');
-    expect(html).toContain('name="interval" value="monthly"');
-    // One button per purchasable tier (entry/standard/plus/power), each its
-    // own TIER_PRICE_LABEL — the ladder replaces the old monthly/yearly toggle.
+    // One form per purchasable tier (entry/standard/plus/power), each its
+    // own TIER_PRICE_LABEL + an interval select feeding `interval`.
     expect(html).toContain('name="plan" value="entry"');
     expect(html).toContain('name="plan" value="standard"');
     expect(html).toContain('name="plan" value="plus"');
@@ -316,6 +375,16 @@ describe("console billing doors (configured)", () => {
     expect(html).toContain("$3/mo");
     expect(html).toContain("$5/mo");
     expect(html).toContain("$10/mo");
+    // The interval choice: monthly/quarterly/yearly selects, monthly default.
+    expect(html).toContain('<select name="interval"');
+    expect(html).toContain('<option value="monthly" selected>');
+    expect(html).toContain('<option value="quarterly"');
+    expect(html).toContain('<option value="yearly"');
+    // ENTRY shows quarterly/yearly ONLY (no monthly Price exists): its form
+    // defaults to quarterly, and exactly three of the four selects offer monthly.
+    expect(html).toContain('<option value="quarterly" selected>');
+    expect(html.match(/<option value="monthly"/g)).toHaveLength(3);
+    expect(html.match(/<select name="interval"/g)).toHaveLength(4);
     // The teaser is the UNCONFIGURED state only — billing IS configured here.
     expect(html).not.toContain("keep writing after your trial");
     expect(html).not.toContain('data-testid="manage-billing"');
@@ -409,7 +478,12 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
     expect(params.get("cancel_url")).toBe(`${ISSUER}/console?checkout_canceled=1`);
     expect(params.get("automatic_tax[enabled]")).toBe("true"); // Stripe Tax
     expect(params.get("subscription_data[metadata][user_id]")).toBe(id);
+    expect(params.get("subscription_data[metadata][plan]")).toBe("standard"); // the updated-webhook fallback tag
     expect(params.get("metadata[plan]")).toBe("standard");
+    // A fresh trial (clock ~30d out) converts card-on-file: trial_end rides
+    // the subscription so billing starts when the free 30 days end.
+    const user = (await getUserById(env.DB, id))!;
+    expect(params.get("subscription_data[trial_end]")).toBe(String(Math.floor(Date.parse(user.planDowngradeAt!) / 1000)));
   });
 
   test("yearly button → the yearly env price", async () => {
@@ -425,22 +499,30 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
     expect(new URLSearchParams(raw).get("line_items[0][price]")).toBe(PRICE_YEARLY);
   });
 
-  test("the plus tier resolves to the voice-monthly price (monthly-only in PR-A)", async () => {
-    const { id } = await seedUser("checkout-plus@example.com");
-    const sessionId = await seedSession(id);
-    let raw = "";
-    interceptCheckoutCreate((b) => (raw = b));
-    const res = await app.fetch(
-      post("/billing/checkout", { __csrf: CSRF, interval: "monthly", plan: "plus" }, sessionCookie(sessionId)),
-      { ...BILLING_ENV, STRIPE_PRICE_VOICE_MONTHLY: "price_test_plus_monthly" },
-    );
-    expect(res.status).toBe(302);
-    const params = new URLSearchParams(raw);
-    expect(params.get("line_items[0][price]")).toBe("price_test_plus_monthly");
-    expect(params.get("metadata[plan]")).toBe("plus");
+  test("the full matrix drives checkout: plus×monthly, power×quarterly, entry×yearly each resolve their own Price", async () => {
+    const cases: Array<{ plan: string; interval: string; price: string }> = [
+      { plan: "plus", interval: "monthly", price: "price_test_plus_monthly" },
+      { plan: "power", interval: "quarterly", price: "price_test_power_quarterly" },
+      { plan: "entry", interval: "yearly", price: "price_test_entry_yearly" },
+    ];
+    for (const [i, c] of cases.entries()) {
+      const { id } = await seedUser(`checkout-matrix-${i}@example.com`);
+      const sessionId = await seedSession(id);
+      let raw = "";
+      interceptCheckoutCreate((b) => (raw = b));
+      const res = await app.fetch(
+        post("/billing/checkout", { __csrf: CSRF, interval: c.interval, plan: c.plan }, sessionCookie(sessionId)),
+        BILLING_ENV,
+      );
+      expect(res.status).toBe(302);
+      const params = new URLSearchParams(raw);
+      expect(params.get("line_items[0][price]")).toBe(c.price);
+      expect(params.get("metadata[plan]")).toBe(c.plan);
+      expect(params.get("subscription_data[metadata][plan]")).toBe(c.plan);
+    }
   });
 
-  test("entry/power have no configured Price yet → billing_err=invalid, no session minted", async () => {
+  test("entry has NO monthly → billing_err=invalid, no session minted", async () => {
     const { id } = await seedUser("checkout-entry@example.com");
     const sessionId = await seedSession(id);
     // NO /v1/checkout/sessions interceptor: a session mint here would hit the
@@ -451,6 +533,78 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
     );
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/console?billing_err=invalid");
+  });
+
+  test("a (tier, interval) whose Price var is unset → billing_err=invalid; billing overall stays up", async () => {
+    const { id } = await seedUser("checkout-hole@example.com");
+    const sessionId = await seedSession(id);
+    const holeEnv = { ...BILLING_ENV, STRIPE_PRICE_POWER_YEARLY: undefined };
+    const res = await app.fetch(
+      post("/billing/checkout", { __csrf: CSRF, interval: "yearly", plan: "power" }, sessionCookie(sessionId)),
+      holeEnv,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?billing_err=invalid"); // NOT a 503
+  });
+
+  // --- trial-aware checkout (card-on-file conversion) -----------------------
+
+  test("TRIAL_END forwarding: a trial with ≥48h runway checks out with subscription_data[trial_end] = its plan_downgrade_at", async () => {
+    const { id } = await seedUser("trial-end-fwd@example.com"); // trial, clock ~30d out
+    const downgradeAt = new Date(Date.now() + 10 * 86_400_000); // 10 days runway
+    await env.DB.prepare("UPDATE users SET plan_downgrade_at = ? WHERE id = ?")
+      .bind(downgradeAt.toISOString(), id)
+      .run();
+    const sessionId = await seedSession(id);
+    let raw = "";
+    interceptCheckoutCreate((b) => (raw = b));
+    const res = await app.fetch(
+      post("/billing/checkout", { __csrf: CSRF, interval: "yearly", plan: "power" }, sessionCookie(sessionId)),
+      BILLING_ENV,
+    );
+    expect(res.status).toBe(302);
+    const params = new URLSearchParams(raw);
+    expect(params.get("subscription_data[trial_end]")).toBe(String(Math.floor(downgradeAt.getTime() / 1000)));
+    // The rest of the session is unchanged by the trial awareness.
+    expect(params.get("line_items[0][price]")).toBe("price_test_power_yearly");
+    expect(params.get("mode")).toBe("subscription");
+  });
+
+  test("TRIAL_END omitted under Stripe's 48h minimum: <48h runway bills immediately", async () => {
+    const { id } = await seedUser("trial-end-short@example.com");
+    // 1 hour of trial left — under STRIPE_MIN_TRIAL_END_MS (Stripe refuses
+    // trial_end closer than 48h out).
+    expect(STRIPE_MIN_TRIAL_END_MS).toBe(48 * 60 * 60 * 1000);
+    await env.DB.prepare("UPDATE users SET plan_downgrade_at = ? WHERE id = ?")
+      .bind(new Date(Date.now() + 60 * 60 * 1000).toISOString(), id)
+      .run();
+    const sessionId = await seedSession(id);
+    let raw = "";
+    interceptCheckoutCreate((b) => (raw = b));
+    const res = await app.fetch(
+      post("/billing/checkout", { __csrf: CSRF, interval: "monthly" }, sessionCookie(sessionId)),
+      BILLING_ENV,
+    );
+    expect(res.status).toBe(302);
+    expect(new URLSearchParams(raw).get("subscription_data[trial_end]")).toBeNull();
+  });
+
+  test("TRIAL_END never rides an EXPIRED user's checkout (no runway to honor)", async () => {
+    const { id } = await seedUser("trial-end-expired@example.com");
+    await env.DB.prepare(
+      "UPDATE users SET plan = 'expired', pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+    const sessionId = await seedSession(id);
+    let raw = "";
+    interceptCheckoutCreate((b) => (raw = b));
+    const res = await app.fetch(
+      post("/billing/checkout", { __csrf: CSRF, interval: "monthly" }, sessionCookie(sessionId)),
+      BILLING_ENV,
+    );
+    expect(res.status).toBe(302);
+    expect(new URLSearchParams(raw).get("subscription_data[trial_end]")).toBeNull();
   });
 
   test("re-subscribe: an existing Stripe customer is REUSED (customer + address auto, no customer_email)", async () => {
@@ -679,6 +833,31 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
     // standard carries voice (60 min) — unlike the old "parachute" plan, the
     // new ladder's paid tiers all include voice; only entry is notes-only.
     expect(JSON.parse(pushed)).toEqual(planEntitlement("standard"));
+  });
+
+  test("TRIAL CONVERSION lands IMMEDIATELY at session completion: metadata.plan routes the tier, the pair clears, the tier's caps push (while the Stripe-trial still runs)", async () => {
+    // The card-on-file flow: checkout.session.completed fires when the card is
+    // entered — the Stripe subscription is still TRIALING (trial_end = day 30)
+    // but the plan + entitlements flip NOW. They picked a plan; the sub exists.
+    const { id } = await seedUser("trial-convert@example.com"); // trial, clock armed
+    await seedVault("trial-convert-box", id);
+    let pushed = "";
+    interceptCapPush("trial-convert-box", (b) => (pushed = b));
+
+    const res = await postWebhook(
+      makeEventPayload("checkout.session.completed", {
+        ...checkoutCompletedObject({ userId: id, customer: "cus_tc_1", subscription: "sub_tc_1" }),
+        metadata: { plan: "entry" },
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { action: string }).action).toBe("checkout_completed_upgraded");
+
+    const user = (await getUserById(env.DB, id))!;
+    expect(user.plan).toBe("entry"); // immediately — not at trial_end
+    expect(user.pendingPlan).toBeNull(); // the day-30 sweep can't revert the conversion
+    expect(user.planDowngradeAt).toBeNull();
+    expect(JSON.parse(pushed)).toEqual(planEntitlement("entry")); // the PICKED tier's entitlement
   });
 
   test("an upgrade CLEARS a pending downgrade (re-subscribe during grace)", async () => {
@@ -1031,6 +1210,12 @@ describe("customer.subscription.deleted — the deferred downgrade", () => {
 });
 
 describe("customer.subscription.updated — cancels, un-cancels, plan syncs", () => {
+  beforeAll(() => {
+    // The portal-upgrade test's cap push rides global fetch (fetchMock).
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
   test("cancel_at_period_end → pending_plan='expired' (informational; deleted stamps the time)", async () => {
     const { id } = await seedPaidUser("upd1@example.com", { subscription: "sub_upd_1" });
     const res = await postWebhook(
@@ -1090,6 +1275,72 @@ describe("customer.subscription.updated — cancels, un-cancels, plan syncs", ()
     const user = (await getUserById(env.DB, id))!;
     expect(user.plan).toBe("standard");
     expect(user.pendingPlan).toBeNull();
+  });
+
+  test("PORTAL upgrade (price change on the sub): standard→power applies power + pushes power's entitlement", async () => {
+    const { id } = await seedPaidUser("upd-portal@example.com", { subscription: "sub_upd_portal" });
+    await seedVault("upd-portal-box", id);
+    let pushed = "";
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({
+        path: "/vault/upd-portal-box/api/internal/config",
+        method: "PUT",
+        body: (raw: string) => {
+          pushed = raw;
+          return true;
+        },
+      })
+      .reply(200, { ok: true }, { headers: { "content-type": "application/json" } });
+
+    const res = await postWebhook(
+      makeEventPayload(
+        "customer.subscription.updated",
+        subscriptionObject({ id: "sub_upd_portal", priceId: "price_test_power_monthly" }),
+      ),
+    );
+    expect(((await res.json()) as { action: string }).action).toBe("subscription_updated_plan_applied");
+    const user = (await getUserById(env.DB, id))!;
+    expect(user.plan).toBe("power");
+    expect(JSON.parse(pushed)).toEqual(planEntitlement("power"));
+    fetchMock.assertNoPendingInterceptors();
+  });
+
+  test("PORTAL downgrade: plus→entry (a quarterly Price) applies entry", async () => {
+    const { id } = await seedPaidUser("upd-down@example.com", { subscription: "sub_upd_down" });
+    await setUserPlan(env.DB, id, "plus");
+    const res = await postWebhook(
+      makeEventPayload(
+        "customer.subscription.updated",
+        subscriptionObject({ id: "sub_upd_down", priceId: "price_test_entry_quarterly" }),
+      ),
+    );
+    expect(((await res.json()) as { action: string }).action).toBe("subscription_updated_plan_applied");
+    expect((await getUserById(env.DB, id))!.plan).toBe("entry");
+  });
+
+  test("unknown price falls back to the subscription's metadata.plan tag (stamped at checkout)", async () => {
+    const { id } = await seedPaidUser("upd-meta@example.com", { subscription: "sub_upd_meta" });
+    const res = await postWebhook(
+      makeEventPayload("customer.subscription.updated", {
+        ...subscriptionObject({ id: "sub_upd_meta", priceId: "price_rotated_out" }),
+        metadata: { plan: "plus" },
+      }),
+    );
+    expect(((await res.json()) as { action: string }).action).toBe("subscription_updated_plan_applied");
+    expect((await getUserById(env.DB, id))!.plan).toBe("plus");
+  });
+
+  test("unknown price + a NON-tier metadata tag still no-ops (never applies trial/expired/garbage)", async () => {
+    const { id } = await seedPaidUser("upd-metabad@example.com", { subscription: "sub_upd_metabad" });
+    const res = await postWebhook(
+      makeEventPayload("customer.subscription.updated", {
+        ...subscriptionObject({ id: "sub_upd_metabad", priceId: "price_rotated_out" }),
+        metadata: { plan: "trial" },
+      }),
+    );
+    expect(((await res.json()) as { action: string }).action).toBe("subscription_updated_unknown_price");
+    expect((await getUserById(env.DB, id))!.plan).toBe("standard");
   });
 });
 

@@ -60,7 +60,15 @@ import {
   listVaultsForOwner,
   userOwnsVault,
 } from "./vaults.ts";
-import { PLAN_SPECS, canStartCheckout, isPaidTier, planEntitlement, restoreAtCapMessage, vaultCapMessage } from "./plans.ts";
+import {
+  PLAN_SPECS,
+  canStartCheckout,
+  entitlementPlanFor,
+  isPaidTier,
+  planEntitlement,
+  restoreAtCapMessage,
+  vaultCapMessage,
+} from "./plans.ts";
 import { callVaultApi, pushVaultCap } from "./vault-call.ts";
 import {
   callVaultRestore,
@@ -292,7 +300,6 @@ async function renderConsoleFor(
       // only while billing is configured (billing-config.ts; unconfigured =
       // today's deploy = the teaser stays and no billing UI exists).
       billingConfigured: deps.billingConfigured === true,
-      voiceBillingConfigured: deps.voiceBillingConfigured === true,
       // Interim MOCK path (mock-payments): non-prod + no real Stripe (or the
       // explicit MOCK_BILLING flag). Upgrade buttons then POST the mock
       // endpoint + a "test mode" label; ALWAYS false in production.
@@ -406,10 +413,12 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   try {
     const vault = await createVault(db, rawName, user.id, deps.now?.() ?? new Date());
     // Push the plan's storage cap + voice entitlement into the new vault's DO
-    // config (the internal seam — vault-call.ts). Best-effort by the same
-    // contract as the first note: a hiccup leaves the DO on the (more generous)
-    // env default, never fails creation; applyPlanToVaults / the backfill reconcile.
-    await pushVaultCap(db, deps, user.id, vault.name, planEntitlement(user.plan));
+    // config (the internal seam — vault-call.ts). A TRIAL pushes the CHOSEN
+    // tier's spec when pending_plan names one (plans.ts entitlementPlanFor).
+    // Best-effort by the same contract as the first note: a hiccup leaves the
+    // DO on the (more generous) env default, never fails creation;
+    // applyPlanToVaults / the backfill reconcile.
+    await pushVaultCap(db, deps, user.id, vault.name, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan)));
     // (a) research answer → user row. Allowlisted inside; unknown values no-op.
     if (notesApp) await setNotesApp(db, user.id, notesApp);
     // (b) their first note → INTO the new vault, verbatim. Best-effort by
@@ -605,8 +614,9 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
       throw err;
     }
     // Same best-effort entitlement push as any vault creation (a miss leaves the
-    // vault on its prior caps; applyPlanToVaults reconciles).
-    await pushVaultCap(db, deps, user.id, targetName, planEntitlement(user.plan));
+    // vault on its prior caps; applyPlanToVaults reconciles). Trial mirrors the
+    // chosen tier (entitlementPlanFor), same as the create path.
+    await pushVaultCap(db, deps, user.id, targetName, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan)));
   }
 
   try {

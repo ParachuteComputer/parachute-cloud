@@ -32,13 +32,16 @@ import { CSRF, ISSUER, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 /** Non-prod, no Stripe → mock AUTO-ON (staging's real state). Plain `env`. */
 const MOCK_ENV = env;
-/** Non-prod, full Stripe config → mock OFF, the real Checkout path wins. */
+/** Non-prod, full Stripe config (the two secrets + the four ANCHOR Prices —
+ *  billing-config.ts) → mock OFF, the real Checkout path wins. */
 const CONFIGURED_ENV = {
   ...env,
   STRIPE_SECRET_KEY: "sk_test_dummy_for_constructor",
   STRIPE_WEBHOOK_SECRET: "whsec_test_secret_aaaaaaaaaaaaaaaaaaaa",
-  STRIPE_PRICE_PARACHUTE_MONTHLY: "price_mock_test_monthly",
-  STRIPE_PRICE_PARACHUTE_YEARLY: "price_mock_test_yearly",
+  STRIPE_PRICE_ENTRY_QUARTERLY: "price_mock_test_entry_quarterly",
+  STRIPE_PRICE_STANDARD_MONTHLY: "price_mock_test_standard_monthly",
+  STRIPE_PRICE_PLUS_MONTHLY: "price_mock_test_plus_monthly",
+  STRIPE_PRICE_POWER_MONTHLY: "price_mock_test_power_monthly",
 };
 /** Non-prod, configured, but MOCK_BILLING=1 → the flag forces mock ON. */
 const MOCK_FLAG_CONFIGURED = { ...CONFIGURED_ENV, MOCK_BILLING: "1" };

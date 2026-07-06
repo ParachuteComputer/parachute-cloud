@@ -42,10 +42,10 @@
  */
 import type Stripe from "stripe";
 import type { OAuthDeps } from "./oauth-shared.ts";
-import { type PlanId, coercePlanId, isPaidTier } from "./plans.ts";
+import { PAID_TIERS, type PaidTier, type PlanId, coercePlanId, isPaidTier } from "./plans.ts";
 import { getUserById, getUserByStripeCustomerId, getUserByStripeSubscriptionId, setUserPlan } from "./users.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
-import type { BillingConfig } from "./billing-config.ts";
+import { BILLING_INTERVALS, type BillingConfig } from "./billing-config.ts";
 
 export interface LifecycleResult {
   ok: true;
@@ -354,12 +354,18 @@ export async function handleSubscriptionDeleted(
   return { ok: true, userId: user.id, action: "subscription_deleted_downgrade_scheduled" };
 }
 
-/** Map a Stripe Price id to the tier it buys (env-configured, never hardcoded).
- *  PR-A's anchor prices: the monthly/yearly Prices back `standard`, the additive
- *  voice-monthly Price backs `plus`. PR-C expands this to the full per-tier map. */
-export function planForPrice(priceId: string, config: BillingConfig): PlanId | null {
-  if (priceId === config.priceMonthly || priceId === config.priceYearly) return "standard";
-  if (config.priceVoiceMonthly && priceId === config.priceVoiceMonthly) return "plus";
+/** Map a Stripe Price id to the tier it buys (env-configured, never
+ *  hardcoded) — the full 4-tier × interval matrix: ANY of a tier's configured
+ *  Prices (monthly/quarterly/yearly) resolves to that tier, so a Customer
+ *  Portal upgrade/downgrade landing as `customer.subscription.updated` with a
+ *  price change applies the right plan. Unknown price → null (the caller
+ *  falls back to subscription metadata, then no-ops). */
+export function planForPrice(priceId: string, config: BillingConfig): PaidTier | null {
+  for (const tier of PAID_TIERS) {
+    for (const interval of BILLING_INTERVALS) {
+      if (config.prices[tier][interval] === priceId) return tier;
+    }
+  }
   return null;
 }
 
@@ -393,7 +399,12 @@ export async function handleSubscriptionUpdated(
   const priceId = subscription.items?.data?.[0]?.price?.id;
   if (!priceId) return { ok: true, userId: user.id, action: "subscription_updated_no_price" };
 
-  const newPlan = planForPrice(priceId, config);
+  // Price → tier through the configured matrix; when the price isn't ours
+  // (e.g. a Price rotated out of the env vars), fall back to the `plan` tag
+  // checkout stamped into subscription metadata (billing.ts) — the same tag
+  // checkout.session.completed trusts. Both missing → no-op + telemetry.
+  const metaTier = coercePlanId(subscription.metadata?.plan);
+  const newPlan = planForPrice(priceId, config) ?? (isPaidTier(metaTier) ? metaTier : null);
   if (!newPlan) return { ok: true, userId: user.id, action: "subscription_updated_unknown_price" };
 
   if (newPlan !== user.plan) {
@@ -430,6 +441,7 @@ export interface BillingSweepSummary {
 
 interface DueRow {
   id: string;
+  plan: string;
   pending_plan: string | null;
 }
 
@@ -443,7 +455,7 @@ interface DueRow {
 export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date): Promise<BillingSweepSummary> {
   const res = await db
     .prepare(
-      `SELECT id, pending_plan FROM users
+      `SELECT id, plan, pending_plan FROM users
        WHERE pending_plan IS NOT NULL AND plan_downgrade_at IS NOT NULL AND plan_downgrade_at <= ?
        ORDER BY plan_downgrade_at ASC LIMIT ?`,
     )
@@ -453,7 +465,15 @@ export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date
   let applied = 0;
   for (const row of dueRows) {
     try {
-      const plan = coercePlanId(row.pending_plan);
+      const pending = coercePlanId(row.pending_plan);
+      // TRIAL FLOOR GUARD: the sweep applies DOWNGRADES — a due, card-less
+      // trial always lands on the expired floor. A trial's pending_plan is
+      // 'expired' from signup, but the tier-picker path may stamp the CHOSEN
+      // paid tier there for entitlement mirroring (plans.ts
+      // entitlementPlanFor); a real conversion clears the pair via
+      // checkout.session.completed long before the sweep sees it, so applying
+      // a paid pending tier here would be a FREE upgrade at day 30 — floor it.
+      const plan: PlanId = coercePlanId(row.plan) === "trial" && isPaidTier(pending) ? "expired" : pending;
       await setUserPlan(db, row.id, plan);
       await db.prepare("UPDATE users SET pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?").bind(row.id).run();
       const results = await applyPlanToVaults(db, deps, row.id);
