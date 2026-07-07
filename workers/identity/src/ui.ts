@@ -694,6 +694,11 @@ function vaultCard(v: ConsoleVaultCard, csrfToken: string, planCapBytes: number)
   // (v1: each vault's cap IS the plan total — plans.ts). No row yet (fresh
   // vault, or the nightly rollup hasn't reached it) → the honest "within a
   // day" line, never a made-up zero.
+  // TODO(console-launch): the denominator here is planTotalBytes (notes +
+  // attachment budgets SUMMED into one number), but storage is now a POOLED
+  // TOTAL shared across all vaults AND a two-meter split — "of <total>" per card
+  // double-counts the shared budget and hides the notes-vs-attachment split.
+  // Show the pooled remaining, or the two meters, instead of a summed per-vault cap.
   const usageLine = v.usage
     ? `Using ${formatUsageBytes(v.usage.usedBytes)} of ${formatPlanBytes(planCapBytes)}`
     : "Usage appears within a day.";
@@ -709,6 +714,9 @@ function vaultCard(v: ConsoleVaultCard, csrfToken: string, planCapBytes: number)
       ${connectAiContent(v)}
     </details>
     <details>
+      ${/* TODO(console-launch): "Building a surface?" / "surface (UI)" is insider
+           jargon a fresh cloud user won't parse — reword to plain "Build a custom
+           app over your vault" language (or gate behind a friendlier framing). */ ""}
       <summary>Building a surface?</summary>
       <p class="muted" style="margin:.2rem 0 0">Seed this vault with the <strong>Surface Starter</strong> guide — a living note that walks your connected AI through building a custom surface (UI) over the vault. It's not seeded by default; adding it again is harmless.</p>
       <form method="post" action="/console/packs">
@@ -915,8 +923,8 @@ function renderPlanCards(opts: {
     return `<select name="interval" aria-label="${esc(PLAN_SPECS[tier].label)} billing interval" style="font-size:.85em;padding:.15rem .2rem">${options}</select>`;
   };
 
-  // The Stripe-gated checkout form for one tier — trial's "Add a card" and
-  // expired's "Choose this plan" reuse it (same POST, different button label).
+  // The Stripe-gated checkout form for one tier — trial and expired both reuse
+  // it with the same "Subscribe" label (same POST /billing checkout endpoint).
   const checkoutForm = (tier: PaidTier, label: string): string =>
     `<form class="inline" method="post" action="${checkoutAction}" data-testid="upgrade-${tier}" style="display:flex;gap:.3rem;align-items:center;margin-top:.5rem">
        <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -931,19 +939,26 @@ function renderPlanCards(opts: {
       isCurrent && trial
         ? `<div data-testid="current-tier-${tier}" style="font-size:.72rem;color:var(--sage-dark);font-weight:600;margin-top:.15rem">${trial.isDefault ? "Default while you decide" : "You're trying this"}</div>`
         : "";
-    // The FREE "Choose this plan" affordance — TRIAL ONLY. An expired user gets
-    // no /console/plan form at all (their affordance is the checkout below).
+    // The FREE "try this free" affordance — TRIAL ONLY. An expired user gets no
+    // /console/plan form at all (their affordance is the checkout below). The
+    // current tier renders a disabled "You're trying this"; every other tier a
+    // live "Try this free" + a tiny "free during your trial" hint.
     const chooseFree = isTrial
       ? `<form class="inline" method="post" action="/console/plan" data-testid="choose-${tier}" style="margin-top:.5rem">
            <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
            <input type="hidden" name="plan" value="${tier}">
-           <button class="linkbtn" type="submit">${isCurrent ? "Keep this plan" : "Choose this plan"}</button>
+           ${
+             isCurrent
+               ? `<button class="linkbtn" type="submit" disabled style="opacity:.7;cursor:default">You're trying this</button>`
+               : `<button class="linkbtn" type="submit">Try this free</button>
+              <span class="muted" style="display:block;font-size:.72rem;margin-top:.1rem">free during your trial</span>`
+           }
          </form>`
       : "";
-    // The Stripe affordance (only when billing is available): trial = "Add a
-    // card" (subscribe now / convert the trial), expired = "Choose this plan"
-    // (pay to reactivate). Absent → the section-level calm line stands in.
-    const paidAffordance = checkoutAvailable ? checkoutForm(tier, isTrial ? "Add a card" : "Choose this plan") : "";
+    // The Stripe affordance (only when billing is available): "Subscribe" in BOTH
+    // the trial (convert / start paying now) and expired (pay to reactivate)
+    // cases. Absent → the section-level calm line stands in.
+    const paidAffordance = checkoutAvailable ? checkoutForm(tier, "Subscribe") : "";
     return `<div class="card" data-testid="plan-card-${tier}" style="flex:1 1 12rem;min-width:11rem;margin:0;padding:1rem">
          <div style="display:flex;justify-content:space-between;align-items:baseline;gap:.5rem">
            <strong>${esc(spec.label)}</strong><span class="muted">${esc(TIER_PRICE_LABEL[tier])}</span>
@@ -968,6 +983,7 @@ function renderPlanCards(opts: {
   const billingWrap = checkoutAvailable ? ` data-testid="upgrade-billing"` : "";
   return `<section id="plans" data-testid="plans"${billingWrap} style="margin:0 0 1.1rem">
        <h2 style="margin:0 0 .4rem;font-size:1rem">Plans${mockNote}</h2>
+       <p class="muted" data-testid="plans-storage-note" style="margin:0 0 .6rem;font-size:.82rem">Storage is a shared total across all your vaults — use it for one big vault or several.</p>
        <div style="display:flex;flex-wrap:wrap;gap:.7rem">${cards}</div>
        ${noCardLine}
      </section>`;
@@ -1075,11 +1091,16 @@ export function renderConsole(props: ConsoleProps): string {
      ${promoHtml}`;
 
   if (vaults.length === 0) {
+    // The hero stays the primary top action (name + create the first vault); the
+    // plan cards sit BELOW it so a fresh user can actually pick a tier and the
+    // header's trial banner "Change plan" / #plans anchor resolves — before this
+    // the zero-vault screen linked to a #plans that never rendered (FIX 1).
     return page(
       "Console — Parachute",
       `${header("Name your vault")}
        ${notice ? `<div class="notice">${esc(notice)}</div>` : ""}
-       ${firstRunHero(csrfToken, firstRun ?? {}, error)}`,
+       ${firstRunHero(csrfToken, firstRun ?? {}, error)}
+       ${plansSectionHtml}`,
     );
   }
 
@@ -1113,14 +1134,17 @@ export function renderConsole(props: ConsoleProps): string {
          <button class="linkbtn" type="submit" style="color:var(--muted)" data-testid="show-setup-guide">Show setup guide</button>
        </form></div>`
     : "";
+  // Product above the upsell (FIX 4): a user who just made their first vault sees
+  // getting-started + their vault(s) + the create/at-cap door FIRST, then the
+  // plan cards — pricing sits below the thing they came here to use.
   return page(
     "Console — Parachute",
     `${header("Your vaults")}
      ${notice ? `<div class="notice">${esc(notice)}</div>` : ""}
-     ${plansSectionHtml}
      ${checklist ? checklistCard(checklist, csrfToken) : ""}
      ${list}
      ${createCard}
+     ${plansSectionHtml}
      ${restoreFoot}
      ${consoleScript(csrfToken)}`,
   );

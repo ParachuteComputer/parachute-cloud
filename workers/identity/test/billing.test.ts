@@ -384,7 +384,7 @@ describe("NOT CONFIGURED — the clean degradation (today's deploy)", () => {
     },
   );
 
-  test("PRODUCTION, no keys: a trial user STILL sees the 4 plan cards + the free 'Choose this plan' path; no Stripe/mock checkout button (the regression fix)", async () => {
+  test("PRODUCTION, no keys: a trial user STILL sees the 4 plan cards + the free 'Try this free' path; no Stripe/mock checkout button (the regression fix)", async () => {
     const { id } = await seedUser("noconfig@example.com"); // seedUser → trial
     await seedVault("noconfig-box", id);
     const html = await consoleHtml(await seedSession(id), PROD_UNCONFIGURED_ENV);
@@ -395,9 +395,18 @@ describe("NOT CONFIGURED — the clean degradation (today's deploy)", () => {
     expect(html).toContain('data-testid="plan-card-power"');
     expect(html).toContain("$1/mo");
     expect(html).toContain("$10/mo");
+    // The pooled-storage clarifier sits under the Plans heading.
+    expect(html).toContain('data-testid="plans-storage-note"');
+    expect(html).toContain("shared total across all your vaults");
     // Picking a tier needs NO card — the free /console/plan affordance is present.
     expect(html).toContain('action="/console/plan"');
     expect(html).toContain('data-testid="choose-plus"');
+    // The free-tier CTA reads "Try this free" (non-current tiers) with the
+    // "free during your trial" hint; the current (default Plus) tier's button is
+    // the disabled "You're trying this".
+    expect(html).toContain("Try this free");
+    expect(html).toContain("free during your trial");
+    expect(html).toContain("You're trying this");
     // The calm no-card line stands in for the (absent) checkout button.
     expect(html).toContain('data-testid="no-card-line"');
     expect(html).toContain("no card needed");
@@ -460,6 +469,8 @@ describe("console billing doors (configured)", () => {
     const html = await consoleHtml(await seedSession(id), BILLING_ENV);
     expect(html).toContain('data-testid="upgrade-billing"');
     expect(html).toContain('action="/billing/checkout"');
+    // The paid CTA reads "Subscribe" (both trial + expired share it now).
+    expect(html).toContain("Subscribe");
     // One form per purchasable tier (entry/standard/plus/power), each its
     // own TIER_PRICE_LABEL + an interval select feeding `interval`.
     expect(html).toContain('name="plan" value="entry"');

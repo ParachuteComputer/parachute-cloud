@@ -539,6 +539,10 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   // own — reads, tokens, everything — but can't create more until under the
   // cap. Benign TOCTOU: two concurrent creates can both pass the count — a
   // one-vault overshoot, reconciled by the same rule on the next attempt.
+  // TODO(console-launch): the expired+zero-vault create trap — an expired user
+  // with no vaults has vault_count=0, so 0 >= 0 always refuses here with the
+  // at-cap message even though they've never made a vault. Give them a distinct
+  // "pick a plan to create your first vault" path instead of the cap wall.
   const spec = PLAN_SPECS[user.plan];
   if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
     return consoleError(db, req, deps, user, vaultCapMessage(user.plan), firstRun);
