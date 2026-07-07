@@ -5,12 +5,11 @@
  *
  *  1. The `welcome` pack — the five-guide welcome ring (Welcome to your vault,
  *     Capture anything, Tags and the graph, Connect your AI, Yours to keep;
- *     the guides-ring rewrite, vault#544) + the `capture` / `guide` / `pinned`
+ *     the guides-ring rewrite, vault#544) + the `capture` / `guide`
  *     tags. `capture` is the sacred raw-input tag Notes' schema audit requires
  *     (ONE tag since vault#528; entry method lives in note metadata.source);
- *     `guide` is the skill-file tag (no schema — guides are AI-first + human-
- *     readable markdown); `pinned` sits Welcome at the top of the Notes app. The
- *     five guides are ordinary notes tagged `#guide` (Welcome also `#pinned`),
+ *     `guide` is the skill-file tag (no schema — guides are for you and your AI
+ *     alike, plain markdown). The five guides are ordinary notes tagged `#guide`,
  *     forming a small linked web (Welcome → all four; the rest chain,
  *     Connect-your-AI also links [[Getting Started]]).
  *     The Connect-your-AI note names the console origin (ISSUER_ORIGIN). This
@@ -45,15 +44,13 @@ import {
 // Re-exported so the conformance tests assert against the SAME constants the
 // seed writes (single import site; content lives in core). The guides-ring set
 // (vault#544): the five welcome paths + Getting Started, plus the seeded tag
-// declarations (capture via NOTES_REQUIRED_TAGS, the schema-carrying GUIDE_TAG,
-// and PINNED_TAG).
+// declarations (capture via NOTES_REQUIRED_TAGS + the GUIDE_TAG).
 export {
   CAPTURE_ANYTHING_PATH,
   CONNECT_AI_PATH,
   GETTING_STARTED_PATH,
   GUIDE_TAG,
   NOTES_REQUIRED_TAGS,
-  PINNED_TAG,
   TAGS_GRAPH_PATH,
   WELCOME_PATH,
   YOURS_TO_KEEP_PATH,
