@@ -339,7 +339,6 @@ describe("MCP — vault-info (server-layer override)", () => {
     const tagNames = (proj.tags as any[]).map((t) => t.name);
     expect(tagNames).toContain("capture");
     expect(tagNames).toContain("guide");
-    expect(tagNames).toContain("pinned");
     expect(Array.isArray(proj.indexed_fields)).toBe(true);
     expect((proj.query_hints as string[]).length).toBeGreaterThan(0);
     // Cloud always knows its public origin → absolute coordinates.

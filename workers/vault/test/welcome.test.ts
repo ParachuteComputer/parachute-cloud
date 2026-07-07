@@ -15,16 +15,16 @@ import { GETTING_STARTED_PACK, welcomePack } from "@openparachute/core/src/seed-
 /**
  * Default-seed conformance: a brand-new vault materializes with the two
  * default core packs — the five-guide welcome ring + core's declared seed tags
- * (the `welcome` pack: capture/guide/pinned, asserted dynamically so this suite
+ * (the `welcome` pack: capture/guide, asserted dynamically so this suite
  * tracks core@main) and the AI-facing Getting Started guide (the
  * `getting-started` pack) — and NOTHING else. The seed must be invisible to
  * everything that already exists: idempotent on re-entry, absent for
  * pre-existing vaults, ordinary/deletable notes, exported like any other note.
  *
- * The guides ring (vault#544): six seeded notes, all `#guide` skill files
- * (Welcome also `#pinned`). Guides are AI-first + human-readable markdown, so
- * the `#guide` tag carries no per-guide audience schema (written_for dropped
- * 2026-07-06). The `capture` tag assertion still
+ * The guides ring (vault#544): six seeded notes, all `#guide` skill files.
+ * Guides are for you and your AI alike, plain markdown, so the `#guide` tag
+ * carries no per-guide audience schema (written_for dropped 2026-07-06; the
+ * vestigial #pinned seed dropped 2026-07-07). The `capture` tag assertion still
  * mirrors notes-ui's audit equality exactly (schema-audit.ts diffs
  * `description` + `parent_names` verbatim against NOTES_REQUIRED_SCHEMA), so
  * green there means the PWA banner clears for the right reason. The parity
@@ -74,21 +74,20 @@ describe("default seed — a new vault's first materialization", () => {
     const gettingStarted = notes.find((n) => n.path === GETTING_STARTED_PATH)!;
     expect(gettingStarted.content).toContain("start-here guide");
 
-    // The guides all carry #guide (Welcome also #pinned).
+    // The guides all carry #guide.
     for (const path of WELCOME_GUIDES) {
       const note = notes.find((n) => n.path === path)!;
       expect(note.tags, `${path} tagged #guide`).toContain("guide");
     }
-    expect(welcome.tags, "Welcome is pinned").toContain("pinned");
-    // Only Welcome is pinned — the other guides are not.
-    for (const path of WELCOME_GUIDES.filter((p) => p !== WELCOME_PATH)) {
+    // #pinned was dropped from the seed (2026-07-07) — no seeded note is pinned.
+    for (const path of WELCOME_GUIDES) {
       expect(notes.find((n) => n.path === path)!.tags).not.toContain("pinned");
     }
     expect(gettingStarted.tags).toContain("guide");
 
     // Exactly core's declared seed-tag set — dynamic (the welcome pack's tags:
-    // capture + guide + pinned), so the assertion follows core@main rather than
-    // pinning a count that a core seed-schema change would silently strand.
+    // capture + guide), so the assertion follows core@main rather than pinning
+    // a count that a core seed-schema change would silently strand.
     const declaredTags = welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string }).tags;
     const tags = await listTagsWithSchema(v);
     expect(tags.map((t) => t.name).sort()).toEqual(declaredTags.map((d) => d.name).sort());
@@ -111,9 +110,8 @@ describe("default seed — a new vault's first materialization", () => {
     expect(guideRow.fields?.written_for).toBeUndefined();
     // Six #guide notes seeded → the count reflects them (5 welcome + Getting Started).
     expect(guideRow.count).toBe(6);
-    // pinned: identity row, one pinned note (Welcome).
-    const pinnedRow = tags.find((t) => t.name === "pinned")!;
-    expect(pinnedRow.count).toBe(1);
+    // #pinned is NOT in the seed tag set anymore (dropped 2026-07-07).
+    expect(tags.find((t) => t.name === "pinned")).toBeUndefined();
   });
 
   it("seeded content is byte-equal to core's packs (no cloud-side fork)", async () => {
@@ -179,7 +177,7 @@ describe("default seed — a new vault's first materialization", () => {
     expect(again.skippedNotes.sort()).toEqual([...ALL_PATHS].sort());
 
     expect(await listNotes(v)).toHaveLength(6);
-    // capture + guide + pinned — the welcome pack's full declared tag set.
+    // capture + guide — the welcome pack's full declared tag set.
     const declaredTags = welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string }).tags;
     expect(await listTagsWithSchema(v)).toHaveLength(declaredTags.length);
   });
