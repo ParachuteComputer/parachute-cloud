@@ -79,6 +79,11 @@ describe("console first-run (zero vaults)", () => {
     // No vault yet → no checklist card, no "Your vaults" list header.
     expect(html).not.toContain('data-testid="checklist"');
     expect(html).not.toContain("Your vaults");
+    // FIX 1: the plan cards now render BELOW the hero so the header trial
+    // banner's "Change plan" (#plans) link resolves + a fresh user can pick a
+    // tier — before this the zero-vault screen linked to a #plans that never was.
+    expect(html).toContain('data-testid="plans"');
+    expect(html.indexOf("Create my vault")).toBeLessThan(html.indexOf('data-testid="plans"'));
   });
 
   test("with a vault → the normal console: checklist card above vault cards, no research questions", async () => {
@@ -92,6 +97,9 @@ describe("console first-run (zero vaults)", () => {
     expect(html).not.toContain('name="first_note"');
     // The checklist renders ABOVE the vault cards.
     expect(html.indexOf('data-testid="checklist"')).toBeLessThan(html.indexOf('class="vault"'));
+    // FIX 4: the plan cards (pricing) sit BELOW the vault cards — product above
+    // the upsell.
+    expect(html.indexOf('class="vault"')).toBeLessThan(html.indexOf('data-testid="plans"'));
   });
 
   test("a validation error re-renders the hero with the answers preserved", async () => {

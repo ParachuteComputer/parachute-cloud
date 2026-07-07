@@ -148,9 +148,11 @@ describe("PLAN_SPECS — the ratified ladder", () => {
   });
 
   test("display copy derives from the specs", () => {
-    expect(planLine("entry")).toBe("Entry plan — 1 vault, 100 MB notes (notes only)");
-    expect(planLine("standard")).toBe("Standard plan — 3 vaults, 250 MB notes + 2 GiB attachments");
-    expect(planLine("trial")).toBe("Free trial — 5 vaults, 500 MB notes + 8 GiB attachments");
+    expect(planLine("entry")).toBe("Entry plan — 1 vault, 100 MB notes (notes only) across your vaults");
+    expect(planLine("standard")).toBe(
+      "Standard plan — 3 vaults, 250 MB notes + 2 GiB attachments across your vaults",
+    );
+    expect(planLine("trial")).toBe("Free trial — 5 vaults, 500 MB notes + 8 GiB attachments across your vaults");
     expect(planLine("expired")).toBe(
       "Trial ended — your notes are safe to read and export; pick a plan to write again",
     );

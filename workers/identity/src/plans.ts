@@ -169,6 +169,10 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
  *  the Stripe Prices — keep dashboard + copy in step). Entry has no monthly
  *  (Stripe's $0.30 flat fee eats a $1 charge) — it bills quarterly/annually. */
 export const TIER_PRICE_LABEL: Record<PaidTier, string> = {
+  // TODO(console-launch): Entry shows "$1/mo" but has NO monthly interval (it
+  // bills quarterly/yearly — Stripe's flat fee eats a $1 charge). The "/mo"
+  // label is misleading against the interval select that omits monthly for
+  // entry; reword to "$1/mo, billed quarterly" or "$12/yr" so copy matches checkout.
   entry: "$1/mo",
   standard: "$3/mo",
   plus: "$5/mo",
@@ -331,7 +335,9 @@ export function planLine(plan: PlanId): string {
   const vaults = `${spec.vault_count} vault${spec.vault_count === 1 ? "" : "s"}`;
   const attach =
     spec.attachment_bytes > 0 ? ` + ${formatPlanBytes(spec.attachment_bytes)} attachments` : " (notes only)";
-  const body = `${vaults}, ${formatPlanBytes(spec.notes_bytes)} notes${attach}`;
+  // "across your vaults" — storage is a POOLED total shared across every vault
+  // the plan includes, not a per-vault budget.
+  const body = `${vaults}, ${formatPlanBytes(spec.notes_bytes)} notes${attach} across your vaults`;
   if (plan === "trial") return `Free trial — ${body}`;
   return `${spec.label} plan — ${body}`;
 }
@@ -345,13 +351,16 @@ export function upgradeTeaser(): string {
   return "Paid plans from $1/mo — pick a plan to keep writing after your trial. Have a code? Redeem it below.";
 }
 
-/** One tier's key caps as a short "250 MB notes · 8 GiB attachments · 300 voice
- *  min/mo" line — the plan card body + the pick-a-plan confirmation both read it. */
+/** One tier's key caps as a short "5 vaults · 500 MB notes · 8 GiB attachments ·
+ *  300 voice min/mo" line — the plan card body + the pick-a-plan confirmation
+ *  both read it. Leads with the vault count (the storage is a shared total
+ *  across that many vaults). */
 export function tierCapSummary(tier: PaidTier): string {
   const spec = PLAN_SPECS[tier];
+  const vaults = `${spec.vault_count} vault${spec.vault_count === 1 ? "" : "s"}`;
   const attach = spec.attachment_bytes > 0 ? `${formatPlanBytes(spec.attachment_bytes)} attachments` : "notes only";
   const voice = spec.voice_enabled ? `${spec.transcribe_minutes} voice min/mo` : "no voice";
-  return `${formatPlanBytes(spec.notes_bytes)} notes · ${attach} · ${voice}`;
+  return `${vaults} · ${formatPlanBytes(spec.notes_bytes)} notes · ${attach} · ${voice}`;
 }
 
 /**
