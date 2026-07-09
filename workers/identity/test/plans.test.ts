@@ -327,8 +327,10 @@ describe("vault-count enforcement + entitlement push", () => {
       post("/console/vaults", { __csrf: CSRF, name: "capflow-box" }, sessionCookie(sessionId)),
       env,
     );
-    expect(created.status).toBe(302);
-    expect(created.headers.get("location")).toBe("/console?created=capflow-box");
+    expect(created.status).toBe(303);
+    expect(created.headers.get("location")).toBe(
+      "https://notes.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fcapflow-box",
+    );
 
     // The pushed body is the TWO-METER entitlement (entry: 100 MB notes, 0
     // attachments, voice off, not frozen).
@@ -418,7 +420,7 @@ describe("vault-count enforcement + entitlement push", () => {
       post("/console/vaults", { __csrf: CSRF, name: "trialpick-box" }, sessionCookie(sessionId)),
       env,
     );
-    expect(created.status).toBe(302);
+    expect(created.status).toBe(303);
     expect(JSON.parse(body!)).toEqual({
       caps: { notes_bytes: 100 * MiB, attachment_bytes: 0 },
       transcription: { enabled: false, minutes_limit: 0 },
@@ -439,8 +441,10 @@ describe("vault-count enforcement + entitlement push", () => {
       post("/console/vaults", { __csrf: CSRF, name: "pushfail-box" }, sessionCookie(sessionId)),
       env,
     );
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/console?created=pushfail-box");
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(
+      "https://notes.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fpushfail-box",
+    );
     expect(await vaultRowCount(userId)).toBe(1);
     expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_failed"))).toBe(true);
     warn.mockRestore();
@@ -455,7 +459,7 @@ describe("vault-count enforcement + entitlement push", () => {
       post("/console/vaults", { __csrf: CSRF, name: "pushgone-box" }, sessionCookie(sessionId)),
       env,
     );
-    expect(res.status).toBe(302);
+    expect(res.status).toBe(303);
     expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_failed"))).toBe(true);
     warn.mockRestore();
   });

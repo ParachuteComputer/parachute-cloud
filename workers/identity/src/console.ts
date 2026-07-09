@@ -9,15 +9,11 @@
  *   POST /login              verify + session → /console
  *   POST /logout             clear session → /login
  *   GET  /console            zero vaults → the first-run hero ("Name your
- *                            vault" + two optional research questions);
- *                            otherwise the checklist card + vault cards +
- *                            create form
- *   POST /console/vaults     claim a vault name → /console?created=<name>.
- *                            Also carries the OPTIONAL first-run extras:
- *                            `notes_app` (research, stored on the user row) and
- *                            `first_note` (written INTO the new vault as the
- *                            user's real first note — best-effort, see
- *                            writeFirstNote)
+ *                            vault"); otherwise the checklist card + vault
+ *                            cards + create form
+ *   POST /console/vaults     claim a vault name → 303 straight to the new
+ *                            vault's Notes UI (the everyday-user door; the
+ *                            console stays reachable for plan/billing).
  *   POST /console/packs      apply a seed pack to an owned vault (server-side
  *                            call to the vault worker with an internally minted
  *                            scoped token) → /console?pack_added=<name>
@@ -83,7 +79,6 @@ import {
   getChecklistState,
   isChecklistItem,
   markChecklistItem,
-  setNotesApp,
   unhideChecklist,
 } from "./checklist.ts";
 import { latestUsageForVaults } from "./usage.ts";
@@ -526,11 +521,10 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   if (!user) return redirectResponse("/login");
   const form = await req.formData();
   const rawName = String(form.get("name") ?? "");
-  // First-run extras — both OPTIONAL (the questions are research, not a wall).
-  const notesApp = String(form.get("notes_app") ?? "");
-  const firstNote = String(form.get("first_note") ?? "");
-  // Preserve the user's answers across a validation error re-render.
-  const firstRun: FirstRunValues = { name: rawName, notesApp, firstNote };
+  // Preserve the entered name across a validation-error re-render. (Legacy
+  // clients may still POST `notes_app`/`first_note` from the old first-run
+  // form — we simply never read them: extra fields are ignored, never a 400.)
+  const firstRun: FirstRunValues = { name: rawName };
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
     return consoleError(db, req, deps, user, "Your session expired. Please try again.", firstRun);
   }
@@ -556,12 +550,11 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
     // DO on the (more generous) env default, never fails creation;
     // applyPlanToVaults / the backfill reconcile.
     await pushVaultCap(db, deps, user.id, vault.name, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan)));
-    // (a) research answer → user row. Allowlisted inside; unknown values no-op.
-    if (notesApp) await setNotesApp(db, user.id, notesApp);
-    // (b) their first note → INTO the new vault, verbatim. Best-effort by
-    // contract: a vault-worker hiccup must never fail vault creation.
-    if (firstNote.trim().length > 0) await writeFirstNote(db, deps, user, vault.name, firstNote);
-    return redirectResponse(`/console?created=${encodeURIComponent(vault.name)}`);
+    // Land the user straight in their notes, not back on the console (the
+    // 2026-07-08 onboarding decision). 303 so the form POST resolves to a GET
+    // on the cross-origin Notes deep-link. The console stays reachable for
+    // plan/billing management.
+    return redirectResponse(cardFor(vault.name, deps).notesUrl, {}, 303);
   } catch (err) {
     if (err instanceof VaultNameInvalidError) {
       const msg =
@@ -574,43 +567,6 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
       return consoleError(db, req, deps, user, "That vault name is already taken.", firstRun);
     }
     throw err;
-  }
-}
-
-/** Path of the note the first-run answer (b) becomes in the user's new vault. */
-const FIRST_NOTE_PATH = "My first note";
-
-/**
- * Write the first-run "first thing you want your AI to remember" into the
- * freshly created vault as a REAL note (path "My first note", content
- * verbatim), through the same mint seam the packs button uses (60s
- * `vault:<name>:write`, aud-pinned — see {@link handleAddPackPost}).
- *
- * BEST-EFFORT by contract: this runs after the vault row is committed, and a
- * failure (vault worker down, cold-start hiccup) logs a structured warning and
- * returns — vault creation MUST still succeed. This request is typically the
- * vault DO's first materialization, so the welcome seed runs in the same
- * breath and the user's note joins the seeded web.
- */
-async function writeFirstNote(
-  db: D1Database,
-  deps: OAuthDeps,
-  user: User,
-  vaultName: string,
-  content: string,
-): Promise<void> {
-  try {
-    const res = await postVaultApi(db, deps, user.id, vaultName, "/api/notes", {
-      path: FIRST_NOTE_PATH,
-      content,
-    });
-    if (!res.ok) {
-      console.warn(`event=first_note_write_failed vault=${vaultName} status=${res.status}`);
-    }
-  } catch (err) {
-    console.warn(
-      `event=first_note_write_failed vault=${vaultName} error=${err instanceof Error ? err.message : String(err)}`,
-    );
   }
 }
 

@@ -210,8 +210,12 @@ export function htmlResponse(body: string, status = 200, extra: Record<string, s
   });
 }
 
-export function redirectResponse(location: string, extra: Record<string, string> = {}): Response {
-  return new Response(null, { status: 302, headers: { location, ...extra } });
+export function redirectResponse(
+  location: string,
+  extra: Record<string, string> = {},
+  status = 302,
+): Response {
+  return new Response(null, { status, headers: { location, ...extra } });
 }
 
 export function oauthErrorRedirect(

@@ -4,9 +4,6 @@
  * /oauth/authorize. Kept deliberately small: this is the human surface, not the
  * wire contract.
  */
-// The first-run research chips mirror the landing page's set; the values live
-// in checklist.ts (next to the allowlist that gates the write).
-import { NOTES_APP_OPTIONS } from "./checklist.ts";
 // Plan copy renders from plans.ts (the single source of truth for
 // entitlements + display strings) — the console can never drift from it.
 import {
@@ -536,8 +533,6 @@ export interface ConsoleChecklistProps {
 /** First-run form values preserved across a validation-error re-render. */
 export interface FirstRunValues {
   name?: string;
-  notesApp?: string;
-  firstNote?: string;
 }
 
 export interface ConsoleProps {
@@ -824,17 +819,11 @@ function checklistCard(c: ConsoleChecklistProps, csrfToken: string): string {
 // --- first-run (zero vaults) -------------------------------------------------
 
 /**
- * The first-run hero: one warm card — name your vault (the only required
- * field) plus two OPTIONAL research questions. The questions never gate
- * creation; skipping both is a fine answer.
+ * The first-run hero: one warm card — name your vault, then straight into your
+ * notes. Creating a vault lands you in the Notes UI (the 2026-07-08 onboarding
+ * decision), so the hero is a single field, no questions in the way.
  */
 function firstRunHero(csrfToken: string, values: FirstRunValues, error?: string): string {
-  const chips = NOTES_APP_OPTIONS.map(
-    ({ value, label }) =>
-      `<span><input type="radio" id="na-${esc(value)}" name="notes_app" value="${esc(value)}"${
-        values.notesApp === value ? " checked" : ""
-      }><label for="na-${esc(value)}">${esc(label)}</label></span>`,
-  ).join("\n");
   return `<p style="margin:.4rem 0 1.1rem">Welcome. Your vault is where your notes — and everything you want your AI to remember — will live, under a name you choose. It's yours: open format, export anytime.</p>
     <div class="card">
       <form method="post" action="/console/vaults">
@@ -842,11 +831,6 @@ function firstRunHero(csrfToken: string, values: FirstRunValues, error?: string)
         <label for="name" style="font-size:.95rem">Vault name</label>
         <input class="biginput" id="name" name="name" type="text" placeholder="e.g. field-notes" pattern="${VAULT_NAME_PATTERN}" value="${esc(values.name ?? "")}" required autofocus>
         <p class="muted" style="margin:.35rem 0 0">Lowercase letters, numbers, and hyphens. 2–63 characters.</p>
-        <label style="margin-top:1.3rem">What do you take notes in today? <span class="muted" style="font-weight:400">(optional)</span></label>
-        <div class="chips">${chips}</div>
-        <label for="first_note" style="margin-top:1.3rem">What's the first thing you want your AI to remember? <span class="muted" style="font-weight:400">(optional)</span></label>
-        <input id="first_note" name="first_note" type="text" maxlength="500" placeholder="e.g. I'm rebuilding my garden this summer" value="${esc(values.firstNote ?? "")}">
-        <p class="muted" style="margin:.35rem 0 0">We'll tuck it into your new vault as your first note.</p>
         ${error ? `<div class="err">${esc(error)}</div>` : ""}
         <button class="primary" type="submit">Create my vault</button>
       </form>
