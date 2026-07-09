@@ -921,7 +921,13 @@ function consoleScript(csrfToken: string): string {
   function wireCreate(form){
     form.addEventListener("submit",function(e){
       if(!window.fetch||!window.FormData||!form.closest)return;
+      // In-flight guard: a create is already running for this form — swallow the
+      // repeat so a second submit can't double-POST (the display:none below is
+      // the visual block; this is the explicit one). Cleared on the error/
+      // fallback paths (restore), never on success (we navigate away).
+      if(form.getAttribute("data-inflight"))return e.preventDefault();
       e.preventDefault();
+      form.setAttribute("data-inflight","1");
       var nameEl=form.querySelector('input[name="name"]');
       var name=nameEl?String(nameEl.value).trim():"";
       var card=form.closest(".card")||form.parentNode;
@@ -940,10 +946,10 @@ function consoleScript(csrfToken: string): string {
           setTimeout(function(){markReady(panel);setTimeout(function(){window.location.assign(data.redirect);},1150);},wait);
           return;
         }
-        restore(card,panel,stash);
+        restore(form,card,panel,stash);
         showError(form,(data&&data.error)||"Something went wrong. Please try again.");
       }).catch(function(){
-        restore(card,panel,stash);
+        restore(form,card,panel,stash);
         form.submit();
       });
     });
@@ -965,13 +971,14 @@ function consoleScript(csrfToken: string): string {
     if(sub)sub.textContent="Opening your notes\\u2026";
     panel.className="creating ready";
   }
-  function restore(card,panel,stash){
+  function restore(form,card,panel,stash){
     if(panel&&panel.parentNode)panel.parentNode.removeChild(panel);
     for(var i=0;i<stash.length;i++)stash[i][0].style.display=stash[i][1];
+    form.removeAttribute("data-inflight");
   }
   function showError(form,msg){
     var err=form.querySelector(".err");
-    if(!err){err=document.createElement("div");err.className="err";var btn=form.querySelector('button[type="submit"]')||form.querySelector("button");if(btn)form.insertBefore(err,btn);else form.appendChild(err);}
+    if(!err){err=document.createElement("div");err.className="err";err.setAttribute("role","alert");var btn=form.querySelector('button[type="submit"]')||form.querySelector("button");if(btn)form.insertBefore(err,btn);else form.appendChild(err);}
     err.textContent=msg;
     var nameEl=form.querySelector('input[name="name"]');if(nameEl)nameEl.focus();
   }

@@ -307,6 +307,21 @@ describe("create-vault — the progressive-enhancement JSON variant", () => {
     expect(body.error).toContain("session");
   });
 
+  test("an UNAUTHENTICATED fetch-variant create → 302 /login, no JSON, nothing created", async () => {
+    // The `!user` gate runs BEFORE prefersJson, so the fetch signal never earns a
+    // JSON body from an anonymous caller — a would-be leak (creating unowned, or
+    // an error oracle) is refused with the same neutral login redirect the no-JS
+    // path gets. Code order guarantees it today; this pins that order.
+    const res = await app.fetch(fetchCreate({ __csrf: CSRF, name: "ghost-box" }, ""), env);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/login");
+    // A bare redirect carries no content-type at all — certainly not JSON.
+    expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
+    expect(await res.text()).toBe("");
+    const row = await env.DB.prepare("SELECT name FROM vaults WHERE name = ?").bind("ghost-box").first();
+    expect(row).toBeNull();
+  });
+
   test("the classic (no header) form POST stays byte-identical: a 303, not JSON", async () => {
     const { id: userId } = await seedUser("moment-classic@example.com");
     const sessionId = await seedSession(userId);
