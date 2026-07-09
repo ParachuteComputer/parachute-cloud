@@ -157,6 +157,16 @@ const STYLE = `
   .connect-block{margin:.9rem 0 0;padding-top:.8rem;border-top:1px solid var(--line)}
   .copyrow + .connect-block{margin-top:.5rem;padding-top:0;border-top:0}
   .connect-block h4{margin:0 0 .35rem;font-size:.9rem;font-family:"DM Sans",sans-serif;font-weight:600}
+  .creating{display:flex;flex-direction:column;align-items:center;text-align:center;padding:1.3rem .5rem .9rem}
+  .creating-orb{width:2.7rem;height:2.7rem;border-radius:999px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:1.15rem;background:radial-gradient(circle at 50% 38%,var(--sage),var(--sage-dark));margin:.2rem 0 1rem;animation:orbpulse 1.5s ease-in-out infinite}
+  .creating-title{font-family:"Instrument Serif",Georgia,serif;font-size:1.35rem;margin:0 0 .3rem;color:var(--ink)}
+  .creating-sub{margin:0}
+  .creating.ready .creating-orb{animation:none;background:var(--sage);box-shadow:0 0 0 .4rem rgba(95,122,87,.14)}
+  .creating.ready .creating-orb::after{content:"\\2713"}
+  .creating.ready .creating-title,.creating.ready .creating-sub{animation:readyfade .5s ease}
+  @keyframes orbpulse{0%,100%{transform:scale(.82);opacity:.55}50%{transform:scale(1);opacity:1}}
+  @keyframes readyfade{from{opacity:0;transform:translateY(.18rem)}to{opacity:1;transform:none}}
+  @media (prefers-reduced-motion:reduce){.creating-orb{animation:none}.creating.ready .creating-title,.creating.ready .creating-sub{animation:none}}
 `;
 
 // Exported for admin-ui.ts (the operator console reuses the exact page shell +
@@ -872,9 +882,20 @@ function firstRunHero(csrfToken: string, values: FirstRunValues, error?: string)
 
 /**
  * Console page JS — deliberately tiny (this file is otherwise zero-JS):
- * clipboard for the MCP-URL copy buttons, and marking an expandable checklist
- * item done on first open. Both degrade quietly without JS (the URL is
- * selectable text; the disclosure still opens — it just isn't recorded).
+ * clipboard for the MCP-URL copy buttons, marking an expandable checklist item
+ * done on first open, and the vault-creation MOMENT (below). All three degrade
+ * quietly without JS — the URL is selectable text, the disclosure still opens
+ * (it just isn't recorded), and the create form POSTs to its usual 303.
+ *
+ * The creation moment (progressive enhancement over the create form): intercept
+ * the submit, stage a warm "building → ready" beat, and let the server hand the
+ * Notes URL back as JSON (`X-Requested-With: fetch`) — a fetch can't follow that
+ * cross-origin 303 past CORS, so we navigate ourselves via window.location. The
+ * ceremony is short (≤ ~2s added) and NEVER blocks on a timer when the request
+ * errors: a server error drops cleanly back to the form with its message; any
+ * unexpected response falls through to the native submit so the server's real
+ * response (303 / re-rendered error / login redirect) takes over — never a user
+ * stranded in the "building" state.
  */
 function consoleScript(csrfToken: string): string {
   return `<script>(function(){
@@ -895,6 +916,72 @@ function consoleScript(csrfToken: string): string {
       fetch("/console/checklist",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams({__csrf:CSRF,item:d.getAttribute("data-check")}).toString()});
     });
   })(ds[i]);
+  var forms=document.querySelectorAll('form[action="/console/vaults"]');
+  for(var fi=0;fi<forms.length;fi++)wireCreate(forms[fi]);
+  function wireCreate(form){
+    form.addEventListener("submit",function(e){
+      if(!window.fetch||!window.FormData||!form.closest)return;
+      // In-flight guard: a create is already running for this form — swallow the
+      // repeat so a second submit can't double-POST (the display:none below is
+      // the visual block; this is the explicit one). Cleared on the error/
+      // fallback paths (restore), never on success (we navigate away).
+      if(form.getAttribute("data-inflight"))return e.preventDefault();
+      e.preventDefault();
+      form.setAttribute("data-inflight","1");
+      var nameEl=form.querySelector('input[name="name"]');
+      var name=nameEl?String(nameEl.value).trim():"";
+      var card=form.closest(".card")||form.parentNode;
+      var fd=new FormData(form);
+      var stash=[];
+      for(var i=0;i<card.children.length;i++){var el=card.children[i];stash.push([el,el.style.display]);el.style.display="none";}
+      var panel=buildPanel(name);
+      card.appendChild(panel);
+      var t0=Date.now();
+      fetch(form.getAttribute("action"),{method:"POST",body:fd,credentials:"same-origin",headers:{"x-requested-with":"fetch"}}).then(function(res){
+        if((res.headers.get("content-type")||"").indexOf("application/json")===-1)throw new Error("non-json");
+        return res.json();
+      }).then(function(data){
+        if(data&&data.redirect){
+          var wait=Math.max(0,650-(Date.now()-t0));
+          setTimeout(function(){markReady(panel);setTimeout(function(){window.location.assign(data.redirect);},1150);},wait);
+          return;
+        }
+        restore(form,card,panel,stash);
+        showError(form,(data&&data.error)||"Something went wrong. Please try again.");
+      }).catch(function(){
+        restore(form,card,panel,stash);
+        form.submit();
+      });
+    });
+  }
+  function buildPanel(name){
+    var p=document.createElement("div");
+    p.className="creating";p.setAttribute("role","status");p.setAttribute("aria-live","polite");
+    var orb=document.createElement("div");orb.className="creating-orb";orb.setAttribute("aria-hidden","true");
+    var h=document.createElement("p");h.className="creating-title";
+    if(name){h.appendChild(document.createTextNode("Preparing "));var s=document.createElement("strong");s.textContent=name;h.appendChild(s);h.appendChild(document.createTextNode("\\u2026"));}
+    else{h.textContent="Preparing your vault\\u2026";}
+    var sub=document.createElement("p");sub.className="creating-sub muted";sub.textContent="Making a space that's yours.";
+    p.appendChild(orb);p.appendChild(h);p.appendChild(sub);
+    return p;
+  }
+  function markReady(panel){
+    var h=panel.querySelector(".creating-title"),sub=panel.querySelector(".creating-sub");
+    if(h)h.textContent="Your vault is ready";
+    if(sub)sub.textContent="Opening your notes\\u2026";
+    panel.className="creating ready";
+  }
+  function restore(form,card,panel,stash){
+    if(panel&&panel.parentNode)panel.parentNode.removeChild(panel);
+    for(var i=0;i<stash.length;i++)stash[i][0].style.display=stash[i][1];
+    form.removeAttribute("data-inflight");
+  }
+  function showError(form,msg){
+    var err=form.querySelector(".err");
+    if(!err){err=document.createElement("div");err.className="err";err.setAttribute("role","alert");var btn=form.querySelector('button[type="submit"]')||form.querySelector("button");if(btn)form.insertBefore(err,btn);else form.appendChild(err);}
+    err.textContent=msg;
+    var nameEl=form.querySelector('input[name="name"]');if(nameEl)nameEl.focus();
+  }
 })();</script>`;
 }
 
@@ -1137,7 +1224,8 @@ export function renderConsole(props: ConsoleProps): string {
       `${header("Name your vault")}
        ${notice ? `<div class="notice">${esc(notice)}</div>` : ""}
        ${firstRunHero(csrfToken, firstRun ?? {}, error)}
-       ${plansSectionHtml}`,
+       ${plansSectionHtml}
+       ${consoleScript(csrfToken)}`,
     );
   }
 

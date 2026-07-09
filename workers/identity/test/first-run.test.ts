@@ -179,6 +179,159 @@ describe("first-run create — lands in Notes, tolerant of legacy fields", () =>
   });
 });
 
+// --- the vault-creation moment (Phase 3) -------------------------------------
+
+describe("the vault-creation moment — renders the building→ready JS", () => {
+  test("the create-form moment JS rides the zero-vault hero (was has-vault-only)", async () => {
+    const { id: userId } = await seedUser("moment-hero@example.com");
+    const html = await consoleHtml(await seedSession(userId));
+    // The consoleScript now ships on the first-run page so the hero create form
+    // gets the beat too — its wiring + the "Preparing…" copy are inline.
+    expect(html).toContain("wireCreate");
+    expect(html).toContain('form[action="/console/vaults"]');
+    expect(html).toContain("Preparing your vault");
+    expect(html).toContain("Your vault is ready");
+    // The moment's CSS is present (the pulse + reduced-motion honesty).
+    expect(html).toContain(".creating-orb");
+    expect(html).toContain("prefers-reduced-motion");
+  });
+
+  test("the moment JS is also wired on the has-vault console (create-another card)", async () => {
+    const { id: userId } = await seedUser("moment-has@example.com");
+    await seedVault("already-here", userId);
+    const html = await consoleHtml(await seedSession(userId));
+    expect(html).toContain("wireCreate");
+  });
+});
+
+describe("create-vault — the progressive-enhancement JSON variant", () => {
+  beforeAll(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+  afterEach(() => fetchMock.assertNoPendingInterceptors());
+
+  function stubCapPush(vaultName: string): void {
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: `/vault/${vaultName}/api/internal/config`, method: "PUT" })
+      .reply(200, { name: vaultName }, { headers: { "content-type": "application/json" } });
+  }
+
+  function notesDeepLink(vaultName: string): string {
+    return `${NOTES_APP}/?add=${encodeURIComponent(`https://u.parachute.computer/vault/${vaultName}`)}`;
+  }
+
+  /** A create POST marked as a fetch (the create-form JS path) — via the
+   *  `X-Requested-With: fetch` header the JS sets, or an explicit Accept. */
+  function fetchCreate(
+    fields: Record<string, string>,
+    cookie: string,
+    signal: "xrw" | "accept" = "xrw",
+  ): Request {
+    const headers: Record<string, string> = {
+      "content-type": "application/x-www-form-urlencoded",
+      origin: ISSUER,
+      cookie,
+    };
+    if (signal === "xrw") headers["x-requested-with"] = "fetch";
+    else headers["accept"] = "application/json";
+    return new Request(`${ISSUER}/console/vaults`, {
+      method: "POST",
+      body: new URLSearchParams(fields),
+      headers,
+    });
+  }
+
+  test("X-Requested-With: fetch → 200 JSON { redirect } (not the cross-origin 303)", async () => {
+    const { id: userId } = await seedUser("moment-xrw@example.com");
+    const sessionId = await seedSession(userId);
+    stubCapPush("moment-box");
+    const res = await app.fetch(fetchCreate({ __csrf: CSRF, name: "moment-box" }, sessionCookie(sessionId)), env);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = (await res.json()) as { redirect?: string };
+    expect(body.redirect).toBe(notesDeepLink("moment-box"));
+    // Not a dry run — the vault really is created (the JS then navigates to it).
+    const row = await env.DB.prepare("SELECT name FROM vaults WHERE name = ?").bind("moment-box").first();
+    expect(row).not.toBeNull();
+  });
+
+  test("Accept: application/json triggers the same JSON success", async () => {
+    const { id: userId } = await seedUser("moment-accept@example.com");
+    const sessionId = await seedSession(userId);
+    stubCapPush("accept-box");
+    const res = await app.fetch(
+      fetchCreate({ __csrf: CSRF, name: "accept-box" }, sessionCookie(sessionId), "accept"),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { redirect?: string };
+    expect(body.redirect).toBe(notesDeepLink("accept-box"));
+  });
+
+  test("a reserved name → 200 JSON { error } (never the HTML re-render, no vault)", async () => {
+    const { id: userId } = await seedUser("moment-reserved@example.com");
+    const sessionId = await seedSession(userId);
+    const res = await app.fetch(fetchCreate({ __csrf: CSRF, name: "admin" }, sessionCookie(sessionId)), env);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = (await res.json()) as { error?: string; redirect?: string };
+    expect(body.redirect).toBeUndefined();
+    expect(body.error).toContain("reserved");
+  });
+
+  test("a taken name → 200 JSON { error: already taken }", async () => {
+    const { id: a } = await seedUser("moment-owner@example.com");
+    const sessionA = await seedSession(a);
+    stubCapPush("dup-box");
+    const first = await app.fetch(fetchCreate({ __csrf: CSRF, name: "dup-box" }, sessionCookie(sessionA)), env);
+    expect(first.status).toBe(200);
+    // A second account claims the same name → JSON error, refused before any cap
+    // push (so no interceptor is needed for the second attempt).
+    const { id: b } = await seedUser("moment-other@example.com");
+    const sessionB = await seedSession(b);
+    const dup = await app.fetch(fetchCreate({ __csrf: CSRF, name: "dup-box" }, sessionCookie(sessionB)), env);
+    expect(dup.status).toBe(200);
+    const body = (await dup.json()) as { error?: string };
+    expect(body.error).toContain("already taken");
+  });
+
+  test("a bad CSRF token under the fetch variant → 200 JSON { error }", async () => {
+    const { id: userId } = await seedUser("moment-csrf@example.com");
+    const sessionId = await seedSession(userId);
+    const res = await app.fetch(fetchCreate({ __csrf: "wrong", name: "csrf-box" }, sessionCookie(sessionId)), env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { error?: string; redirect?: string };
+    expect(body.redirect).toBeUndefined();
+    expect(body.error).toContain("session");
+  });
+
+  test("an UNAUTHENTICATED fetch-variant create → 302 /login, no JSON, nothing created", async () => {
+    // The `!user` gate runs BEFORE prefersJson, so the fetch signal never earns a
+    // JSON body from an anonymous caller — a would-be leak (creating unowned, or
+    // an error oracle) is refused with the same neutral login redirect the no-JS
+    // path gets. Code order guarantees it today; this pins that order.
+    const res = await app.fetch(fetchCreate({ __csrf: CSRF, name: "ghost-box" }, ""), env);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/login");
+    // A bare redirect carries no content-type at all — certainly not JSON.
+    expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
+    expect(await res.text()).toBe("");
+    const row = await env.DB.prepare("SELECT name FROM vaults WHERE name = ?").bind("ghost-box").first();
+    expect(row).toBeNull();
+  });
+
+  test("the classic (no header) form POST stays byte-identical: a 303, not JSON", async () => {
+    const { id: userId } = await seedUser("moment-classic@example.com");
+    const sessionId = await seedSession(userId);
+    stubCapPush("classic-box");
+    const res = await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "classic-box" }, sessionCookie(sessionId)), env);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(notesDeepLink("classic-box"));
+  });
+});
+
 // --- checklist CRUD -----------------------------------------------------------
 
 describe("getting-started checklist (POST /console/checklist)", () => {

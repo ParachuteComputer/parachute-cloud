@@ -13,7 +13,13 @@
  *                            cards + create form
  *   POST /console/vaults     claim a vault name → 303 straight to the new
  *                            vault's Notes UI (the everyday-user door; the
- *                            console stays reachable for plan/billing).
+ *                            console stays reachable for plan/billing). A
+ *                            progressive-enhancement variant: an
+ *                            `X-Requested-With: fetch` (or Accept: json) request
+ *                            gets `{ redirect }` (200 JSON) instead of the
+ *                            cross-origin 303 a fetch can't follow — the
+ *                            create-form JS plays a "building -> ready" beat then
+ *                            navigates itself (ui.ts consoleScript).
  *   POST /console/packs      apply a seed pack to an owned vault (server-side
  *                            call to the vault worker with an internally minted
  *                            scoped token) → /console?pack_added=<name>
@@ -94,6 +100,7 @@ import {
   type OAuthDeps,
   htmlResponse,
   isSameOriginRequest,
+  jsonResponse,
   redirectResponse,
   resolveBoundOrigins,
   vaultInstanceUrl,
@@ -516,17 +523,36 @@ export async function handleChoosePlanPost(db: D1Database, req: Request, deps: O
   return redirectResponse(`/console?plan_chosen=${encodeURIComponent(raw)}`);
 }
 
+/**
+ * The create-vault POST is progressively enhanced: the create-form JS submits
+ * with `X-Requested-With: fetch` so it can play the "building → ready" moment
+ * and navigate itself. Detected here so the JSON variant kicks in ONLY for
+ * those requests — a classic (no-JS) form POST names neither signal and stays
+ * byte-identical to before. `Accept: application/json` is honored too (explicit
+ * + testable); a browser navigation's Accept lists a wildcard media range but
+ * never the literal `application/json`, so it isn't misread as a fetch.
+ */
+function prefersJson(req: Request): boolean {
+  if ((req.headers.get("x-requested-with") ?? "").toLowerCase() === "fetch") return true;
+  return (req.headers.get("accept") ?? "").includes("application/json");
+}
+
 export async function handleCreateVaultPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
+  const wantsJson = prefersJson(req);
   const form = await req.formData();
   const rawName = String(form.get("name") ?? "");
   // Preserve the entered name across a validation-error re-render. (Legacy
   // clients may still POST `notes_app`/`first_note` from the old first-run
   // form — we simply never read them: extra fields are ignored, never a 400.)
   const firstRun: FirstRunValues = { name: rawName };
+  // A create failure: JSON `{ error }` for the fetch path (the JS drops back to
+  // the form and shows it), else the full re-rendered console with the error.
+  const fail = (msg: string): Response | Promise<Response> =>
+    wantsJson ? jsonResponse({ error: msg }) : consoleError(db, req, deps, user, msg, firstRun);
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
-    return consoleError(db, req, deps, user, "Your session expired. Please try again.", firstRun);
+    return fail("Your session expired. Please try again.");
   }
   // Plan vault-count gate (plans.ts). `>=` grandfathers users already OVER a
   // cap (e.g. accounts predating plans): they keep and use every vault they
@@ -539,7 +565,7 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   // "pick a plan to create your first vault" path instead of the cap wall.
   const spec = PLAN_SPECS[user.plan];
   if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-    return consoleError(db, req, deps, user, vaultCapMessage(user.plan), firstRun);
+    return fail(vaultCapMessage(user.plan));
   }
   try {
     const vault = await createVault(db, rawName, user.id, deps.now?.() ?? new Date());
@@ -551,20 +577,23 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
     // applyPlanToVaults / the backfill reconcile.
     await pushVaultCap(db, deps, user.id, vault.name, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan)));
     // Land the user straight in their notes, not back on the console (the
-    // 2026-07-08 onboarding decision). 303 so the form POST resolves to a GET
-    // on the cross-origin Notes deep-link. The console stays reachable for
-    // plan/billing management.
-    return redirectResponse(cardFor(vault.name, deps).notesUrl, {}, 303);
+    // 2026-07-08 onboarding decision). No-JS: 303 so the form POST resolves to a
+    // GET on the cross-origin Notes deep-link. Fetch path: hand the URL back as
+    // JSON (a fetch can't follow that cross-origin redirect past CORS) — the JS
+    // plays its brief "ready" beat then navigates via window.location. The
+    // console stays reachable for plan/billing management either way.
+    const notesUrl = cardFor(vault.name, deps).notesUrl;
+    return wantsJson ? jsonResponse({ redirect: notesUrl }) : redirectResponse(notesUrl, {}, 303);
   } catch (err) {
     if (err instanceof VaultNameInvalidError) {
       const msg =
         err.reason === "reserved"
           ? "That name is reserved. Please choose another."
           : "Use 2–63 characters: lowercase letters, numbers, and hyphens (starting with a letter or number).";
-      return consoleError(db, req, deps, user, msg, firstRun);
+      return fail(msg);
     }
     if (err instanceof VaultNameTakenError) {
-      return consoleError(db, req, deps, user, "That vault name is already taken.", firstRun);
+      return fail("That vault name is already taken.");
     }
     throw err;
   }
