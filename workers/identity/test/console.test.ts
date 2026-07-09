@@ -1230,9 +1230,14 @@ describe("console — vaults", () => {
       post("/console/vaults", { __csrf: CSRF, name: "my-notes" }, `parachute_id_session=${session}; parachute_id_csrf=${CSRF}`),
       env,
     );
-    expect(create.status).toBe(302);
-    expect(create.headers.get("location")).toBe("/console?created=my-notes");
+    // Create lands the user straight in the new vault's Notes UI (303).
+    expect(create.status).toBe(303);
+    expect(create.headers.get("location")).toBe(
+      "https://notes.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fmy-notes",
+    );
 
+    // The console stays reachable for management; the created-notice + connect
+    // card still render when you navigate back to it.
     const consoleRes = await app.fetch(
       new Request(`${ISSUER}/console?created=my-notes`, { headers: { cookie: `parachute_id_session=${session}` } }),
       env,

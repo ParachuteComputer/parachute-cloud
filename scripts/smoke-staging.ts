@@ -342,7 +342,7 @@ async function main() {
       redirect: "manual",
       body: form({ __csrf: conCsrf!, name: newVault }),
     });
-    assert(cvRes.status === 302 && (cvRes.headers.get("location") ?? "").includes(`created=${newVault}`), "console create vault → claimed", `status ${cvRes.status}`);
+    assert(cvRes.status === 303 && (cvRes.headers.get("location") ?? "").includes(encodeURIComponent(`/vault/${newVault}`)), "console create vault → lands in Notes (303)", `status ${cvRes.status} loc ${cvRes.headers.get("location")}`);
 
     // The console page shows the connect card with the reachable URL shape,
     // plus the plan line (fresh signup = the 30-day no-card TRIAL, which mirrors
@@ -388,9 +388,9 @@ async function main() {
       body: form({ __csrf: conCsrf!, name: `${newVault}-two` }),
     });
     assert(
-      cv2.status === 302 && (cv2.headers.get("location") ?? "").includes(`created=${newVault}-two`),
+      cv2.status === 303 && (cv2.headers.get("location") ?? "").includes(encodeURIComponent(`/vault/${newVault}-two`)),
       "2nd vault create on the trial → succeeds (trial includes 5 vaults)",
-      `status ${cv2.status}`,
+      `status ${cv2.status} loc ${cv2.headers.get("location")}`,
     );
 
     // New user mints a token for THEIR vault via the real authorize flow.
@@ -799,46 +799,59 @@ async function main() {
     arrivalEmail = email;
     arrivalPassword = password;
 
-    // Zero vaults → the first-run hero with both research questions.
+    // Zero vaults → the first-run hero: just the name field, no research
+    // questions (removed 2026-07-08 — creating a vault lands you in your notes).
     const heroHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie } })).text();
     assert(
       heroHtml.includes("Name your vault") &&
-        heroHtml.includes("What do you take notes in today?") &&
-        heroHtml.includes("What's the first thing you want your AI to remember?") &&
+        !heroHtml.includes("What do you take notes in today?") &&
+        !heroHtml.includes("What's the first thing you want your AI to remember?") &&
         !heroHtml.includes('data-testid="checklist"'),
-      "arrival: zero-vault console renders the first-run hero + research questions",
+      "arrival: zero-vault console renders the first-run hero (no research questions)",
     );
 
-    // Create with BOTH answers.
+    // Create the vault → lands STRAIGHT in the vault's Notes UI (303,
+    // cross-origin deep-link), no longer back on the console.
     const cvRes = await fetch(`${IDENTITY}/console/vaults`, {
       method: "POST",
       headers: { ...FORM, origin: IDENTITY, cookie },
       redirect: "manual",
-      body: form({ __csrf: csrf!, name: vaultName, notes_app: "obsidian", first_note: firstNote }),
+      body: form({ __csrf: csrf!, name: vaultName }),
     });
+    const cvLoc = cvRes.headers.get("location") ?? "";
     assert(
-      cvRes.status === 302 && (cvRes.headers.get("location") ?? "").includes(`created=${vaultName}`),
-      "arrival: create with research answers → vault claimed",
-      `status ${cvRes.status}`,
+      cvRes.status === 303 &&
+        cvLoc.startsWith("https://notes.parachute.computer/?add=") &&
+        cvLoc.includes(encodeURIComponent(`/vault/${vaultName}`)),
+      "arrival: create lands in the vault's Notes UI (303)",
+      `status ${cvRes.status} loc ${cvLoc}`,
     );
 
-    // The first note exists IN the vault (verbatim), alongside the 6 seed notes.
+    // The old auto-"first note" is gone; seed a marker note through the normal
+    // owner API so downstream sections (the snapshot restore round-trip) still
+    // have a note to verify — and confirm it joins the welcome seed.
     const owner = await authorizeFor(email, password, vaultName);
     assert(!!owner.token, "arrival: owner mints a token for the new vault", owner.error ? `error=${owner.error}` : "ok");
     if (owner.token) {
-      const notesRes = await fetch(`${VAULT}/vault/${vaultName}/api/notes?include_content=true`, {
-        headers: { authorization: `Bearer ${owner.token}` },
+      const AUTH = { authorization: `Bearer ${owner.token}` };
+      const writeRes = await fetch(`${VAULT}/vault/${vaultName}/api/notes`, {
+        method: "POST",
+        headers: { ...AUTH, "content-type": "application/json" },
+        body: JSON.stringify({ path: "My first note", content: firstNote }),
       });
+      assert(writeRes.status === 201, "arrival: owner writes a marker note via the API", `status ${writeRes.status}`);
+
+      const notesRes = await fetch(`${VAULT}/vault/${vaultName}/api/notes?include_content=true`, { headers: AUTH });
       const notes = (await notesRes.json()) as Array<{ path?: string; content?: string }>;
       const mine = notes.find((n) => n.path === "My first note");
       assert(
         notesRes.status === 200 && !!mine && (mine.content ?? "").includes(firstNote),
-        "arrival: 'My first note' written into the vault, content verbatim",
+        "arrival: the marker note lands in the vault, content verbatim",
         `${notes.length} notes: ${notes.map((n) => n.path).join(", ")}`,
       );
       assert(
         notes.length === 7 && notes.some((n) => n.path === "Welcome to your vault 🪂"),
-        "arrival: the first note JOINS the welcome seed (6 seed notes + theirs)",
+        "arrival: the marker note JOINS the welcome seed (6 seed notes + theirs)",
         `${notes.length} notes`,
       );
     }
@@ -1125,7 +1138,7 @@ async function main() {
       redirect: "manual",
       body: form({ __csrf: tCsrf!, name: tVault }),
     });
-    assert(tCv.status === 302 && (tCv.headers.get("location") ?? "").includes(`created=${tVault}`), "tier-change: created a vault", `status ${tCv.status}`);
+    assert(tCv.status === 303 && (tCv.headers.get("location") ?? "").includes(encodeURIComponent(`/vault/${tVault}`)), "tier-change: created a vault (lands in Notes)", `status ${tCv.status} loc ${tCv.headers.get("location")}`);
 
     // Pick POWER — no card. Sets pending_plan=power; the caps re-push immediately.
     const toPower = await fetch(`${IDENTITY}/console/plan`, {
@@ -1435,7 +1448,7 @@ async function main() {
         redirect: "manual",
         body: form({ __csrf: mCsrf!, name: mVault }),
       });
-      assert(mCv.status === 302 && (mCv.headers.get("location") ?? "").includes(`created=${mVault}`), "mock E2E: created a vault", `status ${mCv.status}`);
+      assert(mCv.status === 303 && (mCv.headers.get("location") ?? "").includes(encodeURIComponent(`/vault/${mVault}`)), "mock E2E: created a vault (lands in Notes)", `status ${mCv.status} loc ${mCv.headers.get("location")}`);
 
       const mUp = await fetch(`${IDENTITY}/billing/mock-checkout`, {
         method: "POST",
@@ -1554,7 +1567,7 @@ async function main() {
         redirect: "manual",
         body: form({ __csrf: eCsrf!, name: eVault }),
       });
-      assert(eCv.status === 302 && (eCv.headers.get("location") ?? "").includes(`created=${eVault}`), "enforcement: entry user created a vault", `status ${eCv.status}`);
+      assert(eCv.status === 303 && (eCv.headers.get("location") ?? "").includes(encodeURIComponent(`/vault/${eVault}`)), "enforcement: entry user created a vault (lands in Notes)", `status ${eCv.status} loc ${eCv.headers.get("location")}`);
 
       const eOwner = await authorizeFor(eEmail, ePass, eVault);
       if (!eOwner.token) {

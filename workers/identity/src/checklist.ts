@@ -79,28 +79,3 @@ export async function markChecklistItem(
     .run();
 }
 
-// --- first-run research answer ----------------------------------------------
-
-/**
- * The "What do you take notes in today?" chip values — MIRRORS the landing
- * page's set (landing-preview.html radiogroup `notes_app`), so the research
- * data joins across both funnels.
- */
-export const NOTES_APP_OPTIONS = [
-  { value: "apple-notes", label: "Apple Notes" },
-  { value: "notion", label: "Notion" },
-  { value: "obsidian", label: "Obsidian" },
-  { value: "paper", label: "Paper" },
-  { value: "nothing", label: "Nothing yet" },
-] as const;
-
-const NOTES_APP_VALUES: ReadonlySet<string> = new Set(NOTES_APP_OPTIONS.map((o) => o.value));
-
-/**
- * Persist the research answer on the user row. Only allowlisted values are
- * written (the field is user-editable form data); anything else is a no-op.
- */
-export async function setNotesApp(db: D1Database, userId: string, raw: string): Promise<void> {
-  if (!NOTES_APP_VALUES.has(raw)) return;
-  await db.prepare("UPDATE users SET notes_app = ? WHERE id = ?").bind(raw, userId).run();
-}

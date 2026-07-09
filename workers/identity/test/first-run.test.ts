@@ -6,10 +6,9 @@
  *
  * Covers:
  *   - first-run rendering (zero-vault hero vs has-vault console),
- *   - the two optional research questions: notes_app persisted on the user
- *     row (allowlisted), first_note written INTO the new vault through the
- *     mint seam — including the best-effort contract (a failed/unreachable
- *     vault write never fails vault creation),
+ *   - create lands the user straight in the vault's Notes UI (303), with the
+ *     old first-run prompts gone and legacy notes_app/first_note fields
+ *     tolerated (ignored, never a 400),
  *   - checklist CRUD: doors mark done + redirect, idempotency, dismissal,
  *     CSRF/session/ownership gates,
  *   - the Connect-your-AI card content (Claude steps + MCP URL + copy button
@@ -19,7 +18,6 @@
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import app from "../src/index.ts";
-import { validateAccessToken } from "../src/tokens.ts";
 import { CSRF, ISSUER, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 const NOTES_APP = "https://notes.parachute.computer";
@@ -61,21 +59,17 @@ async function notesAppFor(userId: string): Promise<string | null> {
 // --- first-run rendering -----------------------------------------------------
 
 describe("console first-run (zero vaults)", () => {
-  test("zero vaults → the hero: name input + BOTH optional research questions, no checklist", async () => {
+  test("zero vaults → the hero: just the name input, no research questions, no checklist", async () => {
     const { id: userId } = await seedUser("fresh@example.com");
     const html = await consoleHtml(await seedSession(userId));
     expect(html).toContain("Name your vault");
     expect(html).toContain("Create my vault");
-    // Research question (a): the landing page's chip set, mirrored.
-    expect(html).toContain("What do you take notes in today?");
-    for (const label of ["Apple Notes", "Notion", "Obsidian", "Paper", "Nothing yet"]) {
-      expect(html).toContain(label);
-    }
-    // Research question (b).
-    expect(html).toContain("What's the first thing you want your AI to remember?");
-    expect(html).toContain('name="first_note"');
-    // Both marked optional — guidance, never a wall.
-    expect(html).toContain("(optional)");
+    // The two old research prompts are GONE — creating a vault lands you in
+    // your notes, so nothing stands between the name and the door.
+    expect(html).not.toContain("What do you take notes in today?");
+    expect(html).not.toContain("What's the first thing you want your AI to remember?");
+    expect(html).not.toContain('name="first_note"');
+    expect(html).not.toContain('name="notes_app"');
     // No vault yet → no checklist card, no "Your vaults" list header.
     expect(html).not.toContain('data-testid="checklist"');
     expect(html).not.toContain("Your vaults");
@@ -102,9 +96,10 @@ describe("console first-run (zero vaults)", () => {
     expect(html.indexOf('class="vault"')).toBeLessThan(html.indexOf('data-testid="plans"'));
   });
 
-  test("a validation error re-renders the hero with the answers preserved", async () => {
+  test("a validation error re-renders the hero with the name preserved; legacy fields are ignored", async () => {
     const { id: userId } = await seedUser("preserve@example.com");
     const sessionId = await seedSession(userId);
+    // A legacy client still POSTs the old optional fields — they must not 400.
     const res = await app.fetch(
       post(
         "/console/vaults",
@@ -117,137 +112,68 @@ describe("console first-run (zero vaults)", () => {
     const html = await res.text();
     expect(html).toContain("reserved");
     expect(html).toContain("Name your vault"); // still the hero (no vault created)
-    expect(html).toContain('value="admin"');
-    expect(html).toContain("Remember the garden");
-    expect(html).toMatch(/value="obsidian"\s+checked/);
+    expect(html).toContain('value="admin"'); // the entered name is preserved
+    // The removed prompts don't come back on re-render.
+    expect(html).not.toContain("Remember the garden");
+    expect(html).not.toContain('name="notes_app"');
   });
 });
 
 // --- first-run create: research answers + the first note ---------------------
 
-describe("first-run create — notes_app + first_note", () => {
+describe("first-run create — lands in Notes, tolerant of legacy fields", () => {
   beforeAll(() => {
     fetchMock.activate();
     fetchMock.disableNetConnect();
   });
   afterEach(() => fetchMock.assertNoPendingInterceptors());
 
-  test("notes_app is persisted on the user row (allowlisted value)", async () => {
-    const { id: userId } = await seedUser("research@example.com");
-    const sessionId = await seedSession(userId);
-    const res = await app.fetch(
-      post("/console/vaults", { __csrf: CSRF, name: "research-box", notes_app: "obsidian" }, sessionCookie(sessionId)),
-      env,
-    );
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/console?created=research-box");
-    expect(await notesAppFor(userId)).toBe("obsidian");
-  });
-
-  test("an unknown notes_app value is NOT stored (allowlist), creation still succeeds", async () => {
-    const { id: userId } = await seedUser("research2@example.com");
-    const sessionId = await seedSession(userId);
-    const res = await app.fetch(
-      post("/console/vaults", { __csrf: CSRF, name: "research-box2", notes_app: "malware'); DROP--" }, sessionCookie(sessionId)),
-      env,
-    );
-    expect(res.status).toBe(302);
-    expect(await notesAppFor(userId)).toBeNull();
-  });
-
-  test("first_note is written into the new vault through the mint seam — path, content verbatim, narrow claims", async () => {
-    const { id: userId } = await seedUser("firstnote@example.com");
-    const sessionId = await seedSession(userId);
-
-    let auth: string | undefined;
-    let body: string | undefined;
+  // The only vault call at create is the best-effort plan-cap push
+  // (PUT /api/internal/config). Stub it so the create path completes; the
+  // redirect target is what these tests pin.
+  function stubCapPush(vaultName: string): void {
     fetchMock
       .get(env.VAULT_ORIGIN!)
-      .intercept({
-        path: "/vault/seedling/api/notes",
-        method: "POST",
-        headers: (h: Record<string, string>) => {
-          auth = h.authorization ?? h.Authorization;
-          return true;
-        },
-        body: (raw: string) => {
-          body = raw;
-          return true;
-        },
-      })
-      .reply(201, { id: "n1", path: "My first note" }, { headers: { "content-type": "application/json" } });
+      .intercept({ path: `/vault/${vaultName}/api/internal/config`, method: "PUT" })
+      .reply(200, { name: vaultName }, { headers: { "content-type": "application/json" } });
+  }
 
+  function notesDeepLink(vaultName: string): string {
+    return `${NOTES_APP}/?add=${encodeURIComponent(`https://u.parachute.computer/vault/${vaultName}`)}`;
+  }
+
+  test("a fresh create redirects (303) straight to the new vault's Notes UI", async () => {
+    const { id: userId } = await seedUser("landing@example.com");
+    const sessionId = await seedSession(userId);
+    stubCapPush("landing-box");
+    const res = await app.fetch(
+      post("/console/vaults", { __csrf: CSRF, name: "landing-box" }, sessionCookie(sessionId)),
+      env,
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(notesDeepLink("landing-box"));
+  });
+
+  test("legacy notes_app + first_note fields are ignored — not stored, no note written, still lands in Notes", async () => {
+    const { id: userId } = await seedUser("legacy@example.com");
+    const sessionId = await seedSession(userId);
+    const warn = vi.spyOn(console, "warn");
+    stubCapPush("legacy-box");
+    // An old client still POSTs the removed optional fields. The handler never
+    // reads them: no 400, notes_app not persisted, and (with no /api/notes
+    // interceptor + disableNetConnect) any attempted first-note write would
+    // throw → warn — its silence proves no write was attempted.
     const res = await app.fetch(
       post(
         "/console/vaults",
-        { __csrf: CSRF, name: "seedling", first_note: "I'm rebuilding my garden this summer" },
+        { __csrf: CSRF, name: "legacy-box", notes_app: "obsidian", first_note: "old client note" },
         sessionCookie(sessionId),
       ),
       env,
     );
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/console?created=seedling");
-
-    // The note body: their text VERBATIM at the fixed path.
-    expect(JSON.parse(body!)).toEqual({ path: "My first note", content: "I'm rebuilding my garden this summer" });
-
-    // The mint seam, pinned end-to-end (same contract as the packs button):
-    // aud-pinned, resource-narrowed write scope, 60s TTL, first-party client.
-    const token = auth!.replace(/^Bearer /, "");
-    const { payload } = await validateAccessToken(env.DB, token, ISSUER);
-    expect(payload.aud).toBe("vault.seedling");
-    expect(payload.scope).toBe("vault:seedling:write");
-    expect(payload.vault_scope).toEqual(["seedling"]);
-    expect(payload.sub).toBe(userId);
-    expect(payload.client_id).toBe("parachute-console");
-    expect((payload.exp as number) - (payload.iat as number)).toBe(60);
-  });
-
-  test("BEST-EFFORT: a failed vault write (500) does not fail vault creation", async () => {
-    const { id: userId } = await seedUser("besteffort@example.com");
-    const sessionId = await seedSession(userId);
-    fetchMock
-      .get(env.VAULT_ORIGIN!)
-      .intercept({ path: "/vault/resilient/api/notes", method: "POST" })
-      .reply(500, { error: "Internal server error" }, { headers: { "content-type": "application/json" } });
-
-    const res = await app.fetch(
-      post("/console/vaults", { __csrf: CSRF, name: "resilient", first_note: "still mine" }, sessionCookie(sessionId)),
-      env,
-    );
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/console?created=resilient");
-    const vault = await env.DB.prepare("SELECT name FROM vaults WHERE name = ?").bind("resilient").first();
-    expect(vault).not.toBeNull();
-  });
-
-  test("BEST-EFFORT: an UNREACHABLE vault worker does not fail vault creation (logged)", async () => {
-    const { id: userId } = await seedUser("unreachable@example.com");
-    const sessionId = await seedSession(userId);
-    const warn = vi.spyOn(console, "warn");
-    // No interceptor + disableNetConnect → the fetch throws; the handler
-    // catches, logs, and finishes the redirect anyway.
-    const res = await app.fetch(
-      post("/console/vaults", { __csrf: CSRF, name: "offline-box", first_note: "note into the void" }, sessionCookie(sessionId)),
-      env,
-    );
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/console?created=offline-box");
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("event=first_note_write_failed"))).toBe(true);
-    warn.mockRestore();
-  });
-
-  test("an empty / whitespace first_note makes NO vault call at all", async () => {
-    const { id: userId } = await seedUser("nonote@example.com");
-    const sessionId = await seedSession(userId);
-    const warn = vi.spyOn(console, "warn");
-    // disableNetConnect + no interceptor: any attempted call would surface as
-    // an event=first_note_write_failed warning. Silence proves no call.
-    const res = await app.fetch(
-      post("/console/vaults", { __csrf: CSRF, name: "quiet-box", first_note: "   " }, sessionCookie(sessionId)),
-      env,
-    );
-    expect(res.status).toBe(302);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(notesDeepLink("legacy-box"));
+    expect(await notesAppFor(userId)).toBeNull();
     expect(warn.mock.calls.some((c) => String(c[0]).includes("first_note_write_failed"))).toBe(false);
     warn.mockRestore();
   });
