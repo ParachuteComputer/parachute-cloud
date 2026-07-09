@@ -21,12 +21,12 @@ const ADMIN_STYLE = `<style>
   table.fleet tr:last-child td{border-bottom:0}
   .tablewrap{overflow-x:auto}
   .statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.9rem}
-  .stat{border:1px solid var(--line);border-radius:var(--radius-panel);padding:.8rem 1rem;background:var(--field)}
+  .stat{border:1px solid var(--line);border-radius:var(--radius-panel);padding:.8rem 1rem;background:var(--field);box-shadow:var(--shadow-soft)}
   .stat .k{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
-  .stat .v{font-size:1.5rem;font-family:"Instrument Serif",Georgia,serif}
+  .stat .v{font-size:1.5rem;font-family:var(--font-serif)}
   .stat .sub{font-size:.8rem;color:var(--muted)}
   .adminnav{display:flex;gap:1rem;align-items:baseline;margin:.15rem 0 1.2rem;font-size:.92rem}
-  .badge{display:inline-block;font-size:.72rem;font-weight:600;padding:.1rem .5rem;border-radius:var(--pill);background:var(--fill);color:var(--muted)}
+  .badge{display:inline-block;font-family:var(--font-round);font-size:.72rem;font-weight:600;padding:.1rem .5rem;border-radius:var(--pill);background:var(--fill);color:var(--muted)}
   .badge-warn{background:var(--warn-bg);color:var(--warn-ink)}
   .badge-on{background:var(--accent-soft);color:var(--accent-soft-ink)}
   .rowbtn{font-size:.8rem;padding:.3rem .6rem;background:var(--fill);color:var(--ink);border-radius:var(--radius-code)}
