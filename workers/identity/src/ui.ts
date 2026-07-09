@@ -18,6 +18,7 @@ import {
   planLine,
   planTotalBytes,
   tierCapSummary,
+  tierIntervalPricing,
   trialBannerLine,
   vaultCapMessage,
 } from "./plans.ts";
@@ -146,6 +147,16 @@ const STYLE = `
   ul.history li:first-child{border-top:0}
   ul.history .when{font-family:ui-monospace,Menlo,monospace;font-size:.84rem}
   ul.history form{margin-left:auto}
+  .lead{margin:0 0 1.1rem;color:var(--ink);font-size:1rem;line-height:1.5}
+  .lead p{margin:0}
+  .pricepill{display:inline-block;background:#eaf2e6;border:1px solid #cfe0c4;color:var(--sage-dark);padding:.32rem .7rem;border-radius:999px;font-size:.86rem;font-weight:600}
+  .secnav{display:flex;flex-wrap:wrap;gap:.4rem;margin:0 0 1.3rem}
+  .secnav a{padding:.3rem .8rem;border-radius:999px;background:#eff3ea;color:var(--sage-dark);text-decoration:none;font-size:.88rem;font-weight:600;white-space:nowrap}
+  .secnav a:hover{background:#e4e8dd}
+  .interval-pricing{font-size:.82rem;color:var(--muted);margin:.3rem 0 0}
+  .connect-block{margin:.9rem 0 0;padding-top:.8rem;border-top:1px solid var(--line)}
+  .connect-block:first-of-type{margin-top:.5rem;padding-top:0;border-top:0}
+  .connect-block h4{margin:0 0 .35rem;font-size:.9rem;font-family:"DM Sans",sans-serif;font-weight:600}
 `;
 
 // Exported for admin-ui.ts (the operator console reuses the exact page shell +
@@ -290,7 +301,10 @@ export function renderSignup(opts: { csrfToken: string; error?: string; email?: 
   return page(
     "Create your account — Parachute",
     `<h1>Create your account</h1>
-     <p class="muted" style="margin:0 0 1.1rem">A vault of your own, hosted. Start free — no card needed.</p>
+     <div class="lead" data-testid="signup-context">
+       <p style="margin:.2rem 0 .5rem">A private vault your AI can read and write — your notes, and everything you want it to remember, in one place you own.</p>
+       <p class="pricepill" data-testid="signup-pricing">From $1/mo · 30 days free · no card to start</p>
+     </div>
      <div class="card">
        ${magicForm(csrfToken, email, "Email me a sign-in link", showPassword ? undefined : error)}
        <p class="muted" style="margin:.7rem 0 0">We'll email you a link — no password to choose. It signs you in and creates your account.</p>
@@ -608,20 +622,38 @@ export interface ConsoleProps {
 }
 
 /**
- * The Connect-your-AI walkthrough — Claude first (numbered doors, not a
- * manual), then the "any MCP client" line, with the CLI one-liner as the nerd
- * footnote. Shared between each vault card's disclosure and checklist item ③
- * so the two can never drift.
+ * The Connect-your-AI walkthrough — your vault's MCP URL up top (copy it once,
+ * paste it into any AI), then a stepped path for Claude and one for ChatGPT, the
+ * "any MCP client" line, the CLI one-liner as the nerd footnote, and a link out
+ * to the fuller guide. Shared between each vault card's disclosure and checklist
+ * item ③ so the two can never drift.
+ *
+ * ChatGPT's connector menu naming varies by plan and moves often, so its steps
+ * stay deliberately generic ("your connector settings") rather than pinning an
+ * exact label we'd have to chase.
  */
 function connectAiContent(v: ConsoleVaultCard): string {
-  return `<ol class="steps">
-      <li>Open <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> and go to <strong>Settings → Connectors</strong></li>
-      <li>Choose <strong>Add custom connector</strong></li>
-      <li>Paste your vault&#39;s URL and connect:</li>
-    </ol>
+  return `<p class="muted" style="margin:.2rem 0 .3rem">Your vault&#39;s connection URL — copy it, then paste it into any AI below:</p>
     <div class="copyrow"><pre>${esc(v.mcpUrl)}</pre><button type="button" class="copybtn" data-copy="${esc(v.mcpUrl)}">Copy</button></div>
+    <div class="connect-block">
+      <h4>Claude</h4>
+      <ol class="steps">
+        <li>Open <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> and go to <strong>Settings → Connectors</strong></li>
+        <li>Choose <strong>Add custom connector</strong></li>
+        <li>Paste the URL above and connect</li>
+      </ol>
+    </div>
+    <div class="connect-block">
+      <h4>ChatGPT</h4>
+      <ol class="steps">
+        <li>Open ChatGPT and go to <strong>Settings → Connectors</strong> (available on paid plans)</li>
+        <li>In your connector settings, add a custom connector / MCP server</li>
+        <li>Paste the URL above and connect</li>
+      </ol>
+    </div>
     <p class="muted" style="margin:.65rem 0 0"><strong>Other AIs:</strong> that same URL works in any MCP-compatible client — paste it wherever your AI asks for an MCP server.</p>
-    <p class="muted" style="margin:.45rem 0 0">Command line: <code>${esc(v.connectCmd)}</code></p>`;
+    <p class="muted" style="margin:.45rem 0 0">Command line: <code>${esc(v.connectCmd)}</code></p>
+    <p class="muted" style="margin:.45rem 0 0">Need more detail? See the <a href="https://parachute.computer/guides/connect-your-ai/" target="_blank" rel="noopener">Connect your AI guide</a>.</p>`;
 }
 
 /** iOS/Android add-to-home-screen steps for the Notes PWA (checklist item ④). */
@@ -949,6 +981,7 @@ function renderPlanCards(opts: {
          </div>
          ${badge}
          <p class="muted" style="margin:.35rem 0 0">${esc(tierCapSummary(tier))}</p>
+         <p class="interval-pricing" data-testid="interval-pricing-${tier}">${esc(tierIntervalPricing(tier))}</p>
          ${chooseFree}${paidAffordance}
        </div>`;
   }).join("");
@@ -971,6 +1004,26 @@ function renderPlanCards(opts: {
        <div style="display:flex;flex-wrap:wrap;gap:.7rem">${cards}</div>
        ${noCardLine}
      </section>`;
+}
+
+/**
+ * The console section nav (#97) — a light, wrapping row of anchor links that
+ * turns the one-long-scroll page into something you can jump around. Anchors
+ * resolve to the on-page sections (#vaults, #plans); Security is its own page.
+ * With exactly one vault, an "Open notes" link (#99) puts the everyday
+ * destination one tap away — no scroll to the card. Wraps on narrow screens
+ * (`.secnav` flex-wrap), so it stays usable on mobile.
+ */
+function sectionNav(vaults: ConsoleVaultCard[], hasPlans: boolean): string {
+  const links: string[] = [`<a href="#vaults">Vaults</a>`];
+  if (vaults.length === 1) {
+    links.push(
+      `<a href="${esc(vaults[0]!.notesUrl)}" target="_blank" rel="noopener" data-testid="nav-open-notes">Open notes &nearr;</a>`,
+    );
+  }
+  if (hasPlans) links.push(`<a href="#plans">Plan</a>`);
+  links.push(`<a href="/console/security">Security</a>`);
+  return `<nav class="secnav" data-testid="section-nav" aria-label="Console sections">${links.join("")}</nav>`;
 }
 
 /**
@@ -1120,14 +1173,20 @@ export function renderConsole(props: ConsoleProps): string {
     : "";
   // Product above the upsell (FIX 4): a user who just made their first vault sees
   // getting-started + their vault(s) + the create/at-cap door FIRST, then the
-  // plan cards — pricing sits below the thing they came here to use.
+  // plan cards — pricing sits below the thing they came here to use. The section
+  // nav (#97) rides just under the header so the page is navigable, not just a
+  // scroll; the vault list + create door live under the #vaults anchor it points
+  // to.
   return page(
     "Console — Parachute",
     `${header("Your vaults")}
+     ${sectionNav(vaults, plansSectionHtml !== "")}
      ${notice ? `<div class="notice">${esc(notice)}</div>` : ""}
      ${checklist ? checklistCard(checklist, csrfToken) : ""}
-     ${list}
-     ${createCard}
+     <section id="vaults" data-testid="section-vaults">
+       ${list}
+       ${createCard}
+     </section>
      ${plansSectionHtml}
      ${restoreFoot}
      ${consoleScript(csrfToken)}`,

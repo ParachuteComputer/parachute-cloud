@@ -31,6 +31,7 @@ import {
   isPaidTier,
   planEntitlement,
   planLine,
+  tierIntervalPricing,
   upgradeTeaser,
   vaultCapMessage,
 } from "../src/plans.ts";
@@ -161,6 +162,16 @@ describe("PLAN_SPECS — the ratified ladder", () => {
     expect(vaultCapMessage("expired")).toContain("trial has ended");
   });
 
+  test("tierIntervalPricing — the honest per-interval breakdown, entry omits monthly (#98)", () => {
+    // Amounts mirror the Stripe Prices (wrangler.toml STRIPE_PRICE_<TIER>_<INTERVAL>).
+    expect(tierIntervalPricing("entry")).toBe("$3 / 3 mo · $10/yr"); // no monthly cycle
+    expect(tierIntervalPricing("standard")).toBe("$3/mo · $7 / 3 mo · $25/yr");
+    expect(tierIntervalPricing("plus")).toBe("$5/mo · $12 / 3 mo · $40/yr");
+    expect(tierIntervalPricing("power")).toBe("$10/mo · $25 / 3 mo · $80/yr");
+    // Entry never advertises a monthly cycle it doesn't sell.
+    expect(tierIntervalPricing("entry")).not.toContain("/mo");
+  });
+
   test("entitlementPlanFor — the trial mirrors the CHOSEN tier (pending_plan), else its plus-mirroring self", () => {
     // "Try any plan free for 30 days": an Entry trialist experiences Entry,
     // a Power trialist Power.
@@ -253,6 +264,11 @@ describe("console plan display", () => {
     expect(html).toContain('data-testid="plan-card-power"');
     expect(html).toContain("$1/mo");
     expect(html).toContain("1 GiB notes"); // Power's caps, from PLAN_SPECS
+    // The honest per-interval price breakdown rides each card (#98).
+    expect(html).toContain('data-testid="interval-pricing-power"');
+    expect(html).toContain("$10/mo · $25 / 3 mo · $80/yr");
+    expect(html).toContain('data-testid="interval-pricing-entry"');
+    expect(html).toContain("$3 / 3 mo · $10/yr"); // entry, no monthly
     expect(html).toContain('action="/console/plan"'); // pick a tier — no card
     expect(html).not.toContain("stripe");
     expect(html).not.toContain("/billing/checkout");

@@ -165,19 +165,55 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
   },
 };
 
-/** Monthly headline price copy per purchasable tier (the ACTUAL amounts live on
- *  the Stripe Prices — keep dashboard + copy in step). Entry has no monthly
- *  (Stripe's $0.30 flat fee eats a $1 charge) — it bills quarterly/annually. */
+/** Headline "from" price copy per purchasable tier — the effective monthly rate
+ *  (its cheapest cycle for entry, its monthly for the rest). The honest
+ *  per-interval breakdown ({@link tierIntervalPricing}) sits beside it on the
+ *  card so the "$1/mo" entry headline can't read as a monthly cycle that doesn't
+ *  exist. The ACTUAL amounts live on the Stripe Prices — keep dashboard + copy
+ *  in step. Entry has no monthly (Stripe's $0.30 flat fee eats a $1 charge) — it
+ *  bills quarterly/annually. */
 export const TIER_PRICE_LABEL: Record<PaidTier, string> = {
-  // TODO(console-launch): Entry shows "$1/mo" but has NO monthly interval (it
-  // bills quarterly/yearly — Stripe's flat fee eats a $1 charge). The "/mo"
-  // label is misleading against the interval select that omits monthly for
-  // entry; reword to "$1/mo, billed quarterly" or "$12/yr" so copy matches checkout.
   entry: "$1/mo",
   standard: "$3/mo",
   plus: "$5/mo",
   power: "$10/mo",
 };
+
+/**
+ * The billed amount per cycle, per tier — the number Stripe actually charges for
+ * monthly / quarterly / yearly. These MIRROR the Stripe Prices: each
+ * `STRIPE_PRICE_<TIER>_<INTERVAL>` id in `workers/identity/wrangler.toml` carries
+ * its dollar amount in a trailing comment, and this table must stay in step when
+ * a Price changes (the id itself is opaque, so the amount can only live here in
+ * code). `monthly: null` = no such cycle (entry — Stripe's flat fee eats a $1
+ * monthly charge, so entry bills quarterly/yearly only). Source of truth for the
+ * honest per-interval copy that answers "how do the intervals differ?" (#98).
+ */
+const TIER_INTERVAL_AMOUNTS: Record<
+  PaidTier,
+  { monthly: string | null; quarterly: string; yearly: string }
+> = {
+  entry: { monthly: null, quarterly: "$3", yearly: "$10" },
+  standard: { monthly: "$3", quarterly: "$7", yearly: "$25" },
+  plus: { monthly: "$5", quarterly: "$12", yearly: "$40" },
+  power: { monthly: "$10", quarterly: "$25", yearly: "$80" },
+};
+
+/**
+ * The per-interval price breakdown for a tier's card — e.g.
+ * "$3/mo · $7 / 3 mo · $25/yr" (standard), or "$3 / 3 mo · $10/yr" (entry, which
+ * has no monthly cycle). Shows the real billed amounts so a reader can see how
+ * the intervals differ (and that the yearly cycle costs less per month) without
+ * doing the arithmetic. Amounts from {@link TIER_INTERVAL_AMOUNTS}.
+ */
+export function tierIntervalPricing(tier: PaidTier): string {
+  const a = TIER_INTERVAL_AMOUNTS[tier];
+  const parts: string[] = [];
+  if (a.monthly) parts.push(`${a.monthly}/mo`);
+  parts.push(`${a.quarterly} / 3 mo`);
+  parts.push(`${a.yearly}/yr`);
+  return parts.join(" · ");
+}
 
 export function isPlanId(raw: string): raw is PlanId {
   return (
