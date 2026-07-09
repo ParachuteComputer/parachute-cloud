@@ -166,7 +166,8 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
 };
 
 /** Headline "from" price copy per purchasable tier — the effective monthly rate
- *  (its cheapest cycle for entry, its monthly for the rest). The honest
+ *  (its quarterly cycle for entry — yearly is cheaper still — its monthly for
+ *  the rest). The honest
  *  per-interval breakdown ({@link tierIntervalPricing}) sits beside it on the
  *  card so the "$1/mo" entry headline can't read as a monthly cycle that doesn't
  *  exist. The ACTUAL amounts live on the Stripe Prices — keep dashboard + copy

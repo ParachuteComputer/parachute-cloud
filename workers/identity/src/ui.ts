@@ -155,7 +155,7 @@ const STYLE = `
   .secnav a:hover{background:#e4e8dd}
   .interval-pricing{font-size:.82rem;color:var(--muted);margin:.3rem 0 0}
   .connect-block{margin:.9rem 0 0;padding-top:.8rem;border-top:1px solid var(--line)}
-  .connect-block:first-of-type{margin-top:.5rem;padding-top:0;border-top:0}
+  .copyrow + .connect-block{margin-top:.5rem;padding-top:0;border-top:0}
   .connect-block h4{margin:0 0 .35rem;font-size:.9rem;font-family:"DM Sans",sans-serif;font-weight:600}
 `;
 
