@@ -93,7 +93,16 @@ workers/identity/   the OAuth issuer (authorize/token/DCR/JWKS/revocation on D1)
                     plans note): the four tiers render regardless of Stripe, and
                     a trial picks/changes its mirrored tier with NO card via
                     POST /console/plan (an expired user can't get a free tier
-                    there — reactivate = pay). 427 tests.
+                    there — reactivate = pay). ALSO the console coherence pass
+                    (0.0.8-rc.48, #97-#101): a wrapping section nav (Vaults ·
+                    Plan · Security, + a lone-vault "Open notes" shortcut),
+                    honest per-interval price breakdowns on the plan cards
+                    (plans.ts `tierIntervalPricing` — amounts MIRROR the Stripe
+                    Prices in wrangler.toml), Claude + ChatGPT stepped
+                    connect walkthroughs (`connectAiContent`, links out to
+                    parachute.computer/guides/connect-your-ai), and a
+                    signup-screen context block (what you get + "From $1/mo ·
+                    30 days free · no card to start"). 430 tests.
 src/                the OLD control plane (Worker + D1 + Stripe). Dormant; billing
                     lifecycle design gets harvested into the control-plane revival.
 scripts/            deploy-staging.sh + smoke-staging.ts (full 118-step live smoke,
@@ -110,7 +119,7 @@ bun install                         # ALSO refreshes the copied core dep (see go
 bun run test                        # control-plane tests (src/) + the export→import round-trip (test-bun/) — 125
 bun run typecheck                   # root tsc
 cd workers/vault && bun run typecheck && bun x vitest run    # 278+1 todo under workerd
-cd workers/identity && bun run typecheck && bun x vitest run # 421
+cd workers/identity && bun run typecheck && bun x vitest run # 430
 bash scripts/deploy-staging.sh      # deploy both workers -e staging + migrate + seed
 bun scripts/smoke-staging.ts        # FULL live smoke vs staging (creates test debris)
 bash scripts/deploy-prod.sh         # deploy both workers top-level + migrate (NO seed)

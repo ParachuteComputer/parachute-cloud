@@ -285,6 +285,23 @@ describe("vault name rules", () => {
 // --- console: signup / login / logout / vaults ----------------------------
 
 describe("console — signup", () => {
+  test("GET /signup carries the context block: what you get + the pricing/trust line (#101)", async () => {
+    const res = await app.fetch(new Request(`${ISSUER}/signup`), env);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The "what you're getting" context (a private vault your AI can read/write).
+    expect(html).toContain('data-testid="signup-context"');
+    expect(html).toContain("your AI can read and write");
+    // The light pricing/trust line — from $1/mo, 30 days free, no card to start.
+    expect(html).toContain('data-testid="signup-pricing"');
+    expect(html).toContain("From $1/mo");
+    expect(html).toContain("30 days free");
+    expect(html).toContain("no card to start");
+    // Still light — no plan cards on the signup screen.
+    expect(html).not.toContain('data-testid="plans"');
+    expect(html).not.toContain('data-testid="plan-card-power"');
+  });
+
   test("signup creates a user + session, redirects to /console", async () => {
     const res = await signup("newbie@example.com", "longenough1");
     expect(res.status).toBe(302);
@@ -1261,6 +1278,71 @@ describe("console — vaults", () => {
     expect(html).toContain("Connect your AI");
     // Post-create notice points at the door first.
     expect(html).toContain("open your notes, or connect your AI below");
+  });
+
+  test("the connect walkthrough steps BOTH Claude and ChatGPT + links the fuller guide (#100)", async () => {
+    const session = await sessionFor("connectwalk@example.com");
+    await app.fetch(
+      post("/console/vaults", { __csrf: CSRF, name: "connect-box" }, `parachute_id_session=${session}; parachute_id_csrf=${CSRF}`),
+      env,
+    );
+    const consoleRes = await app.fetch(
+      new Request(`${ISSUER}/console`, { headers: { cookie: `parachute_id_session=${session}` } }),
+      env,
+    );
+    const html = await consoleRes.text();
+    // Claude stepped path.
+    expect(html).toContain("Claude");
+    expect(html).toContain("Add custom connector");
+    // ChatGPT stepped path (kept generic where the menu naming is uncertain).
+    expect(html).toContain("ChatGPT");
+    expect(html).toContain("custom connector / MCP server");
+    // Copy-to-clipboard for the vault MCP URL (the existing affordance pattern).
+    expect(html).toContain('data-copy="https://u.parachute.computer/vault/connect-box/mcp"');
+    // Deep guidance links out to parachute.computer rather than living inline.
+    expect(html).toContain("https://parachute.computer/guides/connect-your-ai/");
+  });
+
+  test("the console carries a section nav; a lone vault gets an Open-notes nav link (#97, #99)", async () => {
+    const session = await sessionFor("navuser@example.com");
+    await app.fetch(
+      post("/console/vaults", { __csrf: CSRF, name: "nav-box" }, `parachute_id_session=${session}; parachute_id_csrf=${CSRF}`),
+      env,
+    );
+    const consoleRes = await app.fetch(
+      new Request(`${ISSUER}/console`, { headers: { cookie: `parachute_id_session=${session}` } }),
+      env,
+    );
+    const html = await consoleRes.text();
+    // The nav row + its section anchors (Vaults · Plan · Security).
+    expect(html).toContain('data-testid="section-nav"');
+    expect(html).toContain('href="#vaults"');
+    expect(html).toContain('href="#plans"');
+    expect(html).toContain('href="/console/security"');
+    // The #vaults anchor target actually exists on the page.
+    expect(html).toContain('id="vaults"');
+    // Exactly one vault → the direct Open-notes link in the nav (#99).
+    expect(html).toContain('data-testid="nav-open-notes"');
+    expect(html).toContain(
+      'href="https://notes.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fnav-box"',
+    );
+  });
+
+  test("with two vaults the nav drops the lone-vault Open-notes shortcut (each card keeps its own)", async () => {
+    const session = await sessionFor("navuser2@example.com");
+    const cookie = `parachute_id_session=${session}; parachute_id_csrf=${CSRF}`;
+    await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "nav-two-a" }, cookie), env);
+    await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "nav-two-b" }, cookie), env);
+    const consoleRes = await app.fetch(
+      new Request(`${ISSUER}/console`, { headers: { cookie: `parachute_id_session=${session}` } }),
+      env,
+    );
+    const html = await consoleRes.text();
+    expect(html).toContain('data-testid="section-nav"');
+    expect(html).not.toContain('data-testid="nav-open-notes"');
+    // Both cards still carry their own primary "Open your notes →" door (the
+    // arrow-suffixed card button — distinct from the checklist's open-notes door).
+    expect(html.match(/Open your notes &rarr;/g)?.length).toBe(2);
   });
 
   test("vault-name input pattern compiles under the RegExp v flag (Chrome's pattern semantics)", async () => {
