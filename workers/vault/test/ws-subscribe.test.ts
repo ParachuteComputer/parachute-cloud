@@ -63,7 +63,14 @@ function attach(res: Response): WsHandle {
     closeWaiters.splice(0).forEach((w) => w(closeInfo!));
   });
 
-  const nextMessage = (timeoutMs = 5000): Promise<any> => {
+  // Generous default: this file's FIRST test pays the whole cold-start bill
+  // (first DO touch + workerd's first WS setup) inside one message wait, and
+  // at 5s it flaked 4 of 6 CI runs on loaded runners (2026-07-09) — including
+  // WITH the pinned lockfile, so it's runner variance, not dep drift. Headroom
+  // costs nothing on a pass (the promise resolves the moment the frame lands);
+  // it only slows how fast a genuine hang reports. expectSilence (a real
+  // sleep) deliberately keeps its short caller-chosen windows.
+  const nextMessage = (timeoutMs = 15000): Promise<any> => {
     const q = queue.shift();
     if (q !== undefined) return Promise.resolve(q);
     return new Promise((resolve, reject) => {
@@ -79,7 +86,7 @@ function attach(res: Response): WsHandle {
     ws,
     send: (obj) => ws.send(typeof obj === "string" ? obj : JSON.stringify(obj)),
     nextMessage,
-    async readSnapshot(timeoutMs = 5000) {
+    async readSnapshot(timeoutMs = 15000) {
       const notes: any[] = [];
       for (;;) {
         const m = await nextMessage(timeoutMs);
@@ -88,7 +95,7 @@ function attach(res: Response): WsHandle {
         if (m.done) return notes;
       }
     },
-    waitClose(timeoutMs = 5000): Promise<{ code: number; reason: string }> {
+    waitClose(timeoutMs = 15000): Promise<{ code: number; reason: string }> {
       if (closeInfo) return Promise.resolve(closeInfo);
       return new Promise((resolve, reject) => {
         const t = setTimeout(() => reject(new Error("ws close timeout")), timeoutMs);
