@@ -81,7 +81,10 @@ export function senderFor(env: Env): EmailSender {
   return devLogSender();
 }
 
-const app = new Hono<{ Bindings: Env }>();
+// Exported (named) so `route-manifest.test.ts` can introspect `app.routes` and
+// prove no server route escapes the ceremony manifest (the P0.4 drift-catcher).
+// The DEFAULT export stays the `{ fetch, scheduled }` handler wrangler runs.
+export const app = new Hono<{ Bindings: Env }>();
 
 // --- liveness (public, unauthenticated, no D1) ---
 // Cheap JSON for external monitors + the smoke scripts. The scheduled health
