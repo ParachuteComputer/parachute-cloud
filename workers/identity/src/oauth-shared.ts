@@ -347,9 +347,16 @@ export function oauthErrorRedirect(
  * non-requestable; a NAMED `vault:<name>:admin` (and unnamed `vault:admin`,
  * which the picker narrows) stays requestable — the vault owner grants it.
  * Mirrors the hub's behavior asserted by its DCR/authorize tests.
+ *
+ * The `account:*` namespace (`account:<id>:{admin,read}`, C1/SCOPE-c) is ALWAYS
+ * non-requestable: account tokens are cookie-minted only (`POST /account/token`,
+ * C2) and must never flow through `/oauth/authorize`. The 3-part account grammar
+ * would slip past the 2-part service-admin rule below, so the whole namespace is
+ * refused up front — an `account:<id>:read` is as un-requestable as its admin.
  */
 export function isNonRequestableScope(scope: string): boolean {
   const parts = scope.split(":");
+  if (parts[0] === "account") return true;
   return parts.length === 2 && parts[1] === "admin" && parts[0] !== "vault";
 }
 
