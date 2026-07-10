@@ -231,8 +231,34 @@ app.post("/__test/snapshot-run", async (c) => {
   return c.json(await runSnapshotSweep(c.env, deps));
 });
 
-// Root → the console (which redirects to /login when signed out).
-app.get("/", (c) => c.redirect("/console", 302));
+/**
+ * Serve the SPA shell (index.html) through the Static Assets binding (P1.1).
+ * Only `/` reaches the worker (run_worker_first includes it for the Host-branch
+ * below); every other SPA path is served by the asset runtime directly via
+ * `not_found_handling = "single-page-application"`, so this is the one place the
+ * worker hands back the shell itself. If the ASSETS binding is absent (a bare or
+ * unit-test config with no [assets]), fall back to the legacy console redirect
+ * so `/` is never a hard error.
+ */
+async function serveSpaShell(env: Env, req: Request): Promise<Response> {
+  if (!env.ASSETS) return new Response(null, { status: 302, headers: { location: "/console" } });
+  return env.ASSETS.fetch(new URL("/index.html", req.url));
+}
+
+// Host-branched root (P1.1). The legacy console front door
+// (env.CONSOLE_REDIRECT_HOST — cloud.parachute.computer in production) keeps its
+// 302→/console during the bridge; every OTHER host that reaches `/` (the
+// app.parachute.computer Custom Domain added in P1.2, and the staging
+// workers.dev origin) serves the SPA shell. `/` is run-worker-first so the
+// worker sees it before Static Assets — the one path where "worker-first" and
+// "server ceremony" diverge (route-manifest.ts ROOT_PATH).
+app.get("/", (c) => {
+  const host = new URL(c.req.url).host;
+  if (c.env.CONSOLE_REDIRECT_HOST && host === c.env.CONSOLE_REDIRECT_HOST) {
+    return c.redirect("/console", 302);
+  }
+  return serveSpaShell(c.env, c.req.raw);
+});
 
 /**
  * Default export: the Hono fetch handler + the ops cron ([triggers] in

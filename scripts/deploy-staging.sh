@@ -34,6 +34,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # deployed stale). One bun install makes every deploy build against current core.
 (cd "$ROOT" && bun install)
 
+# --- SPA bundle (P1.1) — build the notes-ui app the identity worker serves via
+# Workers Static Assets INTO workers/identity/dist-assets BEFORE its deploy (the
+# [assets].directory must exist at `wrangler deploy` time). Built from the sibling
+# parachute-surface checkout at VITE_BASE_PATH=/ (origin-root shape). Fail-fast
+# here — before any worker is deployed — if the SPA build can't be produced.
+# In CI the deploy-staging workflow must have a parachute-surface checkout too
+# (SURFACE_REPO), the same way it clones parachute-vault for @openparachute/core.
+bash "$ROOT/scripts/build-spa.sh"
+
 # --- one-time provisioning (already done 2026-07-02; kept for a fresh account) --
 #   bunx wrangler d1 create parachute-identity-staging   # -> id into [env.staging.d1_databases]
 #                                                        #    in workers/identity/wrangler.toml

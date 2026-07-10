@@ -68,6 +68,18 @@ jobs:
           git clone --depth 1 https://github.com/ParachuteComputer/parachute-vault.git "$GITHUB_WORKSPACE/../parachute-vault"
           echo "parachute-vault @ $(git -C "$GITHUB_WORKSPACE/../parachute-vault" rev-parse HEAD)"
 
+      - name: Clone parachute-surface (the notes-ui SPA the identity worker serves)
+        # P1.1: scripts/build-spa.sh builds @openparachute/notes-ui from this
+        # sibling checkout at VITE_BASE_PATH=/ into workers/identity/dist-assets.
+        # Tracks parachute-surface@main (like the vault clone); the deploy step
+        # sets SPA_ALLOW_VERSION_DRIFT=1 to build main's notes-ui and announce
+        # its version rather than hard-failing the pin. app.parachute.computer is
+        # NOT routed to users until P3.9, so tracking main here is safe.
+        if: steps.gate.outputs.ready == 'true'
+        run: |
+          git clone --depth 1 https://github.com/ParachuteComputer/parachute-surface.git "$GITHUB_WORKSPACE/../parachute-surface"
+          echo "parachute-surface @ $(git -C "$GITHUB_WORKSPACE/../parachute-surface" rev-parse HEAD)"
+
       - uses: oven-sh/setup-bun@v2
         if: steps.gate.outputs.ready == 'true'
         with:
@@ -95,6 +107,9 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Build the SPA from parachute-surface@main and announce its notes-ui
+          # version rather than hard-failing the pin (see deploy-staging.yml).
+          SPA_ALLOW_VERSION_DRIFT: "1"
         run: bash scripts/deploy-prod.sh
 
       - name: Live smoke (read-only, production)
