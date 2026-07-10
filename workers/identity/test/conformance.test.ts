@@ -8,10 +8,15 @@
  */
 import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
+import {
+  checkAuthorizationServerMetadata,
+  checkProtectedResourceMetadata,
+} from "@openparachute/door-contract";
 import app from "../src/index.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "../src/oauth-authorize.ts";
-import { handleToken } from "../src/oauth-token.ts";
+import { ADVERTISED_SCOPES } from "../src/oauth-metadata.ts";
 import { handleRevoke } from "../src/oauth-revoke.ts";
+import { handleToken } from "../src/oauth-token.ts";
 import { REFRESH_GRACE_MS, validateAccessToken } from "../src/tokens.ts";
 import {
   CSRF,
@@ -44,26 +49,22 @@ describe("discovery endpoints", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("access-control-allow-origin")).toBe("*");
     const md = (await res.json()) as Record<string, unknown>;
-    expect(md.issuer).toBe(ISSUER);
-    expect(md.authorization_endpoint).toBe(`${ISSUER}/oauth/authorize`);
-    expect(md.token_endpoint).toBe(`${ISSUER}/oauth/token`);
-    expect(md.registration_endpoint).toBe(`${ISSUER}/oauth/register`);
-    expect(md.revocation_endpoint).toBe(`${ISSUER}/oauth/revoke`);
-    expect(md.jwks_uri).toBe(`${ISSUER}/.well-known/jwks.json`);
-    expect(md.response_types_supported).toEqual(["code"]);
-    expect(md.grant_types_supported).toEqual(["authorization_code", "refresh_token"]);
-    expect(md.code_challenge_methods_supported).toEqual(["S256"]);
-    expect(md.token_endpoint_auth_methods_supported).toEqual(["none", "client_secret_post"]);
-    expect(Array.isArray(md.scopes_supported)).toBe(true);
+    // Wire shape asserted against the SHARED canon (@openparachute/door-contract),
+    // not inline literals — the self-host hub twin binds the SAME vectors. Any
+    // drift in the issuer-derived endpoints or the supported-value arrays fails
+    // here (checkAuthorizationServerMetadata returns the discrepancy list).
+    // `scopes_supported` is the door-advertised set, so it is a parameter.
+    expect(checkAuthorizationServerMetadata(md, ISSUER, ADVERTISED_SCOPES)).toEqual([]);
   });
 
   test("protected-resource metadata (RFC 9728) has the exact shape", async () => {
     const res = await app.fetch(new Request(`${ISSUER}/.well-known/oauth-protected-resource`), env);
     expect(res.status).toBe(200);
     const md = (await res.json()) as Record<string, unknown>;
-    expect(md.resource).toBe(ISSUER);
-    expect(md.authorization_servers).toEqual([ISSUER]);
-    expect(md.bearer_methods_supported).toEqual(["header"]);
+    // Shared canon (door-contract); cloud additionally emits `scopes_supported`
+    // + `resource_documentation`, a superset the canon doesn't model (and the
+    // checker ignores) — not a divergence.
+    expect(checkProtectedResourceMetadata(md, ISSUER)).toEqual([]);
   });
 
   test("JWKS advertises an RS256 signing key", async () => {
