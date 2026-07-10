@@ -821,9 +821,11 @@ async function main() {
     const cvLoc = cvRes.headers.get("location") ?? "";
     assert(
       cvRes.status === 303 &&
-        cvLoc.startsWith("https://notes.parachute.computer/?add=") &&
+        // APP_ORIGIN is self-referential on staging (the app is served AT the
+        // identity origin), so the arrival deep-link points back here (#116).
+        cvLoc.startsWith(`${IDENTITY}/?add=`) &&
         cvLoc.includes(encodeURIComponent(`/vault/${vaultName}`)),
-      "arrival: create lands in the vault's Notes UI (303)",
+      "arrival: create lands in the app on the same origin (303)",
       `status ${cvRes.status} loc ${cvLoc}`,
     );
 
@@ -875,8 +877,8 @@ async function main() {
     });
     const doorLoc = doorRes.headers.get("location") ?? "";
     assert(
-      doorRes.status === 302 && doorLoc.startsWith("https://notes.parachute.computer/?add="),
-      "arrival: a checklist door 302s to the Notes deep-link",
+      doorRes.status === 302 && doorLoc.startsWith(`${IDENTITY}/?add=`),
+      "arrival: a checklist door 302s to the app deep-link (same origin)",
       doorLoc,
     );
     const doneHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie } })).text();

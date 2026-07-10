@@ -112,8 +112,9 @@ describe("day-0 welcome", () => {
     expect(mail.to).toBe("fresh@example.com");
     expect(mail.subject).toBe("Welcome to Parachute");
     expect(mail.replyTo).toBe(DRIP_REPLY_TO);
-    // The three doors: notes (the user's real vault), console, reply-to-a-human.
-    expect(mail.text).toContain("notes.parachute.computer/?add=");
+    // The three doors: the app (the user's real vault), console, reply-to-a-human.
+    // The vault door uses the configured APP_ORIGIN (wrangler default; #116).
+    expect(mail.text).toContain("https://app.parachute.computer/?add=");
     expect(mail.text).toContain(encodeURIComponent(`${env.VAULT_ORIGIN}/vault/freshvault`));
     expect(mail.text).toContain(`${ISSUER}/console`);
     expect(mail.text).toContain("Reply to this email. A person reads it.");
@@ -123,6 +124,19 @@ describe("day-0 welcome", () => {
     // Ledger row written.
     expect(await ledgerRows(u.id)).toEqual(["welcome"]);
     expect(await dripEventCount("welcome:sent")).toBe(1);
+  });
+
+  test("APP_ORIGIN unset ⇒ the welcome link falls back to the legacy Notes PWA (#116)", async () => {
+    const u = await seedUserAt("appwelcome@example.com", minutesAgo(10));
+    await seedVault("appwelcomevault", u.id);
+    const sender = dripSender();
+    // Clearing the wrangler-configured APP_ORIGIN proves the drip link is
+    // env-driven (resolveAppOrigin) and degrades gracefully, not hardcoded.
+    await quietly(() => runDrip({ ...env, APP_ORIGIN: undefined }, sender, at));
+    expect(sender.sent).toHaveLength(1);
+    const mail = sender.sent[0]!;
+    expect(mail.text).toContain("https://notes.parachute.computer/?add=");
+    expect(mail.text).not.toContain("app.parachute.computer");
   });
 
   test("a fresh signup without a vault gets the name-your-vault variant", async () => {

@@ -25,6 +25,14 @@ export interface OAuthDeps {
    * (workers.dev) mode where there's no wildcard cert. Unset → subdomain form.
    */
   vaultOrigin?: string;
+  /**
+   * The origin new arrivals land on — the app deep-link target for the post-create
+   * arrival, the vault cards' Notes door, and the checklist doors. Resolved from
+   * `env.APP_ORIGIN` (default the legacy Notes PWA) via `resolveAppOrigin`. Prod =
+   * `https://app.parachute.computer` (the same-origin app); staging = its own
+   * issuer origin (self-referential — the app is served there). No trailing slash.
+   */
+  appOrigin: string;
   /** Deterministic clock for tests. */
   now?: () => Date;
   /** Origins the issuer answers on (same-origin + resource resolution). Default `[issuer]`. */
@@ -82,6 +90,24 @@ export function resolveBoundOrigins(deps: OAuthDeps): readonly string[] {
 }
 
 /**
+ * The app origin new arrivals land on when `APP_ORIGIN` is unset — the legacy
+ * standalone Notes PWA. A stale/missing config degrades HERE, to a live serving
+ * origin, rather than 404ing a new user's first step.
+ */
+export const DEFAULT_APP_ORIGIN = "https://notes.parachute.computer";
+
+/**
+ * The app deep-link origin — `env.APP_ORIGIN` when set (prod =
+ * `app.parachute.computer`; staging = its own issuer origin, self-referential),
+ * else `DEFAULT_APP_ORIGIN`. Trailing slash normalized off so `${origin}/?add=…`
+ * never doubles up. The single resolver for both `depsForEnv().appOrigin` (the
+ * console/cards) and the drip email link, so they can never disagree.
+ */
+export function resolveAppOrigin(env: Env): string {
+  return (env.APP_ORIGIN ?? DEFAULT_APP_ORIGIN).replace(/\/$/, "");
+}
+
+/**
  * The bound-origin set the same-origin gate accepts (P0.5). `issuer` is ALWAYS a
  * member; `raw` (the comma-separated `BOUND_ORIGINS` env var) contributes any
  * additional origins. Each `raw` entry is trimmed, has trailing slashes dropped,
@@ -120,6 +146,9 @@ export function depsForEnv(env: Env): OAuthDeps {
     issuer,
     vaultBaseDomain: env.VAULT_BASE_DOMAIN,
     vaultOrigin: env.VAULT_ORIGIN,
+    // Where a new arrival lands (post-create 303, vault cards, checklist doors) —
+    // APP_ORIGIN when set, else the legacy Notes PWA (resolveAppOrigin).
+    appOrigin: resolveAppOrigin(env),
     // ISSUER is always accepted; BOUND_ORIGINS (P0.5) adds the app origin during
     // the two-issuer window. Unset ⇒ exactly [issuer] (pre-P0.5 behavior).
     boundOrigins: () => parseBoundOrigins(issuer, env.BOUND_ORIGINS),

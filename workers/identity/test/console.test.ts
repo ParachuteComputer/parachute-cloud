@@ -1247,10 +1247,11 @@ describe("console — vaults", () => {
       post("/console/vaults", { __csrf: CSRF, name: "my-notes" }, `parachute_id_session=${session}; parachute_id_csrf=${CSRF}`),
       env,
     );
-    // Create lands the user straight in the new vault's Notes UI (303).
+    // Create lands the user straight in the new vault's app UI (303) — the
+    // configured APP_ORIGIN (wrangler default app.parachute.computer; #116).
     expect(create.status).toBe(303);
     expect(create.headers.get("location")).toBe(
-      "https://notes.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fmy-notes",
+      "https://app.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fmy-notes",
     );
 
     // The console stays reachable for management; the created-notice + connect
@@ -1267,10 +1268,10 @@ describe("console — vaults", () => {
     // the conformance "happy path" services-catalog assertion.)
     expect(html).toContain("https://u.parachute.computer/vault/my-notes/mcp");
     expect(html).toContain("is ready");
-    // Primary door: the Notes PWA connect deep-link with the url-encoded
-    // vault URL, opening in a new tab.
+    // Primary door: the app connect deep-link with the url-encoded vault URL,
+    // opening in a new tab.
     expect(html).toContain(
-      'href="https://notes.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fmy-notes"',
+      'href="https://app.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fmy-notes"',
     );
     expect(html).toContain("Open your notes");
     expect(html).toContain('target="_blank" rel="noopener"');
@@ -1278,6 +1279,47 @@ describe("console — vaults", () => {
     expect(html).toContain("Connect your AI");
     // Post-create notice points at the door first.
     expect(html).toContain("open your notes, or connect your AI below");
+  });
+
+  test("APP_ORIGIN drives the post-create arrival + card/checklist deep-links (env-read, not hardcoded) (#116)", async () => {
+    const session = await sessionFor("appland@example.com");
+    const cookie = `parachute_id_session=${session}; parachute_id_csrf=${CSRF}`;
+    // A DISTINCT origin (not the wrangler default) proves the value flows from
+    // env through resolveAppOrigin, not a hardcoded host.
+    const APP = "https://home.parachute.test";
+    const appEnv = { ...env, APP_ORIGIN: APP };
+    const deepLink = `${APP}/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fappvault`;
+
+    // Post-create 303 lands on the configured APP origin — the same-origin arrival.
+    const create = await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "appvault" }, cookie), appEnv);
+    expect(create.status).toBe(303);
+    expect(create.headers.get("location")).toBe(deepLink);
+
+    // The vault card's "Open your notes" door (+ the lone-vault nav shortcut)
+    // point at the app origin; nothing on the page still names notes.parachute.
+    const html = await (
+      await app.fetch(new Request(`${ISSUER}/console`, { headers: { cookie: `parachute_id_session=${session}` } }), appEnv)
+    ).text();
+    expect(html).toContain(`href="${deepLink}"`);
+    expect(html).not.toContain("notes.parachute.computer");
+
+    // A checklist door (open-notes) 302s to the app origin too.
+    const door = await app.fetch(post("/console/checklist", { __csrf: CSRF, item: "open-notes" }, cookie), appEnv);
+    expect(door.status).toBe(302);
+    expect(door.headers.get("location")).toBe(deepLink);
+  });
+
+  test("APP_ORIGIN unset ⇒ the arrival falls back to the legacy Notes PWA (the graceful default)", async () => {
+    const session = await sessionFor("defaultland@example.com");
+    const cookie = `parachute_id_session=${session}; parachute_id_csrf=${CSRF}`;
+    // Clear the wrangler-configured APP_ORIGIN ⇒ resolveAppOrigin degrades to the
+    // notes PWA rather than 404ing a new user's first step.
+    const unsetEnv = { ...env, APP_ORIGIN: undefined };
+    const create = await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "defaultvault" }, cookie), unsetEnv);
+    expect(create.status).toBe(303);
+    expect(create.headers.get("location")).toBe(
+      "https://notes.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fdefaultvault",
+    );
   });
 
   test("the connect walkthrough steps BOTH Claude and ChatGPT + links the fuller guide (#100)", async () => {
@@ -1324,7 +1366,7 @@ describe("console — vaults", () => {
     // Exactly one vault → the direct Open-notes link in the nav (#99).
     expect(html).toContain('data-testid="nav-open-notes"');
     expect(html).toContain(
-      'href="https://notes.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fnav-box"',
+      'href="https://app.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fnav-box"',
     );
   });
 

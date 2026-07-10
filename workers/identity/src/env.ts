@@ -38,6 +38,18 @@ export interface Env {
    */
   CONSOLE_REDIRECT_HOST?: string;
   /**
+   * The origin new arrivals land on — the app deep-link target for the
+   * post-create 303, the vault cards' "Open your notes" door, the getting-started
+   * checklist doors, and the day-0 welcome email link. Production =
+   * `https://app.parachute.computer` (the same-origin app + ceremonies); staging =
+   * its own workers.dev identity origin (the app is served AT the issuer there, so
+   * the value is self-referential and correct). UNSET ⇒ the legacy standalone
+   * Notes PWA (`https://notes.parachute.computer`), so a stale config degrades to
+   * the working origin rather than a 404. Consumed via `resolveAppOrigin` /
+   * `depsForEnv().appOrigin`. No trailing slash required (normalized on read).
+   */
+  APP_ORIGIN?: string;
+  /**
    * The Workers Static Assets fetcher (P1.1) — bound from wrangler.toml
    * [assets].binding = "ASSETS". The `/` handler uses it to serve the SPA shell
    * (index.html) for non-console hosts; every other SPA path is served by the

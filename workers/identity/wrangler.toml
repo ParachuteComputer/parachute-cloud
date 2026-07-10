@@ -180,6 +180,16 @@ CONSOLE_REDIRECT_HOST = "cloud.parachute.computer"
 #   BOUND_ORIGINS = "https://app.parachute.computer"
 # Widening the accept-set never weakens CSRF (an independent conjunct) and never
 # admits a foreign origin — only the origins listed here.
+# APP_ORIGIN (#116) — where a new arrival lands: the app deep-link target for the
+# post-create 303, the vault cards' "Open your notes" door, the checklist doors,
+# and the day-0 welcome email link. Now that app.parachute.computer serves the app
+# + ceremonies on ONE origin, this completes the same-origin journey (signup →
+# create → land at app.parachute.computer/?add=…, zero cross-origin hops after
+# marketing). UNSET ⇒ the legacy standalone Notes PWA (a stale config degrades to
+# a live serving origin, not a 404). NOTE: PWAs installed from notes.parachute.
+# computer keep working (that origin still serves; Phase 4 bridges them) — this
+# only changes where NEW arrivals land.
+APP_ORIGIN = "https://app.parachute.computer"
 # Cloud addressing base. With VAULT_ORIGIN set (below) the service-catalog +
 # console cards use the path form; unset it to fall back to `https://<name>.<base>`.
 VAULT_BASE_DOMAIN = "u.parachute.computer"
@@ -340,6 +350,12 @@ ISSUER = "https://parachute-identity-staging.openparachute.workers.dev"
 # same-origin accept-set is exactly [ISSUER] until the app rehearsal needs the
 # second origin (Phase 2 sets it to the staging app origin to exercise the
 # app.-origin account POST + the twin CSRF tests).
+# APP_ORIGIN (#116) — SELF-REFERENTIAL on staging: the app is served AT this
+# issuer origin (Static Assets on the staging workers.dev host, CONSOLE_REDIRECT_
+# HOST unset), so the post-create arrival + card/checklist deep-links + the drip
+# link all point back to this same origin (`<issuer>/?add=…`) — zero cross-origin
+# hops, exactly the production shape rehearsed on one origin.
+APP_ORIGIN = "https://parachute-identity-staging.openparachute.workers.dev"
 VAULT_BASE_DOMAIN = "parachute-vault-do-staging.openparachute.workers.dev"
 VAULT_ORIGIN = "https://parachute-vault-do-staging.openparachute.workers.dev"
 ENVIRONMENT = "staging"
