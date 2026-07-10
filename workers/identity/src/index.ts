@@ -57,6 +57,7 @@ import { handleScheduled } from "./ops.ts";
 import { handleUnsubscribe, runDrip } from "./drip.ts";
 import { runSnapshotSweep } from "./snapshots.ts";
 import { runUsageRollup } from "./usage.ts";
+import { handleAccountSession } from "./account-session.ts";
 import { handleAccountToken } from "./account-token.ts";
 import {
   handleAccountVaultCreate,
@@ -180,6 +181,7 @@ app.post("/account/token", (c) => handleAccountToken(c.env.DB, c.req.raw, depsFo
 // mutations), account id from the TOKEN not the body. GET list, POST create
 // (returns a ready vault_token — lands the app IN the vault), per-vault mint,
 // and DELETE (501 — no delete door on the hosted side yet). account-api.ts.
+app.get("/account/session", (c) => handleAccountSession(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));
