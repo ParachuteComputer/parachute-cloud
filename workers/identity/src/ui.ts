@@ -690,10 +690,20 @@ function connectAiContent(v: ConsoleVaultCard): string {
     <p class="muted" style="margin:.45rem 0 0">Need more detail? See the <a href="https://parachute.computer/guides/connect-your-ai/" target="_blank" rel="noopener">Connect your AI guide</a>.</p>`;
 }
 
-/** iOS/Android add-to-home-screen steps for the Notes PWA (checklist item ④). */
+/** iOS/Android add-to-home-screen steps for the app PWA (checklist item ④). */
 function addToPhoneContent(v: ConsoleVaultCard): string {
-  return `<p class="muted" style="margin:.15rem 0 .45rem">Parachute Notes installs straight from the browser — no app store.</p>
-    <p style="margin:.3rem 0;font-size:.92rem"><strong>iPhone / iPad:</strong> open <a href="${esc(v.notesUrl)}" target="_blank" rel="noopener">notes.parachute.computer</a> in Safari → tap <strong>Share</strong> → <strong>Add to Home Screen</strong>.</p>
+  // The visible label tracks the actual deep-link host (app origin, or the
+  // legacy Notes PWA when APP_ORIGIN is unset) — never a hardcoded host that
+  // could diverge from where the link goes.
+  const appHost = (() => {
+    try {
+      return new URL(v.notesUrl).host;
+    } catch {
+      return "your Parachute app";
+    }
+  })();
+  return `<p class="muted" style="margin:.15rem 0 .45rem">Parachute installs straight from the browser — no app store.</p>
+    <p style="margin:.3rem 0;font-size:.92rem"><strong>iPhone / iPad:</strong> open <a href="${esc(v.notesUrl)}" target="_blank" rel="noopener">${esc(appHost)}</a> in Safari → tap <strong>Share</strong> → <strong>Add to Home Screen</strong>.</p>
     <p style="margin:.3rem 0;font-size:.92rem"><strong>Android:</strong> open it in Chrome → menu <strong>⋮</strong> → <strong>Add to Home screen</strong> (or <strong>Install app</strong>).</p>`;
 }
 

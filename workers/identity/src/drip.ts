@@ -33,7 +33,7 @@
 import { randomBase64url } from "./crypto.ts";
 import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
-import { htmlResponse } from "./oauth-shared.ts";
+import { htmlResponse, resolveAppOrigin } from "./oauth-shared.ts";
 
 /** The three drip emails, in send order (most time-sensitive first). */
 export const DRIP_KINDS = ["welcome", "connect-nudge", "feedback"] as const;
@@ -333,12 +333,12 @@ async function firstVaultName(db: D1Database, userId: string): Promise<string | 
   return row?.name ?? null;
 }
 
-/** Mirrors the console's Notes-PWA door (console.ts cardFor). */
+/** Mirrors the console's app door (console.ts cardFor) — same appOrigin resolver. */
 function notesUrlFor(vaultName: string, env: Env): string {
   const base = env.VAULT_ORIGIN
     ? `${env.VAULT_ORIGIN.replace(/\/$/, "")}/vault/${vaultName}`
     : `https://${vaultName}.${env.VAULT_BASE_DOMAIN.replace(/^\.+/, "")}`;
-  return `https://notes.parachute.computer/?add=${encodeURIComponent(base)}`;
+  return `${resolveAppOrigin(env)}/?add=${encodeURIComponent(base)}`;
 }
 
 async function copyFor(kind: DripKind, env: Env, userId: string, unsubscribeUrl: string): Promise<DripCopy> {

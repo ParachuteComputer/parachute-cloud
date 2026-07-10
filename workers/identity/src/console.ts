@@ -202,23 +202,24 @@ export async function handleLogoutPost(db: D1Database, req: Request, deps: OAuth
 // --- console ---------------------------------------------------------------
 
 /**
- * The standalone Notes PWA deploy. `/?add=<vault URL>` jumps straight into the
- * connect flow for that vault — the console's everyday-user door onto a fresh
- * vault (the CLI/MCP card stays as the "Connect your AI" secondary).
+ * Build a vault's connect card. The `/?add=<vault URL>` deep-links jump straight
+ * into the connect flow for that vault, targeting the APP origin (`deps.appOrigin`
+ * — the same-origin app at `app.parachute.computer`, or the legacy Notes PWA when
+ * APP_ORIGIN is unset). The CLI/MCP coordinates stay as the "Connect your AI"
+ * secondary.
  */
-const NOTES_APP_URL = "https://notes.parachute.computer";
-
 function cardFor(name: string, deps: OAuthDeps): ConsoleVaultCard {
   const base = vaultInstanceUrl(name, deps);
+  const app = deps.appOrigin;
   return {
     name,
-    notesUrl: `${NOTES_APP_URL}/?add=${encodeURIComponent(base)}`,
-    // The PWA's connect flow honors a `redirect` companion: connect the vault
+    notesUrl: `${app}/?add=${encodeURIComponent(base)}`,
+    // The app's connect flow honors a `redirect` companion: connect the vault
     // (or skip if already connected), then land on the given view. write-note
     // lands on the new-note editor (/new — notes-ui 0.1.10 shipped the
     // redirect fix); import-notes lands on /import.
-    writeUrl: `${NOTES_APP_URL}/?add=${encodeURIComponent(base)}&redirect=${encodeURIComponent("/new")}`,
-    importUrl: `${NOTES_APP_URL}/?add=${encodeURIComponent(base)}&redirect=${encodeURIComponent("/import")}`,
+    writeUrl: `${app}/?add=${encodeURIComponent(base)}&redirect=${encodeURIComponent("/new")}`,
+    importUrl: `${app}/?add=${encodeURIComponent(base)}&redirect=${encodeURIComponent("/import")}`,
     mcpUrl: `${base}/mcp`,
     connectCmd: `claude mcp add --transport http parachute-${name} ${base}/mcp`,
   };

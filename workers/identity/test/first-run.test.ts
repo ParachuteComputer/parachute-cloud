@@ -20,7 +20,8 @@ import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import app from "../src/index.ts";
 import { CSRF, ISSUER, seedSession, seedUser, seedVault } from "./helpers.ts";
 
-const NOTES_APP = "https://notes.parachute.computer";
+// The app deep-link origin — the wrangler-configured APP_ORIGIN (#116).
+const APP_ORIGIN = "https://app.parachute.computer";
 
 function post(path: string, fields: Record<string, string>, cookie: string): Request {
   return new Request(`${ISSUER}${path}`, {
@@ -139,7 +140,7 @@ describe("first-run create — lands in Notes, tolerant of legacy fields", () =>
   }
 
   function notesDeepLink(vaultName: string): string {
-    return `${NOTES_APP}/?add=${encodeURIComponent(`https://u.parachute.computer/vault/${vaultName}`)}`;
+    return `${APP_ORIGIN}/?add=${encodeURIComponent(`https://u.parachute.computer/vault/${vaultName}`)}`;
   }
 
   test("a fresh create redirects (303) straight to the new vault's Notes UI", async () => {
@@ -219,7 +220,7 @@ describe("create-vault — the progressive-enhancement JSON variant", () => {
   }
 
   function notesDeepLink(vaultName: string): string {
-    return `${NOTES_APP}/?add=${encodeURIComponent(`https://u.parachute.computer/vault/${vaultName}`)}`;
+    return `${APP_ORIGIN}/?add=${encodeURIComponent(`https://u.parachute.computer/vault/${vaultName}`)}`;
   }
 
   /** A create POST marked as a fetch (the create-form JS path) — via the
@@ -349,7 +350,7 @@ describe("getting-started checklist (POST /console/checklist)", () => {
     );
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe(
-      `${NOTES_APP}/?add=${encodeURIComponent("https://u.parachute.computer/vault/doorvault")}`,
+      `${APP_ORIGIN}/?add=${encodeURIComponent("https://u.parachute.computer/vault/doorvault")}`,
     );
     expect(await checklistRow(userId, "open-notes")).not.toBeNull();
     // The console now renders the item as done.
@@ -368,13 +369,13 @@ describe("getting-started checklist (POST /console/checklist)", () => {
       post("/console/checklist", { __csrf: CSRF, item: "write-note" }, sessionCookie(sessionId)),
       env,
     );
-    expect(write.headers.get("location")).toBe(`${NOTES_APP}/?add=${base}&redirect=%2Fnew`);
+    expect(write.headers.get("location")).toBe(`${APP_ORIGIN}/?add=${base}&redirect=%2Fnew`);
 
     const imp = await app.fetch(
       post("/console/checklist", { __csrf: CSRF, item: "import-notes" }, sessionCookie(sessionId)),
       env,
     );
-    expect(imp.headers.get("location")).toBe(`${NOTES_APP}/?add=${base}&redirect=%2Fimport`);
+    expect(imp.headers.get("location")).toBe(`${APP_ORIGIN}/?add=${base}&redirect=%2Fimport`);
     expect(await checklistRow(userId, "write-note")).not.toBeNull();
     expect(await checklistRow(userId, "import-notes")).not.toBeNull();
   });

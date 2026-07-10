@@ -26,6 +26,10 @@ export function deps(now?: () => Date): OAuthDeps {
   return {
     issuer: ISSUER,
     vaultBaseDomain: VAULT_BASE,
+    // APP_ORIGIN unset in the test env ⇒ the graceful default (the legacy Notes
+    // PWA), mirroring resolveAppOrigin. The APP_ORIGIN-set path is exercised by
+    // passing a widened env to app.fetch (see the deep-link tests).
+    appOrigin: "https://notes.parachute.computer",
     boundOrigins: () => [ISSUER],
     now,
     rateLimiter: env.RATE_LIMITER,
