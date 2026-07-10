@@ -14,6 +14,20 @@ export interface Env {
   RATE_LIMITER: RateLimiterNamespace;
   /** Issuer origin — the `iss` claim + discovery-doc base. No trailing slash. */
   ISSUER: string;
+  /**
+   * Extra origins the same-origin gate accepts, comma-separated (P0.5). The
+   * cookie-authed console/account POSTs gate on `isSameOriginRequest` against the
+   * bound-origin set; `ISSUER` is ALWAYS in that set, and any origin listed here
+   * is added to it (union). UNSET/empty ⇒ the set is exactly `[ISSUER]` —
+   * byte-identical to the pre-P0.5 behavior. This is what lets the app served at
+   * a SECOND origin (e.g. `app.parachute.computer`) POST to the issuer's account
+   * surface during the two-issuer window without a same-origin 403. Foreign
+   * origins are still refused — this only widens the accept-set to the origins
+   * named here. Each entry is normalized to a bare origin (trailing slash + blanks
+   * dropped); an unparseable entry is ignored, never poisons the set. See
+   * `parseBoundOrigins` in oauth-shared.ts.
+   */
+  BOUND_ORIGINS?: string;
   /** Cloud vault addressing: `vault:<name>` → `https://<name>.<VAULT_BASE_DOMAIN>`. */
   VAULT_BASE_DOMAIN: string;
   /**

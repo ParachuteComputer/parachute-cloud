@@ -81,6 +81,32 @@ export function resolveBoundOrigins(deps: OAuthDeps): readonly string[] {
 }
 
 /**
+ * The bound-origin set the same-origin gate accepts (P0.5). `issuer` is ALWAYS a
+ * member; `raw` (the comma-separated `BOUND_ORIGINS` env var) contributes any
+ * additional origins. Each `raw` entry is trimmed, has trailing slashes dropped,
+ * and is canonicalized to a bare origin via `URL(...).origin` (so it matches what
+ * `isSameOriginRequest` compares the request's Origin against); blank and
+ * unparseable entries are skipped rather than poisoning the set, and a repeat of
+ * `issuer` is deduped. UNSET/empty `raw` ⇒ returns exactly `[issuer]` — the
+ * pre-P0.5 behavior, byte-for-byte. Widening this set never weakens the CSRF
+ * check (a separate conjunct at every gate) — it only adds origins that a POST's
+ * Origin/Referer may match.
+ */
+export function parseBoundOrigins(issuer: string, raw: string | undefined): readonly string[] {
+  const origins = new Set<string>([issuer]);
+  for (const part of (raw ?? "").split(",")) {
+    const trimmed = part.trim().replace(/\/+$/, "");
+    if (!trimmed) continue;
+    try {
+      origins.add(new URL(trimmed).origin);
+    } catch {
+      // A malformed entry is ignored — never poison the whole accept-set.
+    }
+  }
+  return [...origins];
+}
+
+/**
  * The request-time deps built from worker config — THE single construction
  * (formerly index.ts's private `depsFor`; moved here so the scheduled handler
  * (ops.ts, the usage rollup's vault calls) can build the same deps without
@@ -93,7 +119,9 @@ export function depsForEnv(env: Env): OAuthDeps {
     issuer,
     vaultBaseDomain: env.VAULT_BASE_DOMAIN,
     vaultOrigin: env.VAULT_ORIGIN,
-    boundOrigins: () => [issuer],
+    // ISSUER is always accepted; BOUND_ORIGINS (P0.5) adds the app origin during
+    // the two-issuer window. Unset ⇒ exactly [issuer] (pre-P0.5 behavior).
+    boundOrigins: () => parseBoundOrigins(issuer, env.BOUND_ORIGINS),
     exposeDevLinks: env.ENVIRONMENT !== "production",
     rateLimiter: env.RATE_LIMITER,
     billingConfigured: billingConfig(env) !== null,

@@ -101,6 +101,14 @@ new_sqlite_classes = ["RateLimiterDO"]
 # ISSUER — every token's `iss` + the discovery-doc base. A cloud vault has no hub,
 # so `iss` must equal a real, reachable origin: the branded console host.
 ISSUER = "https://cloud.parachute.computer"
+# BOUND_ORIGINS (P0.5) — extra origins the same-origin gate accepts, beyond ISSUER
+# (which is ALWAYS accepted). Comma-separated; each entry is normalized to a bare
+# origin. LEAVE UNSET until the app is served at its own origin: unset ⇒ the
+# accept-set is exactly [ISSUER], byte-identical to pre-P0.5. Phase 2/P1.3 sets
+# this to the two-issuer set once app.parachute.computer is live, e.g.:
+#   BOUND_ORIGINS = "https://app.parachute.computer"
+# Widening the accept-set never weakens CSRF (an independent conjunct) and never
+# admits a foreign origin — only the origins listed here.
 # Cloud addressing base. With VAULT_ORIGIN set (below) the service-catalog +
 # console cards use the path form; unset it to fall back to `https://<name>.<base>`.
 VAULT_BASE_DOMAIN = "u.parachute.computer"
@@ -224,6 +232,10 @@ service = "parachute-vault-do-staging"
 # iss=<staging identity>, and the staging vault worker's ISSUER_ORIGIN matches).
 [env.staging.vars]
 ISSUER = "https://parachute-identity-staging.openparachute.workers.dev"
+# BOUND_ORIGINS (P0.5) — see the production [vars] note. UNSET here too: staging's
+# same-origin accept-set is exactly [ISSUER] until the app rehearsal needs the
+# second origin (Phase 2 sets it to the staging app origin to exercise the
+# app.-origin account POST + the twin CSRF tests).
 VAULT_BASE_DOMAIN = "parachute-vault-do-staging.openparachute.workers.dev"
 VAULT_ORIGIN = "https://parachute-vault-do-staging.openparachute.workers.dev"
 ENVIRONMENT = "staging"
