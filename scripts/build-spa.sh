@@ -94,4 +94,11 @@ cp -R "$NOTES_UI/dist/." "$DEST/"
 # the worker and would just be served as a stray /CNAME asset. Drop it.
 rm -f "$DEST/CNAME"
 
-echo "build-spa: wrote $(find "$DEST" -type f | wc -l | tr -d ' ') files to workers/identity/dist-assets (index.html + assets/ + sw.js + manifest)."
+# Emit the SPA Content-Security-Policy _headers file (P1.1.5) from the ACTUAL
+# built index.html — the inline theme-script hash is derived here so it can never
+# drift from what's served (Cloudflare treats a root `_headers` file as config,
+# not a served asset). See scripts/gen-spa-headers.ts + workers/identity/src/spa-csp.ts.
+echo "build-spa: emitting dist-assets/_headers (SPA Content-Security-Policy)…"
+bun "$ROOT/scripts/gen-spa-headers.ts" "$DEST"
+
+echo "build-spa: wrote $(find "$DEST" -type f | wc -l | tr -d ' ') files to workers/identity/dist-assets (index.html + assets/ + sw.js + manifest + _headers)."

@@ -150,6 +150,29 @@ describe("the Host-branched root (P1.1)", () => {
     expect(await res.text()).toContain('id="root"');
   });
 
+  test("the worker-served SPA shell (`/`) carries the SPA Content-Security-Policy (P1.1.5)", async () => {
+    // `/` is worker-served via env.ASSETS.fetch — `_headers` can't be relied on
+    // to reach it, so serveSpaShell stamps the SPA CSP explicitly. The stub
+    // index.html has no inline script, so the hash-less shape is exercised here;
+    // the real inline-script hash is pinned in test-bun/spa-csp.test.ts.
+    const res = await worker.fetch(new Request("https://app.example/"), env);
+    const csp = res.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("default-src 'self'");
+    expect(csp).toContain("script-src 'self'"); // no 'unsafe-inline'/'unsafe-eval'
+    expect(csp).not.toContain("unsafe-eval");
+    expect(csp).toContain("connect-src 'self' https: wss:"); // the WIDE tier (PW4/D10)
+    expect(csp).toContain("object-src 'none'");
+    expect(csp).toContain("frame-ancestors 'none'");
+    // NOT the strict ceremony policy — the SPA shell is a distinct surface.
+    expect(csp).not.toContain("default-src 'none'");
+  });
+
+  test("the console-host redirect (`/`) carries NO SPA CSP — it's not the shell", async () => {
+    const res = await worker.fetch(new Request(`${ISSUER}/`), env);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("content-security-policy")).toBeNull();
+  });
+
   test("with CONSOLE_REDIRECT_HOST unset (staging), `/` serves the SPA at every host", async () => {
     // Prove the staging shape: no console-redirect host ⇒ even the 'cloud' host
     // serves the SPA at root. Uses an env override (the wrangler [vars] set it).

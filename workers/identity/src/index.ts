@@ -59,6 +59,7 @@ import { runUsageRollup } from "./usage.ts";
 import { handleCheckoutPost, handleMockCheckoutPost, handlePortalPost } from "./billing.ts";
 import { handleStripeWebhookPost } from "./billing-webhook.ts";
 import { handlePromoRedeemPost } from "./promo.ts";
+import { spaCspForHtml } from "./spa-csp.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
 // (wrangler.toml [[durable_objects.bindings]] class_name = "RateLimiterDO").
@@ -232,17 +233,34 @@ app.post("/__test/snapshot-run", async (c) => {
 });
 
 /**
- * Serve the SPA shell (index.html) through the Static Assets binding (P1.1).
+ * Serve the SPA shell (index.html) through the Static Assets binding (P1.1),
+ * carrying the SPA Content-Security-Policy (P1.1.5).
+ *
  * Only `/` reaches the worker (run_worker_first includes it for the Host-branch
  * below); every other SPA path is served by the asset runtime directly via
  * `not_found_handling = "single-page-application"`, so this is the one place the
- * worker hands back the shell itself. If the ASSETS binding is absent (a bare or
- * unit-test config with no [assets]), fall back to the legacy console redirect
- * so `/` is never a hard error.
+ * worker hands back the shell itself. Because it is WORKER-served, the
+ * `dist-assets/_headers` CSP (which Cloudflare applies to asset-served responses)
+ * cannot be relied on to reach it — so the worker stamps the SAME policy here,
+ * derived from the shell's own bytes ({@link spaCspForHtml}) so the inline-script
+ * hash always matches what's served. `set` overrides any CSP `_headers` may have
+ * added through the binding, so the two never conflict.
+ *
+ * If the ASSETS binding is absent (a bare or unit-test config with no [assets]),
+ * fall back to the legacy console redirect so `/` is never a hard error.
  */
 async function serveSpaShell(env: Env, req: Request): Promise<Response> {
   if (!env.ASSETS) return new Response(null, { status: 302, headers: { location: "/console" } });
-  return env.ASSETS.fetch(new URL("/index.html", req.url));
+  const asset = await env.ASSETS.fetch(new URL("/index.html", req.url));
+  const html = await asset.text();
+  const res = new Response(html, asset); // preserves status + content-type from the asset
+  res.headers.set("content-security-policy", await spaCspForHtml(html));
+  // We re-emit the shell as a fresh (uncompressed) body, so drop any length/
+  // encoding the asset response carried — a stale content-length would truncate
+  // and a copied content-encoding would mislabel the now-plain body.
+  res.headers.delete("content-length");
+  res.headers.delete("content-encoding");
+  return res;
 }
 
 // Host-branched root (P1.1). The legacy console front door
