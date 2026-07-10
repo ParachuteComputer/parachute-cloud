@@ -28,6 +28,23 @@ export interface Env {
    * `parseBoundOrigins` in oauth-shared.ts.
    */
   BOUND_ORIGINS?: string;
+  /**
+   * The ONE host whose `/` keeps 302→/console during the bridge (P1.1) — the
+   * legacy console front door (`cloud.parachute.computer` in production). Every
+   * other host that reaches the worker at `/` (the app. Custom Domain from P1.2,
+   * the staging workers.dev origin) serves the SPA shell instead. Compared as a
+   * bare host (no scheme). UNSET (staging) ⇒ every host serves the SPA at root —
+   * which is exactly what makes the Static-Assets serving provable on staging.
+   */
+  CONSOLE_REDIRECT_HOST?: string;
+  /**
+   * The Workers Static Assets fetcher (P1.1) — bound from wrangler.toml
+   * [assets].binding = "ASSETS". The `/` handler uses it to serve the SPA shell
+   * (index.html) for non-console hosts; every other SPA path is served by the
+   * asset runtime directly (never reaching the worker). Optional so unit tests /
+   * bare configs without the binding still type-check.
+   */
+  ASSETS?: Fetcher;
   /** Cloud vault addressing: `vault:<name>` → `https://<name>.<VAULT_BASE_DOMAIN>`. */
   VAULT_BASE_DOMAIN: string;
   /**

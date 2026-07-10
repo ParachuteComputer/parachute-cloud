@@ -95,6 +95,82 @@ function underPrefix(path: string, prefix: string): boolean {
 }
 
 /**
+ * The Host-branched root. `/` is run-worker-first (so the worker's `/` handler
+ * sees it and can branch on Host — the canonical console host 302s to /console;
+ * every other host serves the SPA shell), but it is NOT a ceremony: it can
+ * resolve to the SPA. It therefore lives in the `run_worker_first` rule set
+ * (below) but never in `CEREMONY_PREFIXES` — the one path where "worker-first"
+ * and "server-owned ceremony" deliberately diverge.
+ */
+export const ROOT_PATH = "/" as const;
+
+/**
+ * Turn the manifest into the exact `run_worker_first` rule array wrangler wants
+ * (`workers/identity/wrangler.toml` [assets].run_worker_first, both prod and
+ * [env.staging]). THE single source: `run-worker-first.test.ts` asserts the
+ * committed TOML arrays are byte-equal to this, so adding a ceremony prefix here
+ * fails the build until the config is regenerated — the P0.4 drift-catcher
+ * extended from the router to the serving config.
+ *
+ * The shape (Cloudflare Workers Static Assets `run_worker_first`, a
+ * `boolean | string[]`; the array form shipped 2025-06-17):
+ *   - each CEREMONY_PREFIXES entry → TWO globs, the exact path AND `<prefix>/*`.
+ *     Cloudflare's `*` is a DEEP wildcard but needs trailing content, so
+ *     `/console/*` does NOT match the bare `/console` — both are required to
+ *     cover a prefix and its sub-tree.
+ *   - `/` (ROOT_PATH) — the Host-branch (worker decides SPA vs 302 /console).
+ *   - each SPA_EXCEPTIONS entry → a `!`-negation. Negative patterns have
+ *     PRECEDENCE over positives and order is insignificant (CF semantics), so
+ *     `!/oauth/callback` reliably drops the callback OUT of worker-first even
+ *     though `/oauth/*` would otherwise claim it — the callback falls through to
+ *     Static Assets → `not_found_handling = "single-page-application"` → the SPA
+ *     shell boots and its router completes the PKCE `?code=&state=` return.
+ */
+export function runWorkerFirstRules(): string[] {
+  const rules: string[] = [];
+  for (const prefix of CEREMONY_PREFIXES) rules.push(prefix, `${prefix}/*`);
+  rules.push(ROOT_PATH);
+  for (const ex of SPA_EXCEPTIONS) rules.push(`!${ex}`);
+  return rules;
+}
+
+/**
+ * Match a path against one Cloudflare `run_worker_first` glob (no leading `!`).
+ * `*` is a deep wildcard (matches across `/`); everything else is literal. A
+ * pattern with no `*` is an EXACT path match — so `/console` matches only
+ * `/console`, while `/console/*` matches `/console/...` (and never bare
+ * `/console`, mirroring CF's "the `*` needs trailing content").
+ */
+function matchesGlob(path: string, pattern: string): boolean {
+  const rx = "^" + pattern.replace(/[.*+?^${}()|[\]\\]/g, (ch) => (ch === "*" ? ".*" : `\\${ch}`)) + "$";
+  return new RegExp(rx).test(path);
+}
+
+/**
+ * The runtime twin of the `run_worker_first` config: true when Cloudflare would
+ * run the WORKER first for `pathname` (rather than serving a static asset). CF's
+ * rule: worker-first iff SOME positive pattern matches AND NO negative (`!`)
+ * pattern matches. Classification is path-only (query/hash stripped) so
+ * `/oauth/callback?code=…` stays asset-first (SPA), exactly as the deployed
+ * matcher will treat it.
+ *
+ * Invariant (pinned by the tests): for every path except `/`, this equals
+ * `isCeremonyPath` — the root is the sole worker-first-but-not-ceremony path.
+ */
+export function runsWorkerFirst(pathname: string, rules: readonly string[] = runWorkerFirstRules()): boolean {
+  const path = pathname.split(/[?#]/, 1)[0] ?? pathname;
+  let positive = false;
+  for (const rule of rules) {
+    if (rule.startsWith("!")) {
+      if (matchesGlob(path, rule.slice(1))) return false; // negation wins, order-insensitive
+    } else if (matchesGlob(path, rule)) {
+      positive = true;
+    }
+  }
+  return positive;
+}
+
+/**
  * The runtime classifier the tests (and any defensive in-worker check) share
  * with the generated `run_worker_first` globs: an SPA exception wins first,
  * otherwise a ceremony-prefix match makes it server-owned. Wildcard route paths

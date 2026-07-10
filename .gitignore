@@ -1,6 +1,11 @@
 node_modules
 .wrangler
 .dev.vars
+# P1.1: the notes-ui SPA bundle the identity worker serves via Workers Static
+# Assets is a generated artifact (scripts/build-spa.sh builds it before deploy;
+# workers/identity/vitest.config.ts writes a stub for the test suite). Never
+# committed — it churns per notes-ui bump and is reproducible from the pin.
+workers/identity/dist-assets/
 *.log
 dist
 .env

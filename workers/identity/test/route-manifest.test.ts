@@ -32,10 +32,13 @@ function routeUnderPrefix(routePath: string, prefix: string): boolean {
 const registeredPaths: readonly string[] = [...new Set(app.routes.map((r) => r.path))];
 
 /**
- * The one route whose SPA-vs-ceremony disposition is deliberately DEFERRED to
- * P1.1 (`/` becomes Host-branched: app.→SPA, cloud.→302 /console). Excluded
- * from the drift-catcher until then; the plan (PHASES-INFRA-BREAKDOWN P0.4/P1.1)
- * records the deferral.
+ * The one route that is worker-first but NOT a ceremony. P1.1 resolved `/`'s
+ * disposition: it is Host-branched (the console host 302s to /console; every
+ * other host serves the SPA shell), so it lives in `run_worker_first` (via
+ * route-manifest `ROOT_PATH`) yet can resolve to the SPA — it is intentionally
+ * NOT in CEREMONY_PREFIXES. Excluded from the drift-catcher for that reason; the
+ * matcher invariant in static-assets-routing.test.ts pins the divergence
+ * (`runsWorkerFirst("/") === true`, `isCeremonyPath("/") === false`).
  */
 const DEFERRED_ROUTES = new Set(["/"]);
 
