@@ -35,7 +35,13 @@
  */
 import type Stripe from "stripe";
 import type { Env } from "./env.ts";
-import { type OAuthDeps, isSameOriginRequest, redirectResponse, resolveBoundOrigins } from "./oauth-shared.ts";
+import {
+  type OAuthDeps,
+  ceremonyOrigin,
+  isSameOriginRequest,
+  redirectResponse,
+  resolveBoundOrigins,
+} from "./oauth-shared.ts";
 import { verifyCsrfToken } from "./csrf.ts";
 import { sessionUser } from "./session-user.ts";
 import {
@@ -194,8 +200,14 @@ export async function handleCheckoutPost(
       ...(user.stripeCustomerId
         ? { customer: user.stripeCustomerId, customer_update: { address: "auto" as const } }
         : { customer_email: user.email }),
-      success_url: `${deps.issuer}/console?upgraded=1`,
-      cancel_url: `${deps.issuer}/console?checkout_canceled=1`,
+      // Return the browser to the origin the checkout STARTED on (app. or
+      // cloud.), not the fixed issuer, so an app.-origin upgrade lands back on
+      // app./console (P1.3 same-origin ceremonies). The same-origin gate above
+      // already proved the request Origin is a bound member; ceremonyOrigin
+      // falls back to the issuer otherwise. These are browser-followed URLs, not
+      // token claims — `metadata.plan` + client_reference_id carry identity.
+      success_url: `${ceremonyOrigin(req, deps)}/console?upgraded=1`,
+      cancel_url: `${ceremonyOrigin(req, deps)}/console?checkout_canceled=1`,
       // Stripe Tax (see the module note — the account-side enablement is an
       // Aaron step next to the keys).
       automatic_tax: { enabled: true },
@@ -308,7 +320,8 @@ export async function handlePortalPost(
   try {
     const session = await stripe.billingPortal.sessions.create({
       customer: user.stripeCustomerId,
-      return_url: `${deps.issuer}/console`,
+      // Same-origin return (P1.3): back to the origin the portal was opened from.
+      return_url: `${ceremonyOrigin(req, deps)}/console`,
     });
     console.log(`event=billing_portal_opened user=${user.id}`);
     return redirectResponse(session.url);

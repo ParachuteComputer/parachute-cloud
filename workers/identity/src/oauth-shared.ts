@@ -180,6 +180,40 @@ export function isSameOriginRequest(req: Request, boundOrigins: readonly string[
 }
 
 /**
+ * The origin a ceremony's OWN user-facing URLs should be built from (P1.3) — the
+ * origin the user is CURRENTLY on, so a multi-step journey stays on ONE origin
+ * instead of bouncing the user to the issuer mid-flow. This matters the moment
+ * the issuer answers on more than one origin: `app.parachute.computer` is a
+ * co-equal SERVING origin for the ceremonies while `cloud.parachute.computer`
+ * remains the TOKEN issuer (iss / discovery `issuer` / JWKS / `aud` all stay
+ * cloud. through Phase 4). A magic link requested from app. must point back to
+ * app.; a checkout started on app. must return to app.
+ *
+ * Returns the request's own origin when it's an ACCEPTED origin (a member of the
+ * bound set — the SAME test `isSameOriginRequest` gates the POST on), else falls
+ * back to `deps.issuer`. A missing/opaque/foreign Origin ⇒ the issuer, so the URL
+ * is always built from a TRUSTED origin, never an attacker-supplied one. In
+ * practice every caller runs the same-origin gate first, so by the time this is
+ * reached the request Origin is already a bound member — the fallback is
+ * defense-in-depth, not a normal branch.
+ *
+ * ONLY for a ceremony's own SERVING URLs (the magic-link href, the post-payment
+ * return). NEVER for token `iss`, JWKS, OAuth discovery `issuer`, or `aud` —
+ * those stay pinned to `deps.issuer`.
+ */
+export function ceremonyOrigin(req: Request, deps: OAuthDeps): string {
+  const raw = req.headers.get("origin") ?? req.headers.get("referer");
+  if (!raw) return deps.issuer;
+  let origin: string;
+  try {
+    origin = new URL(raw).origin;
+  } catch {
+    return deps.issuer;
+  }
+  return resolveBoundOrigins(deps).includes(origin) ? origin : deps.issuer;
+}
+
+/**
  * CORS POSTURE — the issuer's documented contract (#35, settled 2026-07-02).
  *
  * The cloud issuer runs a deliberate three-way SPLIT:

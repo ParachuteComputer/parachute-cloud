@@ -172,14 +172,17 @@ ISSUER = "https://cloud.parachute.computer"
 # Static-Assets serving provable before any Custom Domain exists). Compared as a
 # bare host (no scheme); unset ⇒ every host serves the SPA at root.
 CONSOLE_REDIRECT_HOST = "cloud.parachute.computer"
-# BOUND_ORIGINS (P0.5) — extra origins the same-origin gate accepts, beyond ISSUER
-# (which is ALWAYS accepted). Comma-separated; each entry is normalized to a bare
-# origin. LEAVE UNSET until the app is served at its own origin: unset ⇒ the
-# accept-set is exactly [ISSUER], byte-identical to pre-P0.5. Phase 2/P1.3 sets
-# this to the two-issuer set once app.parachute.computer is live, e.g.:
-#   BOUND_ORIGINS = "https://app.parachute.computer"
-# Widening the accept-set never weakens CSRF (an independent conjunct) and never
-# admits a foreign origin — only the origins listed here.
+# BOUND_ORIGINS (P0.5 / P1.3) — extra origins the same-origin gate accepts, beyond
+# ISSUER (which is ALWAYS accepted). Comma-separated; each entry is normalized to a
+# bare origin. SET to app.parachute.computer now that it's a co-equal SERVING origin
+# for the ceremonies (P1.3): the app. Custom Domain is the SAME identity worker, so
+# every cookie-authed POST from app. (magic-link request, signup, login, consent,
+# checkout) must pass the same-origin gate — without this the accept-set is only
+# [ISSUER=cloud.] and every app.-origin POST is rejected as "session expired". The
+# token issuer stays cloud. (iss / discovery `issuer` / JWKS / aud unchanged); this
+# widens ONLY the origins a POST's Origin/Referer may match. Widening the accept-set
+# never weakens CSRF (an independent conjunct) and never admits a foreign origin.
+BOUND_ORIGINS = "https://app.parachute.computer"
 # APP_ORIGIN (#116) — where a new arrival lands: the app deep-link target for the
 # post-create 303, the vault cards' "Open your notes" door, the checklist doors,
 # and the day-0 welcome email link. Now that app.parachute.computer serves the app
@@ -346,10 +349,11 @@ ISSUER = "https://parachute-identity-staging.openparachute.workers.dev"
 # staging workers.dev origin, so the Static-Assets serving is provable here
 # before any Custom Domain exists. Production sets it to cloud.parachute.computer
 # so only that host keeps 302→/console.
-# BOUND_ORIGINS (P0.5) — see the production [vars] note. UNSET here too: staging's
-# same-origin accept-set is exactly [ISSUER] until the app rehearsal needs the
-# second origin (Phase 2 sets it to the staging app origin to exercise the
-# app.-origin account POST + the twin CSRF tests).
+# BOUND_ORIGINS (P0.5 / P1.3) — see the production [vars] note. DELIBERATELY UNSET on
+# staging: staging is SINGLE-origin (APP_ORIGIN == ISSUER — the app is served AT the
+# staging issuer host), so ISSUER already covers the one origin every POST comes from
+# and there is no second origin to add. The two-origin (app. ≠ cloud.) path can't be
+# rehearsed on staging; it's covered by the origin-aware unit tests and a prod smoke.
 # APP_ORIGIN (#116) — SELF-REFERENTIAL on staging: the app is served AT this
 # issuer origin (Static Assets on the staging workers.dev host, CONSOLE_REDIRECT_
 # HOST unset), so the post-create arrival + card/checklist deep-links + the drip

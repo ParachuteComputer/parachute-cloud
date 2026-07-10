@@ -67,6 +67,7 @@ import {
 } from "./ui.ts";
 import {
   type OAuthDeps,
+  ceremonyOrigin,
   htmlResponse,
   isSameOriginRequest,
   redirectResponse,
@@ -156,7 +157,14 @@ export async function handleMagicRequestPost(
     // magic_links row, no email, and no dev echo header (there is no link).
     if (existing?.suspendedAt) return htmlResponse(renderMagicSent({ email }), 200);
     const { rawToken } = await createMagicLink(db, email, existing?.id ?? null, now, next);
-    const link = `${deps.issuer}/auth/verify?token=${encodeURIComponent(rawToken)}`;
+    // Build the emailed link from the origin the request came in on (app. or
+    // cloud.), NOT the fixed issuer — so a user who asked from app.parachute.
+    // computer gets a link back to app., landing the session on the origin they
+    // started on (P1.3 same-origin ceremonies). The gate above already proved
+    // the Origin is a bound member; ceremonyOrigin falls back to the issuer for
+    // any opaque/foreign origin. The stored `next` resume target is unchanged —
+    // its authorize URL stays issuer-anchored (the OAuth ceremony origin).
+    const link = `${ceremonyOrigin(req, deps)}/auth/verify?token=${encodeURIComponent(rawToken)}`;
     const sent = await sender.sendMagicLink(email, link);
     if (!sent.ok) {
       // A real-binding failure (bad address, quota, CF transient) must leave a
