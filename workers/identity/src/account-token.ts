@@ -56,12 +56,16 @@ import { signAccessToken } from "./tokens.ts";
  * the hub twin's 10-min window; the app re-mints when it's about to lapse. */
 export const ACCOUNT_TOKEN_TTL_SECONDS = 10 * 60;
 /**
- * The first-party client id stamped on the account token. The cloud door's
- * platform-issuer identity — the same id the console's internal mints use
- * (vault-call.ts), unforgeable because DCR client ids are server-generated
- * UUIDs (clients.ts).
+ * The client id stamped on the account token — the cloud account surface's own
+ * platform-issuer identity, DISTINCT from the `parachute-console` id the
+ * vault-worker internal seam is gated on (vault-call.ts FIRST_PARTY_CLIENT_ID).
+ * Kept distinct on purpose (C2 review, matches the hub twin): a legible identity
+ * in logs, and — since the account surface's tenant-facing VAULT tokens (C3
+ * account-api.ts) share this id — a guarantee those tokens can never satisfy the
+ * first-party internal-config gate even when they carry `vault:<name>:admin`.
+ * Unforgeable because DCR client ids are server-generated UUIDs (clients.ts).
  */
-export const ACCOUNT_TOKEN_CLIENT_ID = "parachute-console";
+export const ACCOUNT_TOKEN_CLIENT_ID = "parachute-account";
 
 /** The account scope for a given owner: `account:<owner-id>:admin`. */
 export function accountAdminScope(ownerId: string): string {

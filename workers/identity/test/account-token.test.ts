@@ -13,7 +13,7 @@
  */
 import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
-import { handleAccountToken, ACCOUNT_TOKEN_TTL_SECONDS } from "../src/account-token.ts";
+import { handleAccountToken, ACCOUNT_TOKEN_CLIENT_ID, ACCOUNT_TOKEN_TTL_SECONDS } from "../src/account-token.ts";
 import { ACCOUNT_TOKEN_AUDIENCE, hasAccountScope, validateAccountToken } from "../src/account-auth.ts";
 import { CSRF_COOKIE, CSRF_FIELD } from "../src/csrf.ts";
 import { SESSION_COOKIE } from "../src/sessions.ts";
@@ -175,6 +175,17 @@ describe("POST /account/token — mint + round-trip through C1's validator", () 
     expect(hasAccountScope(validated.token.scopes, userId, "admin")).toBe(true);
     expect(hasAccountScope(validated.token.scopes, userId, "read")).toBe(true); // admin ⊇ read
     expect(hasAccountScope(validated.token.scopes, "some-other-owner", "admin")).toBe(false);
+  });
+
+  test("the account token's client_id is parachute-account, NOT the first-party console id", async () => {
+    // C2-review fold-in: the account surface has its OWN client identity,
+    // distinct from the vault-worker first-party id (parachute-console) so its
+    // tokens can never satisfy the internal-config gate. Legible in logs too.
+    const { sessionId } = await seedOwner();
+    const res = await handleAccountToken(db(), goodReq(sessionId), deps());
+    const { token } = (await res.json()) as { token: string };
+    expect(decodeJwtPayload(token).client_id).toBe(ACCOUNT_TOKEN_CLIENT_ID);
+    expect(ACCOUNT_TOKEN_CLIENT_ID).toBe("parachute-account");
   });
 
   test("the minted token is an account token (aud=account), never a vault token", async () => {

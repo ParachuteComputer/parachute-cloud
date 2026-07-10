@@ -57,6 +57,12 @@ import { handleUnsubscribe, runDrip } from "./drip.ts";
 import { runSnapshotSweep } from "./snapshots.ts";
 import { runUsageRollup } from "./usage.ts";
 import { handleAccountToken } from "./account-token.ts";
+import {
+  handleAccountVaultCreate,
+  handleAccountVaultDelete,
+  handleAccountVaultTokenMint,
+  handleAccountVaultsList,
+} from "./account-api.ts";
 import { handleCheckoutPost, handleMockCheckoutPost, handlePortalPost } from "./billing.ts";
 import { handleStripeWebhookPost } from "./billing-webhook.ts";
 import { handlePromoRedeemPost } from "./promo.ts";
@@ -167,6 +173,15 @@ app.post("/console/promo", (c) => handlePromoRedeemPost(c.env.DB, c.req.raw, dep
 // body) → same-origin. Stateless (no registry row); revocation is logout +
 // the read-time suspend chokepoint (account-token.ts, SCOPE-a/d).
 app.post("/account/token", (c) => handleAccountToken(c.env.DB, c.req.raw, depsFor(c.env)));
+// The /account/* vault-lifecycle REST surface (C3): Bearer-gated by the account
+// token above (validateAccountToken + hasAccountScope — read for GET, admin for
+// mutations), account id from the TOKEN not the body. GET list, POST create
+// (returns a ready vault_token — lands the app IN the vault), per-vault mint,
+// and DELETE (501 — no delete door on the hosted side yet). account-api.ts.
+app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));
+app.delete("/account/vaults/:name", (c) => handleAccountVaultDelete(c.env.DB, c.req.raw, depsFor(c.env)));
 
 // --- operator admin console (Wave 4c) ---
 // EVERY route (GET and POST) resolves the session and requires role='operator'
