@@ -30,6 +30,15 @@ workers_dev = true
 pattern = "cloud.parachute.computer"
 custom_domain = true
 
+# The Parachute app front door (P1.2, parachute-cloud#116). A SECOND Custom Domain
+# on the SAME worker: cloud. keeps 302→/console (it IS CONSOLE_REDIRECT_HOST), while
+# app. reaches the `/` Host-branch as a non-console host and serves the SPA shell
+# from Static Assets. Additive — `wrangler deploy` adopts this alongside cloud.
+# without striping it (Custom Domains attach to exactly one worker; both point here).
+[[routes]]
+pattern = "app.parachute.computer"
+custom_domain = true
+
 # Workers Logs: persist invocation logs + console.* so `wrangler tail`, the
 # dashboard, and the logs API can actually surface them. Before this stanza the
 # account had NO persistent logs — structured failure lines like
