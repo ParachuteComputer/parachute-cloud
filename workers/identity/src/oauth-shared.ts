@@ -10,6 +10,7 @@
  */
 import { VAULT_VERBS } from "./audience.ts";
 import { billingConfig, mockBillingEnabled } from "./billing-config.ts";
+import { randomBase64url } from "./crypto.ts";
 import type { Env } from "./env.ts";
 import type { RateLimiterNamespace } from "./rate-limit.ts";
 
@@ -231,10 +232,91 @@ export function jsonResponse(body: unknown, status = 200, extra: Record<string, 
   });
 }
 
+/**
+ * CONTENT-SECURITY-POLICY (P0.2) — every server-rendered page carries one.
+ *
+ * The marker a template stamps on an inline `<script>` so {@link htmlResponse}
+ * can swap it for the response's real nonce: `<script ${NONCE_ATTR}>`. The
+ * surrounding double-quotes are LOAD-BEARING for injection safety — `esc()`
+ * turns every `"` in user-supplied content into `&quot;`, so this exact byte
+ * sequence can only originate from a trusted template literal, never from user
+ * data. That's why the substitution below (which grants a nonce) can never be
+ * spoofed into nonce-ing an attacker-supplied `<script>`: an attacker cannot
+ * emit a raw `"` to forge the marker.
+ */
+export const NONCE_ATTR = 'nonce="__CSP_NONCE__"';
+
+export interface CspOptions {
+  /**
+   * `connect-src` sources (defaults to `['self']`). The ceremony pages this PR
+   * governs only fetch same-origin (the console script's `/console/*` calls), so
+   * the strict default fits. Kept an OPTION, not a constant, for PW4's two-tier
+   * connect-src: Phase 1's SPA route (served from Static Assets on the same
+   * origin) will widen this to the vault REST + live-query WS origins —
+   * `contentSecurityPolicy(nonce, { connectSrc: ["'self'", "https://u.parachute.computer", "wss://u.parachute.computer"] })`.
+   */
+  connectSrc?: readonly string[];
+}
+
+/**
+ * The Content-Security-Policy for a server-rendered page. Returns the policy
+ * STRING (not a hardcoded constant) so a per-route caller can widen it without
+ * touching the strict ceremony default.
+ *
+ * The posture:
+ *   - `default-src 'none'` — deny by default; every source below is explicit.
+ *   - `script-src 'self' 'nonce-…'` — the one inline script (the console's
+ *     create-moment/clipboard/checklist JS) is admitted ONLY by a per-response
+ *     nonce; NO `'unsafe-inline'` for script (the protection that matters).
+ *     `'self'` is forward-compat for Phase 1's bundled SPA JS.
+ *   - `style-src 'self' 'unsafe-inline'` — the pages carry inline `<style>`
+ *     blocks AND 100+ inline `style="…"` attributes. A nonce covers `<style>`
+ *     ELEMENTS but NOT style attributes, so `'unsafe-inline'` is required unless
+ *     all attribute styles are refactored out (a later cleanup, not this PR).
+ *     Style injection is far lower-risk than script injection — accepted.
+ *   - `img-src 'self' data:` — no `<img>` today (the TOTP QR is inline `<svg>`),
+ *     kept for favicons + forward-compat.
+ *   - `connect-src` — see {@link CspOptions.connectSrc}.
+ *   - `form-action 'self'` — every form POSTs same-origin (billing's checkout
+ *     form posts same-origin, THEN the worker 302s to Stripe — form-action
+ *     governs the form's target, not the server redirect, so Checkout is safe).
+ *   - `frame-ancestors 'none'` / `base-uri 'none'` / `object-src 'none'` —
+ *     no framing, no `<base>`, no plugins.
+ */
+export function contentSecurityPolicy(nonce: string, opts: CspOptions = {}): string {
+  const connectSrc = opts.connectSrc ?? ["'self'"];
+  return [
+    "default-src 'none'",
+    `script-src 'self' 'nonce-${nonce}'`,
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    `connect-src ${connectSrc.join(" ")}`,
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+    "object-src 'none'",
+  ].join("; ");
+}
+
+/**
+ * Every HTML response funnels through here, so this is where the CSP header is
+ * attached and the per-response nonce is minted + threaded into the body. A
+ * fresh 128-bit nonce is generated per response; the header's `'nonce-…'` and
+ * the `<script nonce="…">` in the body are the SAME value by construction (one
+ * generation, substituted in both), so they can never drift. Pages with no
+ * inline script simply have no marker to substitute — they still carry the
+ * header (an unreferenced nonce is harmless).
+ */
 export function htmlResponse(body: string, status = 200, extra: Record<string, string> = {}): Response {
-  return new Response(body, {
+  const nonce = randomBase64url(16);
+  const html = body.includes(NONCE_ATTR) ? body.replaceAll(NONCE_ATTR, `nonce="${nonce}"`) : body;
+  return new Response(html, {
     status,
-    headers: { "content-type": "text/html; charset=utf-8", ...extra },
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy": contentSecurityPolicy(nonce),
+      ...extra,
+    },
   });
 }
 
