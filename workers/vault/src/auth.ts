@@ -143,9 +143,28 @@ function constantTimeEquals(a: string, b: string): boolean {
   return diff === 0;
 }
 
-// One guard per isolate, keyed by (issuer, test-jwks). scope-guard's JWKS cache
-// is module-global, so reuse maximizes cache hits across requests in a warm
-// isolate.
+/**
+ * Parse the ADDITIVE `ALLOWED_ISSUERS` set (comma-separated origins) into a
+ * normalized array — trailing slashes stripped (matching `hubOrigin`'s own
+ * normalization), blanks dropped. Returns `undefined` when unset/empty so the
+ * guard is built WITHOUT the `allowedIssuers` option, byte-identical to the
+ * single-ISSUER_ORIGIN behavior that predated this seam.
+ */
+function parseAllowedIssuers(raw: string | undefined): string[] | undefined {
+  if (!raw) return undefined;
+  const set = raw
+    .split(",")
+    .map((s) => s.trim().replace(/\/$/, ""))
+    .filter((s) => s.length > 0);
+  return set.length > 0 ? set : undefined;
+}
+
+// One guard per isolate, keyed by (issuer, test-jwks, allowed-issuer-set).
+// scope-guard's JWKS cache is module-global, so reuse maximizes cache hits
+// across requests in a warm isolate. A deployed isolate serves one fixed env, so
+// the allowed-set component is constant in production; folding it into the key
+// keeps the cache correct if the set ever varies (and lets the auth-matrix tests
+// exercise distinct sets within one isolate).
 let cachedGuard: { key: string; guard: ReturnType<typeof createScopeGuard> } | undefined;
 
 function getGuard(env: Env) {
@@ -155,18 +174,28 @@ function getGuard(env: Env) {
   // in git) — so a prod deploy that never sets ENVIRONMENT ignores TEST_JWKS and
   // always fetches real keys from ISSUER_ORIGIN.
   const testMode = !!env.TEST_JWKS && env.ENVIRONMENT === "test";
-  const key = `${issuer}::${testMode ? "test" : "prod"}`;
+  // ADDITIVE iss set (P0.1). scope-guard unions this with `hubOrigin`; the
+  // signature verify runs FIRST regardless of `iss` (validate.ts), so a wider
+  // set never weakens the gate — a foreign-key token 401s no matter its `iss`.
+  // When undefined, the `allowedIssuers` option is omitted entirely below, so
+  // the createScopeGuard call is identical to before this var existed.
+  const allowedExtra = parseAllowedIssuers(env.ALLOWED_ISSUERS);
+  const key = `${issuer}::${testMode ? "test" : "prod"}::${allowedExtra?.join(",") ?? ""}`;
   if (cachedGuard && cachedGuard.key === key) return cachedGuard.guard;
+  // Re-evaluated per validate by scope-guard; the isolate's env is fixed so the
+  // captured array is stable (and the cache key above tracks it if it isn't).
+  const allowedIssuers = allowedExtra ? { allowedIssuers: () => allowedExtra } : {};
   const guard = testMode
     ? createScopeGuard({
         hubOrigin: issuer,
+        ...allowedIssuers,
         // Static key set + empty revocation list — the auth matrix runs without
         // a live Identity Worker. createLocalJWKSet lacks jose's remote `.reload`
         // escape hatch; scope-guard's forced-reload no-ops when it's absent.
         jwksGetter: createLocalJWKSet(JSON.parse(env.TEST_JWKS!)) as unknown as JwksGetter,
         revocationFetcher: async () => ({ generated_at: new Date().toISOString(), jtis: [] }),
       })
-    : createScopeGuard({ hubOrigin: issuer, jwksOrigin: issuer });
+    : createScopeGuard({ hubOrigin: issuer, jwksOrigin: issuer, ...allowedIssuers });
   cachedGuard = { key, guard };
   return guard;
 }

@@ -26,6 +26,17 @@ export interface Env {
   // --- vars (wrangler [vars] / secrets) ---
   /** Identity Worker origin — token `iss` pin + JWKS/revocation fetch base. */
   ISSUER_ORIGIN: string;
+  /**
+   * ADDITIVE set of extra `iss` values to accept beyond ISSUER_ORIGIN
+   * (comma-separated origins; trailing slashes/blanks tolerated). Unset/empty →
+   * the single-ISSUER_ORIGIN exact match this worker has always enforced.
+   * scope-guard unions this set with `hubOrigin`, and the signature verify runs
+   * FIRST regardless of `iss` — so widening the set never weakens the gate. Its
+   * only purpose is a box/app reachable under several of the hub's OWN origins
+   * at once (P0.1: acceptance is set-tolerant ahead of app.parachute.computer;
+   * the discovery advertisement still names only ISSUER_ORIGIN).
+   */
+  ALLOWED_ISSUERS?: string;
   /** Subdomain base for hostname routing: <name>.<VAULT_BASE_DOMAIN>. */
   VAULT_BASE_DOMAIN: string;
   /** Default per-tenant storage cap in bytes (string in wrangler vars). */
