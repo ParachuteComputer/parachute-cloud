@@ -1,5 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
+import { SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 
 /**
  * Phase-0 spike: prove @openparachute/core boots + operates on Durable Object
@@ -32,7 +33,7 @@ describe("vault-core on DO SQLite", () => {
     log("boot", r);
     expect(r.ok).toBe(true);
     expect(r.error).toBeNull();
-    expect(r.schemaVersion).toBe(24);
+    expect(r.schemaVersion).toBe(SCHEMA_VERSION); // self-tracks core; no more drift breaks
     expect(Number(r.tableCount)).toBeGreaterThan(5);
   });
 

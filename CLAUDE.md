@@ -6,7 +6,7 @@
 
 ## Mental model
 
-> **One Durable Object per vault.** The DO's SQLite *is* the vault (schema v24 via `@openparachute/core` behind a `Database`-shaped shim); its isolation is the tenant boundary — a vault's code cannot address another tenant's data. Scale-to-zero: hibernated vaults bill ~storage only. Shared core + shared wire contract with the self-hosted bun vault; the runtime around core deliberately diverges (bounded, per the design's shared-vs-forked ledger).
+> **One Durable Object per vault.** The DO's SQLite *is* the vault (schema (current SCHEMA_VERSION from `@openparachute/core`) via `@openparachute/core` behind a `Database`-shaped shim); its isolation is the tenant boundary — a vault's code cannot address another tenant's data. Scale-to-zero: hibernated vaults bill ~storage only. Shared core + shared wire contract with the self-hosted bun vault; the runtime around core deliberately diverges (bounded, per the design's shared-vs-forked ledger).
 
 ## Layout
 
