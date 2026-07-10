@@ -32,7 +32,7 @@ describe("vault-core on DO SQLite", () => {
     log("boot", r);
     expect(r.ok).toBe(true);
     expect(r.error).toBeNull();
-    expect(r.schemaVersion).toBe(23);
+    expect(r.schemaVersion).toBe(24);
     expect(Number(r.tableCount)).toBeGreaterThan(5);
   });
 
