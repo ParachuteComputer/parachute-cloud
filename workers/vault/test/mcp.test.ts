@@ -309,6 +309,12 @@ describe("MCP — vault-info (server-layer override)", () => {
   }
   const READ = (v: string) => mintToken({ vault: v, scopes: `vault:${v}:read` });
   const WRITE = (v: string) => mintToken({ vault: v, scopes: `vault:${v}:write vault:${v}:read` });
+  // Tag-schema/taxonomy curation (`update-tag`, `delete-tag`, `rename-tag`,
+  // `merge-tags`) moved `write` → `admin` in core 0.7.1's read/write/admin
+  // re-tier: content-authorship is now separate from structure/schema curation.
+  // A `vault:write`-only token no longer sees these tools at all — they're
+  // filtered out of tools/list and tools/call returns "Unknown tool".
+  const ADMIN = (v: string) => mintToken({ vault: v, scopes: `vault:${v}:admin vault:${v}:write vault:${v}:read` });
 
   /** Call vault-info and return the parsed projection (throws on any error). */
   async function callVaultInfo(vault: string, token: string, args: Record<string, unknown>): Promise<any> {
@@ -352,10 +358,12 @@ describe("MCP — vault-info (server-layer override)", () => {
 
   it("projection surfaces a schema tag declared via MCP (effective fields + indexed catalog, core buildVaultProjection)", async () => {
     const v = freshVault();
-    // Declare a schema-carrying tag through the MCP write path, then confirm
+    // Declare a schema-carrying tag through the MCP admin path, then confirm
     // vault-info reflects it — proving the override runs core's real projection
     // (not a stub) against the live vault, independent of seed content.
-    const decl = await mcpPost(v, await WRITE(v), {
+    // `update-tag` is admin-tier as of core 0.7.1 (schema/taxonomy curation);
+    // a `write` token would get "Unknown tool" here.
+    const decl = await mcpPost(v, await ADMIN(v), {
       jsonrpc: "2.0",
       id: 34,
       method: "tools/call",
