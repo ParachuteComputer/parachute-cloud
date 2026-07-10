@@ -23,6 +23,7 @@ import {
   vaultCapMessage,
 } from "./plans.ts";
 import { type BillingInterval } from "./billing-config.ts";
+import { NONCE_ATTR } from "./oauth-shared.ts";
 
 export interface AuthorizeParams {
   clientId: string;
@@ -921,7 +922,10 @@ function firstRunHero(csrfToken: string, values: FirstRunValues, error?: string)
  * stranded in the "building" state.
  */
 function consoleScript(csrfToken: string): string {
-  return `<script>(function(){
+  // The nonce marker is swapped for the response's real CSP nonce in
+  // htmlResponse (oauth-shared.ts). Any future inline <script> MUST carry
+  // ${NONCE_ATTR} or the CSP will block it — the csp.test.ts scan pins that.
+  return `<script ${NONCE_ATTR}>(function(){
   var CSRF=${JSON.stringify(csrfToken)};
   document.addEventListener("click",function(e){
     var b=e.target&&e.target.closest?e.target.closest("[data-copy]"):null;
