@@ -46,7 +46,7 @@
 set -euo pipefail
 
 # The pinned notes-ui version this worker serves. Exact (no caret) — deterministic.
-SPA_NOTES_UI_VERSION="0.1.23"
+SPA_NOTES_UI_VERSION="0.2.0"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$ROOT/workers/identity/dist-assets"
