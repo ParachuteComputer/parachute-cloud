@@ -10,6 +10,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import app from "../src/index.ts";
 import {
+  ceremonyOrigin,
   depsForEnv,
   isSameOriginRequest,
   parseBoundOrigins,
@@ -67,8 +68,18 @@ describe("parseBoundOrigins — the union (ISSUER always in, extras added)", () 
 });
 
 describe("depsForEnv — boundOrigins wiring (the plumbing works when set)", () => {
-  test("unset env ⇒ resolveBoundOrigins is exactly [ISSUER]", () => {
+  test("the COMMITTED prod config sets BOUND_ORIGINS ⇒ resolveBoundOrigins includes app (P1.3 fix pinned)", () => {
+    // The vitest pool reads wrangler.toml's top-level [vars], so `env` carries
+    // the committed production BOUND_ORIGINS. This pins that the same-origin fix
+    // is actually WIRED in the deployed config — remove BOUND_ORIGINS and this
+    // (and the live app. front door) breaks.
     const deps = depsForEnv(env as never);
+    expect(resolveBoundOrigins(deps)).toContain(APP);
+    expect(resolveBoundOrigins(deps)).toContain(ISSUER);
+  });
+
+  test("unset env ⇒ resolveBoundOrigins degrades to exactly [ISSUER] (pre-P0.5 behavior)", () => {
+    const deps = depsForEnv({ ...env, BOUND_ORIGINS: undefined } as never);
     expect(resolveBoundOrigins(deps)).toEqual([ISSUER]);
   });
 
@@ -117,6 +128,51 @@ describe("isSameOriginRequest — accepts any bound origin, refuses foreign", ()
 });
 
 /**
+ * ceremonyOrigin (P1.3) — a ceremony's OWN user-facing URLs (the magic-link href,
+ * the post-payment return) build from the origin the user is CURRENTLY on, so the
+ * journey stays on one origin. Returns the request origin when it's a BOUND member,
+ * else falls back to the issuer (never a foreign/opaque origin). This is the twin of
+ * isSameOriginRequest with an issuer fallback instead of a boolean.
+ */
+describe("ceremonyOrigin — request-origin-aware, issuer fallback", () => {
+  const unsetDeps = depsForEnv({ ...env, BOUND_ORIGINS: undefined } as never); // [ISSUER]
+  const appDeps = depsForEnv({ ...env, BOUND_ORIGINS: APP } as never); // [ISSUER, APP]
+
+  test("issuer is always accepted (unset + set configs both echo it back)", () => {
+    expect(ceremonyOrigin(originReq(ISSUER), unsetDeps)).toBe(ISSUER);
+    expect(ceremonyOrigin(originReq(ISSUER), appDeps)).toBe(ISSUER);
+  });
+
+  test("SET {cloud., app.}: an app.-origin request builds from APP (stays on app.)", () => {
+    expect(ceremonyOrigin(originReq(APP), appDeps)).toBe(APP);
+  });
+
+  test("UNSET ([ISSUER]): an app.-origin request falls back to the issuer (app. not bound)", () => {
+    expect(ceremonyOrigin(originReq(APP), unsetDeps)).toBe(ISSUER);
+  });
+
+  test("a FOREIGN origin never comes back — falls back to the issuer in both configs", () => {
+    expect(ceremonyOrigin(originReq(EVIL), unsetDeps)).toBe(ISSUER);
+    expect(ceremonyOrigin(originReq(EVIL), appDeps)).toBe(ISSUER);
+  });
+
+  test("Referer is the fallback when Origin is absent (bound-set-checked the same way)", () => {
+    const viaReferer = new Request(`${ISSUER}/x`, { method: "POST", headers: { referer: `${APP}/console` } });
+    expect(ceremonyOrigin(viaReferer, appDeps)).toBe(APP);
+  });
+
+  test("a missing Origin/Referer falls back to the issuer (URL always from a trusted origin)", () => {
+    const noOrigin = new Request(`${ISSUER}/x`, { method: "POST" });
+    expect(ceremonyOrigin(noOrigin, appDeps)).toBe(ISSUER);
+  });
+
+  test("an opaque/unparseable Origin falls back to the issuer", () => {
+    const opaque = new Request(`${ISSUER}/x`, { method: "POST", headers: { origin: "null" } });
+    expect(ceremonyOrigin(opaque, appDeps)).toBe(ISSUER);
+  });
+});
+
+/**
  * End-to-end through the real router: /signup runs the exact
  * `verifyCsrfToken(req, form) && isSameOriginRequest(req, resolveBoundOrigins(deps))`
  * gate every cookie-authed POST uses. The signal is user creation — a refused
@@ -125,6 +181,9 @@ describe("isSameOriginRequest — accepts any bound origin, refuses foreign", ()
  */
 describe("the real router gate (/signup) honors BOUND_ORIGINS", () => {
   const appEnv = { ...env, BOUND_ORIGINS: APP } as never;
+  // The committed env now SETS BOUND_ORIGINS (the P1.3 fix), so to exercise the
+  // pre-P0.5 "unset" path the regression test overrides it back to undefined.
+  const unsetEnv = { ...env, BOUND_ORIGINS: undefined } as never;
 
   function signupReq(origin: string, opts: { email: string; ip: string; csrf?: string }): Request {
     return new Request(`${ISSUER}/signup`, {
@@ -145,9 +204,9 @@ describe("the real router gate (/signup) honors BOUND_ORIGINS", () => {
     });
   }
 
-  test("UNSET (regression pin): an app.-origin POST is refused — today only ISSUER passes", async () => {
+  test("UNSET (regression pin): with BOUND_ORIGINS absent, an app.-origin POST is refused — only ISSUER passes", async () => {
     const email = "p05-unset-app@example.com";
-    await app.fetch(signupReq(APP, { email, ip: "10.50.0.1" }), env);
+    await app.fetch(signupReq(APP, { email, ip: "10.50.0.1" }), unsetEnv);
     expect(await getUserByEmail(env.DB, email)).toBeNull();
   });
 

@@ -148,6 +148,45 @@ describe("magic link — send + verify", () => {
     expect(user!.passwordHash).toBe(""); // passwordless account
   });
 
+  test("P1.3 same-origin: the emitted link is built from the REQUEST origin, not the fixed issuer", async () => {
+    const APP = "https://app.parachute.computer";
+    // deps whose bound set is the two-issuer window {cloud., app.} — what
+    // BOUND_ORIGINS="https://app.parachute.computer" produces in prod.
+    const twoOriginDeps = (now?: () => Date) => ({ ...deps(now), boundOrigins: () => [ISSUER, APP] });
+    // A magic request that came IN on app.parachute.computer.
+    const fromApp = new Request(`${APP}/auth/magic`, {
+      method: "POST",
+      body: new URLSearchParams({ __csrf: CSRF, email: "app-user@example.com" }),
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: APP,
+        cookie: `parachute_id_csrf=${CSRF}`,
+        "cf-connecting-ip": "10.13.0.1",
+      },
+    });
+    const sender = captureSender();
+    const now = new Date("2026-07-09T12:00:00Z");
+    const res = await handleMagicRequestPost(env.DB, fromApp, twoOriginDeps(() => now), sender);
+    expect(res.status).toBe(200);
+    expect(sender.sent).toHaveLength(1);
+    // The link points BACK to app. (the origin the user is on), so the click
+    // lands the session on app. — never bounced to cloud.
+    const link = new URL(sender.sent[0]!.link);
+    expect(link.origin).toBe(APP);
+    expect(link.pathname).toBe("/auth/verify");
+    expect(link.searchParams.get("token")).toBeTruthy();
+  });
+
+  test("P1.3 same-origin: a request on the ISSUER origin still builds an issuer link (request-origin-aware, not app-hardcoded)", async () => {
+    const APP = "https://app.parachute.computer";
+    const twoOriginDeps = { ...deps(), boundOrigins: () => [ISSUER, APP] };
+    const sender = captureSender();
+    // magicReq carries origin: ISSUER — with app. also bound, the link must still
+    // echo the ISSUER origin the request came from (proves it's not always-app).
+    await handleMagicRequestPost(env.DB, magicReq("cloud-user@example.com", "10.13.0.2"), twoOriginDeps, sender);
+    expect(new URL(sender.sent[0]!.link).origin).toBe(ISSUER);
+  });
+
   test("single-use: a second verify of the same token fails", async () => {
     const sender = captureSender();
     const now = new Date("2026-07-02T12:00:00Z");
