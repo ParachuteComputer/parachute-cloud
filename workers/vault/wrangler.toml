@@ -90,6 +90,15 @@ binding = "AI"
 # deploy-time `--var` to forget). Tests use TEST_JWKS (gated on ENVIRONMENT=test),
 # so this value doesn't affect the vault vitest suite.
 ISSUER_ORIGIN = "https://cloud.parachute.computer"
+# ADDITIVE set of extra token `iss` values to accept beyond ISSUER_ORIGIN
+# (comma-separated). scope-guard unions this with ISSUER_ORIGIN and verifies the
+# signature FIRST regardless of `iss`, so widening it never weakens auth. UNSET =
+# the single-ISSUER_ORIGIN exact match this worker has always enforced (leave it
+# unset for now — behavior is byte-identical). P1.3 flips it to
+# "https://cloud.parachute.computer,https://app.parachute.computer" once app. is
+# a live Custom Domain on the identity worker; the discovery advertisement keeps
+# naming only ISSUER_ORIGIN (acceptance ≠ advertisement).
+# ALLOWED_ISSUERS = "https://cloud.parachute.computer,https://app.parachute.computer"
 # Subdomain base for hostname routing: <name>.u.parachute.computer → DO(name).
 VAULT_BASE_DOMAIN = "u.parachute.computer"
 # Default per-tenant storage cap (bytes). 1 GiB. Overridable per-DO in config.
@@ -143,6 +152,11 @@ binding = "AI"
 # workers/identity/wrangler.toml) — staging vaults trust the STAGING issuer.
 [env.staging.vars]
 ISSUER_ORIGIN = "https://parachute-identity-staging.openparachute.workers.dev"
+# ADDITIVE extra-`iss` set (see the top-level [vars] note). UNSET = today's
+# single-ISSUER_ORIGIN match. The staging soak first runs it unset (behavior
+# unchanged), then sets a synthetic second value pointing at the SAME staging
+# JWKS to prove both are accepted before P1.3 wires the real second origin.
+# ALLOWED_ISSUERS = ""
 VAULT_BASE_DOMAIN = "parachute-vault-do-staging.openparachute.workers.dev"
 CAP_BYTES = "1073741824"
 # "staging" ≠ "test": the TEST_JWKS double-gate stays closed here too.
