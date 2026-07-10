@@ -26,8 +26,20 @@ export function ensureCsrfToken(req: Request): { token: string; setCookie?: stri
   return { token, setCookie: `${CSRF_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/` };
 }
 
-export function verifyCsrfToken(req: Request, form: FormData): boolean {
+/**
+ * The double-submit core: the request's CSRF cookie must be present and match
+ * the `submitted` token. Both the form-body path ({@link verifyCsrfToken}) and
+ * the JSON-body path (the `POST /account/token` mint, whose `__csrf` rides the
+ * JSON body rather than a `FormData` field) route through here so the check is
+ * one implementation. A missing cookie or empty/absent submitted token fails
+ * closed.
+ */
+export function csrfTokenValid(req: Request, submitted: string | null | undefined): boolean {
   const cookie = parseCookie(req.headers.get("cookie"), CSRF_COOKIE);
-  const field = String(form.get(CSRF_FIELD) ?? "");
+  const field = submitted ?? "";
   return !!cookie && !!field && timingSafeEqualString(cookie, field);
+}
+
+export function verifyCsrfToken(req: Request, form: FormData): boolean {
+  return csrfTokenValid(req, String(form.get(CSRF_FIELD) ?? ""));
 }

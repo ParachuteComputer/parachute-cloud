@@ -56,6 +56,7 @@ import { handleScheduled } from "./ops.ts";
 import { handleUnsubscribe, runDrip } from "./drip.ts";
 import { runSnapshotSweep } from "./snapshots.ts";
 import { runUsageRollup } from "./usage.ts";
+import { handleAccountToken } from "./account-token.ts";
 import { handleCheckoutPost, handleMockCheckoutPost, handlePortalPost } from "./billing.ts";
 import { handleStripeWebhookPost } from "./billing-webhook.ts";
 import { handlePromoRedeemPost } from "./promo.ts";
@@ -157,6 +158,15 @@ app.post("/console/security", (c) => handleSecurityPost(c.env.DB, c.req.raw, dep
 // console write boundary), then the race-safe claim + comp grant (promo.ts).
 // Pure comp machinery — no Stripe, no env gate; LIVE in production by design.
 app.post("/console/promo", (c) => handlePromoRedeemPost(c.env.DB, c.req.raw, depsFor(c.env)));
+
+// --- account credential (Parachute App campaign #116, Phase 2 C2) ---
+// POST /account/token exchanges the session cookie for a short-lived
+// account:<owner-id>:admin bearer (aud="account"), the credential the net-new
+// /account/* REST surface (C3) is gated by. Console write boundary in order:
+// session (findActiveSession — refuses suspended) → CSRF (__csrf in the JSON
+// body) → same-origin. Stateless (no registry row); revocation is logout +
+// the read-time suspend chokepoint (account-token.ts, SCOPE-a/d).
+app.post("/account/token", (c) => handleAccountToken(c.env.DB, c.req.raw, depsFor(c.env)));
 
 // --- operator admin console (Wave 4c) ---
 // EVERY route (GET and POST) resolves the session and requires role='operator'

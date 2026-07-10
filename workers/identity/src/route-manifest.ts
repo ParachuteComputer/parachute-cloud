@@ -63,7 +63,7 @@ export const CEREMONY_PREFIXES = [
   "/auth", // magic-link request (/auth/magic) + verify (/auth/verify)
   "/console", // account console + every /console/* action (vaults, security, plan, packs, checklist, promo, import/export/restore)
   "/admin", // operator admin console + /admin/* (users, vaults, plan, suspend)
-  "/account", // RESERVED for Phase 2 (parachute-cloud#116) — no live route yet; see RESERVED_PREFIXES
+  "/account", // Parachute App campaign (#116): POST /account/token (C2) + the /account/* surface (C3)
   "/billing", // Stripe checkout / portal / webhook / mock-checkout
   "/unsubscribe", // onboarding-drip one-click unsubscribe (GET/POST)
   "/health", // liveness JSON — must return JSON, never the SPA shell
@@ -82,12 +82,13 @@ export const SPA_EXCEPTIONS = ["/oauth/callback"] as const;
 
 /**
  * The subset of CEREMONY_PREFIXES that has NO live route in `index.ts` yet —
- * reserved so the SPA fallback can never claim it the moment Phase 2 lands its
- * `/account/*` contract. Exempted from the "no dead entry" test (there is
- * intentionally nothing to point at today). Mirrors the P0.3 denylist's own
- * forward-looking `/^\/account\//` reservation.
+ * reserved so the SPA fallback can never claim it before its routes land, and
+ * exempted from the "no dead entry" test (there is intentionally nothing to
+ * point at). Empty since Phase 2 C2 (#116): `/account` now carries a live route
+ * (`POST /account/token`), so it graduated from reserved to a real ceremony
+ * prefix. New forward-looking prefixes go here until their first route ships.
  */
-export const RESERVED_PREFIXES = ["/account"] as const;
+export const RESERVED_PREFIXES = [] as const;
 
 /** True when `path` is exactly `prefix` or a sub-path `prefix/...`. */
 function underPrefix(path: string, prefix: string): boolean {
