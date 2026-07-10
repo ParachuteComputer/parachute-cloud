@@ -165,7 +165,11 @@ export async function handleMagicRequestPost(
     // any opaque/foreign origin. The stored `next` resume target is unchanged —
     // its authorize URL stays issuer-anchored (the OAuth ceremony origin).
     const link = `${ceremonyOrigin(req, deps)}/auth/verify?token=${encodeURIComponent(rawToken)}`;
-    const sent = await sender.sendMagicLink(email, link);
+    // G5: choose the email variant at send time — no `existing` row = a
+    // brand-new account this link will create. Only the address owner reads the
+    // email, so this new-vs-returning distinction leaks nothing (the on-page
+    // copy stays neutral).
+    const sent = await sender.sendMagicLink(email, link, !existing);
     if (!sent.ok) {
       // A real-binding failure (bad address, quota, CF transient) must leave a
       // log trail — otherwise it's a silent 200 and an inbox that never rings.

@@ -34,10 +34,19 @@ describe("GET /account/session", () => {
     const res = await app.fetch(sessionReq(sessionId), env);
     expect(res.status).toBe(200);
     expect(res.headers.get("access-control-allow-origin")).toBeNull();
-    const body = (await res.json()) as { signed_in: boolean; csrf: string };
+    const body = (await res.json()) as {
+      signed_in: boolean;
+      csrf: string;
+      email: string;
+      account_created_at: string;
+    };
     expect(body.signed_in).toBe(true);
     expect(typeof body.csrf).toBe("string");
     expect(body.csrf.length).toBeGreaterThan(0);
+    // G1: identity signal for "Signed in as X" + "Account created ✓".
+    expect(body.email).toBe("session-a@example.com");
+    expect(typeof body.account_created_at).toBe("string");
+    expect(Number.isNaN(Date.parse(body.account_created_at))).toBe(false);
     // Double-submit consistency: the set CSRF cookie value equals the returned
     // token, so the SPA can echo it as __csrf and C2's compare will match.
     const setCookie = res.headers.get("set-cookie") ?? "";

@@ -36,5 +36,12 @@ export async function handleAccountSession(
   const csrf = ensureCsrfToken(req);
   const headers: Record<string, string> = { "cache-control": "no-store" };
   if (csrf.setCookie) headers["set-cookie"] = csrf.setCookie;
-  return jsonResponse({ signed_in: true, csrf: csrf.token }, 200, headers);
+  // `email` powers the app's "Signed in as X" chip; `account_created_at` (the
+  // user row's created_at) lets the app show "Account created ✓" for a fresh
+  // signup (it derives is_new from this + the empty vault list — G1).
+  return jsonResponse(
+    { signed_in: true, csrf: csrf.token, email: user.email, account_created_at: user.createdAt },
+    200,
+    headers,
+  );
 }
