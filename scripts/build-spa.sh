@@ -20,9 +20,9 @@
 #      REJECTS a bare "/" meta tag (surface-client mount.ts), so no post-process
 #      of a prebuilt dist can produce the root basename — it must be BUILT with
 #      VITE_BASE_PATH=/. Without it the router falls back to `/notes` and blanks.
-#   3. The version the app campaign pins (0.1.22, the P0.3 ceremony-denylist SW)
-#      is NOT published to npm anyway (npm latest is 0.1.15) — it lives only in
-#      the sibling checkout.
+#   3. The version the app campaign pins (0.1.23, the P0.3 ceremony-denylist SW
+#      + surface#189's bare-path fix) is NOT published to npm anyway (npm latest
+#      is 0.1.15) — it lives only in the sibling checkout.
 #
 # So we build the SAME artifact notes.parachute.computer already serves (the
 # standalone VITE_BASE_PATH=/ build), from the sibling parachute-surface checkout,
