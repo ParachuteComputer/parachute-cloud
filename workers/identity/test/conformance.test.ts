@@ -9,6 +9,7 @@
 import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import {
+  checkAccountDescriptor,
   checkAuthorizationServerMetadata,
   checkProtectedResourceMetadata,
 } from "@openparachute/door-contract";
@@ -88,6 +89,20 @@ describe("discovery endpoints", () => {
     const body = (await res.json()) as { generated_at: string; jtis: string[] };
     expect(typeof body.generated_at).toBe("string");
     expect(Array.isArray(body.jtis)).toBe(true);
+  });
+
+  test("parachute-account descriptor (C4) conforms to the shared contract", async () => {
+    const res = await app.fetch(new Request(`${ISSUER}/.well-known/parachute-account`), env);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+    const md = (await res.json()) as Record<string, unknown>;
+    // Shape + cross-field invariants pinned by the shared canon (door-contract).
+    expect(checkAccountDescriptor(md, { issuer: ISSUER, door: "cloud" })).toEqual([]);
+    // Cloud's door-specific values.
+    expect(md.signup_path).toBe("/signup");
+    expect(md.app_client_id).toBe("parachute-app");
+    expect((md.capabilities as Record<string, unknown>).vault_rename).toBe(false);
+    expect(Array.isArray(md.plans) && (md.plans as unknown[]).length).toBe(4);
   });
 });
 

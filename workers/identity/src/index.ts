@@ -40,6 +40,7 @@ import {
   handleAdminVaultsGet,
 } from "./admin.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
+import { accountDescriptor } from "./account-descriptor.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
 import {
   authorizationServerMetadata,
@@ -106,6 +107,7 @@ app.get("/.well-known/oauth-authorization-server", (c) => authorizationServerMet
 app.get("/.well-known/oauth-protected-resource", (c) => protectedResourceMetadata(depsFor(c.env)));
 app.get("/.well-known/jwks.json", (c) => handleJwks(c.env.DB));
 app.get("/.well-known/parachute-revocation.json", (c) => handleRevocationList(c.env.DB, depsFor(c.env)));
+app.get("/.well-known/parachute-account", (c) => accountDescriptor(depsFor(c.env)));
 
 // --- OAuth ---
 // CORS is applied at the route so success AND error paths carry it: wildcard on
