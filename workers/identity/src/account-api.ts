@@ -35,6 +35,7 @@
  * account surface — belt-and-suspenders with the account-token's `aud="account"`
  * pin (account-auth.ts).
  */
+import { validateVaultScopes } from "@openparachute/door-contract";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import {
   type AccountVerb,
@@ -68,9 +69,6 @@ import {
   userOwnsVault,
 } from "./vaults.ts";
 import { latestUsageForVaults } from "./usage.ts";
-
-/** The verbs a per-vault token may carry (the mint's scope allowlist). */
-const VAULT_MINT_VERBS = new Set(["read", "write", "admin"]);
 
 /** TTL for the tenant-facing vault tokens this surface mints — the standard
  *  access-token lifetime. Stateless (no registry row, no refresh, like the
@@ -381,10 +379,14 @@ export async function handleAccountVaultDelete(db: D1Database, req: Request, dep
  * Mint a vault token for an OWNED vault — the OAuth-redirect bypass, and the
  * fallback for a create whose inline `vault_token` was empty. Ownership-gated
  * (`userOwnsVault` — an unowned OR unknown vault gets ONE 403, no existence
- * oracle) and scope-validated: every requested scope must be exactly
+ * oracle) and scope-validated (`@openparachute/door-contract`'s
+ * `validateVaultScopes`, hub-parity P3): every requested scope must be exactly
  * `vault:<thisName>:{read,write,admin}` (a foreign vault name, a non-vault
- * scope, or a bad verb → 400 `invalid_scope`, blocking injection). Absent
- * `scopes` defaults to `read write`. Scope: `account:<id>:admin`.
+ * scope, or a bad verb → 400 `invalid_scope`, blocking injection). Absent,
+ * `null`, OR an explicit empty array all default to `read write` — BEHAVIOR
+ * DELTA (P3): cloud used to 400 `invalid_scope` on an explicit `[]`; the
+ * P0-pinned shared semantics now treat it the same as omitting `scopes`
+ * entirely (hub's prior lenient reading). Scope: `account:<id>:admin`.
  */
 export async function handleAccountVaultTokenMint(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const auth = await requireAccount(db, req, deps, "admin");
@@ -402,6 +404,15 @@ export async function handleAccountVaultTokenMint(db: D1Database, req: Request, 
   const body = await readJsonBody(req);
   const scopeResult = validateVaultScopes(body.scopes, name);
   if (!scopeResult.ok) {
+    // Map the shared canon's two rejection reasons onto cloud's PRE-EXISTING
+    // single wire response (hub-parity P3). Cloud's own validator never
+    // distinguished a structural failure (non-array / non-string entry) from a
+    // content failure (well-formed but wrong scope) — both hit exactly this one
+    // 400 `invalid_scope` `{error, message}` shape (verified against cloud's own
+    // prior `validateVaultScopes` + the existing test suite, which only ever
+    // asserted `invalid_scope`). So BOTH `invalid_request` and `invalid_scope`
+    // from the shared validator land here unchanged — this preserves "cloud's
+    // HTTP error codes are unchanged", not a new split cloud never had.
     return restError(400, "invalid_scope", `scopes must each be vault:${name}:{read,write,admin}`);
   }
 
@@ -417,32 +428,14 @@ export async function handleAccountVaultTokenMint(db: D1Database, req: Request, 
   );
 }
 
-/**
- * Validate a requested `scopes` array against a single vault. Returns the
- * de-duplicated scope list, or `{ ok: false }` on anything that isn't exactly
- * `vault:<vaultName>:{read,write,admin}` (a different vault name, a non-vault
- * scope like `account:*`, an unknown verb, a non-string entry, or an empty
- * array). Absent (`undefined`) defaults to `read write`.
- */
-export function validateVaultScopes(
-  requested: unknown,
-  vaultName: string,
-): { ok: true; scopes: string[] } | { ok: false } {
-  if (requested === undefined) {
-    return { ok: true, scopes: [`vault:${vaultName}:read`, `vault:${vaultName}:write`] };
-  }
-  if (!Array.isArray(requested) || requested.length === 0) return { ok: false };
-  const scopes = new Set<string>();
-  for (const s of requested) {
-    if (typeof s !== "string") return { ok: false };
-    const parts = s.split(":");
-    if (parts.length !== 3 || parts[0] !== "vault" || parts[1] !== vaultName || !VAULT_MINT_VERBS.has(parts[2]!)) {
-      return { ok: false };
-    }
-    scopes.add(s);
-  }
-  return { ok: true, scopes: [...scopes] };
-}
+// `validateVaultScopes` is now the ONE shared implementation
+// (`@openparachute/door-contract`, hub-parity P3) replacing this file's former
+// local copy — re-exported here so existing importers (`test/account-api.test.ts`)
+// don't need to retarget their import path. Behavior delta from cloud's prior
+// local version: explicit `[]` now maps to the vault's default read+write pair
+// instead of rejecting (the P0-pinned semantics; see the call site's comment for
+// how the resulting reason still lands on cloud's unchanged 400 `invalid_scope`).
+export { validateVaultScopes };
 
 /**
  * Mint one tenant-facing vault token: `aud=vault.<name>`, `vault_scope=[name]`,
