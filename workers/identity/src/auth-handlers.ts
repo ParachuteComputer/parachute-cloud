@@ -70,6 +70,7 @@ import {
   ceremonyOrigin,
   htmlResponse,
   isSameOriginRequest,
+  jsonResponse,
   redirectResponse,
   resolveBoundOrigins,
 } from "./oauth-shared.ts";
@@ -113,6 +114,16 @@ export async function finishPrimaryAuth(
 
 // --- magic link ------------------------------------------------------------
 
+/**
+ * Does the caller want a JSON reply rather than the server-rendered ceremony
+ * page? The same `X-Requested-With: fetch` opt-in the console's create-moment
+ * uses (rc.49). Lets the SPA run the email moment in-app (G2).
+ */
+function prefersJson(req: Request): boolean {
+  if ((req.headers.get("x-requested-with") ?? "").toLowerCase() === "fetch") return true;
+  return (req.headers.get("accept") ?? "").toLowerCase().includes("application/json");
+}
+
 export async function handleMagicRequestPost(
   db: D1Database,
   req: Request,
@@ -120,6 +131,11 @@ export async function handleMagicRequestPost(
   sender: EmailSender,
 ): Promise<Response> {
   const form = await req.formData();
+  // G2: the SPA opts into a JSON reply. The NEUTRAL "we handled it" body is
+  // identical for sent / throttled / suspended (no account-existence oracle);
+  // only bad input (CSRF/origin, malformed email) gets a distinct error — those
+  // are about the request itself, not whether an account exists.
+  const wantsJson = prefersJson(req);
   // The authorize-resume rider (launch-flow fix 2): a send from the OAuth
   // authorize login page carries the pending request's params as hidden fields
   // (ui.ts renderLogin — the same round-trip the password form uses). When a
@@ -129,9 +145,13 @@ export async function handleMagicRequestPost(
   // like the password login's 2FA divert stores its resume in pending_logins.
   const authorizeParams = authorizeParamsFromForm(form);
   const next = authorizeParams ? buildAuthorizeUrl(deps.issuer, authorizeParams) : null;
-  if (!checkForm(req, form, deps)) return magicError(req, "Your session expired. Please try again.", "");
+  if (!checkForm(req, form, deps)) {
+    if (wantsJson) return jsonResponse({ error: "Your session expired. Please try again." }, 403);
+    return magicError(req, "Your session expired. Please try again.", "");
+  }
   const email = normalizeEmail(String(form.get("email") ?? ""));
   if (!EMAIL_RE.test(email)) {
+    if (wantsJson) return jsonResponse({ error: "Enter a valid email address." }, 400);
     // Re-render the page the user is actually on: the authorize login when the
     // rider is present (so the pending request survives the retry), else the
     // console login.
@@ -155,7 +175,9 @@ export async function handleMagicRequestPost(
     // SUSPENDED account: the exact same neutral "check your email" page as
     // every other outcome (no oracle), but nothing is minted or sent — no
     // magic_links row, no email, and no dev echo header (there is no link).
-    if (existing?.suspendedAt) return htmlResponse(renderMagicSent({ email }), 200);
+    if (existing?.suspendedAt) {
+      return wantsJson ? jsonResponse({ ok: true }, 200) : htmlResponse(renderMagicSent({ email }), 200);
+    }
     const { rawToken } = await createMagicLink(db, email, existing?.id ?? null, now, next);
     // Build the emailed link from the origin the request came in on (app. or
     // cloud.), NOT the fixed issuer — so a user who asked from app.parachute.
@@ -165,7 +187,11 @@ export async function handleMagicRequestPost(
     // any opaque/foreign origin. The stored `next` resume target is unchanged —
     // its authorize URL stays issuer-anchored (the OAuth ceremony origin).
     const link = `${ceremonyOrigin(req, deps)}/auth/verify?token=${encodeURIComponent(rawToken)}`;
-    const sent = await sender.sendMagicLink(email, link);
+    // G5: choose the email variant at send time — no `existing` row = a
+    // brand-new account this link will create. Only the address owner reads the
+    // email, so this new-vs-returning distinction leaks nothing (the on-page
+    // copy stays neutral).
+    const sent = await sender.sendMagicLink(email, link, !existing);
     if (!sent.ok) {
       // A real-binding failure (bad address, quota, CF transient) must leave a
       // log trail — otherwise it's a silent 200 and an inbox that never rings.
@@ -182,9 +208,10 @@ export async function handleMagicRequestPost(
     // DEV ONLY: echo the link so the flow is testable without real email. Gated
     // hard on ENVIRONMENT !== "production" (deps.exposeDevLinks).
     if (deps.exposeDevLinks) extra["x-parachute-dev-magic-link"] = link;
-    return htmlResponse(renderMagicSent({ email }), 200, extra);
+    return wantsJson ? jsonResponse({ ok: true }, 200, extra) : htmlResponse(renderMagicSent({ email }), 200, extra);
   }
-  return htmlResponse(renderMagicSent({ email }), 200);
+  // Throttled: same neutral body, nothing sent.
+  return wantsJson ? jsonResponse({ ok: true }, 200) : htmlResponse(renderMagicSent({ email }), 200);
 }
 
 function magicError(req: Request, message: string, email: string): Response {
@@ -196,7 +223,7 @@ export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: O
   const token = new URL(req.url).searchParams.get("token");
   const now = deps.now?.() ?? new Date();
   const consumed = token ? await consumeMagicLink(db, token, now) : null;
-  if (!consumed) return magicLinkDead();
+  if (!consumed) return magicLinkDead(req, deps);
   // Resolve the user: existing → verify their email; otherwise create-or-fetch
   // (a concurrent link for a new address could have created the row first).
   // A SUSPENDED account gets the same dead-link page as an expired token —
@@ -204,7 +231,7 @@ export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: O
   let userId = consumed.userId;
   const existing = userId ? await getUserById(db, userId) : await getUserByEmail(db, consumed.email);
   if (existing) {
-    if (existing.suspendedAt) return magicLinkDead();
+    if (existing.suspendedAt) return magicLinkDead(req, deps);
     userId = existing.id;
     await markEmailVerified(db, userId);
   } else {
@@ -218,8 +245,22 @@ export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: O
   return finishPrimaryAuth(db, deps, userId, safeNext(consumed.next ?? "/console", deps));
 }
 
-/** The one neutral response every unusable magic link gets (invalid, used, expired — or suspended). */
-function magicLinkDead(): Response {
+/**
+ * The neutral response every unusable magic link gets (invalid, used, expired —
+ * or suspended). G4: when the link was clicked on an APP origin (the emailed
+ * href pointed at app.parachute.computer, a bound origin ≠ the issuer), bounce to
+ * the app's OWN recovery — `/welcome?link=expired` — so the SPA renders "that
+ * link expired" + a prefilled resend instead of a dead-end server page. A
+ * link-click navigation carries no `Origin` header (so `ceremonyOrigin` can't see
+ * it); the request URL's own origin IS the app origin (the link's host), and we
+ * only trust it when it's a bound member — never an open redirect. cloud-origin
+ * verifies keep the neutral server page.
+ */
+function magicLinkDead(req: Request, deps: OAuthDeps): Response {
+  const reqOrigin = new URL(req.url).origin;
+  if (reqOrigin !== deps.issuer && resolveBoundOrigins(deps).includes(reqOrigin)) {
+    return redirectResponse(`${reqOrigin}/welcome?link=expired`);
+  }
   return htmlResponse(
     renderError({
       title: "Link expired",

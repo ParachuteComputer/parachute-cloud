@@ -246,6 +246,52 @@ describe("magic link — send + verify", () => {
     expect(sender.sent).toHaveLength(0);
   });
 
+  // G2: the SPA opts into a JSON reply (X-Requested-With: fetch) so the email
+  // moment runs in-app instead of hopping to the server-rendered ceremony.
+  function magicReqJson(email: string, ip = "10.2.2.2"): Request {
+    return new Request(`${ISSUER}/auth/magic`, {
+      method: "POST",
+      body: new URLSearchParams({ __csrf: CSRF, email }),
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: ISSUER,
+        cookie: `parachute_id_csrf=${CSRF}`,
+        "cf-connecting-ip": ip,
+        "x-requested-with": "fetch",
+      },
+    });
+  }
+
+  test("G2 JSON variant: X-Requested-With: fetch → neutral { ok: true }, link still sent", async () => {
+    const sender = captureSender();
+    const res = await handleMagicRequestPost(env.DB, magicReqJson("spa@example.com"), deps(), sender);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type") ?? "").toContain("application/json");
+    expect(await res.json()).toEqual({ ok: true });
+    expect(sender.sent).toHaveLength(1);
+  });
+
+  test("G2 JSON variant: malformed email → { error } 400, nothing sent", async () => {
+    const sender = captureSender();
+    const res = await handleMagicRequestPost(env.DB, magicReqJson("not-an-email"), deps(), sender);
+    expect(res.status).toBe(400);
+    expect((await res.json() as { error: string }).error).toContain("valid email");
+    expect(sender.sent).toHaveLength(0);
+  });
+
+  test("G4: a dead link on an APP origin → /welcome?link=expired; on the issuer → the neutral server page", async () => {
+    const APP = "https://app.parachute.computer";
+    const twoOriginDeps = (now?: () => Date) => ({ ...deps(now), boundOrigins: () => [ISSUER, APP] });
+    // App-origin verify of an invalid/used token → the app's own recovery.
+    const appDead = await handleMagicVerifyGet(env.DB, new Request(`${APP}/auth/verify?token=nope`), twoOriginDeps());
+    expect(appDead.status).toBe(302);
+    expect(appDead.headers.get("location")).toBe(`${APP}/welcome?link=expired`);
+    // Issuer-origin verify of the same dead token → the neutral server page (unchanged).
+    const cloudDead = await handleMagicVerifyGet(env.DB, verifyReq("nope"), twoOriginDeps());
+    expect(cloudDead.status).toBe(400);
+    expect(await cloudDead.text()).toContain("Link expired");
+  });
+
   test("a failing sender still returns the neutral 200, with a structured PII-safe log trail", async () => {
     // A real-binding failure (bad address, quota, CF transient) must not turn
     // into a silent 200: the handler logs event=magic_link_send_failed with the

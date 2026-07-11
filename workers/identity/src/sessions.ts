@@ -6,7 +6,22 @@
 import { randomBase64url } from "./crypto.ts";
 
 export const SESSION_COOKIE = "parachute_id_session";
-export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+/**
+ * Session lifetime — 90 days (G3, auth redesign). A magic-link-first product
+ * can't re-email a signed-in person every day: a session (and its cookie
+ * Max-Age) lasts 90 days from its last use. `findActiveSession` still expires it
+ * hard past this, logout deletes the row, and the suspend join refuses it — so
+ * the longer window is bounded by the same kill switches as before (see the
+ * rolling note on {@link shouldSlideSession}). Was 24h.
+ */
+export const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+/**
+ * Roll the session forward once it has been used past this much of its life
+ * (30 days) — so an ACTIVE person stays signed in indefinitely, while an idle
+ * one still expires at 90 days. The threshold bounds the write to at most once
+ * per 30 days per session (not per request).
+ */
+export const SESSION_REFRESH_THRESHOLD_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface Session {
   id: string;
@@ -53,6 +68,31 @@ export async function findActiveSession(db: D1Database, id: string, now: Date = 
   if (!row) return null;
   if (now.getTime() > new Date(row.expires_at).getTime()) return null;
   return { id: row.id, userId: row.user_id, createdAt: row.created_at, expiresAt: row.expires_at };
+}
+
+/**
+ * Should this live session be rolled forward? True once it has been used past
+ * {@link SESSION_REFRESH_THRESHOLD_MS} of its life — i.e., its remaining life has
+ * dropped below `TTL - threshold`. A freshly-created/-slid session (expires ≈
+ * now + TTL) is NOT slid; one that's crossed the threshold is. Pure — the
+ * caller does the write ({@link slideSession}) + re-issues the cookie only when
+ * this returns true, which bounds both to ~once per threshold per session.
+ */
+export function shouldSlideSession(session: Session, now: Date = new Date()): boolean {
+  const remainingMs = new Date(session.expiresAt).getTime() - now.getTime();
+  return remainingMs < SESSION_TTL_MS - SESSION_REFRESH_THRESHOLD_MS;
+}
+
+/**
+ * Extend a session's expiry to `now + TTL` (the rolling write). Only touches
+ * `expires_at` — the session id is stable across slides, and a deleted (logged-
+ * out) or suspended session is never reached here (the caller gates on
+ * {@link findActiveSession} first). Returns the new expiry.
+ */
+export async function slideSession(db: D1Database, id: string, now: Date = new Date()): Promise<string> {
+  const expiresAt = new Date(now.getTime() + SESSION_TTL_MS).toISOString();
+  await db.prepare("UPDATE sessions SET expires_at = ? WHERE id = ?").bind(expiresAt, id).run();
+  return expiresAt;
 }
 
 /** Delete ALL of a user's sessions (the suspend action's immediate part). */

@@ -171,7 +171,7 @@ describe("bindingSender — envelope + raw through the EmailMessage contract", (
   test("sendMagicLink sends ONE EmailMessage whose envelope matches its parsed MIME", async () => {
     const { binding, sent } = captureBinding();
     const sender = bindingSender(binding, FROM);
-    const res = await sender.sendMagicLink("user@example.com", "https://cloud.parachute.computer/auth/verify?token=t0k");
+    const res = await sender.sendMagicLink("user@example.com", "https://cloud.parachute.computer/auth/verify?token=t0k", false);
     expect(res).toEqual({ ok: true });
     expect(sent).toHaveLength(1);
     const msg = sent[0]!;
@@ -183,6 +183,22 @@ describe("bindingSender — envelope + raw through the EmailMessage contract", (
     expect(parsed.subject).toBe("Your Parachute sign-in link");
     expect(parsed.text).toContain("https://cloud.parachute.computer/auth/verify?token=t0k");
     expect(parsed.html).toContain("https://cloud.parachute.computer/auth/verify?token=t0k");
+  });
+
+  test("G5: new-account vs returning variants differ in subject + copy (enumeration-safe — only the owner reads it)", async () => {
+    const { binding: nb, sent: newSent } = captureBinding();
+    await bindingSender(nb, FROM).sendMagicLink("newbie@example.com", "https://cloud.parachute.computer/auth/verify?token=n", true);
+    const newMail = await parseAndValidate(rawOf(newSent[0]!), FROM);
+    expect(newMail.subject).toBe("Welcome to Parachute — your sign-in link");
+    expect(newMail.html).toContain("Create my account");
+    expect(newMail.text).toContain("creates a brand-new account");
+
+    const { binding: rb, sent: retSent } = captureBinding();
+    await bindingSender(rb, FROM).sendMagicLink("back@example.com", "https://cloud.parachute.computer/auth/verify?token=r", false);
+    const retMail = await parseAndValidate(rawOf(retSent[0]!), FROM);
+    expect(retMail.subject).toBe("Your Parachute sign-in link");
+    expect(retMail.html).toContain("Sign me in");
+    expect(retMail.text).toContain("signs you in as back@example.com");
   });
 
   test("sendOps sends a text/plain EmailMessage", async () => {
@@ -204,7 +220,7 @@ describe("bindingSender — envelope + raw through the EmailMessage contract", (
       },
       FROM,
     );
-    const res = await sender.sendMagicLink("user@example.com", "https://x.example/link");
+    const res = await sender.sendMagicLink("user@example.com", "https://x.example/link", false);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error).toContain("sender not verified");
   });

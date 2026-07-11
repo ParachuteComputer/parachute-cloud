@@ -71,7 +71,8 @@ export interface DripEmail {
 
 export interface EmailSender {
   readonly kind: "binding" | "devlog";
-  sendMagicLink(to: string, link: string): Promise<SendResult>;
+  /** `newAccount` picks the email variant (G5): new-account vs returning copy. */
+  sendMagicLink(to: string, link: string, newAccount: boolean): Promise<SendResult>;
   /** Generic operational send — plain text, no templating. Used by ops.ts. */
   sendOps(msg: OpsEmail): Promise<SendResult>;
   /** Onboarding-drip send — plain text + unsubscribe headers. Used by drip.ts. */
@@ -201,31 +202,43 @@ export function buildRawEmail(opts: RawEmailOpts): string {
 
 // --- message bodies ------------------------------------------------------------
 
-function magicLinkBodies(link: string): { html: string; text: string } {
-  const text = [
-    "Sign in to Parachute Cloud",
-    "",
-    "Click the link below to sign in. It works once and expires in 10 minutes.",
-    "",
-    link,
-    "",
-    "If you didn't request this, you can safely ignore this email — no one can sign in without the link.",
-  ].join("\n");
+/**
+ * The two magic-link variants (G5), chosen at send time on user-exists — the
+ * earliest honest moment to tell new-vs-returning, and enumeration-safe because
+ * only the address owner ever reads it (the on-page copy stays neutral). `to` is
+ * the recipient (a validated email — safe to embed) so the returning copy can
+ * say "as X".
+ */
+function magicLinkBodies(
+  link: string,
+  newAccount: boolean,
+  to: string,
+): { subject: string; html: string; text: string } {
+  const subject = newAccount ? "Welcome to Parachute — your sign-in link" : SUBJECT;
+  const heading = newAccount ? "Welcome to Parachute" : "Welcome back";
+  const intro = newAccount
+    ? "This link signs you in and creates a brand-new account — nothing is created unless you click it. You'll make your first vault right after."
+    : `This link signs you in as ${to}. Your vault is where you left it.`;
+  const buttonLabel = newAccount ? "Create my account & sign in" : "Sign me in";
+  const footer = newAccount
+    ? "If you didn't request this, you can safely ignore this email — nothing is created and no one can sign in without the link."
+    : "If you didn't request this, you can safely ignore this email — no one can sign in without the link.";
+  const text = [heading, "", intro, "", "It works once and expires in 10 minutes.", "", link, "", footer].join("\n");
   const html = `<!doctype html><html><body style="margin:0;padding:0;background:#f4f6f1">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f1;padding:2.5rem 1rem">
     <tr><td align="center">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:32rem;background:#ffffff;border:1px solid #dde3d6;border-radius:14px;padding:2rem;font-family:'DM Sans',-apple-system,system-ui,sans-serif;color:#2b332a">
         <tr><td style="font-family:Georgia,serif;font-size:1.05rem;color:#4c6547;padding-bottom:1.25rem">Parachute</td></tr>
-        <tr><td style="font-family:Georgia,serif;font-size:1.6rem;line-height:1.2;padding-bottom:.6rem">Sign in to Parachute Cloud</td></tr>
-        <tr><td style="color:#6a7566;line-height:1.55;padding-bottom:1.4rem">Click the button below to sign in. It works once and expires in 10 minutes.</td></tr>
-        <tr><td style="padding-bottom:1.4rem"><a href="${link}" style="display:inline-block;background:#5f7a57;color:#ffffff;text-decoration:none;padding:.7rem 1.4rem;border-radius:9px;font-weight:600">Sign in</a></td></tr>
+        <tr><td style="font-family:Georgia,serif;font-size:1.6rem;line-height:1.2;padding-bottom:.6rem">${heading}</td></tr>
+        <tr><td style="color:#6a7566;line-height:1.55;padding-bottom:1.4rem">${intro} It works once and expires in 10 minutes.</td></tr>
+        <tr><td style="padding-bottom:1.4rem"><a href="${link}" style="display:inline-block;background:#5f7a57;color:#ffffff;text-decoration:none;padding:.7rem 1.4rem;border-radius:9px;font-weight:600">${buttonLabel}</a></td></tr>
         <tr><td style="color:#6a7566;font-size:.85rem;line-height:1.5;word-break:break-all">Or paste this link into your browser:<br><a href="${link}" style="color:#4c6547">${link}</a></td></tr>
-        <tr><td style="color:#9aa693;font-size:.8rem;line-height:1.5;padding-top:1.4rem;border-top:1px solid #eef1ea;margin-top:1rem">If you didn't request this, you can safely ignore this email — no one can sign in without the link.</td></tr>
+        <tr><td style="color:#9aa693;font-size:.8rem;line-height:1.5;padding-top:1.4rem;border-top:1px solid #eef1ea;margin-top:1rem">${footer}</td></tr>
       </table>
     </td></tr>
   </table>
 </body></html>`;
-  return { html, text };
+  return { subject, html, text };
 }
 
 // --- senders -------------------------------------------------------------------
@@ -253,9 +266,9 @@ export function bindingSender(binding: SendEmailBinding, fromAddress: string): E
   }
   return {
     kind: "binding",
-    async sendMagicLink(to, link) {
-      const { html, text } = magicLinkBodies(link);
-      return send({ to, subject: SUBJECT, html, text });
+    async sendMagicLink(to, link, newAccount) {
+      const { subject, html, text } = magicLinkBodies(link, newAccount, to);
+      return send({ to, subject, html, text });
     },
     async sendOps({ to, subject, text }) {
       return send({ to, subject, text });
@@ -270,8 +283,8 @@ export function bindingSender(binding: SendEmailBinding, fromAddress: string): E
 export function devLogSender(): EmailSender {
   return {
     kind: "devlog",
-    async sendMagicLink(to, link) {
-      console.log(`[magic-link] would email ${to}: ${link}`);
+    async sendMagicLink(to, link, newAccount) {
+      console.log(`[magic-link] would email ${to} (${newAccount ? "new" : "returning"}): ${link}`);
       return { ok: true };
     },
     async sendOps({ to, subject, text }) {
