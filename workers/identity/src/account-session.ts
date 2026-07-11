@@ -17,36 +17,70 @@
  * allow-origin`, so the browser blocks it from reading the body — intended.
  */
 import { ensureCsrfToken } from "./csrf.ts";
-import { type OAuthDeps, jsonResponse } from "./oauth-shared.ts";
-import { sessionUser } from "./session-user.ts";
+import type { OAuthDeps } from "./oauth-shared.ts";
+import {
+  buildSessionCookie,
+  findActiveSession,
+  parseSessionCookie,
+  shouldSlideSession,
+  slideSession,
+} from "./sessions.ts";
+import { getUserById } from "./users.ts";
+
+/**
+ * A credentialed JSON reply that can carry MULTIPLE Set-Cookie headers (the CSRF
+ * mint and the rolling session re-issue can coincide) — a `Record` can't. NO
+ * CORS headers (see the module note); `no-store` so a back/forward navigation
+ * never replays a stale csrf/session state.
+ */
+function sessionJson(body: unknown, cookies: readonly string[]): Response {
+  const headers = new Headers({ "content-type": "application/json", "cache-control": "no-store" });
+  for (const c of cookies) headers.append("set-cookie", c);
+  return new Response(JSON.stringify(body), { status: 200, headers });
+}
 
 export async function handleAccountSession(
   db: D1Database,
   req: Request,
   deps: OAuthDeps,
 ): Promise<Response> {
-  // CSRF token for BOTH branches (G2 — anonymous CSRF). ensureCsrfToken reuses
-  // an existing CSRF cookie or mints one (returns setCookie only when it minted);
-  // the returned `token` always equals the cookie value, so the app echoes it as
-  // `__csrf` and C2's double-submit matches. It works WITHOUT a session — the
-  // server-rendered ceremony pages already rely on that — and the token
-  // authorizes NOTHING on its own (it's one half of a double-submit that also
-  // needs the matching cookie + same-origin + a live session at C2's mint gate).
-  // Returning it on the signed-OUT branch lets the SPA run the sign-in (email)
-  // moment in-app instead of hopping to the server-rendered /signup ceremony.
+  // CSRF token for BOTH branches (G2 — anonymous CSRF). ensureCsrfToken reuses an
+  // existing CSRF cookie or mints one (setCookie only when it minted); the token
+  // always equals the cookie value, so the app echoes it as `__csrf` and C2's
+  // double-submit matches. It works WITHOUT a session — the ceremony pages
+  // already rely on that — and authorizes NOTHING alone (it's one half of a
+  // double-submit that also needs the matching cookie + same-origin + a live
+  // session at C2's mint gate). Returning it on the signed-OUT branch lets the
+  // SPA run the sign-in moment in-app instead of hopping to /signup.
   const csrf = ensureCsrfToken(req);
-  const headers: Record<string, string> = { "cache-control": "no-store" };
-  if (csrf.setCookie) headers["set-cookie"] = csrf.setCookie;
+  const cookies: string[] = [];
+  if (csrf.setCookie) cookies.push(csrf.setCookie);
 
-  const user = await sessionUser(db, req, deps);
-  if (!user) {
-    return jsonResponse({ signed_in: false, csrf: csrf.token }, 200, headers);
+  const now = deps.now?.() ?? new Date();
+  const sessionId = parseSessionCookie(req.headers.get("cookie"));
+  // findActiveSession is the single chokepoint: it refuses an expired row AND a
+  // suspended user's session (the users-join). A logged-out row is gone. So
+  // nothing below rolls or reads a dead/suspended/absent session.
+  const session = sessionId ? await findActiveSession(db, sessionId, now) : null;
+  if (!session) {
+    return sessionJson({ signed_in: false, csrf: csrf.token }, cookies);
   }
-  // G1: `email` powers "Signed in as X"; `account_created_at` (the user row's
-  // created_at) powers "Account created ✓" for a fresh signup.
-  return jsonResponse(
+
+  // G3: roll the session forward ON USE (bounded — only past the 30d threshold,
+  // so ~once per 30d per session, not per request) and re-issue the cookie with
+  // a fresh 90d Max-Age. An active app user (the SPA polls this) never expires;
+  // an idle one still lapses at 90d. The id is stable across slides.
+  if (shouldSlideSession(session, now)) {
+    await slideSession(db, session.id, now);
+    cookies.push(buildSessionCookie(session.id));
+  }
+
+  const user = await getUserById(db, session.userId);
+  if (!user) return sessionJson({ signed_in: false, csrf: csrf.token }, cookies);
+  // G1: `email` powers "Signed in as X"; `account_created_at` powers "Account
+  // created ✓" for a fresh signup.
+  return sessionJson(
     { signed_in: true, csrf: csrf.token, email: user.email, account_created_at: user.createdAt },
-    200,
-    headers,
+    cookies,
   );
 }

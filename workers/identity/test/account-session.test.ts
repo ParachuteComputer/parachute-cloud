@@ -7,15 +7,23 @@
  */
 import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
+import { handleAccountSession } from "../src/account-session.ts";
 import { CSRF_COOKIE, CSRF_FIELD } from "../src/csrf.ts";
 import app from "../src/index.ts";
 import { SESSION_COOKIE } from "../src/sessions.ts";
-import { ISSUER, seedSession, seedUser } from "./helpers.ts";
+import { ISSUER, deps, seedSession, seedUser } from "./helpers.ts";
+
+const DAY = 24 * 60 * 60 * 1000;
 
 function sessionReq(sessionId: string): Request {
   return new Request(`${ISSUER}/account/session`, {
     headers: { cookie: `${SESSION_COOKIE}=${sessionId}` },
   });
+}
+
+/** All Set-Cookie headers (runtime has getSetCookie; the worker TS lib lacks it). */
+function setCookies(res: Response): string[] {
+  return (res.headers as unknown as { getSetCookie(): string[] }).getSetCookie();
 }
 
 describe("GET /account/session", () => {
@@ -82,5 +90,28 @@ describe("GET /account/session", () => {
     const tok = (await res.json()) as { aud: string; token: string };
     expect(tok.aud).toBe("account");
     expect(typeof tok.token).toBe("string");
+  });
+
+  test("G3: an aged session rolls forward + re-issues the session cookie; a fresh one does not", async () => {
+    const { id } = await seedUser("roll@example.com");
+    const sessionId = await seedSession(id); // expires ≈ now + 90d (fresh)
+    const base = Date.now();
+
+    // Fresh (just created): NOT past the 30d threshold → no session cookie re-issued.
+    const fresh = await handleAccountSession(env.DB, sessionReq(sessionId), deps(() => new Date(base)));
+    expect(setCookies(fresh).some((c) => c.startsWith(`${SESSION_COOKIE}=`))).toBe(false);
+
+    // 31 days later: remaining ≈ 59d < 60d → roll → session cookie re-issued
+    // (same id, fresh 90d Max-Age), and the user still resolves signed-in.
+    const rolled = await handleAccountSession(
+      env.DB,
+      sessionReq(sessionId),
+      deps(() => new Date(base + 31 * DAY)),
+    );
+    const rolledCookie = setCookies(rolled).find((c) => c.startsWith(`${SESSION_COOKIE}=`));
+    expect(rolledCookie).toBeDefined();
+    expect(rolledCookie).toContain(`${SESSION_COOKIE}=${sessionId}`);
+    expect(rolledCookie).toContain(`Max-Age=${(90 * DAY) / 1000}`);
+    expect((await rolled.json() as { signed_in: boolean }).signed_in).toBe(true);
   });
 });
