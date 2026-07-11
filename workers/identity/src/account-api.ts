@@ -291,6 +291,14 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
       // production with neither hides it, matching the console's own
       // teaser-only state.
       billing_enabled: deps.billingConfigured === true || deps.mockBillingEnabled === true,
+      // Whether this account has a Stripe customer to MANAGE — lets the app
+      // decide the billing CTA up front: show "Manage billing" (→ POST
+      // /account/billing/portal) only when true; otherwise "Upgrade" (→ POST
+      // /account/billing/checkout). Without this the app would blind-tap the
+      // portal for a comped/mock paid account (no Stripe customer) and hit its
+      // reactive 409 `no_billing_customer`. Mirrors the console's own
+      // `hasBillingAccount` gate on the Manage-billing button (ui.ts).
+      has_billing_customer: !!user.stripeCustomerId,
     },
     200,
     { "cache-control": "no-store" },

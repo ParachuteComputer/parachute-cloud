@@ -126,5 +126,26 @@ export async function validateAccountToken(
     return { ok: false, status: 401, error: "invalid_token", message: "token names more than one account" };
   }
 
-  return { ok: true, token: { accountId: ids[0]!, scopes: accountScopes, payload } };
+  const accountId = ids[0]!;
+
+  // STRUCTURAL cross-account belt (money surface): the account principal is the
+  // scope's `<id>`, and the token's `sub` MUST be that same id. Every mint path
+  // upholds this by construction — C2 (account-token.ts) mints
+  // `account:<session.userId>:admin` with `sub=session.userId`, and `account:*`
+  // is non-requestable at `/oauth/authorize` (isNonRequestableScope, oauth-
+  // shared.ts) so no auth-code/refresh token can ever carry an account scope
+  // with a divergent `sub`. This assertion closes the "bearer for A acts on B"
+  // class STRUCTURALLY rather than by trusting that discipline: a token whose
+  // `sub` and `account:<id>` scope disagree can never authorize anything. It is
+  // pure belt (no legitimate token trips it), so it rejects auth-shaped (401).
+  if (typeof payload.sub !== "string" || payload.sub !== accountId) {
+    return {
+      ok: false,
+      status: 401,
+      error: "invalid_token",
+      message: "token subject does not match its account scope",
+    };
+  }
+
+  return { ok: true, token: { accountId, scopes: accountScopes, payload } };
 }

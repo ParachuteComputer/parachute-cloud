@@ -334,6 +334,13 @@ export async function handleCheckoutPost(
     return redirectResponse("/console?billing_err=session");
   }
   const plan = checkoutPlan(String(form.get("plan") ?? "standard"));
+  // Pre-check `canStartCheckout` BEFORE parsing the interval, restoring the
+  // pre-refactor error-code ordering: a paid user hand-crafting a form with a
+  // bogus interval still gets `billing_err=already` (not `=invalid`), so this
+  // live payment path stays byte-identical to `main`. `checkoutCore` re-checks
+  // `canStartCheckout` (the only caller-authoritative gate); this duplicate
+  // pre-check exists solely to pin the console's error precedence.
+  if (!canStartCheckout(user.plan)) return redirectResponse("/console?billing_err=already");
   const interval = String(form.get("interval") ?? "monthly");
   if (!isBillingInterval(interval)) return redirectResponse("/console?billing_err=invalid");
 
