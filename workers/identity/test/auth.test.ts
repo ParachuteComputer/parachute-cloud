@@ -279,6 +279,53 @@ describe("magic link — send + verify", () => {
     expect(sender.sent).toHaveLength(0);
   });
 
+  // A REAL `application/json` body — the exact wire parachute-app's client.ts
+  // sends. The G2 tests above set the JSON-reply opt-in header on a FORM body,
+  // so they never exercised a JSON *body*: `req.formData()` THROWS on JSON in
+  // workerd → an uncaught 500, invisible to those tests, caught only on the live
+  // staging app-cutover. `next` is the app's in-app landing path.
+  function magicReqRealJson(email: string, next?: string, ip = "10.2.2.3"): Request {
+    const body: Record<string, string> = { __csrf: CSRF, email };
+    if (next !== undefined) body.next = next;
+    return new Request(`${ISSUER}/auth/magic`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      headers: {
+        "content-type": "application/json",
+        origin: ISSUER,
+        cookie: `parachute_id_csrf=${CSRF}`,
+        "cf-connecting-ip": ip,
+        "x-requested-with": "fetch",
+      },
+    });
+  }
+
+  test("JSON BODY (the SPA wire): application/json → 200 { ok: true }, link still sent (regression: req.formData() must not 500)", async () => {
+    const sender = captureSender();
+    const res = await handleMagicRequestPost(env.DB, magicReqRealJson("spa-json@example.com"), deps(), sender);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type") ?? "").toContain("application/json");
+    expect(await res.json()).toEqual({ ok: true });
+    expect(sender.sent).toHaveLength(1);
+  });
+
+  test("JSON BODY: a same-origin `next` in the body is honored at verify (not the /console default)", async () => {
+    const sender = captureSender();
+    const send = await handleMagicRequestPost(env.DB, magicReqRealJson("spa-next@example.com", "/welcome"), deps(), sender);
+    expect(send.status).toBe(200);
+    const verify = await handleMagicVerifyGet(env.DB, verifyReq(tokenFromLink(sender.sent[0]!.link)), deps());
+    expect(verify.status).toBe(302);
+    expect(verify.headers.get("location")).toContain("/welcome");
+    expect(verify.headers.get("location")).not.toContain("/console");
+  });
+
+  test("JSON BODY: an off-origin `next` is neutralized by safeNext (no open redirect)", async () => {
+    const sender = captureSender();
+    await handleMagicRequestPost(env.DB, magicReqRealJson("spa-evil@example.com", "https://evil.example/steal"), deps(), sender);
+    const verify = await handleMagicVerifyGet(env.DB, verifyReq(tokenFromLink(sender.sent[0]!.link)), deps());
+    expect(verify.headers.get("location")).not.toContain("evil.example");
+  });
+
   test("G4: a dead link on an APP origin → /welcome?link=expired; on the issuer → the neutral server page", async () => {
     const APP = "https://app.parachute.computer";
     const twoOriginDeps = (now?: () => Date) => ({ ...deps(now), boundOrigins: () => [ISSUER, APP] });
