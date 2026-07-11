@@ -9,7 +9,7 @@
  * `/account/setup`, hub#748) in a follow-up.
  */
 import type { AccountPlanSummary, ParachuteAccountDescriptor } from "@openparachute/door-contract";
-import { type OAuthDeps, jsonResponse } from "./oauth-shared.ts";
+import { type OAuthDeps, jsonResponse, vaultInstanceUrl } from "./oauth-shared.ts";
 import { PAID_TIERS, PLAN_SPECS, TIER_PRICE_LABEL } from "./plans.ts";
 
 /**
@@ -50,6 +50,11 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // slug / DO address / URL); delete not yet (handleAccountVaultDelete is 501).
     capabilities: { vault_create: true, vault_rename: false, vault_delete: false },
     plans: planLadder(),
+    // A `{name}`-placeholder template the app substitutes to preview a vault's
+    // address pre-creation. Derived from the SAME vaultInstanceUrl the real URLs
+    // come from (path form in prod, subdomain otherwise), so the two never
+    // disagree — `{name}` isn't URL-encoded there, so it survives as a placeholder.
+    vault_url_template: vaultInstanceUrl("{name}", deps),
   };
   return jsonResponse(body, 200, CORS);
 }

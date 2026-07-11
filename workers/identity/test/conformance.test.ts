@@ -103,6 +103,9 @@ describe("discovery endpoints", () => {
     expect(md.app_client_id).toBe("parachute-app");
     expect((md.capabilities as Record<string, unknown>).vault_rename).toBe(false);
     expect(Array.isArray(md.plans) && (md.plans as unknown[]).length).toBe(4);
+    // PR-2: the {name}-placeholder vault-URL template, derived from vaultInstanceUrl.
+    expect(md.vault_url_template).toContain("{name}");
+    expect(md.vault_url_template).toContain("/vault/{name}"); // path form in the test env
   });
 });
 
