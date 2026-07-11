@@ -25,20 +25,25 @@ export async function handleAccountSession(
   req: Request,
   deps: OAuthDeps,
 ): Promise<Response> {
-  const user = await sessionUser(db, req, deps);
-  if (!user) {
-    // Not signed in → the app routes to /signup; no CSRF needed yet.
-    return jsonResponse({ signed_in: false }, 200, { "cache-control": "no-store" });
-  }
-  // ensureCsrfToken reuses an existing CSRF cookie or mints one (returns setCookie
-  // only when it minted). The returned `token` always equals the cookie value, so
-  // the app can echo it as `__csrf` and C2's double-submit will match.
+  // CSRF token for BOTH branches (G2 — anonymous CSRF). ensureCsrfToken reuses
+  // an existing CSRF cookie or mints one (returns setCookie only when it minted);
+  // the returned `token` always equals the cookie value, so the app echoes it as
+  // `__csrf` and C2's double-submit matches. It works WITHOUT a session — the
+  // server-rendered ceremony pages already rely on that — and the token
+  // authorizes NOTHING on its own (it's one half of a double-submit that also
+  // needs the matching cookie + same-origin + a live session at C2's mint gate).
+  // Returning it on the signed-OUT branch lets the SPA run the sign-in (email)
+  // moment in-app instead of hopping to the server-rendered /signup ceremony.
   const csrf = ensureCsrfToken(req);
   const headers: Record<string, string> = { "cache-control": "no-store" };
   if (csrf.setCookie) headers["set-cookie"] = csrf.setCookie;
-  // `email` powers the app's "Signed in as X" chip; `account_created_at` (the
-  // user row's created_at) lets the app show "Account created ✓" for a fresh
-  // signup (it derives is_new from this + the empty vault list — G1).
+
+  const user = await sessionUser(db, req, deps);
+  if (!user) {
+    return jsonResponse({ signed_in: false, csrf: csrf.token }, 200, headers);
+  }
+  // G1: `email` powers "Signed in as X"; `account_created_at` (the user row's
+  // created_at) powers "Account created ✓" for a fresh signup.
   return jsonResponse(
     { signed_in: true, csrf: csrf.token, email: user.email, account_created_at: user.createdAt },
     200,

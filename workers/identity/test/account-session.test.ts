@@ -19,13 +19,19 @@ function sessionReq(sessionId: string): Request {
 }
 
 describe("GET /account/session", () => {
-  test("no session cookie → { signed_in: false }, no-store, no CORS", async () => {
+  test("no session cookie → { signed_in: false, csrf }, no-store, no CORS (G2 anon CSRF)", async () => {
     const res = await app.fetch(new Request(`${ISSUER}/account/session`), env);
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("no-store");
     // Credentialed endpoint — must NOT carry wildcard CORS (same-origin only).
     expect(res.headers.get("access-control-allow-origin")).toBeNull();
-    expect(await res.json()).toEqual({ signed_in: false });
+    const body = (await res.json()) as { signed_in: boolean; csrf: string };
+    expect(body.signed_in).toBe(false);
+    // G2: anonymous CSRF — the token lets the SPA run the sign-in moment in-app.
+    expect(typeof body.csrf).toBe("string");
+    expect(body.csrf.length).toBeGreaterThan(0);
+    // A fresh (cookie-less) request mints the CSRF cookie, value == the token.
+    expect(res.headers.get("set-cookie") ?? "").toContain(`${CSRF_COOKIE}=${body.csrf}`);
   });
 
   test("valid session → { signed_in: true, csrf } + a matching CSRF cookie", async () => {
