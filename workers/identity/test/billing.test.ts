@@ -847,6 +847,31 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
     expect(res.headers.get("location")).toBe("/console?billing_err=invalid");
   });
 
+  test("F1: an OMITTED interval field (no `interval` in the form at all) defaults to the tier's cheapest available cycle — entry → quarterly (succeeds), standard → monthly", async () => {
+    const { id: entryId } = await seedUser("checkout-entry-bare@example.com");
+    const entrySession = await seedSession(entryId);
+    let entryRaw = "";
+    interceptCheckoutCreate((b) => (entryRaw = b));
+    const entryRes = await app.fetch(
+      post("/billing/checkout", { __csrf: CSRF, plan: "entry" }, sessionCookie(entrySession)),
+      BILLING_ENV,
+    );
+    expect(entryRes.status).toBe(302);
+    expect(entryRes.headers.get("location")).toBe("https://checkout.stripe.com/c/test");
+    expect(new URLSearchParams(entryRaw).get("line_items[0][price]")).toBe("price_test_entry_quarterly");
+
+    const { id: standardId } = await seedUser("checkout-standard-bare@example.com");
+    const standardSession = await seedSession(standardId);
+    let standardRaw = "";
+    interceptCheckoutCreate((b) => (standardRaw = b));
+    const standardRes = await app.fetch(
+      post("/billing/checkout", { __csrf: CSRF, plan: "standard" }, sessionCookie(standardSession)),
+      BILLING_ENV,
+    );
+    expect(standardRes.status).toBe(302);
+    expect(new URLSearchParams(standardRaw).get("line_items[0][price]")).toBe(PRICE_MONTHLY);
+  });
+
   test("a (tier, interval) whose Price var is unset → billing_err=invalid; billing overall stays up", async () => {
     const { id } = await seedUser("checkout-hole@example.com");
     const sessionId = await seedSession(id);

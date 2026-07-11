@@ -240,7 +240,7 @@ describe("POST /account/billing/checkout — Bearer-gated hosted Checkout", () =
     },
   );
 
-  test("interval omitted → defaults to monthly", async () => {
+  test("interval omitted → defaults to the tier's cheapest available cycle (standard → monthly)", async () => {
     const { id } = await seedUser("acct-checkout-defaultinterval@example.com");
     const token = await mintAccountToken(id);
     let raw = "";
@@ -248,6 +248,18 @@ describe("POST /account/billing/checkout — Bearer-gated hosted Checkout", () =
     const res = await app.fetch(bearerPost("/account/billing/checkout", token, { tier: "standard" }), BILLING_ENV);
     expect(res.status).toBe(200);
     expect(new URLSearchParams(raw).get("line_items[0][price]")).toBe("price_test_standard_monthly");
+  });
+
+  test("F1: a BARE {tier:\"entry\"} (interval omitted) now SUCCEEDS — defaults to quarterly, entry's cheapest cycle, instead of 400ing on a monthly Price entry never had", async () => {
+    const { id } = await seedUser("acct-checkout-entry-bare@example.com");
+    const token = await mintAccountToken(id);
+    let raw = "";
+    interceptCheckoutCreate((b) => (raw = b));
+    const res = await app.fetch(bearerPost("/account/billing/checkout", token, { tier: "entry" }), BILLING_ENV);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { url: string };
+    expect(body.url).toBe("https://checkout.stripe.com/c/acct-test");
+    expect(new URLSearchParams(raw).get("line_items[0][price]")).toBe("price_test_entry_quarterly");
   });
 
   test("invalid tier → 400 invalid_tier, no Stripe call", async () => {

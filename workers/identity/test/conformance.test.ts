@@ -119,6 +119,35 @@ describe("discovery endpoints", () => {
     expect(md.vault_url_template).toContain("{name}");
     expect(md.vault_url_template).toContain("/vault/{name}"); // path form in the test env
   });
+
+  test("parachute-account descriptor — F1: each plan publishes per-interval availability + price (additive on price_month)", async () => {
+    const res = await app.fetch(new Request(`${ISSUER}/.well-known/parachute-account`), env);
+    const md = (await res.json()) as {
+      plans: Array<{
+        id: string;
+        price_month?: number;
+        intervals: Record<"monthly" | "quarterly" | "yearly", { available: boolean; price?: number; label?: string }>;
+      }>;
+    };
+    const byId = Object.fromEntries(md.plans.map((p) => [p.id, p]));
+
+    // Back-compat: price_month is unchanged (entry's effective/marketing rate).
+    expect(byId.entry!.price_month).toBe(1);
+    expect(byId.standard!.price_month).toBe(3);
+
+    // F1's fix: entry has NO monthly cycle — the app can now see that instead
+    // of assuming every tier bills monthly.
+    expect(byId.entry!.intervals.monthly).toEqual({ available: false });
+    expect(byId.entry!.intervals.quarterly).toEqual({ available: true, price: 3, label: "$3/quarter" });
+    expect(byId.entry!.intervals.yearly).toEqual({ available: true, price: 10, label: "$10/yr" });
+
+    // Every other tier has all three cycles.
+    for (const id of ["standard", "plus", "power"]) {
+      expect(byId[id]!.intervals.monthly.available).toBe(true);
+      expect(byId[id]!.intervals.quarterly.available).toBe(true);
+      expect(byId[id]!.intervals.yearly.available).toBe(true);
+    }
+  });
 });
 
 // --- account door — session/token/vault-token drift detectors (hub-parity P3,

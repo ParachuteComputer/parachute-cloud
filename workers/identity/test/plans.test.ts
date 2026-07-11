@@ -23,6 +23,7 @@ import { validateAccessToken } from "../src/tokens.ts";
 import {
   PLAN_SPECS,
   canStartCheckout,
+  cheapestInterval,
   coercePlanId,
   entitlementPlanFor,
   formatPlanBytes,
@@ -32,6 +33,7 @@ import {
   planEntitlement,
   planLine,
   tierIntervalPricing,
+  tierIntervals,
   upgradeTeaser,
   vaultCapMessage,
 } from "../src/plans.ts";
@@ -170,6 +172,36 @@ describe("PLAN_SPECS — the ratified ladder", () => {
     expect(tierIntervalPricing("power")).toBe("$10/mo · $25 / 3 mo · $80/yr");
     // Entry never advertises a monthly cycle it doesn't sell.
     expect(tierIntervalPricing("entry")).not.toContain("/mo");
+  });
+
+  test("tierIntervals — F1: entry's monthly is unavailable; quarterly/yearly carry numeric price + label", () => {
+    expect(tierIntervals("entry")).toEqual({
+      monthly: { available: false },
+      quarterly: { available: true, price: 3, label: "$3/quarter" },
+      yearly: { available: true, price: 10, label: "$10/yr" },
+    });
+    expect(tierIntervals("standard")).toEqual({
+      monthly: { available: true, price: 3, label: "$3/mo" },
+      quarterly: { available: true, price: 7, label: "$7/quarter" },
+      yearly: { available: true, price: 25, label: "$25/yr" },
+    });
+    expect(tierIntervals("plus")).toEqual({
+      monthly: { available: true, price: 5, label: "$5/mo" },
+      quarterly: { available: true, price: 12, label: "$12/quarter" },
+      yearly: { available: true, price: 40, label: "$40/yr" },
+    });
+    expect(tierIntervals("power")).toEqual({
+      monthly: { available: true, price: 10, label: "$10/mo" },
+      quarterly: { available: true, price: 25, label: "$25/quarter" },
+      yearly: { available: true, price: 80, label: "$80/yr" },
+    });
+  });
+
+  test("cheapestInterval — F1: entry's cheapest available cycle is quarterly (no monthly Price); everyone else is monthly", () => {
+    expect(cheapestInterval("entry")).toBe("quarterly");
+    expect(cheapestInterval("standard")).toBe("monthly");
+    expect(cheapestInterval("plus")).toBe("monthly");
+    expect(cheapestInterval("power")).toBe("monthly");
   });
 
   test("entitlementPlanFor — the trial mirrors the CHOSEN tier (pending_plan), else its plus-mirroring self", () => {
