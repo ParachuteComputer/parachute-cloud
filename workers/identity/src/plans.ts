@@ -173,6 +173,17 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
  *  exist. The ACTUAL amounts live on the Stripe Prices — keep dashboard + copy
  *  in step. Entry has no monthly (Stripe's $0.30 flat fee eats a $1 charge) — it
  *  bills quarterly/annually. */
+/** The headline monthly price per purchasable tier, in whole USD — the NUMERIC
+ *  source `account-api` reads for `price_monthly_usd`, rather than regex-stripping
+ *  TIER_PRICE_LABEL (a future non-integer like "$2.50/mo" would corrupt to 250).
+ *  Keep in sync with TIER_PRICE_LABEL. */
+export const TIER_PRICE_MONTHLY_USD: Record<PaidTier, number> = {
+  entry: 1,
+  standard: 3,
+  plus: 5,
+  power: 10,
+};
+
 export const TIER_PRICE_LABEL: Record<PaidTier, string> = {
   entry: "$1/mo",
   standard: "$3/mo",

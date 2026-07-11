@@ -20,6 +20,7 @@ import {
   CEREMONY_PREFIXES,
   RESERVED_PREFIXES,
   SPA_EXCEPTIONS,
+  SUBTREE_ONLY_PREFIXES,
   isCeremonyPath,
 } from "../src/route-manifest.ts";
 
@@ -109,6 +110,18 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
       }
       expect([...DEFERRED_ROUTES]).toEqual(["/"]);
     });
+
+    test("the /account sub-tree is server-owned but the bare /account is the SPA shell", () => {
+      // The account API is entirely under /account/… (C2 token + C3 surface) —
+      // those stay worker-first.
+      for (const p of ["/account/session", "/account/token", "/account/vaults", "/account/summary"]) {
+        expect(isCeremonyPath(p)).toBe(true);
+      }
+      // The bare /account is the Parachute App's own Account-manager screen: a
+      // cold hard-load must boot the SPA shell, never 404 in the worker.
+      expect(isCeremonyPath("/account")).toBe(false);
+      expect(SUBTREE_ONLY_PREFIXES).toEqual(["/account"]);
+    });
   });
 
   // (d) P0.3 parity — provably the same set as the notes-ui service-worker
@@ -149,7 +162,10 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
     const KNOWN_PARITY_DIFFERENCES = { swOnly: ["/api"], manifestOnly: ["/__test"] };
 
     test("the sets are identical modulo the documented differences", () => {
-      const manifest = new Set<string>(CEREMONY_PREFIXES);
+      // `/account` is a SUBTREE_ONLY prefix (its `/account/*` sub-tree is server-
+      // owned; the bare `/account` is the SPA shell) — still part of the manifest's
+      // server-owned set, and the SW denylist matches it (`/^\/account\//`).
+      const manifest = new Set<string>([...CEREMONY_PREFIXES, ...SUBTREE_ONLY_PREFIXES]);
       const denylist = new Set<string>(P03_DENYLIST_PREFIXES);
       const manifestOnly = [...manifest].filter((p) => !denylist.has(p)).sort();
       const swOnly = [...denylist].filter((p) => !manifest.has(p)).sort();

@@ -22,6 +22,7 @@ import worker from "../src/index.ts";
 import {
   CEREMONY_PREFIXES,
   SPA_EXCEPTIONS,
+  SUBTREE_ONLY_PREFIXES,
   isCeremonyPath,
   runWorkerFirstRules,
   runsWorkerFirst,
@@ -45,8 +46,10 @@ describe("runWorkerFirstRules — the derived config (P1.1)", () => {
     for (const ex of SPA_EXCEPTIONS) expect(rules).toContain(`!${ex}`);
   });
 
-  test("exact length: 2 per prefix + root + one negation per exception (no strays)", () => {
-    expect(rules).toHaveLength(CEREMONY_PREFIXES.length * 2 + 1 + SPA_EXCEPTIONS.length);
+  test("exact length: 2 per ceremony prefix + 1 per subtree-only prefix + root + one negation per exception (no strays)", () => {
+    expect(rules).toHaveLength(
+      CEREMONY_PREFIXES.length * 2 + SUBTREE_ONLY_PREFIXES.length + 1 + SPA_EXCEPTIONS.length,
+    );
   });
 });
 

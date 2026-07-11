@@ -49,10 +49,11 @@ import {
 } from "./oauth-shared.ts";
 import {
   PLAN_SPECS,
-  TIER_PRICE_LABEL,
+  TIER_PRICE_MONTHLY_USD,
   entitlementPlanFor,
   isPaidTier,
   planEntitlement,
+  planTotalBytes,
   vaultCapMessage,
 } from "./plans.ts";
 import { ACCESS_TOKEN_TTL_SECONDS, signAccessToken } from "./tokens.ts";
@@ -251,11 +252,14 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
     vault_limit: spec.vault_count,
     vaults_used: vaults.length,
     storage_used_bytes: storageUsed,
-    storage_limit_bytes: spec.notes_bytes + spec.attachment_bytes,
+    // The effective tier's total (notes + attachment) budget — the same sum the
+    // cap push computes; call the helper rather than re-inlining it.
+    storage_limit_bytes: planTotalBytes(effective),
   };
   // A current monthly price only for a paid tier (trial/expired aren't charged).
+  // Read the numeric source directly — no regex-strip of the display label.
   if (isPaidTier(user.plan)) {
-    plan.price_monthly_usd = Number.parseInt(TIER_PRICE_LABEL[user.plan].replace(/[^0-9]/g, ""), 10);
+    plan.price_monthly_usd = TIER_PRICE_MONTHLY_USD[user.plan];
   }
   if (user.plan === "trial" && user.planDowngradeAt) {
     const msLeft = new Date(user.planDowngradeAt).getTime() - now.getTime();

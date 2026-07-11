@@ -63,7 +63,6 @@ export const CEREMONY_PREFIXES = [
   "/auth", // magic-link request (/auth/magic) + verify (/auth/verify)
   "/console", // account console + every /console/* action (vaults, security, plan, packs, checklist, promo, import/export/restore)
   "/admin", // operator admin console + /admin/* (users, vaults, plan, suspend)
-  "/account", // Parachute App campaign (#116): POST /account/token (C2) + the /account/* surface (C3)
   "/billing", // Stripe checkout / portal / webhook / mock-checkout
   "/unsubscribe", // onboarding-drip one-click unsubscribe (GET/POST)
   "/health", // liveness JSON — must return JSON, never the SPA shell
@@ -81,12 +80,26 @@ export const CEREMONY_PREFIXES = [
 export const SPA_EXCEPTIONS = ["/oauth/callback"] as const;
 
 /**
+ * Prefixes whose SUB-TREE is server-owned (`/account/…`) but whose EXACT path is
+ * an SPA client route. `/account`: the account API lives entirely under
+ * `/account/…` (session/token/vaults/summary — C2/C3), while the bare `/account`
+ * is the Parachute App's own Account-manager screen. So `run_worker_first` gets
+ * `/account/*` (worker) but NOT the exact `/account` — a cold hard-load of
+ * `/account` (before the service worker installs) must boot the SPA shell, not
+ * 404 in the worker. `isCeremonyPath` mirrors this: the sub-tree is ceremony, the
+ * bare prefix is not. (The P0.3 SW denylist already matches `/^\/account\//`
+ * — sub-tree only — so this aligns the run_worker_first side with it.)
+ */
+export const SUBTREE_ONLY_PREFIXES = ["/account"] as const;
+
+/**
  * The subset of CEREMONY_PREFIXES that has NO live route in `index.ts` yet —
  * reserved so the SPA fallback can never claim it before its routes land, and
  * exempted from the "no dead entry" test (there is intentionally nothing to
- * point at). Empty since Phase 2 C2 (#116): `/account` now carries a live route
- * (`POST /account/token`), so it graduated from reserved to a real ceremony
- * prefix. New forward-looking prefixes go here until their first route ships.
+ * point at). Empty today. New forward-looking prefixes go here until their first
+ * route ships. (`/account` is NOT here — its `/account/…` API is live; it lives
+ * in SUBTREE_ONLY_PREFIXES because only the sub-tree, not the bare path, is
+ * server-owned.)
  */
 export const RESERVED_PREFIXES = [] as const;
 
@@ -130,6 +143,9 @@ export const ROOT_PATH = "/" as const;
 export function runWorkerFirstRules(): string[] {
   const rules: string[] = [];
   for (const prefix of CEREMONY_PREFIXES) rules.push(prefix, `${prefix}/*`);
+  // Sub-tree-only prefixes emit ONLY `<prefix>/*` — the bare `<prefix>` is
+  // deliberately absent so it falls through to the SPA shell (see the const).
+  for (const prefix of SUBTREE_ONLY_PREFIXES) rules.push(`${prefix}/*`);
   rules.push(ROOT_PATH);
   for (const ex of SPA_EXCEPTIONS) rules.push(`!${ex}`);
   return rules;
@@ -187,5 +203,9 @@ export function runsWorkerFirst(pathname: string, rules: readonly string[] = run
 export function isCeremonyPath(pathname: string): boolean {
   const path = pathname.split(/[?#]/, 1)[0] ?? pathname;
   if (SPA_EXCEPTIONS.some((ex) => underPrefix(path, ex))) return false;
-  return CEREMONY_PREFIXES.some((prefix) => underPrefix(path, prefix));
+  if (CEREMONY_PREFIXES.some((prefix) => underPrefix(path, prefix))) return true;
+  // Sub-tree-only: the sub-tree (`/account/…`) is server-owned, the bare prefix
+  // (`/account`) is the SPA shell — mirrors the `/account/*`-without-`/account`
+  // run_worker_first rule.
+  return SUBTREE_ONLY_PREFIXES.some((prefix) => path.startsWith(prefix + "/"));
 }
