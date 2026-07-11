@@ -10,7 +10,7 @@
  */
 import type { AccountPlanSummary, ParachuteAccountDescriptor } from "@openparachute/door-contract";
 import { type OAuthDeps, jsonResponse, vaultInstanceUrl } from "./oauth-shared.ts";
-import { PAID_TIERS, PLAN_SPECS, TIER_PRICE_LABEL } from "./plans.ts";
+import { PAID_TIERS, PLAN_SPECS, TIER_PRICE_MONTHLY_USD, type TierIntervalAvailability, tierIntervals } from "./plans.ts";
 
 /**
  * The reserved first-party client id a native app uses against the cloud door.
@@ -25,16 +25,44 @@ const CORS = {
 };
 
 /**
- * The plan ladder the descriptor advertises — `id`/`name`/`vaults` straight from
- * `PLAN_SPECS`, the headline monthly rate parsed from `TIER_PRICE_LABEL`
- * ("$3/mo" → 3) so the single source of pricing truth stays in `plans.ts`.
+ * The additive per-interval extension the descriptor publishes on top of the
+ * shared `AccountPlanSummary` shape (door-contract) — F1/F5: cloud already has
+ * this truth (`plans.ts` `TIER_INTERVAL_AMOUNTS`, via `tierIntervals`), it just
+ * needed publishing so the app can render an interval selector (monthly/
+ * quarterly/yearly) showing only the cycles a tier actually has, instead of
+ * assuming every tier bills monthly (entry doesn't — Stripe's flat fee eats a
+ * $1 monthly charge). `price_month` (the door-contract field) is UNCHANGED —
+ * kept for back-compat so any existing reader of the old shape still works;
+ * `intervals` is new and purely additive. A door-contract consumer that only
+ * knows `AccountPlanSummary` sees exactly the fields it expects; one that
+ * knows this shape gets the extra data too.
  */
-function planLadder(): AccountPlanSummary[] {
+export interface AccountPlanSummaryWithIntervals extends AccountPlanSummary {
+  /** Per-cycle availability/price/label, keyed by the three billing cycles —
+   *  {@link TierIntervalAvailability} for each. entry.monthly reads
+   *  `{available:false}` (no monthly Price exists for entry). */
+  intervals: {
+    monthly: TierIntervalAvailability;
+    quarterly: TierIntervalAvailability;
+    yearly: TierIntervalAvailability;
+  };
+}
+
+/**
+ * The plan ladder the descriptor advertises — `id`/`name`/`vaults` straight
+ * from `PLAN_SPECS`, `price_month` from the numeric `TIER_PRICE_MONTHLY_USD`
+ * source (not a regex-parse of the `TIER_PRICE_LABEL` display string — the
+ * plans.ts note: a future non-integer label like "$2.50/mo" would otherwise
+ * corrupt to 250), and the new `intervals` breakdown from `tierIntervals` —
+ * all three read the SAME `plans.ts` source of pricing truth.
+ */
+function planLadder(): AccountPlanSummaryWithIntervals[] {
   return PAID_TIERS.map((tier) => ({
     id: PLAN_SPECS[tier].id,
     name: PLAN_SPECS[tier].label,
     vaults: PLAN_SPECS[tier].vault_count,
-    price_month: Number.parseInt(TIER_PRICE_LABEL[tier].replace(/[^0-9]/g, ""), 10),
+    price_month: TIER_PRICE_MONTHLY_USD[tier],
+    intervals: tierIntervals(tier),
   }));
 }
 

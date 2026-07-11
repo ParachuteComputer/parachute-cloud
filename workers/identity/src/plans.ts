@@ -227,6 +227,62 @@ export function tierIntervalPricing(tier: PaidTier): string {
   return parts.join(" · ");
 }
 
+/** One billing cycle's availability + billed amount for a tier's card — the
+ *  per-interval shape both the account descriptor (account-descriptor.ts,
+ *  `GET /.well-known/parachute-account`) and `cheapestInterval` below read.
+ *  `price` is the WHOLE-DOLLAR amount actually billed for that CYCLE (not a
+ *  monthly-equivalent rate — entry's quarterly reads `price: 3`, the $3 charged
+ *  once a quarter, not $1); `label` is a short display string ("$3/quarter").
+ *  Both are present only when `available`. */
+export interface TierIntervalAvailability {
+  available: boolean;
+  price?: number;
+  label?: string;
+}
+
+const INTERVAL_SUFFIX = { monthly: "mo", quarterly: "quarter", yearly: "yr" } as const;
+
+function intervalAvailability(amount: string | null, suffix: string): TierIntervalAvailability {
+  if (!amount) return { available: false };
+  return { available: true, price: Number.parseInt(amount.replace(/[^0-9]/g, ""), 10), label: `${amount}/${suffix}` };
+}
+
+/**
+ * Availability + numeric price + a short label for each of a tier's three
+ * billing cycles (F1/F5 — the per-interval data the app needs to render an
+ * interval selector showing only the cycles a tier actually has). Derived from
+ * {@link TIER_INTERVAL_AMOUNTS}, the SAME table {@link tierIntervalPricing}
+ * renders as prose — one source of truth for both. Entry's `monthly` reads
+ * `{available:false}` (no such Price; Stripe's flat fee eats a $1 monthly
+ * charge, so entry bills quarterly/yearly only).
+ */
+export function tierIntervals(tier: PaidTier): Record<"monthly" | "quarterly" | "yearly", TierIntervalAvailability> {
+  const a = TIER_INTERVAL_AMOUNTS[tier];
+  return {
+    monthly: intervalAvailability(a.monthly, INTERVAL_SUFFIX.monthly),
+    quarterly: intervalAvailability(a.quarterly, INTERVAL_SUFFIX.quarterly),
+    yearly: intervalAvailability(a.yearly, INTERVAL_SUFFIX.yearly),
+  };
+}
+
+/**
+ * The cheapest billing cycle a tier actually sells, monthly→quarterly→yearly
+ * order — checkout's default when a caller omits `interval` (billing.ts's
+ * `handleCheckoutPost` + `handleAccountBillingCheckoutPost`): a bare
+ * `{tier:"entry"}` now resolves to "quarterly" (entry's actual cheapest cycle)
+ * instead of the flat "monthly" every tier used to default to, which 400'd for
+ * entry (no such Price — F1). Relies on the same coupling billing-config.ts's
+ * ANCHOR Prices already assume: each tier's cheapest cycle here is always one
+ * of the four guaranteed-configured anchors, so this never picks an interval
+ * whose Price might be absent from a given deployment.
+ */
+export function cheapestInterval(tier: PaidTier): "monthly" | "quarterly" | "yearly" {
+  const intervals = tierIntervals(tier);
+  if (intervals.monthly.available) return "monthly";
+  if (intervals.quarterly.available) return "quarterly";
+  return "yearly";
+}
+
 export function isPlanId(raw: string): raw is PlanId {
   return (
     raw === "entry" ||

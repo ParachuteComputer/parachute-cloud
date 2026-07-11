@@ -87,7 +87,7 @@ import {
   priceFor,
 } from "./billing-config.ts";
 import { makeStripe } from "./stripe-client.ts";
-import { type PaidTier, canStartCheckout, isPaidTier } from "./plans.ts";
+import { type PaidTier, canStartCheckout, cheapestInterval, isPaidTier } from "./plans.ts";
 import { type User, setUserPlan } from "./users.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 import { readJsonBody, requireAccount } from "./account-api.ts";
@@ -341,7 +341,15 @@ export async function handleCheckoutPost(
   // `canStartCheckout` (the only caller-authoritative gate); this duplicate
   // pre-check exists solely to pin the console's error precedence.
   if (!canStartCheckout(user.plan)) return redirectResponse("/console?billing_err=already");
-  const interval = String(form.get("interval") ?? "monthly");
+  // An OMITTED `interval` field (not present-but-invalid) defaults to the
+  // tier's CHEAPEST AVAILABLE billing cycle (F1) instead of a flat "monthly" —
+  // entry, which has no monthly Price, now defaults to quarterly and succeeds
+  // instead of 400ing on a cycle it never sold. The console's own select
+  // always submits an explicit valid interval (ui.ts's per-tier options), so
+  // this default is a belt for hand-crafted/legacy form posts, not the normal
+  // path — an explicit invalid/unavailable interval is still refused below /
+  // by checkoutCore, unchanged.
+  const interval = String(form.get("interval") ?? cheapestInterval(plan));
   if (!isBillingInterval(interval)) return redirectResponse("/console?billing_err=invalid");
 
   const origin = ceremonyOrigin(req, deps);
@@ -539,9 +547,15 @@ export async function handleAccountBillingPortalPost(
  * `standard` because its own Upgrade buttons only ever submit valid values),
  * a caller-supplied tier here is validated STRICTLY: an API client should get
  * a clear 400, never a silent substitution to a plan it didn't ask for.
- * `interval` defaults to `"monthly"` when omitted (entry, which has no
- * monthly Price, still 400s via the normal `invalid_plan` matrix-hole path
- * below — the same `entry×monthly` refusal the console's checkout gives).
+ * `interval` defaults to the TIER'S CHEAPEST AVAILABLE billing cycle when
+ * omitted (`cheapestInterval`, plans.ts — F1): a bare `{tier:"entry"}` now
+ * resolves to `"quarterly"` (entry's actual cheapest cycle) and SUCCEEDS,
+ * instead of 400ing on the flat `"monthly"` default entry never had a Price
+ * for. An EXPLICIT interval is still honored/validated as-is: a caller-
+ * supplied unrecognized string still 400s `invalid_interval`, and an
+ * explicit-but-unavailable combination (e.g. `entry`+`monthly`) still 400s
+ * `invalid_plan` via the normal matrix-hole path below — the same
+ * `entry×monthly` refusal the console's checkout gives.
  *
  * MOCK BILLING: when real Stripe isn't configured but `deps.mockBillingEnabled`
  * is (non-production, billing-config.ts) — the same interim demo path the
@@ -575,7 +589,9 @@ export async function handleAccountBillingCheckoutPost(
     return billingApiError(400, "invalid_tier", "tier must be one of entry, standard, plus, power");
   }
   const tier = rawTier as PaidTier;
-  const rawInterval = typeof body.interval === "string" ? body.interval : "monthly";
+  // Omitted → the tier's cheapest available cycle (see the module note above);
+  // present-but-invalid still 400s below, unchanged.
+  const rawInterval = typeof body.interval === "string" ? body.interval : cheapestInterval(tier);
   if (!isBillingInterval(rawInterval)) {
     return billingApiError(400, "invalid_interval", "interval must be one of monthly, quarterly, yearly");
   }
