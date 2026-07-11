@@ -223,7 +223,7 @@ export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: O
   const token = new URL(req.url).searchParams.get("token");
   const now = deps.now?.() ?? new Date();
   const consumed = token ? await consumeMagicLink(db, token, now) : null;
-  if (!consumed) return magicLinkDead();
+  if (!consumed) return magicLinkDead(req, deps);
   // Resolve the user: existing → verify their email; otherwise create-or-fetch
   // (a concurrent link for a new address could have created the row first).
   // A SUSPENDED account gets the same dead-link page as an expired token —
@@ -231,7 +231,7 @@ export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: O
   let userId = consumed.userId;
   const existing = userId ? await getUserById(db, userId) : await getUserByEmail(db, consumed.email);
   if (existing) {
-    if (existing.suspendedAt) return magicLinkDead();
+    if (existing.suspendedAt) return magicLinkDead(req, deps);
     userId = existing.id;
     await markEmailVerified(db, userId);
   } else {
@@ -245,8 +245,22 @@ export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: O
   return finishPrimaryAuth(db, deps, userId, safeNext(consumed.next ?? "/console", deps));
 }
 
-/** The one neutral response every unusable magic link gets (invalid, used, expired — or suspended). */
-function magicLinkDead(): Response {
+/**
+ * The neutral response every unusable magic link gets (invalid, used, expired —
+ * or suspended). G4: when the link was clicked on an APP origin (the emailed
+ * href pointed at app.parachute.computer, a bound origin ≠ the issuer), bounce to
+ * the app's OWN recovery — `/welcome?link=expired` — so the SPA renders "that
+ * link expired" + a prefilled resend instead of a dead-end server page. A
+ * link-click navigation carries no `Origin` header (so `ceremonyOrigin` can't see
+ * it); the request URL's own origin IS the app origin (the link's host), and we
+ * only trust it when it's a bound member — never an open redirect. cloud-origin
+ * verifies keep the neutral server page.
+ */
+function magicLinkDead(req: Request, deps: OAuthDeps): Response {
+  const reqOrigin = new URL(req.url).origin;
+  if (reqOrigin !== deps.issuer && resolveBoundOrigins(deps).includes(reqOrigin)) {
+    return redirectResponse(`${reqOrigin}/welcome?link=expired`);
+  }
   return htmlResponse(
     renderError({
       title: "Link expired",

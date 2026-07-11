@@ -279,6 +279,19 @@ describe("magic link — send + verify", () => {
     expect(sender.sent).toHaveLength(0);
   });
 
+  test("G4: a dead link on an APP origin → /welcome?link=expired; on the issuer → the neutral server page", async () => {
+    const APP = "https://app.parachute.computer";
+    const twoOriginDeps = (now?: () => Date) => ({ ...deps(now), boundOrigins: () => [ISSUER, APP] });
+    // App-origin verify of an invalid/used token → the app's own recovery.
+    const appDead = await handleMagicVerifyGet(env.DB, new Request(`${APP}/auth/verify?token=nope`), twoOriginDeps());
+    expect(appDead.status).toBe(302);
+    expect(appDead.headers.get("location")).toBe(`${APP}/welcome?link=expired`);
+    // Issuer-origin verify of the same dead token → the neutral server page (unchanged).
+    const cloudDead = await handleMagicVerifyGet(env.DB, verifyReq("nope"), twoOriginDeps());
+    expect(cloudDead.status).toBe(400);
+    expect(await cloudDead.text()).toContain("Link expired");
+  });
+
   test("a failing sender still returns the neutral 200, with a structured PII-safe log trail", async () => {
     // A real-binding failure (bad address, quota, CF transient) must not turn
     // into a silent 200: the handler logs event=magic_link_send_failed with the
