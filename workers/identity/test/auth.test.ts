@@ -326,6 +326,14 @@ describe("magic link — send + verify", () => {
     expect(verify.headers.get("location")).not.toContain("evil.example");
   });
 
+  test("JSON BODY: no `next` → the SPA caller defaults to the app root `/` (its BootGate dispatches), never /console", async () => {
+    const sender = captureSender();
+    await handleMagicRequestPost(env.DB, magicReqRealJson("spa-default@example.com"), deps(), sender);
+    const verify = await handleMagicVerifyGet(env.DB, verifyReq(tokenFromLink(sender.sent[0]!.link)), deps());
+    expect(verify.status).toBe(302);
+    expect(verify.headers.get("location")).toBe("/");
+  });
+
   test("G4: a dead link on an APP origin → /welcome?link=expired; on the issuer → the neutral server page", async () => {
     const APP = "https://app.parachute.computer";
     const twoOriginDeps = (now?: () => Date) => ({ ...deps(now), boundOrigins: () => [ISSUER, APP] });

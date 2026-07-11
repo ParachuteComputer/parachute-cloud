@@ -170,16 +170,20 @@ export async function handleMagicRequestPost(
   // like the password login's 2FA divert stores its resume in pending_logins.
   //
   // Otherwise honor a caller-supplied `next` (the SPA passes its in-app landing
-  // path, e.g. `/welcome`, in the body) — run through `safeNext` so it can only
-  // ever be a same-origin path (no open redirect), never leaving null to fall
-  // back to the server console at verify time.
+  // path, e.g. `/welcome`, in the body). Precedence: the OAuth authorize-resume
+  // URL (issuer-anchored) → a caller-supplied relative path (`safeNext`-guarded,
+  // same-origin only, no open redirect) → for the SPA/JSON caller, the app root
+  // `/` (its BootGate dispatches new-vs-returning — NEVER the server console) →
+  // for the server-rendered forms, null (verify keeps its own `/console` default).
   const authorizeParams = authorizeParamsFromForm(form);
   const requestedNext = String(form.get("next") ?? "").trim();
   const next = authorizeParams
     ? buildAuthorizeUrl(deps.issuer, authorizeParams)
     : requestedNext
       ? safeNext(requestedNext, deps)
-      : null;
+      : wantsJson
+        ? "/"
+        : null;
   if (!checkForm(req, form, deps)) {
     if (wantsJson) return jsonResponse({ error: "Your session expired. Please try again." }, 403);
     return magicError(req, "Your session expired. Please try again.", "");
