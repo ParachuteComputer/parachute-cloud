@@ -7,11 +7,13 @@
  * DELIBERATE ARCHITECTURE (SCOPE-c): the cloud issuer does NOT import
  * `@openparachute/scope-guard` on the issuer side — the identity worker validates
  * its OWN tokens with its OWN `validateAccessToken` (tokens.ts: kid + iss pin +
- * jti revocation), plus the tiny local `admin ⊇ read` account-scope checker
- * below (a mirror of the vault RS's hand-rolled `hasScopeForVault`, auth.ts:105).
- * The account grammar is trivial (`admin ⊇ read`, a single `<id>` match); the X1
- * twin conformance suite is the parity guard against the hub's scope-guard
- * semantics, not a shared import.
+ * jti revocation). The `admin ⊇ read` account-scope grammar itself (the mirror
+ * of the vault RS's hand-rolled `hasScopeForVault`, auth.ts:105) is now the ONE
+ * shared implementation in `@openparachute/door-contract` (hub-parity P3 —
+ * cloud's local `AccountVerb`/`ACCOUNT_VERB_RANK`/`hasAccountScope` mirrors are
+ * gone; this module re-exports the canon instead of re-deriving it). The X1
+ * twin conformance suite (`test/door-contract-parity.test.ts`) is the parity
+ * guard binding cloud's LIVE runtime to that canon.
  *
  * The audience is pinned to `"account"` ([PLAN-DECISION SCOPE-a]) so a
  * vault-audience token (`aud=vault.<name>`) can never satisfy an `/account/*`
@@ -19,7 +21,16 @@
  * `aud=vault.<name>`) — belt-and-suspenders in both directions.
  */
 import type { JWTPayload } from "jose";
+import {
+  type AccountVerb,
+  ACCOUNT_VERB_RANK,
+  hasAccountScope,
+  parseAccountScope,
+} from "@openparachute/door-contract";
 import { validateAccessToken } from "./tokens.ts";
+
+export type { AccountVerb };
+export { ACCOUNT_VERB_RANK, hasAccountScope };
 
 /**
  * The audience an account token carries ([PLAN-DECISION SCOPE-a]). C2 mints with
@@ -29,50 +40,11 @@ import { validateAccessToken } from "./tokens.ts";
  */
 export const ACCOUNT_TOKEN_AUDIENCE = "account";
 
-export type AccountVerb = "read" | "admin";
-
-/** `admin ⊇ read` — the two-rung account ladder (mirrors auth.ts VERB_RANK). */
-const ACCOUNT_VERB_RANK: Record<AccountVerb, number> = { read: 0, admin: 1 };
-
-function isAccountVerb(s: string): s is AccountVerb {
-  return s === "read" || s === "admin";
-}
-
-/**
- * Decompose an `account:<id>:<verb>` scope. Returns null for anything else
- * (a 2-part `account:admin`, a vault scope, a malformed string) — only the
- * 3-part account grammar carries account authority.
- */
-function decomposeAccountScope(scope: string): { id: string; verb: AccountVerb } | null {
-  const parts = scope.split(":");
-  if (parts.length === 3 && parts[0] === "account" && parts[1]!.length > 0 && isAccountVerb(parts[2]!)) {
-    return { id: parts[1]!, verb: parts[2]! };
-  }
-  return null;
-}
-
-/**
- * Does `granted` carry `verb`-or-higher authority over account `<id>`? The local
- * account-scope checker (SCOPE-c) — the mirror of the vault RS's
- * `hasScopeForVault`. `admin` satisfies a `read` requirement; a scope for a
- * different `<id>` never matches.
- */
-export function hasAccountScope(granted: readonly string[], accountId: string, verb: AccountVerb): boolean {
-  const reqRank = ACCOUNT_VERB_RANK[verb];
-  for (const s of granted) {
-    const d = decomposeAccountScope(s);
-    if (!d) continue;
-    if (d.id !== accountId) continue;
-    if (ACCOUNT_VERB_RANK[d.verb] >= reqRank) return true;
-  }
-  return false;
-}
-
 /** The distinct account ids named by the `account:<id>:*` scopes in the set. */
 function accountIdsIn(scopes: readonly string[]): string[] {
   const ids = new Set<string>();
   for (const s of scopes) {
-    const d = decomposeAccountScope(s);
+    const d = parseAccountScope(s);
     if (d) ids.add(d.id);
   }
   return [...ids];
@@ -141,7 +113,7 @@ export async function validateAccountToken(
 
   const scope = typeof payload.scope === "string" ? payload.scope : "";
   const scopes = scope.split(" ").filter((s) => s.length > 0);
-  const accountScopes = scopes.filter((s) => decomposeAccountScope(s) !== null);
+  const accountScopes = scopes.filter((s) => parseAccountScope(s) !== null);
   const ids = accountIdsIn(accountScopes);
 
   // A validly-signed `aud=account` token with no account scope carries no

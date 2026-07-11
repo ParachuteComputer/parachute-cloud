@@ -10,14 +10,19 @@ import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import {
   checkAccountDescriptor,
+  checkAccountSessionResponse,
+  checkAccountTokenMintResponse,
   checkAuthorizationServerMetadata,
   checkProtectedResourceMetadata,
+  checkVaultTokenMintResponse,
 } from "@openparachute/door-contract";
 import app from "../src/index.ts";
+import { CSRF_COOKIE, CSRF_FIELD } from "../src/csrf.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "../src/oauth-authorize.ts";
 import { ADVERTISED_SCOPES } from "../src/oauth-metadata.ts";
 import { handleRevoke } from "../src/oauth-revoke.ts";
 import { handleToken } from "../src/oauth-token.ts";
+import { SESSION_COOKIE } from "../src/sessions.ts";
 import { REFRESH_GRACE_MS, validateAccessToken } from "../src/tokens.ts";
 import {
   CSRF,
@@ -100,12 +105,97 @@ describe("discovery endpoints", () => {
     expect(checkAccountDescriptor(md, { issuer: ISSUER, door: "cloud" })).toEqual([]);
     // Cloud's door-specific values.
     expect(md.signup_path).toBe("/signup");
-    expect(md.app_client_id).toBe("parachute-app");
+    // hub-parity P3: the descriptor no longer advertises app_client_id (the
+    // hosted flow never OAuths its home door) — the APP_CLIENT_ID constant
+    // stays exported for the C5 seeded client + cross-origin native flows, only
+    // the advertisement is gone.
+    expect(md.app_client_id).toBeUndefined();
+    // hub-parity P3: the auth block — magic-link-first sign-in, the /login
+    // ceremony that also carries password + next.
+    expect(md.auth).toEqual({ methods: ["magic_link"], signin_path: "/login" });
     expect((md.capabilities as Record<string, unknown>).vault_rename).toBe(false);
     expect(Array.isArray(md.plans) && (md.plans as unknown[]).length).toBe(4);
     // PR-2: the {name}-placeholder vault-URL template, derived from vaultInstanceUrl.
     expect(md.vault_url_template).toContain("{name}");
     expect(md.vault_url_template).toContain("/vault/{name}"); // path form in the test env
+  });
+});
+
+// --- account door — session/token/vault-token drift detectors (hub-parity P3,
+// door-contract 0.4.0) -------------------------------------------------------
+
+describe("account door — shared-canon drift detectors", () => {
+  test("GET /account/session conforms to the canon — anon branch", async () => {
+    const res = await app.fetch(new Request(`${ISSUER}/account/session`), env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(checkAccountSessionResponse(body, { signedIn: false })).toEqual([]);
+  });
+
+  test("GET /account/session conforms to the canon — signed-in branch", async () => {
+    const { id } = await seedUser("conformance-session@example.com");
+    const sessionId = await seedSession(id);
+    const res = await app.fetch(
+      new Request(`${ISSUER}/account/session`, { headers: { cookie: `${SESSION_COOKIE}=${sessionId}` } }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(checkAccountSessionResponse(body, { signedIn: true })).toEqual([]);
+  });
+
+  test("POST /account/token conforms to the canon (the full cookie+CSRF ceremony)", async () => {
+    const { id } = await seedUser("conformance-token@example.com");
+    const sessionId = await seedSession(id);
+    const csrf = "conformance-csrf-token";
+    const res = await app.fetch(
+      new Request(`${ISSUER}/account/token`, {
+        method: "POST",
+        headers: {
+          cookie: `${SESSION_COOKIE}=${sessionId}; ${CSRF_COOKIE}=${csrf}`,
+          origin: ISSUER,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ [CSRF_FIELD]: csrf }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(checkAccountTokenMintResponse(body)).toEqual([]);
+  });
+
+  test("POST /account/vaults/<name>/token conforms to the canon", async () => {
+    const { id } = await seedUser("conformance-vault-token@example.com");
+    await seedVault("conformance-vault", id);
+    const sessionId = await seedSession(id);
+    const csrf = "conformance-vault-csrf-token";
+    // Mint the account bearer through the real C2 ceremony (the same fixture as
+    // the account-token check above), then spend it on the per-vault mint.
+    const mintRes = await app.fetch(
+      new Request(`${ISSUER}/account/token`, {
+        method: "POST",
+        headers: {
+          cookie: `${SESSION_COOKIE}=${sessionId}; ${CSRF_COOKIE}=${csrf}`,
+          origin: ISSUER,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ [CSRF_FIELD]: csrf }),
+      }),
+      env,
+    );
+    const { token: accountToken } = (await mintRes.json()) as { token: string };
+
+    const res = await app.fetch(
+      new Request(`${ISSUER}/account/vaults/conformance-vault/token`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${accountToken}` },
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(checkVaultTokenMintResponse(body, "conformance-vault")).toEqual([]);
   });
 });
 

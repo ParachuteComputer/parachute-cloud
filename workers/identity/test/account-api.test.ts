@@ -412,7 +412,11 @@ describe("C3 — POST /account/vaults/<name>/token", () => {
     expect(res.status).toBe(400);
   });
 
-  test("400 invalid_scope — an empty scopes array", async () => {
+  test("200 defaults read+write — an explicit empty scopes array (hub-parity P3 behavior delta)", async () => {
+    // BEHAVIOR DELTA (P3, door-contract 0.4.0's validateVaultScopes): cloud used
+    // to 400 invalid_scope on an explicit `[]`; the shared, P0-pinned semantics
+    // now treat `[]` the same as an absent `scopes` field — default read+write
+    // (hub's prior lenient reading). See account-api.ts handleAccountVaultTokenMint.
     const { userId, token } = await seedOwnerWithPlan("empty-scopes@example.com");
     await seedVault("real3", userId);
     const res = await handleAccountVaultTokenMint(
@@ -420,7 +424,9 @@ describe("C3 — POST /account/vaults/<name>/token", () => {
       accountReq("POST", "/account/vaults/real3/token", { token, body: { scopes: [] } }),
       accountDeps(),
     );
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(200);
+    const payload = decodeJwtPayload(((await res.json()) as { vault_token: string }).vault_token);
+    expect(payload.scope).toBe("vault:real3:read vault:real3:write");
   });
 
   test("403 not_owner — minting for another user's vault (TENANT SAFETY)", async () => {
@@ -466,25 +472,31 @@ describe("C3 — suspended owner refused across the surface", () => {
   });
 });
 
-// --- validateVaultScopes (pure) ----------------------------------------------
+// --- validateVaultScopes (pure — now @openparachute/door-contract's shared
+// canon, re-exported from account-api.ts; hub-parity P3) -------------------
 
 describe("C3 — validateVaultScopes", () => {
-  test("undefined defaults to read+write for the vault", () => {
+  test("undefined/null/[] all default to read+write for the vault", () => {
+    // BEHAVIOR DELTA (P3): an explicit `[]` used to be a 400 reject; the
+    // shared, P0-pinned semantics now treat it exactly like an absent/null
+    // `scopes` field (hub's prior lenient reading).
     expect(validateVaultScopes(undefined, "v")).toEqual({ ok: true, scopes: ["vault:v:read", "vault:v:write"] });
+    expect(validateVaultScopes(null, "v")).toEqual({ ok: true, scopes: ["vault:v:read", "vault:v:write"] });
+    expect(validateVaultScopes([], "v")).toEqual({ ok: true, scopes: ["vault:v:read", "vault:v:write"] });
   });
   test("accepts + de-dupes valid same-vault scopes", () => {
     const r = validateVaultScopes(["vault:v:read", "vault:v:read", "vault:v:admin"], "v");
     expect(r).toEqual({ ok: true, scopes: ["vault:v:read", "vault:v:admin"] });
   });
   test.each([
-    ["a foreign vault name", ["vault:other:read"]],
-    ["a non-vault scope", ["account:x:admin"]],
-    ["an unknown verb", ["vault:v:owner"]],
-    ["a two-part scope", ["vault:v"]],
-    ["a non-string entry", [123]],
-    ["an empty array", []],
-  ])("rejects %s", (_label, scopes) => {
-    expect(validateVaultScopes(scopes, "v")).toEqual({ ok: false });
+    ["a foreign vault name", ["vault:other:read"], "invalid_scope"],
+    ["a non-vault scope", ["account:x:admin"], "invalid_scope"],
+    ["an unknown verb", ["vault:v:owner"], "invalid_scope"],
+    ["a two-part scope", ["vault:v"], "invalid_scope"],
+    ["a non-string entry", [123], "invalid_request"],
+    ["a non-array value", "vault:v:read", "invalid_request"],
+  ] as const)("rejects %s with reason %s", (_label, scopes, reason) => {
+    expect(validateVaultScopes(scopes, "v")).toEqual({ ok: false, reason });
   });
 });
 
