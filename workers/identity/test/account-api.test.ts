@@ -19,12 +19,14 @@ import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import {
   ACCOUNT_VAULT_TOKEN_TTL_SECONDS,
+  handleAccountSummary,
   handleAccountVaultCreate,
   handleAccountVaultDelete,
   handleAccountVaultTokenMint,
   handleAccountVaultsList,
   validateVaultScopes,
 } from "../src/account-api.ts";
+import { PLAN_SPECS } from "../src/plans.ts";
 import { ACCOUNT_TOKEN_AUDIENCE } from "../src/account-auth.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "../src/account-token.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
@@ -483,5 +485,68 @@ describe("C3 — validateVaultScopes", () => {
     ["an empty array", []],
   ])("rejects %s", (_label, scopes) => {
     expect(validateVaultScopes(scopes, "v")).toEqual({ ok: false });
+  });
+});
+
+// --- GET /account/summary — plan + usage ------------------------------------
+
+describe("GET /account/summary", () => {
+  test("401 when no Authorization header is present", async () => {
+    const res = await handleAccountSummary(db(), accountReq("GET", "/account/summary"), accountDeps());
+    expect(res.status).toBe(401);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+  });
+
+  test("a paid plan → the canonical shape with plan computed from PLAN_SPECS", async () => {
+    const { token } = await seedOwnerWithPlan("summary-paid@example.com", "standard");
+    const res = await handleAccountSummary(db(), accountReq("GET", "/account/summary", { token }), accountDeps());
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const body = (await res.json()) as {
+      email: string;
+      account_created_at?: string;
+      plan: {
+        tier: string;
+        label: string;
+        price_monthly_usd?: number;
+        vault_limit?: number;
+        vaults_used?: number;
+        storage_used_bytes?: number;
+        storage_limit_bytes?: number;
+        trial_days_left?: number;
+      };
+      manage_billing_url?: string;
+    };
+    expect(body.email).toBe("summary-paid@example.com");
+    expect(typeof body.account_created_at).toBe("string");
+    expect(body.plan.tier).toBe("standard");
+    expect(body.plan.label).toBe(PLAN_SPECS.standard.label); // "Standard"
+    expect(body.plan.price_monthly_usd).toBe(3);
+    expect(body.plan.vault_limit).toBe(PLAN_SPECS.standard.vault_count); // 3
+    expect(body.plan.vaults_used).toBe(0); // none seeded
+    expect(body.plan.storage_used_bytes).toBe(0); // no usage rows yet
+    expect(body.plan.storage_limit_bytes).toBe(
+      PLAN_SPECS.standard.notes_bytes + PLAN_SPECS.standard.attachment_bytes,
+    );
+    expect(body.plan.trial_days_left).toBeUndefined(); // not a trial
+    expect(body.manage_billing_url).toBe(`${ISSUER}/console`);
+  });
+
+  test("a trial → 'Free trial' label, trial_days_left present, no price", async () => {
+    const { userId, token } = await seedOwnerWithPlan("summary-trial@example.com", "trial");
+    const downgradeAt = new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString();
+    await env.DB.prepare("UPDATE users SET plan_downgrade_at = ? WHERE id = ?").bind(downgradeAt, userId).run();
+    const res = await handleAccountSummary(db(), accountReq("GET", "/account/summary", { token }), accountDeps());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      plan: { tier: string; label: string; price_monthly_usd?: number; trial_days_left?: number; vault_limit?: number };
+    };
+    expect(body.plan.tier).toBe("trial");
+    expect(body.plan.label).toBe("Free trial");
+    expect(body.plan.price_monthly_usd).toBeUndefined(); // trials aren't charged
+    expect(body.plan.trial_days_left).toBeGreaterThanOrEqual(14);
+    expect(body.plan.trial_days_left).toBeLessThanOrEqual(15);
+    // With no pending tier chosen, the trial's effective entitlements are its own.
+    expect(body.plan.vault_limit).toBe(PLAN_SPECS.trial.vault_count);
   });
 });
