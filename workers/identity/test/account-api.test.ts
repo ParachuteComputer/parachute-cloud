@@ -149,6 +149,24 @@ describe("C3 — the Bearer gate", () => {
     );
     expect(res.status).toBe(200);
   });
+
+  test("STRUCTURAL cross-account belt: a hand-forged token whose sub != its account scope id → 401 (never authorizes B on A's behalf)", async () => {
+    // Two real accounts. Forge a token SIGNED for user A (sub=A) but whose
+    // account scope names user B — the exact cross-account shape no legitimate
+    // mint can produce (C2 always mints account:<sub>:admin). The sub===accountId
+    // assertion in validateAccountToken rejects it 401 before any handler runs,
+    // so it can never list/create/mint/portal/checkout against EITHER account.
+    const { id: idA } = await seedUser("forge-sub-a@example.com");
+    const { id: idB } = await seedUser("forge-sub-b@example.com");
+    const forged = await mintAccountToken(idA, "admin", { accountId: idB }); // sub=A, scope=account:B:admin
+    const res = await handleAccountVaultsList(
+      db(),
+      accountReq("GET", "/account/vaults", { token: forged }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_token");
+  });
 });
 
 // --- GET /account/vaults -----------------------------------------------------
@@ -527,7 +545,8 @@ describe("GET /account/summary", () => {
         storage_limit_bytes?: number;
         trial_days_left?: number;
       };
-      manage_billing_url?: string;
+      billing_enabled?: boolean;
+      has_billing_customer?: boolean;
     };
     expect(body.email).toBe("summary-paid@example.com");
     expect(typeof body.account_created_at).toBe("string");
@@ -541,7 +560,46 @@ describe("GET /account/summary", () => {
       PLAN_SPECS.standard.notes_bytes + PLAN_SPECS.standard.attachment_bytes,
     );
     expect(body.plan.trial_days_left).toBeUndefined(); // not a trial
-    expect(body.manage_billing_url).toBe(`${ISSUER}/console`);
+    // accountDeps() carries no billingConfigured/mockBillingEnabled (both
+    // undefined — the test deps() helper doesn't set them), so the honest
+    // signal reads false; the dedicated describe block below drives both.
+    expect(body.billing_enabled).toBe(false);
+    // seedOwnerWithPlan sets plan but NO stripe_customer_id (a comped-shaped
+    // paid account) → has_billing_customer false: the app shows "Upgrade", not
+    // "Manage billing", so it never blind-taps the portal into a 409.
+    expect(body.has_billing_customer).toBe(false);
+  });
+
+  test("has_billing_customer is TRUE only when a Stripe customer exists — the app's Manage-billing gate", async () => {
+    const { userId, token } = await seedOwnerWithPlan("summary-hascust@example.com", "standard");
+    await env.DB.prepare("UPDATE users SET stripe_customer_id = 'cus_summary_1' WHERE id = ?").bind(userId).run();
+    const res = await handleAccountSummary(db(), accountReq("GET", "/account/summary", { token }), accountDeps());
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { has_billing_customer: boolean }).has_billing_customer).toBe(true);
+  });
+
+  test("billing_enabled mirrors the console's checkoutAvailable formula: true when EITHER real Stripe OR mock is active, false when neither", async () => {
+    const { token } = await seedOwnerWithPlan("summary-billing-flag@example.com", "standard");
+    const real = await handleAccountSummary(
+      db(),
+      accountReq("GET", "/account/summary", { token }),
+      { ...accountDeps(), billingConfigured: true, mockBillingEnabled: false },
+    );
+    expect(((await real.json()) as { billing_enabled: boolean }).billing_enabled).toBe(true);
+
+    const mock = await handleAccountSummary(
+      db(),
+      accountReq("GET", "/account/summary", { token }),
+      { ...accountDeps(), billingConfigured: false, mockBillingEnabled: true },
+    );
+    expect(((await mock.json()) as { billing_enabled: boolean }).billing_enabled).toBe(true);
+
+    const neither = await handleAccountSummary(
+      db(),
+      accountReq("GET", "/account/summary", { token }),
+      { ...accountDeps(), billingConfigured: false, mockBillingEnabled: false },
+    );
+    expect(((await neither.json()) as { billing_enabled: boolean }).billing_enabled).toBe(false);
   });
 
   test("a trial → 'Free trial' label, trial_days_left present, no price", async () => {

@@ -100,8 +100,9 @@ function bearerToken(req: Request): string | null {
   return m ? m[1]!.trim() : null;
 }
 
-/** Parse a JSON request body into an object, tolerant of an absent/malformed body. */
-async function readJsonBody(req: Request): Promise<Record<string, unknown>> {
+/** Parse a JSON request body into an object, tolerant of an absent/malformed
+ *  body. Exported for the sibling account-API billing doors (billing.ts). */
+export async function readJsonBody(req: Request): Promise<Record<string, unknown>> {
   try {
     const body = (await req.json()) as unknown;
     return body && typeof body === "object" ? (body as Record<string, unknown>) : {};
@@ -130,8 +131,15 @@ async function readJsonBody(req: Request): Promise<Record<string, unknown>> {
  * Returns the account id AND the loaded owner (so callers needing the plan don't
  * re-read) on success, or a typed error Response. The account id is the ONLY
  * tenant key downstream — never a body/path field.
+ *
+ * Exported so sibling `/account/*` surfaces outside this file — the Bearer-
+ * gated billing endpoints (billing.ts `handleAccountBillingPortalPost` /
+ * `handleAccountBillingCheckoutPost`) — share the SAME auth gate rather than
+ * re-deriving it. Every `/account/*` route must resolve auth through this one
+ * function so the tenant-scoping property (bearer `sub` = the only account a
+ * caller can act on) holds in exactly one place.
  */
-async function requireAccount(
+export async function requireAccount(
   db: D1Database,
   req: Request,
   deps: OAuthDeps,
@@ -269,10 +277,28 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
       email: user.email,
       account_created_at: user.createdAt,
       plan,
-      // The door-agnostic billing seam — cloud's existing console plan/billing
-      // page. The app deep-links out to it (a per-request Stripe portal-session
-      // deep-link is a follow-on).
-      manage_billing_url: `${deps.issuer}/console`,
+      // Honest capability signal for the app's "Manage plan & billing"
+      // section — NOT a URL anymore (billing.ts's Bearer-gated
+      // `/account/billing/{portal,checkout}` doors replace the old
+      // `manage_billing_url: <issuer>/console` cross-origin hop this field
+      // used to carry: the app now calls those directly with the account
+      // bearer it already holds and redirects straight to Stripe, no
+      // console/re-login round-trip). True when EITHER the real Stripe
+      // config is present OR the interim mock path is active (mirrors the
+      // console's OWN `checkoutAvailable = billingConfigured ||
+      // mockBillingEnabled`, ui.ts) — staging (mock, no real keys) still
+      // shows the section so the no-relogin flow is exercisable there;
+      // production with neither hides it, matching the console's own
+      // teaser-only state.
+      billing_enabled: deps.billingConfigured === true || deps.mockBillingEnabled === true,
+      // Whether this account has a Stripe customer to MANAGE — lets the app
+      // decide the billing CTA up front: show "Manage billing" (→ POST
+      // /account/billing/portal) only when true; otherwise "Upgrade" (→ POST
+      // /account/billing/checkout). Without this the app would blind-tap the
+      // portal for a comped/mock paid account (no Stripe customer) and hit its
+      // reactive 409 `no_billing_customer`. Mirrors the console's own
+      // `hasBillingAccount` gate on the Manage-billing button (ui.ts).
+      has_billing_customer: !!user.stripeCustomerId,
     },
     200,
     { "cache-control": "no-store" },
