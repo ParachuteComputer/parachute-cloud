@@ -320,10 +320,19 @@ describe("magic link — send + verify", () => {
   });
 
   test("JSON BODY: an off-origin `next` is neutralized by safeNext (no open redirect)", async () => {
-    const sender = captureSender();
-    await handleMagicRequestPost(env.DB, magicReqRealJson("spa-evil@example.com", "https://evil.example/steal"), deps(), sender);
-    const verify = await handleMagicVerifyGet(env.DB, verifyReq(tokenFromLink(sender.sent[0]!.link)), deps());
-    expect(verify.headers.get("location")).not.toContain("evil.example");
+    // Absolute URL + the backslash-bypass vectors: `/\evil.com` is not `//…` so a
+    // naive `!startsWith("//")` guard passes it, and browsers normalize `\`→`/`
+    // → https://evil.com/. Since verify replays the stored `next`, each MUST land
+    // on a same-origin path (safeNext falls back to /console), never off-origin.
+    for (const evil of ["https://evil.example/steal", "/\\evil.com", "/\\/evil.com", "/\\\\evil.com"]) {
+      const sender = captureSender();
+      await handleMagicRequestPost(env.DB, magicReqRealJson(`spa-evil-${sender.sent.length}@example.com`, evil), deps(), sender);
+      const verify = await handleMagicVerifyGet(env.DB, verifyReq(tokenFromLink(sender.sent[0]!.link)), deps());
+      const location = verify.headers.get("location") ?? "";
+      expect(location).not.toContain("evil");
+      // Same-origin only: a relative path or our own issuer origin, nothing else.
+      expect(location.startsWith("/") && !location.startsWith("//") && !location.startsWith("/\\")).toBe(true);
+    }
   });
 
   test("JSON BODY: no `next` → the SPA caller defaults to the app root `/` (its BootGate dispatches), never /console", async () => {

@@ -359,7 +359,12 @@ function login2faError(req: Request, message: string): Response {
 
 /** Only follow a `next` that stays on this issuer (relative path or our own origin). */
 function safeNext(next: string, deps: OAuthDeps): string {
-  if (next.startsWith("/") && !next.startsWith("//")) return next;
+  // A leading `/` NOT followed by `/` or `\`. Rejecting the backslash matters:
+  // a browser normalizes `\`→`/`, so `/\evil.com` (which is not `//…`) would
+  // resolve to `https://evil.com/` — an open redirect. This handler now STORES a
+  // caller-supplied `next` and replays it at verify time, so the guard is
+  // load-bearing against an authenticated redirect-phish.
+  if (/^\/(?![/\\])/.test(next)) return next;
   try {
     if (new URL(next).origin === deps.issuer) return next;
   } catch {
