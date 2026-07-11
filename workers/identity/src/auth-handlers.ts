@@ -124,13 +124,38 @@ function prefersJson(req: Request): boolean {
   return (req.headers.get("accept") ?? "").toLowerCase().includes("application/json");
 }
 
+/**
+ * Read the magic-request body as `FormData`, regardless of how it was sent. The
+ * server-rendered login/console forms post `application/x-www-form-urlencoded`;
+ * the SPA (parachute-app `client.ts`) posts `application/json`. `req.formData()`
+ * THROWS on a JSON body in workerd (an uncaught 500 — caught live on the staging
+ * app-cutover, invisible to the G2 unit tests, which set the JSON-reply opt-in
+ * header on a FORM body). So branch on content-type and normalize a flat JSON
+ * object into `FormData`, so every downstream field read (checkForm/`__csrf`,
+ * `email`, `next`, the authorize-resume params) is identical for both callers.
+ */
+async function readMagicForm(req: Request): Promise<FormData> {
+  const contentType = (req.headers.get("content-type") ?? "").toLowerCase();
+  if (contentType.includes("application/json")) {
+    const fd = new FormData();
+    const data = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+    if (data && typeof data === "object") {
+      for (const [key, value] of Object.entries(data)) {
+        if (value != null) fd.set(key, String(value));
+      }
+    }
+    return fd;
+  }
+  return req.formData();
+}
+
 export async function handleMagicRequestPost(
   db: D1Database,
   req: Request,
   deps: OAuthDeps,
   sender: EmailSender,
 ): Promise<Response> {
-  const form = await req.formData();
+  const form = await readMagicForm(req);
   // G2: the SPA opts into a JSON reply. The NEUTRAL "we handled it" body is
   // identical for sent / throttled / suspended (no account-existence oracle);
   // only bad input (CSRF/origin, malformed email) gets a distinct error — those
@@ -143,8 +168,22 @@ export async function handleMagicRequestPost(
   // reconstructed authorize URL, stored SERVER-SIDE on the magic_links row
   // (migration 0017) — the emailed link stays an opaque token handle, exactly
   // like the password login's 2FA divert stores its resume in pending_logins.
+  //
+  // Otherwise honor a caller-supplied `next` (the SPA passes its in-app landing
+  // path, e.g. `/welcome`, in the body). Precedence: the OAuth authorize-resume
+  // URL (issuer-anchored) → a caller-supplied relative path (`safeNext`-guarded,
+  // same-origin only, no open redirect) → for the SPA/JSON caller, the app root
+  // `/` (its BootGate dispatches new-vs-returning — NEVER the server console) →
+  // for the server-rendered forms, null (verify keeps its own `/console` default).
   const authorizeParams = authorizeParamsFromForm(form);
-  const next = authorizeParams ? buildAuthorizeUrl(deps.issuer, authorizeParams) : null;
+  const requestedNext = String(form.get("next") ?? "").trim();
+  const next = authorizeParams
+    ? buildAuthorizeUrl(deps.issuer, authorizeParams)
+    : requestedNext
+      ? safeNext(requestedNext, deps)
+      : wantsJson
+        ? "/"
+        : null;
   if (!checkForm(req, form, deps)) {
     if (wantsJson) return jsonResponse({ error: "Your session expired. Please try again." }, 403);
     return magicError(req, "Your session expired. Please try again.", "");
@@ -320,7 +359,12 @@ function login2faError(req: Request, message: string): Response {
 
 /** Only follow a `next` that stays on this issuer (relative path or our own origin). */
 function safeNext(next: string, deps: OAuthDeps): string {
-  if (next.startsWith("/") && !next.startsWith("//")) return next;
+  // A leading `/` NOT followed by `/` or `\`. Rejecting the backslash matters:
+  // a browser normalizes `\`→`/`, so `/\evil.com` (which is not `//…`) would
+  // resolve to `https://evil.com/` — an open redirect. This handler now STORES a
+  // caller-supplied `next` and replays it at verify time, so the guard is
+  // load-bearing against an authenticated redirect-phish.
+  if (/^\/(?![/\\])/.test(next)) return next;
   try {
     if (new URL(next).origin === deps.issuer) return next;
   } catch {
