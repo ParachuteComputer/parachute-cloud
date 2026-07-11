@@ -49,7 +49,9 @@ import {
 } from "./oauth-shared.ts";
 import {
   PLAN_SPECS,
+  TIER_PRICE_LABEL,
   entitlementPlanFor,
+  isPaidTier,
   planEntitlement,
   vaultCapMessage,
 } from "./plans.ts";
@@ -198,6 +200,81 @@ export async function handleAccountVaultsList(db: D1Database, req: Request, deps
     };
   });
   return jsonResponse({ vaults: list }, 200, { "cache-control": "no-store" });
+}
+
+// --- GET /account/summary — the account's plan + usage summary --------------
+
+/**
+ * The account-level plan/usage summary the app's Account screen renders — the
+ * app-as-manager door. Bearer-gated `account:<id>:read` (the SAME requireAccount
+ * gate as GET /account/vaults). Every plan limit/used field is OPTIONAL: we emit
+ * only what we honestly meter, and the app renders what's present (never fakes a
+ * number). Matches the app's canonical `AccountSummary` type. Scope: read.
+ */
+export async function handleAccountSummary(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const auth = await requireAccount(db, req, deps, "read");
+  if (!auth.ok) return auth.response;
+  const { user } = auth;
+  const now = deps.now?.() ?? new Date();
+
+  // The tier whose LIMITS apply — a trial mirrors its chosen tier (or Plus),
+  // exactly as the vault-cap push resolves it (entitlementPlanFor).
+  const effective = entitlementPlanFor(user.plan, user.pendingPlan);
+  const spec = PLAN_SPECS[effective];
+
+  // vaults_used + account-wide storage_used — one batched usage query (the list
+  // handler's pattern). storage collapses the two-meter split (notes + attach)
+  // into the single number the app's summary shows.
+  const vaults = await listVaultsForOwner(db, user.id);
+  const usage = await latestUsageForVaults(
+    db,
+    vaults.map((v) => v.name),
+  );
+  let storageUsed = 0;
+  for (const v of vaults) {
+    const row = usage.get(v.name);
+    if (row) storageUsed += row.dbBytes + row.r2Bytes;
+  }
+
+  const plan: {
+    tier: string;
+    label: string;
+    price_monthly_usd?: number;
+    vault_limit?: number;
+    vaults_used?: number;
+    storage_used_bytes?: number;
+    storage_limit_bytes?: number;
+    trial_days_left?: number;
+  } = {
+    tier: user.plan,
+    label: user.plan === "trial" ? "Free trial" : PLAN_SPECS[user.plan].label,
+    vault_limit: spec.vault_count,
+    vaults_used: vaults.length,
+    storage_used_bytes: storageUsed,
+    storage_limit_bytes: spec.notes_bytes + spec.attachment_bytes,
+  };
+  // A current monthly price only for a paid tier (trial/expired aren't charged).
+  if (isPaidTier(user.plan)) {
+    plan.price_monthly_usd = Number.parseInt(TIER_PRICE_LABEL[user.plan].replace(/[^0-9]/g, ""), 10);
+  }
+  if (user.plan === "trial" && user.planDowngradeAt) {
+    const msLeft = new Date(user.planDowngradeAt).getTime() - now.getTime();
+    plan.trial_days_left = Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
+  }
+
+  return jsonResponse(
+    {
+      email: user.email,
+      account_created_at: user.createdAt,
+      plan,
+      // The door-agnostic billing seam — cloud's existing console plan/billing
+      // page. The app deep-links out to it (a per-request Stripe portal-session
+      // deep-link is a follow-on).
+      manage_billing_url: `${deps.issuer}/console`,
+    },
+    200,
+    { "cache-control": "no-store" },
+  );
 }
 
 // --- POST /account/vaults — create (the hinge: lands you IN the vault) -------
