@@ -66,7 +66,13 @@ import {
   handleAccountVaultTokenMint,
   handleAccountVaultsList,
 } from "./account-api.ts";
-import { handleCheckoutPost, handleMockCheckoutPost, handlePortalPost } from "./billing.ts";
+import {
+  handleAccountBillingCheckoutPost,
+  handleAccountBillingPortalPost,
+  handleCheckoutPost,
+  handleMockCheckoutPost,
+  handlePortalPost,
+} from "./billing.ts";
 import { handleStripeWebhookPost } from "./billing-webhook.ts";
 import { handlePromoRedeemPost } from "./promo.ts";
 import { spaCspForHtml } from "./spa-csp.ts";
@@ -188,6 +194,16 @@ app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, d
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/vaults/:name", (c) => handleAccountVaultDelete(c.env.DB, c.req.raw, depsFor(c.env)));
+// The no-relogin billing seam (Bearer-gated account-API siblings of
+// /billing/checkout + /billing/portal below — billing.ts): the app sends the
+// account bearer it already holds and gets back `{ url }` to redirect to,
+// with no cloud-console cookie hop. Deliberately grouped here with the OTHER
+// `/account/*` routes (NOT the `/billing/*` cookie routes further down) so
+// they never accidentally inherit CSRF/same-origin expectations that don't
+// apply to a Bearer — see billing.ts's module note on why dropping those is
+// correct for this auth boundary, not a lapsed gate.
+app.post("/account/billing/portal", (c) => handleAccountBillingPortalPost(c.env, c.req.raw, depsFor(c.env)));
+app.post("/account/billing/checkout", (c) => handleAccountBillingCheckoutPost(c.env, c.req.raw, depsFor(c.env)));
 
 // --- operator admin console (Wave 4c) ---
 // EVERY route (GET and POST) resolves the session and requires role='operator'

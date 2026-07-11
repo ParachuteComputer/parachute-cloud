@@ -527,7 +527,7 @@ describe("GET /account/summary", () => {
         storage_limit_bytes?: number;
         trial_days_left?: number;
       };
-      manage_billing_url?: string;
+      billing_enabled?: boolean;
     };
     expect(body.email).toBe("summary-paid@example.com");
     expect(typeof body.account_created_at).toBe("string");
@@ -541,7 +541,34 @@ describe("GET /account/summary", () => {
       PLAN_SPECS.standard.notes_bytes + PLAN_SPECS.standard.attachment_bytes,
     );
     expect(body.plan.trial_days_left).toBeUndefined(); // not a trial
-    expect(body.manage_billing_url).toBe(`${ISSUER}/console`);
+    // accountDeps() carries no billingConfigured/mockBillingEnabled (both
+    // undefined — the test deps() helper doesn't set them), so the honest
+    // signal reads false; the dedicated describe block below drives both.
+    expect(body.billing_enabled).toBe(false);
+  });
+
+  test("billing_enabled mirrors the console's checkoutAvailable formula: true when EITHER real Stripe OR mock is active, false when neither", async () => {
+    const { token } = await seedOwnerWithPlan("summary-billing-flag@example.com", "standard");
+    const real = await handleAccountSummary(
+      db(),
+      accountReq("GET", "/account/summary", { token }),
+      { ...accountDeps(), billingConfigured: true, mockBillingEnabled: false },
+    );
+    expect(((await real.json()) as { billing_enabled: boolean }).billing_enabled).toBe(true);
+
+    const mock = await handleAccountSummary(
+      db(),
+      accountReq("GET", "/account/summary", { token }),
+      { ...accountDeps(), billingConfigured: false, mockBillingEnabled: true },
+    );
+    expect(((await mock.json()) as { billing_enabled: boolean }).billing_enabled).toBe(true);
+
+    const neither = await handleAccountSummary(
+      db(),
+      accountReq("GET", "/account/summary", { token }),
+      { ...accountDeps(), billingConfigured: false, mockBillingEnabled: false },
+    );
+    expect(((await neither.json()) as { billing_enabled: boolean }).billing_enabled).toBe(false);
   });
 
   test("a trial → 'Free trial' label, trial_days_left present, no price", async () => {
