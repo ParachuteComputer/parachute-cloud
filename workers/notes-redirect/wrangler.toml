@@ -1,0 +1,7 @@
+name = "parachute-notes-redirect"
+main = "index.js"
+compatibility_date = "2026-07-01"
+workers_dev = false
+routes = [
+  { pattern = "notes.parachute.computer/*", zone_name = "parachute.computer" },
+]
