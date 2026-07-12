@@ -112,11 +112,13 @@ describe("day-0 welcome", () => {
     expect(mail.to).toBe("fresh@example.com");
     expect(mail.subject).toBe("Welcome to Parachute");
     expect(mail.replyTo).toBe(DRIP_REPLY_TO);
-    // The three doors: the app (the user's real vault), console, reply-to-a-human.
-    // The vault door uses the configured APP_ORIGIN (wrangler default; #116).
+    // The three doors: the app (the user's real vault), the app's Connect-AI
+    // surface, reply-to-a-human. The vault door uses the configured APP_ORIGIN
+    // (wrangler default; #116); the connect door does too (post-cutover to app).
     expect(mail.text).toContain("https://app.parachute.computer/?add=");
     expect(mail.text).toContain(encodeURIComponent(`${env.VAULT_ORIGIN}/vault/freshvault`));
-    expect(mail.text).toContain(`${ISSUER}/console`);
+    expect(mail.text).toContain("https://app.parachute.computer/connect");
+    expect(mail.text).not.toContain(`${ISSUER}/console`);
     expect(mail.text).toContain("Reply to this email. A person reads it.");
     // The unsubscribe link rides the footer AND the header field.
     expect(mail.text).toContain(mail.unsubscribeUrl);
@@ -205,7 +207,8 @@ describe("day-3 connect nudge", () => {
     expect(sender.sent.map((m) => m.to)).toEqual(["due@example.com"]);
     const mail = sender.sent[0]!;
     expect(mail.subject).toBe("Connect your AI to your vault");
-    expect(mail.text).toContain(`${ISSUER}/console`);
+    expect(mail.text).toContain("https://app.parachute.computer/connect");
+    expect(mail.text).not.toContain(`${ISSUER}/console`);
     expect(mail.text).toContain(mail.unsubscribeUrl);
   });
 
@@ -399,9 +402,19 @@ describe("copy", () => {
   test("every email footer carries the unsubscribe link; no HTML anywhere", () => {
     const unsubscribeUrl = "https://cloud.example/unsubscribe?t=x";
     const all = [
-      welcomeCopy({ notesUrl: "https://notes.example/?add=y", consoleUrl: "https://cloud.example/console", unsubscribeUrl }),
-      welcomeCopy({ notesUrl: null, consoleUrl: "https://cloud.example/console", unsubscribeUrl }),
-      connectNudgeCopy({ consoleUrl: "https://cloud.example/console", unsubscribeUrl }),
+      welcomeCopy({
+        notesUrl: "https://notes.example/?add=y",
+        consoleUrl: "https://cloud.example/console",
+        connectUrl: "https://app.example/connect",
+        unsubscribeUrl,
+      }),
+      welcomeCopy({
+        notesUrl: null,
+        consoleUrl: "https://cloud.example/console",
+        connectUrl: "https://app.example/connect",
+        unsubscribeUrl,
+      }),
+      connectNudgeCopy({ connectUrl: "https://app.example/connect", unsubscribeUrl }),
       feedbackCopy({ unsubscribeUrl }),
     ];
     for (const c of all) {
