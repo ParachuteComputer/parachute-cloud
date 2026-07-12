@@ -144,15 +144,23 @@ export interface DripCopy {
 }
 
 function footer(unsubscribeUrl: string): string {
-  return ["", "Parachute Cloud", `Stop these emails: ${unsubscribeUrl}`].join("\n");
+  return ["", "Parachute", `Stop these emails: ${unsubscribeUrl}`].join("\n");
 }
 
 /**
  * Day-0 welcome: the vault's three doors. `notesUrl` is the user's first
  * vault's Notes-PWA door when they already have a vault; a user who signed up
  * but hasn't named a vault yet gets the name-your-vault variant instead.
+ * `connectUrl` is the app's Connect-your-AI surface (post-cutover; vault
+ * creation itself still lives in the console, hence `consoleUrl` stays for
+ * the no-vault variant).
  */
-export function welcomeCopy(opts: { notesUrl: string | null; consoleUrl: string; unsubscribeUrl: string }): DripCopy {
+export function welcomeCopy(opts: {
+  notesUrl: string | null;
+  consoleUrl: string;
+  connectUrl: string;
+  unsubscribeUrl: string;
+}): DripCopy {
   const subject = "Welcome to Parachute";
   if (opts.notesUrl === null) {
     return {
@@ -177,8 +185,8 @@ export function welcomeCopy(opts: { notesUrl: string | null; consoleUrl: string;
       "That's your vault in the browser. Write anything.",
       "",
       "Connect your AI:",
-      opts.consoleUrl,
-      "Your vault speaks MCP. The console has the connection URL and a copy-paste command for Claude.",
+      opts.connectUrl,
+      "Your vault speaks MCP. Open Connect your AI in the app for your MCP URL and a copy-paste command for Claude.",
       "",
       "Talk to a human:",
       "Reply to this email. A person reads it.",
@@ -190,7 +198,7 @@ export function welcomeCopy(opts: { notesUrl: string | null; consoleUrl: string;
 }
 
 /** Day-3 connect nudge — only reaches accounts with no AI activity. */
-export function connectNudgeCopy(opts: { consoleUrl: string; unsubscribeUrl: string }): DripCopy {
+export function connectNudgeCopy(opts: { connectUrl: string; unsubscribeUrl: string }): DripCopy {
   return {
     subject: "Connect your AI to your vault",
     text: [
@@ -198,8 +206,8 @@ export function connectNudgeCopy(opts: { consoleUrl: string; unsubscribeUrl: str
       "",
       "Your vault speaks MCP. Point Claude, or any assistant that speaks it, at your vault and it can read and write your notes. You approve what it can touch.",
       "",
-      "The connection URL and a copy-paste command are in your console:",
-      opts.consoleUrl,
+      "The connection URL and a copy-paste command are in the app's Connect your AI:",
+      opts.connectUrl,
       "",
       "If you just want a notes app, ignore this. The vault works fine without an AI.",
       footer(opts.unsubscribeUrl),
@@ -276,9 +284,9 @@ export async function unsubscribeByToken(
 
 function unsubscribePage(valid: boolean): string {
   const body = valid
-    ? "<h1>You're unsubscribed</h1><p>Parachute Cloud won't send you any more onboarding emails. Sign-in links and account emails still work as normal.</p>"
+    ? "<h1>You're unsubscribed</h1><p>Parachute won't send you any more onboarding emails. Sign-in links and account emails still work as normal.</p>"
     : "<h1>This link isn't valid</h1><p>The unsubscribe link may have been copied incompletely. Use the link from the footer of the email.</p>";
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Parachute Cloud</title></head>
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Parachute</title></head>
 <body style="margin:0;padding:2.5rem 1rem;background:#f4f6f1;font-family:-apple-system,system-ui,sans-serif;color:#2b332a">
 <div style="max-width:32rem;margin:0 auto;background:#fff;border:1px solid #dde3d6;border-radius:14px;padding:2rem">
 <div style="font-family:Georgia,serif;color:#4c6547;padding-bottom:1rem">Parachute</div>${body}</div></body></html>`;
@@ -341,15 +349,21 @@ function notesUrlFor(vaultName: string, env: Env): string {
   return `${resolveAppOrigin(env)}/?add=${encodeURIComponent(base)}`;
 }
 
+/** Mirrors notesUrlFor's appOrigin resolver — the app's Connect-your-AI door. */
+function connectUrlFor(env: Env): string {
+  return `${resolveAppOrigin(env).replace(/\/$/, "")}/connect`;
+}
+
 async function copyFor(kind: DripKind, env: Env, userId: string, unsubscribeUrl: string): Promise<DripCopy> {
   const consoleUrl = `${env.ISSUER.replace(/\/$/, "")}/console`;
+  const connectUrl = connectUrlFor(env);
   switch (kind) {
     case "welcome": {
       const vault = await firstVaultName(env.DB, userId);
-      return welcomeCopy({ notesUrl: vault ? notesUrlFor(vault, env) : null, consoleUrl, unsubscribeUrl });
+      return welcomeCopy({ notesUrl: vault ? notesUrlFor(vault, env) : null, consoleUrl, connectUrl, unsubscribeUrl });
     }
     case "connect-nudge":
-      return connectNudgeCopy({ consoleUrl, unsubscribeUrl });
+      return connectNudgeCopy({ connectUrl, unsubscribeUrl });
     case "feedback":
       return feedbackCopy({ unsubscribeUrl });
   }
