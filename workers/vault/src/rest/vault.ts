@@ -5,6 +5,7 @@
  * the bun per-vault→global→true chain.
  */
 import type { Store } from "@openparachute/core/src/types.js";
+import { getVaultMap } from "@openparachute/core/src/notes.js";
 import { json, parseBool, parseQuery } from "./parse.js";
 
 export type VaultConfigLike = {
@@ -47,6 +48,10 @@ export async function handleVault(
   if (req.method === "GET") {
     const result: Record<string, unknown> = vaultResponse(vaultConfig);
     if (transcription) result.transcription = transcription;
+    // Front-door structural map — ALWAYS included, mirroring bun's handleVault
+    // (routes.ts, contracts-brief C1.2). Cloud has no tag-scoped tokens
+    // (NO_TAG_SCOPE everywhere), so the unscoped call is always correct here.
+    result.map = getVaultMap(store.db);
     if (parseBool(parseQuery(url, "include_stats"), false)) {
       result.stats = await store.getVaultStats();
     }
@@ -69,7 +74,14 @@ export async function handleVault(
       const v = body.config.audio_retention;
       if (!VALID_AUDIO_RETENTION.includes(v as typeof VALID_AUDIO_RETENTION[number])) {
         return json(
-          { error: "invalid_audio_retention", message: `audio_retention must be one of: ${VALID_AUDIO_RETENTION.join(", ")}` },
+          {
+            error: "invalid_audio_retention",
+            error_type: "invalid_audio_retention",
+            field: "config.audio_retention",
+            got: v,
+            message: `audio_retention must be one of: ${VALID_AUDIO_RETENTION.join(", ")}`,
+            hint: `pass one of: ${VALID_AUDIO_RETENTION.join(", ")}`,
+          },
           400,
         );
       }
@@ -80,7 +92,17 @@ export async function handleVault(
     if (body.config?.auto_transcribe !== undefined) {
       const enabled = body.config.auto_transcribe?.enabled;
       if (typeof enabled !== "boolean") {
-        return json({ error: "invalid_auto_transcribe", message: "auto_transcribe.enabled must be a boolean" }, 400);
+        return json(
+          {
+            error: "invalid_auto_transcribe",
+            error_type: "invalid_auto_transcribe",
+            field: "config.auto_transcribe.enabled",
+            got: enabled,
+            message: "auto_transcribe.enabled must be a boolean",
+            hint: "pass true or false",
+          },
+          400,
+        );
       }
       vaultConfig.auto_transcribe = { ...vaultConfig.auto_transcribe, enabled };
       dirty = true;
@@ -90,5 +112,5 @@ export async function handleVault(
     return json(vaultResponse(vaultConfig));
   }
 
-  return json({ error: "Method not allowed" }, 405);
+  return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
 }

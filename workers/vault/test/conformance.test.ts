@@ -616,3 +616,166 @@ describe("routing", () => {
     expect(body.authServer).toBe(ISSUER);
   });
 });
+
+/**
+ * Cross-door parity pins (contracts-brief C1.4) — verifies the vault-core
+ * `file:` dep bump (V1, parachute-vault#599) reaches cloud through BOTH REST
+ * (forked runtime code, mirrored by hand in rest/*.ts) AND MCP (core-driven —
+ * `generateMcpTools(store)`, so these fixes are inherited automatically with
+ * zero cloud src changes; the MCP cases here pin that inheritance actually
+ * held). Ground truth: parachute-vault/core/src/notes.ts (rowToNote),
+ * core/src/query-warnings.ts, core/src/mcp.ts query-notes.
+ */
+describe("contracts-brief C1.4 — cross-door parity pins", () => {
+  const BOTH_ACCEPT = "application/json, text/event-stream";
+
+  /** tools/call query-notes → the parsed tool output (JSON.parse of the sole
+   *  text content block), matching mcp.test.ts's mcpPost convention. */
+  async function queryNotesViaMcp(vault: string, args: Record<string, unknown>): Promise<any> {
+    const res = await SELF.fetch(`${base(vault)}/mcp`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OP}`, Accept: BOTH_ACCEPT, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "query-notes", arguments: args },
+      }),
+    });
+    const body = (await res.json()) as any;
+    expect(body.result.isError).toBeFalsy();
+    return JSON.parse(body.result.content[0].text);
+  }
+
+  describe("metadata always-present (V1.1, core-level)", () => {
+    it("GET /api/notes/{id} (default path) → metadata: {} on a metadata-less note", async () => {
+      const v = freshVault();
+      const n = await createNote(v, { content: "no metadata" });
+      const note = (await (await op(v, `/api/notes/${n.id}`)).json()) as any;
+      expect(note.metadata).toEqual({});
+    });
+
+    it("GET /api/notes list (default path) → metadata: {} present on metadata-less notes", async () => {
+      const v = freshVault();
+      await createNote(v, { content: "no metadata", tags: ["nometa"] });
+      const list = (await (await op(v, "/api/notes?tag=nometa&include_content=true")).json()) as any[];
+      expect(list[0].metadata).toEqual({});
+    });
+
+    it("GET /api/notes?search= (default path) → metadata: {} present on metadata-less notes", async () => {
+      const v = freshVault();
+      await createNote(v, { content: "searchable xylophone body" });
+      const list = (await (await op(v, "/api/notes?search=xylophone&include_content=true")).json()) as any[];
+      expect(list.length).toBeGreaterThan(0);
+      expect(list[0].metadata).toEqual({});
+    });
+
+    it("MCP query-notes (single by id) → metadata: {} on a metadata-less note", async () => {
+      const v = freshVault();
+      const n = await createNote(v, { content: "no metadata via mcp" });
+      const note = await queryNotesViaMcp(v, { id: n.id });
+      expect(note.metadata).toEqual({});
+    });
+
+    it("MCP query-notes (list) → metadata: {} present on metadata-less notes", async () => {
+      const v = freshVault();
+      await createNote(v, { content: "no metadata via mcp list", tags: ["mcpnometa"] });
+      const out = await queryNotesViaMcp(v, { tag: "mcpnometa", include_content: true });
+      const list = Array.isArray(out) ? out : out.notes;
+      expect(list[0].metadata).toEqual({});
+    });
+  });
+
+  describe("slashed note-id path — %2F whole-encode is the contract", () => {
+    it("%2F-encoded path resolves; the raw-slash form 404s", async () => {
+      const v = freshVault();
+      const n = await createNote(v, { content: "nested", path: "folder/nested-note" });
+      const encoded = await op(v, `/api/notes/${encodeURIComponent("folder/nested-note")}`);
+      expect(encoded.status).toBe(200);
+      expect((await encoded.json() as any).id).toBe(n.id);
+
+      const rawSlash = await op(v, "/api/notes/folder/nested-note");
+      expect(rawSlash.status).toBe(404);
+    });
+  });
+
+  describe("search × offset → ignored_param warning (V1.2/C1.3)", () => {
+    it("?search=x&offset=5 → 200, results unchanged, X-Parachute-Warnings names `offset`", async () => {
+      const v = freshVault();
+      await createNote(v, { content: "warnme offsettest" });
+      const withOffset = await op(v, "/api/notes?search=offsettest&offset=5");
+      const withoutOffset = await op(v, "/api/notes?search=offsettest");
+      expect(withOffset.status).toBe(200);
+      const a = (await withOffset.json()) as any[];
+      const b = (await withoutOffset.json()) as any[];
+      expect(a.map((n) => n.id)).toEqual(b.map((n) => n.id));
+      const raw = withOffset.headers.get("X-Parachute-Warnings");
+      expect(raw).toBeTruthy();
+      const warnings = JSON.parse(decodeURIComponent(raw!));
+      expect(warnings.some((w: any) => w.code === "ignored_param" && w.param === "offset")).toBe(true);
+    });
+
+    it("?search=x&search_mode=advanced&sort=desc → unsupported_param warnings, results unaffected (C1.5)", async () => {
+      const v = freshVault();
+      await createNote(v, { content: "warnme modetest" });
+      const res = await op(v, "/api/notes?search=modetest&search_mode=advanced&sort=desc");
+      expect(res.status).toBe(200);
+      const raw = res.headers.get("X-Parachute-Warnings");
+      expect(raw).toBeTruthy();
+      const warnings = JSON.parse(decodeURIComponent(raw!));
+      expect(warnings.some((w: any) => w.code === "unsupported_param" && w.param === "search_mode")).toBe(true);
+      expect(warnings.some((w: any) => w.code === "unsupported_param" && w.param === "sort")).toBe(true);
+    });
+
+    it("structured-query offset is UNAFFECTED (still honored, no warning)", async () => {
+      const v = freshVault();
+      await createNote(v, { content: "s1", tags: ["structoffset"] });
+      await createNote(v, { content: "s2", tags: ["structoffset"] });
+      const res = await op(v, "/api/notes?tag=structoffset&offset=1");
+      expect(res.status).toBe(200);
+      const list = (await res.json()) as any[];
+      expect(list).toHaveLength(1);
+      expect(res.headers.get("X-Parachute-Warnings")).toBeNull();
+    });
+  });
+
+  describe("default ordering — created_at ASC, limit 50 (pinned AS-IS; a flip to desc is AARON-GATE)", () => {
+    it("bare GET /api/notes returns oldest-first by default", async () => {
+      const v = freshVault();
+      const a = await createNote(v, { content: "first" });
+      const b = await createNote(v, { content: "second" });
+      const c = await createNote(v, { content: "third" });
+      const list = (await (await op(v, "/api/notes")).json()) as any[];
+      const ids = list.map((n) => n.id);
+      expect(ids.indexOf(a.id)).toBeLessThan(ids.indexOf(b.id));
+      expect(ids.indexOf(b.id)).toBeLessThan(ids.indexOf(c.id));
+    });
+  });
+
+  describe("transcription capability `enabled` — parity (already pinned above; re-asserted here as a C1.4 checklist item)", () => {
+    it("GET /api/vault carries transcription.enabled (boolean) on a fresh vault", async () => {
+      const v = freshVault();
+      const apiVault = (await (await op(v, "/api/vault")).json()) as any;
+      expect(typeof apiVault.transcription.enabled).toBe("boolean");
+    });
+  });
+
+  describe("MCP truncation-honesty warning (V1.3, core-level — inherited via generateMcpTools)", () => {
+    it("query-notes with limit === result count (no cursor) → `truncated` warning in the envelope", async () => {
+      const v = freshVault();
+      await createNote(v, { content: "t1", tags: ["trunc"] });
+      await createNote(v, { content: "t2", tags: ["trunc"] });
+      const out = await queryNotesViaMcp(v, { tag: "trunc", limit: 1 });
+      expect(Array.isArray(out)).toBe(false);
+      expect(out.notes).toHaveLength(1);
+      expect(out.warnings?.some((w: any) => w.code === "truncated")).toBe(true);
+    });
+
+    it("query-notes under the limit (no cursor) → no truncated warning", async () => {
+      const v = freshVault();
+      await createNote(v, { content: "u1", tags: ["notrunc"] });
+      const out = await queryNotesViaMcp(v, { tag: "notrunc", limit: 50 });
+      expect(Array.isArray(out)).toBe(true);
+    });
+  });
+});

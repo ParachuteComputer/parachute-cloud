@@ -27,8 +27,10 @@ import { transactionAsync } from "@openparachute/core/src/txn.js";
 import * as linkOps from "@openparachute/core/src/links.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
+import type { QueryWarning } from "@openparachute/core/src/query-warnings.js";
 import {
   json,
+  jsonWithWarnings,
   cursorJson,
   parseBool,
   parseQuery,
@@ -177,9 +179,9 @@ async function handleNotesInner(
       // Single note by id/path
       if (id) {
         const note = await resolveNote(store, id);
-        if (!note) return json({ error: "Note not found", id }, 404);
+        if (!note) return json({ error: "Note not found", error_type: "not_found", id }, 404);
         if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
-          return json({ error: "Note not found", id }, 404);
+          return json({ error: "Note not found", error_type: "not_found", id }, 404);
         }
         const includeContent = parseBool(parseQuery(url, "include_content"), true);
         const contentRange = parseContentRangeQuery(url, includeContent);
@@ -213,6 +215,9 @@ async function handleNotesInner(
           {
             error: "cursor is incompatible with full-text search — FTS has its own ordering. Use date_filter on updated_at for since-last-checked search.",
             code: "INVALID_QUERY",
+            error_type: "invalid_query",
+            field: "cursor",
+            hint: "drop `cursor` when using `search`, or drop `search` and use `meta[updated_at][gte]=…` for since-last-checked polling",
           },
           400,
         );
@@ -224,7 +229,57 @@ async function handleNotesInner(
         const limit = parseInt10(parseQuery(url, "limit")) ?? 50;
         const tagExpand = parseExpandParam(url);
         if (tagExpand.error) return tagExpand.error;
-        const rawResults = await store.searchNotes(search, { tags: searchTags, limit, expand: tagExpand.expand });
+        // `offset` under full-text search (contracts-brief V1.2/C1.3): search
+        // has no stable row order to offset into — results are always page 1,
+        // ranked by relevance. Warn rather than silently ignore (the
+        // structured-query path below has real offset support, unaffected).
+        const searchWarnings: QueryWarning[] = [];
+        if (parseQuery(url, "offset") !== null) {
+          searchWarnings.push({
+            code: "ignored_param",
+            message: "`offset` has no effect: full-text search has no stable row order to offset into — results are always page 1, ranked by relevance",
+            param: "offset",
+          });
+        }
+        // `search_mode` + `sort`-under-search (contracts-brief item 2/C1.5):
+        // cloud v1 has no `search_mode` (advanced FTS5 syntax) or `sort`
+        // (relevance vs created_at) support under full-text search — bun
+        // honors both (vault#551). Rather than silently ignore (wrong
+        // results with no signal), name them loudly; a full port rides the
+        // shared-core merge.
+        if (parseQuery(url, "search_mode") !== null) {
+          searchWarnings.push({
+            code: "unsupported_param",
+            message: "`search_mode` is not supported on cloud v1 — search always runs in literal mode. No effect on results.",
+            param: "search_mode",
+          });
+        }
+        if (parseQuery(url, "sort") !== null) {
+          searchWarnings.push({
+            code: "unsupported_param",
+            message: "`sort` is not supported under full-text search on cloud v1 — results are always ranked by relevance. No effect on results.",
+            param: "sort",
+          });
+        }
+        let rawResults: Note[];
+        try {
+          rawResults = await store.searchNotes(search, { tags: searchTags, limit, expand: tagExpand.expand });
+        } catch (e: any) {
+          if (e && e.name === "QueryError") {
+            return json(
+              {
+                error: e.message,
+                code: e.code ?? "INVALID_QUERY",
+                error_type: e.error_type ?? "invalid_query",
+                ...(e.field !== undefined ? { field: e.field } : {}),
+                ...(e.got !== undefined ? { got: e.got } : {}),
+                ...(e.hint !== undefined ? { hint: e.hint } : {}),
+              },
+              400,
+            );
+          }
+          throw e;
+        }
         const results = filterNotesByTagScope(rawResults, tagScope.allowed, tagScope.raw);
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
         const contentRange = parseContentRangeQuery(url, includeContent);
@@ -248,7 +303,7 @@ async function handleNotesInner(
           const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url));
           for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
         }
-        return json(output);
+        return jsonWithWarnings(output, searchWarnings);
       }
 
       // Structured query.
@@ -272,6 +327,9 @@ async function handleNotesInner(
           {
             error: "cursor is incompatible with near (graph neighborhood). Resolve the neighborhood first, then iterate with cursor over the resulting note set.",
             code: "INVALID_QUERY",
+            error_type: "invalid_query",
+            field: "cursor",
+            hint: "resolve the `near` neighborhood first, then paginate the resulting note set with `cursor`",
           },
           400,
         );
@@ -288,10 +346,20 @@ async function handleNotesInner(
         }
       } catch (e: any) {
         if (e && e.name === "QueryError") {
-          return json({ error: e.message, code: e.code ?? "INVALID_QUERY" }, 400);
+          return json(
+            {
+              error: e.message,
+              code: e.code ?? "INVALID_QUERY",
+              error_type: e.error_type ?? "invalid_query",
+              ...(e.field !== undefined ? { field: e.field } : {}),
+              ...(e.got !== undefined ? { got: e.got } : {}),
+              ...(e.hint !== undefined ? { hint: e.hint } : {}),
+            },
+            400,
+          );
         }
         if (e && e.name === "CursorError") {
-          return json({ error: e.message, code: e.code ?? "cursor_invalid" }, 400);
+          return json({ error: e.message, code: e.code ?? "cursor_invalid", error_type: e.code ?? "cursor_invalid" }, 400);
         }
         throw e;
       }
@@ -299,9 +367,9 @@ async function handleNotesInner(
       const nearNoteId = parseQuery(url, "near[note_id]");
       if (nearNoteId) {
         const anchor = await resolveNote(store, nearNoteId);
-        if (!anchor) return json({ error: "Anchor note not found", note_id: nearNoteId }, 404);
+        if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
         if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
-          return json({ error: "Anchor note not found", note_id: nearNoteId }, 404);
+          return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
         }
         const depth = Math.min(parseInt10(parseQuery(url, "near[depth]")) ?? 2, 5);
         const relationship = parseQuery(url, "near[relationship]") ?? undefined;
@@ -467,12 +535,12 @@ async function handleNotesInner(
       return json(body.notes ? final : final[0], 201);
     }
 
-    return json({ error: "Method not allowed" }, 405);
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
   }
 
   // ---- Note-level routes (/notes/:idOrPath[/attachments]) ----
   const idMatch = subpath.match(/^\/([^/]+)(\/.*)?$/);
-  if (!idMatch) return json({ error: "Not found" }, 404);
+  if (!idMatch) return json({ error: "Not found", error_type: "not_found" }, 404);
 
   const idOrPath = decodeURIComponent(idMatch[1]!);
   const sub = idMatch[2] ?? "";
@@ -481,10 +549,15 @@ async function handleNotesInner(
   if (sub === "/attachments") {
     if (method === "POST") {
       const note = await resolveNote(store, idOrPath);
-      if (!note) return json({ error: "Not found" }, 404);
-      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found" }, 404);
+      if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
       const body = await req.json() as { path: string; mimeType: string; transcribe?: boolean };
-      if (!body.path || !body.mimeType) return json({ error: "path and mimeType are required" }, 400);
+      if (!body.path || !body.mimeType) {
+        return json(
+          { error: "path and mimeType are required", error_type: "missing_required_field", hint: "pass both `path` and `mimeType`" },
+          400,
+        );
+      }
       // Voice transcription (cloud#56): on `transcribe:true`, stamp the
       // attachment `pending` (the DB IS the queue — the same shape the self-host
       // worker uses) and mark the owning note as a transcribe stub, then arm the
@@ -515,11 +588,11 @@ async function handleNotesInner(
     }
     if (method === "GET") {
       const note = await resolveNote(store, idOrPath);
-      if (!note) return json({ error: "Not found" }, 404);
-      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found" }, 404);
+      if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
       return json(await store.getAttachments(note.id));
     }
-    return json({ error: "Method not allowed" }, 405);
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
   }
 
   const attMatch = sub.match(/^\/attachments\/([^/]+)$/);
@@ -527,10 +600,10 @@ async function handleNotesInner(
     const attId = decodeURIComponent(attMatch[1]!);
     if (method === "DELETE") {
       const note = await resolveNote(store, idOrPath);
-      if (!note) return json({ error: "Not found" }, 404);
-      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found" }, 404);
+      if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
       const result = await store.deleteAttachment(note.id, attId);
-      if (!result.deleted) return json({ error: "Not found" }, 404);
+      if (!result.deleted) return json({ error: "Not found", error_type: "not_found" }, 404);
       // Orphan-delete the R2 object only when no other attachment references it
       // (bun unlinks the fs file here; cloud deletes the R2 key AND decrements
       // the storage meter — deleteObject owns both, see VaultDO.deleteObject).
@@ -539,16 +612,16 @@ async function handleNotesInner(
       }
       return new Response(null, { status: 204 });
     }
-    return json({ error: "Method not allowed" }, 405);
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
   }
 
-  if (sub !== "") return json({ error: "Not found" }, 404);
+  if (sub !== "") return json({ error: "Not found", error_type: "not_found" }, 404);
 
   // GET /notes/:idOrPath — single note
   if (method === "GET") {
     const note = await resolveNote(store, idOrPath);
-    if (!note) return json({ error: "Not found" }, 404);
-    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found" }, 404);
+    if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
     const includeContent = parseBool(parseQuery(url, "include_content"), true);
     const contentRange = parseContentRangeQuery(url, includeContent);
     if (contentRange.error) return contentRange.error;
@@ -845,13 +918,13 @@ async function handleNotesInner(
   // DELETE /notes/:idOrPath
   if (method === "DELETE") {
     const note = await resolveNote(store, idOrPath);
-    if (!note) return json({ error: "Not found" }, 404);
-    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found" }, 404);
+    if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
     await store.deleteNote(note.id);
     return json({ deleted: true, id: note.id });
   }
 
-  return json({ error: "Method not allowed" }, 405);
+  return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
 }
 
 /** R2 object key for an attachment's vault-relative path (`<date>/<file>`). */

@@ -127,10 +127,16 @@ export function verbForMethod(method: string): VaultVerb {
   return m === "GET" || m === "HEAD" || m === "OPTIONS" ? "read" : "write";
 }
 
+// RFC 7235: the auth-scheme token is case-insensitive (`Bearer`/`bearer`/
+// `BEARER`, ...) — only the scheme is matched case-insensitively, the token
+// itself is passed through verbatim. Mirrors parachute-vault/src/auth.ts's
+// BEARER_PREFIX (V1.4/C1.3 contracts-brief parity).
+const BEARER_PREFIX = /^Bearer\s+/i;
+
 /** Bearer → X-API-Key → ?key= (parachute-vault/src/auth.ts:287). */
 export function extractApiKey(req: Request): string | null {
   const authHeader = req.headers.get("authorization");
-  if (authHeader?.startsWith("Bearer ")) return authHeader.slice(7);
+  if (authHeader && BEARER_PREFIX.test(authHeader)) return authHeader.replace(BEARER_PREFIX, "");
   const xApiKey = req.headers.get("x-api-key");
   if (xApiKey) return xApiKey;
   return new URL(req.url).searchParams.get("key");
