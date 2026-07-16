@@ -1,104 +1,68 @@
 #!/usr/bin/env bash
 #
-# build-spa.sh — produce the notes-ui SPA bundle the identity worker serves via
-# Workers Static Assets (P1.1, parachute-cloud#116), into
-# workers/identity/dist-assets/ (the [assets].directory). Both deploy scripts run
-# this BEFORE `wrangler deploy` so the assets dir exists at deploy time; it is
-# gitignored (generated) and reproducible from the pin below.
+# Build the Parachute App bundle served by the Cloud identity worker through
+# Workers Static Assets. The identity worker owns the Cloud/account/OAuth
+# ceremonies and serves this browser application on app.parachute.computer;
+# Vault data remains in the separate vault worker at u.parachute.computer.
 #
-# ── WHY BUILD FROM SOURCE, not the npm dist (the P1.1 correction) ──────────────
-# The plan's first instinct was "copy the published @openparachute/notes-ui dist."
-# That does NOT work for serving at ORIGIN ROOT, and the reasons are load-bearing:
-#
-#   1. The npm-published dist is the BUNDLED-HOST shape: `base: ""` → RELATIVE
-#      asset refs (`./assets/...`). Served at origin root, a deep link like
-#      `/some-note` (or the /oauth/callback PKCE return) resolves `./assets/x`
-#      against the request path → `/some-note/assets/x` → 404 → the SPA can't
-#      boot. Origin-root serving needs ABSOLUTE `/assets/...` (base "/").
-#   2. The React Router basename for origin root comes ONLY from the build-time
-#      `VITE_BASE_PATH=/` signal (base-url.ts STANDALONE_DEPLOY). getMountBase
-#      REJECTS a bare "/" meta tag (surface-client mount.ts), so no post-process
-#      of a prebuilt dist can produce the root basename — it must be BUILT with
-#      VITE_BASE_PATH=/. Without it the router falls back to `/notes` and blanks.
-#   3. The version the app campaign pins (0.1.23, the P0.3 ceremony-denylist SW
-#      + surface#189's bare-path fix) is NOT published to npm anyway (npm latest
-#      is 0.1.15) — it lives only in the sibling checkout.
-#
-# So we build the SAME artifact notes.parachute.computer already serves (the
-# standalone VITE_BASE_PATH=/ build), from the sibling parachute-surface checkout,
-# pinned to an exact version. This IS the [PLAN-DECISION] "the worker pins which
-# version it serves" — just built, not copied.
-#
-# 0.1.23 also carries surface#189 (the bare-path note route no longer collides
-# with a ceremony prefix) — the companion fix that makes same-origin SPA + this
-# run_worker_first guard safe once app. is live.
-#
-# ── TO BUMP THE SERVED APP ─────────────────────────────────────────────────────
-#   1. Bump SPA_NOTES_UI_VERSION below to the target notes-ui version.
-#   2. Make sure the parachute-surface checkout is AT that version (its main HEAD,
-#      or ideally a release tag `notes-ui-v<version>`; CI checks out that ref).
-#      The guard below FAILS the build on any mismatch so the served app is always
-#      the intended, deterministic one — the sibling monorepo bumps notes-ui per
-#      PR, so a stale/ahead checkout is caught rather than silently served.
-#   • Escape hatch for a staging soak against a drifted checkout: run with
-#     SPA_ALLOW_VERSION_DRIFT=1 to WARN-and-build the checkout's actual version
-#     instead of failing (the built + announced version is still explicit).
+# The App source is pinned in spa-source.env. Deployment workflows fetch that
+# exact commit into a sibling checkout, and this script verifies its package
+# version before building. This keeps the frontend embedded in any Cloud release
+# reproducible instead of silently following another repository's main branch.
 set -euo pipefail
 
-# The pinned notes-ui version this worker serves. Exact (no caret) — deterministic.
-SPA_NOTES_UI_VERSION="0.2.0"
-
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEST="$ROOT/workers/identity/dist-assets"
-# The sibling parachute-surface checkout (override with SURFACE_REPO if it lives
-# elsewhere — e.g. a CI clone path).
-SURFACE_REPO="${SURFACE_REPO:-$ROOT/../parachute-surface}"
-NOTES_UI="$SURFACE_REPO/packages/notes-ui"
+# shellcheck source=spa-source.env
+source "$ROOT/scripts/spa-source.env"
 
-if [[ ! -d "$NOTES_UI" ]]; then
-  echo "build-spa: parachute-surface checkout not found at $SURFACE_REPO" >&2
-  echo "           set SURFACE_REPO=/path/to/parachute-surface (a sibling checkout)." >&2
+DEST="${SPA_DEST:-$ROOT/workers/identity/dist-assets}"
+APP_REPO="${APP_REPO:-$ROOT/../parachute-app}"
+
+if [[ ! -f "$APP_REPO/package.json" ]]; then
+  echo "build-spa: parachute-app checkout not found at $APP_REPO" >&2
+  echo "           set APP_REPO=/path/to/parachute-app (a sibling checkout)." >&2
   exit 1
 fi
 
-# Version guard — the served app must be the pinned version, or fail loudly
-# (unless SPA_ALLOW_VERSION_DRIFT=1, which downgrades the mismatch to a warning).
-ACTUAL="$(cd "$NOTES_UI" && node -p "require('./package.json').version" 2>/dev/null || true)"
-if [[ "$ACTUAL" != "$SPA_NOTES_UI_VERSION" ]]; then
-  if [[ "${SPA_ALLOW_VERSION_DRIFT:-}" == "1" ]]; then
-    echo "build-spa: WARNING — pinned $SPA_NOTES_UI_VERSION but checkout has ${ACTUAL:-<unknown>}; building the checkout's version (SPA_ALLOW_VERSION_DRIFT=1)." >&2
-  else
-    echo "build-spa: notes-ui version mismatch — pinned $SPA_NOTES_UI_VERSION, checkout has ${ACTUAL:-<unknown>}." >&2
-    echo "           check out parachute-surface at notes-ui v$SPA_NOTES_UI_VERSION (tag notes-ui-v$SPA_NOTES_UI_VERSION)," >&2
-    echo "           update SPA_NOTES_UI_VERSION in this script to a deliberate bump," >&2
-    echo "           or re-run with SPA_ALLOW_VERSION_DRIFT=1 to build the checkout's version anyway." >&2
-    exit 1
-  fi
+ACTUAL_NAME="$(cd "$APP_REPO" && node -p "require('./package.json').name" 2>/dev/null || true)"
+if [[ "$ACTUAL_NAME" != "@openparachute/parachute-app" ]]; then
+  echo "build-spa: expected @openparachute/parachute-app at $APP_REPO, found ${ACTUAL_NAME:-<unknown>}." >&2
+  exit 1
 fi
 
-echo "build-spa: building @openparachute/notes-ui v${ACTUAL:-$SPA_NOTES_UI_VERSION} at origin root (VITE_BASE_PATH=/)…"
-cd "$SURFACE_REPO"
-bun install
-# surface-client is a workspace dep of notes-ui — build it first (mirrors
-# deploy-notes-ui.yml, the standalone notes.parachute.computer pipeline).
-bun run --filter "@openparachute/surface-client" build
-# The origin-root build: VITE_BASE_PATH=/ → absolute /assets/... + STANDALONE_DEPLOY
-# (basename ""). The identical artifact notes.parachute.computer serves today.
-VITE_BASE_PATH="/" bun run --filter "@openparachute/notes-ui" build
+ACTUAL_VERSION="$(cd "$APP_REPO" && node -p "require('./package.json').version" 2>/dev/null || true)"
+if [[ "$ACTUAL_VERSION" != "$SPA_APP_VERSION" ]]; then
+  echo "build-spa: App version mismatch — pinned $SPA_APP_VERSION, checkout has ${ACTUAL_VERSION:-<unknown>}." >&2
+  echo "           fetch SPA_APP_REF=$SPA_APP_REF from scripts/spa-source.env." >&2
+  exit 1
+fi
 
-# Publish into the worker's assets dir (clean first so removed files don't linger).
+ACTUAL_REF="$(cd "$APP_REPO" && git rev-parse HEAD 2>/dev/null || true)"
+if [[ "$ACTUAL_REF" != "$SPA_APP_REF" ]]; then
+  echo "build-spa: App source mismatch — pinned $SPA_APP_REF, checkout has ${ACTUAL_REF:-<no git revision>}." >&2
+  exit 1
+fi
+if [[ -n "$(cd "$APP_REPO" && git status --porcelain)" ]]; then
+  echo "build-spa: App checkout has tracked or untracked local modifications; refusing a non-reproducible bundle." >&2
+  exit 1
+fi
+
+# The App is root-hosted by default, but keep the explicit build signal because
+# deep links and /oauth/callback require absolute /assets/... references and a
+# root React Router basename.
+echo "build-spa: building @openparachute/parachute-app v$ACTUAL_VERSION ($SPA_APP_REF) at origin root…"
+cd "$APP_REPO"
+bun install --frozen-lockfile
+VITE_BASE_PATH="/" bun run build
+
 rm -rf "$DEST"
 mkdir -p "$DEST"
-cp -R "$NOTES_UI/dist/." "$DEST/"
-# CNAME is a GitHub Pages artifact (the notes. custom domain) — meaningless for
-# the worker and would just be served as a stray /CNAME asset. Drop it.
+cp -R "$APP_REPO/dist/." "$DEST/"
 rm -f "$DEST/CNAME"
 
-# Emit the SPA Content-Security-Policy _headers file (P1.1.5) from the ACTUAL
-# built index.html — the inline theme-script hash is derived here so it can never
-# drift from what's served (Cloudflare treats a root `_headers` file as config,
-# not a served asset). See scripts/gen-spa-headers.ts + workers/identity/src/spa-csp.ts.
+# Static Assets bypasses the identity worker's server-rendered HTML helper, so
+# emit the SPA-specific CSP from the actual index.html theme script hash.
 echo "build-spa: emitting dist-assets/_headers (SPA Content-Security-Policy)…"
 bun "$ROOT/scripts/gen-spa-headers.ts" "$DEST"
 
-echo "build-spa: wrote $(find "$DEST" -type f | wc -l | tr -d ' ') files to workers/identity/dist-assets (index.html + assets/ + sw.js + manifest + _headers)."
+echo "build-spa: wrote $(find "$DEST" -type f | wc -l | tr -d ' ') files to $DEST."

@@ -33,18 +33,20 @@ ISSUER_ORIGIN="https://cloud.parachute.computer"   # console + OAuth issuer (iss
 VAULT_PUBLIC="https://u.parachute.computer"        # vault host (path routing)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Verify and rebuild the exact shared Hub contract before the workspace install
+# snapshots the file: dependency into node_modules.
+bash "$ROOT/scripts/materialize-door-contract.sh"
 # Refresh the copied file: dep FIRST — bun snapshots @openparachute/core into
 # node_modules at install time, so a vault-core change upstream is INVISIBLE to
 # builds until re-installed (bit us 2026-07-02: stale txn.ts tested green,
 # deployed stale). One bun install makes every deploy build against current core.
 (cd "$ROOT" && bun install)
 
-# --- SPA bundle (P1.1) — build the notes-ui app the identity worker serves via
+# --- SPA bundle — build the Parachute App the identity worker serves via
 # Workers Static Assets INTO workers/identity/dist-assets BEFORE its deploy (the
-# [assets].directory must exist at `wrangler deploy` time). Built from the sibling
-# parachute-surface checkout at VITE_BASE_PATH=/ (origin-root shape). Runs before
-# the identity deploy below. In CI the deploy-prod workflow must have a
-# parachute-surface checkout (SURFACE_REPO), like it clones parachute-vault.
+# [assets].directory must exist at `wrangler deploy` time). The workflow fetches
+# the exact commit in scripts/spa-source.env; build-spa.sh verifies and builds it
+# at the origin root before the identity deploy below.
 bash "$ROOT/scripts/build-spa.sh"
 
 # --- identity worker (OAuth issuer on the production D1) ---------------------

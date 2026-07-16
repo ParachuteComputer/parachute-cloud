@@ -428,8 +428,9 @@ describe("copy", () => {
 
 describe("worker wiring", () => {
   test("the deployed drip cron sends through the real export (ledger row lands)", async () => {
-    const u = await seedUserAt("wired@example.com", minutesAgo(10));
-    const ctrl = createScheduledController({ scheduledTime: NOW, cron: DRIP_CRON });
+    const liveNow = new Date();
+    const u = await seedUserAt("wired@example.com", new Date(liveNow.getTime() - 10 * 60 * 1000));
+    const ctrl = createScheduledController({ scheduledTime: liveNow, cron: DRIP_CRON });
     const ctx = createExecutionContext();
     await quietly(async () => {
       await worker.scheduled(ctrl, env, ctx);
@@ -439,7 +440,7 @@ describe("worker wiring", () => {
   });
 
   test("the staging drip trigger exists off-production and 404s ON production", async () => {
-    await seedUserAt("trigger@example.com", minutesAgo(10));
+    await seedUserAt("trigger@example.com", new Date(Date.now() - 10 * 60 * 1000));
     const req = () => new Request(`${ISSUER}/__test/drip-run`, { method: "POST" });
 
     const staging = await quietly(async () => worker.fetch(req(), env));
