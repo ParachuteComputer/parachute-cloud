@@ -58,7 +58,12 @@ VITE_BASE_PATH="/" bun run build
 rm -rf "$DEST"
 mkdir -p "$DEST"
 cp -R "$APP_REPO/dist/." "$DEST/"
-rm -f "$DEST/CNAME"
+# Pages-era artifacts ride in from the app's public/: CNAME (GitHub Pages) and
+# _redirects (Cloudflare Pages SPA fallback). The identity worker does its own
+# SPA fallback (not_found_handling = single-page-application), and wrangler
+# HARD-REJECTS the Pages-style _redirects rule at deploy time ("Infinite loop
+# detected", code 100324 — cloud#156, first real CI deploy 2026-07-16). Strip both.
+rm -f "$DEST/CNAME" "$DEST/_redirects"
 
 # Static Assets bypasses the identity worker's server-rendered HTML helper, so
 # emit the SPA-specific CSP from the actual index.html theme script hash.
