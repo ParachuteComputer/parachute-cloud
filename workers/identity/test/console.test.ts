@@ -241,6 +241,104 @@ describe("vault ownership — authorize flow", () => {
   });
 });
 
+// --- RFC 8707 resource binding: the vault worker's own origin -------------
+//
+// The connector-add bug (u.parachute.computer as a Claude/ChatGPT connector):
+// a client that sends the generic scopes plus `resource=<the vault's own
+// PRM-advertised MCP URL>` — the spec-compliant 2025-06-18 MCP shape — used to
+// fall through to the bare free-typed "Vault name" prompt instead of a clean
+// bound-vault consent, because `resolveResourceVault` had no way to recognize
+// the vault worker's own origin. See audience.ts `ResolveResourceOpts.vaultOrigin`.
+
+describe("RFC 8707 resource binding — the vault worker's own origin (connector-add fix)", () => {
+  test("resource=<VAULT_ORIGIN>/vault/<name>/mcp narrows consent to the named vault, no bare vault_pick prompt", async () => {
+    const { id: userId } = await seedUser("connector-fix@example.com");
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    await seedVault("connectorvault", userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope: "vault:read vault:write",
+          resource: `${env.VAULT_ORIGIN}/vault/connectorvault/mcp`,
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        },
+        sessionId,
+      ),
+      { ...deps(), vaultOrigin: env.VAULT_ORIGIN },
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Narrowing ran: the hidden scope field round-trips the NAMED scopes...
+    expect(html).toContain('name="scope" value="vault:connectorvault:read vault:connectorvault:write"');
+    // ...so the consent page never falls back to the bare free-typed input
+    // (ui.ts renderConsent's needsVaultPick branch, id="vault_pick").
+    expect(html).not.toContain('id="vault_pick"');
+  });
+
+  test("regression pin: without vaultOrigin wired into deps, the identical request degrades to the pre-fix bare vault_pick prompt", async () => {
+    const { id: userId } = await seedUser("connector-prefix@example.com");
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    await seedVault("prefixvault", userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope: "vault:read vault:write",
+          resource: `${env.VAULT_ORIGIN}/vault/prefixvault/mcp`,
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        },
+        sessionId,
+      ),
+      deps(), // vaultOrigin unset — the pre-fix deps shape (helpers.ts deps())
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('id="vault_pick"');
+    expect(html).toContain('name="scope" value="vault:read vault:write"');
+  });
+
+  test("end-to-end: consent-approve on a resource-bound request issues a code (the real client round trip)", async () => {
+    const { id: userId } = await seedUser("connector-e2e@example.com");
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    await seedVault("e2evault", userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizePost(
+      env.DB,
+      consentReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope: "vault:read vault:write",
+          resource: `${env.VAULT_ORIGIN}/vault/e2evault/mcp`,
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        },
+        { sessionId },
+      ),
+      { ...deps(), vaultOrigin: env.VAULT_ORIGIN },
+    );
+    expect(res.status).toBe(302);
+    const u = new URL(res.headers.get("location")!);
+    expect(u.searchParams.get("error")).toBeNull();
+    expect(u.searchParams.get("code")).toBeTruthy();
+  });
+});
+
 // --- vault name validation -------------------------------------------------
 
 describe("vault name rules", () => {
@@ -1193,6 +1291,75 @@ describe("resolveResourceVault case-normalization", () => {
   });
   test("mixed-case subdomain form canonicalizes to lowercase", () => {
     expect(resolveResourceVault("https://MyVault.u.parachute.computer/mcp", opts)).toBe("myvault");
+  });
+});
+
+/**
+ * The connector-bug fix: the vault worker's own origin (VAULT_ORIGIN, cloud's
+ * two-worker topology) is now a recognized address for the path form,
+ * SEPARATE from boundOrigins (the CSRF accept-set — see bound-origins.test.ts
+ * for the pin that this did NOT widen CSRF). Before this fix, opts carried no
+ * `vaultOrigin` field at all, so `${VAULT_ORIGIN}/vault/<name>/mcp` — the
+ * EXACT string the vault worker's own PRM advertises as `resource` — resolved
+ * to null.
+ */
+describe("resolveResourceVault — the vault worker's own origin (VAULT_ORIGIN)", () => {
+  const vaultOrigin = env.VAULT_ORIGIN!; // "https://u.parachute.computer" in the committed prod config
+  const opts = { boundOrigins: [ISSUER] as readonly string[], vaultBaseDomain: VAULT_BASE, vaultOrigin };
+
+  test("the exact PRM-advertised MCP resource resolves the vault name", () => {
+    expect(resolveResourceVault(`${vaultOrigin}/vault/myvault/mcp`, opts)).toBe("myvault");
+  });
+
+  test("the per-vault PRM path itself also resolves", () => {
+    expect(resolveResourceVault(`${vaultOrigin}/vault/myvault/.well-known/oauth-protected-resource`, opts)).toBe(
+      "myvault",
+    );
+  });
+
+  test("a foreign origin in path form still does not resolve, even with vaultOrigin configured", () => {
+    expect(resolveResourceVault("https://evil.example/vault/myvault/mcp", opts)).toBeNull();
+  });
+
+  test("boundOrigins path-form recognition is unaffected by an additionally-set vaultOrigin (no regression)", () => {
+    expect(resolveResourceVault(`${ISSUER}/vault/myvault/mcp`, opts)).toBe("myvault");
+  });
+
+  test("subdomain-form recognition is unaffected by vaultOrigin (no regression)", () => {
+    expect(resolveResourceVault(`https://myvault.${VAULT_BASE}/mcp`, opts)).toBe("myvault");
+  });
+
+  test("regression pin: WITHOUT vaultOrigin in opts (the pre-fix shape), the same PRM resource resolves to null", () => {
+    const preFixOpts = { boundOrigins: [ISSUER] as readonly string[], vaultBaseDomain: VAULT_BASE };
+    expect(resolveResourceVault(`${vaultOrigin}/vault/myvault/mcp`, preFixOpts)).toBeNull();
+  });
+});
+
+/**
+ * Congruence pin: constructs the resource URL the way the VAULT worker's own
+ * discovery.ts builds it (`workers/vault/src/discovery.ts` `protectedResource()`:
+ * `resource = ${publicOrigin(req)}/vault/${vaultName}/mcp`). For a live
+ * vault-worker request with no X-Forwarded-Host override, `publicOrigin(req)`
+ * is the vault worker's own origin — VAULT_ORIGIN here. Mirrored rather than
+ * imported (the two are separate Worker packages in this monorepo, matching
+ * how the rest of the codebase cross-references — see e.g.
+ * workers/identity/src/snapshots.ts's "mirrored from workers/vault" comment).
+ * If either worker's resource-URL shape drifts, THIS is the tripwire, not a
+ * live probe.
+ */
+describe("congruence — the identity worker resolves the vault worker's own PRM resource string", () => {
+  function vaultAdvertisedResource(vaultName: string): string {
+    return `${env.VAULT_ORIGIN}/vault/${vaultName}/mcp`;
+  }
+
+  test("byte-identical to what workers/vault/src/discovery.ts protectedResource() emits", () => {
+    expect(
+      resolveResourceVault(vaultAdvertisedResource("congruence-vault"), {
+        boundOrigins: [ISSUER],
+        vaultBaseDomain: VAULT_BASE,
+        vaultOrigin: env.VAULT_ORIGIN,
+      }),
+    ).toBe("congruence-vault");
   });
 });
 

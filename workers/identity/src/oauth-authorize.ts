@@ -155,6 +155,7 @@ async function authorizeCore(
   const boundVault = resolveResourceVault(params.resource, {
     boundOrigins: resolveBoundOrigins(deps),
     vaultBaseDomain: deps.vaultBaseDomain,
+    vaultOrigin: deps.vaultOrigin,
   });
   if (boundVault) {
     params.scope = narrowResourceVaultScopes(params.scope.split(" ").filter((s) => s.length > 0), boundVault).join(" ");
@@ -343,6 +344,7 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   const boundVault = resolveResourceVault(params.resource, {
     boundOrigins: resolveBoundOrigins(deps),
     vaultBaseDomain: deps.vaultBaseDomain,
+    vaultOrigin: deps.vaultOrigin,
   });
   if (boundVault) {
     params.scope = narrowResourceVaultScopes(params.scope.split(" ").filter((s) => s.length > 0), boundVault).join(" ");

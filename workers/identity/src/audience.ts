@@ -73,10 +73,21 @@ function decodeVaultName(segment: string): string | null {
 }
 
 export interface ResolveResourceOpts {
-  /** The issuer's own origin set — for the hub-compatible `/vault/<name>/mcp` path form. */
+  /** The issuer's own origin set — for the hub-compatible `/vault/<name>/mcp` path form (single origin serves both issuer and vaults, e.g. the hub). */
   boundOrigins: readonly string[];
   /** Cloud vault base domain — for the subdomain form `<name>.<base>`. */
   vaultBaseDomain?: string;
+  /**
+   * The cloud vault worker's own origin (`VAULT_ORIGIN`) — a SEPARATE origin
+   * from `boundOrigins` in cloud's two-worker topology (identity + vault),
+   * where it still recognizes the path form `/vault/<name>/mcp`. This is
+   * deliberately its own field rather than folded into `boundOrigins`:
+   * `boundOrigins` doubles as the CSRF/same-origin accept-set for
+   * cookie-authenticated POSTs, and the vault origin must never gain that
+   * (it never serves a cookie-authed form) — see `resolveBoundOrigins` in
+   * oauth-shared.ts.
+   */
+  vaultOrigin?: string;
 }
 
 /**
@@ -87,8 +98,11 @@ export interface ResolveResourceOpts {
  *   1. Cloud subdomain addressing — host `<name>.<vaultBaseDomain>` (any path).
  *      This is how a cloud vault at `https://<name>.u.parachute.computer/…`
  *      names itself; the vault name is the leftmost label.
- *   2. Hub-compatible path addressing — an origin in `boundOrigins` with path
- *      `/vault/<name>/mcp` or the per-vault PRM path.
+ *   2. Path addressing — an origin in `boundOrigins` OR `vaultOrigin` with
+ *      path `/vault/<name>/mcp` or the per-vault PRM path. `boundOrigins`
+ *      covers the hub (one origin serves both issuer and vaults); `vaultOrigin`
+ *      covers the cloud vault worker's own host, which the vault's PRM
+ *      advertises as its `resource` — see the module comment.
  *
  * A resource off both shapes (foreign origin, malformed, non-vault path) → null,
  * and the flow degrades to the unbound (manual-pick / `vault=` hint) path.
@@ -114,8 +128,16 @@ export function resolveResourceVault(
       if (label && !label.includes(".") && VAULT_NAME_RE.test(label)) return label;
     }
   }
-  // 2. Hub-compatible path form on a bound origin.
-  if (opts.boundOrigins.includes(parsed.origin)) {
+  // 2. Path form on a bound origin or the vault worker's own origin.
+  let vaultOriginNormalized: string | null = null;
+  if (opts.vaultOrigin) {
+    try {
+      vaultOriginNormalized = new URL(opts.vaultOrigin).origin;
+    } catch {
+      // Malformed config — ignore, boundOrigins still applies.
+    }
+  }
+  if (opts.boundOrigins.includes(parsed.origin) || parsed.origin === vaultOriginNormalized) {
     const mcp = VAULT_MCP_PATH_RE.exec(parsed.pathname);
     if (mcp?.[1]) return decodeVaultName(mcp[1]);
     const prm = VAULT_PRM_PATH_RE.exec(parsed.pathname);
