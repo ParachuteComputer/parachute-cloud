@@ -81,23 +81,28 @@ jobs:
           git clone --depth 1 https://github.com/ParachuteComputer/parachute-vault.git "$GITHUB_WORKSPACE/../parachute-vault"
           echo "parachute-vault @ $(git -C "$GITHUB_WORKSPACE/../parachute-vault" rev-parse HEAD)"
 
-      - name: Clone parachute-surface (the notes-ui SPA the identity worker serves)
-        # P1.1: scripts/build-spa.sh builds @openparachute/notes-ui from this
-        # sibling checkout at VITE_BASE_PATH=/ into workers/identity/dist-assets.
-        # Tracks parachute-surface@main (like the vault clone) — surface bumps
-        # notes-ui per PR with no per-version tag, so the deploy step below sets
-        # SPA_ALLOW_VERSION_DRIFT=1: build main's current notes-ui and ANNOUNCE
-        # the version rather than hard-failing the pin. Cloned to the default
-        # SURFACE_REPO path ($ROOT/../parachute-surface).
+      - name: Fetch pinned Parachute App (SPA served by the identity worker)
+        # scripts/spa-source.env is the single source pin. Fetching the exact
+        # commit makes a Cloud release reproduce the same browser artifact even
+        # after parachute-app/main advances.
         if: steps.gate.outputs.ready == 'true'
         run: |
-          git clone --depth 1 https://github.com/ParachuteComputer/parachute-surface.git "$GITHUB_WORKSPACE/../parachute-surface"
-          echo "parachute-surface @ $(git -C "$GITHUB_WORKSPACE/../parachute-surface" rev-parse HEAD)"
+          source scripts/spa-source.env
+          APP_REPO="$GITHUB_WORKSPACE/../parachute-app"
+          git init "$APP_REPO"
+          git -C "$APP_REPO" remote add origin https://github.com/ParachuteComputer/parachute-app.git
+          git -C "$APP_REPO" fetch --depth 1 origin "$SPA_APP_REF"
+          git -C "$APP_REPO" checkout --detach FETCH_HEAD
+          echo "parachute-app v$SPA_APP_VERSION @ $(git -C "$APP_REPO" rev-parse HEAD)"
 
       - uses: oven-sh/setup-bun@v2
         if: steps.gate.outputs.ready == 'true'
         with:
           bun-version: 1.3.13 # keep consistent with local dev
+
+      - name: Materialize pinned Hub door-contract dependency
+        if: steps.gate.outputs.ready == 'true'
+        run: bash scripts/materialize-door-contract.sh
 
       - name: Cache bun download cache
         if: steps.gate.outputs.ready == 'true'
@@ -119,10 +124,6 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Build the SPA from parachute-surface@main and announce its notes-ui
-          # version rather than hard-failing the pin (surface has no per-version
-          # tag; the deploy tracks main, like the vault file dep). See build-spa.sh.
-          SPA_ALLOW_VERSION_DRIFT: "1"
         run: bash scripts/deploy-staging.sh
 
       - name: Live smoke (full, staging-only — creates throwaway debris)

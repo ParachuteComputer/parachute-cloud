@@ -28,19 +28,21 @@ IDENTITY_STAGING="https://parachute-identity-staging.openparachute.workers.dev"
 VAULT_STAGING="https://parachute-vault-do-staging.openparachute.workers.dev"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Verify and rebuild the exact shared Hub contract before the workspace install
+# snapshots the file: dependency into node_modules.
+bash "$ROOT/scripts/materialize-door-contract.sh"
 # Refresh the copied file: dep FIRST — bun snapshots @openparachute/core into
 # node_modules at install time, so a vault-core change upstream is INVISIBLE to
 # builds until re-installed (bit us 2026-07-02: stale txn.ts tested green,
 # deployed stale). One bun install makes every deploy build against current core.
 (cd "$ROOT" && bun install)
 
-# --- SPA bundle (P1.1) — build the notes-ui app the identity worker serves via
+# --- SPA bundle — build the Parachute App the identity worker serves via
 # Workers Static Assets INTO workers/identity/dist-assets BEFORE its deploy (the
-# [assets].directory must exist at `wrangler deploy` time). Built from the sibling
-# parachute-surface checkout at VITE_BASE_PATH=/ (origin-root shape). Fail-fast
-# here — before any worker is deployed — if the SPA build can't be produced.
-# In CI the deploy-staging workflow must have a parachute-surface checkout too
-# (SURFACE_REPO), the same way it clones parachute-vault for @openparachute/core.
+# [assets].directory must exist at `wrangler deploy` time). The workflow fetches
+# the exact parachute-app commit in scripts/spa-source.env as a sibling checkout;
+# build-spa.sh verifies its version and builds the origin-root shape. Fail before
+# either worker deploys if the browser artifact cannot be reproduced.
 bash "$ROOT/scripts/build-spa.sh"
 
 # --- one-time provisioning (already done 2026-07-02; kept for a fresh account) --

@@ -9,10 +9,14 @@
 #     checkout BEFORE `bun install`. The root install covers the whole
 #     workspace (workers/*), which is why even the identity/control-plane jobs
 #     need the sibling present.
+#   - workers/identity depends on @openparachute/door-contract via
+#     `file:../../../parachute-hub/packages/door-contract`. Every job uses
+#     scripts/materialize-door-contract.sh before install to fetch or verify the
+#     exact Hub commit in scripts/door-contract-source.env and rebuild dist.
 #   - bun.lock is COMMITTED (cloud#44, 2026-07-09) — registry deps install
 #     pinned from the lockfile (the vitest-3.2.7 drift broke main), so the
-#     download cache is keyed on bun.lock. Only the file: sibling dep floats
-#     (deliberately, see #45); no --frozen-lockfile for the same reason.
+#     download cache is keyed on bun.lock. The Vault file dependency still
+#     follows main deliberately (see #45); the Hub file dependency is pinned.
 #   - Root `bun run typecheck` IS run now (control-plane job): cloud#23 (stripe
 #     caret drift) is closed — `stripe` is pinned EXACT ("22.1.0") and the
 #     committed lockfile pins the rest, so an install can no longer resolve
@@ -48,18 +52,8 @@ jobs:
         with:
           bun-version: 1.3.13 # keep consistent with local dev
 
-      - name: Clone parachute-hub + build door-contract (sibling file dep, Phase B)
-        # workers/identity depends on @openparachute/door-contract via
-        # file:../../../parachute-hub/packages/door-contract (cloud+hub shared-core
-        # merge, parachute-cloud#116). Clone the hub sibling like parachute-vault,
-        # then build the package's dist (it points main→dist; the root install
-        # below copies the file: dep into node_modules, so dist must exist first).
-        # bunx fetches a pinned tsc — the package has no deps of its own. Every
-        # job needs it because the workspace-wide install resolves the file: dep.
-        run: |
-          git clone --depth 1 https://github.com/ParachuteComputer/parachute-hub.git "$GITHUB_WORKSPACE/../parachute-hub"
-          (cd "$GITHUB_WORKSPACE/../parachute-hub/packages/door-contract" && bunx --package=typescript@5.6.3 tsc)
-          echo "door-contract dist @ $(ls "$GITHUB_WORKSPACE/../parachute-hub/packages/door-contract/dist" | tr '\n' ' ')"
+      - name: Materialize pinned Hub door-contract dependency
+        run: bash scripts/materialize-door-contract.sh
 
       - name: Cache bun download cache
         uses: actions/cache@v5
@@ -96,18 +90,8 @@ jobs:
         with:
           bun-version: 1.3.13 # keep consistent with local dev
 
-      - name: Clone parachute-hub + build door-contract (sibling file dep, Phase B)
-        # workers/identity depends on @openparachute/door-contract via
-        # file:../../../parachute-hub/packages/door-contract (cloud+hub shared-core
-        # merge, parachute-cloud#116). Clone the hub sibling like parachute-vault,
-        # then build the package's dist (it points main→dist; the root install
-        # below copies the file: dep into node_modules, so dist must exist first).
-        # bunx fetches a pinned tsc — the package has no deps of its own. Every
-        # job needs it because the workspace-wide install resolves the file: dep.
-        run: |
-          git clone --depth 1 https://github.com/ParachuteComputer/parachute-hub.git "$GITHUB_WORKSPACE/../parachute-hub"
-          (cd "$GITHUB_WORKSPACE/../parachute-hub/packages/door-contract" && bunx --package=typescript@5.6.3 tsc)
-          echo "door-contract dist @ $(ls "$GITHUB_WORKSPACE/../parachute-hub/packages/door-contract/dist" | tr '\n' ' ')"
+      - name: Materialize pinned Hub door-contract dependency
+        run: bash scripts/materialize-door-contract.sh
 
       - name: Cache bun download cache
         uses: actions/cache@v5
@@ -146,18 +130,8 @@ jobs:
         with:
           bun-version: 1.3.13 # keep consistent with local dev
 
-      - name: Clone parachute-hub + build door-contract (sibling file dep, Phase B)
-        # workers/identity depends on @openparachute/door-contract via
-        # file:../../../parachute-hub/packages/door-contract (cloud+hub shared-core
-        # merge, parachute-cloud#116). Clone the hub sibling like parachute-vault,
-        # then build the package's dist (it points main→dist; the root install
-        # below copies the file: dep into node_modules, so dist must exist first).
-        # bunx fetches a pinned tsc — the package has no deps of its own. Every
-        # job needs it because the workspace-wide install resolves the file: dep.
-        run: |
-          git clone --depth 1 https://github.com/ParachuteComputer/parachute-hub.git "$GITHUB_WORKSPACE/../parachute-hub"
-          (cd "$GITHUB_WORKSPACE/../parachute-hub/packages/door-contract" && bunx --package=typescript@5.6.3 tsc)
-          echo "door-contract dist @ $(ls "$GITHUB_WORKSPACE/../parachute-hub/packages/door-contract/dist" | tr '\n' ' ')"
+      - name: Materialize pinned Hub door-contract dependency
+        run: bash scripts/materialize-door-contract.sh
 
       - name: Cache bun download cache
         uses: actions/cache@v5
