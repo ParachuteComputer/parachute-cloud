@@ -3,11 +3,13 @@
 # (scripts/smoke-staging.ts — creates throwaway accounts/vaults, which is what
 # staging is for).
 #
-# SECRET GATE: this workflow needs three repo secrets that may not exist yet
-# (Aaron's ledger). When any is missing it warns loudly and SKIPS the deploy,
-# exiting green — merges to main must not be red-gated on a pending ops step.
+# SECRET GATE: this workflow needs three secrets. When any is missing it warns
+# loudly and SKIPS the deploy, exiting green — merges to main must not be
+# red-gated on a pending ops step.
 #
-#   CLOUDFLARE_API_TOKEN   API token in the new Parachute CF account (d5d7c864…):
+#   CLOUDFLARE_API_TOKEN   ENVIRONMENT secret (`staging`/`production` — the
+#                          prod environment adds a required-reviewer approval
+#                          gate). API token in the Parachute CF account (d5d7c864…):
 #                          Account → Workers Scripts: Edit; Account → D1: Edit;
 #                          Account → Workers R2 Storage: Edit;
 #                          Zone (parachute.computer) → Workers Routes: Edit.
@@ -41,6 +43,9 @@ jobs:
   deploy:
     name: deploy + smoke (staging)
     runs-on: ubuntu-latest
+    # Deploy credentials live in the `staging` GitHub Environment (no approval
+    # gate) — job-level `environment:` is what grants access to its secrets.
+    environment: staging
     timeout-minutes: 25
     steps:
       - name: Check deploy secrets
@@ -68,7 +73,7 @@ jobs:
             echo "ready=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         if: steps.gate.outputs.ready == 'true'
 
       - name: Clone parachute-vault (sibling file dep for @openparachute/core)
@@ -95,7 +100,7 @@ jobs:
           git -C "$APP_REPO" checkout --detach FETCH_HEAD
           echo "parachute-app v$SPA_APP_VERSION @ $(git -C "$APP_REPO" rev-parse HEAD)"
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         if: steps.gate.outputs.ready == 'true'
         with:
           bun-version: 1.3.13 # keep consistent with local dev
@@ -106,7 +111,7 @@ jobs:
 
       - name: Cache bun download cache
         if: steps.gate.outputs.ready == 'true'
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('package.json', 'workers/*/package.json') }}
