@@ -102,14 +102,16 @@ new_sqlite_classes = ["RateLimiterDO"]
 
 # =============================================================================
 # WORKERS STATIC ASSETS (P1.1, parachute-cloud#116) — serve the Parachute app
-# (the notes-ui SPA) FROM this worker, with run_worker_first pinning the server
-# ceremonies so the SPA catch-all can never shadow them. This adds the SERVING
-# capability only; the app.parachute.computer Custom Domain (P1.2) + the ISSUER
-# flip (Phase 4) are separate. On staging (workers.dev) it's provable today.
+# (the parachute-app SPA) FROM this worker, with run_worker_first pinning the
+# server ceremonies so the SPA catch-all can never shadow them. This adds the
+# SERVING capability only; the app.parachute.computer Custom Domain (P1.2) +
+# the ISSUER flip (Phase 4) are separate. On staging (workers.dev) it's
+# provable today.
 #
-#   directory          — the notes-ui dist, produced by scripts/build-spa.sh (a
-#                        VITE_BASE_PATH=/ origin-root build of the pinned
-#                        @openparachute/notes-ui — see that script for why the
+#   directory          — the parachute-app dist, produced by scripts/build-spa.sh
+#                        (a VITE_BASE_PATH=/ origin-root build of the pinned
+#                        @openparachute/parachute-app, at the exact commit named
+#                        in scripts/spa-source.env — see that script for why the
 #                        npm-published dist is the WRONG shape) into ./dist-assets
 #                        BEFORE `wrangler deploy`. Gitignored (generated); both
 #                        deploy scripts build it first. Relative to this file.

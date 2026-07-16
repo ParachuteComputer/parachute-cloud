@@ -3,12 +3,13 @@
  * gen-spa-headers.ts — emit `dist-assets/_headers` with the SPA
  * Content-Security-Policy (P1.1.5, parachute-cloud#116).
  *
- * Run by scripts/build-spa.sh AFTER the notes-ui build has been copied into
- * dist-assets, so the inline-script hash is derived from the ACTUAL built
- * `index.html` — never a hardcoded hash that could drift from what's served
- * (the deploy tracks surface@main, so the built shell can move under us). The
- * policy directives live in workers/identity/src/spa-csp.ts, shared verbatim
- * with the worker's `/` Host-branch (serveSpaShell).
+ * Run by scripts/build-spa.sh AFTER the parachute-app build has been copied
+ * into dist-assets, so the inline-script hash is derived from the ACTUAL
+ * built `index.html` — never a hardcoded hash that could drift from what's
+ * served (the deploy tracks the pinned commit in scripts/spa-source.env, so
+ * the built shell still moves under us on every pin bump). The policy
+ * directives live in workers/identity/src/spa-csp.ts, shared verbatim with
+ * the worker's `/` Host-branch (serveSpaShell).
  *
  * Usage: `bun scripts/gen-spa-headers.ts [dist-assets-dir]`
  * (defaults to workers/identity/dist-assets).
