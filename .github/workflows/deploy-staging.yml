@@ -60,13 +60,13 @@ jobs:
           if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then missing="$missing CLOUDFLARE_ACCOUNT_ID"; fi
           if [ -z "$DEV_SECRETS" ]; then missing="$missing DEV_SECRETS"; fi
           if [ -n "$missing" ]; then
-            echo "::notice title=Staging deploy skipped::Missing repo secret(s):$missing. Deploy + smoke skipped (green by design). See the header of .github/workflows/deploy-staging.yml for what to set."
+            echo "::notice title=Staging deploy skipped::Missing deploy secret(s):$missing. Deploy + smoke skipped (green by design). See the header of .github/workflows/deploy-staging.yml for what to set."
             {
               echo "## Staging deploy skipped"
               echo ""
-              echo "Missing repo secret(s): \`$missing\`"
+              echo "Missing deploy secret(s): \`$missing\`"
               echo ""
-              echo "Set them under Settings → Secrets and variables → Actions, then re-run via workflow_dispatch. Token permissions and the DEV_SECRETS format are documented in the workflow file header."
+              echo "Set CLOUDFLARE_API_TOKEN under Settings → Environments (production/staging) and the rest under Settings → Secrets and variables → Actions, then re-run via workflow_dispatch. Token permissions and the DEV_SECRETS format are documented in the workflow file header."
             } >> "$GITHUB_STEP_SUMMARY"
             echo "ready=false" >> "$GITHUB_OUTPUT"
           else
