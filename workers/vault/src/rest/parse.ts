@@ -21,6 +21,7 @@ import {
   type ExpandContext,
   type ExpandMode,
 } from "@openparachute/core/src/expand.js";
+import type { QueryWarning } from "@openparachute/core/src/query-warnings.js";
 import { type TagScopeCtx, NO_TAG_SCOPE, buildExpandVisibility } from "./tag-scope.js";
 
 export { type TagScopeCtx, NO_TAG_SCOPE } from "./tag-scope.js";
@@ -42,10 +43,30 @@ export function json(data: unknown, status = 200): Response {
 }
 
 /**
+ * `json(...)` plus the `X-Parachute-Warnings` response header (ported from
+ * routes.ts:jsonWithWarnings, vault#550/contracts-brief C1.3) —
+ * `encodeURIComponent(JSON.stringify(warnings))`, set only when `warnings` is
+ * non-empty. Percent-encoded for the same reason bun's does: HTTP header
+ * VALUES are Latin1/ASCII-only, while a warning `message` may not be 7-bit
+ * clean. Decode with `decodeURIComponent` then `JSON.parse`. Callers that want
+ * warnings INLINE in an envelope body should also spread them in before
+ * calling this (mirrors the bun cursor-envelope call sites).
+ */
+export function jsonWithWarnings(data: unknown, warnings: QueryWarning[], status = 200): Response {
+  const res = json(data, status);
+  if (warnings.length > 0) {
+    res.headers.set("X-Parachute-Warnings", encodeURIComponent(JSON.stringify(warnings)));
+  }
+  return res;
+}
+
+/**
  * Cursor-mode response. Keeps the bun body shape (`{ notes, next_cursor }` — so
  * REST clients work unchanged) AND mirrors the watermark into an `X-Next-Cursor`
  * header (design §5 discriminator list). The header is present only when the
- * watermark is non-null.
+ * watermark is non-null. `X-Next-Cursor` is a CLOUD-ONLY additive convenience —
+ * bun never emits it (the body's `next_cursor` is the cross-door contract,
+ * contracts-brief item 3/C1.3) — kept for existing header-reading clients.
  */
 export function cursorJson(notes: unknown[], nextCursor: string | null): Response {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -100,7 +121,13 @@ export function parseContentRangeQuery(
     return { range };
   } catch (e: any) {
     if (e && e.name === "QueryError") {
-      return { range: null, error: json({ error: e.message, code: e.code ?? "INVALID_QUERY" }, 400) };
+      return {
+        range: null,
+        error: json(
+          { error: e.message, code: e.code ?? "INVALID_QUERY", error_type: e.error_type ?? "invalid_query" },
+          400,
+        ),
+      };
     }
     throw e;
   }
@@ -332,6 +359,10 @@ export function parseExpandParam(url: URL): { expand?: TagExpandMode; error?: Re
         {
           error: `invalid \`expand\` value "${expandParam}" — must be one of ${TAG_EXPAND_MODES.map((m) => `"${m}"`).join(", ")}. Omit for the default ("subtypes": parent_names descendants).`,
           code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "expand",
+          got: expandParam,
+          hint: `pass one of ${TAG_EXPAND_MODES.map((m) => `"${m}"`).join(", ")}, or omit for the default`,
         },
         400,
       ),

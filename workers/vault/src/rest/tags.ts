@@ -39,7 +39,7 @@ export async function handleTags(
     const singleTag = parseQuery(url, "tag");
     if (singleTag) {
       if (tagScope.allowed && !tagScope.allowed.has(singleTag)) {
-        return json({ error: "Tag not found", tag: singleTag }, 404);
+        return json({ error: "Tag not found", error_type: "tag_not_found", tag: singleTag }, 404);
       }
       const allTags = await store.listTags();
       const found = allTags.find((t) => t.name === singleTag);
@@ -78,16 +78,16 @@ export async function handleTags(
 
   // POST /tags/merge
   if (subpath === "/merge") {
-    if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    if (req.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
     const body = (await req.json().catch(() => null)) as { sources?: unknown; target?: unknown } | null;
-    if (!body) return json({ error: "Invalid JSON body" }, 400);
+    if (!body) return json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400);
     const sources = body.sources;
     const target = body.target;
     if (!Array.isArray(sources) || !sources.every((s) => typeof s === "string" && s.length > 0)) {
-      return json({ error: "sources must be a non-empty array of strings" }, 400);
+      return json({ error: "sources must be a non-empty array of strings", error_type: "invalid_request", field: "sources" }, 400);
     }
     if (typeof target !== "string" || target.length === 0) {
-      return json({ error: "target must be a non-empty string" }, 400);
+      return json({ error: "target must be a non-empty string", error_type: "invalid_request", field: "target" }, 400);
     }
     if (tagScope.allowed) {
       for (const t of [...sources, target]) {
@@ -118,27 +118,29 @@ export async function handleTags(
   // POST /tags/:name/rename
   const renameMatch = subpath.match(/^\/([^/]+)\/rename$/);
   if (renameMatch) {
-    if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    if (req.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
     const oldName = decodeURIComponent(renameMatch[1]!);
     const body = (await req.json().catch(() => null)) as { new_name?: unknown } | null;
-    if (!body) return json({ error: "Invalid JSON body" }, 400);
+    if (!body) return json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400);
     const newName = body.new_name;
     if (typeof newName !== "string" || newName.length === 0) {
-      return json({ error: "new_name must be a non-empty string" }, 400);
+      return json({ error: "new_name must be a non-empty string", error_type: "invalid_request", field: "new_name" }, 400);
     }
     if (tagScope.allowed && (!tagScope.allowed.has(oldName) || !tagScope.allowed.has(newName))) {
       return tagScopeForbidden(tagScope.raw ?? []);
     }
     const result = await store.renameTag(oldName, newName);
     if ("error" in result) {
-      if (result.error === "not_found") return json({ error: "not_found", tag: oldName }, 404);
+      if (result.error === "not_found") return json({ error: "not_found", error_type: "tag_not_found", tag: oldName }, 404);
       if (result.error === "target_exists") {
         return json(
           {
             error: "target_exists",
+            error_type: "target_exists",
             target: newName,
             conflicting: result.conflicting,
             message: "Target tag (or one of its sub-tags) already exists; use POST /api/tags/merge to combine them.",
+            hint: "use POST /api/tags/merge to combine the tags instead",
           },
           409,
         );
@@ -150,11 +152,13 @@ export async function handleTags(
   // POST /tags/:name/conformance
   const conformanceMatch = subpath.match(/^\/([^/]+)\/conformance$/);
   if (conformanceMatch) {
-    if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    if (req.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
     const cTag = decodeURIComponent(conformanceMatch[1]!);
-    if (tagScope.allowed && !tagScope.allowed.has(cTag)) return json({ error: "Tag not found", tag: cTag }, 404);
+    if (tagScope.allowed && !tagScope.allowed.has(cTag)) {
+      return json({ error: "Tag not found", error_type: "tag_not_found", tag: cTag }, 404);
+    }
     const body = (await req.json().catch(() => null)) as { fields?: Record<string, unknown> | null } | null;
-    if (!body) return json({ error: "Invalid JSON body" }, 400);
+    if (!body) return json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400);
     const proposed: Record<string, tagSchemaOps.TagFieldSchema> = {};
     if (body.fields && typeof body.fields === "object" && !Array.isArray(body.fields)) {
       for (const [k, v] of Object.entries(body.fields)) {
@@ -168,9 +172,11 @@ export async function handleTags(
   // GET /tags/:name/effective
   const effectiveMatch = subpath.match(/^\/([^/]+)\/effective$/);
   if (effectiveMatch) {
-    if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
+    if (req.method !== "GET") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
     const eTag = decodeURIComponent(effectiveMatch[1]!);
-    if (tagScope.allowed && !tagScope.allowed.has(eTag)) return json({ error: "Tag not found", tag: eTag }, 404);
+    if (tagScope.allowed && !tagScope.allowed.has(eTag)) {
+      return json({ error: "Tag not found", error_type: "tag_not_found", tag: eTag }, 404);
+    }
     const projection = buildVaultProjection(store.db);
     const record = await store.getTagRecord(eTag);
     const resolved = loadSchemaConfig(store.db);
@@ -186,12 +192,14 @@ export async function handleTags(
   }
 
   const nameMatch = subpath.match(/^\/([^/]+)$/);
-  if (!nameMatch) return json({ error: "Not found" }, 404);
+  if (!nameMatch) return json({ error: "Not found", error_type: "not_found" }, 404);
   const tagName = decodeURIComponent(nameMatch[1]!);
 
   // GET /tags/:name
   if (req.method === "GET") {
-    if (tagScope.allowed && !tagScope.allowed.has(tagName)) return json({ error: "Tag not found", tag: tagName }, 404);
+    if (tagScope.allowed && !tagScope.allowed.has(tagName)) {
+      return json({ error: "Tag not found", error_type: "tag_not_found", tag: tagName }, 404);
+    }
     const allTags = await store.listTags();
     const found = allTags.find((t) => t.name === tagName);
     const record = await store.getTagRecord(tagName);
@@ -236,7 +244,15 @@ export async function handleTags(
       parentNamesPatch = null;
     } else if (body.parent_names !== undefined) {
       if (!Array.isArray(body.parent_names)) {
-        return json({ error: "parent_names must be an array of tag names" }, 400);
+        return json(
+          {
+            error: "parent_names must be an array of tag names",
+            error_type: "invalid_parent_names",
+            field: "parent_names",
+            hint: "pass an array of tag name strings, or null to clear",
+          },
+          400,
+        );
       }
       const cleaned = (body.parent_names as unknown[]).filter((p): p is string => typeof p === "string" && p.length > 0);
       parentNamesPatch = cleaned.length > 0 ? cleaned : null;
@@ -295,7 +311,7 @@ export async function handleTags(
     return json(await store.deleteTag(tagName));
   }
 
-  return json({ error: "Method not allowed" }, 405);
+  return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
 }
 
 export async function handleFindPath(
@@ -303,21 +319,30 @@ export async function handleFindPath(
   store: Store,
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): Promise<Response> {
-  if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
+  if (req.method !== "GET") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
 
   const url = new URL(req.url);
   const source = parseQuery(url, "source");
   const target = parseQuery(url, "target");
-  if (!source || !target) return json({ error: "source and target parameters are required" }, 400);
+  if (!source || !target) {
+    return json(
+      { error: "source and target parameters are required", error_type: "invalid_request", hint: "pass both ?source= and ?target=" },
+      400,
+    );
+  }
 
   const db = store.db;
   try {
     const sourceNote = await resolveNote(store, source);
-    if (!sourceNote) return json({ error: `Note not found: "${source}"` }, 404);
-    if (!noteWithinTagScope(sourceNote, tagScope.allowed, tagScope.raw)) return json({ error: `Note not found: "${source}"` }, 404);
+    if (!sourceNote) return json({ error: `Note not found: "${source}"`, error_type: "not_found", note_id: source }, 404);
+    if (!noteWithinTagScope(sourceNote, tagScope.allowed, tagScope.raw)) {
+      return json({ error: `Note not found: "${source}"`, error_type: "not_found", note_id: source }, 404);
+    }
     const targetNote = await resolveNote(store, target);
-    if (!targetNote) return json({ error: `Note not found: "${target}"` }, 404);
-    if (!noteWithinTagScope(targetNote, tagScope.allowed, tagScope.raw)) return json({ error: `Note not found: "${target}"` }, 404);
+    if (!targetNote) return json({ error: `Note not found: "${target}"`, error_type: "not_found", note_id: target }, 404);
+    if (!noteWithinTagScope(targetNote, tagScope.allowed, tagScope.raw)) {
+      return json({ error: `Note not found: "${target}"`, error_type: "not_found", note_id: target }, 404);
+    }
     const maxDepth = Math.min(parseInt10(parseQuery(url, "max_depth")) ?? 5, 10);
 
     const result = linkOps.findPath(db, sourceNote.id, targetNote.id, { max_depth: maxDepth });
@@ -329,7 +354,7 @@ export async function handleFindPath(
     }
     return json(result);
   } catch (e: any) {
-    if (e instanceof NotFoundError) return json({ error: e.message }, 404);
+    if (e instanceof NotFoundError) return json({ error: e.message, error_type: "not_found" }, 404);
     const ambig = ambiguousPathResponse(e);
     if (ambig) return ambig;
     throw e;
