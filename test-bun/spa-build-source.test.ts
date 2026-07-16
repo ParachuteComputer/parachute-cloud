@@ -31,6 +31,23 @@ function runDoorContractHelper(sourceFile?: string) {
   });
 }
 
+function makePinnedHubClone(prefix: string): string {
+  const temp = mkdtempSync(resolve(tmpdir(), prefix));
+  tempDirs.push(temp);
+  const hub = resolve(temp, "hub");
+  const clone = Bun.spawnSync(["git", "clone", "--shared", "--no-checkout", hubRepo, hub], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(clone.exitCode, clone.stderr.toString()).toBe(0);
+  const checkout = Bun.spawnSync(["git", "-C", hub, "checkout", "--detach", doorContractRef], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(checkout.exitCode, checkout.stderr.toString()).toBe(0);
+  return hub;
+}
+
 describe("served SPA source", () => {
   test("builds the pinned Parachute App at the origin root", () => {
     const sourcePin = read("scripts/spa-source.env");
@@ -85,10 +102,16 @@ describe("served SPA source", () => {
     expect(script).toContain('rm -rf "$PACKAGE_DIR/dist"');
     expect(script).toContain("bunx --package=typescript@5.6.3 tsc");
 
-    const result = runDoorContractHelper();
+    const pinnedHub = makePinnedHubClone("parachute-cloud-pinned-hub-");
+    const result = Bun.spawnSync(["bash", doorContractHelper], {
+      cwd: root,
+      env: { ...process.env, PARACHUTE_HUB_REPO: pinnedHub },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     expect(result.exitCode, result.stderr.toString()).toBe(0);
     expect(result.stdout.toString()).toContain("door-contract v0.4.0");
-    expect(existsSync(resolve(hubRepo, "packages/door-contract/dist/index.js"))).toBe(true);
+    expect(existsSync(resolve(pinnedHub, "packages/door-contract/dist/index.js"))).toBe(true);
   });
 
   test("rejects a Hub checkout that does not match the configured source pin", () => {
@@ -106,19 +129,7 @@ describe("served SPA source", () => {
   });
 
   test("rejects a dirty inherited Hub tsconfig build input", () => {
-    const temp = mkdtempSync(resolve(tmpdir(), "parachute-cloud-dirty-hub-"));
-    tempDirs.push(temp);
-    const hub = resolve(temp, "hub");
-    const clone = Bun.spawnSync(["git", "clone", "--shared", "--no-checkout", hubRepo, hub], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    expect(clone.exitCode, clone.stderr.toString()).toBe(0);
-    const checkout = Bun.spawnSync(["git", "-C", hub, "checkout", "--detach", doorContractRef], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    expect(checkout.exitCode, checkout.stderr.toString()).toBe(0);
+    const hub = makePinnedHubClone("parachute-cloud-dirty-hub-");
     appendFileSync(resolve(hub, "tsconfig.json"), "\n// dirty inherited build input\n");
 
     const result = Bun.spawnSync(["bash", doorContractHelper], {
@@ -151,6 +162,15 @@ describe("served SPA source", () => {
       expect(deploy).toBeGreaterThan(helper);
     });
   }
+
+  test("ordinary CI fetches the pinned App for the executable source-boundary regression", () => {
+    const source = read(".github/workflows/ci.yml");
+    const controlPlane = source.slice(source.indexOf("  control-plane:"));
+    expect(controlPlane).toContain("source scripts/spa-source.env");
+    expect(controlPlane).toContain('git -C "$APP_REPO" fetch --depth 1 origin "$SPA_APP_REF"');
+    expect(controlPlane).toContain('test "$(git -C "$APP_REPO" rev-parse HEAD)" = "$SPA_APP_REF"');
+    expect(controlPlane.indexOf("source scripts/spa-source.env")).toBeLessThan(controlPlane.indexOf("run: bun run test"));
+  });
 
   test("ordinary CI uses the same pinned contract helper before every install", () => {
     const source = read(".github/workflows/ci.yml");

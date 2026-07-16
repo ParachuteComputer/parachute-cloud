@@ -13,6 +13,9 @@
 #     `file:../../../parachute-hub/packages/door-contract`. Every job uses
 #     scripts/materialize-door-contract.sh before install to fetch or verify the
 #     exact Hub commit in scripts/door-contract-source.env and rebuild dist.
+#   - The control-plane source-boundary suite executes build-spa.sh's dirty
+#     checkout guard against an isolated clone, so that job also fetches the
+#     exact App commit from scripts/spa-source.env as a sibling checkout.
 #   - bun.lock is COMMITTED (cloud#44, 2026-07-09) — registry deps install
 #     pinned from the lockfile (the vitest-3.2.7 drift broke main), so the
 #     download cache is keyed on bun.lock. The Vault file dependency still
@@ -125,6 +128,16 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/ParachuteComputer/parachute-vault.git "$GITHUB_WORKSPACE/../parachute-vault"
           echo "parachute-vault @ $(git -C "$GITHUB_WORKSPACE/../parachute-vault" rev-parse HEAD)"
+
+      - name: Fetch pinned parachute-app (source-boundary regression fixture)
+        run: |
+          source scripts/spa-source.env
+          APP_REPO="$GITHUB_WORKSPACE/../parachute-app"
+          git init "$APP_REPO"
+          git -C "$APP_REPO" remote add origin https://github.com/ParachuteComputer/parachute-app.git
+          git -C "$APP_REPO" fetch --depth 1 origin "$SPA_APP_REF"
+          git -C "$APP_REPO" checkout --detach FETCH_HEAD
+          test "$(git -C "$APP_REPO" rev-parse HEAD)" = "$SPA_APP_REF"
 
       - uses: oven-sh/setup-bun@v2
         with:
