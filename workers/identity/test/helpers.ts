@@ -232,3 +232,22 @@ export function decodeJwtPayload(token: string): Record<string, unknown> {
   const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
   return JSON.parse(atob(b64)) as Record<string, unknown>;
 }
+
+/**
+ * Extract the cross-origin redirect target from a rendered same-origin bridge
+ * page (ui.ts `renderRedirectBridge` — the `form-action 'self'` fix: a
+ * form-POST response that must end at a cross-origin URL renders this 200
+ * HTML page instead of a direct 30x). Parses the JSON-encoded argument out of
+ * the inline `location.replace(...)` call, which round-trips the exact URL
+ * (including any `<`-escaping) back to a plain string. `null` when the
+ * page isn't a bridge page.
+ */
+export function bridgeTarget(html: string): string | null {
+  const m = html.match(/location\.replace\((.*)\);<\/script>/);
+  if (!m) return null;
+  try {
+    return JSON.parse(m[1]!) as string;
+  } catch {
+    return null;
+  }
+}

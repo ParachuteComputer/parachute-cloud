@@ -22,11 +22,12 @@ import { isTotpEnrolled } from "./two-factor.ts";
 import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
 import { clearLoginFailures, clientIp, isLoginLocked, loginKey, recordLoginFailure } from "./rate-limit.ts";
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { type AuthorizeParams, describeScopes, renderConsent, renderError, renderLogin } from "./ui.ts";
+import { type AuthorizeParams, describeScopes, renderConsent, renderError, renderLogin, renderRedirectBridge } from "./ui.ts";
 import {
   type OAuthDeps,
   findNonRequestableScopes,
   htmlResponse,
+  isCrossOrigin,
   isSameOriginRequest,
   oauthErrorRedirect,
   redirectResponse,
@@ -247,12 +248,45 @@ export async function handleAuthorizeGet(db: D1Database, req: Request, deps: OAu
   return authorizeCore(db, req, parsed, deps);
 }
 
+/**
+ * Chrome enforces `form-action 'self'` against a form POST's ULTIMATE
+ * redirect destination, not just the form's action (oauth-shared.ts —
+ * {@link isCrossOrigin}, ui.ts `renderRedirectBridge`). Every response this
+ * endpoint can produce for a POST funnels through here: the consent
+ * approve/deny/error redirects (all target the CLIENT's redirect_uri —
+ * cross-origin by definition) and, via `handleLoginSubmit`'s downstream
+ * `authorizeCore` call, the rarer skip-consent-on-login case (a prior grant
+ * already covers this client, so login lands straight on the code redirect
+ * instead of the consent page). A same-origin response (the rendered login/
+ * consent HTML, or `/login/2fa`) passes through unchanged — only a 30x whose
+ * Location is cross-origin gets bridged. The GET path (`handleAuthorizeGet`)
+ * never routes through here and keeps its direct redirects (proven safe —
+ * GET-triggered navigations are unconstrained by `form-action`).
+ */
+function bridgeIfCrossOrigin(res: Response, issuer: string): Response {
+  if (res.status < 300 || res.status >= 400) return res;
+  const location = res.headers.get("location");
+  if (!location || !isCrossOrigin(location, issuer)) return res;
+  // `handleLoginSubmit` can layer a fresh session `set-cookie` onto a response
+  // that turns out to need bridging (the skip-consent-on-login case) —
+  // htmlResponse builds an entirely NEW Response, so that cookie must be
+  // carried over explicitly or the mint is silently dropped.
+  const extra: Record<string, string> = {};
+  const setCookie = res.headers.get("set-cookie");
+  if (setCookie) extra["set-cookie"] = setCookie;
+  return htmlResponse(renderRedirectBridge(new URL(location, issuer).toString()), 200, extra);
+}
+
 export async function handleAuthorizePost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const form = await req.formData();
   const action = String(form.get("__action") ?? "");
-  if (action === "login") return handleLoginSubmit(db, req, form, deps);
-  if (action === "consent") return handleConsentSubmit(db, req, form, deps);
-  return htmlError("Invalid request", "unknown form action", 400);
+  const res =
+    action === "login"
+      ? await handleLoginSubmit(db, req, form, deps)
+      : action === "consent"
+        ? await handleConsentSubmit(db, req, form, deps)
+        : htmlError("Invalid request", "unknown form action", 400);
+  return bridgeIfCrossOrigin(res, deps.issuer);
 }
 
 async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, deps: OAuthDeps): Promise<Response> {

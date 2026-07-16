@@ -94,11 +94,13 @@ import {
   type FirstRunValues,
   renderConsole,
   renderConsoleLogin,
+  renderRedirectBridge,
   renderSignup,
 } from "./ui.ts";
 import {
   type OAuthDeps,
   htmlResponse,
+  isCrossOrigin,
   isSameOriginRequest,
   jsonResponse,
   redirectResponse,
@@ -108,6 +110,20 @@ import {
 
 function csrfExtra(setCookie?: string): Record<string, string> {
   return setCookie ? { "set-cookie": setCookie } : {};
+}
+
+/**
+ * A form-POST redirect that may land on a CROSS-ORIGIN app deep link (the
+ * create-vault no-JS path, a checklist door) — the same `form-action 'self'`
+ * trap the OAuth consent leg and Stripe checkout hit (see oauth-shared.ts's
+ * `contentSecurityPolicy` note): Chrome silently `net::ERR_ABORTED`s a
+ * same-origin form's response when it 30x's cross-origin. Bridges only when
+ * the target actually is cross-origin (`isCrossOrigin`) — the app can be
+ * self-referential in some deploys (staging's `APP_ORIGIN`), in which case a
+ * direct redirect is unaffected and stays one hop.
+ */
+function appDeepLinkRedirect(url: string, deps: OAuthDeps, status = 302): Response {
+  return isCrossOrigin(url, deps.issuer) ? htmlResponse(renderRedirectBridge(url)) : redirectResponse(url, {}, status);
 }
 
 // --- signup ----------------------------------------------------------------
@@ -584,7 +600,7 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
     // plays its brief "ready" beat then navigates via window.location. The
     // console stays reachable for plan/billing management either way.
     const notesUrl = cardFor(vault.name, deps).notesUrl;
-    return wantsJson ? jsonResponse({ redirect: notesUrl }) : redirectResponse(notesUrl, {}, 303);
+    return wantsJson ? jsonResponse({ redirect: notesUrl }) : appDeepLinkRedirect(notesUrl, deps, 303);
   } catch (err) {
     if (err instanceof VaultNameInvalidError) {
       const msg =
@@ -1035,7 +1051,7 @@ export async function handleChecklistPost(db: D1Database, req: Request, deps: OA
   // No vault yet → nothing for a door to open; don't record phantom progress.
   if (vaults.length === 0) return redirectResponse("/console");
   await markChecklistItem(db, user.id, item, deps.now?.() ?? new Date());
-  return redirectResponse(checklistDestination(item, cardFor(vaults[0]!.name, deps)));
+  return appDeepLinkRedirect(checklistDestination(item, cardFor(vaults[0]!.name, deps)), deps);
 }
 
 /**
