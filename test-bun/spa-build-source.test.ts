@@ -63,6 +63,9 @@ describe("served SPA source", () => {
     expect(script).toContain('VITE_BASE_PATH="/" bun run build');
     expect(script).not.toContain("@openparachute/notes-ui");
     expect(script).not.toContain("SURFACE_REPO");
+    // Pages-era artifacts must be stripped post-copy: wrangler hard-rejects the
+    // app's Pages-style _redirects at deploy (code 100324 — cloud#156).
+    expect(script).toContain('rm -f "$DEST/CNAME" "$DEST/_redirects"');
   });
 
   test("rejects an untracked App public asset before building", () => {
