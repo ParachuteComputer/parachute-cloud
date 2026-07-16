@@ -234,3 +234,44 @@ describe("the real router gate (/signup) honors BOUND_ORIGINS", () => {
     expect(await getUserByEmail(env.DB, email)).toBeNull();
   });
 });
+
+/**
+ * The connector-bug fix (RFC 8707 resource binding gained a dedicated
+ * vault-address origin set derived from VAULT_ORIGIN — see audience.ts
+ * `ResolveResourceOpts.vaultOrigin`) is deliberately NOT wired through
+ * BOUND_ORIGINS/resolveBoundOrigins. `u.parachute.computer` never serves a
+ * cookie-authed form POST, so it has no business in the CSRF accept-set —
+ * widening BOUND_ORIGINS to include it would answer the wrong question. These
+ * pin that the fix did NOT take that shortcut.
+ */
+describe("VAULT_ORIGIN stays OUT of the CSRF/same-origin accept-set (the conflation fix)", () => {
+  const VAULT = env.VAULT_ORIGIN!;
+
+  test("the committed prod config's resolveBoundOrigins does not include VAULT_ORIGIN", () => {
+    const deps = depsForEnv(env as never);
+    expect(resolveBoundOrigins(deps)).not.toContain(VAULT);
+  });
+
+  test("isSameOriginRequest refuses a cookie-authed POST whose Origin is the vault worker", () => {
+    const bound = resolveBoundOrigins(depsForEnv(env as never));
+    expect(isSameOriginRequest(originReq(VAULT), bound)).toBe(false);
+  });
+
+  test("the real router gate (/signup) still refuses a vault-origin POST", async () => {
+    const email = "vault-origin-csrf@example.com";
+    await app.fetch(
+      new Request(`${ISSUER}/signup`, {
+        method: "POST",
+        body: new URLSearchParams({ __csrf: CSRF, email, password: "longenough1" }),
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: VAULT,
+          "cf-connecting-ip": "10.50.0.9",
+          cookie: `parachute_id_csrf=${CSRF}`,
+        },
+      }),
+      env,
+    );
+    expect(await getUserByEmail(env.DB, email)).toBeNull();
+  });
+});
