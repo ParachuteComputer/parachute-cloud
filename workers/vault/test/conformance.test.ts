@@ -404,6 +404,29 @@ describe("vault landing + config", () => {
     expect((await bad.json() as any).error).toBe("invalid_audio_retention");
   });
 
+  // C1.2 — bun's handleVault ALWAYS attaches `map` (the front-door structural
+  // orientation: total note count, tags with membership counts, path buckets,
+  // unfiled count). Cloud has no tag-scoped tokens, so the unscoped
+  // getVaultMap() call is always the right one to mirror. Deltas (not
+  // absolute counts) since a fresh vault materializes cloud's welcome/
+  // getting-started seed pack — see console note-seeding.
+  it("GET /api/vault carries `map` — {total_notes, tags, path_buckets, unfiled_notes}", async () => {
+    const v = freshVault();
+    const before = (await (await op(v, "/api/vault")).json()) as any;
+    expect(before.map).toBeTruthy();
+    const baseTotal = before.map.total_notes;
+    const baseUnfiled = before.map.unfiled_notes;
+
+    await createNote(v, { content: "in a folder", path: "folder/note", tags: ["mapped"] });
+    await createNote(v, { content: "unfiled" });
+
+    const apiVault = (await (await op(v, "/api/vault")).json()) as any;
+    expect(apiVault.map.total_notes).toBe(baseTotal + 2);
+    expect(apiVault.map.tags.some((t: any) => t.name === "mapped" && t.count === 1)).toBe(true);
+    expect(apiVault.map.path_buckets.some((b: any) => b.name === "folder" && b.count === 1)).toBe(true);
+    expect(apiVault.map.unfiled_notes).toBe(baseUnfiled + 1);
+  });
+
   // Cross-door capability parity — self-host declares `transcription` on BOTH
   // the landing and /api/vault (routes.ts handleVault); cloud must match so
   // notes-ui's /api/vault probe works without its landing-fallback workaround.
