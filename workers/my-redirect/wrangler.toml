@@ -1,0 +1,7 @@
+name = "parachute-my-redirect"
+main = "index.js"
+compatibility_date = "2026-07-16"
+workers_dev = false
+routes = [
+  { pattern = "my.parachute.computer/*", zone_name = "parachute.computer" },
+]

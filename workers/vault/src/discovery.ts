@@ -86,7 +86,16 @@ function scopesSupportedFor(vaultName: string): string[] {
   return [`vault:${vaultName}:read`, `vault:${vaultName}:write`];
 }
 
-/** RFC 9728 Protected Resource Metadata. */
+/**
+ * RFC 9728 Protected Resource Metadata.
+ *
+ * The `resource` string this builds is congruence-pinned from the identity
+ * worker's side too — see workers/identity/test/console.test.ts's
+ * "congruence — the identity worker resolves the vault worker's own PRM
+ * resource string" describe block (mirrors this exact
+ * `${origin}/vault/<name>/mcp` shape; a drift here is the tripwire, not a
+ * live probe).
+ */
 function protectedResource(req: Request, env: Env, vaultName: string): Response {
   const resource = `${publicOrigin(req)}/vault/${vaultName}/mcp`;
   return jsonDoc({
