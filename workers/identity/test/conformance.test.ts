@@ -18,6 +18,7 @@ import {
 } from "@openparachute/door-contract";
 import app from "../src/index.ts";
 import { CSRF_COOKIE, CSRF_FIELD } from "../src/csrf.ts";
+import { handleLogoutPost } from "../src/console.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "../src/oauth-authorize.ts";
 import { ADVERTISED_SCOPES } from "../src/oauth-metadata.ts";
 import { handleRevoke } from "../src/oauth-revoke.ts";
@@ -34,6 +35,7 @@ import {
   decodeJwtPayload,
   deps,
   familyIdFor,
+  form,
   liveRefreshCount,
   loginReq,
   makePkce,
@@ -47,6 +49,17 @@ import {
   seedVault,
   tokenReq,
 } from "./helpers.ts";
+
+function getSetCookies(res: Response): string[] {
+  return (res.headers as unknown as { getSetCookie(): string[] }).getSetCookie();
+}
+
+/** The "Not you?" form's hidden `next` field, HTML-unescaped back to a real URL. */
+function extractNotYouNext(html: string): string {
+  const m = /<form class="inline" method="post" action="\/logout">[\s\S]*?name="next" value="([^"]*)"/.exec(html);
+  if (!m) throw new Error("no 'Not you?' next field found in consent HTML");
+  return m[1]!.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+}
 
 // --- discovery -------------------------------------------------------------
 
@@ -992,6 +1005,119 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     const html = await res.text();
     expect(html).toContain("issued by");
     expect(html).toContain(new URL(ISSUER).host);
+  });
+
+  // Auth redesign §3, move 1 ("one visible identity") — the consent page
+  // gains "Signed in as {email} · Not you?" so an approval can never again
+  // happen with no visible way to notice it's the wrong account.
+  test("consent page names the signed-in account, with 'Not you?' carrying THIS pending authorize URL (#34 W2)", async () => {
+    const { id: userId } = await seedUser("consent-owner@example.com");
+    await seedVault("default", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const query = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:default:read",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "xyz123",
+    };
+    const res = await handleAuthorizeGet(env.DB, authorizeGetReq(query, sessionId), deps());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-testid="signed-in-as"');
+    expect(html).toContain("Signed in as");
+    expect(html).toContain("consent-owner@example.com");
+    expect(html).toContain("Not you?");
+
+    // The "Not you?" next is THIS exact pending request, reconstructed —
+    // proven by round-tripping every param a resumed authorize would need.
+    const next = new URL(extractNotYouNext(html));
+    expect(next.origin + next.pathname).toBe(`${ISSUER}/oauth/authorize`);
+    expect(next.searchParams.get("client_id")).toBe(clientId);
+    expect(next.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
+    expect(next.searchParams.get("scope")).toBe("vault:default:read");
+    expect(next.searchParams.get("code_challenge")).toBe(challenge);
+    expect(next.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(next.searchParams.get("state")).toBe("xyz123");
+  });
+
+  test("INJECTION SAFETY: a hostile account email is escaped on the consent page", async () => {
+    const { id: userId } = await seedUser("<script>alert(1)</script>@example.com");
+    await seedVault("default", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        },
+        sessionId,
+      ),
+      deps(),
+    );
+    const html = await res.text();
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+  });
+
+  test("'Not you?' round trip: logout-with-next lands on the pending authorize URL, which resumes as a fresh (session-less) login with the SAME params — no new resume machinery needed", async () => {
+    const { id: userId } = await seedUser("switcher@example.com");
+    await seedVault("default", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const query = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:default:read",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "resume-me",
+    };
+    const consentRes = await handleAuthorizeGet(env.DB, authorizeGetReq(query, sessionId), deps());
+    const next = extractNotYouNext(await consentRes.text());
+
+    const logoutRes = await handleLogoutPost(
+      env.DB,
+      new Request(`${ISSUER}/logout`, {
+        method: "POST",
+        body: form({ __csrf: CSRF, next }),
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: ISSUER,
+          cookie: `${SESSION_COOKIE}=${sessionId}; ${CSRF_COOKIE}=${CSRF}`,
+        },
+      }),
+      deps(),
+    );
+    expect(logoutRes.status).toBe(302);
+    expect(logoutRes.headers.get("location")).toBe(next);
+    expect(getSetCookies(logoutRes).some((c) => /parachute_id_session=;.*Max-Age=0/.test(c))).toBe(true);
+
+    // Following the redirect with NO session cookie (freshly logged out)
+    // re-enters /oauth/authorize with every original param intact — the
+    // SAME session-less login render a first-time visitor would see, ready
+    // for the right person to sign in and resume the connector request.
+    const resumed = await handleAuthorizeGet(env.DB, new Request(next), deps());
+    expect(resumed.status).toBe(200);
+    const resumedHtml = await resumed.text();
+    expect(resumedHtml).toContain("Sign in to Parachute");
+    expect(resumedHtml).not.toContain("Signed in as");
+    expect(resumedHtml).toContain(`value="${clientId}"`);
+    expect(resumedHtml).toContain(`value="${challenge}"`);
+    expect(resumedHtml).toContain(`value="resume-me"`);
   });
 
   test("consent approve → same-origin bridge carrying the code; deny → bridge carrying access_denied", async () => {

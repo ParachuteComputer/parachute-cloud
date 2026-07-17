@@ -268,6 +268,25 @@ export interface ConsentProps {
    * they're consenting (#42; also disambiguates staging vs production).
    */
   issuerHost: string;
+  /** The authenticated account approving this grant — the "Signed in as" line. */
+  email: string;
+  /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `buildAuthorizeUrl`). */
+  notYouNext: string;
+}
+
+/**
+ * "Signed in as {email} · Not you?" (auth redesign §3, move 1) — every
+ * authenticated ceremony surface names the account it's acting as, closing
+ * the "approved a connector for the wrong account" gap. "Not you?" is a
+ * small POST /logout carrying `next` (server-validated by `safeNext` —
+ * console.ts never trusts this value directly): sign out, land back on
+ * `next`, sign in as the right person, and the connector request resumes
+ * because `next` re-enters the SAME pending flow. `next` omitted (the
+ * console header — no pending connector to resume) keeps the bare-logout
+ * landing on `/login` byte-identical to before this line existed.
+ */
+function signedInAsLine(email: string, csrfToken: string, next?: string): string {
+  return `<p class="muted" data-testid="signed-in-as" style="margin:0 0 1rem">Signed in as <strong>${esc(email)}</strong> &middot; <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}">${next ? `<input type="hidden" name="next" value="${esc(next)}">` : ""}<button class="linkbtn" type="submit">Not you?</button></form></p>`;
 }
 
 function scopeLabel(scope: string): string {
@@ -282,7 +301,7 @@ export function describeScopes(scopes: string[]): Array<{ scope: string; label: 
 }
 
 export function renderConsent(props: ConsentProps): string {
-  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, issuerHost } = props;
+  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, issuerHost, email, notYouNext } = props;
   const scopeList = scopeDescriptions
     .map((s) => `<li><strong>${esc(s.label)}</strong><br><span class="muted">${esc(s.scope)}</span></li>`)
     .join("\n");
@@ -296,7 +315,8 @@ export function renderConsent(props: ConsentProps): string {
   return page(
     "Authorize — Parachute",
     `<h1>Authorize ${esc(clientName)}</h1>
-     <p class="muted" style="margin:0 0 1rem">issued by <strong>${esc(issuerHost)}</strong></p>
+     <p class="muted" style="margin:0 0 .3rem">issued by <strong>${esc(issuerHost)}</strong></p>
+     ${signedInAsLine(email, csrfToken, notYouNext)}
      <div class="card">
        <p class="muted"><strong>${esc(clientName)}</strong> is requesting access to:</p>
        <ul class="scopes">${scopeList}</ul>
@@ -486,6 +506,16 @@ export function renderConsoleLogin(opts: {
            ${showPassword && error ? `<div class="err">${esc(error)}</div>` : ""}
            <button class="secondary" type="submit">Sign in with a password</button>
          </form>
+         <p class="muted" style="margin:1rem 0 .3rem">New to Parachute?</p>
+         <form method="post" action="/signup" data-testid="password-signup-form">
+           <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+           <label for="su-email">Email</label>
+           <input id="su-email" name="email" type="email" autocomplete="username" required>
+           <label for="su-password">Password</label>
+           <input id="su-password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+           <p class="muted" style="margin:.35rem 0 0">At least 8 characters.</p>
+           <button class="secondary" type="submit">Create account with a password</button>
+         </form>
        </details>
      </div>
      <div class="foot" data-testid="login-signup-door">New to Parachute? <a href="/signup"><strong>Create your free account</strong></a></div>`,
@@ -511,11 +541,12 @@ export function renderMagicSent(opts: { email: string; csrfToken: string }): str
 }
 
 /** The TOTP second-factor prompt after primary auth, when 2FA is enabled. */
-export function renderLogin2fa(opts: { csrfToken: string; error?: string }): string {
-  const { csrfToken, error } = opts;
+export function renderLogin2fa(opts: { csrfToken: string; email: string; notYouNext: string; error?: string }): string {
+  const { csrfToken, email, notYouNext, error } = opts;
   return page(
     "Two-factor — Parachute",
     `<h1>Enter your code</h1>
+     ${signedInAsLine(email, csrfToken, notYouNext)}
      <div class="card">
        <form method="post" action="/login/2fa">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -1354,10 +1385,9 @@ export function renderConsole(props: ConsoleProps): string {
   // route exists (it answers 404 to them anyway; admin.ts).
   const header = (title: string) => `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:1rem">
        <h1 style="margin:0">${esc(title)}</h1>
-       <span style="display:flex;gap:1rem;align-items:baseline">${isOperator ? `<a href="/admin" data-testid="admin-link">Admin</a>` : ""}<a href="/console/security">Security</a>
-       <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}"><button class="linkbtn" type="submit">Sign out</button></form></span>
+       <span style="display:flex;gap:1rem;align-items:baseline">${isOperator ? `<a href="/admin" data-testid="admin-link">Admin</a>` : ""}<a href="/console/security">Security</a></span>
      </div>
-     <p class="muted" style="margin:.15rem 0 .2rem">${esc(email)}</p>
+     ${signedInAsLine(email, csrfToken)}
      <p class="muted" data-testid="plan-line" style="margin:0 0 1.2rem;font-size:.88rem">${planHtml}</p>
      ${promoHtml}`;
 

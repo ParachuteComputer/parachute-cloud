@@ -17,7 +17,7 @@ import { approveClient, getClient, requireRegisteredRedirectUri } from "./client
 import { isCoveredByGrant, recordGrant } from "./grants.ts";
 import { unownedNamedVaults } from "./vaults.ts";
 import { SESSION_COOKIE, buildSessionCookie, createSession, findActiveSession, parseSessionCookie } from "./sessions.ts";
-import { getUserByEmail, needsRehash, setPassword, verifyPassword } from "./users.ts";
+import { getUserByEmail, getUserById, needsRehash, setPassword, verifyPassword } from "./users.ts";
 import { isTotpEnrolled } from "./two-factor.ts";
 import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
 import { clearLoginFailures, clientIp, isLoginLocked, loginKey, recordLoginFailure } from "./rate-limit.ts";
@@ -216,6 +216,10 @@ async function authorizeCore(
   const lockedVault = params.vault && VAULT_NAME_RE.test(params.vault) ? params.vault : null;
   const csrf = ensureCsrfToken(req);
   const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
+  // The session is already proven live (findActiveSession JOINs users WHERE
+  // suspended_at IS NULL), so the user row always resolves here — `?? ""` is
+  // defensive only, matching the codebase's convention elsewhere.
+  const consentUser = await getUserById(db, session.userId);
   return htmlResponse(
     renderConsent({
       params,
@@ -227,6 +231,13 @@ async function authorizeCore(
       // From CONFIG (deps.issuer), never from the request — the "issued by
       // <host>" trust line on the consent page (#42).
       issuerHost: new URL(deps.issuer).host,
+      // Auth redesign §3 move 1: "Signed in as {email} · Not you?" — the
+      // ceremony now names the account approving the grant. `notYouNext`
+      // reconstructs THIS exact pending authorize URL, so a "Not you?"
+      // logout lands back here (no session → the login page, params intact)
+      // and the connector request resumes without any new machinery.
+      email: consentUser?.email ?? "",
+      notYouNext: buildAuthorizeUrl(deps.issuer, params),
     }),
     200,
     extra,

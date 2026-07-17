@@ -979,6 +979,50 @@ describe("TOTP 2FA — enroll, login gate, backup codes, disable", () => {
     expect(res.headers.get("location")).toBe("/login");
   });
 
+  // Auth redesign §3 move 1 ("one visible identity"): the 2FA prompt names
+  // the account mid-primary-auth, same "Signed in as X · Not you?" line the
+  // consent page gets — closing the same visibility gap during the second
+  // factor, not just after it.
+  test("the 2FA prompt names the pending account: 'Signed in as {email} · Not you?'", async () => {
+    const { id } = await seedUser("totp-named@example.com", "correct horse");
+    const sessionId = await seedSession(id);
+    await enroll(sessionId);
+    const login = await handleLoginPost(env.DB, consoleLoginReq("totp-named@example.com", "correct horse"), deps(() => T_LOGIN));
+    const pending = cookieVal(login, "parachute_id_pending")!;
+
+    const prompt = await handleLogin2faGet(
+      env.DB,
+      new Request(`${ISSUER}/login/2fa`, { headers: { cookie: `parachute_id_pending=${pending}` } }),
+      deps(() => T_LOGIN),
+    );
+    const html = await prompt.text();
+    expect(html).toContain('data-testid="signed-in-as"');
+    expect(html).toContain("Signed in as");
+    expect(html).toContain("totp-named@example.com");
+    expect(html).toContain("Not you?");
+    // "Not you?" carries a `next` — the password login's own post-2FA
+    // destination (/console here; would be the pending authorize URL when
+    // the login itself was resuming a connector).
+    expect(html).toMatch(/name="next" value="\/console"/);
+  });
+
+  test("INJECTION SAFETY: a hostile account email is escaped on the 2FA prompt", async () => {
+    const hostileEmail = "<script>alert(1)</script>@example.com";
+    const { id } = await seedUser(hostileEmail, "correct horse");
+    const sessionId = await seedSession(id);
+    await enroll(sessionId);
+    const login = await handleLoginPost(env.DB, consoleLoginReq(hostileEmail, "correct horse"), deps(() => T_LOGIN));
+    const pending = cookieVal(login, "parachute_id_pending")!;
+    const prompt = await handleLogin2faGet(
+      env.DB,
+      new Request(`${ISSUER}/login/2fa`, { headers: { cookie: `parachute_id_pending=${pending}` } }),
+      deps(() => T_LOGIN),
+    );
+    const html = await prompt.text();
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+  });
+
   test("set-password lets a magic-link (passwordless) account gain a password", async () => {
     // Passwordless account (empty hash) via the users layer, then a session.
     const { createUser } = await import("../src/users.ts");

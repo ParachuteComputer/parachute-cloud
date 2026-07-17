@@ -128,6 +128,22 @@ export function resolveBoundOrigins(deps: OAuthDeps): readonly string[] {
 }
 
 /**
+ * The advertised human front door (auth redesign §1, "one advertised door")
+ * — `my.parachute.computer` in production (`vaultPublicOrigin`, the same
+ * Custom Domain `vaultAdvertisedUrl` above advertises for vault URLs),
+ * falling back to `appOrigin` where there's no separate `my.` (staging: a
+ * single self-referential origin). Both `app.` and `my.` serve the IDENTICAL
+ * SPA shell (P1.2/A1 Custom Domains on this same worker), so either resolves
+ * to the one true arrival screen. Deliberately NOT `vaultAdvertisedUrl`'s own
+ * fallback (`vaultOrigin`, the VAULT WORKER's machine-reachability origin) —
+ * a person redirected here must land on an origin THIS worker serves `/`
+ * (the SPA shell) on, which `vaultOrigin` is not.
+ */
+export function frontDoorOrigin(deps: OAuthDeps): string {
+  return (deps.vaultPublicOrigin ?? deps.appOrigin).replace(/\/$/, "");
+}
+
+/**
  * The app origin new arrivals land on when `APP_ORIGIN` is unset — the legacy
  * standalone Notes PWA. A stale/missing config degrades HERE, to a live serving
  * origin, rather than 404ing a new user's first step.
@@ -184,7 +200,14 @@ export function depsForEnv(env: Env): OAuthDeps {
     issuer,
     vaultBaseDomain: env.VAULT_BASE_DOMAIN,
     vaultOrigin: env.VAULT_ORIGIN,
-    vaultPublicOrigin: env.VAULT_PUBLIC_ORIGIN ?? env.VAULT_ORIGIN,
+    // Left UNCOALESCED with VAULT_ORIGIN (unlike a plausible-looking "just
+    // default it here" instinct): `vaultAdvertisedUrl` already applies its
+    // own `?? deps.vaultOrigin` fallback for vault-address URLs, and
+    // `frontDoorOrigin` (oauth-shared.ts) needs a genuine `undefined` here to
+    // fall through to `appOrigin` instead — staging (PUBLIC unset, ORIGIN set
+    // to the vault WORKER's own origin) would otherwise 302 GET /signup to a
+    // host with no SPA on it (cloud#178 review finding).
+    vaultPublicOrigin: env.VAULT_PUBLIC_ORIGIN,
     // Where a new arrival lands (post-create 303, vault cards, checklist doors) —
     // APP_ORIGIN when set, else the legacy Notes PWA (resolveAppOrigin).
     appOrigin: resolveAppOrigin(env),
