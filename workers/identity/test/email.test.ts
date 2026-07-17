@@ -171,7 +171,12 @@ describe("bindingSender — envelope + raw through the EmailMessage contract", (
   test("sendMagicLink sends ONE EmailMessage whose envelope matches its parsed MIME", async () => {
     const { binding, sent } = captureBinding();
     const sender = bindingSender(binding, FROM);
-    const res = await sender.sendMagicLink("user@example.com", "https://cloud.parachute.computer/auth/verify?token=t0k", false);
+    const res = await sender.sendMagicLink(
+      "user@example.com",
+      "https://cloud.parachute.computer/auth/verify?token=t0k",
+      "482913",
+      false,
+    );
     expect(res).toEqual({ ok: true });
     expect(sent).toHaveLength(1);
     const msg = sent[0]!;
@@ -180,23 +185,36 @@ describe("bindingSender — envelope + raw through the EmailMessage contract", (
     expect(msg.from).toBe(FROM);
     expect(msg.to).toBe("user@example.com");
     const parsed = await parseAndValidate(rawOf(msg), FROM);
-    expect(parsed.subject).toBe("Your Parachute sign-in link");
+    expect(parsed.subject).toBe("Your Parachute code: 482 913");
     expect(parsed.text).toContain("https://cloud.parachute.computer/auth/verify?token=t0k");
     expect(parsed.html).toContain("https://cloud.parachute.computer/auth/verify?token=t0k");
+    // The code (auth redesign §2) rides the body too, readable without the link.
+    expect(parsed.text).toContain("482 913");
+    expect(parsed.html).toContain("482 913");
   });
 
   test("G5: new-account vs returning variants differ in subject + copy (enumeration-safe — only the owner reads it)", async () => {
     const { binding: nb, sent: newSent } = captureBinding();
-    await bindingSender(nb, FROM).sendMagicLink("newbie@example.com", "https://cloud.parachute.computer/auth/verify?token=n", true);
+    await bindingSender(nb, FROM).sendMagicLink(
+      "newbie@example.com",
+      "https://cloud.parachute.computer/auth/verify?token=n",
+      "111222",
+      true,
+    );
     const newMail = await parseAndValidate(rawOf(newSent[0]!), FROM);
-    expect(newMail.subject).toBe("Welcome to Parachute — your sign-in link");
+    expect(newMail.subject).toBe("Welcome to Parachute — your code: 111 222");
     expect(newMail.html).toContain("Create my account");
     expect(newMail.text).toContain("creates a brand-new account");
 
     const { binding: rb, sent: retSent } = captureBinding();
-    await bindingSender(rb, FROM).sendMagicLink("back@example.com", "https://cloud.parachute.computer/auth/verify?token=r", false);
+    await bindingSender(rb, FROM).sendMagicLink(
+      "back@example.com",
+      "https://cloud.parachute.computer/auth/verify?token=r",
+      "333444",
+      false,
+    );
     const retMail = await parseAndValidate(rawOf(retSent[0]!), FROM);
-    expect(retMail.subject).toBe("Your Parachute sign-in link");
+    expect(retMail.subject).toBe("Your Parachute code: 333 444");
     expect(retMail.html).toContain("Sign me in");
     expect(retMail.text).toContain("signs you in as back@example.com");
   });
@@ -220,7 +238,7 @@ describe("bindingSender — envelope + raw through the EmailMessage contract", (
       },
       FROM,
     );
-    const res = await sender.sendMagicLink("user@example.com", "https://x.example/link", false);
+    const res = await sender.sendMagicLink("user@example.com", "https://x.example/link", "555666", false);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error).toContain("sender not verified");
   });

@@ -115,6 +115,125 @@ describe("renderRedirectBridge", () => {
   });
 });
 
+// --- renderRedirectBridge with clientName — the post-consent contract fix ---
+// (auth redesign §5, task #34: the "Authorized, now what" dead end).
+
+describe("renderRedirectBridge({ clientName }) — the client-aware post-consent screen", () => {
+  const target = "https://app.example/cb?code=abc123&state=xyz";
+
+  test("names the client in the heading, the manual link, and the watchdog copy", () => {
+    const html = renderRedirectBridge(target, { clientName: "Claude" });
+    expect(html).toContain("Taking you back to Claude…");
+    expect(html).toContain(">Continue to Claude →<");
+    // The watchdog text lives inside a JS string literal in the <script>
+    // (JSON-escaped for that context), not HTML — the apostrophe is NOT an
+    // HTML entity there.
+    expect(html).toContain("You're connected. If nothing happened, switch back to Claude");
+  });
+
+  test("still carries the exact redirect target in both the script and the fallback link", () => {
+    const html = renderRedirectBridge(target, { clientName: "Claude" });
+    const scriptTarget = bridgeTarget(html);
+    expect(scriptTarget).toBe(target);
+    expect(html).toContain(`href="${target.replace(/&/g, "&amp;")}"`);
+  });
+
+  test("the watchdog fires 3 seconds after location.replace, not before — same-tab, deferred copy swap", () => {
+    const html = renderRedirectBridge(target, { clientName: "Claude" });
+    const m = html.match(/<script[^>]*>(.*)<\/script>/);
+    expect(m).toBeTruthy();
+    const scriptBody = m![1]!;
+    // setTimeout(..., 3000) precedes location.replace textually — both fire
+    // synchronously on script execution (replace() doesn't block), so ORDER
+    // doesn't change behavior, but the watchdog's own delay does: it must be
+    // gated on the literal 3000ms window, not fire immediately.
+    expect(scriptBody).toMatch(/setTimeout\(function\(\)\{.*\},3000\);location\.replace\(/);
+  });
+
+  test("without clientName, the output is byte-identical to the original generic bridge (no watchdog, no regression for billing/console callers)", () => {
+    expect(renderRedirectBridge(target)).toBe(renderRedirectBridge(target, {}));
+    const html = renderRedirectBridge(target);
+    expect(html).toContain("<h1>Redirecting…</h1>");
+    expect(html).toContain("continue here");
+    expect(html).not.toContain("setTimeout");
+  });
+
+  test("INJECTION SAFETY: an untrusted client_name (self-registered via DCR) is escaped everywhere it lands", () => {
+    const hostile = '</script><script>alert(1)</script>"><img src=x>';
+    const html = renderRedirectBridge(target, { clientName: hostile });
+    // The heading + link land through esc() — no raw tag/attr breakout.
+    expect(html).not.toContain("<img src=x>");
+    expect(html).not.toContain("<script>alert(1)</script>");
+    // The watchdog string is JSON+`<`-escaped, same discipline as the URL.
+    const scriptBody = html.match(/<script[^>]*>(.*?)<\/script>/s)![1]!;
+    expect(scriptBody).not.toContain("</script>");
+  });
+});
+
+// --- end-to-end: the consent-approve leg names the client + carries the watchdog ---
+
+describe("form-action fix + post-consent contract, end-to-end: the OAuth consent bridge is client-aware", () => {
+  test("a NAMED client's display name appears on the bridge page + the watchdog copy", async () => {
+    const { id: userId } = await seedUser("bridge-named@example.com");
+    await seedVault("default", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Test Connector" });
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await app.fetch(
+      consentReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        },
+        { sessionId },
+      ),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Taking you back to Test Connector…");
+    expect(html).toContain("Continue to Test Connector →");
+    expect(html).toContain("switch back to Test Connector");
+    // The redirect target is still exactly right (the client-aware branch
+    // didn't disturb the mechanism the earlier suite already pins).
+    const target = bridgeTarget(html);
+    expect(target).toBeTruthy();
+    expect(new URL(target!).origin).toBe(new URL(REDIRECT_URI).origin);
+    expect(new URL(target!).searchParams.get("code")).toBeTruthy();
+  });
+
+  test("an UNNAMED client (no client_name at registration) falls back to the generic bridge — no undefined/blank name leaks through", async () => {
+    const { id: userId } = await seedUser("bridge-unnamed@example.com");
+    await seedVault("default", userId);
+    const { clientId } = await seedApprovedClient(); // no clientName
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await app.fetch(
+      consentReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        },
+        { sessionId },
+      ),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("<h1>Redirecting…</h1>");
+    expect(html).not.toContain("undefined");
+    expect(html).not.toContain("setTimeout");
+  });
+});
+
 // --- end-to-end through the real router: the consent-approve leg ------------
 
 describe("form-action fix, end-to-end: OAuth consent approve bridges past the cross-origin redirect_uri", () => {

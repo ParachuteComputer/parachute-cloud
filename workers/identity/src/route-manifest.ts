@@ -60,7 +60,7 @@ export const CEREMONY_PREFIXES = [
   "/signup", // signup GET/POST
   "/login", // login GET/POST + /login/2fa (subsumed by the prefix)
   "/logout", // logout POST
-  "/auth", // magic-link request (/auth/magic) + verify (/auth/verify)
+  "/auth", // magic-link request (/auth/magic) + verify (/auth/verify) + its short-form code (/auth/code)
   "/console", // account console + every /console/* action (vaults, security, plan, packs, checklist, promo, import/export/restore)
   "/admin", // operator admin console + /admin/* (users, vaults, plan, suspend)
   "/billing", // Stripe checkout / portal / webhook / mock-checkout

@@ -214,8 +214,10 @@ export function renderLogin(opts: {
   csrfToken: string;
   error?: string;
   showPassword?: boolean;
+  /** Opens the "have a code?" disclosure with `error` shown there instead. */
+  showCode?: boolean;
 }): string {
-  const { params, csrfToken, error, showPassword } = opts;
+  const { params, csrfToken, error, showPassword, showCode } = opts;
   return page(
     "Sign in — Parachute",
     `<h1>Sign in to Parachute</h1>
@@ -225,10 +227,14 @@ export function renderLogin(opts: {
          ${hiddenParams(params)}
          <label for="email">Email</label>
          <input id="email" name="email" type="email" autocomplete="email" required autofocus>
-         ${!showPassword && error ? `<div class="err">${esc(error)}</div>` : ""}
+         ${!showPassword && !showCode && error ? `<div class="err">${esc(error)}</div>` : ""}
          <button class="primary" type="submit">Email me a sign-in link</button>
        </form>
-       <p class="muted" style="margin:.7rem 0 0">We'll email you a link that signs you in and continues connecting your app — no password needed.</p>
+       <p class="muted" style="margin:.7rem 0 0">We'll email you a link that signs you in and continues connecting your app — or type the 6-digit code from that email below.</p>
+       <details${showCode ? " open" : ""}>
+         <summary>Have a code?</summary>
+         ${codeForm(csrfToken, undefined, showCode ? error : undefined, hiddenParams(params))}
+       </details>
        <details${showPassword ? " open" : ""}>
          <summary>Use a password instead</summary>
          <form method="post" action="/oauth/authorize">
@@ -341,16 +347,45 @@ export function renderError(opts: { title: string; message: string }): string {
  * never touched, so it's escaped for both places it appears: `esc()` for the
  * href attribute, and a JSON-encoded, `<`-escaped literal for the script (so
  * a redirect target can never smuggle a `</script>` breakout).
+ *
+ * `opts.clientName` (auth redesign §5, "the post-consent contract" — the
+ * connector dead-end fix) turns this into the OAuth-specific post-consent
+ * screen: named-client copy plus a ~3-second watchdog that swaps the body
+ * text to explicit "you're connected, go back or close this tab" guidance if
+ * the document is STILL showing that long after `location.replace` was
+ * called — the exact bare-spinner dead end a connector client can leave a
+ * disposable tab in. `clientName` is UNTRUSTED (an OAuth client's own
+ * self-registered `client_name`, RFC 7591) so it is escaped everywhere it
+ * lands, same discipline as `url`. Omitted (billing/Stripe redirects, the
+ * app deep-link doors) → the ORIGINAL generic copy, byte-identical, no
+ * watchdog — this bridge is shared infrastructure and only the OAuth
+ * consent-approve leg (oauth-authorize.ts `bridgeIfCrossOrigin`) opts into
+ * the enhanced screen.
  */
-export function renderRedirectBridge(url: string): string {
+export function renderRedirectBridge(url: string, opts: { clientName?: string } = {}): string {
   const scriptSafeUrl = JSON.stringify(url).replace(/</g, "\\u003c");
+  const { clientName } = opts;
+  if (!clientName) {
+    return page(
+      "Redirecting…",
+      `<h1>Redirecting…</h1>
+       <div class="card">
+         <p class="muted">Taking you back to finish up. If this takes more than a moment, <a href="${esc(url)}">continue here</a>.</p>
+       </div>
+       <script ${NONCE_ATTR}>location.replace(${scriptSafeUrl});</script>`,
+    );
+  }
+  const continueLabel = `Continue to ${clientName} →`;
+  const watchdogText = `You're connected. If nothing happened, switch back to ${clientName} — or close this tab; your authorization is complete.`;
+  const watchdogSafe = JSON.stringify(watchdogText).replace(/</g, "\\u003c");
   return page(
     "Redirecting…",
-    `<h1>Redirecting…</h1>
+    `<h1>Taking you back to ${esc(clientName)}…</h1>
      <div class="card">
-       <p class="muted">Taking you back to finish up. If this takes more than a moment, <a href="${esc(url)}">continue here</a>.</p>
+       <p class="muted" id="pcb-p">Finishing up — you can close this tab once it says you're connected.</p>
+       <p style="margin-top:1.1rem"><a href="${esc(url)}">${esc(continueLabel)}</a></p>
      </div>
-     <script ${NONCE_ATTR}>location.replace(${scriptSafeUrl});</script>`,
+     <script ${NONCE_ATTR}>setTimeout(function(){var p=document.getElementById("pcb-p");if(p)p.textContent=${watchdogSafe};},3000);location.replace(${scriptSafeUrl});</script>`,
   );
 }
 
@@ -364,6 +399,27 @@ function magicForm(csrfToken: string, email: string | undefined, buttonLabel: st
        <input id="email" name="email" type="email" autocomplete="email" value="${esc(email ?? "")}" required autofocus>
        ${error ? `<div class="err">${esc(error)}</div>` : ""}
        <button class="primary" type="submit">${esc(buttonLabel)}</button>
+     </form>`;
+}
+
+/**
+ * The "have a code?" form — the 6-digit short-form spelling of the magic
+ * link (auth redesign §2). Posts to /auth/code; NEVER re-populates the code
+ * value on error (same convention as the password field below — a guessed
+ * secret is never echoed back). `extraHidden` round-trips the pending OAuth
+ * authorize params on the authorize login page, exactly like the magic and
+ * password forms above it, so a wrong-code retry doesn't lose the request.
+ */
+function codeForm(csrfToken: string, email: string | undefined, error: string | undefined, extraHidden = ""): string {
+  return `<form method="post" action="/auth/code">
+       <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+       ${extraHidden}
+       <label for="code-email">Email</label>
+       <input id="code-email" name="email" type="email" autocomplete="email" value="${esc(email ?? "")}" required>
+       <label for="code">6-digit code</label>
+       <input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="123456" required>
+       ${error ? `<div class="err">${esc(error)}</div>` : ""}
+       <button class="secondary" type="submit">Verify code</button>
      </form>`;
 }
 
@@ -399,15 +455,26 @@ export function renderSignup(opts: { csrfToken: string; error?: string; email?: 
 }
 
 /** Console login (standalone, distinct from the OAuth authorize login). Magic-link default. */
-export function renderConsoleLogin(opts: { csrfToken: string; error?: string; email?: string; showPassword?: boolean }): string {
-  const { csrfToken, error, email, showPassword } = opts;
+export function renderConsoleLogin(opts: {
+  csrfToken: string;
+  error?: string;
+  email?: string;
+  showPassword?: boolean;
+  /** Opens the "have a code?" disclosure with `error` shown there instead. */
+  showCode?: boolean;
+}): string {
+  const { csrfToken, error, email, showPassword, showCode } = opts;
   return page(
     "Sign in — Parachute",
     `<h1>Sign in</h1>
      <p class="muted" style="margin:.15rem 0 1.1rem">Parachute Cloud — your notes, and everything you want your AI to remember, in a vault of your own. Open format, export anytime.</p>
      <div class="card">
-       ${magicForm(csrfToken, email, "Email me a sign-in link", showPassword ? undefined : error)}
-       <p class="muted" style="margin:.7rem 0 0">We'll email you a link that signs you in — no password needed.</p>
+       ${magicForm(csrfToken, email, "Email me a sign-in link", !showPassword && !showCode ? error : undefined)}
+       <p class="muted" style="margin:.7rem 0 0">We'll email you a link that signs you in — or type the 6-digit code from that email below.</p>
+       <details${showCode ? " open" : ""}>
+         <summary>Have a code?</summary>
+         ${codeForm(csrfToken, email, showCode ? error : undefined)}
+       </details>
        <details${showPassword ? " open" : ""}>
          <summary>Use a password instead</summary>
          <form method="post" action="/login">
@@ -426,13 +493,18 @@ export function renderConsoleLogin(opts: { csrfToken: string; error?: string; em
 }
 
 /** "Check your email" — the neutral response to a magic-link request (no enumeration). */
-export function renderMagicSent(opts: { email: string }): string {
+export function renderMagicSent(opts: { email: string; csrfToken: string }): string {
   return page(
     "Check your email — Parachute",
     `<h1>Check your email</h1>
      <div class="card">
        <p>If <strong>${esc(opts.email)}</strong> has (or can have) a Parachute account, a sign-in link is on its way.</p>
        <p class="muted">The link works once and expires in 10 minutes. You can close this tab — open the link from your email to continue.</p>
+       <details open>
+         <summary>Have the code instead?</summary>
+         <p class="muted" style="margin:.35rem 0 .5rem">Click the link in the email — or type the 6-digit code from it here.</p>
+         ${codeForm(opts.csrfToken, opts.email, undefined)}
+       </details>
      </div>
      <div class="foot"><a href="/login">← Back to sign in</a></div>`,
   );

@@ -25,6 +25,7 @@ import {
   handleSignupPost,
 } from "./console.ts";
 import {
+  handleCodeVerifyPost,
   handleLogin2faGet,
   handleLogin2faPost,
   handleMagicRequestPost,
@@ -239,6 +240,9 @@ app.post("/billing/mock-checkout", (c) => {
 // --- magic-link sign-in + second factor ---
 app.post("/auth/magic", (c) => handleMagicRequestPost(c.env.DB, c.req.raw, depsFor(c.env), senderFor(c.env)));
 app.get("/auth/verify", (c) => handleMagicVerifyGet(c.env.DB, c.req.raw, depsFor(c.env)));
+// The magic link's 6-digit short-form spelling (auth redesign Wave 1, #34) —
+// verifies+consumes the SAME single-use token as GET /auth/verify above.
+app.post("/auth/code", (c) => handleCodeVerifyPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/login/2fa", (c) => handleLogin2faGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/login/2fa", (c) => handleLogin2faPost(c.env.DB, c.req.raw, depsFor(c.env)));
 

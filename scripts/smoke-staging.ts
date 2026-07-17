@@ -665,6 +665,66 @@ async function main() {
     const reuse = await fetch(magicLink!, { redirect: "manual" });
     assert(reuse.status === 400, "magic-link is single-use (second verify → 400)", `status ${reuse.status}`);
 
+    // 10b. The sign-in CODE — the magic link's 6-digit short-form spelling
+    //      (auth redesign Wave 1, task #34). Same single-use token, two
+    //      spellings: staging echoes the code beside the link
+    //      (`x-parachute-dev-magic-code`, the same exposeDevLinks gate) so
+    //      this drives headlessly too. Verify by CODE must mint a session
+    //      identically to the link, and — since it's the SAME row — using
+    //      the code kills the link too (checked immediately after).
+    {
+      const codeEmail = `magic-code+${Date.now()}@example.com`;
+      const csend = await fetch(`${IDENTITY}/auth/magic`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${mcsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: mcsrf!, email: codeEmail }),
+      });
+      const codeLink = csend.headers.get("x-parachute-dev-magic-link");
+      const code = csend.headers.get("x-parachute-dev-magic-code");
+      assert(
+        csend.status === 200 && !!codeLink && !!code && /^\d{6}$/.test(code),
+        "magic send → dev link header AND a sibling 6-digit dev code header",
+        `code ${code}`,
+      );
+
+      const cverify = await fetch(`${IDENTITY}/auth/code`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${mcsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: mcsrf!, email: codeEmail, code: code! }),
+      });
+      const codeSession = cookieVal(cverify.headers.getSetCookie(), "parachute_id_session");
+      assert(
+        cverify.status === 302 && cverify.headers.get("location") === "/console" && !!codeSession,
+        "code verify → session + /console, same as the link (POST /auth/code)",
+        `status ${cverify.status}`,
+      );
+
+      // Single-use is SHARED: the code just consumed this row, so the
+      // ORIGINAL emailed link (same row) must now be dead too.
+      const linkAfterCode = await fetch(codeLink!, { redirect: "manual" });
+      assert(
+        linkAfterCode.status === 400,
+        "the LINK on the same row dies once the CODE consumes it (one token, two spellings)",
+        `status ${linkAfterCode.status}`,
+      );
+
+      // A wrong code on an unknown email gets the SAME neutral failure — no oracle.
+      const wrongRes = await fetch(`${IDENTITY}/auth/code`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${mcsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: mcsrf!, email: `nonexistent-code+${Date.now()}@example.com`, code: "000000" }),
+      });
+      const wrongHtml = await wrongRes.text();
+      assert(
+        wrongRes.status === 200 && wrongHtml.includes("request a fresh link"),
+        "a wrong code on an unknown email gets the same neutral 'request a fresh link' response",
+        `status ${wrongRes.status}`,
+      );
+    }
+
     // Launch-flow fix 2 — the authorize login's magic door RESUMES the pending
     // authorize request (the passwordless-user dead-end fix): start a fresh
     // authorize with NO session, send the magic link WITH the pending params
@@ -731,6 +791,80 @@ async function main() {
         rResumed.status === 200 && /Authorize|Approve/.test(rConsent) && rConsent.includes(rState),
         "resumed authorize renders consent for the pending request",
         `status ${rResumed.status}`,
+      );
+    }
+
+    // Same resume walk, by CODE instead of the link — the "requested the link
+    // on my phone's Claude app, email is on my laptop" connector case (§2 of
+    // the auth redesign): the code-verify POST carries NO authorize params of
+    // its own — the resume target lives server-side on the row, exactly like
+    // the link's.
+    {
+      const resumeEmail2 = `resume-code+${Date.now()}@example.com`;
+      const { challenge: rcChallenge } = await pkce();
+      const rcState = `resume-code-${MARKER}`;
+      const rcParams: Record<string, string> = {
+        client_id: clientId,
+        redirect_uri: REDIRECT_URI,
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: rcChallenge,
+        code_challenge_method: "S256",
+        state: rcState,
+      };
+      const rcLogin = await fetch(`${IDENTITY}/oauth/authorize?${form(rcParams)}`, { redirect: "manual" });
+      const rcCsrf = cookieVal(rcLogin.headers.getSetCookie(), "parachute_id_csrf");
+      const rcHtml = await rcLogin.text();
+      assert(
+        rcLogin.status === 200 && rcHtml.includes('action="/auth/code"') && rcHtml.includes("Have a code?"),
+        "session-less authorize login ALSO offers the 6-digit code door",
+        `status ${rcLogin.status}`,
+      );
+      const rcSend = await fetch(`${IDENTITY}/auth/magic`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${rcCsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: rcCsrf!, email: resumeEmail2, ...rcParams }),
+      });
+      const rcCode = rcSend.headers.get("x-parachute-dev-magic-code");
+      assert(
+        rcSend.status === 200 && !!rcCode && /^\d{6}$/.test(rcCode),
+        "authorize magic send → a dev code header too, sibling to the link header",
+        `status ${rcSend.status}`,
+      );
+      const rcVerify = await fetch(`${IDENTITY}/auth/code`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${rcCsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: rcCsrf!, email: resumeEmail2, code: rcCode! }),
+      });
+      const rcSession = cookieVal(rcVerify.headers.getSetCookie(), "parachute_id_session");
+      const rcLoc = rcVerify.headers.get("location") ?? "";
+      let rcLocOk = false;
+      try {
+        const u = new URL(rcLoc);
+        rcLocOk =
+          u.pathname === "/oauth/authorize" &&
+          u.searchParams.get("client_id") === clientId &&
+          u.searchParams.get("state") === rcState &&
+          u.searchParams.get("code_challenge") === rcChallenge;
+      } catch {
+        rcLocOk = false;
+      }
+      assert(
+        rcVerify.status === 302 && !!rcSession && rcLocOk,
+        "code verify → 302 RESUMES the exact authorize request, same as the link",
+        `loc ${rcLoc.slice(0, 100)}`,
+      );
+      const rcResumed = await fetch(rcLoc, {
+        headers: { cookie: `parachute_id_session=${rcSession}` },
+        redirect: "manual",
+      });
+      const rcConsent = await rcResumed.text();
+      assert(
+        rcResumed.status === 200 && /Authorize|Approve/.test(rcConsent) && rcConsent.includes(rcState),
+        "resumed-by-code authorize renders consent for the pending request",
+        `status ${rcResumed.status}`,
       );
     }
 

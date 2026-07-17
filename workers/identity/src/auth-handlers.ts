@@ -16,7 +16,7 @@
  */
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import type { EmailSender } from "./email.ts";
-import { consumeMagicLink, createMagicLink } from "./magic-links.ts";
+import { type ConsumedMagicLink, consumeMagicLink, createMagicLink, verifyMagicCode } from "./magic-links.ts";
 import { bumpMagicLinkEvent } from "./ops.ts";
 import {
   buildPendingLoginCookie,
@@ -57,6 +57,7 @@ import { qrSvg } from "./qr.ts";
 import { EMAIL_RE, PASSWORD_MIN, normalizeEmail } from "./validation.ts";
 import { authorizeParamsFromForm, buildAuthorizeUrl } from "./oauth-authorize.ts";
 import {
+  type AuthorizeParams,
   renderConsoleLogin,
   renderError,
   renderLogin,
@@ -215,9 +216,10 @@ export async function handleMagicRequestPost(
     // every other outcome (no oracle), but nothing is minted or sent — no
     // magic_links row, no email, and no dev echo header (there is no link).
     if (existing?.suspendedAt) {
-      return wantsJson ? jsonResponse({ ok: true }, 200) : htmlResponse(renderMagicSent({ email }), 200);
+      const csrfToken = ensureCsrfToken(req).token;
+      return wantsJson ? jsonResponse({ ok: true }, 200) : htmlResponse(renderMagicSent({ email, csrfToken }), 200);
     }
-    const { rawToken } = await createMagicLink(db, email, existing?.id ?? null, now, next);
+    const { rawToken, code } = await createMagicLink(db, email, existing?.id ?? null, now, next);
     // Build the emailed link from the origin the request came in on (app. or
     // cloud.), NOT the fixed issuer — so a user who asked from app.parachute.
     // computer gets a link back to app., landing the session on the origin they
@@ -230,7 +232,7 @@ export async function handleMagicRequestPost(
     // brand-new account this link will create. Only the address owner reads the
     // email, so this new-vs-returning distinction leaks nothing (the on-page
     // copy stays neutral).
-    const sent = await sender.sendMagicLink(email, link, !existing);
+    const sent = await sender.sendMagicLink(email, link, code, !existing);
     if (!sent.ok) {
       // A real-binding failure (bad address, quota, CF transient) must leave a
       // log trail — otherwise it's a silent 200 and an inbox that never rings.
@@ -244,13 +246,23 @@ export async function handleMagicRequestPost(
     // PII-free per-day counter for the weekly ops digest (never throws).
     await bumpMagicLinkEvent(db, sent.ok ? "sent" : "failed", now);
     const extra: Record<string, string> = {};
-    // DEV ONLY: echo the link so the flow is testable without real email. Gated
-    // hard on ENVIRONMENT !== "production" (deps.exposeDevLinks).
-    if (deps.exposeDevLinks) extra["x-parachute-dev-magic-link"] = link;
-    return wantsJson ? jsonResponse({ ok: true }, 200, extra) : htmlResponse(renderMagicSent({ email }), 200, extra);
+    // DEV ONLY: echo the link + code so the flow is testable without real
+    // email. Gated hard on ENVIRONMENT !== "production" (deps.exposeDevLinks).
+    // The code rides a SIBLING header (not the existing link header) — callers
+    // that only expect a URL there (smoke-staging's existing steps) are
+    // unaffected; a new step reads x-parachute-dev-magic-code.
+    if (deps.exposeDevLinks) {
+      extra["x-parachute-dev-magic-link"] = link;
+      extra["x-parachute-dev-magic-code"] = code;
+    }
+    const csrfToken = ensureCsrfToken(req).token;
+    return wantsJson
+      ? jsonResponse({ ok: true }, 200, extra)
+      : htmlResponse(renderMagicSent({ email, csrfToken }), 200, extra);
   }
   // Throttled: same neutral body, nothing sent.
-  return wantsJson ? jsonResponse({ ok: true }, 200) : htmlResponse(renderMagicSent({ email }), 200);
+  const csrfToken = ensureCsrfToken(req).token;
+  return wantsJson ? jsonResponse({ ok: true }, 200) : htmlResponse(renderMagicSent({ email, csrfToken }), 200);
 }
 
 function magicError(req: Request, message: string, email: string): Response {
@@ -258,30 +270,120 @@ function magicError(req: Request, message: string, email: string): Response {
   return htmlResponse(renderConsoleLogin({ csrfToken: csrf.token, error: message, email }), 200, csrfExtra(csrf.setCookie));
 }
 
+/**
+ * Resolve a consumed magic-link (or code) row to a user — existing → verify
+ * their email; otherwise create-or-fetch (a concurrent link for a new address
+ * could have created the row first). Shared by the link's GET /auth/verify
+ * and the code's POST /auth/code so both spellings resolve identically.
+ * Returns null for a SUSPENDED account — the never-mint chokepoint; the
+ * caller decides how that surfaces (the link's dead-link page vs the code's
+ * neutral failure message), but neither ever mints.
+ */
+async function resolveVerifiedUser(db: D1Database, consumed: ConsumedMagicLink, now: Date): Promise<string | null> {
+  let userId = consumed.userId;
+  const existing = userId ? await getUserById(db, userId) : await getUserByEmail(db, consumed.email);
+  if (existing) {
+    if (existing.suspendedAt) return null;
+    userId = existing.id;
+    await markEmailVerified(db, userId);
+    return userId;
+  }
+  return (await createUser(db, consumed.email, "", now, { emailVerified: true })).id;
+}
+
 export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const token = new URL(req.url).searchParams.get("token");
   const now = deps.now?.() ?? new Date();
   const consumed = token ? await consumeMagicLink(db, token, now) : null;
   if (!consumed) return magicLinkDead(req, deps);
-  // Resolve the user: existing → verify their email; otherwise create-or-fetch
-  // (a concurrent link for a new address could have created the row first).
   // A SUSPENDED account gets the same dead-link page as an expired token —
   // covers links minted before the suspension landed, with no oracle.
-  let userId = consumed.userId;
-  const existing = userId ? await getUserById(db, userId) : await getUserByEmail(db, consumed.email);
-  if (existing) {
-    if (existing.suspendedAt) return magicLinkDead(req, deps);
-    userId = existing.id;
-    await markEmailVerified(db, userId);
-  } else {
-    userId = (await createUser(db, consumed.email, "", now, { emailVerified: true })).id;
-  }
+  const userId = await resolveVerifiedUser(db, consumed, now);
+  if (!userId) return magicLinkDead(req, deps);
   // Follow the stored resume target (the authorize URL for sends from the
   // OAuth login page — single-use + expiry came free with the token consume
   // above), re-validated against the issuer origin; null → /console. A
   // 2FA-enrolled account keeps the same destination through the code prompt
   // (finishPrimaryAuth threads it into pending_logins.next).
   return finishPrimaryAuth(db, deps, userId, safeNext(consumed.next ?? "/console", deps));
+}
+
+// --- sign-in code (the magic link's short-form spelling, auth redesign §2) --
+
+/**
+ * POST /auth/code {email, code} — verify + consume the SAME single-use token
+ * the magic link rides, by its 6-digit short-form spelling instead of the
+ * link click. Session-mint path is byte-identical to the link's
+ * (`resolveVerifiedUser` + `finishPrimaryAuth`), including the authorize-
+ * resume rider (`consumed.next`) — a code typed on the OAuth authorize
+ * login's "have a code?" disclosure resumes the pending connector request
+ * exactly like clicking the link would. Neutral failure everywhere (wrong
+ * code, expired, unknown email, suspended account, attempt-cap tripped) — the
+ * same "didn't work, request a fresh link" message with no oracle, mirroring
+ * the wrong-password / unknown-account responses elsewhere in this file.
+ */
+export async function handleCodeVerifyPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const form = await req.formData();
+  // The pending OAuth authorize params, when this POST came from that page's
+  // own code disclosure (ui.ts renderLogin — the same hidden-field round-trip
+  // the magic and password forms on that page already use). Present only
+  // ROUND-TRIPS the params for a RETRY on failure; success always resolves the
+  // resume target from the consumed row's own `next`, never from this form.
+  const authorizeParams = authorizeParamsFromForm(form);
+  if (!checkForm(req, form, deps)) {
+    return codeError(req, authorizeParams, "Your session expired. Please try again.", "");
+  }
+  const email = normalizeEmail(String(form.get("email") ?? ""));
+  const code = String(form.get("code") ?? "").trim();
+  const now = deps.now?.() ?? new Date();
+  const neutralMsg = "That code didn't work — request a fresh link.";
+
+  // Brute-force fence BEFORE the lookup, same shape as the 2FA/login paths —
+  // keyed per (ip, code:email) so it can't be weaponized to lock another
+  // account's fence, and shared with nothing else.
+  const key = loginKey(clientIp(req), `code:${email}`);
+  if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
+    return codeError(req, authorizeParams, "Too many attempts. Please wait a few minutes and try again.", email);
+  }
+
+  const consumed = await verifyMagicCode(db, email, code, now);
+  if (!consumed) {
+    await recordLoginFailure(deps.rateLimiter, key, now);
+    return codeError(req, authorizeParams, neutralMsg, email);
+  }
+  const userId = await resolveVerifiedUser(db, consumed, now);
+  if (!userId) {
+    // SUSPENDED — same neutral failure as a wrong/expired code, never a mint.
+    await recordLoginFailure(deps.rateLimiter, key, now);
+    return codeError(req, authorizeParams, neutralMsg, email);
+  }
+  await clearLoginFailures(deps.rateLimiter, key);
+  return finishPrimaryAuth(db, deps, userId, safeNext(consumed.next ?? "/console", deps));
+}
+
+/** Re-render whichever ceremony page the code was submitted from, with the
+ * "have a code?" disclosure open and the error shown there — the authorize
+ * login when the pending-request rider is present (so a retry doesn't lose
+ * the connector's request), else the console login. */
+function codeError(
+  req: Request,
+  authorizeParams: AuthorizeParams | null,
+  message: string,
+  email: string,
+): Response {
+  const csrf = ensureCsrfToken(req);
+  if (authorizeParams) {
+    return htmlResponse(
+      renderLogin({ params: authorizeParams, csrfToken: csrf.token, error: message, showCode: true }),
+      200,
+      csrfExtra(csrf.setCookie),
+    );
+  }
+  return htmlResponse(
+    renderConsoleLogin({ csrfToken: csrf.token, error: message, email, showCode: true }),
+    200,
+    csrfExtra(csrf.setCookie),
+  );
 }
 
 /**
