@@ -27,15 +27,23 @@
  */
 import { BunSqliteStore } from "@openparachute/core/src/store.js";
 import type { HookRegistry } from "@openparachute/core/src/hooks.js";
+import type { EmbeddingProvider } from "@openparachute/core/src/embedding/provider.js";
 
 export class DoSqliteStore extends BunSqliteStore {
   private readonly storage: DurableObjectStorage;
 
-  constructor(db: unknown, storage: DurableObjectStorage, opts?: { hooks?: HookRegistry }) {
+  constructor(
+    db: unknown,
+    storage: DurableObjectStorage,
+    opts?: { hooks?: HookRegistry; embeddingProvider?: EmbeddingProvider; embeddingDisabledReason?: string },
+  ) {
     // BunSqliteStore's constructor runs initSchema(db) — the boot migrations use
     // core's FREE transaction helper (shim no-ops their BEGIN); `this.transaction`
     // below is only exercised post-boot, so `storage` being assigned after
-    // `super()` is fine.
+    // `super()` is fine. `embeddingProvider` (semantic search MVP, C2) rides the
+    // SAME constructor-injection seam core's Store already defines — the DO
+    // passes a lazily-resolving proxy (vault-do.ts) so tests can swap the
+    // concrete provider on an already-booted DO instance.
     super(db as never, opts);
     this.storage = storage;
   }

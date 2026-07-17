@@ -42,12 +42,20 @@ export async function handleVault(
    * response omits it there too).
    */
   transcription?: { enabled: boolean; minutes_remaining: number },
+  /**
+   * Semantic-search capability for the GET response (C2, EXPERIMENTAL) — same
+   * parity contract as `transcription` above (vault-do.ts `embeddingCapability()`
+   * mirrors self-host's `resolveEmbeddingCapability`, declared on /api/vault
+   * there too). GET-only.
+   */
+  embeddings?: { enabled: boolean; provider?: string; model?: string },
 ): Promise<Response> {
   const url = new URL(req.url);
 
   if (req.method === "GET") {
     const result: Record<string, unknown> = vaultResponse(vaultConfig);
     if (transcription) result.transcription = transcription;
+    if (embeddings) result.embeddings = embeddings;
     // Front-door structural map — ALWAYS included, mirroring bun's handleVault
     // (routes.ts, contracts-brief C1.2). Cloud has no tag-scoped tokens
     // (NO_TAG_SCOPE everywhere), so the unscoped call is always correct here.

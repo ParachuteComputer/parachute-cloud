@@ -27,7 +27,7 @@ import { transactionAsync } from "@openparachute/core/src/txn.js";
 import * as linkOps from "@openparachute/core/src/links.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
-import type { QueryWarning } from "@openparachute/core/src/query-warnings.js";
+import { embeddingsPendingWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
 import {
   json,
   jsonWithWarnings,
@@ -208,6 +208,110 @@ async function handleNotesInner(
           result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url)).get(note.id) ?? 0;
         }
         return json(result);
+      }
+
+      // Semantic search (EXPERIMENTAL — semantic search MVP, C2). Ported
+      // verbatim from parachute-vault/src/routes.ts (the wire contract lives
+      // in this branch, so it is transcribed rather than reinvented — the
+      // conformance suite pins any drift). Checked BEFORE the search/cursor
+      // exclusivity check below so `semantic=true` combined with `search=`
+      // or `cursor=` gets its OWN error naming `semantic`, not silently
+      // routed into the search branch.
+      const nearText = parseQuery(url, "near_text");
+      const semantic = parseBool(parseQuery(url, "semantic"), false);
+      if (semantic) {
+        if (search) {
+          return json(
+            {
+              error: "semantic is incompatible with full-text search — pick one (semantic ranks by meaning via near_text; search ranks by keyword).",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "semantic",
+              hint: "drop `search` when using `semantic`, or drop `semantic`/`near_text` to use keyword search",
+            },
+            400,
+          );
+        }
+        if (parseQuery(url, "cursor") !== null) {
+          return json(
+            {
+              error: "cursor is incompatible with semantic search — ranking is by similarity, not a stable row order to page through.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "semantic",
+              hint: "drop `cursor` when using `semantic`",
+            },
+            400,
+          );
+        }
+        if (!nearText || !nearText.trim()) {
+          return json(
+            {
+              error: "semantic=true requires `near_text` — the free text to rank notes by meaning.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "near_text",
+              hint: "pass ?near_text=...&semantic=true",
+            },
+            400,
+          );
+        }
+        const parsedSemantic = parseNotesQueryOpts(url);
+        if (parsedSemantic.error) return parsedSemantic.error;
+        try {
+          const semanticResult = await store.semanticSearch(nearText, { ...parsedSemantic.queryOpts, cursor: undefined });
+          const semanticWarnings: QueryWarning[] = [];
+          if (semanticResult.pendingCount > 0) {
+            semanticWarnings.push(
+              embeddingsPendingWarning(semanticResult.pendingCount, semanticResult.totalCandidates),
+            );
+          }
+          const filtered = filterNotesByTagScope(semanticResult.notes, tagScope.allowed, tagScope.raw);
+          const includeContent = parseBool(parseQuery(url, "include_content"), false);
+          const contentRange = parseContentRangeQuery(url, includeContent);
+          if (contentRange.error) return contentRange.error;
+          const inclMeta = parseIncludeMetadata(url);
+          let output: any[] = includeContent ? filtered.map((n) => ({ ...n })) : filtered.map(toNoteIndex);
+          const expand = parseExpandParams(url, db, tagScope);
+          if (expand && includeContent) {
+            for (const n of output) expand.ctx.expanded.add(n.id);
+            for (const n of output) {
+              if (typeof n.content === "string") {
+                n.content = expandContent(n.content, expand.ctx, expand.depth);
+              }
+            }
+          }
+          if (contentRange.range && includeContent) {
+            for (const n of output) applyContentRange(n, contentRange.range);
+          }
+          if (inclMeta !== undefined && inclMeta !== true) {
+            output = output.map((n: any) => filterMetadata(n, inclMeta));
+          }
+          if (parseBool(parseQuery(url, "include_link_count"), false)) {
+            const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url));
+            for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
+          }
+          return jsonWithWarnings(output, semanticWarnings);
+        } catch (e: any) {
+          if (e && e.name === "QueryError") {
+            // `semantic_unavailable` (no/not-ready provider) is a capability
+            // gap, not a malformed request — 503, distinct from every other
+            // QueryError's 400. Never a silent fallback to keyword search.
+            const status = e.error_type === "semantic_unavailable" ? 503 : 400;
+            return json(
+              {
+                error: e.message,
+                code: e.code ?? "INVALID_QUERY",
+                error_type: e.error_type ?? "invalid_query",
+                ...(e.field !== undefined ? { field: e.field } : {}),
+                ...(e.got !== undefined ? { got: e.got } : {}),
+                ...(e.hint !== undefined ? { hint: e.hint } : {}),
+              },
+              status,
+            );
+          }
+          throw e;
+        }
       }
 
       if (search && url.searchParams.has("cursor")) {

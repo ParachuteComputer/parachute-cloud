@@ -110,6 +110,18 @@ import {
   bodyWithTranscript,
 } from "./transcription/pipeline.js";
 import { cleanupTranscript, type TextGeneratorLike } from "./transcription/cleanup.js";
+import type { EmbeddingProvider, EmbedInput, EmbedResult, ProviderAvailability } from "@openparachute/core/src/embedding/provider.js";
+import { chunkNoteContent, type Chunk } from "@openparachute/core/src/embedding/chunker.js";
+import { planStaleness, contentHash } from "@openparachute/core/src/embedding/staleness.js";
+import {
+  getNoteVectorRows,
+  deleteObsoleteVectorRows,
+  upsertNoteVector,
+  getNotesPendingEmbedding,
+} from "@openparachute/core/src/embedding/vectors.js";
+import { normalize } from "@openparachute/core/src/embedding/vector-codec.js";
+import { WorkersAiEmbeddingProvider } from "./embedding/workers-ai.js";
+import { embeddingsExplicitlyDisabled } from "./embedding/select.js";
 
 function errText(e: unknown): string {
   if (e instanceof Error) return `${e.name}: ${e.message}`;
@@ -187,6 +199,54 @@ const TRANSCRIBE_MONTH_KEY = "transcribe_minutes_month";
  *  (mirrors the self-host worker's DEFAULT_MAX_ATTEMPTS). */
 const TRANSCRIBE_MAX_ATTEMPTS = 3;
 
+/** DO-storage key: whether the embedding backfill scan last found NOTHING
+ *  pending (semantic search MVP, C2). Gates the cheap per-request arm-check
+ *  in `ensureState` — see `maybeArmEmbeddingBackfill`'s doc. */
+const EMBEDDING_BACKFILL_DONE_KEY = "embedding_backfill_done";
+
+/** Bounded per-wake budget: up to this many notes' worth of stale chunks are
+ *  embedded in ONE Workers AI call per alarm wake (embedding inference is
+ *  fast, unlike whisper's ~240s budget — see transcription/workers-ai.ts's
+ *  "one inference per wake" comment for the contrast — so batching several
+ *  notes per wake is safe). Keeps a single wake's subrequest/token footprint
+ *  bounded regardless of vault size: a 3000-note vault backfills across many
+ *  wakes instead of risking one wake's Workers AI call / DO subrequest
+ *  limits. At core's ~450-token chunk target, 25 notes × ~2 chunks/note
+ *  worst-case is comfortably under bge-m3's ~60k-token context window. */
+const EMBED_NOTES_PER_WAKE = 25;
+
+/**
+ * Lazily resolves to the DO's live embedding provider on every property/
+ * method access, rather than baking a concrete provider instance into
+ * `DoSqliteStore`'s constructor-injected (and `readonly` on core's `Store`)
+ * `embeddingProvider` field. This is what lets the vitest suites swap in a
+ * stub via `__setTestEmbeddingProvider` on an ALREADY-BOOTED DO instance
+ * (the same problem `transcriptionProvider()`'s lazy-method-call pattern
+ * solves for transcription — but here the seam is a Store CONSTRUCTOR
+ * option, not a method called fresh per use, so the indirection has to live
+ * inside the object itself). `resolve()` always returns the CURRENTLY active
+ * provider, so `model`/`dims` (used to scope `note_vectors` queries) can
+ * never drift from whatever `embed()` will actually write.
+ */
+class LazyEmbeddingProvider implements EmbeddingProvider {
+  constructor(private readonly resolve: () => EmbeddingProvider) {}
+  get name(): string {
+    return this.resolve().name;
+  }
+  get model(): string {
+    return this.resolve().model;
+  }
+  get dims(): number {
+    return this.resolve().dims;
+  }
+  embed(input: EmbedInput): Promise<EmbedResult> {
+    return this.resolve().embed(input);
+  }
+  available(): Promise<ProviderAvailability> {
+    return this.resolve().available();
+  }
+}
+
 /** UTC "YYYY-MM" for the meter's month tag. */
 function utcMonth(d: Date): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
@@ -228,6 +288,25 @@ export class VaultDO extends DurableObject {
   private shim: DatabaseShim;
   private store!: DoSqliteStore;
   private bootError: string | null = null;
+
+  /**
+   * True while an `alarm()` invocation is on the stack (semantic search MVP,
+   * C2). Guards {@link scheduleEmbeddingAlarm} against a REENTRANT mid-wake
+   * re-arm: `transcribeOne`'s own `patchNoteBody` calls `store.updateNote`,
+   * which fires the SAME embedding-on-write hook (constructor) any REST/MCP
+   * write does — arming a NEW alarm for "now" WHILE `alarm()` is still
+   * running. Observed live under the test pool's concurrency model: that
+   * immediate re-arm could fire a SECOND, overlapping `alarm()` invocation
+   * before the first one finished, running `transcribeOne` on the SAME
+   * still-"pending" attachment TWICE (double-metered voice minutes). It's
+   * also simply REDUNDANT in the success case — `drainEmbeddingsOnce()`
+   * already runs later in THIS SAME wake (after the transcription block) and
+   * picks up the just-patched note as newly stale on its own, and
+   * `rearmFromPending`'s trailing re-arm re-checks both queues' FINAL state
+   * regardless. So skipping the mid-wake arm attempt costs nothing and
+   * removes the reentrancy window.
+   */
+  private alarmRunning = false;
   protected env: Env;
 
   // In-memory caches of DO-storage state (a warm DO keeps these across
@@ -258,6 +337,25 @@ export class VaultDO extends DurableObject {
    */
   private testCleanupGen?: TextGeneratorLike;
 
+  /**
+   * TEST-ONLY embedding provider override (semantic search MVP, C2). Set via
+   * `__setTestEmbeddingProvider` (vitest, `runInDurableObject`); picked up by
+   * `LazyEmbeddingProvider`'s `resolve()` on next use. Production leaves it
+   * undefined and resolution falls to {@link realEmbeddingProvider}.
+   */
+  private testEmbeddingProvider?: EmbeddingProvider;
+
+  /** Memoized real `WorkersAiEmbeddingProvider` over `env.AI` — built once,
+   *  on first resolution, mirroring `transcriptionProvider()`'s lazy-build. */
+  private realEmbeddingProvider?: EmbeddingProvider;
+
+  /**
+   * Cached in-memory mirror of {@link EMBEDDING_BACKFILL_DONE_KEY}.
+   * `undefined` = not yet loaded from DO storage this wake. See
+   * `maybeArmEmbeddingBackfill`'s doc for the full arm/drain/persist cycle.
+   */
+  private embeddingBackfillDone: boolean | undefined = undefined;
+
   // Live-query fan-out for THIS vault, bound to the store's own post-commit hook
   // registry — the single-writer property (design §3): every mutation and every
   // open stream for the vault co-locate in this object, so there is no
@@ -285,9 +383,48 @@ export class VaultDO extends DurableObject {
       // across DO wakes): SCHEMA v23 + all migrateToVN steps. It also wires the
       // transaction seam to ctx.storage.transactionSync (design §4) so
       // Store.transaction blocks are real DO transactions.
-      this.store = new DoSqliteStore(this.shim, ctx.storage);
+      //
+      // embeddingProvider (semantic search MVP, C2): a LazyEmbeddingProvider
+      // proxy, injected ONLY when EMBEDDINGS_ENABLED isn't explicitly "false"
+      // — mirrors self-host's `buildEmbeddingProvider` returning `undefined`
+      // for the off switch, so a disabled vault's `store.embeddingProvider`
+      // is `undefined` and `semanticSearch` throws the SAME structured
+      // `semantic_unavailable` a not-configured vault throws. The proxy (not
+      // a bare `new WorkersAiEmbeddingProvider(env.AI)`) is what lets tests
+      // swap the concrete provider post-construction via
+      // `__setTestEmbeddingProvider`.
+      this.store = new DoSqliteStore(this.shim, ctx.storage, {
+        ...(embeddingsExplicitlyDisabled(env)
+          ? {}
+          : { embeddingProvider: new LazyEmbeddingProvider(() => this.resolveEmbeddingProvider()) }),
+      });
       this.subManager = new SubscriptionManager(this.store.hooks, {
         resolveVault: () => this.config?.name ?? "",
+      });
+      // Embedding-on-write arm (semantic search MVP, C2): any note create/
+      // update arms the embedding alarm — cheap (just maybe-setAlarm, see
+      // scheduleEmbeddingAlarm), so it costs nothing extra on the hot write
+      // path. The ACTUAL provider call is deferred to the alarm (mirrors
+      // cloud's own transcription pattern — the write path never blocks on a
+      // Workers AI round-trip), which then re-scans via
+      // getNotesPendingEmbedding and embeds whatever chunks are genuinely
+      // stale (a no-op edit costs zero provider calls — core's staleness
+      // gate, unchanged here). Resetting `embeddingBackfillDone` to false
+      // in-memory closes the gap if the arm call itself is ever lost (a
+      // scheduling hiccup — the same best-effort posture
+      // scheduleTranscriptionAlarm documents): the NEXT request's
+      // maybeArmEmbeddingBackfill will retry.
+      this.store.hooks.onNote({
+        name: "embedding-alarm-arm",
+        event: ["created", "updated"],
+        handler: async () => {
+          this.embeddingBackfillDone = false;
+          try {
+            await this.scheduleEmbeddingAlarm();
+          } catch (e) {
+            console.warn("[embed-hook]", errText(e));
+          }
+        },
       });
     } catch (e) {
       this.bootError = errText(e);
@@ -411,6 +548,9 @@ export class VaultDO extends DurableObject {
         // the cloud analogue of the self-host landing's `transcription` flag
         // (parachute-vault vault#529), extended with the metered `minutes_remaining`.
         transcription: this.transcriptionCapability(),
+        // Semantic-search capability (C2, EXPERIMENTAL) — same placement +
+        // shape as self-host's routes.ts `embeddings` field (capability.ts).
+        embeddings: await this.embeddingCapability(),
         stats: await this.store.getVaultStats(),
       });
     }
@@ -527,6 +667,9 @@ export class VaultDO extends DurableObject {
         // landing carries (self-host declares it on /api/vault too — notes-ui
         // must not need its landing-fallback probe against cloud).
         this.transcriptionCapability(),
+        // Same parity for the semantic-search capability (C2, EXPERIMENTAL) —
+        // self-host's routes.ts declares `embeddings` on /api/vault too.
+        await this.embeddingCapability(),
       );
       return res;
     }
@@ -555,6 +698,7 @@ export class VaultDO extends DurableObject {
         this.config.name = vaultName;
         void this.ctx.storage.put("config", this.config);
       }
+      await this.maybeArmEmbeddingBackfill();
       return;
     }
     const stored = (await this.ctx.storage.get<VaultConfigState>("config")) ?? null;
@@ -587,6 +731,31 @@ export class VaultDO extends DurableObject {
     this.transcribeMinutes = (await this.ctx.storage.get<number>(TRANSCRIBE_MINUTES_KEY)) ?? 0;
     this.transcribeMonth = (await this.ctx.storage.get<string>(TRANSCRIBE_MONTH_KEY)) ?? "";
     this.stateLoaded = true;
+    await this.maybeArmEmbeddingBackfill();
+  }
+
+  /**
+   * Arms the embedding alarm when the backfill isn't known-complete yet
+   * (semantic search MVP, C2). Cheap on the common (already-drained) case —
+   * a cached boolean check, no storage I/O — and a no-op-when-already-armed
+   * `getAlarm`/maybe-`setAlarm` check on every request until the first alarm
+   * wake finds nothing left to embed and persists completion (see
+   * `drainEmbeddingsOnce`).
+   *
+   * This is what kicks off backfill for a vault with PRE-EXISTING notes and
+   * no NEW writes: a fresh v27 migration adds zero `note_vectors` rows (core's
+   * `migrateToV27` is purely additive DDL — see its doc comment), so nothing
+   * else would ever notice the gap for an idle-but-read vault. Note writes
+   * arm independently via the `embedding-alarm-arm` hook (the constructor) —
+   * this covers the complementary "no new writes" case. Disabled vaults
+   * (`store.embeddingProvider` undefined) skip entirely — nothing to backfill.
+   */
+  private async maybeArmEmbeddingBackfill(): Promise<void> {
+    if (!this.store.embeddingProvider) return;
+    if (this.embeddingBackfillDone === undefined) {
+      this.embeddingBackfillDone = (await this.ctx.storage.get<boolean>(EMBEDDING_BACKFILL_DONE_KEY)) ?? false;
+    }
+    if (!this.embeddingBackfillDone) await this.scheduleEmbeddingAlarm();
   }
 
   /**
@@ -1629,6 +1798,48 @@ export class VaultDO extends DurableObject {
   }
 
   /**
+   * Resolve the embedding provider (semantic search MVP, C2) — the injected
+   * test stub, else a memoized `WorkersAiEmbeddingProvider`. This is what
+   * `LazyEmbeddingProvider` calls on every access; only reached when
+   * embeddings are enabled (see the constructor's off-switch gate).
+   *
+   * Under the vitest harness (`ENVIRONMENT === "test"`) WITHOUT an injected
+   * stub, this deliberately does NOT fall back to a bare `env.AI` — mirrors
+   * `cleanupGenerator()`'s identical guard just below. Observed live: the
+   * local dev/test AI binding attempts a REAL, uncredentialed Cloudflare API
+   * call (`InferenceUpstreamError` on `/memberships`) and fails slowly —
+   * every pre-existing alarm-touching test (e.g. transcription-do.test.ts)
+   * would otherwise pay that network round-trip on every `alarm()` call,
+   * purely because the embedding-on-write hook arms the SAME shared alarm.
+   * Passing `undefined` makes `available()` report "not configured" cheaply
+   * (no network touch) — tests that want the enabled path inject a stub via
+   * `__setTestEmbeddingProvider` instead, exactly like transcription's
+   * `__setTestProvider`.
+   */
+  private resolveEmbeddingProvider(): EmbeddingProvider {
+    if (this.testEmbeddingProvider) return this.testEmbeddingProvider;
+    if (this.realEmbeddingProvider) return this.realEmbeddingProvider;
+    const ai = this.env.ENVIRONMENT === "test" ? undefined : this.env.AI;
+    return (this.realEmbeddingProvider = new WorkersAiEmbeddingProvider(ai));
+  }
+
+  /**
+   * The semantic-search capability for the landing (mirrors
+   * `transcriptionCapability()`'s placement + self-host's
+   * `resolveEmbeddingCapability`, wire-shape-identical): `enabled` only when
+   * a provider is configured AND its cheap `available()` probe passes.
+   * `undefined` `store.embeddingProvider` (the off-switch case) short-
+   * circuits before ever touching the provider.
+   */
+  private async embeddingCapability(): Promise<{ enabled: boolean; provider?: string; model?: string }> {
+    const provider = this.store.embeddingProvider;
+    if (!provider) return { enabled: false };
+    const avail = await provider.available();
+    if (!avail.ok) return { enabled: false };
+    return { enabled: true, provider: provider.name, model: provider.model };
+  }
+
+  /**
    * Resolve the transcript-cleanup text generator — the injected test stub,
    * else the `env.AI` binding (the cleanup pass reaches the same Workers AI
    * binding as whisper). Under the vitest harness (`ENVIRONMENT === "test"`) we
@@ -1661,18 +1872,58 @@ export class VaultDO extends DurableObject {
   }
 
   /**
-   * The transcription pipeline (cloud#56). Fires off the request path (armed by
-   * a `transcribe:true` attachment link, or re-armed after a backoff). Drains
-   * pending attachments FIFO, ONE inference per wake — whisper-turbo runs up to
-   * ~240 s of wall-clock as an I/O subrequest, so a single alarm invocation
-   * handles one attachment and re-arms if more remain (bounding each wake's work
-   * and keeping the meter/soft-cap re-checked between attachments).
+   * Arm the embedding alarm to fire ~immediately (semantic search MVP, C2).
+   * DELIBERATELY SEPARATE from {@link scheduleTranscriptionAlarm} (same body
+   * shape, not shared) — the transcription pipeline is LIVE in production and
+   * this keeps the two arm paths independently auditable; either can be
+   * reasoned about (and, if ever needed, reverted) without touching the
+   * other's code. Called from the embedding-on-write hook (constructor) and
+   * from `maybeArmEmbeddingBackfill` (the no-new-writes backfill-kickoff
+   * path). Same idempotent "only set when nothing is already armed" contract
+   * as the transcription version — `alarm()` re-checks BOTH queues on every
+   * wake regardless of which one triggered it (see `alarm()`'s doc), so a
+   * coalesced arm never starves either queue.
+   */
+  private async scheduleEmbeddingAlarm(): Promise<void> {
+    // Reentrancy guard — see `alarmRunning`'s doc. `alarm()`'s own trailing
+    // `rearmFromPending` re-checks both queues' FINAL state unconditionally,
+    // so skipping a mid-wake arm attempt never loses work.
+    if (this.alarmRunning) return;
+    try {
+      const existing = await this.ctx.storage.getAlarm();
+      if (existing === null) await this.ctx.storage.setAlarm(Date.now());
+    } catch (e) {
+      console.warn(`[embed-schedule ${this.config?.name}]`, errText(e));
+    }
+  }
+
+  /**
+   * The transcription pipeline (cloud#56) AND the embedding backfill/on-write
+   * drain (semantic search MVP, C2) — ONE alarm, TWO independently-processed
+   * concerns, multiplexed by running both in sequence every wake and
+   * combining their re-arm timing at the end. This is the safest design that
+   * still shares the DO's single physical alarm (a DO can only hold one
+   * armed time at once — two SEPARATE alarms isn't an option):
    *
-   * Mirrors the self-host worker's terminal semantics (surgical placeholder
-   * replacement, {@link TRANSCRIBE_MAX_ATTEMPTS}-attempt backoff, an
-   * "unavailable" marker on terminal failure, retention on success) so the
-   * eternal "Transcribing…" spinner (cloud#56) always resolves to text or a
-   * marker — never infinite pending.
+   *   - Transcription's own block (`dueTranscription`/`transcribeOne`) is
+   *     BYTE-FOR-BYTE UNCHANGED — same call, same try/catch, same position,
+   *     first in the sequence. It still gets exactly what it got before.
+   *   - The embedding drain (`drainEmbeddingsOnce`) runs AFTER, uses its OWN
+   *     state (`note_vectors`/`getNotesPendingEmbedding` — a completely
+   *     different table/queue than `listAttachmentsByTranscribeStatus`), and
+   *     cannot observe or mutate anything transcription reads. There is no
+   *     shared mutable state between the two blocks other than "did a wake
+   *     happen" — so neither can starve or corrupt the other's data.
+   *   - The one shared resource is the alarm's OWN re-arm timestamp
+   *     (`rearmFromPending`, extended — not forked — to accept an explicit
+   *     `embeddingNeedsRearm` flag; see its doc for the proof that passing
+   *     `false` reproduces transcription's ORIGINAL re-arm behavior exactly).
+   *
+   *   Embedding's OWN per-wake budget (`EMBED_NOTES_PER_WAKE`, a bounded
+   *   BATCH per Workers AI call) is far cheaper than whisper's up-to-~240s
+   *   inference, so running it every wake — even a transcription-triggered
+   *   one — never meaningfully lengthens a wake that already budgets for a
+   *   single whisper call.
    */
   async alarm(): Promise<void> {
     if (this.bootError) return;
@@ -1680,30 +1931,58 @@ export class VaultDO extends DurableObject {
     const cfg = (await this.ctx.storage.get<VaultConfigState>("config")) ?? null;
     const vaultName = cfg?.name;
     if (!vaultName) return;
-    await this.ensureState(vaultName);
 
-    // Wake entry point: keep the live-query subscriptions consistent (rehydrate
-    // once per warm DO) and sweep stale sockets. Additive to — never touching —
-    // the transcription drain below (the alarm's owner). The transcription alarm
-    // and the WS binding share no state; a scheduled far-future transcription
-    // alarm does NOT keep an idle-WS vault awake (hibernation still evicts; the
-    // alarm re-fires the DO only when actually due).
-    await this.ensureSubscriptionsRehydrated();
-    await this.sweepWsSockets();
+    // Reentrancy guard (C2) — see `alarmRunning`'s doc: a note write inside
+    // THIS invocation (transcribeOne's own patchNoteBody) fires the SAME
+    // embedding-on-write hook a REST/MCP write does, which would otherwise
+    // try to arm a SECOND alarm for "now" while this one is still running.
+    this.alarmRunning = true;
+    try {
+      await this.ensureState(vaultName);
 
-    const due = await this.dueTranscription();
-    if (due) {
-      try {
-        await this.transcribeOne(vaultName, due);
-      } catch (e) {
-        console.error(`[transcribe ${vaultName}] unexpected error on ${due.id}:`, errText(e));
+      // Wake entry point: keep the live-query subscriptions consistent (rehydrate
+      // once per warm DO) and sweep stale sockets. Additive to — never touching —
+      // the transcription drain below (the alarm's owner). The transcription alarm
+      // and the WS binding share no state; a scheduled far-future transcription
+      // alarm does NOT keep an idle-WS vault awake (hibernation still evicts; the
+      // alarm re-fires the DO only when actually due).
+      await this.ensureSubscriptionsRehydrated();
+      await this.sweepWsSockets();
+
+      const due = await this.dueTranscription();
+      if (due) {
+        try {
+          await this.transcribeOne(vaultName, due);
+        } catch (e) {
+          console.error(`[transcribe ${vaultName}] unexpected error on ${due.id}:`, errText(e));
+        }
       }
+
+      // Embedding drain (C2) — runs every wake, independent of whether a
+      // transcription was due. See drainEmbeddingsOnce's doc for the outcome
+      // shape; `more`/`failed` decide the re-arm below, `empty`/(`partial` with
+      // no more) persist the backfill-complete flag so idle requests stop
+      // arm-checking (maybeArmEmbeddingBackfill).
+      const embedOutcome = await this.drainEmbeddingsOnce();
+      const embeddingDone =
+        embedOutcome.kind === "empty" || (embedOutcome.kind === "partial" && !embedOutcome.more);
+      if (embeddingDone) {
+        this.embeddingBackfillDone = true;
+        await this.ctx.storage.put(EMBEDDING_BACKFILL_DONE_KEY, true);
+      }
+      const embeddingNeedsRearm =
+        embedOutcome.kind === "failed" || (embedOutcome.kind === "partial" && embedOutcome.more);
+
+      // Re-arm from the CURRENT pending set on BOTH queues: soonest of (a due
+      // transcription item → now, a backed-off item → its backoff time, more/
+      // failed embedding work → now), or leave no alarm when NEITHER queue has
+      // anything pending. One whisper inference per wake either way, and we
+      // wake exactly when the next item is actually due (never spin early on a
+      // backed-off item).
+      await this.rearmFromPending(vaultName, embeddingNeedsRearm);
+    } finally {
+      this.alarmRunning = false;
     }
-    // Re-arm from the CURRENT pending set: soonest of (a due item → now, a
-    // backed-off item → its backoff time), or leave no alarm when the queue is
-    // empty. One inference per wake, and we wake exactly when the next item is
-    // actually due (never spin early on a backed-off item).
-    await this.rearmFromPending(vaultName);
   }
 
   /**
@@ -1740,20 +2019,117 @@ export class VaultDO extends DurableObject {
     return pending.find((att) => backoffUntil(att) <= now);
   }
 
-  /** Set the alarm to when the next pending attachment becomes due (a due item
-   *  → now; else the earliest backoff time); no pending → no alarm. */
-  private async rearmFromPending(vaultName: string): Promise<void> {
+  /**
+   * Set the alarm to when the next pending item becomes due, across BOTH
+   * queues — transcription attachments AND (C2) the embedding backfill/
+   * on-write drain. `embeddingNeedsRearm=true` means "wake again ~now"
+   * (mirrors a due transcription item, not a backed-off one — embedding
+   * failures/more-pending both want a prompt retry, there is no embedding
+   * backoff schedule).
+   *
+   * PROOF this is transcription-behavior-preserving when
+   * `embeddingNeedsRearm=false` (the only value this function saw before
+   * C2): `soonest` starts at `POSITIVE_INFINITY` exactly like the original's
+   * `reduce` seed; the transcription `pending` loop computes the identical
+   * value the original did; embedding contributes NOTHING to `soonest` when
+   * its flag is false; `!Number.isFinite(soonest)` is true iff
+   * `pending.length === 0` (a non-empty `pending` always yields a finite
+   * `soonest` via the same `Math.min` reduction — `until` is always a real
+   * timestamp), which reproduces the original's `if (pending.length === 0)
+   * return;` early exit exactly. So this is a superset, not a rewrite, of
+   * the pre-C2 transcription-only logic.
+   */
+  private async rearmFromPending(vaultName: string, embeddingNeedsRearm: boolean): Promise<void> {
     try {
       const pending = await this.store.listAttachmentsByTranscribeStatus("pending", 50);
-      if (pending.length === 0) return;
       const now = Date.now();
-      const soonest = pending.reduce((min, att) => {
-        const until = backoffUntil(att);
-        return Math.min(min, until <= now ? now : until);
-      }, Number.POSITIVE_INFINITY);
-      await this.ctx.storage.setAlarm(Number.isFinite(soonest) ? soonest : now);
+      let soonest = Number.POSITIVE_INFINITY;
+      if (pending.length > 0) {
+        soonest = pending.reduce((min, att) => {
+          const until = backoffUntil(att);
+          return Math.min(min, until <= now ? now : until);
+        }, soonest);
+      }
+      if (embeddingNeedsRearm) soonest = Math.min(soonest, now);
+      if (!Number.isFinite(soonest)) return; // neither queue has anything pending
+      await this.ctx.storage.setAlarm(soonest);
     } catch (e) {
-      console.warn(`[transcribe ${vaultName}] re-arm check failed:`, errText(e));
+      console.warn(`[alarm-rearm ${vaultName}] re-arm check failed:`, errText(e));
+    }
+  }
+
+  /**
+   * One bounded pass of the embedding backfill/on-write drain (semantic
+   * search MVP, C2). Batches up to {@link EMBED_NOTES_PER_WAKE} notes' worth
+   * of stale chunks into a SINGLE Workers AI call per wake — unlike
+   * transcription's "one inference per wake" (whisper's ~240s budget),
+   * embedding inference is fast, so processing several notes per wake is
+   * safe and keeps a large vault's backfill from taking forever.
+   *
+   * Mirrors self-host's `EmbeddingWorker.embedNote` shape (chunk → diff
+   * against existing `note_vectors` rows via `planStaleness` → prune
+   * obsolete rows BEFORE any provider call → embed only what's genuinely
+   * stale) but batches MULTIPLE notes into that one provider call instead of
+   * one note at a time. A no-op edit (identical content, same model) costs
+   * ZERO provider calls — the same freshness gate core's self-host worker
+   * relies on, unchanged here.
+   *
+   * Returns a discriminated outcome (not a bare boolean) so `alarm()` can
+   * tell "genuinely nothing pending" (safe to persist backfill-complete)
+   * apart from "provider unavailable" or "this batch's embed call failed"
+   * (neither of which means the QUEUE is empty — see the call site).
+   */
+  private async drainEmbeddingsOnce(): Promise<
+    | { kind: "disabled" | "unavailable" | "empty" }
+    | { kind: "partial" | "failed"; more: boolean }
+  > {
+    const provider = this.store.embeddingProvider;
+    if (!provider) return { kind: "disabled" };
+    const avail = await provider.available();
+    if (!avail.ok) return { kind: "unavailable" };
+
+    const db = this.store.db;
+    // +1 peeks past the wake's own batch so `more` is known without a
+    // separate COUNT query.
+    const pending = getNotesPendingEmbedding(db, provider.model, EMBED_NOTES_PER_WAKE + 1);
+    if (pending.length === 0) return { kind: "empty" };
+    const more = pending.length > EMBED_NOTES_PER_WAKE;
+    const batch = more ? pending.slice(0, EMBED_NOTES_PER_WAKE) : pending;
+
+    const toEmbed: { noteId: string; chunk: Chunk }[] = [];
+    for (const row of batch) {
+      const chunks = chunkNoteContent(row.content).filter((c) => c.text.trim().length > 0);
+      const existing = getNoteVectorRows(db, row.id);
+      const plan = planStaleness(existing, chunks, provider.model);
+      // Cheap sync write — prunes ghost chunks from a shrunk note or a model
+      // change BEFORE any embed call, mirroring self-host's embed-on-write
+      // hook exactly (core/src/embedding/staleness.ts).
+      deleteObsoleteVectorRows(db, row.id, plan.obsoleteIxs);
+      for (const chunk of plan.stale) toEmbed.push({ noteId: row.id, chunk });
+    }
+    if (toEmbed.length === 0) {
+      // Every note in this batch was already fresh (a race with a
+      // concurrent write, or getNotesPendingEmbedding's coarse "zero rows"
+      // definition — see its doc). Nothing to call the provider for on THIS
+      // wake, but `more` still reflects whether more candidates exist.
+      return { kind: "partial", more };
+    }
+
+    try {
+      const { vectors } = await provider.embed({ texts: toEmbed.map((t) => t.chunk.text) });
+      for (let i = 0; i < toEmbed.length; i++) {
+        const vector = vectors[i];
+        if (!vector) continue; // defensive: provider returned fewer vectors than requested
+        const { noteId, chunk } = toEmbed[i]!;
+        upsertNoteVector(db, noteId, chunk, normalize(vector), provider.model, contentHash(chunk.text));
+      }
+      return { kind: "partial", more };
+    } catch (e) {
+      console.error(`[embeddings ${this.config?.name}] embed batch failed:`, errText(e));
+      // Leave stale — idempotent: the next wake re-derives the same plan
+      // (planStaleness re-diffs against CURRENT content_hash every time) and
+      // retries.
+      return { kind: "failed", more };
     }
   }
 
@@ -2000,6 +2376,26 @@ export class VaultDO extends DurableObject {
   async __transcribeMeter(vaultName: string): Promise<{ minutes: number; month: string }> {
     await this.ensureState(vaultName);
     return { minutes: this.usedMinutesThisMonth(), month: this.transcribeMonth };
+  }
+
+  /**
+   * TEST RPC: inject a stub embedding provider (semantic search MVP, C2) so
+   * the alarm's embedding drain runs deterministically without a live
+   * Workers AI binding. `LazyEmbeddingProvider.resolve()` picks this up on
+   * its NEXT call — no re-construction needed on an already-booted DO. Set
+   * via `runInDurableObject` in the vitest suite; never called on a deployed
+   * path.
+   */
+  __setTestEmbeddingProvider(provider: EmbeddingProvider): void {
+    this.testEmbeddingProvider = provider;
+  }
+
+  /** TEST RPC: force the embedding backfill-complete flag back to unknown/
+   *  false so a test can assert the per-request arm-check re-arms after a
+   *  prior test drained a shared-name vault (defensive; tests use unique
+   *  vault names so this is rarely needed). */
+  __resetEmbeddingBackfillState(): void {
+    this.embeddingBackfillDone = undefined;
   }
 
   /** POST /api/storage/upload · GET /api/storage/<date>/<file> — R2-backed. */

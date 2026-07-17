@@ -23,6 +23,18 @@ export interface Env {
    */
   AI?: Ai;
 
+  /**
+   * Semantic-search off switch (C2, EXPERIMENTAL). Explicit `"true"`/`"false"`
+   * string in wrangler `[vars]` (declared in BOTH blocks, not left unset —
+   * unlike self-host's unset-means-on default, cloud states the toggle
+   * explicitly so an operator can see + flip it). Only the literal string
+   * `"false"` (case-insensitive, trimmed) disables the provider — every other
+   * value, including unset, is enabled. When disabled: zero Workers AI embed
+   * calls, `query-notes { semantic: true }` answers `semantic_unavailable`
+   * exactly like a vault with no provider configured.
+   */
+  EMBEDDINGS_ENABLED?: string;
+
   // --- vars (wrangler [vars] / secrets) ---
   /** Identity Worker origin — token `iss` pin + JWKS/revocation fetch base. */
   ISSUER_ORIGIN: string;

@@ -149,6 +149,11 @@ CAP_BYTES = "1073741824"
 # src/auth.ts fully inert (it requires ENVIRONMENT="test" AND a TEST_JWKS var —
 # now neither holds). Tests pin ENVIRONMENT="test" in vitest.config.ts bindings.
 ENVIRONMENT = "production"
+# Semantic search off switch (C2, EXPERIMENTAL) — stated explicitly (unlike
+# self-host's unset-means-on default) so the toggle is visible in the deployed
+# config. Only the literal "false" disables it; flip + redeploy this worker
+# ONLY (the pinned vault-worker-only ladder) to turn it off in an incident.
+EMBEDDINGS_ENABLED = "true"
 
 # A single incoming request's CPU budget resets per message; a large import that
 # arrives as one request may exceed the 30s default. Raise the ceiling.
@@ -203,6 +208,8 @@ VAULT_BASE_DOMAIN = "parachute-vault-do-staging.openparachute.workers.dev"
 CAP_BYTES = "1073741824"
 # "staging" ≠ "test": the TEST_JWKS double-gate stays closed here too.
 ENVIRONMENT = "staging"
+# Semantic search off switch (C2, EXPERIMENTAL) — see the top-level [vars] note.
+EMBEDDINGS_ENABLED = "true"
 
 # Workers Logs for staging too (explicit per-env restatement; see the top-level
 # [observability] note).

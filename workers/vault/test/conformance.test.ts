@@ -453,6 +453,22 @@ describe("vault landing + config", () => {
     expect(apiVault.transcription).toEqual({ enabled: true, minutes_remaining: 600 });
     expect(apiVault.transcription).toEqual(landing.transcription);
   });
+
+  // Cross-door capability parity for semantic search (C2, EXPERIMENTAL) —
+  // self-host declares `embeddings` on BOTH the landing and /api/vault
+  // (routes.ts handleVault via capability.ts's resolveEmbeddingCapability);
+  // cloud mirrors the same shape + placement. No provider is injected in
+  // this suite's default test env (see vault-do.ts's `resolveEmbeddingProvider`
+  // doc — it deliberately avoids a live, uncredentialed Workers AI call),
+  // so `enabled: false` here is the honest "not available" reading, byte-
+  // shaped identically to self-host's off/not-configured posture.
+  it("GET /api/vault carries the embeddings capability, shape-equal to the landing's", async () => {
+    const v = freshVault();
+    const apiVault = (await (await op(v, "/api/vault")).json()) as any;
+    const landing = (await (await op(v, "")).json()) as any;
+    expect(apiVault.embeddings).toEqual({ enabled: false });
+    expect(apiVault.embeddings).toEqual(landing.embeddings);
+  });
 });
 
 describe("CORS", () => {
