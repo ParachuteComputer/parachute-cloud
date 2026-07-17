@@ -16,7 +16,10 @@
  *     (free teaser + 404 pins, the staging-only sweep trigger, the admin comp
  *     lever, a live restore round-trip — section 17) → voice transcription
  *     (real Workers AI whisper, section 18) → semantic search (real Workers
- *     AI bge-m3 embed-on-write + near_text, section 18b — C2).
+ *     AI bge-m3 embed-on-write + near_text, section 18b — C2) → attachment
+ *     tickets (real MCP mint + streamed spend against a real DO/R2, section
+ *     18c — cloud#177's pre-prod condition; an Entry-tier mint refusal is
+ *     folded into section 20's own Entry fixture).
  *
  * This smoke CREATES accounts + vaults — that's what staging is for; NEVER
  * point it at production (scripts/smoke-prod.ts is the read-only prod check).
@@ -1683,6 +1686,156 @@ async function main() {
     fail("semantic: live embedding section threw (non-fatal — sections continue)", String(err));
   }
 
+  // 18c. Attachment tickets (cloud#177's DO mirror) — the pre-prod condition
+  //      from that PR's review: no vitest-workerd suite proves a REAL
+  //      Cloudflare round trip (a real DO + real R2, not miniflare). Mint
+  //      both tools over a REAL MCP session on the arrival vault, spend each
+  //      with a REAL streamed fetch against the deployed worker, and check
+  //      the resulting bytes back through REST's own byte-serve door —
+  //      mirrors §18/§18b's "live proof, non-fatal, arrival-vault" shape.
+  //      The Entry-tier attachment_bytes:0 MINT refusal is a SEPARATE,
+  //      plan-gated check added to §20 below, which already stands up its
+  //      own Entry-tier fixture user for the enforcement E2E — reused there
+  //      rather than minting a second throwaway account here.
+  if (arrivalVault && arrivalEmail) try {
+    const owner = await authorizeFor(arrivalEmail, arrivalPassword, arrivalVault);
+    if (!owner.token) {
+      fail("tickets: owner mints a token for the arrival vault", owner.error ?? "no token");
+    } else {
+      const AUTH = { authorization: `Bearer ${owner.token}` };
+      const MCP_HEADERS = { ...AUTH, "content-type": "application/json", accept: "application/json, text/event-stream" };
+      async function ticketMcp(body: unknown): Promise<any> {
+        const r = await fetch(`${VAULT}/vault/${arrivalVault}/mcp`, { method: "POST", headers: MCP_HEADERS, body: JSON.stringify(body) });
+        return { status: r.status, json: await r.json() };
+      }
+
+      // A small committed binary fixture — reuses voice-smoke.wav (57 KB);
+      // its audio content is irrelevant here, only its bytes round-tripping.
+      const fixture = readFileSync(join(HERE, "fixtures", "voice-smoke.wav"));
+      const fixtureBytes = new Uint8Array(fixture.buffer, fixture.byteOffset, fixture.byteLength);
+
+      const ticketNote = (await (await fetch(`${VAULT}/vault/${arrivalVault}/api/notes`, {
+        method: "POST",
+        headers: { ...AUTH, "content-type": "application/json" },
+        body: JSON.stringify({ content: `# Ticket smoke ${MARKER}\n\n_attachment pending_` }),
+      })).json()) as { id?: string };
+      assert(!!ticketNote.id, "tickets: created the target note for the upload ticket", ticketNote.id ?? "no id");
+      const noteId = ticketNote.id!;
+
+      // --- Upload ticket: mint over MCP → envelope shape → a REAL streamed
+      //     PUT spend against the deployed worker → 201.
+      const mint = await ticketMcp({
+        jsonrpc: "2.0",
+        id: 100,
+        method: "tools/call",
+        params: { name: "request-attachment-upload", arguments: { note: noteId, filename: "ticket-smoke.wav", size_bytes: fixtureBytes.byteLength, mime_type: "audio/wav" } },
+      });
+      const mintText: string = mint.json?.result?.content?.[0]?.text ?? "";
+      let envelope: any = null;
+      try { envelope = JSON.parse(mintText); } catch { /* leave null — assert fails below */ }
+      assert(
+        mint.status === 200 &&
+          !mint.json?.result?.isError &&
+          envelope?.method === "PUT" &&
+          typeof envelope?.url === "string" &&
+          typeof envelope?.expires_at === "string" &&
+          envelope?.max_bytes === fixtureBytes.byteLength &&
+          typeof envelope?.curl_example === "string",
+        "tickets: MCP request-attachment-upload → envelope (method/url/expires_at/max_bytes/curl_example)",
+        envelope ? JSON.stringify({ method: envelope.method, max_bytes: envelope.max_bytes, expires_at: envelope.expires_at }) : mintText.slice(0, 140),
+      );
+
+      const spendUrl: string = envelope?.url ?? "";
+      const spend = await fetch(spendUrl, {
+        method: "PUT",
+        headers: { "content-type": "audio/wav", "content-length": String(fixtureBytes.byteLength) },
+        body: fixtureBytes,
+      });
+      const spendBody = (await spend.json()) as { id?: string; path?: string; mimeType?: string };
+      assert(
+        spend.status === 201 && !!spendBody.id && !!spendBody.path,
+        "tickets: REAL streamed PUT spend (Content-Length set) → 201, attachment row registered",
+        `status ${spend.status} id=${spendBody.id} path=${spendBody.path}`,
+      );
+
+      // Single-use: spending the SAME URL again → the uniform 404.
+      const respend = await fetch(spendUrl, {
+        method: "PUT",
+        headers: { "content-type": "audio/wav", "content-length": String(fixtureBytes.byteLength) },
+        body: fixtureBytes,
+      });
+      const respendBody = (await respend.json()) as { error_type?: string };
+      assert(
+        respend.status === 404 && respendBody.error_type === "not_found",
+        "tickets: a second spend of the SAME upload ticket → uniform 404 (single-use)",
+        `status ${respend.status} type=${respendBody.error_type}`,
+      );
+
+      // REST GET the attachment bytes back through the byte-serve door — the
+      // SAME path REST's own /api/storage/upload populates — byte-compared
+      // against the fixture.
+      const attId = spendBody.id!;
+      const attPath = spendBody.path!;
+      const restGet = await fetch(`${VAULT}/vault/${arrivalVault}/api/storage/${attPath}`, { headers: AUTH });
+      const restBytes = new Uint8Array(await restGet.arrayBuffer());
+      const uploadByteIntact = restBytes.length === fixtureBytes.length && restBytes.every((b, i) => b === fixtureBytes[i]);
+      assert(
+        restGet.status === 200 && uploadByteIntact,
+        "tickets: REST GET /api/storage/<path> serves the ticket-spent bytes byte-intact",
+        `status ${restGet.status} got=${restBytes.length}B want=${fixtureBytes.length}B`,
+      );
+
+      // --- Download ticket: mint over MCP → a REAL GET spend → byte-compare
+      //     → second spend uniform 404 (single-use).
+      const dlMint = await ticketMcp({
+        jsonrpc: "2.0",
+        id: 101,
+        method: "tools/call",
+        params: { name: "request-attachment-download", arguments: { attachment_id: attId } },
+      });
+      const dlText: string = dlMint.json?.result?.content?.[0]?.text ?? "";
+      let dlEnvelope: any = null;
+      try { dlEnvelope = JSON.parse(dlText); } catch { /* leave null — assert fails below */ }
+      assert(
+        dlMint.status === 200 && !dlMint.json?.result?.isError && dlEnvelope?.method === "GET" && typeof dlEnvelope?.url === "string",
+        "tickets: MCP request-attachment-download → envelope (method/url)",
+        dlEnvelope ? JSON.stringify({ method: dlEnvelope.method, mime_type: dlEnvelope.mime_type }) : dlText.slice(0, 140),
+      );
+
+      const dlUrl: string = dlEnvelope?.url ?? "";
+      const dlSpend = await fetch(dlUrl);
+      const dlBytes = new Uint8Array(await dlSpend.arrayBuffer());
+      const downloadByteIntact = dlBytes.length === fixtureBytes.length && dlBytes.every((b, i) => b === fixtureBytes[i]);
+      assert(
+        dlSpend.status === 200 && downloadByteIntact,
+        "tickets: a REAL GET spend of the download ticket → byte-intact against the fixture",
+        `status ${dlSpend.status} got=${dlBytes.length}B want=${fixtureBytes.length}B`,
+      );
+
+      const dlRespend = await fetch(dlUrl);
+      assert(dlRespend.status === 404, "tickets: a second spend of the SAME download ticket → uniform 404 (single-use)", `status ${dlRespend.status}`);
+
+      // --- Oversized-declared mint: the 100 MiB hard ceiling
+      // (MAX_TICKET_UPLOAD_BYTES) is a mint-time refusal on EVERY plan tier —
+      // not the Entry-tier cap gate (checked separately in §20) — so this
+      // runs fine on the arrival user's trial vault.
+      const oversized = await ticketMcp({
+        jsonrpc: "2.0",
+        id: 102,
+        method: "tools/call",
+        params: { name: "request-attachment-upload", arguments: { note: noteId, filename: "too-big.bin", size_bytes: 100 * 1024 * 1024 + 1 } },
+      });
+      const oversizedData = oversized.json?.error?.data;
+      assert(
+        oversized.status === 200 && !!oversized.json?.error && oversizedData?.error_type === "file_too_large",
+        "tickets: a declared size_bytes over the 100 MiB ceiling → mint-time refusal (file_too_large, not plan-gated)",
+        JSON.stringify(oversizedData ?? oversized.json?.error ?? oversized.json),
+      );
+    }
+  } catch (err) {
+    fail("tickets: live ticket round-trip section threw (non-fatal — sections continue)", String(err));
+  }
+
   // 19. MOCK-upgrade E2E (mock-payments) — the live end-to-end proof, run LAST
   //     so its throwaway vault + Workers-AI inference can't perturb §17/§18's
   //     arrival-user snapshot/voice flow. Only in MOCK mode (real Stripe
@@ -1873,7 +2026,38 @@ async function main() {
           headers: { ...eAuth, "content-type": "application/json" },
           body: JSON.stringify({ content: "notes still write on a notes-only plan" }),
         });
+        const eNoteBody = (await eNote.json()) as { id?: string };
         assert(eNote.status === 201, "enforcement: note writes still work on Entry (notes meter is separate)", `status ${eNote.status}`);
+
+        // The MCP mint tool shares REST's SAME attachment gate ladder
+        // (cloud#177) — an Entry-tier request-attachment-upload MINT must
+        // refuse identically to the REST upload above, before any ticket is
+        // ever written (an agent learns before curling). Reuses THIS
+        // section's own Entry-tier fixture user/vault rather than minting a
+        // second throwaway account (see §18c's tickets section, which checks
+        // the non-plan-gated 100 MiB mint ceiling on the arrival user instead).
+        if (eNoteBody.id) {
+          const eMcpHeaders = { ...eAuth, "content-type": "application/json", accept: "application/json, text/event-stream" };
+          const eMint = await fetch(`${VAULT}/vault/${eVault}/mcp`, {
+            method: "POST",
+            headers: eMcpHeaders,
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 200,
+              method: "tools/call",
+              params: { name: "request-attachment-upload", arguments: { note: eNoteBody.id, filename: "nope.bin", size_bytes: 64 } },
+            }),
+          });
+          const eMintJson = (await eMint.json()) as any;
+          const eMintData = eMintJson?.error?.data;
+          assert(
+            eMint.status === 200 && !!eMintJson?.error && eMintData?.error_type === "attachments_not_included",
+            "enforcement: MCP request-attachment-upload MINT on Entry → attachments_not_included (mint gate matches REST)",
+            JSON.stringify(eMintData ?? eMintJson?.error ?? eMintJson),
+          );
+        } else {
+          fail("enforcement: MCP ticket-mint Entry check skipped — no note id from the Entry note-write above", "");
+        }
 
         // Admin comp the Entry user → EXPIRED → applyPlanToVaults pushes frozen.
         const eFCsrf = `smoke-frozen-${Date.now()}`;

@@ -209,6 +209,18 @@ async function main() {
     // hook must NOT exist in production.
     const embedRun = await fetch(`${VAULT}/vault/${VAULT_NAME}/__test/embed-run`, { method: "POST" });
     assert(embedRun.status === 404, "PRODUCTION: /vault/<name>/__test/embed-run does not exist (404)", `status ${embedRun.status}`);
+
+    // Attachment tickets (cloud#177's DO mirror): a bogus/unknown ticket id
+    // answers the SAME uniform 404 as a spent/expired/wrong-vault/wrong-kind
+    // one (no oracle) — read-only, no mint: `take()`'s SELECT+DELETE is a
+    // no-op against a row that was never there, so this touches no state.
+    const bogusTicket = await fetch(`${VAULT}/vault/${VAULT_NAME}/tickets/bogus-${Date.now()}`);
+    const bogusTicketBody = (await bogusTicket.json()) as { error_type?: string };
+    assert(
+      bogusTicket.status === 404 && bogusTicketBody.error_type === "not_found",
+      "PRODUCTION: GET /vault/<name>/tickets/<bogus-id> → uniform 404 (no oracle, read-only)",
+      `status ${bogusTicket.status} type=${bogusTicketBody.error_type}`,
+    );
   }
 
   // --- summary ---
