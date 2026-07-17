@@ -35,8 +35,9 @@
  */
 import type { Database } from "bun:sqlite";
 import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.js";
-import { buildVaultProjection } from "@openparachute/core/src/vault-projection.js";
+import { buildVaultProjection, attachmentsInstructionBlock } from "@openparachute/core/src/vault-projection.js";
 import type { Store } from "@openparachute/core/src/types.js";
+import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
 import { hasScopeForVault, type AuthResult, type VaultVerb } from "./auth.js";
 
 // Transcribed from the SDK's types.js so negotiation matches byte-for-byte.
@@ -114,10 +115,23 @@ export type McpWriteGate = () => Response | null;
  */
 const DELETE_CLASS_TOOLS = new Set(["delete-note", "delete-tag"]);
 
+/**
+ * The attachment-ticket upload mint (`core/src/mcp.ts`'s
+ * `request-attachment-upload`) is `requiredVerb: "write"` but must NOT run
+ * through the generic {@link isGatedWrite} → `writeGate()` path: that gate
+ * checks the NOTES meter (`capBlockIfFull`), and a mint is an ATTACHMENT
+ * write — it needs the attachment meter's own ladder (frozen →
+ * `attachments_not_included` → attachment cap), exactly the one REST's
+ * storage upload and the ticket spend route run (`caps.ts`,
+ * `attachment-tickets.ts`). See `handleToolCall`'s dedicated branch.
+ */
+const ATTACHMENT_UPLOAD_MINT_TOOL = "request-attachment-upload";
+
 /** A forward-mutating tool (create/update/prune) — the class the REST
- *  POST/PATCH/PUT cap+frozen gate covers. Read tools and DELETE-class tools are
- *  exempt (REST exempts both), so this is the exact "should the write gate run"
- *  predicate.
+ *  POST/PATCH/PUT cap+frozen gate covers. Read tools, DELETE-class tools, and
+ *  the attachment-upload mint (which runs its OWN gate — see
+ *  {@link ATTACHMENT_UPLOAD_MINT_TOOL}) are exempt, so this is the exact
+ *  "should the NOTES write gate run" predicate.
  *
  *  vault-info is the one read-verb tool that can ALSO mutate: it is
  *  `requiredVerb: "read"` (a read-only caller must keep the stats projection and
@@ -128,6 +142,7 @@ const DELETE_CLASS_TOOLS = new Set(["delete-note", "delete-tag"]);
  *  413), mirroring the REST write path. */
 function isGatedWrite(tool: McpToolDef, args: Record<string, unknown>): boolean {
   if (tool.name === "vault-info") return args.description !== undefined;
+  if (tool.name === ATTACHMENT_UPLOAD_MINT_TOOL) return false;
   return requiredVerbForTool(tool) !== "read" && !DELETE_CLASS_TOOLS.has(tool.name);
 }
 
@@ -151,6 +166,14 @@ async function gateError(id: JsonRpcId, blocked: Response): Promise<JsonRpcMessa
  * faithful-but-simple brief built from the vault description — the rich schema
  * projection (`buildVaultProjection`) is a documented follow-up; the
  * connector-critical bytes are the discovery chain + tool list, not this text.
+ *
+ * The Attachments orientation paragraph rides the SAME core helper bun's
+ * `projectionToMarkdown` folds in (`attachmentsInstructionBlock`, D0/§2a of
+ * the design) — one source for the sentence teaching `request-attachment-
+ * upload`/`-download`, so the two doors can't drift on it even though cloud
+ * doesn't (yet) adopt the full projection. `ticketsEnabled: true`
+ * unconditionally — this door always wires an `AttachmentTicketProvider`
+ * (see `VaultDO`'s constructor), same as bun.
  */
 export function serverInstruction(vaultName: string, description: string | null): string {
   const base =
@@ -158,7 +181,8 @@ export function serverInstruction(vaultName: string, description: string | null)
     `Read with query-notes; write with create-note / update-note; manage schema with list-tags / update-tag; ` +
     `traverse with find-path; orient with vault-info.`;
   const d = description?.trim();
-  return d ? `${d}\n\n${base}` : base;
+  const head = d ? `${d}\n\n${base}` : base;
+  return `${head}\n\n${attachmentsInstructionBlock({ ticketsEnabled: true })}`;
 }
 
 /**
@@ -263,7 +287,22 @@ function overrideVaultInfo(
   };
 }
 
-/** Map a core domain error to its JSON-RPC error shape (mirrors mcp-http.ts). */
+/**
+ * Map a core domain error to its JSON-RPC error shape (mirrors mcp-http.ts).
+ *
+ * The trailing generic branch is bun's "backstop" (its own doc comment:
+ * "nothing falls through to the unstructured isError text except a TRULY
+ * unknown error") — ported here because the attachment-ticket mint tools'
+ * validation errors (`missing_required_field`, `invalid_query`,
+ * `file_too_large`, `blocked_upload_extension`, …) are plain
+ * `structuredError()` leaves (core/src/mcp.ts), not one of the four
+ * dedicated domain-error classes above. Before this branch existed, EVERY
+ * `structuredError()` throw on cloud MCP silently degraded to unstructured
+ * `isError: true` text — losing `error_type` entirely, a real drift from
+ * bun's byte-shape (caught by this PR's own conformance suite on the mint
+ * tools' `missing_required_field` case). Not ticket-specific: this closes
+ * the gap for every core tool's `structuredError()` leaf on this door.
+ */
 function mapDomainError(err: unknown): { code: number; data: Record<string, unknown> } | null {
   const e = err as {
     code?: string;
@@ -276,6 +315,12 @@ function mapDomainError(err: unknown): { code: number; data: Record<string, unkn
     to?: unknown;
     current?: unknown;
     violations?: unknown;
+    error_type?: string;
+    hint?: string;
+    limit?: unknown;
+    got?: unknown;
+    extension?: string;
+    how_to?: string;
   };
   switch (e?.code) {
     case "CONFLICT":
@@ -310,6 +355,20 @@ function mapDomainError(err: unknown): { code: number; data: Record<string, unkn
         data: { error_type: "precondition_required", note_id: e.note_id, path: e.note_path ?? null },
       };
     default:
+      if (typeof e?.error_type === "string") {
+        return {
+          code: INVALID_PARAMS,
+          data: {
+            error_type: e.error_type,
+            ...(e.field !== undefined ? { field: e.field } : {}),
+            ...(e.hint !== undefined ? { hint: e.hint } : {}),
+            ...(e.limit !== undefined ? { limit: e.limit } : {}),
+            ...(e.got !== undefined ? { got: e.got } : {}),
+            ...(e.extension !== undefined ? { extension: e.extension } : {}),
+            ...(e.how_to !== undefined ? { how_to: e.how_to } : {}),
+          },
+        };
+      }
       return null;
   }
 }
@@ -321,10 +380,26 @@ function mapDomainError(err: unknown): { code: number; data: Record<string, unkn
  * for THIS vault. A tool the caller can't see in `tools/list` also can't be
  * called (dispatch is against the filtered set) — the primary defense, with the
  * generator's own gating as depth.
+ *
+ * `attachmentTickets` is ALWAYS passed (this door always wires a provider —
+ * see `VaultDO`'s constructor), so `request-attachment-upload`/`-download`
+ * are always present, mirroring bun's "tools omitted only when unwired"
+ * posture (D10) staying vacuously true here. `noteVisible` is omitted:
+ * cloud v1 has no tag-scoped tokens (`rest/tag-scope.ts` — every caller's
+ * `scoped_tags` is `null`), so every note/attachment is visible, same as the
+ * OTHER visibility predicates this file never wires either.
  */
-function visibleTools(store: Store, vaultName: string, auth: AuthResult): McpToolDef[] {
+function visibleTools(
+  store: Store,
+  vaultName: string,
+  auth: AuthResult,
+  attachmentTickets: { provider: AttachmentTicketProvider; urlBase: string },
+): McpToolDef[] {
   const writeContext = { actor: auth.actor, via: auth.via === "operator" ? "operator" : "mcp" };
-  const tools = generateMcpTools(store, { writeContext });
+  const tools = generateMcpTools(store, {
+    writeContext,
+    attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
+  });
   return tools.filter((t) => hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)));
 }
 
@@ -333,6 +408,7 @@ async function handleToolCall(
   params: Record<string, unknown> | undefined,
   tools: McpToolDef[],
   writeGate: McpWriteGate,
+  attachmentMintGate: (declaredBytes: number) => Response | null,
 ): Promise<JsonRpcMessage> {
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
@@ -342,12 +418,25 @@ async function handleToolCall(
   if (!tool) {
     return result(id, { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true });
   }
-  // The paywall + cap gate — a forward-mutating verb (create/update/prune) gets
-  // the SAME frozen-then-cap enforcement the REST write path applies; read-class
-  // AND delete-class verbs pass through (REST exempts both). MCP is the flagship
-  // write door, so without this an expired (frozen) tenant's connected AI could
-  // keep writing forever and a two-meter notes-cap-full vault could keep growing.
-  if (isGatedWrite(tool, args)) {
+  if (name === ATTACHMENT_UPLOAD_MINT_TOOL) {
+    // The attachment gate ladder, AT MINT, against the caller's DECLARED
+    // size — an agent learns `plan_required`/`attachments_not_included`/
+    // `storage_cap_exceeded` before ever curling (D7 of the design). Only
+    // runs when `size_bytes` is already a plausible positive number; an
+    // absent/invalid one falls through to core's own execute(), which
+    // raises the field-validation error — the gate never masks THAT with a
+    // confusing cap refusal.
+    const sizeBytes = args.size_bytes;
+    if (typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > 0) {
+      const blocked = attachmentMintGate(sizeBytes);
+      if (blocked) return gateError(id, blocked);
+    }
+  } else if (isGatedWrite(tool, args)) {
+    // The paywall + cap gate — a forward-mutating verb (create/update/prune) gets
+    // the SAME frozen-then-cap enforcement the REST write path applies; read-class
+    // AND delete-class verbs pass through (REST exempts both). MCP is the flagship
+    // write door, so without this an expired (frozen) tenant's connected AI could
+    // keep writing forever and a two-meter notes-cap-full vault could keep growing.
     const blocked = writeGate();
     if (blocked) return gateError(id, blocked);
   }
@@ -364,7 +453,13 @@ async function handleToolCall(
 
 async function handleOne(
   m: JsonRpcMessage,
-  ctx: { tools: McpToolDef[]; vaultName: string; description: string | null; writeGate: McpWriteGate },
+  ctx: {
+    tools: McpToolDef[];
+    vaultName: string;
+    description: string | null;
+    writeGate: McpWriteGate;
+    attachmentMintGate: (declaredBytes: number) => Response | null;
+  },
 ): Promise<JsonRpcMessage> {
   const { id = null, method, params } = m;
   try {
@@ -386,7 +481,7 @@ async function handleOne(
           tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
         });
       case "tools/call":
-        return handleToolCall(id, params, ctx.tools, ctx.writeGate);
+        return handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate);
       case "ping":
         return result(id, {});
       default:
@@ -410,6 +505,16 @@ export async function handleMcp(
   description: string | null,
   writeGate: McpWriteGate,
   vaultInfo: VaultInfoContext,
+  /**
+   * The attachment-tickets seam (Wave 1 DO mirror): the DO-storage-backed
+   * provider (`attachment-tickets.ts`) + the SAME attachment gate ladder
+   * REST's storage upload and the ticket spend route run, applied here at
+   * MINT against the caller's declared size (D7 — "an agent learns before
+   * curling"). Always supplied by `VaultDO.fetch` (this door always wires a
+   * provider); no optionality here keeps `visibleTools` from ever needing
+   * to special-case an unwired seam on cloud.
+   */
+  tickets: { provider: AttachmentTicketProvider; mintGate: (declaredBytes: number) => Response | null },
 ): Promise<Response> {
   if (req.method === "DELETE") return new Response(null, { status: 200 });
   if (req.method !== "POST") {
@@ -471,12 +576,19 @@ export async function handleMcp(
     return new Response(null, { status: 202 });
   }
 
-  const tools = visibleTools(store, vaultName, auth);
+  // Request-derived origin (X-Forwarded-Host/proto, same as `publicOrigin`
+  // elsewhere on this door) — the ticket URL base a mint tool returns, so a
+  // curled URL always names the origin the agent actually connected
+  // through (the self-healing-under-expose-changes property the design
+  // calls for; bun derives it the same way, `mcp-tools.ts`'s `ticketUrlBase`).
+  const origin = publicOrigin(req);
+  const ticketUrlBase = `${origin.replace(/\/$/, "")}/vault/${vaultName}`;
+  const tools = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase });
   // Wire the server-layer vault-info override onto the caller-visible tool set
   // (core ships a placeholder execute — "must be configured by the server
   // layer"). Parity with bun's mcp-tools.ts overrideVaultInfo.
-  overrideVaultInfo(tools, { vaultName, auth, description, origin: publicOrigin(req), ctx: vaultInfo });
-  const ctx = { tools, vaultName, description, writeGate };
+  overrideVaultInfo(tools, { vaultName, auth, description, origin, ctx: vaultInfo });
+  const ctx = { tools, vaultName, description, writeGate, attachmentMintGate: tickets.mintGate };
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));
 
