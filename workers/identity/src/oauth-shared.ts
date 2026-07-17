@@ -200,7 +200,14 @@ export function depsForEnv(env: Env): OAuthDeps {
     issuer,
     vaultBaseDomain: env.VAULT_BASE_DOMAIN,
     vaultOrigin: env.VAULT_ORIGIN,
-    vaultPublicOrigin: env.VAULT_PUBLIC_ORIGIN ?? env.VAULT_ORIGIN,
+    // Left UNCOALESCED with VAULT_ORIGIN (unlike a plausible-looking "just
+    // default it here" instinct): `vaultAdvertisedUrl` already applies its
+    // own `?? deps.vaultOrigin` fallback for vault-address URLs, and
+    // `frontDoorOrigin` (oauth-shared.ts) needs a genuine `undefined` here to
+    // fall through to `appOrigin` instead — staging (PUBLIC unset, ORIGIN set
+    // to the vault WORKER's own origin) would otherwise 302 GET /signup to a
+    // host with no SPA on it (cloud#178 review finding).
+    vaultPublicOrigin: env.VAULT_PUBLIC_ORIGIN,
     // Where a new arrival lands (post-create 303, vault cards, checklist doors) —
     // APP_ORIGIN when set, else the legacy Notes PWA (resolveAppOrigin).
     appOrigin: resolveAppOrigin(env),

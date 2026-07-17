@@ -411,6 +411,22 @@ describe("console — signup", () => {
     expect(await getUserByEmail(env.DB, "headless@example.com")).not.toBeNull();
   });
 
+  // REGRESSION (cloud#178 review): the committed prod config always sets
+  // VAULT_PUBLIC_ORIGIN, so the test above never exercised the STAGING shape
+  // — PUBLIC unset, VAULT_ORIGIN set (to the vault WORKER's own origin, which
+  // serves no SPA). `depsForEnv` used to coalesce `vaultPublicOrigin` with
+  // VAULT_ORIGIN at construction time, which made `frontDoorOrigin`'s own
+  // `?? appOrigin` fallback dead code — GET /signup would have 302'd account
+  // creation straight at the vault worker. This is the deterministic
+  // equivalent of a live staging walk (accepted by the reviewer in lieu).
+  test("staging shape (VAULT_PUBLIC_ORIGIN unset, VAULT_ORIGIN set): GET /signup falls through to appOrigin, NOT the vault worker", async () => {
+    const stagingShapedEnv = { ...env, VAULT_PUBLIC_ORIGIN: undefined } as never;
+    const res = await app.fetch(new Request(`${ISSUER}/signup`), stagingShapedEnv);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(`${env.APP_ORIGIN}/`);
+    expect(res.headers.get("location")).not.toBe(`${env.VAULT_ORIGIN}/`);
+  });
+
   test("signup creates a user + session, redirects to /console", async () => {
     const res = await signup("newbie@example.com", "longenough1");
     expect(res.status).toBe(302);
