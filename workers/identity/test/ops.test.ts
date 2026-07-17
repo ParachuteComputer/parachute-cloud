@@ -111,7 +111,14 @@ describe("identity /health", () => {
   test("public, unauthenticated, cheap JSON", async () => {
     const res = await worker.fetch(new Request(`${ISSUER}/health`), env);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ status: "ok", service: "identity" });
+    const body = (await res.json()) as { status: string; service: string; version: unknown };
+    expect(body.status).toBe("ok");
+    expect(body.service).toBe("identity");
+    // `version` (cloud#174 fix) is env.CF_VERSION_METADATA.id — miniflare
+    // simulates the binding with its own runtime-generated id (not something
+    // to pin exactly here), or null on a bare config without it. Assert the
+    // SHAPE deploy-staging.sh's poll depends on, not a specific value.
+    expect(body.version === null || typeof body.version === "string").toBe(true);
   });
 });
 

@@ -108,7 +108,11 @@ export const app = new Hono<{ Bindings: Env }>();
 // Cheap JSON for external monitors + the smoke scripts. The scheduled health
 // check does NOT fetch this (a worker can't fetch its own route, and "the cron
 // fired" already proves the worker runs) — its identity leg checks D1 directly.
-app.get("/health", (c) => c.json({ status: "ok", service: "identity" }));
+// `version` (cloud#174 fix) is the ACTUAL deployed version currently serving
+// this request (env.CF_VERSION_METADATA.id) — null when the binding is absent
+// (bare/test configs). deploy-staging.sh polls this to confirm the just-
+// deployed version has actually propagated before running the smoke suite.
+app.get("/health", (c) => c.json({ status: "ok", service: "identity", version: c.env.CF_VERSION_METADATA?.id ?? null }));
 
 // --- discovery (public, wildcard CORS) ---
 app.options("/.well-known/*", () => corsPreflight());
