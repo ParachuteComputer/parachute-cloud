@@ -116,7 +116,10 @@ describe("day-0 welcome", () => {
     // surface, reply-to-a-human. The vault door uses the configured APP_ORIGIN
     // (wrangler default; #116); the connect door does too (post-cutover to app).
     expect(mail.text).toContain("https://app.parachute.computer/?add=");
-    expect(mail.text).toContain(encodeURIComponent(`${env.VAULT_ORIGIN}/vault/freshvault`));
+    // The vault door advertises the PUBLIC origin (VAULT_PUBLIC_ORIGIN — my.
+    // in the committed prod config), not the machine VAULT_ORIGIN (A3 URL
+    // coherence); reading the env var keeps this test config-driven either way.
+    expect(mail.text).toContain(encodeURIComponent(`${env.VAULT_PUBLIC_ORIGIN ?? env.VAULT_ORIGIN}/vault/freshvault`));
     expect(mail.text).toContain("https://app.parachute.computer/connect");
     expect(mail.text).not.toContain(`${ISSUER}/console`);
     expect(mail.text).toContain("Reply to this email. A person reads it.");

@@ -105,7 +105,7 @@ import {
   jsonResponse,
   redirectResponse,
   resolveBoundOrigins,
-  vaultInstanceUrl,
+  vaultAdvertisedUrl,
 } from "./oauth-shared.ts";
 
 function csrfExtra(setCookie?: string): Record<string, string> {
@@ -224,10 +224,12 @@ export async function handleLogoutPost(db: D1Database, req: Request, deps: OAuth
  * into the connect flow for that vault, targeting the APP origin (`deps.appOrigin`
  * — the same-origin app at `app.parachute.computer`, or the legacy Notes PWA when
  * APP_ORIGIN is unset). The CLI/MCP coordinates stay as the "Connect your AI"
- * secondary.
+ * secondary. `base` is the PUBLIC/advertised vault origin (`vaultAdvertisedUrl`
+ * — `my.parachute.computer` in prod, A3 URL coherence), not the machine
+ * `vaultInstanceUrl` the services catalog and internal dispatch use.
  */
 function cardFor(name: string, deps: OAuthDeps): ConsoleVaultCard {
-  const base = vaultInstanceUrl(name, deps);
+  const base = vaultAdvertisedUrl(name, deps);
   const app = deps.appOrigin;
   return {
     name,

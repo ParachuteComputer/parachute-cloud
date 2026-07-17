@@ -140,7 +140,7 @@ describe("first-run create — lands in Notes, tolerant of legacy fields", () =>
   }
 
   function notesDeepLink(vaultName: string): string {
-    return `${APP_ORIGIN}/?add=${encodeURIComponent(`https://u.parachute.computer/vault/${vaultName}`)}`;
+    return `${APP_ORIGIN}/?add=${encodeURIComponent(`https://my.parachute.computer/vault/${vaultName}`)}`;
   }
 
   test("a fresh create lands straight on the new vault's Notes UI (bridged past a cross-origin form-POST redirect)", async () => {
@@ -223,7 +223,7 @@ describe("create-vault — the progressive-enhancement JSON variant", () => {
   }
 
   function notesDeepLink(vaultName: string): string {
-    return `${APP_ORIGIN}/?add=${encodeURIComponent(`https://u.parachute.computer/vault/${vaultName}`)}`;
+    return `${APP_ORIGIN}/?add=${encodeURIComponent(`https://my.parachute.computer/vault/${vaultName}`)}`;
   }
 
   /** A create POST marked as a fetch (the create-form JS path) — via the
@@ -356,7 +356,7 @@ describe("getting-started checklist (POST /console/checklist)", () => {
     // door bridges too (P0 REVENUE fix, console.ts appDeepLinkRedirect).
     expect(res.status).toBe(200);
     expect(bridgeTarget(await res.text())).toBe(
-      `${APP_ORIGIN}/?add=${encodeURIComponent("https://u.parachute.computer/vault/doorvault")}`,
+      `${APP_ORIGIN}/?add=${encodeURIComponent("https://my.parachute.computer/vault/doorvault")}`,
     );
     expect(await checklistRow(userId, "open-notes")).not.toBeNull();
     // The console now renders the item as done.
@@ -367,7 +367,7 @@ describe("getting-started checklist (POST /console/checklist)", () => {
 
   test("write-note → the /new (new-note editor) deep-link; import-notes → the /import deep-link", async () => {
     const { userId, sessionId } = await userWithVault("doors2@example.com", "doorvault2");
-    const base = encodeURIComponent("https://u.parachute.computer/vault/doorvault2");
+    const base = encodeURIComponent("https://my.parachute.computer/vault/doorvault2");
 
     // write-note carries its own redirect: connect, then land on the new-note
     // editor (notes-ui 0.1.10's redirect fix) — not the notes home.
@@ -540,7 +540,7 @@ describe("Connect-your-AI card", () => {
     const { id: userId } = await seedUser("connect@example.com");
     await seedVault("connectme", userId);
     const html = await consoleHtml(await seedSession(userId));
-    const mcpUrl = "https://u.parachute.computer/vault/connectme/mcp";
+    const mcpUrl = "https://my.parachute.computer/vault/connectme/mcp";
     // Numbered Claude-first steps.
     expect(html).toContain("claude.ai");
     expect(html).toContain("Settings → Connectors");

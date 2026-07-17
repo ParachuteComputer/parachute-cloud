@@ -341,10 +341,17 @@ async function firstVaultName(db: D1Database, userId: string): Promise<string | 
   return row?.name ?? null;
 }
 
-/** Mirrors the console's app door (console.ts cardFor) — same appOrigin resolver. */
+/**
+ * Mirrors the console's app door (console.ts cardFor / oauth-shared.ts
+ * `vaultAdvertisedUrl`) — same appOrigin resolver AND the same PUBLIC vault
+ * origin preference (VAULT_PUBLIC_ORIGIN, falling back to VAULT_ORIGIN where
+ * unset, e.g. staging). A3 URL coherence: the welcome email's vault door
+ * advertises `my.parachute.computer` in prod, same as the console card.
+ */
 function notesUrlFor(vaultName: string, env: Env): string {
-  const base = env.VAULT_ORIGIN
-    ? `${env.VAULT_ORIGIN.replace(/\/$/, "")}/vault/${vaultName}`
+  const vaultOrigin = env.VAULT_PUBLIC_ORIGIN ?? env.VAULT_ORIGIN;
+  const base = vaultOrigin
+    ? `${vaultOrigin.replace(/\/$/, "")}/vault/${vaultName}`
     : `https://${vaultName}.${env.VAULT_BASE_DOMAIN.replace(/^\.+/, "")}`;
   return `${resolveAppOrigin(env)}/?add=${encodeURIComponent(base)}`;
 }

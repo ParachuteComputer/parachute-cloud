@@ -1487,7 +1487,7 @@ describe("console — vaults", () => {
     // console.ts appDeepLinkRedirect) rather than a direct redirect.
     expect(create.status).toBe(200);
     expect(bridgeTarget(await create.text())).toBe(
-      "https://app.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fmy-notes",
+      "https://app.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fmy-notes",
     );
 
     // The console stays reachable for management; the created-notice + connect
@@ -1499,15 +1499,16 @@ describe("console — vaults", () => {
     const html = await consoleRes.text();
     expect(html).toContain("my-notes");
     expect(html).toContain("claude mcp add --transport http parachute-my-notes");
-    // Path URL form: VAULT_ORIGIN is set in the toml (the live branded host).
-    // (buildServicesCatalog's subdomain form — VAULT_ORIGIN unset — is covered by
-    // the conformance "happy path" services-catalog assertion.)
-    expect(html).toContain("https://u.parachute.computer/vault/my-notes/mcp");
+    // Path URL form: VAULT_PUBLIC_ORIGIN is set in the toml (the advertised
+    // my. one-origin door, A3 URL coherence — the wire-level services catalog
+    // stays on VAULT_ORIGIN/u., covered by the conformance "happy path"
+    // services-catalog assertion).
+    expect(html).toContain("https://my.parachute.computer/vault/my-notes/mcp");
     expect(html).toContain("is ready");
     // Primary door: the app connect deep-link with the url-encoded vault URL,
     // opening in a new tab.
     expect(html).toContain(
-      'href="https://app.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fmy-notes"',
+      'href="https://app.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fmy-notes"',
     );
     expect(html).toContain("Open your notes");
     expect(html).toContain('target="_blank" rel="noopener"');
@@ -1524,7 +1525,7 @@ describe("console — vaults", () => {
     // env through resolveAppOrigin, not a hardcoded host.
     const APP = "https://home.parachute.test";
     const appEnv = { ...env, APP_ORIGIN: APP };
-    const deepLink = `${APP}/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fappvault`;
+    const deepLink = `${APP}/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fappvault`;
 
     // Post-create lands on the configured APP origin, cross-origin from the
     // issuer here — the no-JS 303 bridges instead of a direct redirect.
@@ -1555,7 +1556,7 @@ describe("console — vaults", () => {
     const create = await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "defaultvault" }, cookie), unsetEnv);
     expect(create.status).toBe(200);
     expect(bridgeTarget(await create.text())).toBe(
-      "https://notes.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fdefaultvault",
+      "https://notes.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fdefaultvault",
     );
   });
 
@@ -1577,7 +1578,7 @@ describe("console — vaults", () => {
     expect(html).toContain("ChatGPT");
     expect(html).toContain("custom connector / MCP server");
     // Copy-to-clipboard for the vault MCP URL (the existing affordance pattern).
-    expect(html).toContain('data-copy="https://u.parachute.computer/vault/connect-box/mcp"');
+    expect(html).toContain('data-copy="https://my.parachute.computer/vault/connect-box/mcp"');
     // Deep guidance links out to parachute.computer rather than living inline.
     expect(html).toContain("https://parachute.computer/guides/connect-your-ai/");
   });
@@ -1603,7 +1604,7 @@ describe("console — vaults", () => {
     // Exactly one vault → the direct Open-notes link in the nav (#99).
     expect(html).toContain('data-testid="nav-open-notes"');
     expect(html).toContain(
-      'href="https://app.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fnav-box"',
+      'href="https://app.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fnav-box"',
     );
   });
 

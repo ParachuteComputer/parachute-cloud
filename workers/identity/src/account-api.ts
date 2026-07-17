@@ -46,7 +46,7 @@ import {
   type OAuthDeps,
   buildServicesCatalog,
   jsonResponse,
-  vaultInstanceUrl,
+  vaultAdvertisedUrl,
 } from "./oauth-shared.ts";
 import {
   PLAN_SPECS,
@@ -199,7 +199,7 @@ export async function handleAccountVaultsList(db: D1Database, req: Request, deps
     const row = usage.get(v.name);
     return {
       name: v.name,
-      url: vaultInstanceUrl(v.name, deps),
+      url: vaultAdvertisedUrl(v.name, deps),
       created_at: v.createdAt,
       // dbBytes → notes graph, r2Bytes → attachment binaries (the two-meter
       // split the plan caps push mirrors). Null until the first rollup lands.
@@ -367,8 +367,12 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   return jsonResponse(
     {
       name,
-      url: vaultInstanceUrl(name, deps),
+      url: vaultAdvertisedUrl(name, deps),
       vault_token: minted.token,
+      // NOTE: `url` above is the advertised PUBLIC origin (A3 URL coherence);
+      // `services` below stays wire-level (buildServicesCatalog → vaultInstanceUrl
+      // / VAULT_ORIGIN) — the app's actual REST/MCP calls resolve through it,
+      // and that seam is deliberately untouched by this display-only change.
       services: buildServicesCatalog(scopes, deps),
     },
     201,

@@ -62,11 +62,30 @@ export interface Env {
   /**
    * The vault worker's origin for PATH routing (`<VAULT_ORIGIN>/vault/<name>`).
    * Set in BOTH environments' vars (production uses path routing on the branded
-   * host until wildcard subdomains land). Consumed by the services catalog, the
-   * console connect cards, AND the scheduled health check (ops.ts probes
-   * `<VAULT_ORIGIN>/health`). Optional only for type-safety of bare configs.
+   * host until wildcard subdomains land). This is the MACHINE-reachability
+   * origin: the OAuth token `services` catalog (oauth-shared.ts
+   * `buildServicesCatalog`), internal vault-worker dispatch (vault-call.ts —
+   * mints, admin config, snapshot/restore triggers), and the scheduled health
+   * check (ops.ts probes `<VAULT_ORIGIN>/health`, which only exists at the
+   * root on u., not my.) all read this DIRECTLY and must keep doing so — `my.`
+   * only routes `/vault/*` + the two RFC 9728 discovery paths, not `/health`.
+   * Optional only for type-safety of bare configs. See `VAULT_PUBLIC_ORIGIN`
+   * for the human-facing counterpart.
    */
   VAULT_ORIGIN?: string;
+  /**
+   * The vault's PUBLIC, human-facing origin — what the console cards, the
+   * Connect-your-AI walkthrough, the account descriptor/API, and the day-0
+   * welcome email PRINT/COPY/LINK (A3 URL coherence). Falls back to
+   * `VAULT_ORIGIN` when unset (`vaultAdvertisedUrl` in oauth-shared.ts), so
+   * staging — which has no `my.` origin — advertises its own workers.dev
+   * VAULT_ORIGIN unchanged without needing an explicit entry. Production sets
+   * this to `https://my.parachute.computer`, the ratified one-origin door
+   * (Phase A1); `u.parachute.computer` stays a permanently recognized alias
+   * for anything that already points at it — this var only changes what we
+   * advertise going forward, never what we accept.
+   */
+  VAULT_PUBLIC_ORIGIN?: string;
   /**
    * Deployment environment. When NOT "production", the magic-link send echoes the
    * link back in an `X-Parachute-Dev-Magic-Link` response header (so the flow is

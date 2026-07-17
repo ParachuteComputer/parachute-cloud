@@ -230,10 +230,20 @@ APP_ORIGIN = "https://app.parachute.computer"
 # Cloud addressing base. With VAULT_ORIGIN set (below) the service-catalog +
 # console cards use the path form; unset it to fall back to `https://<name>.<base>`.
 VAULT_BASE_DOMAIN = "u.parachute.computer"
-# The vault worker's origin — vaults route by PATH (`<origin>/vault/<name>/…`) on
-# the single branded host (no wildcard subdomain cert yet). Drives the services
-# catalog + the console connect cards.
+# The vault worker's MACHINE-reachability origin — vaults route by PATH
+# (`<origin>/vault/<name>/…`) on the single branded host (no wildcard subdomain
+# cert yet). Drives the OAuth services catalog, internal vault-worker dispatch
+# (vault-call.ts), and the scheduled health check (`<VAULT_ORIGIN>/health`,
+# which only exists at u.'s root — my. doesn't route it). u. stays a
+# permanently recognized alias; see VAULT_PUBLIC_ORIGIN below for what we
+# actually ADVERTISE now.
 VAULT_ORIGIN = "https://u.parachute.computer"
+# The vault's PUBLIC, human-facing origin (A3 URL coherence) — what the console
+# connect cards, the Connect-your-AI walkthrough, the account descriptor/API,
+# and the day-0 welcome email PRINT/COPY/LINK. `oauth-shared.ts
+# vaultAdvertisedUrl` falls back to VAULT_ORIGIN when this is unset, which is
+# exactly staging's posture below (no my. there) — so only prod sets it.
+VAULT_PUBLIC_ORIGIN = "https://my.parachute.computer"
 # Deployment environment. "production" here (the top level IS the production
 # deploy, on the live custom domain): the magic-link send NEVER echoes the link
 # in the `x-parachute-dev-magic-link` response header. Headless/smoke testing of
@@ -397,6 +407,10 @@ ISSUER = "https://parachute-identity-staging.openparachute.workers.dev"
 APP_ORIGIN = "https://parachute-identity-staging.openparachute.workers.dev"
 VAULT_BASE_DOMAIN = "parachute-vault-do-staging.openparachute.workers.dev"
 VAULT_ORIGIN = "https://parachute-vault-do-staging.openparachute.workers.dev"
+# VAULT_PUBLIC_ORIGIN is DELIBERATELY UNSET on staging — there is no my. there,
+# so `vaultAdvertisedUrl` falls back to VAULT_ORIGIN above and staging keeps
+# advertising its own workers.dev vault origin unchanged (A3 URL coherence;
+# see the production [vars] note above VAULT_PUBLIC_ORIGIN).
 ENVIRONMENT = "staging"
 EMAIL_FROM = "noreply@parachute.computer"
 # Same operator address as production — but staging has no send_email binding,
