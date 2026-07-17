@@ -123,7 +123,9 @@ function isBillingInterval(raw: string): raw is BillingInterval {
  * redirects are unaffected and keep their direct 30x.
  */
 function stripeRedirect(url: string, issuer: string): Response {
-  return isCrossOrigin(url, issuer) ? htmlResponse(renderRedirectBridge(url)) : redirectResponse(url);
+  return isCrossOrigin(url, issuer)
+    ? htmlResponse(renderRedirectBridge(url), 200, { "cache-control": "no-store" }) // carries a one-time session URL
+    : redirectResponse(url);
 }
 
 /**

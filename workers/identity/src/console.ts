@@ -123,7 +123,9 @@ function csrfExtra(setCookie?: string): Record<string, string> {
  * direct redirect is unaffected and stays one hop.
  */
 function appDeepLinkRedirect(url: string, deps: OAuthDeps, status = 302): Response {
-  return isCrossOrigin(url, deps.issuer) ? htmlResponse(renderRedirectBridge(url)) : redirectResponse(url, {}, status);
+  return isCrossOrigin(url, deps.issuer)
+    ? htmlResponse(renderRedirectBridge(url), 200, { "cache-control": "no-store" })
+    : redirectResponse(url, {}, status);
 }
 
 // --- signup ----------------------------------------------------------------

@@ -101,6 +101,24 @@ function form(o: Record<string, string>): string {
   return new URLSearchParams(o).toString();
 }
 const FORM = { "content-type": "application/x-www-form-urlencoded" };
+/**
+ * Extract the cross-origin redirect target from a rendered same-origin
+ * bridge page (workers/identity/src/ui.ts renderRedirectBridge — the
+ * form-action 'self' fix: a form-POST response that must end at a
+ * cross-origin URL renders this 200 HTML page instead of a direct 30x, since
+ * REDIRECT_URI here is localhost, always cross-origin from IDENTITY).
+ * Mirrors workers/identity/test/helpers.ts bridgeTarget() exactly (the
+ * location.replace(...) JSON-encoded argument) so the two stay in lockstep.
+ */
+function bridgeTarget(html: string): string | null {
+  const m = html.match(/location\.replace\((.*)\);<\/script>/);
+  if (!m) return null;
+  try {
+    return JSON.parse(m[1]!) as string;
+  } catch {
+    return null;
+  }
+}
 
 // --- flow ------------------------------------------------------------------
 async function main() {
@@ -192,9 +210,15 @@ async function main() {
       code_challenge_method: "S256",
     }),
   });
-  const loc = consentRes.headers.get("location") ?? "";
+  // REDIRECT_URI is localhost — always cross-origin from IDENTITY — so this
+  // response is the same-origin bridge page (200), not a direct 302 (the
+  // form-action 'self' fix). Parse the target out of it the same way the
+  // worker's own tests do (bridgeTarget above); tolerate a direct 30x too
+  // (same-origin redirects elsewhere in this file are unaffected either way).
+  const consentBody = await consentRes.text();
+  const loc = consentRes.headers.get("location") ?? bridgeTarget(consentBody) ?? "";
   const code = loc ? new URL(loc).searchParams.get("code") : null;
-  assert(consentRes.status === 302 && !!code, "POST consent → 302 with auth code", `status ${consentRes.status}`);
+  assert(consentRes.status === 200 && !!code, "POST consent → same-origin bridge with auth code (form-action fix)", `status ${consentRes.status}`);
 
   // 4. Token exchange.
   const tokenRes = await fetch(`${IDENTITY}/oauth/token`, {
@@ -1684,11 +1708,24 @@ async function authorizeFor(email: string, password: string, vaultName: string):
     redirect: "manual",
     body: form({ __action: "login", __csrf: csrf!, email, password, ...shared }),
   });
+  // REDIRECT_URI is cross-origin, so a login-time refusal (operator-scope /
+  // ownership gates, which run BEFORE the consent render — see
+  // oauth-authorize.ts authorizeCore) now bridges (200 HTML carrying the
+  // error) instead of a direct 302 (form-action fix). A same-origin redirect
+  // (e.g. /login/2fa) is unaffected and still a direct 30x.
   if (loginRes.status === 302) {
     try { return { error: new URL(loginRes.headers.get("location") ?? "").searchParams.get("error") ?? "redirect" }; }
     catch { return { error: "redirect" }; }
   }
   if (loginRes.status !== 200) return { error: `login status ${loginRes.status}` };
+  const loginBody = await loginRes.text();
+  // A fresh DCR client (registered above) never has a standing grant, so a
+  // bridge here can only ever carry an error — never a skip-consent code.
+  const loginBridgeUrl = bridgeTarget(loginBody);
+  if (loginBridgeUrl) {
+    try { return { error: new URL(loginBridgeUrl).searchParams.get("error") ?? "redirect" }; }
+    catch { return { error: "redirect" }; }
+  }
   const session = cookieVal(loginRes.headers.getSetCookie(), "parachute_id_session");
   const consentRes = await fetch(`${IDENTITY}/oauth/authorize`, {
     method: "POST",
@@ -1696,8 +1733,10 @@ async function authorizeFor(email: string, password: string, vaultName: string):
     redirect: "manual",
     body: form({ __action: "consent", __csrf: csrf!, decision: "approve", ...shared }),
   });
-  if (consentRes.status !== 302) return { error: `consent status ${consentRes.status}` };
-  const u = new URL(consentRes.headers.get("location") ?? "");
+  if (consentRes.status !== 200) return { error: `consent status ${consentRes.status}` };
+  const consentBridgeUrl = bridgeTarget(await consentRes.text());
+  if (!consentBridgeUrl) return { error: "consent status 200 (no bridge)" };
+  const u = new URL(consentBridgeUrl);
   const code = u.searchParams.get("code");
   if (!code) return { error: u.searchParams.get("error") ?? "no-code" };
   const tokenRes = await fetch(`${IDENTITY}/oauth/token`, {

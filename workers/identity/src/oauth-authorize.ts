@@ -263,18 +263,28 @@ export async function handleAuthorizeGet(db: D1Database, req: Request, deps: OAu
  * never routes through here and keeps its direct redirects (proven safe —
  * GET-triggered navigations are unconstrained by `form-action`).
  */
+/** @cloudflare/workers-types doesn't type getSetCookie(), but workerd supports it (the test/*.ts convention — auth.test.ts, console.test.ts, account-session.test.ts). */
+function getSetCookies(headers: Headers): string[] {
+  return (headers as unknown as { getSetCookie(): string[] }).getSetCookie();
+}
+
 function bridgeIfCrossOrigin(res: Response, issuer: string): Response {
   if (res.status < 300 || res.status >= 400) return res;
   const location = res.headers.get("location");
   if (!location || !isCrossOrigin(location, issuer)) return res;
   // `handleLoginSubmit` can layer a fresh session `set-cookie` onto a response
   // that turns out to need bridging (the skip-consent-on-login case) —
-  // htmlResponse builds an entirely NEW Response, so that cookie must be
-  // carried over explicitly or the mint is silently dropped.
-  const extra: Record<string, string> = {};
-  const setCookie = res.headers.get("set-cookie");
-  if (setCookie) extra["set-cookie"] = setCookie;
-  return htmlResponse(renderRedirectBridge(new URL(location, issuer).toString()), 200, extra);
+  // htmlResponse builds an entirely NEW Response, so any cookie must be
+  // carried over explicitly or the mint is silently dropped. `getSetCookie()`
+  // (not `.get()`, which comma-JOINS multiple Set-Cookie values — invalid for
+  // cookies, whose own values can legitimately contain commas, e.g. an
+  // `Expires=Wed, 21 Oct...` attribute) + `.append()` preserves each as its
+  // own header line, correct for 0, 1, or N cookies.
+  const bridged = htmlResponse(renderRedirectBridge(new URL(location, issuer).toString()), 200, {
+    "cache-control": "no-store", // the page carries a one-time code — defense-in-depth
+  });
+  for (const cookie of getSetCookies(res.headers)) bridged.headers.append("set-cookie", cookie);
+  return bridged;
 }
 
 export async function handleAuthorizePost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
