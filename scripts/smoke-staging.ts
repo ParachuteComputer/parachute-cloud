@@ -782,16 +782,24 @@ async function main() {
         "magic verify → 302 RESUMES the exact authorize request (params round-trip)",
         `loc ${rLoc.slice(0, 100)}`,
       );
-      const rResumed = await fetch(rLoc, {
-        headers: { cookie: `parachute_id_session=${rSession}` },
-        redirect: "manual",
-      });
-      const rConsent = await rResumed.text();
-      assert(
-        rResumed.status === 200 && /Authorize|Approve/.test(rConsent) && rConsent.includes(rState),
-        "resumed authorize renders consent for the pending request",
-        `status ${rResumed.status}`,
-      );
+      // Guard: a blank rLoc (the previous assertion already failed and
+      // recorded it) must not crash the WHOLE remaining suite with
+      // `fetch() URL must not be a blank string` — one failed step stays one
+      // failed step, not twenty skipped downstream sections.
+      if (rLoc) {
+        const rResumed = await fetch(rLoc, {
+          headers: { cookie: `parachute_id_session=${rSession}` },
+          redirect: "manual",
+        });
+        const rConsent = await rResumed.text();
+        assert(
+          rResumed.status === 200 && /Authorize|Approve/.test(rConsent) && rConsent.includes(rState),
+          "resumed authorize renders consent for the pending request",
+          `status ${rResumed.status}`,
+        );
+      } else {
+        fail("resumed authorize renders consent for the pending request", "skipped — no resume location from the prior step");
+      }
     }
 
     // Same resume walk, by CODE instead of the link — the "requested the link
@@ -856,16 +864,23 @@ async function main() {
         "code verify → 302 RESUMES the exact authorize request, same as the link",
         `loc ${rcLoc.slice(0, 100)}`,
       );
-      const rcResumed = await fetch(rcLoc, {
-        headers: { cookie: `parachute_id_session=${rcSession}` },
-        redirect: "manual",
-      });
-      const rcConsent = await rcResumed.text();
-      assert(
-        rcResumed.status === 200 && /Authorize|Approve/.test(rcConsent) && rcConsent.includes(rcState),
-        "resumed-by-code authorize renders consent for the pending request",
-        `status ${rcResumed.status}`,
-      );
+      // Same crash guard as the by-link resume above — a blank rcLoc must
+      // fail this ONE assertion, not throw and abort every downstream
+      // section (TOTP, billing, snapshots, voice, semantic search…).
+      if (rcLoc) {
+        const rcResumed = await fetch(rcLoc, {
+          headers: { cookie: `parachute_id_session=${rcSession}` },
+          redirect: "manual",
+        });
+        const rcConsent = await rcResumed.text();
+        assert(
+          rcResumed.status === 200 && /Authorize|Approve/.test(rcConsent) && rcConsent.includes(rcState),
+          "resumed-by-code authorize renders consent for the pending request",
+          `status ${rcResumed.status}`,
+        );
+      } else {
+        fail("resumed-by-code authorize renders consent for the pending request", "skipped — no resume location from the prior step");
+      }
     }
 
     // 11. TOTP enroll on this (passwordless) account, then confirm a re-login

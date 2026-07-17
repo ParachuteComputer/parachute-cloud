@@ -104,6 +104,17 @@ database_name = "parachute-identity"
 database_id = "5d2b6bbf-727d-4052-9b88-570778e766f6"
 migrations_dir = "migrations"
 
+# Version metadata (cloud#174 fix — the rc.92 stale-edge-propagation incident):
+# `/health` surfaces `env.CF_VERSION_METADATA.id` so a deploy script can POLL
+# for the just-uploaded version actually being served at the edge before
+# handing off to a smoke suite that exercises brand-new routes — `wrangler
+# deploy` reporting success only means the upload was accepted, not that every
+# edge PoP has picked it up yet (deploy-staging.sh does this polling; see its
+# header note). Non-inheritable like every other binding — restated in
+# [env.staging] below.
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
 # The rate-limiter DO (#30): one instance per rate key (signup:<ip>,
 # login:<ip>|<email>, magic:<ip>|<email>) — atomic sliding-window counters the
 # best-effort D1 fences couldn't provide. POLICY (windows/limits) lives in
@@ -333,6 +344,12 @@ binding = "DB"
 database_name = "parachute-identity-staging"
 database_id = "6930c39f-36a0-463c-b3b6-d6213d647891"
 migrations_dir = "migrations"
+
+# Non-inheritable, restated: version metadata — the propagation-poll signal
+# deploy-staging.sh reads before handing off to the smoke suite (see the
+# top-level [version_metadata] note).
+[env.staging.version_metadata]
+binding = "CF_VERSION_METADATA"
 
 # Bindings are non-inheritable: restate the rate-limiter DO. Same class; a
 # different worker (parachute-identity-staging) = its own DO namespace, so

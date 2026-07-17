@@ -8,6 +8,20 @@ import type { RateLimiterNamespace } from "./rate-limit.ts";
 export interface Env {
   DB: D1Database;
   /**
+   * Workers' native version-metadata binding (`[version_metadata]` in
+   * wrangler.toml) — `{ id, tag, timestamp }` for the SPECIFIC deployed
+   * version currently serving this request. Surfaced on `GET /health` so
+   * `deploy-staging.sh` can poll for the just-uploaded version actually being
+   * live at the edge before handing off to a smoke suite that exercises
+   * brand-new routes (cloud#174's rc.92 incident: `wrangler deploy` reporting
+   * success only means the upload was ACCEPTED, not that every edge PoP has
+   * picked it up — the smoke ran ~18s post-deploy and still hit the OLD
+   * version, 404ing a route this same PR had just added). Optional so bare
+   * test configs without the binding still type-check; `/health` degrades to
+   * `version: null` when absent.
+   */
+  CF_VERSION_METADATA?: { id: string; tag: string; timestamp: string };
+  /**
    * The RateLimiterDO namespace (#30) — the login/signup/magic abuse fences.
    * One DO per rate key; the client (rate-limit.ts) fails OPEN on DO errors.
    */

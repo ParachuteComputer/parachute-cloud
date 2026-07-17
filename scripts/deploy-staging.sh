@@ -68,8 +68,45 @@ cd "$ROOT/workers/identity"
 bunx wrangler d1 migrations apply parachute-identity-staging --remote --env staging
 bun scripts/seed-dev-user.ts                                    # .dev-secrets -> scripts/seed-dev-user.sql (also grandfathers vault "demo")
 bunx wrangler d1 execute parachute-identity-staging --remote --env staging --file=./scripts/seed-dev-user.sql
+
+# --- propagation guard (cloud#174 fix, the rc.92 incident) -------------------
+# `wrangler deploy` returning success means the upload was ACCEPTED — it does
+# NOT mean every edge PoP is already serving it. The rc.92 auth-Wave-1 deploy
+# hit this for real: the deploy-staging.yml smoke ran ~18s after "Deployed
+# ... triggers" and still landed on the OLD worker version (a brand-new route
+# 404ing, a brand-new response header simply absent) — indistinguishable from
+# a code bug until you check the timestamps. `/health`'s `version` field
+# (env.CF_VERSION_METADATA.id, wired identity-side) is the ground truth for
+# "which version is THIS PoP actually running" — poll it until it changes
+# from the pre-deploy baseline before ever invoking smoke.
+identity_health_version() {
+  curl -sf "${IDENTITY_STAGING}/health" 2>/dev/null | grep -o '"version":"[^"]*"' | sed -e 's/"version":"//' -e 's/"$//'
+}
+BASELINE_VERSION="$(identity_health_version || true)"
+
 # ISSUER + VAULT_ORIGIN are baked into [env.staging.vars] (self-contained).
 bunx wrangler deploy --env staging
+
+echo "Waiting for the new version to actually propagate to the edge before smoke..."
+DEPLOY_WAIT_SECS=90
+DEPLOY_POLL_INTERVAL=3
+elapsed=0
+NEW_VERSION=""
+while [ "$elapsed" -lt "$DEPLOY_WAIT_SECS" ]; do
+  NEW_VERSION="$(identity_health_version || true)"
+  if [ -n "$NEW_VERSION" ] && [ "$NEW_VERSION" != "$BASELINE_VERSION" ]; then
+    echo "New version live: ${NEW_VERSION} (was: ${BASELINE_VERSION:-<none>}) after ${elapsed}s"
+    break
+  fi
+  sleep "$DEPLOY_POLL_INTERVAL"
+  elapsed=$((elapsed + DEPLOY_POLL_INTERVAL))
+done
+if [ -z "$NEW_VERSION" ] || [ "$NEW_VERSION" == "$BASELINE_VERSION" ]; then
+  echo "ERROR: /health on ${IDENTITY_STAGING} still reports the PRE-deploy version" \
+       "(${NEW_VERSION:-<none>}, baseline ${BASELINE_VERSION:-<none>}) after ${DEPLOY_WAIT_SECS}s." \
+       "Refusing to run smoke against a possibly-stale edge — re-run once propagation catches up." >&2
+  exit 1
+fi
 
 echo
 echo "Staging deployed."
