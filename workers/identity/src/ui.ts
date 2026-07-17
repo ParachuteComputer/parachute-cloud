@@ -567,11 +567,23 @@ export type SecurityState =
   | { kind: "enrolling"; qrSvg: string; secret: string }
   | { kind: "backup-codes"; codes: string[] };
 
+/**
+ * The "Your handle" block's state (migration 0022, the GitHub owner-model).
+ * `claimed` non-null → the read-only display (rename is a later wave); null → the
+ * claim form, prefilled with `value ?? suggested` and carrying an inline `error`
+ * when a claim just failed. Only rendered in the overview state.
+ */
+export type SecurityHandle =
+  | { claimed: string }
+  | { claimed: null; suggested: string; value?: string; error?: string };
+
 export interface SecurityProps {
   csrfToken: string;
   email: string;
   hasPassword: boolean;
   state: SecurityState;
+  /** The handle block (overview only); omitted → don't render it. */
+  handle?: SecurityHandle;
   error?: string;
   notice?: string;
 }
@@ -595,8 +607,39 @@ function passwordSection(csrfToken: string, hasPassword: boolean): string {
    </div>`;
 }
 
+/**
+ * The "Your handle" card. A claimed account shows its handle read-only (renaming
+ * comes in a later wave); an unclaimed one shows a plain-form claim (no JS — the
+ * console house style) prefilled with the email-derived suggestion, the policy
+ * stated in full, and any just-failed claim's message inline. `esc()` on the
+ * input `value` turns `"` into `&quot;`, so a crafted handle can't break out of
+ * the attribute (the same CSP injection-safety posture as every other form).
+ */
+function handleSection(csrfToken: string, handle: SecurityHandle): string {
+  if (handle.claimed !== null) {
+    return `<div class="card">
+       <h2>Your handle</h2>
+       <div class="status"><span class="dot dot-on"></span>Your handle is <strong data-testid="handle-current">${esc(handle.claimed)}</strong>.</div>
+       <p class="muted" style="margin:.5rem 0 0">One handle per account — renaming comes later.</p>
+     </div>`;
+  }
+  const value = handle.value ?? handle.suggested;
+  return `<div class="card">
+     <h2>Your handle</h2>
+     <p class="muted" style="margin:.1rem 0 .3rem">Claim a handle for your account. It's optional, and a suggestion from your email is filled in below.</p>
+     ${handle.error ? `<div class="err" style="margin-bottom:.6rem" data-testid="handle-error">${esc(handle.error)}</div>` : ""}
+     <form method="post" action="/console/handle">
+       <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+       <label for="handle">Handle</label>
+       <input id="handle" name="handle" type="text" value="${esc(value)}" placeholder="${esc(handle.suggested)}" autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false" required>
+       <p class="muted" style="margin:.35rem 0 0">Lowercase letters, numbers, and hyphens; 3–30 characters. One per account, and it's permanent for now.</p>
+       <button class="secondary" type="submit">Claim handle</button>
+     </form>
+   </div>`;
+}
+
 export function renderSecurity(props: SecurityProps): string {
-  const { csrfToken, email, hasPassword, state, error, notice } = props;
+  const { csrfToken, email, hasPassword, state, handle, error, notice } = props;
   const banner = `${notice ? `<div class="notice">${esc(notice)}</div>` : ""}${error ? `<div class="err" style="margin-bottom:1rem">${esc(error)}</div>` : ""}`;
 
   if (state.kind === "enrolling") {
@@ -665,6 +708,7 @@ export function renderSecurity(props: SecurityProps): string {
     `<div class="h2row"><h1 style="margin:0">Security</h1><a href="/console">← Vaults</a></div>
      <p class="muted" style="margin:.15rem 0 1.2rem">${esc(email)}</p>
      ${banner}
+     ${handle ? handleSection(csrfToken, handle) : ""}
      ${twoFactor}
      ${passwordSection(csrfToken, hasPassword)}`,
   );

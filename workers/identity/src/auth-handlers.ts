@@ -64,8 +64,17 @@ import {
   renderLogin2fa,
   renderMagicSent,
   renderSecurity,
+  type SecurityHandle,
   type SecurityState,
 } from "./ui.ts";
+import {
+  HandleAlreadySetError,
+  HandleInvalidError,
+  HandleTakenError,
+  claimHandle,
+  getOwnerHandle,
+  suggestHandleFromEmail,
+} from "./handles.ts";
 import {
   type OAuthDeps,
   ceremonyOrigin,
@@ -552,21 +561,30 @@ async function securityOverview(
   db: D1Database,
   req: Request,
   user: User,
-  msg: { error?: string; notice?: string },
+  msg: { error?: string; notice?: string; handle?: { error?: string; value?: string } },
 ): Promise<Response> {
-  // Re-read: password/TOTP may have just changed (the passed `user` is pre-write).
+  // Re-read: password/TOTP/handle may have just changed (the passed `user` is
+  // pre-write). The fresh `ownerId` is what resolves the claimed handle.
   const state = await getTotpState(db, user.id);
-  const fresh = await getUserByEmail(db, user.email);
+  const fresh = (await getUserByEmail(db, user.email)) ?? user;
+  const claimed = await getOwnerHandle(db, fresh.ownerId);
+  // A claimed account shows its handle read-only; an unclaimed one gets the
+  // claim form (a just-failed claim's error/value are only meaningful there).
+  const handle: SecurityHandle =
+    claimed !== null
+      ? { claimed }
+      : { claimed: null, suggested: suggestHandleFromEmail(fresh.email), value: msg.handle?.value, error: msg.handle?.error };
   return renderSecurityState(
     req,
-    fresh ?? user,
+    fresh,
     {
       kind: "overview",
       enrolled: state.secret !== null,
       enrolledAt: state.enrolledAt,
       backupRemaining: state.backupCodes.length,
     },
-    msg,
+    { error: msg.error, notice: msg.notice },
+    handle,
   );
 }
 
@@ -579,6 +597,7 @@ function renderSecurityState(
   user: User,
   state: SecurityState,
   msg: { error?: string; notice?: string } = {},
+  handle?: SecurityHandle,
 ): Response {
   const csrf = ensureCsrfToken(req);
   return htmlResponse(
@@ -587,10 +606,59 @@ function renderSecurityState(
       email: user.email,
       hasPassword: hasPassword(user),
       state,
+      handle,
       error: msg.error,
       notice: msg.notice,
     }),
     200,
     csrfExtra(csrf.setCookie),
   );
+}
+
+// --- POST /console/handle (claim a handle — the console door) ---------------
+
+/**
+ * Claim the account's handle through the console (session + CSRF + same-origin —
+ * the console write boundary, `checkForm`), calling the SAME `claimHandle` core
+ * as the Bearer door (`handleAccountHandleClaim`, account-api.ts): the two-door
+ * precedent from billing's `checkoutCore`/`portalCore` — one claim body, two
+ * front doors. The typed failures map to a re-rendered security page:
+ *   - invalid / reserved (HandleInvalidError) → the claim form with the message
+ *     inline and the attempted value preserved;
+ *   - handle_taken (HandleTakenError) → same, "already taken";
+ *   - handle_already_set (HandleAlreadySetError, a raced/stale double-submit) →
+ *     nothing changed; the re-render shows the existing handle read-only with a
+ *     gentle notice (there's no form left to inline an error into).
+ * Success re-renders showing the claimed handle read-only.
+ */
+export async function handleHandleClaimPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const user = await sessionUser(db, req, deps);
+  if (!user) return redirectResponse("/login");
+  const form = await req.formData();
+  if (!checkForm(req, form, deps)) {
+    return securityOverview(db, req, user, { error: "Your session expired. Please try again." });
+  }
+  const now = deps.now?.() ?? new Date();
+  const rawHandle = String(form.get("handle") ?? "");
+  try {
+    const { handle } = await claimHandle(db, user.id, rawHandle, now);
+    return securityOverview(db, req, user, { notice: `Your handle is set: ${handle}.` });
+  } catch (err) {
+    if (err instanceof HandleInvalidError) {
+      const message =
+        err.reason === "reserved"
+          ? "That handle is reserved. Please choose another."
+          : "Use 3–30 characters: lowercase letters, numbers, and hyphens (not starting or ending with a hyphen).";
+      return securityOverview(db, req, user, { handle: { error: message, value: rawHandle } });
+    }
+    if (err instanceof HandleTakenError) {
+      return securityOverview(db, req, user, {
+        handle: { error: "That handle is already taken. Please choose another.", value: rawHandle },
+      });
+    }
+    if (err instanceof HandleAlreadySetError) {
+      return securityOverview(db, req, user, { notice: "You already have a handle." });
+    }
+    throw err;
+  }
 }

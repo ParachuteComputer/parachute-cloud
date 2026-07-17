@@ -26,6 +26,7 @@ import {
 } from "./console.ts";
 import {
   handleCodeVerifyPost,
+  handleHandleClaimPost,
   handleLogin2faGet,
   handleLogin2faPost,
   handleMagicRequestPost,
@@ -178,6 +179,10 @@ app.post("/console/checklist", (c) => handleChecklistPost(c.env.DB, c.req.raw, d
 app.post("/console/checklist/restore", (c) => handleChecklistRestorePost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/console/security", (c) => handleSecurityGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/security", (c) => handleSecurityPost(c.env.DB, c.req.raw, depsFor(c.env)));
+// Claim the account handle from the console (session + CSRF + same-origin, the
+// console write boundary) — the SAME claimHandle core as the Bearer door
+// (POST /account/handle), re-rendering /console/security with the result.
+app.post("/console/handle", (c) => handleHandleClaimPost(c.env.DB, c.req.raw, depsFor(c.env)));
 // Promo-code redemption (July 4th launch): session + CSRF + same-origin (the
 // console write boundary), then the race-safe claim + comp grant (promo.ts).
 // Pure comp machinery — no Stripe, no env gate; LIVE in production by design.
