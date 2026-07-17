@@ -262,16 +262,26 @@ export async function handleAuthorizeGet(db: D1Database, req: Request, deps: OAu
  * Location is cross-origin gets bridged. The GET path (`handleAuthorizeGet`)
  * never routes through here and keeps its direct redirects (proven safe —
  * GET-triggered navigations are unconstrained by `form-action`).
+ *
+ * This is also THE post-consent contract fix (auth redesign §5, task #34):
+ * when actually bridging, the client's display name (already resolved for
+ * the consent render) rides into `renderRedirectBridge` so the page names
+ * who you're being returned to and carries the 3-second watchdog instead of
+ * a bare "Redirecting…" spinner — the exact dead end a connector client can
+ * leave a disposable tab in after its own server already exchanged the code.
+ * The lookup only runs when actually bridging (cross-origin 3xx) — the
+ * common case (a same-origin render, or an error) never pays for it.
  */
 /** @cloudflare/workers-types doesn't type getSetCookie(), but workerd supports it (the test/*.ts convention — auth.test.ts, console.test.ts, account-session.test.ts). */
 function getSetCookies(headers: Headers): string[] {
   return (headers as unknown as { getSetCookie(): string[] }).getSetCookie();
 }
 
-function bridgeIfCrossOrigin(res: Response, issuer: string): Response {
+async function bridgeIfCrossOrigin(res: Response, issuer: string, db: D1Database, clientId: string): Promise<Response> {
   if (res.status < 300 || res.status >= 400) return res;
   const location = res.headers.get("location");
   if (!location || !isCrossOrigin(location, issuer)) return res;
+  const client = clientId ? await getClient(db, clientId) : null;
   // `handleLoginSubmit` can layer a fresh session `set-cookie` onto a response
   // that turns out to need bridging (the skip-consent-on-login case) —
   // htmlResponse builds an entirely NEW Response, so any cookie must be
@@ -280,9 +290,11 @@ function bridgeIfCrossOrigin(res: Response, issuer: string): Response {
   // cookies, whose own values can legitimately contain commas, e.g. an
   // `Expires=Wed, 21 Oct...` attribute) + `.append()` preserves each as its
   // own header line, correct for 0, 1, or N cookies.
-  const bridged = htmlResponse(renderRedirectBridge(new URL(location, issuer).toString()), 200, {
-    "cache-control": "no-store", // the page carries a one-time code — defense-in-depth
-  });
+  const bridged = htmlResponse(
+    renderRedirectBridge(new URL(location, issuer).toString(), { clientName: client?.clientName ?? undefined }),
+    200,
+    { "cache-control": "no-store" }, // the page carries a one-time code — defense-in-depth
+  );
   for (const cookie of getSetCookies(res.headers)) bridged.headers.append("set-cookie", cookie);
   return bridged;
 }
@@ -296,7 +308,7 @@ export async function handleAuthorizePost(db: D1Database, req: Request, deps: OA
       : action === "consent"
         ? await handleConsentSubmit(db, req, form, deps)
         : htmlError("Invalid request", "unknown form action", 400);
-  return bridgeIfCrossOrigin(res, deps.issuer);
+  return bridgeIfCrossOrigin(res, deps.issuer, db, String(form.get("client_id") ?? ""));
 }
 
 async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, deps: OAuthDeps): Promise<Response> {

@@ -71,8 +71,13 @@ export interface DripEmail {
 
 export interface EmailSender {
   readonly kind: "binding" | "devlog";
-  /** `newAccount` picks the email variant (G5): new-account vs returning copy. */
-  sendMagicLink(to: string, link: string, newAccount: boolean): Promise<SendResult>;
+  /**
+   * `code` is the magic link's short-form spelling (auth redesign §2) — the
+   * SAME single-use token, so clicking the link or typing the code both
+   * finish sign-in. `newAccount` picks the email variant (G5): new-account vs
+   * returning copy.
+   */
+  sendMagicLink(to: string, link: string, code: string, newAccount: boolean): Promise<SendResult>;
   /** Generic operational send — plain text, no templating. Used by ops.ts. */
   sendOps(msg: OpsEmail): Promise<SendResult>;
   /** Onboarding-drip send — plain text + unsubscribe headers. Used by drip.ts. */
@@ -80,7 +85,11 @@ export interface EmailSender {
 }
 
 const FROM_NAME = "Parachute Cloud";
-const SUBJECT = "Your Parachute sign-in link";
+
+/** "481227" → "481 227" — a readable grouping for a lock-screen notification. */
+function formatCode(code: string): string {
+  return code.length === 6 ? `${code.slice(0, 3)} ${code.slice(3)}` : code;
+}
 
 // --- raw RFC 5322 building ---------------------------------------------------
 
@@ -207,23 +216,30 @@ export function buildRawEmail(opts: RawEmailOpts): string {
  * earliest honest moment to tell new-vs-returning, and enumeration-safe because
  * only the address owner ever reads it (the on-page copy stays neutral). `to` is
  * the recipient (a validated email — safe to embed) so the returning copy can
- * say "as X".
+ * say "as X". `code` (auth redesign §2) is the SAME single-use token's 6-digit
+ * short-form spelling — the subject carries it so it's readable from a
+ * lock-screen notification on a DIFFERENT device than the one signing in.
  */
 function magicLinkBodies(
   link: string,
+  code: string,
   newAccount: boolean,
   to: string,
 ): { subject: string; html: string; text: string } {
-  const subject = newAccount ? "Welcome to Parachute — your sign-in link" : SUBJECT;
+  const formatted = formatCode(code);
+  const subject = newAccount ? `Welcome to Parachute — your code: ${formatted}` : `Your Parachute code: ${formatted}`;
   const heading = newAccount ? "Welcome to Parachute" : "Welcome back";
   const intro = newAccount
     ? "This link signs you in and creates a brand-new account — nothing is created unless you click it. You'll make your first vault right after."
     : `This link signs you in as ${to}. Your vault is where you left it.`;
   const buttonLabel = newAccount ? "Create my account & sign in" : "Sign me in";
+  const codeLine = `Or, from another device, enter this code where you're signing in: ${formatted}`;
   const footer = newAccount
-    ? "If you didn't request this, you can safely ignore this email — nothing is created and no one can sign in without the link."
-    : "If you didn't request this, you can safely ignore this email — no one can sign in without the link.";
-  const text = [heading, "", intro, "", "It works once and expires in 10 minutes.", "", link, "", footer].join("\n");
+    ? "If you didn't request this, you can safely ignore this email — nothing is created and no one can sign in without the link or code."
+    : "If you didn't request this, you can safely ignore this email — no one can sign in without the link or code.";
+  const text = [heading, "", intro, "", "It works once and expires in 10 minutes.", "", link, "", codeLine, "", footer].join(
+    "\n",
+  );
   const html = `<!doctype html><html><body style="margin:0;padding:0;background:#f4f6f1">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f1;padding:2.5rem 1rem">
     <tr><td align="center">
@@ -233,6 +249,7 @@ function magicLinkBodies(
         <tr><td style="color:#6a7566;line-height:1.55;padding-bottom:1.4rem">${intro} It works once and expires in 10 minutes.</td></tr>
         <tr><td style="padding-bottom:1.4rem"><a href="${link}" style="display:inline-block;background:#5f7a57;color:#ffffff;text-decoration:none;padding:.7rem 1.4rem;border-radius:9px;font-weight:600">${buttonLabel}</a></td></tr>
         <tr><td style="color:#6a7566;font-size:.85rem;line-height:1.5;word-break:break-all">Or paste this link into your browser:<br><a href="${link}" style="color:#4c6547">${link}</a></td></tr>
+        <tr><td style="color:#6a7566;font-size:.9rem;line-height:1.5;padding-top:1rem">Signing in on another device? Enter this code instead:<br><span style="display:inline-block;margin-top:.35rem;font-family:'SFMono-Regular',Consolas,monospace;font-size:1.3rem;letter-spacing:.08em;background:#f4f6f1;border:1px solid #dde3d6;border-radius:8px;padding:.5rem .9rem">${formatted}</span></td></tr>
         <tr><td style="color:#9aa693;font-size:.8rem;line-height:1.5;padding-top:1.4rem;border-top:1px solid #eef1ea;margin-top:1rem">${footer}</td></tr>
       </table>
     </td></tr>
@@ -266,8 +283,8 @@ export function bindingSender(binding: SendEmailBinding, fromAddress: string): E
   }
   return {
     kind: "binding",
-    async sendMagicLink(to, link, newAccount) {
-      const { subject, html, text } = magicLinkBodies(link, newAccount, to);
+    async sendMagicLink(to, link, code, newAccount) {
+      const { subject, html, text } = magicLinkBodies(link, code, newAccount, to);
       return send({ to, subject, html, text });
     },
     async sendOps({ to, subject, text }) {
@@ -283,8 +300,8 @@ export function bindingSender(binding: SendEmailBinding, fromAddress: string): E
 export function devLogSender(): EmailSender {
   return {
     kind: "devlog",
-    async sendMagicLink(to, link, newAccount) {
-      console.log(`[magic-link] would email ${to} (${newAccount ? "new" : "returning"}): ${link}`);
+    async sendMagicLink(to, link, code, newAccount) {
+      console.log(`[magic-link] would email ${to} (${newAccount ? "new" : "returning"}): ${link} code=${code}`);
       return { ok: true };
     },
     async sendOps({ to, subject, text }) {

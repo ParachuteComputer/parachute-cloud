@@ -11,6 +11,7 @@ import { describe, expect, test, vi } from "vitest";
 import app, { senderFor } from "../src/index.ts";
 import type { EmailSender, SendResult } from "../src/email.ts";
 import {
+  handleCodeVerifyPost,
   handleLogin2faGet,
   handleLogin2faPost,
   handleMagicRequestPost,
@@ -22,8 +23,9 @@ import { handleLoginPost } from "../src/console.ts";
 import { handleAuthorizeGet } from "../src/oauth-authorize.ts";
 import { totpCodeAt } from "../src/totp.ts";
 import { getTotpState, isTotpEnrolled } from "../src/two-factor.ts";
-import { getUserByEmail } from "../src/users.ts";
+import { createUser, getUserByEmail, setUserSuspended } from "../src/users.ts";
 import { MAGIC_MAX_PER_WINDOW } from "../src/rate-limit.ts";
+import { MAGIC_CODE_MAX_ATTEMPTS, consumeMagicLink, createMagicLink, verifyMagicCode } from "../src/magic-links.ts";
 import {
   CSRF,
   ISSUER,
@@ -47,14 +49,14 @@ function cookieVal(res: Response, name: string): string | null {
   return null;
 }
 
-/** A capturing sender so tests can read the link the flow would email. */
-function captureSender(): EmailSender & { sent: Array<{ to: string; link: string }> } {
-  const sent: Array<{ to: string; link: string }> = [];
+/** A capturing sender so tests can read the link (+ code) the flow would email. */
+function captureSender(): EmailSender & { sent: Array<{ to: string; link: string; code: string }> } {
+  const sent: Array<{ to: string; link: string; code: string }> = [];
   return {
     kind: "devlog",
     sent,
-    async sendMagicLink(to: string, link: string): Promise<SendResult> {
-      sent.push({ to, link });
+    async sendMagicLink(to: string, link: string, code: string): Promise<SendResult> {
+      sent.push({ to, link, code });
       return { ok: true };
     },
     async sendOps(): Promise<SendResult> {
@@ -82,6 +84,18 @@ function magicReq(email: string, ip = "10.1.1.1"): Request {
 }
 function verifyReq(token: string): Request {
   return new Request(`${ISSUER}/auth/verify?token=${encodeURIComponent(token)}`);
+}
+function codeVerifyReq(email: string, code: string, extra: Record<string, string> = {}, ip = "10.3.3.1"): Request {
+  return new Request(`${ISSUER}/auth/code`, {
+    method: "POST",
+    body: new URLSearchParams({ __csrf: CSRF, email, code, ...extra }),
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      origin: ISSUER,
+      cookie: `parachute_id_csrf=${CSRF}`,
+      "cf-connecting-ip": ip,
+    },
+  });
 }
 function securityReq(fields: Record<string, string>, sessionId: string): Request {
   return new Request(`${ISSUER}/console/security`, {
@@ -622,6 +636,227 @@ describe("magic link resumes a pending authorize request", () => {
     expect(html).toContain('action="/auth/magic"');
     expect(html).toContain(`name="client_id" value="${clientId}"`);
     expect(sender.sent).toHaveLength(0);
+  });
+});
+
+// --- sign-in code (the magic link's short-form spelling, auth redesign §2, task #34) --
+
+describe("sign-in code — verify by CODE instead of the link", () => {
+  test("happy path: send emails a 6-digit code; verify by code mints the session identically to the link", async () => {
+    const sender = captureSender();
+    const now = new Date("2026-07-16T12:00:00Z");
+    const send = await handleMagicRequestPost(env.DB, magicReq("code-user@example.com"), deps(() => now), sender);
+    expect(send.status).toBe(200);
+    const { code } = sender.sent[0]!;
+    expect(code).toMatch(/^\d{6}$/);
+
+    const res = await handleCodeVerifyPost(env.DB, codeVerifyReq("code-user@example.com", code), deps(() => now));
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console");
+    expect(cookieVal(res, "parachute_id_session")).toBeTruthy();
+    const user = await getUserByEmail(env.DB, "code-user@example.com");
+    expect(user).not.toBeNull();
+    expect(user!.emailVerified).toBe(true);
+    expect(user!.passwordHash).toBe(""); // passwordless account, same as the link path
+  });
+
+  test("single-use: consuming by CODE also kills the LINK on the same row (one token, two spellings)", async () => {
+    const sender = captureSender();
+    const now = new Date("2026-07-16T12:00:00Z");
+    await handleMagicRequestPost(env.DB, magicReq("shared-row-a@example.com"), deps(() => now), sender);
+    const { link, code } = sender.sent[0]!;
+    const codeRes = await handleCodeVerifyPost(env.DB, codeVerifyReq("shared-row-a@example.com", code), deps(() => now));
+    expect(codeRes.status).toBe(302);
+    const linkRes = await handleMagicVerifyGet(env.DB, verifyReq(tokenFromLink(link)), deps(() => now));
+    expect(linkRes.status).toBe(400); // already consumed — by the code
+  });
+
+  test("single-use, the other direction: consuming the LINK first kills the CODE too", async () => {
+    const sender = captureSender();
+    const now = new Date("2026-07-16T12:00:00Z");
+    await handleMagicRequestPost(env.DB, magicReq("shared-row-b@example.com"), deps(() => now), sender);
+    const { link, code } = sender.sent[0]!;
+    const linkRes = await handleMagicVerifyGet(env.DB, verifyReq(tokenFromLink(link)), deps(() => now));
+    expect(linkRes.status).toBe(302);
+    const codeRes = await handleCodeVerifyPost(env.DB, codeVerifyReq("shared-row-b@example.com", code), deps(() => now));
+    expect(codeRes.status).toBe(200); // neutral failure — the row's already consumed
+    expect(await codeRes.text()).toContain("request a fresh link");
+  });
+
+  test("expiry: a code older than the shared 10-minute TTL fails, no session, no account created", async () => {
+    const sender = captureSender();
+    const sent = new Date("2026-07-16T12:00:00Z");
+    await handleMagicRequestPost(env.DB, magicReq("stale-code@example.com"), deps(() => sent), sender);
+    const { code } = sender.sent[0]!;
+    const later = new Date(sent.getTime() + 11 * 60 * 1000); // > 10 min TTL
+    const res = await handleCodeVerifyPost(env.DB, codeVerifyReq("stale-code@example.com", code), deps(() => later));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("request a fresh link");
+    expect(await getUserByEmail(env.DB, "stale-code@example.com")).toBeNull();
+  });
+
+  test("no oracle: a wrong code on an unknown email and a wrong code on a known account get the IDENTICAL neutral response", async () => {
+    const sender = captureSender();
+    const now = new Date("2026-07-16T12:00:00Z");
+    await handleMagicRequestPost(env.DB, magicReq("has-account-code@example.com"), deps(() => now), sender);
+    const unknownRes = await handleCodeVerifyPost(env.DB, codeVerifyReq("nobody-code@example.com", "000000", {}, "10.3.3.5"), deps(() => now));
+    const wrongRes = await handleCodeVerifyPost(env.DB, codeVerifyReq("has-account-code@example.com", "000000", {}, "10.3.3.6"), deps(() => now));
+    expect(unknownRes.status).toBe(wrongRes.status);
+    expect(await unknownRes.text()).toContain("request a fresh link");
+    expect(await wrongRes.text()).toContain("request a fresh link");
+  });
+
+  test("a magic link/code minted before the account gets suspended refuses to mint after — same neutral failure, no oracle", async () => {
+    const sender = captureSender();
+    const now = new Date("2026-07-16T12:00:00Z");
+    // First link doubles as signup — no user row exists yet at mint time.
+    await handleMagicRequestPost(env.DB, magicReq("presusp-code@example.com"), deps(() => now), sender);
+    const { code } = sender.sent[0]!;
+    // The account materializes + is suspended out-of-band (an operator acts on
+    // a pending signup) before the code is ever used.
+    const created = await createUser(env.DB, "presusp-code@example.com", "", now, { emailVerified: false });
+    await setUserSuspended(env.DB, created.id, now);
+    const res = await handleCodeVerifyPost(env.DB, codeVerifyReq("presusp-code@example.com", code), deps(() => now));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("request a fresh link");
+    expect(cookieVal(res, "parachute_id_session")).toBeNull();
+  });
+
+  test("brute-force fence: repeated wrong codes for one (ip,email) lock out — a subsequently CORRECT code is refused too", async () => {
+    const sender = captureSender();
+    const now = new Date("2026-07-16T12:00:00Z");
+    await handleMagicRequestPost(env.DB, magicReq("locked-code@example.com"), deps(() => now), sender);
+    const { code } = sender.sent[0]!;
+    const ip = "10.3.3.9";
+    let last: Response | undefined;
+    for (let i = 0; i < 5; i++) {
+      last = await handleCodeVerifyPost(env.DB, codeVerifyReq("locked-code@example.com", "999999", {}, ip), deps(() => now));
+    }
+    expect(await last!.text()).toContain("request a fresh link"); // still neutral through the 5th miss
+    const lockedAttempt = await handleCodeVerifyPost(env.DB, codeVerifyReq("locked-code@example.com", code, {}, ip), deps(() => now));
+    expect(await lockedAttempt.text()).toContain("Too many attempts");
+    expect(cookieVal(lockedAttempt, "parachute_id_session")).toBeNull();
+  });
+
+  test("CSRF/same-origin gate refuses a bad token before any lookup", async () => {
+    const res = await handleCodeVerifyPost(
+      env.DB,
+      new Request(`${ISSUER}/auth/code`, {
+        method: "POST",
+        body: new URLSearchParams({ __csrf: "wrong-token", email: "gate@example.com", code: "123456" }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: ISSUER, cookie: `parachute_id_csrf=${CSRF}` },
+      }),
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("session expired");
+  });
+
+  test("a wrong code submitted WITH the pending authorize params round-trips them onto the AUTHORIZE login (not the console login)", async () => {
+    const { clientId } = await seedApprovedClient();
+    const { challenge } = await makePkce();
+    const res = await handleCodeVerifyPost(
+      env.DB,
+      codeVerifyReq("nobody-yet-code@example.com", "000000", {
+        client_id: clientId,
+        redirect_uri: REDIRECT_URI,
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        state: "st-code-retry",
+      }),
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("request a fresh link");
+    expect(html).toContain(`name="client_id" value="${clientId}"`);
+    expect(html).toContain('name="state" value="st-code-retry"');
+  });
+
+  test("authorize-resume BY CODE: typing the code on the authorize login's disclosure resumes the exact pending connector request", async () => {
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const { challenge } = await makePkce();
+    const now = new Date("2026-07-16T12:00:00Z");
+    const sender = captureSender();
+    const fields: Record<string, string> = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:read",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "st-code-resume-1",
+    };
+    const send = await handleMagicRequestPost(
+      env.DB,
+      new Request(`${ISSUER}/auth/magic`, {
+        method: "POST",
+        body: new URLSearchParams({ __csrf: CSRF, email: "code-resume@example.com", ...fields }),
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: ISSUER,
+          cookie: `parachute_id_csrf=${CSRF}`,
+          "cf-connecting-ip": "10.7.7.9",
+        },
+      }),
+      deps(() => now),
+      sender,
+    );
+    expect(send.status).toBe(200);
+    const { code } = sender.sent[0]!;
+
+    // The code-verify POST itself carries NO authorize params — the resume
+    // target lives server-side on the row (`consumed.next`), exactly like the
+    // link's own resume.
+    const verify = await handleCodeVerifyPost(env.DB, codeVerifyReq("code-resume@example.com", code), deps(() => now));
+    expect(verify.status).toBe(302);
+    const loc = new URL(verify.headers.get("location")!);
+    expect(loc.origin).toBe(new URL(ISSUER).origin);
+    expect(loc.pathname).toBe("/oauth/authorize");
+    expect(loc.searchParams.get("client_id")).toBe(clientId);
+    expect(loc.searchParams.get("state")).toBe("st-code-resume-1");
+    expect(loc.searchParams.get("code_challenge")).toBe(challenge);
+    const sessionId = cookieVal(verify, "parachute_id_session");
+    expect(sessionId).toBeTruthy();
+
+    const resumed = await handleAuthorizeGet(
+      env.DB,
+      new Request(loc.toString(), { headers: { cookie: `parachute_id_session=${sessionId}` } }),
+      deps(() => now),
+    );
+    expect(resumed.status).toBe(200);
+    const html = await resumed.text();
+    expect(html).toContain("Authorize Claude");
+    expect(html).toContain('name="state" value="st-code-resume-1"');
+  });
+
+  test("through the real router: the dev-echo code header follows the SAME gate as the link header (non-prod present, prod absent)", async () => {
+    const res = await app.fetch(magicReq("code-echo@example.com", "10.5.5.9"), env);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-parachute-dev-magic-code")).toMatch(/^\d{6}$/);
+
+    const prodEnv = { ...env, ENVIRONMENT: "production" };
+    const prodRes = await app.fetch(magicReq("code-echo-prod@example.com", "10.6.6.9"), prodEnv as never);
+    expect(prodRes.status).toBe(200);
+    expect(prodRes.headers.get("x-parachute-dev-magic-code")).toBeNull();
+  });
+});
+
+describe("verifyMagicCode — the per-row attempt cap (independent of the DO fence)", () => {
+  test(`after ${MAGIC_CODE_MAX_ATTEMPTS} wrong codes, the CODE stops verifying but the LINK on the same row stays valid`, async () => {
+    const now = new Date("2026-07-16T12:00:00Z");
+    const { rawToken, code } = await createMagicLink(env.DB, "cap-row@example.com", null, now);
+    for (let i = 0; i < MAGIC_CODE_MAX_ATTEMPTS; i++) {
+      expect(await verifyMagicCode(env.DB, "cap-row@example.com", "000000", now)).toBeNull();
+    }
+    // The cap has tripped: even the CORRECT code no longer verifies.
+    expect(await verifyMagicCode(env.DB, "cap-row@example.com", code, now)).toBeNull();
+    // But the LINK — sharing the same row — is completely untouched.
+    const linkResult = await consumeMagicLink(env.DB, rawToken, now);
+    expect(linkResult).not.toBeNull();
+    expect(linkResult!.email).toBe("cap-row@example.com");
   });
 });
 

@@ -52,6 +52,24 @@ export function randomUUID(): string {
 }
 
 /**
+ * A cryptographically random `digits`-digit numeric code (the magic-link's
+ * short-form sign-in code — magic-links.ts), left-padded with zeros.
+ * Rejection-sampled from a uint32 so the distribution is uniform over
+ * `[0, 10^digits)` — a plain `% 10^digits` would bias toward smaller values.
+ */
+export function randomNumericCode(digits: number): string {
+  const max = 10 ** digits;
+  const limit = Math.floor(0x100000000 / max) * max; // largest multiple of `max` under 2^32
+  const buf = new Uint32Array(1);
+  let n: number;
+  do {
+    crypto.getRandomValues(buf);
+    n = buf[0]!;
+  } while (n >= limit);
+  return String(n % max).padStart(digits, "0");
+}
+
+/**
  * Constant-time string comparison — the hub's `timingSafeEqualString` shape
  * (length check + XOR fold). Used for PKCE + client-secret + hash compares so a
  * mismatch can't be timed byte-by-byte.
