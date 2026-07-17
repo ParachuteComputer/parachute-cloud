@@ -27,7 +27,7 @@ import { transactionAsync } from "@openparachute/core/src/txn.js";
 import * as linkOps from "@openparachute/core/src/links.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
-import { embeddingsPendingWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
+import { embeddingsPendingWarning, ignoredParamWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
 import {
   json,
   jsonWithWarnings,
@@ -314,6 +314,14 @@ async function handleNotesInner(
         }
       }
 
+      // `near_text` without `semantic: true` is inert — ported from
+      // routes.ts:1330-1332 (byte-shape parity: same code/message/param).
+      // Rather than a whole extra branch, this warning rides whichever
+      // normal path (search or structured query) actually runs below.
+      const nearTextIgnored: QueryWarning[] = nearText !== null
+        ? [ignoredParamWarning("near_text", "`semantic=true` is required to activate near_text — pass both together")]
+        : [];
+
       if (search && url.searchParams.has("cursor")) {
         return json(
           {
@@ -337,7 +345,7 @@ async function handleNotesInner(
         // has no stable row order to offset into — results are always page 1,
         // ranked by relevance. Warn rather than silently ignore (the
         // structured-query path below has real offset support, unaffected).
-        const searchWarnings: QueryWarning[] = [];
+        const searchWarnings: QueryWarning[] = [...nearTextIgnored];
         if (parseQuery(url, "offset") !== null) {
           searchWarnings.push({
             code: "ignored_param",
@@ -549,11 +557,11 @@ async function handleNotesInner(
           enrichedOut.push(enriched);
         }
         if (hasCursorParam) return cursorJson(enrichedOut, nextCursor);
-        return json(enrichedOut);
+        return jsonWithWarnings(enrichedOut, nearTextIgnored);
       }
 
       if (hasCursorParam) return cursorJson(output, nextCursor);
-      return json(output);
+      return jsonWithWarnings(output, nearTextIgnored);
     }
 
     // POST /notes — create (single or batch)

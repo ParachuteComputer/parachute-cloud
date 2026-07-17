@@ -18,11 +18,11 @@
  */
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { freshVault, op } from "./helpers.ts";
+import { freshVault, op, createNote } from "./helpers.ts";
 import type { EmbeddingProvider, EmbedInput, EmbedResult, ProviderAvailability } from "@openparachute/core/src/embedding/provider.ts";
 import type { TranscriptionProvider, TranscribeInput, TranscribeResult } from "@openparachute/core/src/transcription/provider.ts";
 import { chunkNoteContent } from "@openparachute/core/src/embedding/chunker.ts";
-import { upsertNoteVector } from "@openparachute/core/src/embedding/vectors.ts";
+import { upsertNoteVector, getNotesPendingEmbedding } from "@openparachute/core/src/embedding/vectors.ts";
 import { contentHash } from "@openparachute/core/src/embedding/staleness.ts";
 
 const TEST_MODEL = "test-embed-model";
@@ -261,6 +261,18 @@ describe("semantic search (C2) — embed-on-write + backfill drain", () => {
     expect((await res.json() as any).field).toBe("near_text");
   });
 
+  it("near_text without semantic=true is inert but warns (ignored_param) — ported from self-host routes.ts:1330-1332", async () => {
+    const v = freshVault("sem");
+    await createNote(v, { content: "an ordinary note", tags: ["nt-ignored"] });
+    // Structured-query path (no `search`, no `semantic`) — near_text rides
+    // along unused; the warning should still surface.
+    const res = await op(v, "/api/notes?near_text=anything&tag=nt-ignored");
+    expect(res.status).toBe(200);
+    const warnings = decodeWarnings(res);
+    const w = warnings?.find((x: any) => x.code === "ignored_param" && x.param === "near_text");
+    expect(w).toBeDefined();
+  });
+
   it("embeddings capability parity: bare landing and /api/vault carry the SAME shape", async () => {
     const v = freshVault("sem");
     // Default test env, no stub injected → unavailable → disabled.
@@ -315,6 +327,54 @@ describe("semantic search (C2) — embed-on-write + backfill drain", () => {
     });
   });
 
+  it("a single note with >100 chunks: no embed() call exceeds 90 texts, and the drain fully embeds it", async () => {
+    // Regression for the review-round-2 blocker: EMBED_NOTES_PER_WAKE bounds
+    // NOTES per wake (25), NOT the flattened CHUNK count — bge-m3 hard-caps
+    // its input array at 100 items (Cloudflare docs; not captured in
+    // @cloudflare/workers-types), so a single long note alone can overflow
+    // one provider.embed() call. Content: many paragraphs, each individually
+    // LONGER than the chunker's ~1800-char target — chunker.ts's
+    // packParagraphs documents that an over-target paragraph becomes its
+    // OWN chunk (never merged with a neighbor, since it already exceeds
+    // minChars), so N such paragraphs deterministically yield N chunks.
+    const bigParagraph = "word ".repeat(400); // ~2000 chars, over the ~1800-char target
+    const content = Array.from({ length: 110 }, () => bigParagraph).join("\n\n");
+    const chunkCount = chunkNoteContent(content).length;
+    expect(chunkCount).toBeGreaterThan(100); // sanity: the synthetic content actually produces >100 chunks
+
+    const v = freshVault("sem");
+    // Prime: materialize + fully drain the welcome-seed notes FIRST, under
+    // the SAME model the real assertions below use — otherwise the seed
+    // guides' own chunks get flattened into the SAME wake as the giant
+    // note (EMBED_NOTES_PER_WAKE=25 easily covers both), inflating the
+    // call-total below. This test isolates ONE note's chunk count.
+    await landing(v);
+    await runAlarmWithEmbedding(v, stubEmbedProvider(() => [1, 0, 0]));
+
+    const noteRes = await op(v, "/api/notes", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content, tags: ["bigmono"] }),
+    });
+    const note = (await noteRes.json()) as { id: string };
+
+    const provider = stubEmbedProvider(() => [1, 0, 0]);
+    await runAlarmWithEmbedding(v, provider);
+
+    // (b) no single embed() call carried more than 90 texts.
+    expect(provider.calls.length).toBeGreaterThan(1); // proves sub-batching actually happened, not one lucky call
+    for (const call of provider.calls) {
+      expect(call.length).toBeLessThanOrEqual(90);
+    }
+    const totalTextsAcrossCalls = provider.calls.reduce((sum, c) => sum + c.length, 0);
+    expect(totalTextsAcrossCalls).toBe(chunkCount);
+
+    // (a) the drain advances past it — every chunk of the one note landed a
+    // vector row (the backlog doesn't wedge on the oversized window).
+    const rowCount = await vectorRowCount(v, note.id);
+    expect(rowCount).toBe(chunkCount);
+  });
+
   it("alarm interplay: a DUE transcription and a STALE note are BOTH processed in ONE alarm() call", async () => {
     const v = freshVault("sem");
     // Arrange a stale (unembedded) note.
@@ -366,5 +426,74 @@ describe("semantic search (C2) — embed-on-write + backfill drain", () => {
 
     // Embedding ALSO ran, in the SAME alarm() call.
     expect(await vectorRowCount(v, note.id)).toBeGreaterThan(0);
+  });
+
+  it("model-change staleness: a done-flag persisted under an OLD model doesn't mask a NEW model's fresh backfill need", async () => {
+    const v = freshVault("sem");
+    await landing(v); // materializes config
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      // Seed: as if a PRIOR deploy fully drained this vault under a
+      // different model (a redeploy that changed EMBEDDING_MODEL).
+      // "embedding_backfill_done" must match EMBEDDING_BACKFILL_DONE_KEY in
+      // vault-do.ts (not exported — the storage key is an implementation
+      // literal, mirrored here as the vitest suites already do for
+      // EMBED_NOTES_PER_WAKE's value elsewhere in this file).
+      await inst.ctx.storage.put("embedding_backfill_done", { done: true, model: "old-model" });
+      await inst.ctx.storage.deleteAlarm();
+      inst.__resetEmbeddingBackfillState(); // force a fresh load from storage
+      // The CURRENTLY active provider's model (TEST_MODEL) differs from the
+      // persisted "old-model" — the stale flag must NOT read as done.
+      inst.__setTestEmbeddingProvider(stubEmbedProvider(() => [1, 0, 0]));
+      await inst.maybeArmEmbeddingBackfill();
+      expect(inst.embeddingBackfillDone).toBe(false);
+      const alarm = await inst.ctx.storage.getAlarm();
+      expect(alarm).not.toBeNull(); // armed to re-check/backfill under the new model
+    });
+  });
+
+  it("concurrent-write race: a note landing WHILE the drain's embed() call is in flight isn't masked by a wrongly-persisted done flag", async () => {
+    const v = freshVault("sem");
+    await landing(v);
+    let raceNoteId = "";
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      await inst.ctx.storage.deleteAlarm();
+      inst.__resetEmbeddingBackfillState();
+      // A stub whose embed() call itself creates a NEW note — simulating a
+      // REST/MCP write landing (and synchronously committing) WHILE this
+      // wake's drainEmbeddingsOnce is awaiting the provider, AFTER its own
+      // candidate scan already ran. This is deterministic (no real
+      // concurrency needed) and exercises the exact race window the fix
+      // closes: the write's own hook sets embeddingBackfillDone=false but
+      // (being mid-alarm) can't arm a new alarm itself (alarmRunning guard)
+      // — alarm()'s own re-check-before-persisting-done must catch it.
+      const raceProvider: EmbeddingProvider = {
+        name: "race-stub",
+        model: TEST_MODEL,
+        dims: DIMS,
+        async available(): Promise<ProviderAvailability> {
+          return { ok: true };
+        },
+        async embed(input: EmbedInput): Promise<EmbedResult> {
+          const note = await inst.store.createNote("a note that lands mid-drain", { tags: ["race"] });
+          raceNoteId = note.id;
+          return { vectors: input.texts.map(() => new Float32Array([1, 0, 0])), model: TEST_MODEL, dims: DIMS };
+        },
+      };
+      inst.__setTestEmbeddingProvider(raceProvider);
+      // Seed ONE genuinely-pending note so drainEmbeddingsOnce has
+      // something to embed (and thus calls embed(), triggering the race).
+      await inst.store.createNote("the note this wake actually embeds", { tags: ["seed"] });
+      await inst.alarm();
+
+      // The race note must NOT be silently marked "done" — still pending,
+      // NEVER persisted as complete, and the alarm re-armed to pick it up.
+      expect(inst.embeddingBackfillDone).toBe(false);
+      const stored = await inst.ctx.storage.get("embedding_backfill_done");
+      expect(stored).toBeUndefined();
+      const pending = getNotesPendingEmbedding(inst.store.db, TEST_MODEL, 10);
+      expect(pending.some((n: { id: string }) => n.id === raceNoteId)).toBe(true);
+      const alarm = await inst.ctx.storage.getAlarm();
+      expect(alarm).not.toBeNull();
+    });
   });
 });

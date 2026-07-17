@@ -199,21 +199,52 @@ const TRANSCRIBE_MONTH_KEY = "transcribe_minutes_month";
  *  (mirrors the self-host worker's DEFAULT_MAX_ATTEMPTS). */
 const TRANSCRIBE_MAX_ATTEMPTS = 3;
 
-/** DO-storage key: whether the embedding backfill scan last found NOTHING
- *  pending (semantic search MVP, C2). Gates the cheap per-request arm-check
- *  in `ensureState` — see `maybeArmEmbeddingBackfill`'s doc. */
+/**
+ * DO-storage value: whether the embedding backfill scan last found NOTHING
+ * pending (semantic search MVP, C2), AND the `model` it was computed
+ * against. Gates the cheap per-request arm-check in `ensureState` — see
+ * `maybeArmEmbeddingBackfill`'s doc. The `model` field closes a staleness
+ * gap: if `EMBEDDING_MODEL` ever changes (a redeploy), an idle vault whose
+ * flag was persisted `true` under the OLD model must NOT read as "still
+ * done" — core's own staleness semantics treat a model change as "every
+ * existing row is obsolete, every current chunk is stale" (planStaleness),
+ * so the backfill genuinely needs to re-run. Comparing the stored model
+ * against the CURRENTLY resolved provider's model on load is what makes
+ * that re-run actually happen instead of the flag masking it forever.
+ */
 const EMBEDDING_BACKFILL_DONE_KEY = "embedding_backfill_done";
+interface EmbeddingBackfillState {
+  done: boolean;
+  model: string;
+}
 
-/** Bounded per-wake budget: up to this many notes' worth of stale chunks are
- *  embedded in ONE Workers AI call per alarm wake (embedding inference is
- *  fast, unlike whisper's ~240s budget — see transcription/workers-ai.ts's
- *  "one inference per wake" comment for the contrast — so batching several
- *  notes per wake is safe). Keeps a single wake's subrequest/token footprint
- *  bounded regardless of vault size: a 3000-note vault backfills across many
- *  wakes instead of risking one wake's Workers AI call / DO subrequest
- *  limits. At core's ~450-token chunk target, 25 notes × ~2 chunks/note
- *  worst-case is comfortably under bge-m3's ~60k-token context window. */
+/** Bounded per-wake budget: up to this many notes are CONSIDERED per alarm
+ *  wake (embedding inference is fast, unlike whisper's ~240s budget — see
+ *  transcription/workers-ai.ts's "one inference per wake" comment for the
+ *  contrast — so batching several notes per wake is safe). Keeps a single
+ *  wake's total candidate scan bounded regardless of vault size: a 3000-note
+ *  vault backfills across many wakes instead of one wake scanning
+ *  everything. This bounds NOTES, not the flattened CHUNK count handed to
+ *  any single provider call — see {@link EMBED_MAX_TEXTS_PER_CALL} for that
+ *  separate, load-bearing cap. */
 const EMBED_NOTES_PER_WAKE = 25;
+
+/**
+ * Hard cap on texts per `provider.embed()` call — bge-m3 rejects a batch
+ * over 100 items (Cloudflare's documented limit; NOT captured in
+ * `@cloudflare/workers-types`, which carries the request/response SHAPE but
+ * not this size limit). `EMBED_NOTES_PER_WAKE` bounds NOTES per wake, not
+ * the flattened CHUNK count — a single long note (or several multi-chunk
+ * notes) can still produce well over 100 stale chunks in one wake. Slicing
+ * the flattened chunk list at this cap (comfortable headroom under 100)
+ * makes an oversized call to the provider STRUCTURALLY IMPOSSIBLE, rather
+ * than caught-and-retried: an uncaught oversized call would 400, and
+ * because `getNotesPendingEmbedding` has no ORDER BY, the SAME oversized
+ * window would be re-selected unchanged on the next wake — wedging the
+ * backfill forever on that one window (never persisting
+ * `embeddingBackfillDone`, never letting the DO's alarm go idle).
+ */
+const EMBED_MAX_TEXTS_PER_CALL = 90;
 
 /**
  * Lazily resolves to the DO's live embedding provider on every property/
@@ -350,7 +381,9 @@ export class VaultDO extends DurableObject {
   private realEmbeddingProvider?: EmbeddingProvider;
 
   /**
-   * Cached in-memory mirror of {@link EMBEDDING_BACKFILL_DONE_KEY}.
+   * Cached in-memory mirror of {@link EMBEDDING_BACKFILL_DONE_KEY} — TRUE
+   * only when the persisted flag is `done: true` for the CURRENTLY resolved
+   * provider's model (see the key's doc for why the model must match).
    * `undefined` = not yet loaded from DO storage this wake. See
    * `maybeArmEmbeddingBackfill`'s doc for the full arm/drain/persist cycle.
    */
@@ -751,9 +784,15 @@ export class VaultDO extends DurableObject {
    * (`store.embeddingProvider` undefined) skip entirely — nothing to backfill.
    */
   private async maybeArmEmbeddingBackfill(): Promise<void> {
-    if (!this.store.embeddingProvider) return;
+    const provider = this.store.embeddingProvider;
+    if (!provider) return;
     if (this.embeddingBackfillDone === undefined) {
-      this.embeddingBackfillDone = (await this.ctx.storage.get<boolean>(EMBEDDING_BACKFILL_DONE_KEY)) ?? false;
+      const stored = await this.ctx.storage.get<EmbeddingBackfillState>(EMBEDDING_BACKFILL_DONE_KEY);
+      // A stored "done" under a DIFFERENT model (a redeploy switched
+      // EMBEDDING_MODEL) does NOT count — see EMBEDDING_BACKFILL_DONE_KEY's
+      // doc. This is what makes a model change re-arm an idle vault's
+      // backfill instead of the stale flag masking it forever.
+      this.embeddingBackfillDone = stored?.done === true && stored.model === provider.model;
     }
     if (!this.embeddingBackfillDone) await this.scheduleEmbeddingAlarm();
   }
@@ -1964,14 +2003,35 @@ export class VaultDO extends DurableObject {
       // no more) persist the backfill-complete flag so idle requests stop
       // arm-checking (maybeArmEmbeddingBackfill).
       const embedOutcome = await this.drainEmbeddingsOnce();
-      const embeddingDone =
+      let embeddingDone =
         embedOutcome.kind === "empty" || (embedOutcome.kind === "partial" && !embedOutcome.more);
-      if (embeddingDone) {
-        this.embeddingBackfillDone = true;
-        await this.ctx.storage.put(EMBEDDING_BACKFILL_DONE_KEY, true);
-      }
-      const embeddingNeedsRearm =
+      let embeddingNeedsRearm =
         embedOutcome.kind === "failed" || (embedOutcome.kind === "partial" && embedOutcome.more);
+
+      if (embeddingDone) {
+        // Concurrent-write race guard: a REST/MCP write can land (and
+        // COMMIT synchronously) WHILE this wake's own `drainEmbeddingsOnce`
+        // was awaiting a provider.embed() call — after that call's own
+        // candidate scan already ran. Its hook is skipped from re-arming
+        // (alarmRunning) and its `embeddingBackfillDone = false` would
+        // otherwise be silently overwritten by the `true` below. One more
+        // cheap existence check (no provider call, LIMIT 1) right before
+        // persisting "done" catches that note instead of stranding it until
+        // an unrelated future write arms the alarm again.
+        const provider = this.store.embeddingProvider;
+        const stillPending = provider ? getNotesPendingEmbedding(this.store.db, provider.model, 1) : [];
+        if (stillPending.length > 0) {
+          embeddingDone = false;
+          embeddingNeedsRearm = true; // pick it up on THIS wake's re-arm, not a later external trigger
+        }
+      }
+      if (embeddingDone) {
+        const provider = this.store.embeddingProvider;
+        if (provider) {
+          this.embeddingBackfillDone = true;
+          await this.ctx.storage.put(EMBEDDING_BACKFILL_DONE_KEY, { done: true, model: provider.model } satisfies EmbeddingBackfillState);
+        }
+      }
 
       // Re-arm from the CURRENT pending set on BOTH queues: soonest of (a due
       // transcription item → now, a backed-off item → its backoff time, more/
@@ -2060,23 +2120,32 @@ export class VaultDO extends DurableObject {
 
   /**
    * One bounded pass of the embedding backfill/on-write drain (semantic
-   * search MVP, C2). Batches up to {@link EMBED_NOTES_PER_WAKE} notes' worth
-   * of stale chunks into a SINGLE Workers AI call per wake — unlike
-   * transcription's "one inference per wake" (whisper's ~240s budget),
-   * embedding inference is fast, so processing several notes per wake is
-   * safe and keeps a large vault's backfill from taking forever.
+   * search MVP, C2). Considers up to {@link EMBED_NOTES_PER_WAKE} notes'
+   * worth of stale chunks per wake — unlike transcription's "one inference
+   * per wake" (whisper's ~240s budget), embedding inference is fast, so
+   * processing several notes per wake is safe and keeps a large vault's
+   * backfill from taking forever. The FLATTENED chunk list is then
+   * sub-batched into `provider.embed()` calls of at most
+   * {@link EMBED_MAX_TEXTS_PER_CALL} texts each (potentially MULTIPLE calls
+   * in one wake) — `EMBED_NOTES_PER_WAKE` bounds notes, not the resulting
+   * chunk count, and a single oversized call would 400 against bge-m3's
+   * 100-item cap (see that constant's doc for why this must be structural,
+   * not caught-and-retried).
    *
    * Mirrors self-host's `EmbeddingWorker.embedNote` shape (chunk → diff
    * against existing `note_vectors` rows via `planStaleness` → prune
    * obsolete rows BEFORE any provider call → embed only what's genuinely
-   * stale) but batches MULTIPLE notes into that one provider call instead of
-   * one note at a time. A no-op edit (identical content, same model) costs
-   * ZERO provider calls — the same freshness gate core's self-host worker
-   * relies on, unchanged here.
+   * stale) but batches MULTIPLE notes across (sub-batched) provider calls
+   * instead of one note at a time. A no-op edit (identical content, same
+   * model) costs ZERO provider calls — the same freshness gate core's
+   * self-host worker relies on, unchanged here. Vectors are written
+   * incrementally after EACH sub-batch succeeds, so one sub-batch's failure
+   * never loses progress already made by earlier sub-batches in the same
+   * wake.
    *
    * Returns a discriminated outcome (not a bare boolean) so `alarm()` can
    * tell "genuinely nothing pending" (safe to persist backfill-complete)
-   * apart from "provider unavailable" or "this batch's embed call failed"
+   * apart from "provider unavailable" or "at least one sub-batch failed"
    * (neither of which means the QUEUE is empty — see the call site).
    */
   private async drainEmbeddingsOnce(): Promise<
@@ -2115,22 +2184,32 @@ export class VaultDO extends DurableObject {
       return { kind: "partial", more };
     }
 
-    try {
-      const { vectors } = await provider.embed({ texts: toEmbed.map((t) => t.chunk.text) });
-      for (let i = 0; i < toEmbed.length; i++) {
-        const vector = vectors[i];
-        if (!vector) continue; // defensive: provider returned fewer vectors than requested
-        const { noteId, chunk } = toEmbed[i]!;
-        upsertNoteVector(db, noteId, chunk, normalize(vector), provider.model, contentHash(chunk.text));
+    // Sub-batch the FLATTENED chunk list at EMBED_MAX_TEXTS_PER_CALL — this
+    // is what makes an oversized single provider.embed() call structurally
+    // impossible regardless of how many chunks this wake's notes produced.
+    let anyFailure = false;
+    for (let i = 0; i < toEmbed.length; i += EMBED_MAX_TEXTS_PER_CALL) {
+      const slice = toEmbed.slice(i, i + EMBED_MAX_TEXTS_PER_CALL);
+      try {
+        const { vectors } = await provider.embed({ texts: slice.map((t) => t.chunk.text) });
+        for (let j = 0; j < slice.length; j++) {
+          const vector = vectors[j];
+          if (!vector) continue; // defensive: provider returned fewer vectors than requested
+          const { noteId, chunk } = slice[j]!;
+          upsertNoteVector(db, noteId, chunk, normalize(vector), provider.model, contentHash(chunk.text));
+        }
+      } catch (e) {
+        console.error(`[embeddings ${this.config?.name}] embed sub-batch failed:`, errText(e));
+        anyFailure = true;
+        // Continue to the NEXT sub-batch rather than aborting the wake — an
+        // unrelated slice's transient failure shouldn't block progress on
+        // the rest of this wake's already-planned work. Leave the failed
+        // slice's chunks stale — idempotent: the next wake re-derives the
+        // same plan (planStaleness re-diffs against CURRENT content_hash
+        // every time) and retries.
       }
-      return { kind: "partial", more };
-    } catch (e) {
-      console.error(`[embeddings ${this.config?.name}] embed batch failed:`, errText(e));
-      // Leave stale — idempotent: the next wake re-derives the same plan
-      // (planStaleness re-diffs against CURRENT content_hash every time) and
-      // retries.
-      return { kind: "failed", more };
     }
+    return { kind: anyFailure ? "failed" : "partial", more };
   }
 
   /**
