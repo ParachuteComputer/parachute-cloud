@@ -199,6 +199,11 @@ export async function handleAccountVaultsList(db: D1Database, req: Request, deps
     const row = usage.get(v.name);
     return {
       name: v.name,
+      // The immutable identity behind `name` (migration 0020, handles/sharing
+      // groundwork) — additive; `name` stays the wire identifier everywhere
+      // else (scopes, URLs, DO addressing) for now. Null only for a legacy row
+      // predating the migration's backfill (shouldn't happen once applied).
+      vault_id: v.vaultId,
       url: vaultAdvertisedUrl(v.name, deps),
       created_at: v.createdAt,
       // dbBytes → notes graph, r2Bytes → attachment binaries (the two-meter
@@ -338,9 +343,11 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   const body = await readJsonBody(req);
   const rawName = typeof body.name === "string" ? body.name : "";
   let name: string;
+  let vaultId: string | null;
   try {
     const vault = await createVault(db, rawName, user.id, deps.now?.() ?? new Date());
     name = vault.name;
+    vaultId = vault.vaultId;
   } catch (err) {
     if (err instanceof VaultNameInvalidError) {
       return err.reason === "reserved"
@@ -367,6 +374,9 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   return jsonResponse(
     {
       name,
+      // The immutable identity behind `name` (migration 0020, handles/sharing
+      // groundwork) — additive; see the /account/vaults list handler's note.
+      vault_id: vaultId,
       url: vaultAdvertisedUrl(name, deps),
       vault_token: minted.token,
       // NOTE: `url` above is the advertised PUBLIC origin (A3 URL coherence);

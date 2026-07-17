@@ -125,10 +125,17 @@ export async function seedUser(email = "owner@example.com", password = "correct 
  * slug/reserved validation in createVault — tests exercise arbitrary names).
  * Idempotent. Ownership is now a precondition for minting a `vault:<name>:*`
  * token, so the mint helpers + authorize tests seed it for the user.
+ *
+ * Also stamps a `vault_id` (mirroring what `createVault` itself does since
+ * migration 0020) so tests exercising the id see the same shape a real
+ * creation would — `crypto.randomUUID()` directly rather than importing the
+ * app's `randomUUID` wrapper, to keep this file dependency-light.
  */
 export async function seedVault(name: string, ownerUserId: string): Promise<void> {
-  await env.DB.prepare("INSERT OR IGNORE INTO vaults (name, owner_user_id, created_at) VALUES (?, ?, ?)")
-    .bind(name.toLowerCase(), ownerUserId, new Date().toISOString())
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO vaults (name, owner_user_id, created_at, vault_id) VALUES (?, ?, ?, ?)",
+  )
+    .bind(name.toLowerCase(), ownerUserId, new Date().toISOString(), crypto.randomUUID())
     .run();
 }
 
