@@ -39,6 +39,25 @@ custom_domain = true
 pattern = "app.parachute.computer"
 custom_domain = true
 
+# my.parachute.computer — THE one-origin door (Phase A1, URL-TOPOLOGY.md rev 2,
+# "one canonical URL"). A THIRD Custom Domain on this SAME worker: `/` Host-
+# branches exactly like app. (not CONSOLE_REDIRECT_HOST, so it serves the SPA
+# shell), while `/vault/*` on this SAME hostname is claimed by a Cloudflare
+# ZONE ROUTE on the VAULT worker instead (workers/vault/wrangler.toml) — routes
+# take precedence over a Custom Domain on the same hostname (confirmed against
+# CF's "Interaction with Routes" docs, 2026-07-16), so that dispatch happens at
+# the platform layer, before this worker (or its Static Assets) ever sees the
+# request. This worker needs ONE piece of defensive code for it: the
+# `/vault`+`/vault/*` run_worker_first backstop below (route-manifest.ts
+# DEFENSIVE_PREFIXES) — a loud 503 if that zone route is ever misconfigured,
+# never a silent SPA-shell 200. See the cutover choreography in PR #<this PR>'s
+# description before flipping DNS — deploy order matters (the vault worker's
+# zone route must attach, and the placeholder my. redirect worker must be
+# retired, BEFORE this Custom Domain attaches).
+[[routes]]
+pattern = "my.parachute.computer"
+custom_domain = true
+
 # Workers Logs: persist invocation logs + console.* so `wrangler tail`, the
 # dashboard, and the logs API can actually surface them. Before this stanza the
 # account had NO persistent logs — structured failure lines like
@@ -132,6 +151,12 @@ new_sqlite_classes = ["RateLimiterDO"]
 #                        the callback reliably drops OUT of worker-first even
 #                        though `/oauth/*` matches it. run-worker-first.test.ts
 #                        asserts this array is byte-equal to the manifest.
+#                        `/vault`, `/vault/*` (Phase A1, DEFENSIVE_PREFIXES) are
+#                        NOT a ceremony — they're the my.parachute.computer
+#                        one-origin door's defensive backstop, so this worker
+#                        503s instead of the SPA shell if the vault worker's
+#                        my./vault/* zone route (workers/vault/wrangler.toml)
+#                        ever goes missing.
 # =============================================================================
 [assets]
 directory = "./dist-assets"
@@ -151,6 +176,7 @@ run_worker_first = [
   "/health", "/health/*",
   "/__test", "/__test/*",
   "/account/*",
+  "/vault", "/vault/*",
   "/",
   "!/oauth/callback",
 ]
@@ -174,17 +200,23 @@ ISSUER = "https://cloud.parachute.computer"
 # Static-Assets serving provable before any Custom Domain exists). Compared as a
 # bare host (no scheme); unset ⇒ every host serves the SPA at root.
 CONSOLE_REDIRECT_HOST = "cloud.parachute.computer"
-# BOUND_ORIGINS (P0.5 / P1.3) — extra origins the same-origin gate accepts, beyond
-# ISSUER (which is ALWAYS accepted). Comma-separated; each entry is normalized to a
-# bare origin. SET to app.parachute.computer now that it's a co-equal SERVING origin
-# for the ceremonies (P1.3): the app. Custom Domain is the SAME identity worker, so
-# every cookie-authed POST from app. (magic-link request, signup, login, consent,
+# BOUND_ORIGINS (P0.5 / P1.3 / A1) — extra origins the same-origin gate accepts,
+# beyond ISSUER (which is ALWAYS accepted). Comma-separated; each entry is
+# normalized to a bare origin. SET to app.parachute.computer + my.parachute.computer
+# now that BOTH are co-equal SERVING origins for the ceremonies (P1.3 added app.;
+# A1 adds my., the one-origin door's Custom Domain on this SAME worker): every
+# cookie-authed POST from either (magic-link request, signup, login, consent,
 # checkout) must pass the same-origin gate — without this the accept-set is only
-# [ISSUER=cloud.] and every app.-origin POST is rejected as "session expired". The
-# token issuer stays cloud. (iss / discovery `issuer` / JWKS / aud unchanged); this
-# widens ONLY the origins a POST's Origin/Referer may match. Widening the accept-set
-# never weakens CSRF (an independent conjunct) and never admits a foreign origin.
-BOUND_ORIGINS = "https://app.parachute.computer"
+# [ISSUER=cloud.] and every app./my.-origin POST is rejected as "session expired".
+# The token issuer stays cloud. (iss / discovery `issuer` / JWKS / aud unchanged);
+# this widens ONLY the origins a POST's Origin/Referer may match. Widening the
+# accept-set never weakens CSRF (an independent conjunct) and never admits a
+# foreign origin. my. is a legitimate CSRF-set member (unlike VAULT_ORIGIN/u. —
+# see audience.ts's ResolveResourceOpts note): my. serves real cookie-authed
+# ceremonies through THIS worker, my./vault/* is a SEPARATE zone-routed worker
+# that never reads this worker's cookies (see the vault worker's Bearer-only
+# conformance pin, workers/vault/test/bearer-only.test.ts).
+BOUND_ORIGINS = "https://app.parachute.computer,https://my.parachute.computer"
 # APP_ORIGIN (#116) — where a new arrival lands: the app deep-link target for the
 # post-create 303, the vault cards' "Open your notes" door, the checklist doors,
 # and the day-0 welcome email link. Now that app.parachute.computer serves the app
@@ -337,6 +369,7 @@ run_worker_first = [
   "/health", "/health/*",
   "/__test", "/__test/*",
   "/account/*",
+  "/vault", "/vault/*",
   "/",
   "!/oauth/callback",
 ]

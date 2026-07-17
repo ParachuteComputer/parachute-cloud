@@ -93,6 +93,25 @@ export const SPA_EXCEPTIONS = ["/oauth/callback"] as const;
 export const SUBTREE_ONLY_PREFIXES = ["/account"] as const;
 
 /**
+ * Defensive prefixes (Phase A1, the my.parachute.computer one-origin door) —
+ * NOT ceremonies (no console/login/billing HTML page, no user-facing server
+ * route) but still `run_worker_first`, so THIS worker can answer a loud 503
+ * instead of the SPA fallback silently serving a 200.
+ *
+ * `/vault`: on my.parachute.computer, `/vault/*` is meant to be intercepted by
+ * a Cloudflare ZONE ROUTE that dispatches straight to the VAULT worker
+ * (`workers/vault/wrangler.toml`) — a platform-layer mechanism that takes
+ * precedence over this worker's my. Custom Domain, so in normal operation this
+ * worker never even sees a my./vault/* request. This entry is the backstop for
+ * "the zone route got deleted or misconfigured": `run_worker_first` still
+ * claims the path (so Static Assets' SPA fallback can't shadow it), and the
+ * registered handler (index.ts `vaultRouteMissing`) answers `503 route_missing`
+ * — never the SPA shell, which would look like a working (but empty) vault to
+ * an API/MCP client instead of an honest failure.
+ */
+export const DEFENSIVE_PREFIXES = ["/vault"] as const;
+
+/**
  * The subset of CEREMONY_PREFIXES that has NO live route in `index.ts` yet —
  * reserved so the SPA fallback can never claim it before its routes land, and
  * exempted from the "no dead entry" test (there is intentionally nothing to
@@ -139,6 +158,10 @@ export const ROOT_PATH = "/" as const;
  *     though `/oauth/*` would otherwise claim it — the callback falls through to
  *     Static Assets → `not_found_handling = "single-page-application"` → the SPA
  *     shell boots and its router completes the PKCE `?code=&state=` return.
+ *
+ * DEFENSIVE_PREFIXES expand exactly like CEREMONY_PREFIXES (exact + `/*`) —
+ * `run_worker_first` doesn't distinguish "server ceremony" from "defensive
+ * backstop," it only cares that the worker sees the path first.
  */
 export function runWorkerFirstRules(): string[] {
   const rules: string[] = [];
@@ -146,6 +169,7 @@ export function runWorkerFirstRules(): string[] {
   // Sub-tree-only prefixes emit ONLY `<prefix>/*` — the bare `<prefix>` is
   // deliberately absent so it falls through to the SPA shell (see the const).
   for (const prefix of SUBTREE_ONLY_PREFIXES) rules.push(`${prefix}/*`);
+  for (const prefix of DEFENSIVE_PREFIXES) rules.push(prefix, `${prefix}/*`);
   rules.push(ROOT_PATH);
   for (const ex of SPA_EXCEPTIONS) rules.push(`!${ex}`);
   return rules;
@@ -199,11 +223,16 @@ export function runsWorkerFirst(pathname: string, rules: readonly string[] = run
  * carve-out still holds (`/oauth/callback?code=…` stays SPA-owned, not shadowed
  * into the `/oauth` ceremony rule). This mirrors the P0.3 denylist's anchored
  * `/^\/oauth\/(?!callback)/`, which classifies on the leading path likewise.
+ *
+ * DEFENSIVE_PREFIXES classify true here too — "ceremony" in this file's sense
+ * means "server-owned, the SPA fallback must never claim it," which is exactly
+ * what a defensive backstop is, even though it has no HTML page of its own.
  */
 export function isCeremonyPath(pathname: string): boolean {
   const path = pathname.split(/[?#]/, 1)[0] ?? pathname;
   if (SPA_EXCEPTIONS.some((ex) => underPrefix(path, ex))) return false;
   if (CEREMONY_PREFIXES.some((prefix) => underPrefix(path, prefix))) return true;
+  if (DEFENSIVE_PREFIXES.some((prefix) => underPrefix(path, prefix))) return true;
   // Sub-tree-only: the sub-tree (`/account/…`) is server-owned, the bare prefix
   // (`/account`) is the SPA shell — mirrors the `/account/*`-without-`/account`
   // run_worker_first rule.

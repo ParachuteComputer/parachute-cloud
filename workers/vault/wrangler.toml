@@ -39,6 +39,48 @@ workers_dev = true
 pattern = "u.parachute.computer"
 custom_domain = true
 
+# my.parachute.computer/vault/* — the one-origin door (Phase A1, URL-TOPOLOGY.md
+# rev 2). THREE ZONE ROUTES (not a Custom Domain — my. is already a Custom Domain
+# on the IDENTITY worker, workers/identity/wrangler.toml; a zone route on the SAME
+# hostname takes PRECEDENCE over a Custom Domain there, confirmed against CF's
+# "Interaction with Routes" docs, 2026-07-16, so this worker answers my./vault/*
+# at the platform layer before the identity worker or its Static Assets ever see
+# the request — zero code, zero proxy hop, no new worker). The router below is
+# ALREADY host-agnostic (path routing "works on any host") — no code change.
+#
+# Three patterns, not one, because RFC 9728/8414 discovery needs more than the
+# REST/MCP path itself:
+#   - /vault/*                                             REST, MCP, SSE, and
+#     the path-APPEND discovery form (/vault/<name>/.well-known/...) — all
+#     already live under /vault/, handled by handleDiscovery (discovery.ts).
+#   - /.well-known/oauth-protected-resource/vault/*         the path-INSERTION
+#   - /.well-known/oauth-authorization-server/vault/*        PRM/ASM forms
+#     (discovery.ts matchDiscovery's "insert" branch — .well-known ABOVE the
+#     vault path). This is RFC 9728 §3's canonical resource-metadata location,
+#     and per discovery.ts's own module comment "the only shape strict clients
+#     probe" — mcpWwwAuthenticate's 401 challenge always emits THIS form. Without
+#     these two extra routes, a spec-strict client (Claude/ChatGPT) following the
+#     WWW-Authenticate challenge on my. would 404 at the IDENTITY worker instead
+#     of reaching this discovery doc (my./vault/* alone does not cover a path that
+#     starts with /.well-known/). The bare /.well-known/oauth-protected-resource
+#     and /.well-known/oauth-authorization-server (no /vault/<name> suffix — the
+#     IDENTITY worker's OWN issuer-level metadata) are untouched: both extra
+#     patterns require the /vault/<name> suffix, so they never shadow those.
+#
+# NOTE beyond the literal Phase-A1 brief (flagging for review): the brief named
+# only the first pattern. These two are added because the one-origin door's
+# discovery flow is provably broken without them — see the PR description's
+# "spec friction" note.
+[[routes]]
+pattern = "my.parachute.computer/vault/*"
+zone_name = "parachute.computer"
+[[routes]]
+pattern = "my.parachute.computer/.well-known/oauth-protected-resource/vault/*"
+zone_name = "parachute.computer"
+[[routes]]
+pattern = "my.parachute.computer/.well-known/oauth-authorization-server/vault/*"
+zone_name = "parachute.computer"
+
 # Workers Logs: persist invocation logs + console.* (router errors, DO logs) so
 # tail/dashboard/logs-API surface them — before this stanza the account had no
 # persistent logs at all (2026-07-02 blind spot). head_sampling_rate 1 = every

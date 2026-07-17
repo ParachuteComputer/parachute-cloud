@@ -18,6 +18,7 @@ import { describe, expect, test } from "vitest";
 import { app } from "../src/index.ts";
 import {
   CEREMONY_PREFIXES,
+  DEFENSIVE_PREFIXES,
   RESERVED_PREFIXES,
   SPA_EXCEPTIONS,
   SUBTREE_ONLY_PREFIXES,
@@ -178,5 +179,36 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
       // SPA_EXCEPTIONS. Same effect: callback boots the SPA, siblings don't.
       expect(SPA_EXCEPTIONS).toEqual(["/oauth/callback"]);
     });
+  });
+});
+
+/**
+ * The my.parachute.computer/vault/* defensive backstop (Phase A1). NOT folded
+ * into the (a)-(d) sections above: DEFENSIVE_PREFIXES is deliberately a
+ * SIBLING list to CEREMONY_PREFIXES (route-manifest.ts), not a member of it —
+ * it has no HTML ceremony page, and it must NOT appear in the P0.3 SW-denylist
+ * parity comparison above (notes-ui doesn't serve at my., so its denylist has
+ * no reason to know about /vault).
+ */
+describe("route manifest — the my./vault/* defensive backstop (Phase A1)", () => {
+  test("DEFENSIVE_PREFIXES has ≥1 live registered route (no dead entry)", () => {
+    for (const prefix of DEFENSIVE_PREFIXES) {
+      const match = registeredPaths.some((rp) => routeUnderPrefix(rp, prefix));
+      expect(match, `no route registered under ${prefix}`).toBe(true);
+    }
+  });
+
+  test("isCeremonyPath classifies /vault paths as server-owned (the drift-catcher's actual guarantee)", () => {
+    expect(isCeremonyPath("/vault")).toBe(true);
+    expect(isCeremonyPath("/vault/some-name/mcp")).toBe(true);
+    expect(isCeremonyPath("/vault/some-name/api/notes")).toBe(true);
+  });
+
+  test("DEFENSIVE_PREFIXES stays disjoint from CEREMONY_PREFIXES (a distinct concept, not a duplicate)", () => {
+    for (const p of DEFENSIVE_PREFIXES) {
+      expect((CEREMONY_PREFIXES as readonly string[]).includes(p), `${p} should not double up in CEREMONY_PREFIXES`).toBe(
+        false,
+      );
+    }
   });
 });

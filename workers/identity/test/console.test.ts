@@ -30,6 +30,7 @@ import {
 import { getUserByEmail, hashPassword, needsRehash, verifyPassword } from "../src/users.ts";
 import { hashSecret, randomUUID, verifySecret } from "../src/crypto.ts";
 import { resolveResourceVault } from "../src/audience.ts";
+import { depsForEnv, resolveBoundOrigins } from "../src/oauth-shared.ts";
 import { LOGIN_MAX_FAILURES, SIGNUP_MAX_PER_WINDOW, checkAndBumpSignup } from "../src/rate-limit.ts";
 import {
   CSRF,
@@ -1361,6 +1362,69 @@ describe("congruence — the identity worker resolves the vault worker's own PRM
         boundOrigins: [ISSUER],
         vaultBaseDomain: VAULT_BASE,
         vaultOrigin: env.VAULT_ORIGIN,
+      }),
+    ).toBe("congruence-vault");
+  });
+});
+
+/**
+ * Congruence pin (Phase A1, URL-TOPOLOGY.md — the my.parachute.computer
+ * one-origin door): once my. is a bound serving origin, the vault worker
+ * ALSO answers my./vault/<name>/mcp (via the zone route,
+ * workers/vault/wrangler.toml), and `publicOrigin(req)` there resolves to
+ * my. (no X-Forwarded-Host override) — so the vault's own PRM `resource`
+ * names my., NOT VAULT_ORIGIN/u. This pins that `resolveResourceVault`
+ * already accepts that string, with NO change to audience.ts: `boundOrigins`
+ * (the same set `resolveBoundOrigins(deps)` builds for the CSRF gate) is now
+ * `[cloud., app., my.]`, and branch 2 of `resolveResourceVault` — the
+ * hub-compatible "single origin serves both issuer and vaults" path-form
+ * case #153 already wrote — recognizes ANY member of that set. my. becomes
+ * exactly that case: unlike u./VAULT_ORIGIN (never a ceremony-serving origin,
+ * hence its own dedicated `vaultOrigin` field, deliberately NOT folded into
+ * boundOrigins — see the module comment above `ResolveResourceOpts`), my. IS
+ * a real bound serving origin, so it legitimately rides boundOrigins.
+ */
+describe("congruence — the identity worker resolves the vault worker's own PRM resource string, ON my. (Phase A1)", () => {
+  const MY_ORIGIN = "https://my.parachute.computer";
+
+  function vaultAdvertisedResourceOnMy(vaultName: string): string {
+    return `${MY_ORIGIN}/vault/${vaultName}/mcp`;
+  }
+
+  test("the committed prod BOUND_ORIGINS includes my. (the precondition this congruence relies on)", () => {
+    const bound = resolveBoundOrigins(depsForEnv(env as never));
+    expect(bound).toContain(MY_ORIGIN);
+  });
+
+  test("byte-identical to what workers/vault/src/discovery.ts protectedResource() emits when it answers on my.", () => {
+    const deps = depsForEnv(env as never);
+    expect(
+      resolveResourceVault(vaultAdvertisedResourceOnMy("congruence-vault-my"), {
+        boundOrigins: resolveBoundOrigins(deps),
+        vaultBaseDomain: VAULT_BASE,
+        vaultOrigin: deps.vaultOrigin,
+      }),
+    ).toBe("congruence-vault-my");
+  });
+
+  test("the per-vault PRM path-append form on my. also resolves (already under /vault/, no zone-route gap)", () => {
+    const deps = depsForEnv(env as never);
+    expect(
+      resolveResourceVault(`${MY_ORIGIN}/vault/congruence-vault-my/.well-known/oauth-protected-resource`, {
+        boundOrigins: resolveBoundOrigins(deps),
+        vaultBaseDomain: VAULT_BASE,
+        vaultOrigin: deps.vaultOrigin,
+      }),
+    ).toBe("congruence-vault-my");
+  });
+
+  test("u./VAULT_ORIGIN resolution is unaffected by my. joining boundOrigins (no regression)", () => {
+    const deps = depsForEnv(env as never);
+    expect(
+      resolveResourceVault(`${deps.vaultOrigin}/vault/congruence-vault/mcp`, {
+        boundOrigins: resolveBoundOrigins(deps),
+        vaultBaseDomain: VAULT_BASE,
+        vaultOrigin: deps.vaultOrigin,
       }),
     ).toBe("congruence-vault");
   });
