@@ -251,10 +251,14 @@ describe("attachment tickets — upload mint → spend round trip", () => {
     // pool can let an armed alarm fire opportunistically before the next
     // request — which would legitimately replace `_Transcript pending._`
     // with a terminal marker and clear `transcribe_stub` (no live AI
-    // binding in this test env). Reading the note immediately, in the same
-    // tick as the spend, is what `transcription-do.test.ts`'s
-    // `noteMetaViaStore` helper does for the identical reason.
+    // binding in this test env). Reading immediately, in the same tick as
+    // the spend, narrows but does not close that window (observed live,
+    // cloud#171) — `deleteAlarm()` first removes the armed alarm the pool
+    // could opportunistically fire at all, mirroring the fix
+    // `transcription-do.test.ts`'s `runAlarmWith` applies for the identical
+    // race.
     await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      await inst.ctx.storage.deleteAlarm();
       const stored = await inst.store.getNote(note.id);
       expect(stored.metadata.transcribe_stub).toBe(true);
     });

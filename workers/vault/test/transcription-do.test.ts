@@ -13,7 +13,7 @@
  * metered), the monthly soft cap, placeholder replacement, duration metering,
  * and `until_transcribed` retention (R2 audio dropped + storage meter freed).
  */
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { SELF, env, runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { base, freshVault, mintToken, op } from "./helpers.ts";
@@ -91,20 +91,36 @@ function doStub(vault: string): DurableObjectStub {
 }
 
 /**
- * Inject a stub provider into the vault's DO and run ONE alarm pass
- * deterministically (call `alarm()` directly rather than `runDurableObjectAlarm`
- * — a `setAlarm(now)` fires opportunistically in the vitest pool, so the armed
- * alarm may already be consumed by an intervening request; a direct call runs
- * the exact production code path without that race). Production auto-arming is
- * proven by the live staging E2E; the transcribe:false test below still pins
- * that NO alarm is armed without the flag.
- * (Explicit type args keep tsc from deep-instantiating the VaultDO RPC surface.)
+ * Inject a stub provider and run ONE alarm pass deterministically through
+ * `runDurableObjectAlarm` (cloud#171 de-flake) — NOT a direct `inst.alarm()`
+ * call. The setup calls above this (uploadAudio, the note POST, the
+ * attachment link) each arm the DO's real alarm via `ctx.storage.setAlarm`;
+ * under FULL-suite `vitest-pool-workers` concurrency the pool can deliver
+ * that armed alarm on its OWN, opportunistically, genuinely CONCURRENTLY
+ * with a direct method call on the same live instance (`runInDurableObject`
+ * bypasses the runtime's own alarm-dispatch bookkeeping entirely, so a
+ * direct `inst.alarm()` call is a SEPARATE path into the same method,
+ * raceable against the runtime-delivered one) — two overlapping `alarm()`
+ * invocations both reading `transcribe_status: "pending"` before either
+ * writes back, double-metering the one audio sample (cloud#171: 596 vs 598
+ * minutes). `runDurableObjectAlarm(stub)` is the harness's OWN sanctioned
+ * mechanism for triggering a DO's alarm — "immediately runs AND REMOVES" the
+ * scheduled alarm as one operation, the same single-flight delivery the
+ * runtime's opportunistic firing itself uses, so driving it explicitly here
+ * doesn't open a SECOND competing path the way a direct call does. Setting
+ * the stub and a FRESH `setAlarm(now)` immediately before calling it
+ * (re-arming defensively, in case an earlier opportunistic delivery already
+ * consumed whatever setup armed) keeps this deterministic even if a prior
+ * wake already ran with stale state. (`VaultDO.alarm()` ALSO gained its own
+ * synchronous reentrancy guard as defense in depth — see `alarmRunning`'s doc
+ * in vault-do.ts.)
  */
 async function runAlarmWith(vault: string, provider: TranscriptionProvider): Promise<void> {
   await runInDurableObject<DurableObject, void>(doStub(vault), async (inst: any) => {
     inst.__setTestProvider(provider);
-    await inst.alarm();
+    await inst.ctx.storage.setAlarm(Date.now());
   });
+  await runDurableObjectAlarm(doStub(vault));
 }
 
 /** A stub cleanup text generator — returns a scripted `{ response }` (or throws). */
@@ -118,7 +134,9 @@ function stubCleanup(script: (raw: string) => { response?: unknown }): TextGener
 }
 
 /** Run one alarm pass with BOTH a stub provider and a stub cleanup generator
- *  injected (the cleanup pass otherwise soft-fails to raw under the test env). */
+ *  injected (the cleanup pass otherwise soft-fails to raw under the test env).
+ *  Same opportunistic-firing race as `runAlarmWith` (cloud#171), same fix
+ *  (drive via `runDurableObjectAlarm`, not a direct `inst.alarm()` call). */
 async function runAlarmWithCleanup(
   vault: string,
   provider: TranscriptionProvider,
@@ -127,8 +145,9 @@ async function runAlarmWithCleanup(
   await runInDurableObject<DurableObject, void>(doStub(vault), async (inst: any) => {
     inst.__setTestProvider(provider);
     inst.__setTestCleanup(cleanup);
-    await inst.alarm();
+    await inst.ctx.storage.setAlarm(Date.now());
   });
+  await runDurableObjectAlarm(doStub(vault));
 }
 
 /** Read a note's stored metadata straight from the DO store (bypasses REST
@@ -227,16 +246,23 @@ describe("voice transcription pipeline (cloud#56)", () => {
     const v = freshVault("tx");
     await pushEntitlement(v, true, 600);
     const { noteId } = await setupVoiceNote(v);
-    const attId = (await attachments(v, noteId))[0].id;
     // A plain Error is retriable (the worker contract): the worker backs off.
     const retriable = stubProvider(() => {
       throw new Error("transient upstream 503");
     });
 
     // Attempt 1 → still PENDING with a backoff, note still shows the spinner
-    // (honest — it IS still being retried, not failed).
+    // (honest — it IS still being retried, not failed). No REST call happens
+    // between `setupVoiceNote` (which arms the alarm) and `runAlarmWith`
+    // (which cancels + drives it) — cloud#171: an intervening `SELF.fetch`
+    // dispatch here (the old code fetched `attId` via a separate `GET
+    // /attachments` before this point) gives the vitest pool's own
+    // opportunistic alarm delivery an extra window to fire before our
+    // controlled call takes over, racing it. `attId` is derived below from
+    // the SAME response this call's own assertions already fetch, instead.
     await runAlarmWith(v, retriable);
     let att = (await attachments(v, noteId))[0];
+    const attId = att.id;
     expect(att.metadata.transcribe_status).toBe("pending");
     expect(att.metadata.transcribe_attempts).toBe(1);
     expect(att.metadata.transcribe_backoff_until).toBeTruthy();

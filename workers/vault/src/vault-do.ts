@@ -327,21 +327,26 @@ export class VaultDO extends DurableObject {
   private bootError: string | null = null;
 
   /**
-   * True while an `alarm()` invocation is on the stack (semantic search MVP,
-   * C2). Guards {@link scheduleEmbeddingAlarm} against a REENTRANT mid-wake
-   * re-arm: `transcribeOne`'s own `patchNoteBody` calls `store.updateNote`,
-   * which fires the SAME embedding-on-write hook (constructor) any REST/MCP
-   * write does — arming a NEW alarm for "now" WHILE `alarm()` is still
-   * running. Observed live under the test pool's concurrency model: that
-   * immediate re-arm could fire a SECOND, overlapping `alarm()` invocation
-   * before the first one finished, running `transcribeOne` on the SAME
-   * still-"pending" attachment TWICE (double-metered voice minutes). It's
-   * also simply REDUNDANT in the success case — `drainEmbeddingsOnce()`
-   * already runs later in THIS SAME wake (after the transcription block) and
-   * picks up the just-patched note as newly stale on its own, and
+   * True while an `alarm()` invocation is on the stack. `alarm()` itself
+   * checks-then-sets this SYNCHRONOUSLY at entry (cloud#171 hardening) — no
+   * second invocation on this same DO instance can start work while one is
+   * already running, regardless of how it was dispatched (the DO's normal
+   * alarm-delivery path, or a test's direct `inst.alarm()` call). This
+   * closes the TOCTOU that let two overlapping invocations both read
+   * `transcribe_status: "pending"` before either wrote back, double-metering
+   * the same audio — including the specific mid-wake case {@link
+   * scheduleEmbeddingAlarm} ALSO still guards defensively: `transcribeOne`'s
+   * own `patchNoteBody` calls `store.updateNote`, which fires the SAME
+   * embedding-on-write hook (constructor) any REST/MCP write does — arming a
+   * NEW alarm for "now" WHILE `alarm()` is still running. That arm attempt
+   * is redundant even on its own (`drainEmbeddingsOnce()` already runs later
+   * in THIS SAME wake and picks up the just-patched note as newly stale, and
    * `rearmFromPending`'s trailing re-arm re-checks both queues' FINAL state
-   * regardless. So skipping the mid-wake arm attempt costs nothing and
-   * removes the reentrancy window.
+   * regardless) — skipping it costs nothing. Real Cloudflare DOs already
+   * serialize alarm delivery, so neither guard fires in production today;
+   * both are defensive hardening against a future workerd concurrency
+   * change, and the entry-level one is what actually de-flakes cloud#171
+   * under vitest-pool-workers' concurrency model (see `alarm()`'s doc).
    */
   private alarmRunning = false;
   protected env: Env;
@@ -2056,17 +2061,36 @@ export class VaultDO extends DurableObject {
    */
   async alarm(): Promise<void> {
     if (this.bootError) return;
-    // The alarm has no request → recover the vault name from persisted config.
-    const cfg = (await this.ctx.storage.get<VaultConfigState>("config")) ?? null;
-    const vaultName = cfg?.name;
-    if (!vaultName) return;
-
-    // Reentrancy guard (C2) — see `alarmRunning`'s doc: a note write inside
-    // THIS invocation (transcribeOne's own patchNoteBody) fires the SAME
-    // embedding-on-write hook a REST/MCP write does, which would otherwise
-    // try to arm a SECOND alarm for "now" while this one is still running.
+    // Reentrancy guard (cloud#171 hardening), checked+set SYNCHRONOUSLY
+    // before any `await` — closes it against a genuinely CONCURRENT second
+    // `alarm()` invocation on this same DO instance, not just a mid-wake
+    // re-arm attempt (see `alarmRunning`'s doc for the narrower guard this
+    // generalizes: `scheduleEmbeddingAlarm` already skips arming a SECOND
+    // alarm while one is running, because a note write inside THIS
+    // invocation — transcribeOne's own patchNoteBody — fires the SAME
+    // embedding-on-write hook a REST/MCP write does). Because JS run-to-
+    // completion means the check-then-set below can't be interleaved by
+    // another call to this same method, a second invocation arriving at ANY
+    // point (including one dispatched through the DO's normal alarm-
+    // delivery path while a `runInDurableObject`-style direct call is still
+    // in flight, or vice versa) sees `true` and returns immediately — no
+    // work is lost, since the running invocation's own `rearmFromPending`
+    // re-checks the full current pending set unconditionally before it
+    // finishes. Real Cloudflare DOs already serialize alarm delivery, so
+    // this never fires today (see cloud#171's investigation) — it is
+    // defensive hardening against a future workerd concurrency change, and
+    // it also closes the vitest-pool-workers TOCTOU where the pool's own
+    // opportunistic alarm delivery raced a test's direct `alarm()` call and
+    // both read `transcribe_status: "pending"` before either wrote back,
+    // double-metering the same audio.
+    if (this.alarmRunning) return;
     this.alarmRunning = true;
     try {
+      // The alarm has no request → recover the vault name from persisted config.
+      const cfg = (await this.ctx.storage.get<VaultConfigState>("config")) ?? null;
+      const vaultName = cfg?.name;
+      if (!vaultName) return;
+
       await this.ensureState(vaultName);
 
       // Wake entry point: keep the live-query subscriptions consistent (rehydrate
@@ -2078,12 +2102,33 @@ export class VaultDO extends DurableObject {
       await this.ensureSubscriptionsRehydrated();
       await this.sweepWsSockets();
 
-      const due = await this.dueTranscription();
-      if (due) {
-        try {
-          await this.transcribeOne(vaultName, due);
-        } catch (e) {
-          console.error(`[transcribe ${vaultName}] unexpected error on ${due.id}:`, errText(e));
+      // Test-env guard (cloud#171 de-flake): an alarm wake with NO injected
+      // test provider, under the vitest harness, is a WAKE THAT ISN'T
+      // ACTUALLY UNDER A TEST'S OWN CONTROL — the vitest pool's own
+      // opportunistic alarm delivery (see this method's doc) can invoke
+      // `alarm()` on its own, ahead of a test's `__setTestProvider` call,
+      // between the moment `setupVoiceNote`-style setup arms the alarm and
+      // the moment a test actually gets a turn to inject its stub and drive
+      // it deliberately. Without this guard, that stray wake would call
+      // `transcribeOne` anyway, falling back to a real (uncredentialed, in
+      // this env) `WorkersAiProvider` — consuming the ONE retry attempt on a
+      // real-network failure and backing the attachment off, so the test's
+      // OWN later, correctly-stubbed drive finds nothing due and silently
+      // does nothing (a DIFFERENT flake shape than the double-metering race
+      // above: a transcript that never lands instead of one metered twice).
+      // Skipping ENTIRELY — not even querying `dueTranscription` — leaves
+      // the attachment byte-for-byte untouched (still genuinely "pending",
+      // zero attempts spent) for whichever wake actually carries a stub.
+      // Never taken in production (`env.AI` is always live there) or in any
+      // test that already injected its stub before this wake runs.
+      if (this.env.ENVIRONMENT !== "test" || this.testProvider) {
+        const due = await this.dueTranscription();
+        if (due) {
+          try {
+            await this.transcribeOne(vaultName, due);
+          } catch (e) {
+            console.error(`[transcribe ${vaultName}] unexpected error on ${due.id}:`, errText(e));
+          }
         }
       }
 
