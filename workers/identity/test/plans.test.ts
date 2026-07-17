@@ -380,7 +380,7 @@ describe("vault-count enforcement + entitlement push", () => {
     // no-JS redirect bridges (P0 REVENUE fix, console.ts appDeepLinkRedirect).
     expect(created.status).toBe(200);
     expect(bridgeTarget(await created.text())).toBe(
-      "https://app.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fcapflow-box",
+      "https://app.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fcapflow-box",
     );
 
     // The pushed body is the TWO-METER entitlement (entry: 100 MB notes, 0
@@ -494,7 +494,7 @@ describe("vault-count enforcement + entitlement push", () => {
     );
     expect(res.status).toBe(200);
     expect(bridgeTarget(await res.text())).toBe(
-      "https://app.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fpushfail-box",
+      "https://app.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fpushfail-box",
     );
     expect(await vaultRowCount(userId)).toBe(1);
     expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_failed"))).toBe(true);

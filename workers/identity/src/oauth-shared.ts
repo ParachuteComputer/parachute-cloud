@@ -23,8 +23,22 @@ export interface OAuthDeps {
    * When set, the vault worker is reached by PATH on this origin
    * (`<vaultOrigin>/vault/<name>`) instead of the subdomain form — the dev
    * (workers.dev) mode where there's no wildcard cert. Unset → subdomain form.
+   * MACHINE-reachability only (services catalog, internal vault-call.ts
+   * dispatch, ops.ts health check) — see `vaultPublicOrigin` for the
+   * human-facing counterpart; use `vaultAdvertisedUrl`, not this field
+   * directly, for anything printed/copied/linked to a person.
    */
   vaultOrigin?: string;
+  /**
+   * The vault's PUBLIC, human-facing origin (A3 URL coherence) — what
+   * `vaultAdvertisedUrl` builds console cards, the account descriptor/API, and
+   * the drip welcome email from. Falls back to `vaultOrigin` when unset
+   * (staging, which has no `my.` origin), so the advertised and reachable
+   * origins never diverge there. Production sets it to
+   * `https://my.parachute.computer`; `u.parachute.computer` (`vaultOrigin`)
+   * stays a recognized alias but is no longer what we print.
+   */
+  vaultPublicOrigin?: string;
   /**
    * The origin new arrivals land on — the app deep-link target for the post-create
    * arrival, the vault cards' Notes door, and the checklist doors. Resolved from
@@ -74,13 +88,37 @@ export interface OAuthDeps {
 }
 
 /**
- * The public base URL a client uses to reach a vault instance. Path form when
- * `vaultOrigin` is configured (dev/workers.dev), subdomain form otherwise
- * (prod). The single source of truth for both the services catalog and the
- * console's connect cards, so they never disagree about where a vault lives.
+ * The base URL a MACHINE caller uses to reach a vault instance — the OAuth
+ * token services catalog (`buildServicesCatalog`) and vault-call.ts's actual
+ * fetch target. Path form when `vaultOrigin` is configured (dev/workers.dev,
+ * and today also prod — path routing until wildcard subdomains land),
+ * subdomain form otherwise. NOT for anything a human sees: printed/copied/
+ * linked URLs go through `vaultAdvertisedUrl` instead, so the two can diverge
+ * (prod advertises `my.`, the services catalog + internal dispatch keep
+ * reaching the vault on `u.`) without touching wire-level shapes.
  */
 export function vaultInstanceUrl(name: string, deps: OAuthDeps): string {
   if (deps.vaultOrigin) return `${deps.vaultOrigin.replace(/\/$/, "")}/vault/${name}`;
+  const base = deps.vaultBaseDomain.replace(/^\.+/, "");
+  return `https://${name}.${base}`;
+}
+
+/**
+ * The PUBLIC base URL for a vault instance — what we PRINT, COPY, or LINK
+ * (console connect cards, the Connect-your-AI walkthrough, the account
+ * descriptor/API, the day-0 welcome email). Prefers `vaultPublicOrigin`
+ * (prod: `https://my.parachute.computer`), falling back to `vaultOrigin`
+ * (staging, and any bare config that never set the public origin) so the
+ * advertised and reachable origins never diverge where `my.` doesn't exist —
+ * then the same subdomain-form fallback as `vaultInstanceUrl`. Deliberately a
+ * SEPARATE function from `vaultInstanceUrl`: the OAuth services catalog and
+ * internal vault-worker dispatch must keep resolving through `vaultOrigin`
+ * regardless of what this advertises (A3 URL coherence — display/copy only,
+ * u. stays a permanently recognized alias for anything that already targets it).
+ */
+export function vaultAdvertisedUrl(name: string, deps: OAuthDeps): string {
+  const origin = deps.vaultPublicOrigin ?? deps.vaultOrigin;
+  if (origin) return `${origin.replace(/\/$/, "")}/vault/${name}`;
   const base = deps.vaultBaseDomain.replace(/^\.+/, "");
   return `https://${name}.${base}`;
 }
@@ -146,6 +184,7 @@ export function depsForEnv(env: Env): OAuthDeps {
     issuer,
     vaultBaseDomain: env.VAULT_BASE_DOMAIN,
     vaultOrigin: env.VAULT_ORIGIN,
+    vaultPublicOrigin: env.VAULT_PUBLIC_ORIGIN ?? env.VAULT_ORIGIN,
     // Where a new arrival lands (post-create 303, vault cards, checklist doors) —
     // APP_ORIGIN when set, else the legacy Notes PWA (resolveAppOrigin).
     appOrigin: resolveAppOrigin(env),
