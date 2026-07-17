@@ -21,6 +21,7 @@ import { describe, expect, test } from "vitest";
 import worker from "../src/index.ts";
 import {
   CEREMONY_PREFIXES,
+  DEFENSIVE_PREFIXES,
   SPA_EXCEPTIONS,
   SUBTREE_ONLY_PREFIXES,
   isCeremonyPath,
@@ -46,9 +47,20 @@ describe("runWorkerFirstRules — the derived config (P1.1)", () => {
     for (const ex of SPA_EXCEPTIONS) expect(rules).toContain(`!${ex}`);
   });
 
-  test("exact length: 2 per ceremony prefix + 1 per subtree-only prefix + root + one negation per exception (no strays)", () => {
+  test("expands each defensive prefix (Phase A1, the my./vault/* backstop) to exact + `/*`", () => {
+    for (const p of DEFENSIVE_PREFIXES) {
+      expect(rules, `${p} missing exact`).toContain(p);
+      expect(rules, `${p} missing sub-tree glob`).toContain(`${p}/*`);
+    }
+  });
+
+  test("exact length: 2 per ceremony prefix + 1 per subtree-only prefix + 2 per defensive prefix + root + one negation per exception (no strays)", () => {
     expect(rules).toHaveLength(
-      CEREMONY_PREFIXES.length * 2 + SUBTREE_ONLY_PREFIXES.length + 1 + SPA_EXCEPTIONS.length,
+      CEREMONY_PREFIXES.length * 2 +
+        SUBTREE_ONLY_PREFIXES.length +
+        DEFENSIVE_PREFIXES.length * 2 +
+        1 +
+        SPA_EXCEPTIONS.length,
     );
   });
 });
@@ -75,6 +87,8 @@ describe("runsWorkerFirst — the runtime twin of CF's matcher (P1.1)", () => {
     "/.well-known/oauth-authorization-server",
     "/.well-known/oauth-protected-resource",
     "/__test/drip-run",
+    "/vault", // Phase A1 — the my./vault/* defensive backstop (DEFENSIVE_PREFIXES)
+    "/vault/some-name/mcp",
   ];
   test.each(ceremonies)("%s runs the WORKER first (never the SPA)", (path) => {
     expect(runsWorkerFirst(path)).toBe(true);
@@ -116,6 +130,8 @@ describe("runsWorkerFirst — the runtime twin of CF's matcher (P1.1)", () => {
       "/.well-known/jwks.json",
       "/some-note",
       "/settings",
+      "/vault",
+      "/vault/some-name/mcp",
     ];
     for (const p of samples) {
       expect(runsWorkerFirst(p), `${p}: matcher/manifest disagree`).toBe(isCeremonyPath(p));
@@ -183,5 +199,36 @@ describe("the Host-branched root (P1.1)", () => {
     const res = await worker.fetch(new Request(`${ISSUER}/`), staging);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type") ?? "").toContain("text/html");
+  });
+});
+
+// --- 3. the my./vault/* defensive backstop (Phase A1) -----------------------
+
+describe("the /vault defensive backstop (Phase A1, DEFENSIVE_PREFIXES)", () => {
+  // In production this identity worker never actually answers my./vault/* — a
+  // Cloudflare zone route on the vault worker intercepts it at the platform
+  // layer, ahead of this worker's my. Custom Domain. This suite exercises the
+  // worker DIRECTLY (bypassing the zone route entirely, as vitest always does)
+  // to prove the fallback itself is correct — the case that matters is "the
+  // zone route vanished," which looks identical to this from the worker's POV.
+  test("GET /vault → 503 route_missing, never the SPA shell", async () => {
+    const res = await worker.fetch(new Request("https://my.example/vault"), env);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: string; error_type: string };
+    expect(body.error_type).toBe("vault_route_missing");
+  });
+
+  test("GET /vault/<name>/mcp → 503 route_missing, never a 200 SPA shell", async () => {
+    const res = await worker.fetch(new Request("https://my.example/vault/some-name/mcp"), env);
+    expect(res.status).toBe(503);
+    expect(res.headers.get("content-type") ?? "").toContain("application/json");
+  });
+
+  test("any method (POST too — the REST/MCP write path) gets the same 503, not a 404 or a redirect", async () => {
+    const res = await worker.fetch(
+      new Request("https://my.example/vault/some-name/api/notes", { method: "POST" }),
+      env,
+    );
+    expect(res.status).toBe(503);
   });
 });

@@ -11,13 +11,14 @@
  *                        (except the deferred root), so a future ceremony route
  *                        added without updating the manifest fails HERE, before
  *                        the SPA fallback can swallow it;
- *   4. P0.3 parity     — the set matches the notes-ui SW denylist, modulo two
- *                        documented differences.
+ *   4. P0.3 parity     — the set matches the parachute-app SW denylist, modulo
+ *                        two documented differences.
  */
 import { describe, expect, test } from "vitest";
 import { app } from "../src/index.ts";
 import {
   CEREMONY_PREFIXES,
+  DEFENSIVE_PREFIXES,
   RESERVED_PREFIXES,
   SPA_EXCEPTIONS,
   SUBTREE_ONLY_PREFIXES,
@@ -124,15 +125,17 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
     });
   });
 
-  // (d) P0.3 parity — provably the same set as the notes-ui service-worker
+  // (d) P0.3 parity — provably the same set as the parachute-app service-worker
   // denylist, modulo the two documented differences. Maintained mirror (the two
   // repos don't share a package, so we can't import it); the comment points at
   // the source, and this test fails if THIS repo's set drifts from the agreed
-  // shape. See pwa-navigation-denylist.ts.
+  // shape. See parachute-app/src/pwa-navigation-denylist.ts.
   describe("parity with the P0.3 SW denylist", () => {
     // The ceremony prefixes the P0.3 denylist enforces (RegExps → bare
-    // prefixes). Source of truth:
-    // parachute-surface/packages/notes-ui/src/pwa-navigation-denylist.ts
+    // prefixes). Source of truth: parachute-app/src/pwa-navigation-denylist.ts
+    // (the SPA the identity worker actually serves — parachute-cloud#116; the
+    // OLDER notes-ui denylist this comment used to cite is not the deployed
+    // client anymore).
     const P03_DENYLIST_PREFIXES = [
       "/api", // vault REST + notes-daemon proxy
       "/oauth",
@@ -147,25 +150,35 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
       "/billing",
       "/unsubscribe",
       "/health",
+      "/vault", // Phase A1/A2 — /^\/vault\// in the app denylist (my./vault/* backstop)
+      "/u", // Phase B, reserved — /^\/u\// in the app denylist, no cloud route yet
     ];
 
     // The two DELIBERATE differences between the sets:
-    // - /api      : SW-denylist-only. The vault REST lives on a DIFFERENT worker
-    //               / origin (u.parachute.computer); the identity worker has no
-    //               /api route, so its Static Assets fallback has nothing to
-    //               shadow there. The SW denies it because the SW is origin-
-    //               scoped (defensive, cross-origin-proxy heritage).
+    // - /api, /u  : SW-denylist-only. `/api` — the vault REST lives on a
+    //               DIFFERENT worker/origin (u.parachute.computer); the
+    //               identity worker has no /api route, so its Static Assets
+    //               fallback has nothing to shadow there. The SW denies it
+    //               because the SW is origin-scoped (defensive, cross-origin-
+    //               proxy heritage). `/u` — the app denies it now, reserved for
+    //               Phase B's `/u/<handle>/vault/<name>` namespace
+    //               (URL-TOPOLOGY.md §2.6); cloud has no `/u` route/prefix at
+    //               all yet, so there is nothing on the manifest side to match.
     // - /__test   : ceremony-manifest-only. Staging POST test hooks — non-
     //               navigational (the SW's nav fallback only affects GET
     //               navigations) and staging-only, so the SW needn't deny them;
     //               run_worker_first includes them as genuinely server-owned.
-    const KNOWN_PARITY_DIFFERENCES = { swOnly: ["/api"], manifestOnly: ["/__test"] };
+    const KNOWN_PARITY_DIFFERENCES = { swOnly: ["/api", "/u"], manifestOnly: ["/__test"] };
 
     test("the sets are identical modulo the documented differences", () => {
       // `/account` is a SUBTREE_ONLY prefix (its `/account/*` sub-tree is server-
       // owned; the bare `/account` is the SPA shell) — still part of the manifest's
       // server-owned set, and the SW denylist matches it (`/^\/account\//`).
-      const manifest = new Set<string>([...CEREMONY_PREFIXES, ...SUBTREE_ONLY_PREFIXES]);
+      // `DEFENSIVE_PREFIXES` (`/vault`) is folded in too — the app's denylist
+      // KNOWS about my./vault/* (PR #38, `/^\/vault\//`) even though it has no
+      // HTML ceremony page, so it belongs in this comparison same as any other
+      // server-owned prefix.
+      const manifest = new Set<string>([...CEREMONY_PREFIXES, ...SUBTREE_ONLY_PREFIXES, ...DEFENSIVE_PREFIXES]);
       const denylist = new Set<string>(P03_DENYLIST_PREFIXES);
       const manifestOnly = [...manifest].filter((p) => !denylist.has(p)).sort();
       const swOnly = [...denylist].filter((p) => !manifest.has(p)).sort();
@@ -178,5 +191,39 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
       // SPA_EXCEPTIONS. Same effect: callback boots the SPA, siblings don't.
       expect(SPA_EXCEPTIONS).toEqual(["/oauth/callback"]);
     });
+  });
+});
+
+/**
+ * The my.parachute.computer/vault/* defensive backstop (Phase A1). NOT folded
+ * into (a)-(c) above: DEFENSIVE_PREFIXES is deliberately a SIBLING list to
+ * CEREMONY_PREFIXES (route-manifest.ts), not a member of it — it has no HTML
+ * ceremony page, so "no dead entry" (a) and the drift-catcher (c) reason about
+ * it separately, below. It IS folded into (d)'s P0.3 parity comparison, though
+ * (see that describe block's `manifest` set) — the deployed SPA (parachute-app,
+ * not the older notes-ui) DOES serve at my. and its denylist knows about
+ * /vault/* (PR #38), so the parity test would be checking a stale claim if it
+ * excluded DEFENSIVE_PREFIXES.
+ */
+describe("route manifest — the my./vault/* defensive backstop (Phase A1)", () => {
+  test("DEFENSIVE_PREFIXES has ≥1 live registered route (no dead entry)", () => {
+    for (const prefix of DEFENSIVE_PREFIXES) {
+      const match = registeredPaths.some((rp) => routeUnderPrefix(rp, prefix));
+      expect(match, `no route registered under ${prefix}`).toBe(true);
+    }
+  });
+
+  test("isCeremonyPath classifies /vault paths as server-owned (the drift-catcher's actual guarantee)", () => {
+    expect(isCeremonyPath("/vault")).toBe(true);
+    expect(isCeremonyPath("/vault/some-name/mcp")).toBe(true);
+    expect(isCeremonyPath("/vault/some-name/api/notes")).toBe(true);
+  });
+
+  test("DEFENSIVE_PREFIXES stays disjoint from CEREMONY_PREFIXES (a distinct concept, not a duplicate)", () => {
+    for (const p of DEFENSIVE_PREFIXES) {
+      expect((CEREMONY_PREFIXES as readonly string[]).includes(p), `${p} should not double up in CEREMONY_PREFIXES`).toBe(
+        false,
+      );
+    }
   });
 });

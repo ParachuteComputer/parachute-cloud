@@ -20,6 +20,7 @@ import { getUserByEmail } from "../src/users.ts";
 import { CSRF, ISSUER } from "./helpers.ts";
 
 const APP = "https://app.parachute.computer";
+const MY = "https://my.parachute.computer"; // the one-origin door (Phase A1)
 const EVIL = "https://evil.example";
 
 /** A bare POST carrying only an Origin — all `isSameOriginRequest` reads. */
@@ -68,14 +69,20 @@ describe("parseBoundOrigins — the union (ISSUER always in, extras added)", () 
 });
 
 describe("depsForEnv — boundOrigins wiring (the plumbing works when set)", () => {
-  test("the COMMITTED prod config sets BOUND_ORIGINS ⇒ resolveBoundOrigins includes app (P1.3 fix pinned)", () => {
+  test("the COMMITTED prod config sets BOUND_ORIGINS ⇒ resolveBoundOrigins includes app + my. (P1.3 + A1 fix pinned)", () => {
     // The vitest pool reads wrangler.toml's top-level [vars], so `env` carries
     // the committed production BOUND_ORIGINS. This pins that the same-origin fix
     // is actually WIRED in the deployed config — remove BOUND_ORIGINS and this
-    // (and the live app. front door) breaks.
+    // (and the live app./my. front doors) breaks.
     const deps = depsForEnv(env as never);
     expect(resolveBoundOrigins(deps)).toContain(APP);
+    expect(resolveBoundOrigins(deps)).toContain(MY);
     expect(resolveBoundOrigins(deps)).toContain(ISSUER);
+  });
+
+  test("the COMMITTED prod config's bound set is EXACTLY [cloud., app., my.] — no strays (Phase A1)", () => {
+    const deps = depsForEnv(env as never);
+    expect(resolveBoundOrigins(deps)).toEqual([ISSUER, APP, MY]);
   });
 
   test("unset env ⇒ resolveBoundOrigins degrades to exactly [ISSUER] (pre-P0.5 behavior)", () => {
@@ -103,6 +110,14 @@ describe("isSameOriginRequest — accepts any bound origin, refuses foreign", ()
     expect(isSameOriginRequest(originReq(APP), bound)).toBe(true);
     // The security property preserved: widening to {cloud., app.} does NOT admit
     // a foreign origin.
+    expect(isSameOriginRequest(originReq(EVIL), bound)).toBe(false);
+  });
+
+  test("the COMMITTED prod set ([ISSUER, app, my.]): my.-origin POST passes same-origin, evil STILL refused (Phase A1)", () => {
+    const bound = resolveBoundOrigins(depsForEnv(env as never));
+    expect(isSameOriginRequest(originReq(ISSUER), bound)).toBe(true);
+    expect(isSameOriginRequest(originReq(APP), bound)).toBe(true);
+    expect(isSameOriginRequest(originReq(MY), bound)).toBe(true);
     expect(isSameOriginRequest(originReq(EVIL), bound)).toBe(false);
   });
 
@@ -231,6 +246,26 @@ describe("the real router gate (/signup) honors BOUND_ORIGINS", () => {
   test("SET {cloud., app.}: a valid app. origin + BAD CSRF is STILL refused (CSRF independent)", async () => {
     const email = "p05-set-badcsrf@example.com";
     await app.fetch(signupReq(APP, { email, ip: "10.50.0.5", csrf: "wrong-token" }), appEnv);
+    expect(await getUserByEmail(env.DB, email)).toBeNull();
+  });
+
+  // The COMMITTED prod config (Phase A1): `env` here is the real wrangler.toml
+  // top-level [vars], BOUND_ORIGINS = "https://app.parachute.computer,https://my.parachute.computer".
+  test("the COMMITTED {cloud., app., my.}: a my.-origin POST passes the same-origin gate (the one-origin door)", async () => {
+    const email = "a1-set-my@example.com";
+    await app.fetch(signupReq(MY, { email, ip: "10.50.0.6" }), env);
+    expect(await getUserByEmail(env.DB, email)).not.toBeNull();
+  });
+
+  test("the COMMITTED {cloud., app., my.}: a FOREIGN origin is STILL refused even with my. bound", async () => {
+    const email = "a1-set-evil@example.com";
+    await app.fetch(signupReq(EVIL, { email, ip: "10.50.0.7" }), env);
+    expect(await getUserByEmail(env.DB, email)).toBeNull();
+  });
+
+  test("the COMMITTED {cloud., app., my.}: a my. origin + BAD CSRF is STILL refused (CSRF independent of the origin widening)", async () => {
+    const email = "a1-set-my-badcsrf@example.com";
+    await app.fetch(signupReq(MY, { email, ip: "10.50.0.8", csrf: "wrong-token" }), env);
     expect(await getUserByEmail(env.DB, email)).toBeNull();
   });
 });
