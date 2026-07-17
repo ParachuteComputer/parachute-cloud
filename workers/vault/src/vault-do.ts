@@ -516,6 +516,19 @@ export class VaultDO extends DurableObject {
       return this.handleTranscribeRun(vaultName);
     }
 
+    // STAGING-ONLY test hook — POST /vault/<name>/__test/embed-run drives the
+    // embedding drain (C2, semantic search MVP) synchronously. Same rationale
+    // as /__test/transcribe-run just above: the DO alarm auto-fires in
+    // seconds in production, but the live smoke wants a deterministic tick
+    // against the LIVE Workers AI bge-m3 model, which vitest-workerd cannot
+    // exercise (no real inference under the pool). 404 in production AND
+    // test/vitest (`ENVIRONMENT !== "staging"`), pinned by smoke-prod.
+    if (rest === "/__test/embed-run") {
+      if (this.env.ENVIRONMENT !== "staging") return json({ error: "Not found" }, 404);
+      if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+      return this.handleEmbedRun();
+    }
+
     // MCP endpoint — /vault/<name>/mcp[/*] (the "connect your AI" moment). Auth
     // like REST (Bearer → X-API-Key → ?key=); a 401 carries the RFC 9728
     // WWW-Authenticate challenge so a bare 401 walks the client to discovery
@@ -2064,6 +2077,32 @@ export class VaultDO extends DurableObject {
       processed++;
     }
     return json({ processed });
+  }
+
+  /**
+   * STAGING-ONLY: drain the embedding queue NOW (bounded), synchronously,
+   * for the live smoke — the same `drainEmbeddingsOnce` path the alarm runs
+   * (C2, semantic search MVP). Loops until a wake reports nothing left to do
+   * (`empty`, or `partial` with `more: false`) so a fresh note's chunks are
+   * fully embedded — and any other still-pending vault content (e.g. an
+   * un-drained backfill) catches up too — before the smoke queries
+   * `near_text`. Bounded at 10 wakes (up to `10 * EMBED_NOTES_PER_WAKE` = 250
+   * notes' worth of stale chunks) so a stuck/unavailable provider can't loop
+   * forever; `disabled`/`unavailable` stop immediately since retrying
+   * wouldn't change the outcome.
+   */
+  private async handleEmbedRun(): Promise<Response> {
+    let wakes = 0;
+    let kind: string = "empty";
+    for (let i = 0; i < 10; i++) {
+      const outcome = await this.drainEmbeddingsOnce();
+      wakes++;
+      kind = outcome.kind;
+      if (outcome.kind === "empty" || outcome.kind === "disabled" || outcome.kind === "unavailable") break;
+      if (outcome.kind === "partial" && !outcome.more) break;
+      // "failed", or "partial" with more pending — loop again.
+    }
+    return json({ wakes, kind });
   }
 
   /** The first pending attachment whose backoff (if any) has elapsed (FIFO). */

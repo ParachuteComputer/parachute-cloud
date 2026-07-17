@@ -14,7 +14,9 @@
  *     not-configured 503 + hidden console doors today; the configured gates
  *     once the Stripe keys land — section 16) → GFS snapshots + paid restore
  *     (free teaser + 404 pins, the staging-only sweep trigger, the admin comp
- *     lever, a live restore round-trip — section 17).
+ *     lever, a live restore round-trip — section 17) → voice transcription
+ *     (real Workers AI whisper, section 18) → semantic search (real Workers
+ *     AI bge-m3 embed-on-write + near_text, section 18b — C2).
  *
  * This smoke CREATES accounts + vaults — that's what staging is for; NEVER
  * point it at production (scripts/smoke-prod.ts is the read-only prod check).
@@ -1220,12 +1222,23 @@ async function main() {
   //     the restore point → "Restore to a new vault" → the restored vault's
   //     notes round-trip. The live restore round-trip is wrapped so a slow DO
   //     import can't abort the sections that follow.
+  //
+  //     cloud#166: this is a GENUINELY HEAVY round trip — the sweep walks
+  //     EVERY staging vault (grows with debris; see scripts/staging-sweep.ts)
+  //     and the restore itself is a full R2→new-DO tar import — and two
+  //     staging runs threw a client-side TimeoutError here as the fleet grew
+  //     past ~140 vaults. Every fetch in this section gets an EXPLICIT,
+  //     generous timeout (rather than whatever implicit default the runtime
+  //     was hitting) so a slow-but-healthy round trip has room to finish; a
+  //     genuinely stuck one still fails this section cleanly instead of
+  //     hanging the whole smoke.
+  const RESTORE_ROUNDTRIP_TIMEOUT_MS = 120_000;
   try {
     const arrivalCsrf = /parachute_id_csrf=([^;]+)/.exec(arrivalCookie)?.[1] ?? "";
     // One sweep tick via the staging-only trigger. The arrival vault is fresh
     // this run → its snapshot (paid retention) is taken now.
     const runSweep = async (): Promise<{ day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean } | null> => {
-      const r = await fetch(`${IDENTITY}/__test/snapshot-run`, { method: "POST" });
+      const r = await fetch(`${IDENTITY}/__test/snapshot-run`, { method: "POST", signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) });
       return r.status === 200 ? ((await r.json()) as { day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean }) : null;
     };
     const sweep = await runSweep();
@@ -1240,7 +1253,9 @@ async function main() {
 
     // TRIAL (restore-enabled): History lists the restore point (mirrored by the
     // sweep) — no comp needed, the trial already has the paid restore contract.
-    const histHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
+    const histHtml = await (
+      await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie }, signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) })
+    ).text();
     const keyMatch = new RegExp(`name="key" value="(vault-${arrivalVault}/snapshots/[^"]+\\.tar)"`).exec(histHtml);
     assert(
       histHtml.includes('data-testid="restore-point"') && !!keyMatch && histHtml.includes("Restore to a new vault"),
@@ -1256,6 +1271,7 @@ async function main() {
         headers: { ...FORM, origin: IDENTITY, cookie: arrivalCookie },
         redirect: "manual",
         body: form({ __csrf: arrivalCsrf, vault: arrivalVault, key: keyMatch[1]! }),
+        signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS),
       });
       const loc = restoreRes.headers.get("location") ?? "";
       restoredName = decodeURIComponent(/restored=([^&]+)/.exec(loc)?.[1] ?? "");
@@ -1264,7 +1280,9 @@ async function main() {
         "snapshots: restore POST creates the new vault and redirects",
         `status ${restoreRes.status} → ${loc}`,
       );
-      const noticeHtml = await (await fetch(`${IDENTITY}${loc}`, { headers: { cookie: arrivalCookie } })).text();
+      const noticeHtml = await (
+        await fetch(`${IDENTITY}${loc}`, { headers: { cookie: arrivalCookie }, signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) })
+      ).text();
       assert(
         noticeHtml.includes("Snapshot restored into") && noticeHtml.includes("attachment files"),
         "snapshots: the success notice renders with the attachments caveat",
@@ -1279,6 +1297,7 @@ async function main() {
       if (owner.token) {
         const notesRes = await fetch(`${VAULT}/vault/${restoredName}/api/notes?include_content=true`, {
           headers: { authorization: `Bearer ${owner.token}` },
+          signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS),
         });
         const notes = (await notesRes.json()) as Array<{ path?: string; content?: string }>;
         const mine = notes.find((n) => n.path === "My first note");
@@ -1432,6 +1451,87 @@ async function main() {
     }
   } catch (err) {
     fail("voice: live transcription section threw (non-fatal — sections continue)", String(err));
+  }
+
+  // 18b. Semantic search via Workers AI (C2, EXPERIMENTAL) — the one thing no
+  //      vitest-workerd suite can prove (bge-m3 is real inference; the pool
+  //      doesn't run it — same residual class as voice's own
+  //      "vitest-workerd ≠ real workerd" gotcha, see PR #170's body). Not
+  //      plan-gated (unlike voice) — embeddings are on for every vault via
+  //      EMBEDDINGS_ENABLED, so the arrival user's trial vault already
+  //      qualifies. Flow: create a note with distinctive, paraphrasable
+  //      content → drain the embedding queue synchronously via the
+  //      staging-only __test/embed-run trigger (mirrors __test/transcribe-
+  //      run — 404 in production, pinned above in smoke-prod) → query
+  //      `semantic=true&near_text=<paraphrase with NO shared keywords>` and
+  //      assert the note ranks near the top by MEANING, not text overlap.
+  //      Also pins the landing's `embeddings: {enabled}` capability and that
+  //      the response is never `semantic_unavailable` (embeddings are on).
+  if (arrivalVault && arrivalEmail) try {
+    const owner = await authorizeFor(arrivalEmail, arrivalPassword, arrivalVault);
+    if (!owner.token) {
+      fail("semantic: owner mints a token for the arrival vault", owner.error ?? "no token");
+    } else {
+      const AUTH = { authorization: `Bearer ${owner.token}` };
+
+      const land = (await (await fetch(`${VAULT}/vault/${arrivalVault}`, { headers: AUTH })).json()) as any;
+      assert(
+        land.embeddings?.enabled === true,
+        "semantic: landing reports embeddings enabled",
+        JSON.stringify(land.embeddings),
+      );
+
+      // Distinctive, narrow-topic content — nothing else in this vault (the
+      // guide seed, the gardening marker note, the voice memo) is anywhere
+      // near it semantically.
+      const content = `# Semantic smoke ${MARKER}\n\nOur company's return policy requires customers to mail defective kayak paddles back within fourteen days, using the prepaid shipping label enclosed in the original box.`;
+      const note = (await (await fetch(`${VAULT}/vault/${arrivalVault}/api/notes`, {
+        method: "POST",
+        headers: { ...AUTH, "content-type": "application/json" },
+        body: JSON.stringify({ content }),
+      })).json()) as { id: string };
+      assert(!!note.id, "semantic: created a note with distinctive, paraphrasable content", note.id ?? "no id");
+
+      // Drive the drain synchronously (a REAL Workers AI bge-m3 inference
+      // call runs here) — loops until the queue reports nothing left, so the
+      // note above (and any other still-pending vault content) is embedded.
+      const run = await fetch(`${VAULT}/vault/${arrivalVault}/__test/embed-run`, { method: "POST" });
+      const runBody = (await run.json()) as { wakes: number; kind: string };
+      assert(
+        run.status === 200 && runBody.kind !== "disabled" && runBody.kind !== "unavailable",
+        "semantic: __test/embed-run drained the embedding queue (provider live)",
+        `status ${run.status} wakes=${runBody.wakes} kind=${runBody.kind}`,
+      );
+
+      // A paraphrase sharing NO keywords with the note above — must still
+      // rank it via meaning, proving real semantic (not keyword) matching.
+      const nearText = "how long do I have to send back a broken paddle for a refund";
+      const semRes = await fetch(
+        `${VAULT}/vault/${arrivalVault}/api/notes?semantic=true&near_text=${encodeURIComponent(nearText)}&include_content=false`,
+        { headers: AUTH },
+      );
+      assert(
+        semRes.status === 200,
+        "semantic: near_text query answers 200 (embeddings on, never semantic_unavailable)",
+        `status ${semRes.status}`,
+      );
+      const semNotes = (await semRes.json()) as Array<{ id: string }>;
+      const warningsHeader = semRes.headers.get("X-Parachute-Warnings");
+      const warnings = warningsHeader ? (JSON.parse(decodeURIComponent(warningsHeader)) as Array<{ code?: string }>) : [];
+      assert(
+        !warnings.some((w) => w.code === "embeddings_pending"),
+        "semantic: no embeddings_pending warning — the drain above fully caught the vault up",
+        JSON.stringify(warnings),
+      );
+      const rank = semNotes.findIndex((n) => n.id === note.id);
+      assert(
+        rank !== -1 && rank <= 2,
+        "semantic: the paraphrased query ranks the distinctive note near the top by MEANING (no shared keywords)",
+        `rank=${rank === -1 ? "not found" : rank} top3=${JSON.stringify(semNotes.slice(0, 3).map((n) => n.id))}`,
+      );
+    }
+  } catch (err) {
+    fail("semantic: live embedding section threw (non-fatal — sections continue)", String(err));
   }
 
   // 19. MOCK-upgrade E2E (mock-payments) — the live end-to-end proof, run LAST

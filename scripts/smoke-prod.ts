@@ -204,6 +204,11 @@ async function main() {
     // in production (ENVIRONMENT="production" → 404, the __test posture).
     const txRun = await fetch(`${VAULT}/vault/${VAULT_NAME}/__test/transcribe-run`, { method: "POST" });
     assert(txRun.status === 404, "PRODUCTION: /vault/<name>/__test/transcribe-run does not exist (404)", `status ${txRun.status}`);
+
+    // Semantic search (C2): same posture — the staging-only embedding-drain
+    // hook must NOT exist in production.
+    const embedRun = await fetch(`${VAULT}/vault/${VAULT_NAME}/__test/embed-run`, { method: "POST" });
+    assert(embedRun.status === 404, "PRODUCTION: /vault/<name>/__test/embed-run does not exist (404)", `status ${embedRun.status}`);
   }
 
   // --- summary ---
