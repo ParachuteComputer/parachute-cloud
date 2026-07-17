@@ -191,12 +191,22 @@ describe("C3 — GET /account/vaults", () => {
     const res = await handleAccountVaultsList(db(), accountReq("GET", "/account/vaults", { token }), accountDeps());
     expect(res.status).toBe(200);
     const { vaults } = (await res.json()) as {
-      vaults: Array<{ name: string; url: string; created_at: string; usage: { notes_bytes: number; attachment_bytes: number } | null }>;
+      vaults: Array<{
+        name: string;
+        vault_id: string | null;
+        url: string;
+        created_at: string;
+        usage: { notes_bytes: number; attachment_bytes: number } | null;
+      }>;
     };
     expect(vaults).toHaveLength(1);
     expect(vaults[0]!.name).toBe("field-notes");
     expect(vaults[0]!.url).toContain("field-notes");
     expect(vaults[0]!.usage).toEqual({ notes_bytes: 1234, attachment_bytes: 5678 });
+    // vault_id — the immutable identity groundwork (migration 0020): additive,
+    // present, non-null (seedVault stamps one, mirroring a real createVault).
+    expect(typeof vaults[0]!.vault_id).toBe("string");
+    expect(vaults[0]!.vault_id).not.toBe("");
   });
 
   test("a vault with no rollup row yet reports usage: null", async () => {
@@ -236,6 +246,7 @@ describe("C3 — POST /account/vaults (create lands you IN the vault)", () => {
     expect(res.status).toBe(201);
     const body = (await res.json()) as {
       name: string;
+      vault_id: string | null;
       url: string;
       vault_token: string;
       services: Record<string, { url: string; version: string }>;
@@ -243,6 +254,13 @@ describe("C3 — POST /account/vaults (create lands you IN the vault)", () => {
     expect(body.name).toBe("field-notes");
     expect(body.url).toContain("field-notes");
     expect(body.services["vault:field-notes"]!.version).toBe("cloud");
+    // vault_id — the immutable identity groundwork (migration 0020): additive,
+    // present, non-null, and matches the row's own persisted value.
+    expect(typeof body.vault_id).toBe("string");
+    const persisted = await env.DB.prepare("SELECT vault_id FROM vaults WHERE name = 'field-notes'").first<{
+      vault_id: string;
+    }>();
+    expect(body.vault_id).toBe(persisted?.vault_id);
 
     // The token is a real, usable vault token — decode + assert every claim the
     // vault RS enforces (aud strict-pin, resource-narrowed scope, vault_scope).

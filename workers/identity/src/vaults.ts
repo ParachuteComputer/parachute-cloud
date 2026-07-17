@@ -51,6 +51,14 @@ export interface Vault {
    * a blow-away.
    */
   importPendingAt: string | null;
+  /**
+   * The immutable identity behind the (renameable-in-future) `name` slug —
+   * identity-keying groundwork for handles/sharing (migration 0020). Every row
+   * `createVault` mints carries one; typed nullable only to stay honest about
+   * legacy rows from before the migration's backfill ran (should never be null
+   * in practice once the migration has applied — see the migration file).
+   */
+  vaultId: string | null;
 }
 
 interface Row {
@@ -58,6 +66,7 @@ interface Row {
   owner_user_id: string;
   created_at: string;
   import_pending_at: string | null;
+  vault_id: string | null;
 }
 
 function rowToVault(r: Row): Vault {
@@ -66,6 +75,7 @@ function rowToVault(r: Row): Vault {
     ownerUserId: r.owner_user_id,
     createdAt: r.created_at,
     importPendingAt: r.import_pending_at ?? null,
+    vaultId: r.vault_id ?? null,
   };
 }
 
@@ -133,6 +143,11 @@ export async function userOwnsVault(db: D1Database, userId: string, name: string
  * its flag (a flagless row refuses reuse, stranding the name). Cleared via
  * {@link clearImportPending} on import success; every other creation path
  * leaves it NULL.
+ *
+ * Every insert also mints a `vault_id` (migration 0020) — the immutable
+ * identity groundwork for handles/sharing. `randomUUID()` (opaque, 122 bits of
+ * randomness) is plenty collision-resistant for this fleet size; a UNIQUE
+ * index on the column is the belt.
  */
 export async function createVault(
   db: D1Database,
@@ -146,18 +161,23 @@ export async function createVault(
   const name = check.name;
   const createdAt = now.toISOString();
   const importPendingAt = opts.importPending === true ? createdAt : null;
+  const vaultId = randomUUID();
   try {
     await db
-      .prepare("INSERT INTO vaults (name, owner_user_id, created_at, import_pending_at) VALUES (?, ?, ?, ?)")
-      .bind(name, ownerUserId, createdAt, importPendingAt)
+      .prepare(
+        "INSERT INTO vaults (name, owner_user_id, created_at, import_pending_at, vault_id) VALUES (?, ?, ?, ?, ?)",
+      )
+      .bind(name, ownerUserId, createdAt, importPendingAt, vaultId)
       .run();
   } catch (err) {
-    // UNIQUE/PK collision → the name is taken (by this user or another).
+    // UNIQUE/PK collision → the name is taken (by this user or another). (A
+    // vault_id collision would also land here — indistinguishable by message,
+    // but at 122 bits of randomness this branch is name-collision in practice.)
     const msg = err instanceof Error ? err.message : String(err);
     if (/UNIQUE|constraint|PRIMARY/i.test(msg)) throw new VaultNameTakenError(name);
     throw err;
   }
-  return { name, ownerUserId, createdAt, importPendingAt };
+  return { name, ownerUserId, createdAt, importPendingAt, vaultId };
 }
 
 /**
