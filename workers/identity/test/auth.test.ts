@@ -12,6 +12,7 @@ import app, { senderFor } from "../src/index.ts";
 import type { EmailSender, SendResult } from "../src/email.ts";
 import {
   handleCodeVerifyPost,
+  handleHandleClaimPost,
   handleLogin2faGet,
   handleLogin2faPost,
   handleMagicRequestPost,
@@ -19,6 +20,7 @@ import {
   handleSecurityGet,
   handleSecurityPost,
 } from "../src/auth-handlers.ts";
+import { claimHandle, getOwnerHandle } from "../src/handles.ts";
 import { handleLoginPost } from "../src/console.ts";
 import { handleAuthorizeGet } from "../src/oauth-authorize.ts";
 import { totpCodeAt } from "../src/totp.ts";
@@ -1035,5 +1037,188 @@ describe("TOTP 2FA — enroll, login gate, backup codes, disable", () => {
     expect(await res.text()).toContain("Password set");
     const user = await getUserByEmail(env.DB, "pwless@example.com");
     expect(user!.passwordHash.length).toBeGreaterThan(0);
+  });
+});
+
+// --- handles — the console claim door (PR A2, migration 0022) ---------------
+
+describe("handles — the console claim UI (/console/security block + POST /console/handle)", () => {
+  const securityGetReq = (sessionId: string): Request =>
+    new Request(`${ISSUER}/console/security`, { headers: { cookie: `parachute_id_session=${sessionId}` } });
+
+  /**
+   * A cookie-bearing same-origin POST to /console/handle. `csrf: null` omits the
+   * form field (the CSRF-missing case), a string overrides it; `origin` swaps the
+   * Origin header (the cross-origin case). The session + csrf COOKIES are always
+   * present so only the field/origin under test varies.
+   */
+  const handleReq = (handle: string, sessionId: string, opts: { csrf?: string | null; origin?: string } = {}): Request => {
+    const body: Record<string, string> = { handle };
+    const csrf = opts.csrf === undefined ? CSRF : opts.csrf;
+    if (csrf !== null) body.__csrf = csrf;
+    return new Request(`${ISSUER}/console/handle`, {
+      method: "POST",
+      body: new URLSearchParams(body),
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: opts.origin ?? ISSUER,
+        cookie: `parachute_id_session=${sessionId}; parachute_id_csrf=${CSRF}`,
+      },
+    });
+  };
+
+  // --- render states -------------------------------------------------------
+
+  test("render: an unclaimed account shows the email-derived suggestion in the claim form", async () => {
+    const { id } = await seedUser("aaron.gabriel@example.com");
+    const sessionId = await seedSession(id);
+    const res = await handleSecurityGet(env.DB, securityGetReq(sessionId), deps());
+    const html = await res.text();
+    expect(html).toContain("Your handle");
+    expect(html).toContain('action="/console/handle"');
+    // suggestHandleFromEmail("aaron.gabriel@…") → "aarongabriel" (dots stripped).
+    expect(html).toContain('value="aarongabriel"');
+    // The policy, stated plainly on the form.
+    expect(html).toContain("Lowercase letters, numbers, and hyphens");
+    expect(html).toContain("One per account");
+    // No handle claimed yet → no read-only display.
+    expect(html).not.toContain('data-testid="handle-current"');
+  });
+
+  test("render: a claimed account shows the handle read-only, no claim form", async () => {
+    const { id } = await seedUser("has-handle@example.com");
+    await claimHandle(env.DB, id, "takenowner");
+    const sessionId = await seedSession(id);
+    const res = await handleSecurityGet(env.DB, securityGetReq(sessionId), deps());
+    const html = await res.text();
+    expect(html).toContain('data-testid="handle-current"');
+    expect(html).toContain("takenowner");
+    expect(html).toContain("renaming comes later");
+    // Read-only: no claim form to post.
+    expect(html).not.toContain('action="/console/handle"');
+  });
+
+  // --- POST /console/handle ------------------------------------------------
+
+  test("happy path: a valid handle claims, persists, and re-renders read-only", async () => {
+    const { id } = await seedUser("claim-ok@example.com");
+    const sessionId = await seedSession(id);
+    const res = await handleHandleClaimPost(env.DB, handleReq("mycoolhandle", sessionId), deps());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Your handle is set: mycoolhandle.");
+    expect(html).toContain('data-testid="handle-current"');
+    expect(html).not.toContain('action="/console/handle"');
+    // Persisted: users.owner_id → owners.handle.
+    const user = await getUserByEmail(env.DB, "claim-ok@example.com");
+    expect(await getOwnerHandle(env.DB, user!.ownerId)).toBe("mycoolhandle");
+  });
+
+  test("mixed-case input canonicalizes to lowercase before claiming (GitHub behaviour)", async () => {
+    const { id } = await seedUser("claim-case@example.com");
+    const sessionId = await seedSession(id);
+    const res = await handleHandleClaimPost(env.DB, handleReq("MixedCase", sessionId), deps());
+    expect(await res.text()).toContain("Your handle is set: mixedcase.");
+    const user = await getUserByEmail(env.DB, "claim-case@example.com");
+    expect(await getOwnerHandle(env.DB, user!.ownerId)).toBe("mixedcase");
+  });
+
+  test("invalid shape: re-renders the form inline, preserves the attempted value, claims nothing", async () => {
+    const { id } = await seedUser("claim-invalid@example.com");
+    const sessionId = await seedSession(id);
+    const res = await handleHandleClaimPost(env.DB, handleReq("ab", sessionId), deps());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-testid="handle-error"');
+    expect(html).toContain("not starting or ending with a hyphen");
+    expect(html).toContain('action="/console/handle"'); // form still shown
+    expect(html).toContain('value="ab"'); // attempted value preserved
+    const user = await getUserByEmail(env.DB, "claim-invalid@example.com");
+    expect(user!.ownerId).toBeNull();
+  });
+
+  test("a crafted value is HTML-escaped in the re-rendered input (no attribute breakout)", async () => {
+    const { id } = await seedUser("claim-xss@example.com");
+    const sessionId = await seedSession(id);
+    const res = await handleHandleClaimPost(env.DB, handleReq('a"b', sessionId), deps());
+    const html = await res.text();
+    expect(html).toContain('value="a&quot;b"');
+    expect(html).not.toContain('value="a"b"');
+  });
+
+  test("reserved word: re-renders with the reserved message inline, claims nothing", async () => {
+    const { id } = await seedUser("claim-reserved@example.com");
+    const sessionId = await seedSession(id);
+    const res = await handleHandleClaimPost(env.DB, handleReq("admin", sessionId), deps());
+    const html = await res.text();
+    expect(html).toContain('data-testid="handle-error"');
+    expect(html).toContain("That handle is reserved. Please choose another.");
+    const user = await getUserByEmail(env.DB, "claim-reserved@example.com");
+    expect(user!.ownerId).toBeNull();
+  });
+
+  test("taken: another account holds it → friendly inline 'already taken', claims nothing", async () => {
+    const other = await seedUser("holder@example.com");
+    await claimHandle(env.DB, other.id, "sharedname");
+    const { id } = await seedUser("claim-taken@example.com");
+    const sessionId = await seedSession(id);
+    const res = await handleHandleClaimPost(env.DB, handleReq("sharedname", sessionId), deps());
+    const html = await res.text();
+    expect(html).toContain('data-testid="handle-error"');
+    expect(html).toContain("That handle is already taken. Please choose another.");
+    const user = await getUserByEmail(env.DB, "claim-taken@example.com");
+    expect(user!.ownerId).toBeNull();
+  });
+
+  test("already-set: a second claim by the same account leaves the first handle, shows a gentle notice", async () => {
+    const { id } = await seedUser("claim-twice@example.com");
+    const sessionId = await seedSession(id);
+    await handleHandleClaimPost(env.DB, handleReq("firsthandle", sessionId), deps());
+    const res = await handleHandleClaimPost(env.DB, handleReq("secondhandle", sessionId), deps());
+    const html = await res.text();
+    expect(html).toContain("You already have a handle.");
+    // The read-only display shows the ORIGINAL handle — the second claim was a no-op.
+    expect(html).toContain("firsthandle");
+    expect(html).not.toContain("secondhandle");
+    const user = await getUserByEmail(env.DB, "claim-twice@example.com");
+    expect(await getOwnerHandle(env.DB, user!.ownerId)).toBe("firsthandle");
+  });
+
+  test("CSRF-missing: refused with the session-expired message, claims nothing", async () => {
+    const { id } = await seedUser("claim-nocsrf@example.com");
+    const sessionId = await seedSession(id);
+    const res = await handleHandleClaimPost(env.DB, handleReq("nocsrfhandle", sessionId, { csrf: null }), deps());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Your session expired. Please try again.");
+    const user = await getUserByEmail(env.DB, "claim-nocsrf@example.com");
+    expect(user!.ownerId).toBeNull();
+  });
+
+  test("cross-origin: the same-origin gate refuses, claims nothing", async () => {
+    const { id } = await seedUser("claim-crossorigin@example.com");
+    const sessionId = await seedSession(id);
+    const res = await handleHandleClaimPost(
+      env.DB,
+      handleReq("evilhandle", sessionId, { origin: "https://evil.example" }),
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Your session expired. Please try again.");
+    const user = await getUserByEmail(env.DB, "claim-crossorigin@example.com");
+    expect(user!.ownerId).toBeNull();
+  });
+
+  test("no session: redirects to /login without touching the DB", async () => {
+    const res = await handleHandleClaimPost(
+      env.DB,
+      new Request(`${ISSUER}/console/handle`, {
+        method: "POST",
+        body: new URLSearchParams({ __csrf: CSRF, handle: "anon" }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: ISSUER, cookie: `parachute_id_csrf=${CSRF}` },
+      }),
+      deps(),
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/login");
   });
 });
