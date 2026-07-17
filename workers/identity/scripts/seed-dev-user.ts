@@ -60,6 +60,11 @@ function readSecrets(): { email: string; password: string } {
 // A STABLE dev-user id (not randomUUID): re-seeding must not change the id, or
 // it orphans the grandfathered `demo` vault ownership + any dev tokens/sessions.
 const DEV_USER_ID = "0de1d1de-c0de-4000-8000-000000000001";
+// Likewise a STABLE vault_id (migration 0020) for the `demo` vault: INSERT OR
+// REPLACE deletes-and-reinserts on every re-seed, which would otherwise reset
+// vault_id to its column default (NULL) on every staging deploy — falsifying
+// the "immutable identity" invariant on the one vault the deploy touches.
+const DEV_VAULT_ID = "0de1d1de-c0de-4000-8000-0000000000de";
 
 const { email, password } = readSecrets();
 const passwordHash = await hashPassword(password);
@@ -83,11 +88,15 @@ const esc = (s: string) => s.replace(/'/g, "''");
 // smoke-staging.ts asserts it sees the console) — INSERT OR REPLACE would
 // otherwise reset it to 'user' on every re-seed. suspended_at stays unnamed
 // (→ NULL default): a re-seed never leaves the operator suspended.
+// vault_id = DEV_VAULT_ID (pinned, see above): INSERT OR REPLACE would
+// otherwise reset it to the column default (NULL) on every re-seed, exactly
+// like the three columns above — the DEV_USER_ID pattern, applied to the row
+// it owns.
 const sql = `-- DEV-ONLY generated seed — do not commit. Regenerate with \`bun run seed:dev\`.
 INSERT OR REPLACE INTO users (id, email, password_hash, created_at, email_verified, plan, role)
 VALUES ('${esc(DEV_USER_ID)}', '${esc(email)}', '${esc(passwordHash)}', '${esc(createdAt)}', 1, 'standard', 'operator');
-INSERT OR REPLACE INTO vaults (name, owner_user_id, created_at)
-VALUES ('demo', '${esc(DEV_USER_ID)}', '${esc(createdAt)}');
+INSERT OR REPLACE INTO vaults (name, owner_user_id, created_at, vault_id)
+VALUES ('demo', '${esc(DEV_USER_ID)}', '${esc(createdAt)}', '${esc(DEV_VAULT_ID)}');
 `;
 writeFileSync(join(HERE, "seed-dev-user.sql"), sql);
 console.log(`Wrote scripts/seed-dev-user.sql for user ${email} (owns vault "demo")`);
