@@ -122,6 +122,12 @@ import {
 import { normalize } from "@openparachute/core/src/embedding/vector-codec.js";
 import { WorkersAiEmbeddingProvider } from "./embedding/workers-ai.js";
 import { embeddingsExplicitlyDisabled } from "./embedding/select.js";
+import {
+  DoAttachmentTicketProvider,
+  handleTicketSpend,
+  type TicketSpendDeps,
+} from "./attachment-tickets.js";
+import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
 
 function errText(e: unknown): string {
   if (e instanceof Error) return `${e.name}: ${e.message}`;
@@ -404,9 +410,20 @@ export class VaultDO extends DurableObject {
   private subsRehydrated = false;
   private wsSubs = new Map<WebSocket, SubscriptionHandle>();
 
+  /**
+   * Attachment tickets (Wave 1 DO mirror) — the DO-storage-backed
+   * `AttachmentTicketProvider` (attachment-tickets.ts). Constructed
+   * unconditionally, same as bun's `getSharedAttachmentTicketProvider()`
+   * ("bun always wires the in-process provider") — so `request-attachment-
+   * upload` / `-download` are always present in this door's `tools/list`
+   * (core's `generateMcpTools` omits them only when NO provider is passed).
+   */
+  private readonly attachmentTickets: AttachmentTicketProvider;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
+    this.attachmentTickets = new DoAttachmentTicketProvider(ctx.storage);
     // The shim carries `ctx.storage` (not just `.sql`) so its `transactionSync`
     // can delegate to the real DO transaction primitive — the free
     // `transaction(db, fn)` path (incl. boot migrations) prefers it (vault#523).
@@ -529,6 +546,29 @@ export class VaultDO extends DurableObject {
       return this.handleEmbedRun();
     }
 
+    // Attachment ticket spend (attachment-tickets design, Wave 1 DO mirror) —
+    // NO auth beyond the ticket itself; the ticket IS the credential
+    // (single-use, short TTL, scoped to exactly one upload slot or one
+    // attachment's bytes). Dispatched BEFORE `authenticateVaultRequest`
+    // below, deliberately — mirrors bun's `routing.ts` placement exactly: a
+    // bearer-less runtime (a bare `curl`) must be able to spend a ticket
+    // without ever holding this vault's own token. See
+    // `request-attachment-upload`/`-download` (core/src/mcp.ts) for where
+    // tickets are minted.
+    const ticketMatch = rest.match(/^\/tickets\/([^/]+)$/);
+    if (ticketMatch) {
+      const ticketId = decodeURIComponent(ticketMatch[1]!);
+      return handleTicketSpend(request, ticketId, {
+        vaultName,
+        store: this.store,
+        provider: this.attachmentTickets,
+        attachments: this.env.ATTACHMENTS,
+        mintGate: (declaredBytes) => this.attachmentMintGate(declaredBytes),
+        meterAdd: (bytes) => this.meterAdd(bytes),
+        scheduleTranscription: () => this.scheduleTranscriptionAlarm(),
+      });
+    }
+
     // MCP endpoint — /vault/<name>/mcp[/*] (the "connect your AI" moment). Auth
     // like REST (Bearer → X-API-Key → ?key=); a 401 carries the RFC 9728
     // WWW-Authenticate challenge so a bare 401 walks the client to discovery
@@ -561,6 +601,10 @@ export class VaultDO extends DurableObject {
             this.config!.description = description;
             return this.ctx.storage.put("config", this.config);
           },
+        },
+        {
+          provider: this.attachmentTickets,
+          mintGate: (declaredBytes) => this.attachmentMintGate(declaredBytes),
         },
       );
     }
@@ -1402,6 +1446,39 @@ export class VaultDO extends DurableObject {
     const used = usedBytes(dbBytes, this.r2Bytes);
     const cap = this.capBytes();
     if (used >= cap) return capExceededResponse(used, cap, 0);
+    return null;
+  }
+
+  /**
+   * The attachment-specific write gate — every ATTACHMENT-byte-growing
+   * entry point shares this exact ladder: REST's `POST /api/storage/upload`
+   * (below, in {@link handleStorage}), the ticket mint tool (`mcp.ts`'s
+   * `request-attachment-upload`, against the caller's DECLARED size), and
+   * the ticket SPEND route (`attachment-tickets.ts`, re-checked against the
+   * ACTUAL size — closes the mint→spend TOCTOU window). One function, so a
+   * refusal for the same numbers is byte-identical across all three. Order
+   * (each fires BEFORE the next):
+   *   1. FROZEN (the expired floor) → 402 plan_required.
+   *   2. TWO-METER: `attachment_bytes === 0` (Entry, notes-only) → 403
+   *      attachments_not_included; else r2 + declaredBytes against
+   *      `attachment_bytes` → 413 meter=attachments.
+   *   3. LEGACY: db + r2 + declaredBytes against the single summed cap → 413.
+   * Deliberately separate from {@link capBlockIfFull} (the NOTES meter) —
+   * an attachment write must never be checked against the wrong budget.
+   */
+  private attachmentMintGate(declaredBytes: number): Response | null {
+    if (this.isFrozen()) return planRequiredResponse();
+    const caps = this.planCaps();
+    if (caps) {
+      if (caps.attachment_bytes === 0) return attachmentsNotIncludedResponse();
+      if (this.r2Bytes + declaredBytes > caps.attachment_bytes) {
+        return capExceededResponse(this.r2Bytes, caps.attachment_bytes, declaredBytes, "attachments");
+      }
+      return null;
+    }
+    const used = usedBytes(Number(this.raw().databaseSize), this.r2Bytes);
+    const cap = this.capBytes();
+    if (used + declaredBytes > cap) return capExceededResponse(used, cap, declaredBytes);
     return null;
   }
 
@@ -2529,25 +2606,10 @@ export class VaultDO extends DurableObject {
       if (BLOCKED_EXTENSIONS.has(ext)) {
         return json({ error: `File type ${ext} not allowed (active/executable content)` }, 400);
       }
-      // The attachment write gate. Order (each fires BEFORE the next):
-      //   1. FROZEN (the expired floor) → 402 plan_required.
-      //   2. TWO-METER: `attachment_bytes === 0` → 403 attachments_not_included
-      //      (the notes-only tier — an ENTITLEMENT refusal, BEFORE cap math);
-      //      else r2 + this file against `attachment_bytes` → 413 meter=attachments.
-      //   3. LEGACY: db + r2 + this file against the single summed cap → 413.
-      if (this.isFrozen()) return planRequiredResponse();
-      const caps = this.planCaps();
-      if (caps) {
-        if (caps.attachment_bytes === 0) return attachmentsNotIncludedResponse();
-        if (this.r2Bytes + file.size > caps.attachment_bytes) {
-          return capExceededResponse(this.r2Bytes, caps.attachment_bytes, file.size, "attachments");
-        }
-      } else {
-        // Legacy single summed cap (un-pushed / not-yet-migrated vault).
-        const used = usedBytes(Number(this.raw().databaseSize), this.r2Bytes);
-        const cap = this.capBytes();
-        if (used + file.size > cap) return capExceededResponse(used, cap, file.size);
-      }
+      // The attachment write gate — shared with the ticket mint/spend paths;
+      // see {@link attachmentMintGate}'s doc comment for the exact ladder.
+      const gated = this.attachmentMintGate(file.size);
+      if (gated) return gated;
 
       const date = new Date().toISOString().split("T")[0]!;
       const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
