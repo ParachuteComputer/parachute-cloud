@@ -387,21 +387,28 @@ describe("vault name rules", () => {
 // --- console: signup / login / logout / vaults ----------------------------
 
 describe("console — signup", () => {
-  test("GET /signup carries the context block: what you get + the pricing/trust line (#101)", async () => {
+  // Auth redesign §1 ("one advertised door"): GET /signup is no longer a
+  // destination — visiting it 302s to the my./app. front door (the committed
+  // prod config's VAULT_PUBLIC_ORIGIN, https://my.parachute.computer) where
+  // arrival is the SPA's one-email-field Landing screen. The CSRF cookie is
+  // STILL minted (headless/dev creation depends on it — see the next test).
+  test("GET /signup redirects to the advertised front door, still setting the CSRF cookie", async () => {
     const res = await app.fetch(new Request(`${ISSUER}/signup`), env);
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    // The "what you're getting" context (a private vault your AI can read/write).
-    expect(html).toContain('data-testid="signup-context"');
-    expect(html).toContain("your AI can read and write");
-    // The light pricing/trust line — from $1/mo, 30 days free, no card to start.
-    expect(html).toContain('data-testid="signup-pricing"');
-    expect(html).toContain("From $1/mo");
-    expect(html).toContain("30 days free");
-    expect(html).toContain("no card to start");
-    // Still light — no plan cards on the signup screen.
-    expect(html).not.toContain('data-testid="plans"');
-    expect(html).not.toContain('data-testid="plan-card-power"');
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("https://my.parachute.computer/");
+    expect(getSetCookies(res).some((c) => c.startsWith("parachute_id_csrf="))).toBe(true);
+  });
+
+  test("headless/dev creation still works: GET /signup for the CSRF cookie, then POST /signup", async () => {
+    const csrfRes = await app.fetch(new Request(`${ISSUER}/signup`), env);
+    const csrf = setCookieVal(csrfRes, "parachute_id_csrf")!;
+    const res = await app.fetch(
+      post("/signup", { __csrf: csrf, email: "headless@example.com", password: "longenough1" }, `parachute_id_csrf=${csrf}`),
+      env,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console");
+    expect(await getUserByEmail(env.DB, "headless@example.com")).not.toBeNull();
   });
 
   test("signup creates a user + session, redirects to /console", async () => {
@@ -1466,6 +1473,52 @@ describe("console — login / logout", () => {
     expect(res.headers.get("location")).toBe("/login");
     // The clearing cookie has Max-Age=0.
     expect(getSetCookies(res).some((c) => /parachute_id_session=;.*Max-Age=0/.test(c))).toBe(true);
+  });
+
+  // Auth redesign §3 move 1 ("Not you?"): logout gains an OPTIONAL `next`.
+  test("logout with a next redirects there instead of /login — the 'Not you?' switch (still clears the session)", async () => {
+    const { id: userId } = await seedUser("switch-next@example.com");
+    const sessionId = await seedSession(userId);
+    const res = await app.fetch(
+      post("/logout", { __csrf: CSRF, next: "/console" }, `parachute_id_session=${sessionId}; parachute_id_csrf=${CSRF}`),
+      env,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console");
+    expect(getSetCookies(res).some((c) => /parachute_id_session=;.*Max-Age=0/.test(c))).toBe(true);
+  });
+
+  test("logout with a foreign/open-redirect next falls back to safeNext's default (/console) — never an open redirect", async () => {
+    const { id: userId } = await seedUser("switch-evil@example.com");
+    const sessionId = await seedSession(userId);
+    const res = await app.fetch(
+      post(
+        "/logout",
+        { __csrf: CSRF, next: "https://evil.example/steal" },
+        `parachute_id_session=${sessionId}; parachute_id_csrf=${CSRF}`,
+      ),
+      env,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console");
+  });
+
+  test("the console header names the account: 'Signed in as {email} · Not you?' (bare — no next, byte-identical bare-logout landing)", async () => {
+    const { id: userId } = await seedUser("named@example.com");
+    const sessionId = await seedSession(userId);
+    const res = await app.fetch(
+      new Request(`${ISSUER}/console`, { headers: { cookie: `parachute_id_session=${sessionId}` } }),
+      env,
+    );
+    const html = await res.text();
+    expect(html).toContain('data-testid="signed-in-as"');
+    expect(html).toContain("Signed in as");
+    expect(html).toContain("named@example.com");
+    expect(html).toContain("Not you?");
+    // The console header's switch carries no `next` — the bare-logout POST
+    // it submits lands on the SAME /login as the pre-existing "Sign out".
+    const signedInBlock = /data-testid="signed-in-as"[\s\S]*?<\/p>/.exec(html)![0]!;
+    expect(signedInBlock).not.toContain('name="next"');
   });
 });
 

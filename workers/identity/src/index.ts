@@ -136,7 +136,7 @@ app.post("/oauth/register", async (c) =>
 app.post("/oauth/revoke", async (c) => withWildcardCors(await handleRevoke(c.env.DB, c.req.raw, depsFor(c.env))));
 
 // --- console (accounts + vaults) ---
-app.get("/signup", (c) => handleSignupGet(c.req.raw));
+app.get("/signup", (c) => handleSignupGet(c.req.raw, depsFor(c.env)));
 app.post("/signup", (c) => handleSignupPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/login", (c) => handleLoginGet(c.req.raw));
 app.post("/login", (c) => handleLoginPost(c.env.DB, c.req.raw, depsFor(c.env)));

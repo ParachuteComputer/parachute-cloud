@@ -128,6 +128,22 @@ export function resolveBoundOrigins(deps: OAuthDeps): readonly string[] {
 }
 
 /**
+ * The advertised human front door (auth redesign §1, "one advertised door")
+ * — `my.parachute.computer` in production (`vaultPublicOrigin`, the same
+ * Custom Domain `vaultAdvertisedUrl` above advertises for vault URLs),
+ * falling back to `appOrigin` where there's no separate `my.` (staging: a
+ * single self-referential origin). Both `app.` and `my.` serve the IDENTICAL
+ * SPA shell (P1.2/A1 Custom Domains on this same worker), so either resolves
+ * to the one true arrival screen. Deliberately NOT `vaultAdvertisedUrl`'s own
+ * fallback (`vaultOrigin`, the VAULT WORKER's machine-reachability origin) —
+ * a person redirected here must land on an origin THIS worker serves `/`
+ * (the SPA shell) on, which `vaultOrigin` is not.
+ */
+export function frontDoorOrigin(deps: OAuthDeps): string {
+  return (deps.vaultPublicOrigin ?? deps.appOrigin).replace(/\/$/, "");
+}
+
+/**
  * The app origin new arrivals land on when `APP_ORIGIN` is unset — the legacy
  * standalone Notes PWA. A stale/missing config degrades HERE, to a live serving
  * origin, rather than 404ing a new user's first step.

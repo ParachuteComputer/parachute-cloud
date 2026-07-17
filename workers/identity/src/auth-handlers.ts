@@ -417,7 +417,12 @@ export async function handleLogin2faGet(db: D1Database, req: Request, deps: OAut
   const pending = await getPendingLogin(db, parsePendingLoginCookie(req.headers.get("cookie")), deps.now?.() ?? new Date());
   if (!pending) return redirectResponse("/login");
   const csrf = ensureCsrfToken(req);
-  return htmlResponse(renderLogin2fa({ csrfToken: csrf.token }), 200, csrfExtra(csrf.setCookie));
+  const user = await getUserById(db, pending.userId);
+  return htmlResponse(
+    renderLogin2fa({ csrfToken: csrf.token, email: user?.email ?? "", notYouNext: safeNext(pending.next, deps) }),
+    200,
+    csrfExtra(csrf.setCookie),
+  );
 }
 
 export async function handleLogin2faPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
@@ -425,19 +430,24 @@ export async function handleLogin2faPost(db: D1Database, req: Request, deps: OAu
   const rawToken = parsePendingLoginCookie(req.headers.get("cookie"));
   const pending = await getPendingLogin(db, rawToken, now);
   if (!pending) return redirectResponse("/login");
+  // Resolved once up front — reused for both the error re-renders (the "Signed
+  // in as X" line) and the success redirect, so `safeNext` runs exactly once.
+  const user = await getUserById(db, pending.userId);
+  const email = user?.email ?? "";
+  const notYouNext = safeNext(pending.next, deps);
   const form = await req.formData();
-  if (!checkForm(req, form, deps)) return login2faError(req, "Your session expired. Please try again.");
+  if (!checkForm(req, form, deps)) return login2faError(req, "Your session expired. Please try again.", email, notYouNext);
 
   // Brute-force fence on the second factor (a caller here already passed primary
   // auth). Keyed per (ip, 2fa:<userId>) so it can't lock out another account.
   const key = loginKey(clientIp(req), `2fa:${pending.userId}`);
   if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
-    return login2faError(req, "Too many attempts. Please wait a few minutes and try again.");
+    return login2faError(req, "Too many attempts. Please wait a few minutes and try again.", email, notYouNext);
   }
   const result = await verifySecondFactor(db, pending.userId, String(form.get("code") ?? ""), now);
   if (!result.ok) {
     await recordLoginFailure(deps.rateLimiter, key, now);
-    return login2faError(req, "That code didn't match. Try again.");
+    return login2faError(req, "That code didn't match. Try again.", email, notYouNext);
   }
   await clearLoginFailures(deps.rateLimiter, key);
   await consumePendingLogin(db, rawToken);
@@ -448,19 +458,28 @@ export async function handleLogin2faPost(db: D1Database, req: Request, deps: OAu
     return redirectResponse("/login", { "set-cookie": clearPendingLoginCookie() });
   }
   const session = await createSession(db, pending.userId, now);
-  const headers = new Headers({ location: safeNext(pending.next, deps) });
+  const headers = new Headers({ location: notYouNext });
   headers.append("set-cookie", buildSessionCookie(session.id));
   headers.append("set-cookie", clearPendingLoginCookie());
   return new Response(null, { status: 302, headers });
 }
 
-function login2faError(req: Request, message: string): Response {
+function login2faError(req: Request, message: string, email: string, notYouNext: string): Response {
   const csrf = ensureCsrfToken(req);
-  return htmlResponse(renderLogin2fa({ csrfToken: csrf.token, error: message }), 200, csrfExtra(csrf.setCookie));
+  return htmlResponse(
+    renderLogin2fa({ csrfToken: csrf.token, error: message, email, notYouNext }),
+    200,
+    csrfExtra(csrf.setCookie),
+  );
 }
 
-/** Only follow a `next` that stays on this issuer (relative path or our own origin). */
-function safeNext(next: string, deps: OAuthDeps): string {
+/**
+ * Only follow a `next` that stays on this issuer (relative path or our own
+ * origin). Exported for `console.ts`'s "Not you?" logout — the same
+ * safe-redirect guard authorize-resume already uses, reused rather than
+ * re-implemented so the open-redirect fence has exactly one body.
+ */
+export function safeNext(next: string, deps: OAuthDeps): string {
   // A leading `/` NOT followed by `/` or `\`. Rejecting the backslash matters:
   // a browser normalizes `\`→`/`, so `/\evil.com` (which is not `//…`) would
   // resolve to `https://evil.com/` — an open redirect. This handler now STORES a

@@ -3,11 +3,16 @@
  * (it already owns users, sessions, cookies, and the rendered-HTML surface).
  *
  * Routes (all pure `(db, req, deps)` like the OAuth handlers):
- *   GET  /signup             create-account form
+ *   GET  /signup             302 to the `my.`/`app.` front door (auth
+ *                            redesign §1 — no longer a destination); still
+ *                            mints the CSRF cookie so headless/dev creation
+ *                            (a bare POST /signup) keeps working unadvertised
  *   POST /signup             create user + session → /console
  *   GET  /login              console sign-in form
  *   POST /login              verify + session → /console
- *   POST /logout             clear session → /login
+ *   POST /logout             clear session → /login, or an optional
+ *                            `next` (safeNext-guarded — the "Not you?"
+ *                            ceremony switch, auth redesign §3)
  *   GET  /console            zero vaults → the first-run hero ("Name your
  *                            vault"); otherwise the checklist card + vault
  *                            cards + create form
@@ -50,7 +55,7 @@ import {
   parseSessionCookie,
 } from "./sessions.ts";
 import { sessionUser } from "./session-user.ts";
-import { finishPrimaryAuth } from "./auth-handlers.ts";
+import { finishPrimaryAuth, safeNext } from "./auth-handlers.ts";
 import { EMAIL_RE, PASSWORD_MIN } from "./validation.ts";
 import { createUser, getUserByEmail, needsRehash, setPassword, verifyPassword, type User } from "./users.ts";
 import {
@@ -99,6 +104,7 @@ import {
 } from "./ui.ts";
 import {
   type OAuthDeps,
+  frontDoorOrigin,
   htmlResponse,
   isCrossOrigin,
   isSameOriginRequest,
@@ -130,9 +136,21 @@ function appDeepLinkRedirect(url: string, deps: OAuthDeps, status = 302): Respon
 
 // --- signup ----------------------------------------------------------------
 
-export function handleSignupGet(req: Request): Response {
+/**
+ * Auth redesign §1 ("one advertised door"): `/signup` is no longer a
+ * destination — visiting it 302s to the `my.`/`app.` front door, where
+ * arrival is the SPA's one email-field Landing screen. The CSRF cookie is
+ * STILL minted here (unchanged from the old render path): headless/dev
+ * password-first creation stays reachable, unadvertised, via a bare
+ * `POST /signup` using the cookie this GET sets — `handleSignupPost` itself
+ * is untouched, so smoke-staging's "GET for CSRF, then POST" callers keep
+ * working with zero script changes. The human-facing password-creation form
+ * moved to `/login`'s "Use a password instead" disclosure (ui.ts
+ * `renderConsoleLogin`), which still posts to this same unchanged endpoint.
+ */
+export function handleSignupGet(req: Request, deps: OAuthDeps): Response {
   const csrf = ensureCsrfToken(req);
-  return htmlResponse(renderSignup({ csrfToken: csrf.token }), 200, csrfExtra(csrf.setCookie));
+  return redirectResponse(`${frontDoorOrigin(deps)}/`, csrfExtra(csrf.setCookie));
 }
 
 export async function handleSignupPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
@@ -207,6 +225,18 @@ function loginError(req: Request, message: string, email: string): Response {
   return htmlResponse(renderConsoleLogin({ csrfToken: csrf.token, error: message, email }), 200, csrfExtra(csrf.setCookie));
 }
 
+/**
+ * Auth redesign §3 move 1 ("Not you?"): logout gains an OPTIONAL `next`,
+ * server-validated by the same `safeNext` authorize-resume already uses. A
+ * bare logout (no `next` field — the console header's normal Sign-out path)
+ * is byte-identical to before: still a hard 302 to `/login`. A `next` (the
+ * consent page / 2FA prompt's "Not you?" — always THIS pending flow's own
+ * URL) makes the post-logout landing that pending destination instead, so
+ * signing in again as the right person resumes the connector request without
+ * any new resume machinery — a lost/invalid `next` degrades to `safeNext`'s
+ * existing fallback (`/console`, which itself bounces an unauthenticated GET
+ * to `/login`), never worse than today's behavior.
+ */
 export async function handleLogoutPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const form = await req.formData();
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
@@ -214,7 +244,9 @@ export async function handleLogoutPost(db: D1Database, req: Request, deps: OAuth
   }
   const sessionId = parseSessionCookie(req.headers.get("cookie"));
   if (sessionId) await deleteSession(db, sessionId);
-  return redirectResponse("/login", { "set-cookie": clearSessionCookie() });
+  const requestedNext = String(form.get("next") ?? "").trim();
+  const location = requestedNext ? safeNext(requestedNext, deps) : "/login";
+  return redirectResponse(location, { "set-cookie": clearSessionCookie() });
 }
 
 // --- console ---------------------------------------------------------------

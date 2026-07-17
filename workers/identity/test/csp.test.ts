@@ -171,9 +171,10 @@ describe("every server-rendered page carries CSP with no un-nonced inline script
     await assertSecurePage(await app.fetch(new Request(`${ISSUER}/login`), env), "/login");
   });
 
-  test("/signup", async () => {
-    await assertSecurePage(await app.fetch(new Request(`${ISSUER}/signup`), env), "/signup");
-  });
+  // /signup is no longer a rendered page (auth redesign §1) — GET redirects
+  // to the front door, so it carries no CSP header (no HTML body to
+  // protect). Pinned separately in console.test.ts alongside the redirect's
+  // other behavior (location + the still-minted CSRF cookie).
 
   test("/oauth/authorize (ceremony login page)", async () => {
     const { clientId } = await seedApprovedClient();
