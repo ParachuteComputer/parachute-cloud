@@ -280,15 +280,26 @@ app.post("/__test/snapshot-run", async (c) => {
 });
 
 /**
- * The defensive backstop for my.parachute.computer/vault/* (Phase A1, the
- * one-origin door — route-manifest.ts DEFENSIVE_PREFIXES). In normal
- * operation this identity worker NEVER answers this path: a Cloudflare zone
- * route on my.parachute.computer/vault/* dispatches straight to the VAULT
- * worker at the platform layer, ahead of this worker's my. Custom Domain. If
- * that zone route is ever deleted or misconfigured, THIS is the fallback —
- * and it must never silently serve the SPA shell as a 200 (which would look
- * like a working, empty vault to an API/MCP client). A loud 503 is the
- * honest answer: "the vault is unreachable here," not "here is a vault."
+ * The /vault defensive backstop (route-manifest.ts DEFENSIVE_PREFIXES),
+ * primarily for the my.parachute.computer one-origin door (Phase A1): a
+ * Cloudflare zone route on my.parachute.computer/vault/* is meant to
+ * dispatch straight to the VAULT worker at the platform layer, ahead of
+ * this worker's my. Custom Domain, so in normal operation THIS worker never
+ * answers a my./vault/* request. If that zone route is ever deleted or
+ * misconfigured, this is the fallback — and it must never silently serve
+ * the SPA shell as a 200 (which would look like a working, empty vault to
+ * an API/MCP client). A loud 503 is the honest answer: "the vault is
+ * unreachable here," not "here is a vault."
+ *
+ * This handler goes live on EVERY host this worker serves (cloud., app.,
+ * staging) the moment this PR deploys — not just my., and not only once the
+ * my. cutover happens. That's deliberate, not incidental: before this PR,
+ * `/vault/*` on cloud./app. had no route at all, so it fell through to
+ * Static Assets and silently served the SPA shell as a 200 — the exact
+ * failure mode this backstop exists to prevent, present on every serving
+ * host from day one. This PR closes that gap everywhere at once; the
+ * my.-specific zone-route rationale above just explains why the pattern
+ * needed a name.
  */
 function vaultRouteMissing(): Response {
   return Response.json(
@@ -296,7 +307,7 @@ function vaultRouteMissing(): Response {
       error: "route_missing",
       error_type: "vault_route_missing",
       message:
-        "The vault worker's zone route (my.parachute.computer/vault/*) did not intercept this request — the identity worker never serves vault data directly. This is a deployment misconfiguration, not a missing vault.",
+        "This identity worker never serves /vault/* directly — vault requests are meant to be intercepted by a platform-layer route (a Cloudflare zone route) pointed at the vault worker before they reach here. If you expected vault data at this URL, that route is missing or misconfigured on this origin.",
     },
     { status: 503 },
   );
