@@ -90,6 +90,13 @@ export interface User {
   lastInvoicePaidAt: string | null;
   paymentFailedAt: string | null;
   paymentFailedCount: number;
+  /**
+   * The owners row this account has claimed a handle through (migration 0022,
+   * the GitHub owner-model); null until the account claims one (claiming is
+   * optional + Settings-initiated). Resolve to the handle string via
+   * `getOwnerHandle` (handles.ts). Written only by `claimHandle`.
+   */
+  ownerId: string | null;
 }
 
 interface Row {
@@ -108,6 +115,7 @@ interface Row {
   last_invoice_paid_at: string | null;
   payment_failed_at: string | null;
   payment_failed_count: number;
+  owner_id: string | null;
 }
 
 function rowToUser(r: Row): User {
@@ -130,6 +138,7 @@ function rowToUser(r: Row): User {
     lastInvoicePaidAt: r.last_invoice_paid_at,
     paymentFailedAt: r.payment_failed_at,
     paymentFailedCount: r.payment_failed_count,
+    ownerId: r.owner_id,
   };
 }
 
@@ -255,6 +264,9 @@ export async function createUser(
     lastInvoicePaidAt: null,
     paymentFailedAt: null,
     paymentFailedCount: 0,
+    // A fresh account holds no handle — claiming is optional + Settings-
+    // initiated (migration 0022); the INSERT omits owner_id (column default NULL).
+    ownerId: null,
   };
 }
 

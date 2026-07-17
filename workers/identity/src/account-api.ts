@@ -58,6 +58,16 @@ import {
   vaultCapMessage,
 } from "./plans.ts";
 import { ACCESS_TOKEN_TTL_SECONDS, signAccessToken } from "./tokens.ts";
+import {
+  HandleAlreadySetError,
+  HandleInvalidError,
+  HandleTakenError,
+  claimHandle,
+  getOwnerHandle,
+  handleIsAvailable,
+  suggestHandleFromEmail,
+  validateHandle,
+} from "./handles.ts";
 import { type User, getUserById } from "./users.ts";
 import { pushVaultCap } from "./vault-call.ts";
 import {
@@ -277,10 +287,16 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
     plan.trial_days_left = Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
   }
 
+  // The account's claimed handle (migration 0022, the GitHub owner-model) or
+  // null — additive, so the app can render "@handle" beside the email and its
+  // claim CTA when null. A single-hop owners lookup (null ownerId → no query).
+  const handle = await getOwnerHandle(db, user.ownerId);
+
   return jsonResponse(
     {
       email: user.email,
       account_created_at: user.createdAt,
+      handle,
       plan,
       // Honest capability signal for the app's "Manage plan & billing"
       // section — NOT a URL anymore (billing.ts's Bearer-gated
@@ -308,6 +324,91 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
     200,
     { "cache-control": "no-store" },
   );
+}
+
+// --- handles (migration 0022, the GitHub owner-model) ------------------------
+
+/**
+ * GET /account/handle — the account's claimed handle (or null) plus a friendly
+ * email-derived suggestion the app can prefill its claim field with. Scope:
+ * `account:<id>:read` (same requireAccount gate as the other GETs). Additive,
+ * inert on the wire until later waves serve `/u/<handle>` URLs.
+ */
+export async function handleAccountHandleGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const auth = await requireAccount(db, req, deps, "read");
+  if (!auth.ok) return auth.response;
+  const handle = await getOwnerHandle(db, auth.user.ownerId);
+  return jsonResponse(
+    { handle, suggested: suggestHandleFromEmail(auth.user.email) },
+    200,
+    { "cache-control": "no-store" },
+  );
+}
+
+/**
+ * GET /account/handle/check?handle= — is a candidate handle claimable? Returns
+ * `{ available, reason? }`: `reason` is `invalid` (fails the shape rules),
+ * `reserved` (a first-party/platform word), or `taken` (already claimed).
+ * Availability is public information GitHub-style, but the endpoint STAYS behind
+ * the account bearer (`read`) per the plan — a signed-in gate, not an open one.
+ * The `handle` is canonicalized (trim + lowercase) before every check, so a
+ * caller learns availability for the same handle a claim would actually take.
+ */
+export async function handleAccountHandleCheck(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const auth = await requireAccount(db, req, deps, "read");
+  if (!auth.ok) return auth.response;
+
+  const raw = new URL(req.url).searchParams.get("handle") ?? "";
+  const check = validateHandle(raw);
+  if (!check.ok) {
+    return jsonResponse({ available: false, reason: check.reason }, 200, { "cache-control": "no-store" });
+  }
+  const available = await handleIsAvailable(db, check.handle);
+  return jsonResponse(
+    available ? { available: true } : { available: false, reason: "taken" },
+    200,
+    { "cache-control": "no-store" },
+  );
+}
+
+/**
+ * POST /account/handle — claim a handle (claim-once; rename is Wave E). Scope:
+ * `account:<id>:admin` (a write on the account). Body `{ handle }`. Wraps
+ * `claimHandle` (handles.ts) — the same core the console door will call — and
+ * maps its typed failures onto the wire:
+ *   - 400 `invalid_handle` / `reserved` (HandleInvalidError, by reason),
+ *   - 409 `handle_taken` (HandleTakenError — claimed concurrently by another),
+ *   - 409 `handle_already_set` (HandleAlreadySetError — this account already
+ *     holds one; a rename is not yet supported).
+ * On success answers `{ handle }` — the canonical (lowercased) handle claimed.
+ */
+export async function handleAccountHandleClaim(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const auth = await requireAccount(db, req, deps, "admin");
+  if (!auth.ok) return auth.response;
+
+  const body = await readJsonBody(req);
+  const rawHandle = typeof body.handle === "string" ? body.handle : "";
+  try {
+    const { handle } = await claimHandle(db, auth.accountId, rawHandle, deps.now?.() ?? new Date());
+    return jsonResponse({ handle }, 200, { "cache-control": "no-store" });
+  } catch (err) {
+    if (err instanceof HandleInvalidError) {
+      return err.reason === "reserved"
+        ? restError(400, "reserved", "That handle is reserved. Please choose another.")
+        : restError(
+            400,
+            "invalid_handle",
+            "Use 3–30 characters: lowercase letters, numbers, and hyphens (not starting or ending with a hyphen).",
+          );
+    }
+    if (err instanceof HandleTakenError) {
+      return restError(409, "handle_taken", "That handle is already taken.");
+    }
+    if (err instanceof HandleAlreadySetError) {
+      return restError(409, "handle_already_set", "This account already has a handle.");
+    }
+    throw err;
+  }
 }
 
 // --- POST /account/vaults — create (the hinge: lands you IN the vault) -------

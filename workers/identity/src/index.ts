@@ -61,6 +61,9 @@ import { runUsageRollup } from "./usage.ts";
 import { handleAccountSession } from "./account-session.ts";
 import { handleAccountToken } from "./account-token.ts";
 import {
+  handleAccountHandleCheck,
+  handleAccountHandleClaim,
+  handleAccountHandleGet,
   handleAccountSummary,
   handleAccountVaultCreate,
   handleAccountVaultDelete,
@@ -199,6 +202,15 @@ app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, d
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/vaults/:name", (c) => handleAccountVaultDelete(c.env.DB, c.req.raw, depsFor(c.env)));
+// Handles (migration 0022, the GitHub owner-model): claim ONE global handle for
+// the account. GET reads the claimed handle + an email-derived suggestion
+// (read); GET /check tests a candidate's availability (read — public info, but
+// gated per the plan); POST claims it (admin, claim-once — rename is Wave E).
+// Additive + inert on the wire: nothing serves a `/u/<handle>` URL until later
+// waves, so an account without a handle is byte-for-byte unaffected.
+app.get("/account/handle", (c) => handleAccountHandleGet(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/account/handle/check", (c) => handleAccountHandleCheck(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/handle", (c) => handleAccountHandleClaim(c.env.DB, c.req.raw, depsFor(c.env)));
 // The no-relogin billing seam (Bearer-gated account-API siblings of
 // /billing/checkout + /billing/portal below — billing.ts): the app sends the
 // account bearer it already holds and gets back `{ url }` to redirect to,
