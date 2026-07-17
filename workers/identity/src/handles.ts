@@ -143,13 +143,15 @@ export class HandleAlreadySetError extends Error {
 
 /**
  * Claim a handle for a user (claim-once — rename is Wave E). Validates shape +
- * reserved (HandleInvalidError), refuses an account that already holds a handle
- * (HandleAlreadySetError), then INSERTs the owners row and points
- * `users.owner_id` at it in ONE atomic D1 batch. A UNIQUE-violation race (two
- * accounts claiming the same handle at once) rolls the batch back and surfaces
- * HandleTakenError — the `createVault`/`VaultNameTakenError` pattern
- * (vaults.ts). The UPDATE's `owner_id IS NULL` guard is defense-in-depth against
- * the check-then-claim window above it.
+ * reserved (HandleInvalidError), then INSERTs the owners row and points
+ * `users.owner_id` at it in ONE atomic D1 batch. Two failure modes are both
+ * enforced AT THE DB, race-free — no read-then-write window:
+ *   - the account already holds a handle → the CONDITIONAL insert writes nothing
+ *     (`meta.changes === 0`) → HandleAlreadySetError. This is the sole claim-once
+ *     authority (there is deliberately no separate pre-check to race against);
+ *   - another account claimed the same handle concurrently → the `owners.handle`
+ *     UNIQUE constraint rolls the batch back → HandleTakenError (the
+ *     `createVault`/`VaultNameTakenError` pattern, vaults.ts).
  *
  * Returns the canonical handle + the minted owner_id on success.
  */
@@ -163,31 +165,39 @@ export async function claimHandle(
   if (!check.ok) throw new HandleInvalidError(check.reason, rawHandle);
   const handle = check.handle;
 
-  // Claim-once: refuse an account that already points at an owner row. Read
-  // fresh (not the caller's loaded User) so the check reflects the DB; the
-  // batch's `owner_id IS NULL` guard closes the residual check-then-act window.
-  const existing = await db.prepare("SELECT owner_id FROM users WHERE id = ?").bind(userId).first<{
-    owner_id: string | null;
-  }>();
-  if (existing?.owner_id) throw new HandleAlreadySetError(userId);
-
   const ownerId = randomUUID();
   const claimedAt = now.toISOString();
+  // Claim-once AND the claim itself in ONE atomic, race-tight D1 batch — no
+  // read-then-write window to lose. The INSERT is CONDITIONAL: it writes the
+  // owners row ONLY while the account still holds NO handle (`NOT EXISTS ...
+  // owner_id IS NOT NULL`), so a second/concurrent claim writes NOTHING rather
+  // than orphaning a handle nobody owns. Because a D1 batch is a single
+  // serialized transaction, an INSERT that wrote its row (changes=1) always
+  // pairs with the guarded UPDATE landing the pointer; an INSERT that wrote
+  // nothing (changes=0) means the account already had a handle.
+  let results: D1Result[];
   try {
-    await db.batch([
+    results = await db.batch([
       db
-        .prepare("INSERT INTO owners (owner_id, handle, kind, claimed_at) VALUES (?, ?, 'user', ?)")
-        .bind(ownerId, handle, claimedAt),
+        .prepare(
+          "INSERT INTO owners (owner_id, handle, kind, claimed_at) " +
+            "SELECT ?, ?, 'user', ? WHERE NOT EXISTS (SELECT 1 FROM users WHERE id = ? AND owner_id IS NOT NULL)",
+        )
+        .bind(ownerId, handle, claimedAt, userId),
       db.prepare("UPDATE users SET owner_id = ? WHERE id = ? AND owner_id IS NULL").bind(ownerId, userId),
     ]);
   } catch (err) {
     // UNIQUE on owners.handle (the namespace lock) → the handle was claimed
-    // concurrently; the batch rolled back atomically. An owner_id PK collision
-    // would also land here — indistinguishable by message, but at 122 bits of
-    // randomness this branch is a handle collision in practice.
+    // concurrently by ANOTHER account; the batch rolled back atomically. An
+    // owner_id PK collision would also land here — indistinguishable by message,
+    // but at 122 bits of randomness this branch is a handle collision in practice.
     const msg = err instanceof Error ? err.message : String(err);
     if (/UNIQUE|constraint|PRIMARY/i.test(msg)) throw new HandleTakenError(handle);
     throw err;
   }
+  // The conditional INSERT wrote no row → THIS account already holds a handle
+  // (a duplicate or raced claim). Nothing was created and no pointer moved, so
+  // refuse with the claim-once error rather than returning a lying success.
+  if (results[0]!.meta.changes === 0) throw new HandleAlreadySetError(userId);
   return { handle, ownerId };
 }

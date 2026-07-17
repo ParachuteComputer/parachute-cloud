@@ -156,6 +156,40 @@ describe("claimHandle — the claim path", () => {
     expect(await currentOwnerId(b)).toBeNull();
   });
 
+  test("CONCURRENT distinct-handle claims by the same account → one wins, no orphan, one-handle-per-account holds", async () => {
+    // The exact race the conditional-INSERT guard closes: the SAME account fires
+    // two claims for DIFFERENT handles at once. Without the guard, claim #2's
+    // unconditional INSERT would succeed while its guarded UPDATE matched 0 rows
+    // — leaving handle #2 squatted by nobody AND returning a lying 200. The
+    // conditional INSERT (writes only while owner_id IS NULL) makes exactly one
+    // win and the other refuse.
+    const id = await seedUser("handle-conc@example.com");
+    const settled = await Promise.allSettled([
+      claimHandle(env.DB, id, "race-h1"),
+      claimHandle(env.DB, id, "race-h2"),
+    ]);
+    const fulfilled = settled.filter(
+      (r): r is PromiseFulfilledResult<{ handle: string; ownerId: string }> => r.status === "fulfilled",
+    );
+    const rejected = settled.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    // The loser is refused for one-handle-per-account — never a silent success.
+    expect(rejected[0]!.reason).toBeInstanceOf(HandleAlreadySetError);
+
+    const winner = fulfilled[0]!.value.handle;
+    // Exactly ONE owners row across the two candidate handles — no orphan left
+    // in the namespace by the loser.
+    const owners = await env.DB.prepare(
+      "SELECT handle FROM owners WHERE handle IN ('race-h1', 'race-h2')",
+    ).all<{ handle: string }>();
+    expect(owners.results).toHaveLength(1);
+    expect(owners.results![0]!.handle).toBe(winner);
+    // The DB AGREES with the winning return value — the account resolves to
+    // exactly the handle the fulfilled call reported (no lying 200).
+    expect(await getOwnerHandle(env.DB, await currentOwnerId(id))).toBe(winner);
+  });
+
   test.each([
     ["a bad shape", "ab", "invalid"],
     ["a reserved word", "admin", "reserved"],
