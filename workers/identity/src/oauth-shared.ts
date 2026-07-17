@@ -214,6 +214,24 @@ export function ceremonyOrigin(req: Request, deps: OAuthDeps): string {
 }
 
 /**
+ * True when `location` (relative or absolute) resolves to a different origin
+ * than `base`. The gate for {@link redirectResponse} vs the cross-origin
+ * bridge (ui.ts `renderRedirectBridge`, see the `form-action` note on
+ * {@link contentSecurityPolicy}) — a form-POST response redirecting
+ * same-origin (e.g. `/console`) is unaffected by Chrome's enforcement and
+ * should stay a direct 30x; only a cross-origin target needs the bridge. An
+ * unparseable `location` is treated as cross-origin (fail toward the safer,
+ * slower path rather than a silently-blocked direct redirect).
+ */
+export function isCrossOrigin(location: string, base: string): boolean {
+  try {
+    return new URL(location, base).origin !== new URL(base).origin;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * CORS POSTURE — the issuer's documented contract (#35, settled 2026-07-02).
  *
  * The cloud issuer runs a deliberate three-way SPLIT:
@@ -340,9 +358,20 @@ export interface CspOptions {
  *   - `img-src 'self' data:` — no `<img>` today (the TOTP QR is inline `<svg>`),
  *     kept for favicons + forward-compat.
  *   - `connect-src` — see {@link CspOptions.connectSrc}.
- *   - `form-action 'self'` — every form POSTs same-origin (billing's checkout
- *     form posts same-origin, THEN the worker 302s to Stripe — form-action
- *     governs the form's target, not the server redirect, so Checkout is safe).
+ *   - `form-action 'self'` — every form POSTs same-origin; kept STRICT
+ *     deliberately. **Chrome enforces `form-action` against a form
+ *     submission's ultimate redirect destination, not just its immediate
+ *     action URL** (confirmed live, 2026-07-16 — Firefox does not enforce
+ *     this, a genuine engine divergence). A same-origin form whose response
+ *     is a cross-origin 30x — the OAuth consent approve/deny leg, Stripe
+ *     Checkout/Portal, the create-vault no-JS app deep-link — gets a silent
+ *     `net::ERR_ABORTED` in Chrome even though the server fully processed
+ *     the POST. The fix is NOT widening this directive: every such site
+ *     answers through a same-origin bridge page instead (`ui.ts`
+ *     `renderRedirectBridge` — a nonce'd script-initiated `location.replace`,
+ *     which `form-action` does not govern, plus a no-JS fallback link),
+ *     gated by {@link isCrossOrigin} so a same-origin form response (e.g.
+ *     `/console`) keeps its direct redirect.
  *   - `frame-ancestors 'none'` / `base-uri 'none'` / `object-src 'none'` —
  *     no framing, no `<base>`, no plugins.
  */

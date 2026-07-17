@@ -316,6 +316,44 @@ export function renderError(opts: { title: string; message: string }): string {
   );
 }
 
+/**
+ * Same-origin bridge page for a form-POST response that must end in a
+ * CROSS-ORIGIN redirect — the OAuth consent approve/deny leg (a client's
+ * `redirect_uri`), Stripe Checkout/Portal, and the app deep-links (create-
+ * vault's no-JS path, the checklist doors). Chrome enforces `form-action
+ * 'self'` (oauth-shared.ts) against the RESULT of a form submission, not
+ * just the form's own action URL — a same-origin form whose response is a
+ * cross-origin 30x gets silently `net::ERR_ABORTED` in Chrome (confirmed
+ * live, 2026-07-16; Firefox does not enforce this). `form-action` only
+ * governs form-submission NAVIGATIONS though: a script-initiated navigation
+ * is unconstrained by it, so this renders an ordinary same-origin page
+ * (passes CSP like any other ceremony response) whose nonce'd inline script
+ * immediately continues the journey — plus a visible fallback link (a link
+ * CLICK is a user-activation navigation, also unconstrained) for no-JS or a
+ * slow/blocked script. Callers only reach for this when the target actually
+ * IS cross-origin ({@link isCrossOrigin} in oauth-shared.ts) — a same-origin
+ * redirect stays a direct 30x.
+ *
+ * `url` is always server-derived (a registered client redirect_uri with a
+ * server-minted code/state appended, a freshly-minted Stripe session URL, or
+ * a config-derived app deep link) — never raw user input — but rendering it
+ * into a page is a NEW context the original Location-header-only design
+ * never touched, so it's escaped for both places it appears: `esc()` for the
+ * href attribute, and a JSON-encoded, `<`-escaped literal for the script (so
+ * a redirect target can never smuggle a `</script>` breakout).
+ */
+export function renderRedirectBridge(url: string): string {
+  const scriptSafeUrl = JSON.stringify(url).replace(/</g, "\\u003c");
+  return page(
+    "Redirecting…",
+    `<h1>Redirecting…</h1>
+     <div class="card">
+       <p class="muted">Taking you back to finish up. If this takes more than a moment, <a href="${esc(url)}">continue here</a>.</p>
+     </div>
+     <script ${NONCE_ATTR}>location.replace(${scriptSafeUrl});</script>`,
+  );
+}
+
 // --- console (accounts + vaults) ------------------------------------------
 
 /** The magic-link (passwordless) form — the primary sign-in / sign-up affordance. */

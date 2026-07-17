@@ -72,11 +72,14 @@ import type { Env } from "./env.ts";
 import {
   type OAuthDeps,
   ceremonyOrigin,
+  htmlResponse,
+  isCrossOrigin,
   isSameOriginRequest,
   jsonResponse,
   redirectResponse,
   resolveBoundOrigins,
 } from "./oauth-shared.ts";
+import { renderRedirectBridge } from "./ui.ts";
 import { verifyCsrfToken } from "./csrf.ts";
 import { sessionUser } from "./session-user.ts";
 import {
@@ -109,6 +112,20 @@ export type { BillingInterval } from "./billing-config.ts";
 
 function isBillingInterval(raw: string): raw is BillingInterval {
   return raw === "monthly" || raw === "quarterly" || raw === "yearly";
+}
+
+/**
+ * The two CONSOLE billing doors (checkout, portal) both end a successful
+ * form POST at a Stripe-hosted, cross-origin URL — the same `form-action
+ * 'self'` trap as the OAuth consent leg (see the note on
+ * `contentSecurityPolicy` in oauth-shared.ts): a direct 302 there gets a
+ * silent `net::ERR_ABORTED` in Chrome. Same-origin `/console?...` error
+ * redirects are unaffected and keep their direct 30x.
+ */
+function stripeRedirect(url: string, issuer: string): Response {
+  return isCrossOrigin(url, issuer)
+    ? htmlResponse(renderRedirectBridge(url), 200, { "cache-control": "no-store" }) // carries a one-time session URL
+    : redirectResponse(url);
 }
 
 /**
@@ -362,7 +379,7 @@ export async function handleCheckoutPost(
     deps,
     overrides?.stripe,
   );
-  return redirectResponse(result.ok ? result.url : `/console?billing_err=${result.reason}`);
+  return result.ok ? stripeRedirect(result.url, deps.issuer) : redirectResponse(`/console?billing_err=${result.reason}`);
 }
 
 /**
@@ -478,7 +495,7 @@ export async function handlePortalPost(
   if (!result.ok) {
     return redirectResponse(result.reason === "no_customer" ? "/console?billing_err=no-billing" : "/console?billing_err=stripe");
   }
-  return redirectResponse(result.url);
+  return stripeRedirect(result.url, deps.issuer);
 }
 
 // --- account-API doors (Bearer-gated; no CSRF/same-origin — see module note) --

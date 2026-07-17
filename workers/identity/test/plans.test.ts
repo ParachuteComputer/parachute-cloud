@@ -43,6 +43,7 @@ import {
   CSRF,
   ISSUER,
   VAULT_BASE,
+  bridgeTarget,
   decodeJwtPayload,
   deps,
   mintInitialPair,
@@ -375,8 +376,10 @@ describe("vault-count enforcement + entitlement push", () => {
       post("/console/vaults", { __csrf: CSRF, name: "capflow-box" }, sessionCookie(sessionId)),
       env,
     );
-    expect(created.status).toBe(303);
-    expect(created.headers.get("location")).toBe(
+    // The app deep-link is cross-origin from the issuer, so the create-vault
+    // no-JS redirect bridges (P0 REVENUE fix, console.ts appDeepLinkRedirect).
+    expect(created.status).toBe(200);
+    expect(bridgeTarget(await created.text())).toBe(
       "https://app.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fcapflow-box",
     );
 
@@ -468,7 +471,7 @@ describe("vault-count enforcement + entitlement push", () => {
       post("/console/vaults", { __csrf: CSRF, name: "trialpick-box" }, sessionCookie(sessionId)),
       env,
     );
-    expect(created.status).toBe(303);
+    expect(created.status).toBe(200);
     expect(JSON.parse(body!)).toEqual({
       caps: { notes_bytes: 100 * MiB, attachment_bytes: 0 },
       transcription: { enabled: false, minutes_limit: 0 },
@@ -489,8 +492,8 @@ describe("vault-count enforcement + entitlement push", () => {
       post("/console/vaults", { __csrf: CSRF, name: "pushfail-box" }, sessionCookie(sessionId)),
       env,
     );
-    expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(
+    expect(res.status).toBe(200);
+    expect(bridgeTarget(await res.text())).toBe(
       "https://app.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fpushfail-box",
     );
     expect(await vaultRowCount(userId)).toBe(1);
@@ -507,7 +510,7 @@ describe("vault-count enforcement + entitlement push", () => {
       post("/console/vaults", { __csrf: CSRF, name: "pushgone-box" }, sessionCookie(sessionId)),
       env,
     );
-    expect(res.status).toBe(303);
+    expect(res.status).toBe(200);
     expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_failed"))).toBe(true);
     warn.mockRestore();
   });

@@ -37,6 +37,7 @@ import {
   REDIRECT_URI,
   VAULT_BASE,
   authorizeGetReq,
+  bridgeTarget,
   consentReq,
   deps,
   makePkce,
@@ -207,8 +208,10 @@ describe("vault ownership — authorize flow", () => {
       ),
       deps(),
     );
-    expect(res.status).toBe(302);
-    const u = new URL(res.headers.get("location")!);
+    // Cross-origin REDIRECT_URI — consent-submit error redirects bridge too
+    // (P0 REVENUE fix, oauth-authorize.ts bridgeIfCrossOrigin).
+    expect(res.status).toBe(200);
+    const u = new URL(bridgeTarget(await res.text())!);
     expect(u.searchParams.get("error")).toBe("invalid_scope");
     expect(u.searchParams.get("code")).toBeNull();
   });
@@ -236,8 +239,8 @@ describe("vault ownership — authorize flow", () => {
       ),
       deps(),
     );
-    expect(res.status).toBe(302);
-    expect(new URL(res.headers.get("location")!).searchParams.get("code")).toBeTruthy();
+    expect(res.status).toBe(200);
+    expect(new URL(bridgeTarget(await res.text())!).searchParams.get("code")).toBeTruthy();
   });
 });
 
@@ -332,8 +335,8 @@ describe("RFC 8707 resource binding — the vault worker's own origin (connector
       ),
       { ...deps(), vaultOrigin: env.VAULT_ORIGIN },
     );
-    expect(res.status).toBe(302);
-    const u = new URL(res.headers.get("location")!);
+    expect(res.status).toBe(200);
+    const u = new URL(bridgeTarget(await res.text())!);
     expect(u.searchParams.get("error")).toBeNull();
     expect(u.searchParams.get("code")).toBeTruthy();
   });
@@ -1414,10 +1417,12 @@ describe("console — vaults", () => {
       post("/console/vaults", { __csrf: CSRF, name: "my-notes" }, `parachute_id_session=${session}; parachute_id_csrf=${CSRF}`),
       env,
     );
-    // Create lands the user straight in the new vault's app UI (303) — the
-    // configured APP_ORIGIN (wrangler default app.parachute.computer; #116).
-    expect(create.status).toBe(303);
-    expect(create.headers.get("location")).toBe(
+    // Create lands the user straight in the new vault's app UI — the
+    // configured APP_ORIGIN (wrangler default app.parachute.computer; #116),
+    // cross-origin from the issuer so the no-JS 303 bridges (P0 REVENUE fix,
+    // console.ts appDeepLinkRedirect) rather than a direct redirect.
+    expect(create.status).toBe(200);
+    expect(bridgeTarget(await create.text())).toBe(
       "https://app.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fmy-notes",
     );
 
@@ -1457,10 +1462,11 @@ describe("console — vaults", () => {
     const appEnv = { ...env, APP_ORIGIN: APP };
     const deepLink = `${APP}/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fappvault`;
 
-    // Post-create 303 lands on the configured APP origin — the same-origin arrival.
+    // Post-create lands on the configured APP origin, cross-origin from the
+    // issuer here — the no-JS 303 bridges instead of a direct redirect.
     const create = await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "appvault" }, cookie), appEnv);
-    expect(create.status).toBe(303);
-    expect(create.headers.get("location")).toBe(deepLink);
+    expect(create.status).toBe(200);
+    expect(bridgeTarget(await create.text())).toBe(deepLink);
 
     // The vault card's "Open your notes" door (+ the lone-vault nav shortcut)
     // point at the app origin; nothing on the page still names notes.parachute.
@@ -1470,10 +1476,10 @@ describe("console — vaults", () => {
     expect(html).toContain(`href="${deepLink}"`);
     expect(html).not.toContain("notes.parachute.computer");
 
-    // A checklist door (open-notes) 302s to the app origin too.
+    // A checklist door (open-notes) bridges to the app origin too.
     const door = await app.fetch(post("/console/checklist", { __csrf: CSRF, item: "open-notes" }, cookie), appEnv);
-    expect(door.status).toBe(302);
-    expect(door.headers.get("location")).toBe(deepLink);
+    expect(door.status).toBe(200);
+    expect(bridgeTarget(await door.text())).toBe(deepLink);
   });
 
   test("APP_ORIGIN unset ⇒ the arrival falls back to the legacy Notes PWA (the graceful default)", async () => {
@@ -1483,8 +1489,8 @@ describe("console — vaults", () => {
     // notes PWA rather than 404ing a new user's first step.
     const unsetEnv = { ...env, APP_ORIGIN: undefined };
     const create = await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "defaultvault" }, cookie), unsetEnv);
-    expect(create.status).toBe(303);
-    expect(create.headers.get("location")).toBe(
+    expect(create.status).toBe(200);
+    expect(bridgeTarget(await create.text())).toBe(
       "https://notes.parachute.computer/?add=https%3A%2F%2Fu.parachute.computer%2Fvault%2Fdefaultvault",
     );
   });

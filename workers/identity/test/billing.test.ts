@@ -44,7 +44,7 @@ import {
 import { billingConfig, priceFor } from "../src/billing-config.ts";
 import { STRIPE_MIN_TRIAL_END_MS } from "../src/billing.ts";
 import { getUserById, setUserPlan } from "../src/users.ts";
-import { CSRF, ISSUER, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
+import { CSRF, ISSUER, bridgeTarget, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 // --- the configured test environment -----------------------------------------
 
@@ -777,8 +777,12 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
       post("/billing/checkout", { __csrf: CSRF, interval: "monthly" }, sessionCookie(sessionId)),
       BILLING_ENV,
     );
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("https://checkout.stripe.com/c/test");
+    // Stripe's Checkout URL is cross-origin from the issuer, so a successful
+    // mint bridges (P0 REVENUE fix, billing.ts stripeRedirect) rather than a
+    // direct 302 — Chrome's form-action enforcement would otherwise strand a
+    // paying user mid-checkout.
+    expect(res.status).toBe(200);
+    expect(bridgeTarget(await res.text())).toBe("https://checkout.stripe.com/c/test");
 
     const params = new URLSearchParams(raw);
     expect(params.get("mode")).toBe("subscription");
@@ -807,7 +811,7 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
       post("/billing/checkout", { __csrf: CSRF, interval: "yearly" }, sessionCookie(sessionId)),
       BILLING_ENV,
     );
-    expect(res.status).toBe(302);
+    expect(res.status).toBe(200);
     expect(new URLSearchParams(raw).get("line_items[0][price]")).toBe(PRICE_YEARLY);
   });
 
@@ -826,7 +830,7 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
         post("/billing/checkout", { __csrf: CSRF, interval: c.interval, plan: c.plan }, sessionCookie(sessionId)),
         BILLING_ENV,
       );
-      expect(res.status).toBe(302);
+      expect(res.status).toBe(200);
       const params = new URLSearchParams(raw);
       expect(params.get("line_items[0][price]")).toBe(c.price);
       expect(params.get("metadata[plan]")).toBe(c.plan);
@@ -856,8 +860,8 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
       post("/billing/checkout", { __csrf: CSRF, plan: "entry" }, sessionCookie(entrySession)),
       BILLING_ENV,
     );
-    expect(entryRes.status).toBe(302);
-    expect(entryRes.headers.get("location")).toBe("https://checkout.stripe.com/c/test");
+    expect(entryRes.status).toBe(200);
+    expect(bridgeTarget(await entryRes.text())).toBe("https://checkout.stripe.com/c/test");
     expect(new URLSearchParams(entryRaw).get("line_items[0][price]")).toBe("price_test_entry_quarterly");
 
     const { id: standardId } = await seedUser("checkout-standard-bare@example.com");
@@ -868,7 +872,7 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
       post("/billing/checkout", { __csrf: CSRF, plan: "standard" }, sessionCookie(standardSession)),
       BILLING_ENV,
     );
-    expect(standardRes.status).toBe(302);
+    expect(standardRes.status).toBe(200);
     expect(new URLSearchParams(standardRaw).get("line_items[0][price]")).toBe(PRICE_MONTHLY);
   });
 
@@ -899,7 +903,7 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
       post("/billing/checkout", { __csrf: CSRF, interval: "yearly", plan: "power" }, sessionCookie(sessionId)),
       BILLING_ENV,
     );
-    expect(res.status).toBe(302);
+    expect(res.status).toBe(200);
     const params = new URLSearchParams(raw);
     expect(params.get("subscription_data[trial_end]")).toBe(String(Math.floor(downgradeAt.getTime() / 1000)));
     // The rest of the session is unchanged by the trial awareness.
@@ -922,7 +926,7 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
       post("/billing/checkout", { __csrf: CSRF, interval: "monthly" }, sessionCookie(sessionId)),
       BILLING_ENV,
     );
-    expect(res.status).toBe(302);
+    expect(res.status).toBe(200);
     expect(new URLSearchParams(raw).get("subscription_data[trial_end]")).toBeNull();
   });
 
@@ -940,7 +944,7 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
       post("/billing/checkout", { __csrf: CSRF, interval: "monthly" }, sessionCookie(sessionId)),
       BILLING_ENV,
     );
-    expect(res.status).toBe(302);
+    expect(res.status).toBe(200);
     expect(new URLSearchParams(raw).get("subscription_data[trial_end]")).toBeNull();
   });
 
@@ -958,7 +962,7 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
       post("/billing/checkout", { __csrf: CSRF, interval: "monthly" }, sessionCookie(sessionId)),
       BILLING_ENV,
     );
-    expect(res.status).toBe(302);
+    expect(res.status).toBe(200);
     const params = new URLSearchParams(raw);
     expect(params.get("customer")).toBe("cus_prior");
     expect(params.get("customer_update[address]")).toBe("auto"); // tax needs a saved address
@@ -992,8 +996,8 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
       post("/billing/checkout", { __csrf: CSRF, interval: "monthly" }, sessionCookie(sessionId)),
       BILLING_ENV,
     );
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("https://checkout.stripe.com/c/test");
+    expect(res.status).toBe(200);
+    expect(bridgeTarget(await res.text())).toBe("https://checkout.stripe.com/c/test");
   });
 
   test("gates: no session → /login; bad CSRF → billing_err=session; bogus interval → invalid; already paid → already", async () => {
@@ -1069,8 +1073,10 @@ describe("POST /billing/portal — the Customer Portal door", () => {
       });
 
     const res = await app.fetch(post("/billing/portal", { __csrf: CSRF }, sessionCookie(sessionId)), BILLING_ENV);
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("https://billing.stripe.com/p/session/test_1");
+    // The Stripe Portal URL is cross-origin from the issuer, so a successful
+    // mint bridges too (P0 REVENUE fix, billing.ts stripeRedirect).
+    expect(res.status).toBe(200);
+    expect(bridgeTarget(await res.text())).toBe("https://billing.stripe.com/p/session/test_1");
     const params = new URLSearchParams(raw);
     expect(params.get("customer")).toBe("cus_portal_1");
     expect(params.get("return_url")).toBe(`${ISSUER}/console`);

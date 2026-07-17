@@ -29,6 +29,7 @@ import {
   ISSUER,
   REDIRECT_URI,
   authorizeGetReq,
+  bridgeTarget,
   consentReq,
   decodeJwtPayload,
   deps,
@@ -565,8 +566,12 @@ describe("aud narrowing", () => {
       ),
       deps(),
     );
-    expect(res.status).toBe(302);
-    const code = new URL(res.headers.get("location")!).searchParams.get("code")!;
+    // REDIRECT_URI ("https://app.example/cb") is cross-origin from the
+    // issuer, so the consent-approve success 30x is now bridged (P0 REVENUE
+    // fix — form-action 'self' blocks a form POST's cross-origin redirect in
+    // Chrome; see oauth-shared.ts isCrossOrigin / ui.ts renderRedirectBridge).
+    expect(res.status).toBe(200);
+    const code = new URL(bridgeTarget(await res.text())!).searchParams.get("code")!;
     const tokenRes = await handleToken(
       env.DB,
       tokenReq({ grant_type: "authorization_code", code, client_id: clientId, redirect_uri: REDIRECT_URI, code_verifier: verifier }),
@@ -599,8 +604,9 @@ describe("aud narrowing", () => {
       ),
       deps(),
     );
-    expect(res.status).toBe(302);
-    const code = new URL(res.headers.get("location")!).searchParams.get("code")!;
+    // Cross-origin REDIRECT_URI — bridged, same as the test above.
+    expect(res.status).toBe(200);
+    const code = new URL(bridgeTarget(await res.text())!).searchParams.get("code")!;
     const tokenRes = await handleToken(
       env.DB,
       tokenReq({ grant_type: "authorization_code", code, client_id: clientId, redirect_uri: REDIRECT_URI, code_verifier: verifier }),
@@ -988,7 +994,7 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     expect(html).toContain(new URL(ISSUER).host);
   });
 
-  test("consent approve → 302 with code; deny → 302 access_denied", async () => {
+  test("consent approve → same-origin bridge carrying the code; deny → bridge carrying access_denied", async () => {
     const { id: userId } = await seedUser();
     await seedVault("default", userId);
     const { clientId } = await seedApprovedClient();
@@ -1002,13 +1008,22 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
       code_challenge: challenge,
       code_challenge_method: "S256",
     };
+    // REDIRECT_URI is cross-origin from the issuer — Chrome's form-action
+    // enforcement (P0 REVENUE fix) means this can no longer be a direct 302:
+    // it's a same-origin bridge page (200) whose script/fallback link carries
+    // the client's redirect_uri, code, and state.
     const approve = await handleAuthorizePost(env.DB, consentReq(base, { sessionId }), deps());
-    expect(approve.status).toBe(302);
-    expect(new URL(approve.headers.get("location")!).searchParams.get("code")).toBeTruthy();
+    expect(approve.status).toBe(200);
+    const approveTarget = bridgeTarget(await approve.text());
+    expect(approveTarget).toBeTruthy();
+    expect(new URL(approveTarget!).origin).toBe(new URL(REDIRECT_URI).origin);
+    expect(new URL(approveTarget!).searchParams.get("code")).toBeTruthy();
 
     const deny = await handleAuthorizePost(env.DB, consentReq(base, { sessionId, decision: "deny" }), deps());
-    expect(deny.status).toBe(302);
-    expect(new URL(deny.headers.get("location")!).searchParams.get("error")).toBe("access_denied");
+    expect(deny.status).toBe(200);
+    const denyTarget = bridgeTarget(await deny.text());
+    expect(denyTarget).toBeTruthy();
+    expect(new URL(denyTarget!).searchParams.get("error")).toBe("access_denied");
   });
 
   test("prior grant skips consent (302 with code directly on GET)", async () => {
@@ -1152,8 +1167,10 @@ describe("E2E through the router: DCR → authorize → consent → token", () =
       }),
       env,
     );
-    expect(consent.status).toBe(302);
-    const code = new URL(consent.headers.get("location")!).searchParams.get("code")!;
+    // REDIRECT_URI is cross-origin — the consent-approve success bridges
+    // (P0 REVENUE fix) rather than a direct 302.
+    expect(consent.status).toBe(200);
+    const code = new URL(bridgeTarget(await consent.text())!).searchParams.get("code")!;
     // 3. Token.
     const tokenRes = await app.fetch(
       new Request(`${ISSUER}/oauth/token`, {

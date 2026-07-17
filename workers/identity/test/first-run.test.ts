@@ -18,7 +18,7 @@
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import app from "../src/index.ts";
-import { CSRF, ISSUER, seedSession, seedUser, seedVault } from "./helpers.ts";
+import { CSRF, ISSUER, bridgeTarget, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 // The app deep-link origin — the wrangler-configured APP_ORIGIN (#116).
 const APP_ORIGIN = "https://app.parachute.computer";
@@ -143,7 +143,7 @@ describe("first-run create — lands in Notes, tolerant of legacy fields", () =>
     return `${APP_ORIGIN}/?add=${encodeURIComponent(`https://u.parachute.computer/vault/${vaultName}`)}`;
   }
 
-  test("a fresh create redirects (303) straight to the new vault's Notes UI", async () => {
+  test("a fresh create lands straight on the new vault's Notes UI (bridged past a cross-origin form-POST redirect)", async () => {
     const { id: userId } = await seedUser("landing@example.com");
     const sessionId = await seedSession(userId);
     stubCapPush("landing-box");
@@ -151,8 +151,11 @@ describe("first-run create — lands in Notes, tolerant of legacy fields", () =>
       post("/console/vaults", { __csrf: CSRF, name: "landing-box" }, sessionCookie(sessionId)),
       env,
     );
-    expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(notesDeepLink("landing-box"));
+    // APP_ORIGIN is cross-origin from the issuer, so the no-JS 303 bridges
+    // (P0 REVENUE fix, console.ts appDeepLinkRedirect) instead of a direct
+    // redirect — Chrome's form-action enforcement would otherwise strand it.
+    expect(res.status).toBe(200);
+    expect(bridgeTarget(await res.text())).toBe(notesDeepLink("landing-box"));
   });
 
   test("legacy notes_app + first_note fields are ignored — not stored, no note written, still lands in Notes", async () => {
@@ -172,8 +175,8 @@ describe("first-run create — lands in Notes, tolerant of legacy fields", () =>
       ),
       env,
     );
-    expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(notesDeepLink("legacy-box"));
+    expect(res.status).toBe(200);
+    expect(bridgeTarget(await res.text())).toBe(notesDeepLink("legacy-box"));
     expect(await notesAppFor(userId)).toBeNull();
     expect(warn.mock.calls.some((c) => String(c[0]).includes("first_note_write_failed"))).toBe(false);
     warn.mockRestore();
@@ -323,13 +326,14 @@ describe("create-vault — the progressive-enhancement JSON variant", () => {
     expect(row).toBeNull();
   });
 
-  test("the classic (no header) form POST stays byte-identical: a 303, not JSON", async () => {
+  test("the classic (no header) form POST stays byte-identical: the bridge page, not JSON", async () => {
     const { id: userId } = await seedUser("moment-classic@example.com");
     const sessionId = await seedSession(userId);
     stubCapPush("classic-box");
     const res = await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "classic-box" }, sessionCookie(sessionId)), env);
-    expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe(notesDeepLink("classic-box"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(bridgeTarget(await res.text())).toBe(notesDeepLink("classic-box"));
   });
 });
 
@@ -342,14 +346,16 @@ describe("getting-started checklist (POST /console/checklist)", () => {
     return { userId, sessionId: await seedSession(userId) };
   }
 
-  test("a door marks its item done and 302s to the notes deep-link", async () => {
+  test("a door marks its item done and bridges to the notes deep-link", async () => {
     const { userId, sessionId } = await userWithVault("doors@example.com", "doorvault");
     const res = await app.fetch(
       post("/console/checklist", { __csrf: CSRF, item: "open-notes" }, sessionCookie(sessionId)),
       env,
     );
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe(
+    // The app deep-link is cross-origin from the issuer, so this form-POST
+    // door bridges too (P0 REVENUE fix, console.ts appDeepLinkRedirect).
+    expect(res.status).toBe(200);
+    expect(bridgeTarget(await res.text())).toBe(
       `${APP_ORIGIN}/?add=${encodeURIComponent("https://u.parachute.computer/vault/doorvault")}`,
     );
     expect(await checklistRow(userId, "open-notes")).not.toBeNull();
@@ -369,13 +375,13 @@ describe("getting-started checklist (POST /console/checklist)", () => {
       post("/console/checklist", { __csrf: CSRF, item: "write-note" }, sessionCookie(sessionId)),
       env,
     );
-    expect(write.headers.get("location")).toBe(`${APP_ORIGIN}/?add=${base}&redirect=%2Fnew`);
+    expect(bridgeTarget(await write.text())).toBe(`${APP_ORIGIN}/?add=${base}&redirect=%2Fnew`);
 
     const imp = await app.fetch(
       post("/console/checklist", { __csrf: CSRF, item: "import-notes" }, sessionCookie(sessionId)),
       env,
     );
-    expect(imp.headers.get("location")).toBe(`${APP_ORIGIN}/?add=${base}&redirect=%2Fimport`);
+    expect(bridgeTarget(await imp.text())).toBe(`${APP_ORIGIN}/?add=${base}&redirect=%2Fimport`);
     expect(await checklistRow(userId, "write-note")).not.toBeNull();
     expect(await checklistRow(userId, "import-notes")).not.toBeNull();
   });
