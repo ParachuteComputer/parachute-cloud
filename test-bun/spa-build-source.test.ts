@@ -53,7 +53,7 @@ describe("served SPA source", () => {
     const sourcePin = read("scripts/spa-source.env");
     const script = read("scripts/build-spa.sh");
 
-    expect(sourcePin).toContain('SPA_APP_VERSION="0.20.13"');
+    expect(sourcePin).toContain('SPA_APP_VERSION="0.20.14"');
     expect(sourcePin).toMatch(/SPA_APP_REF="[0-9a-f]{40}"/);
     expect(script).toContain('source "$ROOT/scripts/spa-source.env"');
     expect(script).toContain("SPA_APP_REF");
