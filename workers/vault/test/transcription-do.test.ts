@@ -13,7 +13,7 @@
  * metered), the monthly soft cap, placeholder replacement, duration metering,
  * and `until_transcribed` retention (R2 audio dropped + storage meter freed).
  */
-import { SELF, env, runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { base, freshVault, mintToken, op } from "./helpers.ts";
@@ -168,8 +168,11 @@ async function landing(vault: string): Promise<any> {
 
 describe("voice transcription pipeline (cloud#56)", () => {
   // Scheduling-on-flag is proven by contrast: every transcribe:true test below
-  // lands a transcript (so the alarm WAS armed + ran), while the final
-  // transcribe:false test asserts runDurableObjectAlarm reports nothing to run.
+  // lands a transcript (so the alarm WAS armed + ran for TRANSCRIPTION), while
+  // the final transcribe:false test asserts the attachment never carries
+  // `transcribe_status` at all — a precise, transcription-specific check (an
+  // alarm may still be armed for the embedding drain, C2, independent of
+  // transcription — see that test's note).
 
   it("voice tier: transcribes, replaces the placeholder, meters minutes, drops the spinner", async () => {
     const v = freshVault("tx");
@@ -414,7 +417,7 @@ describe("voice transcription pipeline (cloud#56)", () => {
     expect(att.metadata.raw_transcript).toBe("plain whisper output here");
   });
 
-  it("transcribe:false attachments are plain data — no pending, no alarm", async () => {
+  it("transcribe:false attachments are plain data — never queued for TRANSCRIPTION", async () => {
     const v = freshVault("tx");
     const path = await uploadAudio(v, new Uint8Array([9, 9, 9]));
     const note = (await (await op(v, "/api/notes", {
@@ -428,7 +431,14 @@ describe("voice transcription pipeline (cloud#56)", () => {
       body: JSON.stringify({ path, mimeType: "application/octet-stream" }),
     });
     expect(link.status).toBe(201);
-    // No alarm was armed → runDurableObjectAlarm reports nothing ran.
-    expect(await runDurableObjectAlarm(doStub(v))).toBe(false);
+    const attachment = (await link.json()) as { metadata?: Record<string, unknown> };
+    // No transcribe_status at all — never stamped pending, contrast
+    // setupVoiceNote's transcribe:true assertions elsewhere in this file.
+    // NOTE (C2): this no longer means "no alarm was armed at all" — ANY note
+    // write (this test's own POST /api/notes) now also arms the embedding
+    // drain's alarm (semantic search MVP), independent of transcription; the
+    // transcribe_status check below is the precise, transcription-specific
+    // assertion this test actually cares about.
+    expect(attachment.metadata?.transcribe_status).toBeUndefined();
   });
 });
