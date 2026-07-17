@@ -19,6 +19,9 @@ import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import {
   ACCOUNT_VAULT_TOKEN_TTL_SECONDS,
+  handleAccountHandleCheck,
+  handleAccountHandleClaim,
+  handleAccountHandleGet,
   handleAccountSummary,
   handleAccountVaultCreate,
   handleAccountVaultDelete,
@@ -636,5 +639,223 @@ describe("GET /account/summary", () => {
     expect(body.plan.trial_days_left).toBeLessThanOrEqual(15);
     // With no pending tier chosen, the trial's effective entitlements are its own.
     expect(body.plan.vault_limit).toBe(PLAN_SPECS.trial.vault_count);
+  });
+
+  test("handle is null for an unclaimed account, and the claimed value once set", async () => {
+    const { token } = await seedOwnerWithPlan("summary-handle@example.com");
+    const before = await handleAccountSummary(db(), accountReq("GET", "/account/summary", { token }), accountDeps());
+    expect(((await before.json()) as { handle: string | null }).handle).toBeNull();
+
+    await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { token, body: { handle: "summary-user" } }),
+      accountDeps(),
+    );
+    const after = await handleAccountSummary(db(), accountReq("GET", "/account/summary", { token }), accountDeps());
+    expect(((await after.json()) as { handle: string | null }).handle).toBe("summary-user");
+  });
+});
+
+// --- handles (migration 0022, the GitHub owner-model) ------------------------
+
+describe("GET /account/handle", () => {
+  test("401 without a bearer", async () => {
+    const res = await handleAccountHandleGet(db(), accountReq("GET", "/account/handle"), accountDeps());
+    expect(res.status).toBe(401);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+  });
+
+  test("null handle + an email-derived suggestion for a fresh account", async () => {
+    const { token } = await seedOwnerWithPlan("aaron@handles-fresh.example");
+    const res = await handleAccountHandleGet(db(), accountReq("GET", "/account/handle", { token }), accountDeps());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { handle: string | null; suggested: string };
+    expect(body.handle).toBeNull();
+    expect(body.suggested).toBe("aaron");
+  });
+
+  test("a read token satisfies the GET (no admin required)", async () => {
+    const { id } = await seedUser("handle-read@example.com");
+    const readToken = await mintAccountToken(id, "read");
+    const res = await handleAccountHandleGet(db(), accountReq("GET", "/account/handle", { token: readToken }), accountDeps());
+    expect(res.status).toBe(200);
+  });
+
+  test("reports the claimed handle once set", async () => {
+    const { token } = await seedOwnerWithPlan("handle-get-claimed@example.com");
+    await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { token, body: { handle: "getclaimed" } }),
+      accountDeps(),
+    );
+    const res = await handleAccountHandleGet(db(), accountReq("GET", "/account/handle", { token }), accountDeps());
+    expect(((await res.json()) as { handle: string | null }).handle).toBe("getclaimed");
+  });
+});
+
+describe("GET /account/handle/check", () => {
+  test("401 without a bearer (availability is gated behind the account bearer)", async () => {
+    const res = await handleAccountHandleCheck(db(), accountReq("GET", "/account/handle/check?handle=free"), accountDeps());
+    expect(res.status).toBe(401);
+  });
+
+  test("available:true for a free, valid, non-reserved handle", async () => {
+    const { token } = await seedOwnerWithPlan("check-free@example.com");
+    const res = await handleAccountHandleCheck(
+      db(),
+      accountReq("GET", "/account/handle/check?handle=totally-open", { token }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ available: true });
+  });
+
+  test("available:false reason=invalid for a bad shape", async () => {
+    const { token } = await seedOwnerWithPlan("check-invalid@example.com");
+    const res = await handleAccountHandleCheck(
+      db(),
+      accountReq("GET", "/account/handle/check?handle=-bad-", { token }),
+      accountDeps(),
+    );
+    expect(await res.json()).toEqual({ available: false, reason: "invalid" });
+  });
+
+  test("available:false reason=reserved for a reserved word", async () => {
+    const { token } = await seedOwnerWithPlan("check-reserved@example.com");
+    const res = await handleAccountHandleCheck(
+      db(),
+      accountReq("GET", "/account/handle/check?handle=admin", { token }),
+      accountDeps(),
+    );
+    expect(await res.json()).toEqual({ available: false, reason: "reserved" });
+  });
+
+  test("available:false reason=taken once the handle is claimed", async () => {
+    const owner = await seedOwnerWithPlan("check-taken-owner@example.com");
+    await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { token: owner.token, body: { handle: "spoken-for" } }),
+      accountDeps(),
+    );
+    const asker = await seedOwnerWithPlan("check-taken-asker@example.com");
+    const res = await handleAccountHandleCheck(
+      db(),
+      accountReq("GET", "/account/handle/check?handle=spoken-for", { token: asker.token }),
+      accountDeps(),
+    );
+    expect(await res.json()).toEqual({ available: false, reason: "taken" });
+  });
+});
+
+describe("POST /account/handle — claim", () => {
+  test("401 without a bearer", async () => {
+    const res = await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { body: { handle: "x" } }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("403 for a read token — claiming needs admin", async () => {
+    const { id } = await seedUser("claim-read@example.com");
+    const readToken = await mintAccountToken(id, "read");
+    const res = await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { token: readToken, body: { handle: "nope-read" } }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("insufficient_scope");
+  });
+
+  test("200 claims the handle and persists it under the token's account", async () => {
+    const { userId, token } = await seedOwnerWithPlan("claim-ok@example.com");
+    const res = await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { token, body: { handle: "Claim-OK" } }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(200);
+    // Canonicalized (lowercased) on the wire and in the DB.
+    expect(((await res.json()) as { handle: string }).handle).toBe("claim-ok");
+    const row = await env.DB.prepare(
+      "SELECT o.handle FROM owners o JOIN users u ON u.owner_id = o.owner_id WHERE u.id = ?",
+    )
+      .bind(userId)
+      .first<{ handle: string }>();
+    expect(row?.handle).toBe("claim-ok");
+  });
+
+  test("400 invalid_handle for a bad shape", async () => {
+    const { token } = await seedOwnerWithPlan("claim-invalid@example.com");
+    const res = await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { token, body: { handle: "ab" } }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_handle");
+  });
+
+  test("400 reserved for a reserved word", async () => {
+    const { token } = await seedOwnerWithPlan("claim-reserved@example.com");
+    const res = await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { token, body: { handle: "api" } }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("reserved");
+  });
+
+  test("409 handle_taken when another account already holds it", async () => {
+    const a = await seedOwnerWithPlan("claim-taken-a@example.com");
+    await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { token: a.token, body: { handle: "contested" } }),
+      accountDeps(),
+    );
+    const b = await seedOwnerWithPlan("claim-taken-b@example.com");
+    const res = await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { token: b.token, body: { handle: "contested" } }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe("handle_taken");
+  });
+
+  test("409 handle_already_set on a second claim by the same account (claim-once)", async () => {
+    const { token } = await seedOwnerWithPlan("claim-once@example.com");
+    await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { token, body: { handle: "first-one" } }),
+      accountDeps(),
+    );
+    const res = await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", { token, body: { handle: "second-one" } }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe("handle_already_set");
+  });
+
+  test("TENANT — the handle is claimed under the TOKEN's account, ignoring any body owner field", async () => {
+    const a = await seedOwnerWithPlan("claim-tenant-a@example.com");
+    const b = await seedOwnerWithPlan("claim-tenant-b@example.com");
+    await handleAccountHandleClaim(
+      db(),
+      accountReq("POST", "/account/handle", {
+        token: a.token,
+        body: { handle: "belongs-to-a", owner_user_id: b.userId },
+      }),
+      accountDeps(),
+    );
+    const row = await env.DB.prepare("SELECT u.id AS uid FROM owners o JOIN users u ON u.owner_id = o.owner_id WHERE o.handle = 'belongs-to-a'")
+      .first<{ uid: string }>();
+    expect(row?.uid).toBe(a.userId);
+    expect(row?.uid).not.toBe(b.userId);
   });
 });
