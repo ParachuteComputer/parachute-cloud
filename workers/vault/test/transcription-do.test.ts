@@ -624,6 +624,33 @@ describe("per-segment transcript slots (voice W2)", () => {
     expect(att.metadata.segment_index).toBeUndefined();
   });
 
+  it("malformed segment_index at link time DEGRADES TO BARE — the attach route drops it", async () => {
+    const v = freshVault("seg");
+    await pushEntitlement(v, true, 600);
+    // A bare pending marker (not a parted one) — a malformed segment_index must
+    // resolve through the bare path, never fabricate a `(part 3)` slot.
+    const path = await uploadAudio(v, new Uint8Array([1, 2, 3]));
+    const note = (await (await op(v, "/api/notes", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: "# memo\n\n_Transcript pending._\n\n![[memo.webm]]\n" }),
+    })).json()) as { id: string };
+    const link = await op(v, `/api/notes/${note.id}/attachments`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path, mimeType: "audio/webm", transcribe: true, segment_index: "2" }), // string → malformed
+    });
+    expect(link.status).toBe(201);
+    // The malformed value was dropped — the stored attachment carries none.
+    expect(((await link.json()) as { metadata?: Record<string, unknown> }).metadata?.segment_index).toBeUndefined();
+
+    await runAlarmWith(v, stubProvider(() => ({ text: "bare not parted", audioSeconds: 20 })));
+    const body = await noteBody(v, note.id);
+    expect(body).toContain("bare not parted");
+    expect(body).not.toContain("(part "); // never fabricated a part number
+    expect(body).not.toContain("_Transcript pending._");
+  });
+
   it("limit-terminal on ONE segment writes the un-parted limit marker into that slot only", async () => {
     const v = freshVault("seg");
     await pushEntitlement(v, true, 1); // 1-minute budget

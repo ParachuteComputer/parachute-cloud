@@ -212,9 +212,28 @@ describe("per-segment slots (voice W2 — byte-exact cross-door markers)", () =>
     expect(segmentPart({ segment_index: 2 })).toBe(3);
     expect(segmentPart({})).toBeUndefined();
     expect(segmentPart(undefined)).toBeUndefined();
+  });
+
+  it("malformed segment_index DEGRADES TO BARE — never fabricates a part (cross-door contract)", () => {
+    // Byte-identical acceptance predicate to the bun door's `segmentIndexOf`:
+    // ONLY a real non-negative integer opts into parted markers. Every other
+    // shape falls back to `undefined` → the bare `_Transcript pending._` path,
+    // so a malformed client can never coerce a wrong part number.
     expect(segmentPart({ segment_index: -1 })).toBeUndefined();
     expect(segmentPart({ segment_index: 1.5 })).toBeUndefined();
-    expect(segmentPart({ segment_index: "2" })).toBeUndefined();
+    expect(segmentPart({ segment_index: Number.NaN })).toBeUndefined();
+    expect(segmentPart({ segment_index: Number.POSITIVE_INFINITY })).toBeUndefined();
+    expect(segmentPart({ segment_index: "2" })).toBeUndefined(); // string, not number
+    expect(segmentPart({ segment_index: null })).toBeUndefined();
+    expect(segmentPart({ segment_index: true })).toBeUndefined();
+    // End-to-end: a malformed index routes bodyWithTranscript through the BARE
+    // success target (replaces `_Transcript pending._`), never a `(part …)` slot.
+    const bareBody = "# memo\n\n_Transcript pending._\n\n![[memo.webm]]\n";
+    const part = segmentPart({ segment_index: "2" });
+    expect(part).toBeUndefined();
+    const after = bodyWithTranscript(bareBody, "words", part);
+    expect(after).toBe("# memo\n\nwords\n\n![[memo.webm]]\n");
+    expect(after).not.toContain("part");
   });
 
   it("the exact parted marker strings (the contract the bun vault ships identically)", () => {
