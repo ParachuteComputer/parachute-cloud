@@ -16,7 +16,7 @@
 import { SELF, env, runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
-import { base, freshVault, mintToken, op } from "./helpers.ts";
+import { base, freshVault, mintToken, op, OP } from "./helpers.ts";
 import { r2Key } from "../src/rest/notes.ts";
 import type { TranscriptionProvider, TranscribeInput, TranscribeResult } from "@openparachute/core/src/transcription/provider.ts";
 import { TranscriptionError } from "@openparachute/core/src/transcription/provider.ts";
@@ -466,5 +466,293 @@ describe("voice transcription pipeline (cloud#56)", () => {
     // transcribe_status check below is the precise, transcription-specific
     // assertion this test actually cares about.
     expect(attachment.metadata?.transcribe_status).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-segment slots + retry endpoint (voice W2)
+// ---------------------------------------------------------------------------
+
+/** A multi-part voice-memo note: ONE note carrying a `_Transcript pending
+ *  (part N)._` marker per segment, plus one audio attachment per segment linked
+ *  with `segment_index` (0-based) + distinct audio bytes (byte = N, so a
+ *  byte-keyed stub can return the right transcript for whichever part wakes
+ *  first — race-robust regardless of completion order). */
+async function setupSegmentedVoiceNote(
+  vault: string,
+  count = 3,
+): Promise<{ noteId: string; attIds: string[] }> {
+  const markers = Array.from({ length: count }, (_, i) => `_Transcript pending (part ${i + 1})._`);
+  const content = `# 🎙️ Voice memo\n\n${markers.join("\n\n")}\n\n![[memo.webm]]\n`;
+  const noteRes = await op(vault, "/api/notes", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  const note = (await noteRes.json()) as { id: string };
+  const attIds: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const path = await uploadAudio(vault, new Uint8Array([i + 1])); // byte = part number N
+    const link = await op(vault, `/api/notes/${note.id}/attachments`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path, mimeType: "audio/webm", transcribe: true, segment_index: i }),
+    });
+    if (link.status !== 201) throw new Error(`segment ${i} link → ${link.status}: ${await link.text()}`);
+    attIds.push(((await link.json()) as { id: string }).id);
+  }
+  return { noteId: note.id, attIds };
+}
+
+/** A byte-keyed stub: returns "transcript for part <firstByte>" — so whichever
+ *  segment the alarm happens to pick resolves to ITS OWN transcript (the byte we
+ *  uploaded equals the part number N), making slot-targeting assertions
+ *  independent of completion order + any opportunistic-alarm race. */
+const bytePartStub = stubProvider((input: TranscribeInput) => ({
+  text: `transcript for part ${input.audio[0] ?? 0}`,
+  audioSeconds: 60,
+}));
+
+/** Push a pending attachment's backoff into the future so the next alarm skips
+ *  it (only the un-backed-off segment is "due"), giving deterministic control
+ *  over completion ORDER. */
+async function setBackoffFuture(vault: string, attId: string): Promise<void> {
+  await runInDurableObject<DurableObject, void>(doStub(vault), async (inst: any) => {
+    const att = await inst.store.getAttachment(attId);
+    const meta = { ...(att.metadata ?? {}) };
+    meta.transcribe_backoff_until = new Date(Date.now() + 120_000).toISOString();
+    await inst.store.setAttachmentMetadata(attId, meta);
+  });
+}
+
+/**
+ * Put a linked memo into a `failed` TERMINAL state exactly as the pipeline's
+ * own `markTerminal` + `patchNoteBody` do — attachment `failed` (+ attempts
+ * bookkeeping, optional non-retriable `errorCode`), the note body flipped to
+ * the unavailable marker, `transcribe_stub` cleared. Doing it directly (rather
+ * than through a throwing stub) leaves NO test provider on the warm instance,
+ * so an opportunistic alarm wake can't re-run + re-dirty the row mid-test.
+ */
+async function forceFailedTerminal(
+  vault: string,
+  noteId: string,
+  attId: string,
+  opts: { errorCode?: string } = {},
+): Promise<void> {
+  await runInDurableObject<DurableObject, void>(doStub(vault), async (inst: any) => {
+    const att = await inst.store.getAttachment(attId);
+    await inst.store.setAttachmentMetadata(attId, {
+      ...(att.metadata ?? {}),
+      transcribe_status: "failed",
+      transcribe_attempts: 3,
+      transcribe_error: "transient upstream 503",
+      ...(opts.errorCode ? { transcribe_error_code: opts.errorCode } : {}),
+    });
+    const note = await inst.store.getNote(noteId);
+    const meta = { ...(note.metadata ?? {}) };
+    delete meta.transcribe_stub;
+    await inst.store.updateNote(noteId, {
+      content: note.content.replace("_Transcript pending._", "_Transcription unavailable._"),
+      metadata: meta,
+      skipUpdatedAt: true,
+    });
+  });
+}
+
+/** POST the retry endpoint. `token` overrides the operator bearer (for the
+ *  read-scope 403 test). */
+function retryTranscription(vault: string, noteId: string, token?: string): Promise<Response> {
+  return SELF.fetch(`${base(vault)}/api/notes/${noteId}/retry-transcription`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token ?? OP}` },
+  });
+}
+
+describe("per-segment transcript slots (voice W2)", () => {
+  it("three-part OUT-OF-ORDER completion — each transcript lands in its own slot", async () => {
+    const v = freshVault("seg");
+    await pushEntitlement(v, true, 600);
+    const { noteId, attIds } = await setupSegmentedVoiceNote(v, 3);
+    const [p1, p2, p3] = attIds as [string, string, string];
+
+    // Force completion order [part3, part1, part2] via backoff: only the
+    // un-backed-off segment is due on each wake.
+    await setBackoffFuture(v, p1);
+    await setBackoffFuture(v, p2);
+    await runAlarmWith(v, bytePartStub); // part 3
+    let body = await noteBody(v, noteId);
+    expect(body).toContain("transcript for part 3");
+    expect(body).toContain("_Transcript pending (part 1)._"); // others untouched
+    expect(body).toContain("_Transcript pending (part 2)._");
+
+    await clearBackoff(v, p1);
+    await runAlarmWith(v, bytePartStub); // part 1 (p2 still backed off)
+    body = await noteBody(v, noteId);
+    expect(body).toContain("transcript for part 1");
+    expect(body).toContain("_Transcript pending (part 2)._");
+
+    await clearBackoff(v, p2);
+    await runAlarmWith(v, bytePartStub); // part 2 (last)
+    body = await noteBody(v, noteId);
+
+    // Every slot resolved to ITS OWN transcript; no pending markers linger.
+    expect(body).toContain("transcript for part 1");
+    expect(body).toContain("transcript for part 2");
+    expect(body).toContain("transcript for part 3");
+    expect(body).not.toContain("_Transcript pending");
+    // All three attachments done.
+    const atts = await attachments(v, noteId);
+    expect(atts.map((a) => a.metadata.transcribe_status).sort()).toEqual(["done", "done", "done"]);
+    // The stub cleared only after the LAST segment resolved (multi-part stub
+    // persistence): the note is no longer a transcribe stub.
+    const nMeta = await noteMetaViaStore(v, noteId);
+    expect(nMeta.transcribe_stub).toBeUndefined();
+  });
+
+  it("un-segmented regression: a plain memo keeps the BARE markers, no (part N)", async () => {
+    const v = freshVault("seg");
+    await pushEntitlement(v, true, 600);
+    const { noteId } = await setupVoiceNote(v); // no segment_index
+
+    await runAlarmWith(v, stubProvider(() => ({ text: "bare transcript", audioSeconds: 30 })));
+
+    const body = await noteBody(v, noteId);
+    expect(body).toContain("bare transcript");
+    expect(body).not.toContain("(part "); // never parts a single-segment memo
+    expect(body).not.toContain("_Transcript pending._");
+    const att = (await attachments(v, noteId))[0];
+    expect(att.metadata.segment_index).toBeUndefined();
+  });
+
+  it("malformed segment_index at link time DEGRADES TO BARE — the attach route drops it", async () => {
+    const v = freshVault("seg");
+    await pushEntitlement(v, true, 600);
+    // A bare pending marker (not a parted one) — a malformed segment_index must
+    // resolve through the bare path, never fabricate a `(part 3)` slot.
+    const path = await uploadAudio(v, new Uint8Array([1, 2, 3]));
+    const note = (await (await op(v, "/api/notes", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: "# memo\n\n_Transcript pending._\n\n![[memo.webm]]\n" }),
+    })).json()) as { id: string };
+    const link = await op(v, `/api/notes/${note.id}/attachments`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path, mimeType: "audio/webm", transcribe: true, segment_index: "2" }), // string → malformed
+    });
+    expect(link.status).toBe(201);
+    // The malformed value was dropped — the stored attachment carries none.
+    expect(((await link.json()) as { metadata?: Record<string, unknown> }).metadata?.segment_index).toBeUndefined();
+
+    await runAlarmWith(v, stubProvider(() => ({ text: "bare not parted", audioSeconds: 20 })));
+    const body = await noteBody(v, note.id);
+    expect(body).toContain("bare not parted");
+    expect(body).not.toContain("(part "); // never fabricated a part number
+    expect(body).not.toContain("_Transcript pending._");
+  });
+
+  it("limit-terminal on ONE segment writes the un-parted limit marker into that slot only", async () => {
+    const v = freshVault("seg");
+    await pushEntitlement(v, true, 1); // 1-minute budget
+    const { noteId, attIds } = await setupSegmentedVoiceNote(v, 3);
+    const [, p2, p3] = attIds as [string, string, string];
+
+    // Part 1 succeeds (60s = 1 min) → pushes the meter to the cap.
+    await setBackoffFuture(v, p2);
+    await setBackoffFuture(v, p3);
+    await runAlarmWith(v, bytePartStub);
+    expect(await noteBody(v, noteId)).toContain("transcript for part 1");
+
+    // Part 2 is now over budget → the UN-PARTED limit marker lands in slot 2,
+    // and slot 3's pending marker is undisturbed.
+    await clearBackoff(v, p2);
+    await runAlarmWith(v, bytePartStub);
+    const body = await noteBody(v, noteId);
+    expect(body).toContain("transcript for part 1");
+    expect(body).toContain("Monthly voice limit reached");
+    expect(body).not.toContain("_Transcript pending (part 2)._"); // slot 2 → limit
+    expect(body).toContain("_Transcript pending (part 3)._"); // slot 3 untouched
+  });
+});
+
+describe("retry-transcription endpoint (voice W2)", () => {
+  it("retries a failed attachment → pending + marker restored + succeeds on the next wake", async () => {
+    const v = freshVault("retry");
+    await pushEntitlement(v, true, 600);
+    const { noteId } = await setupVoiceNote(v);
+    const attId = (await attachments(v, noteId))[0].id;
+
+    // A RETRIABLE terminal (exhausted attempts, no error_code) — the class a
+    // retry SHOULD recover. Set up directly so no throwing stub lingers.
+    await forceFailedTerminal(v, noteId, attId);
+    let att = (await attachments(v, noteId))[0];
+    expect(att.metadata.transcribe_status).toBe("failed");
+    expect(att.metadata.transcribe_error_code).toBeUndefined(); // retriable class
+    expect(await noteBody(v, noteId)).toContain("_Transcription unavailable._");
+
+    // Retry: 202 + wire-compatible shape, attachment back to pending, spinner
+    // restored, alarm armed.
+    const res = await retryTranscription(v, noteId);
+    expect(res.status).toBe(202);
+    const payload = (await res.json()) as Record<string, unknown>;
+    expect(payload.status).toBe("queued");
+    expect(payload.attachment_id).toBe(attId);
+    expect(payload.transcript_note_id).toBe(noteId);
+    expect(payload.retried).toBe(1);
+    att = (await attachments(v, noteId))[0];
+    expect(att.metadata.transcribe_status).toBe("pending");
+    expect(att.metadata.transcribe_attempts).toBeUndefined(); // bookkeeping cleared
+    expect(await noteBody(v, noteId)).toContain("_Transcript pending._"); // spinner restored
+
+    // Next wake succeeds — the transcript lands where the marker was.
+    await runAlarmWith(v, stubProvider(() => ({ text: "recovered on retry", audioSeconds: 30 })));
+    const body = await noteBody(v, noteId);
+    expect(body).toContain("recovered on retry");
+    expect(body).not.toContain("_Transcript pending._");
+    expect(body).not.toContain("_Transcription unavailable._");
+  });
+
+  it("respects a non-retriable size terminal — audio_too_large stays terminal on retry", async () => {
+    const v = freshVault("retry");
+    await pushEntitlement(v, true, 600);
+    const { noteId, audioPath } = await setupVoiceNote(v);
+
+    // Swap the R2 object for one just over the ceiling → HEAD-gate terminal with
+    // the audio_too_large code (a retry can't shrink the file).
+    await env.ATTACHMENTS.put(r2Key(v, audioPath), new Uint8Array(MAX_TRANSCRIBE_BYTES + 1));
+    await runAlarmWith(v, stubProvider(() => ({ text: "never", audioSeconds: 1 })));
+    let att = (await attachments(v, noteId))[0];
+    expect(att.metadata.transcribe_status).toBe("failed");
+    expect(att.metadata.transcribe_error_code).toBe("audio_too_large");
+
+    // Retry refuses (nothing retriable) and leaves the attachment terminal.
+    const res = await retryTranscription(v, noteId);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as Record<string, unknown>).error).toBe("no_failed_attachment");
+    att = (await attachments(v, noteId))[0];
+    expect(att.metadata.transcribe_status).toBe("failed");
+  });
+
+  it("refuses honestly when nothing is failed", async () => {
+    const v = freshVault("retry");
+    await pushEntitlement(v, true, 600);
+    const { noteId } = await setupVoiceNote(v);
+    // Resolve it successfully first.
+    await runAlarmWith(v, stubProvider(() => ({ text: "all good", audioSeconds: 20 })));
+    expect(await noteBody(v, noteId)).toContain("all good");
+
+    const res = await retryTranscription(v, noteId);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as Record<string, unknown>).error).toBe("no_failed_attachment");
+  });
+
+  it("enforces write scope — a read token gets 403", async () => {
+    const v = freshVault("retry");
+    await pushEntitlement(v, true, 600);
+    const { noteId } = await setupVoiceNote(v);
+    const readToken = await mintToken({ vault: v, scopes: `vault:${v}:read`, vaultScope: [v] });
+
+    const res = await retryTranscription(v, noteId, readToken);
+    expect(res.status).toBe(403);
   });
 });

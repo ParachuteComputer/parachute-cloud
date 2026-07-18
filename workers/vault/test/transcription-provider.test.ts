@@ -17,6 +17,10 @@ import {
 import {
   bodyWithTranscript,
   bodyWithFailureMarker,
+  bodyWithPendingRestored,
+  segmentPart,
+  pendingMarker,
+  unavailableMarker,
   TRANSCRIPT_UNAVAILABLE,
   TRANSCRIPT_LIMIT_REACHED,
 } from "../src/transcription/pipeline.ts";
@@ -195,5 +199,130 @@ describe("pipeline body transforms (never destroy content)", () => {
     expect(bodyWithFailureMarker("edited body", TRANSCRIPT_LIMIT_REACHED)).toBe(
       `edited body\n\n${TRANSCRIPT_LIMIT_REACHED}`,
     );
+  });
+});
+
+describe("per-segment slots (voice W2 — byte-exact cross-door markers)", () => {
+  // A three-part memo body: one pending marker per segment, N = index + 1.
+  const threePartBody = (p1: string, p2: string, p3: string) =>
+    `# 🎙️ Voice memo\n\n${p1}\n\n${p2}\n\n${p3}\n\n![[memo.webm]]\n`;
+
+  it("segmentPart maps a valid segment_index to N = index + 1, else undefined", () => {
+    expect(segmentPart({ segment_index: 0 })).toBe(1);
+    expect(segmentPart({ segment_index: 2 })).toBe(3);
+    expect(segmentPart({})).toBeUndefined();
+    expect(segmentPart(undefined)).toBeUndefined();
+  });
+
+  it("malformed segment_index DEGRADES TO BARE — never fabricates a part (cross-door contract)", () => {
+    // Byte-identical acceptance predicate to the bun door's `segmentIndexOf`:
+    // ONLY a real non-negative integer opts into parted markers. Every other
+    // shape falls back to `undefined` → the bare `_Transcript pending._` path,
+    // so a malformed client can never coerce a wrong part number.
+    expect(segmentPart({ segment_index: -1 })).toBeUndefined();
+    expect(segmentPart({ segment_index: 1.5 })).toBeUndefined();
+    expect(segmentPart({ segment_index: Number.NaN })).toBeUndefined();
+    expect(segmentPart({ segment_index: Number.POSITIVE_INFINITY })).toBeUndefined();
+    expect(segmentPart({ segment_index: "2" })).toBeUndefined(); // string, not number
+    expect(segmentPart({ segment_index: null })).toBeUndefined();
+    expect(segmentPart({ segment_index: true })).toBeUndefined();
+    // End-to-end: a malformed index routes bodyWithTranscript through the BARE
+    // success target (replaces `_Transcript pending._`), never a `(part …)` slot.
+    const bareBody = "# memo\n\n_Transcript pending._\n\n![[memo.webm]]\n";
+    const part = segmentPart({ segment_index: "2" });
+    expect(part).toBeUndefined();
+    const after = bodyWithTranscript(bareBody, "words", part);
+    expect(after).toBe("# memo\n\nwords\n\n![[memo.webm]]\n");
+    expect(after).not.toContain("part");
+  });
+
+  it("the exact parted marker strings (the contract the bun vault ships identically)", () => {
+    expect(pendingMarker(1)).toBe("_Transcript pending (part 1)._");
+    expect(pendingMarker(3)).toBe("_Transcript pending (part 3)._");
+    expect(unavailableMarker(2)).toBe("_Transcription unavailable (part 2)._");
+    // Un-parted (bare) fallbacks are byte-identical to pre-W2.
+    expect(pendingMarker()).toBe("_Transcript pending._");
+    expect(unavailableMarker()).toBe(TRANSCRIPT_UNAVAILABLE);
+  });
+
+  it("a segment success replaces ONLY its own part slot, leaving the others", () => {
+    const body = threePartBody(
+      "_Transcript pending (part 1)._",
+      "_Transcript pending (part 2)._",
+      "_Transcript pending (part 3)._",
+    );
+    const after = bodyWithTranscript(body, "hello from part two", 2);
+    expect(after).toBe(
+      threePartBody("_Transcript pending (part 1)._", "hello from part two", "_Transcript pending (part 3)._"),
+    );
+  });
+
+  it("part 1 vs part 12 — the number is anchored, no false slot match", () => {
+    const body = "_Transcript pending (part 1)._ and _Transcript pending (part 12)._";
+    // Replacing part 1 must not touch part 12's marker.
+    expect(bodyWithTranscript(body, "ONE", 1)).toBe("ONE and _Transcript pending (part 12)._");
+  });
+
+  it("a parted failure marker replaces only its own pending slot", () => {
+    const body = threePartBody(
+      "_Transcript pending (part 1)._",
+      "_Transcript pending (part 2)._",
+      "_Transcript pending (part 3)._",
+    );
+    const after = bodyWithFailureMarker(body, unavailableMarker(2), 2);
+    expect(after).toBe(
+      threePartBody(
+        "_Transcript pending (part 1)._",
+        "_Transcription unavailable (part 2)._",
+        "_Transcript pending (part 3)._",
+      ),
+    );
+  });
+
+  it("limit-terminal on a segment writes the UN-PARTED limit marker into that slot only", () => {
+    const body = threePartBody(
+      "_Transcript pending (part 1)._",
+      "_Transcript pending (part 2)._",
+      "_Transcript pending (part 3)._",
+    );
+    const after = bodyWithFailureMarker(body, TRANSCRIPT_LIMIT_REACHED, 2);
+    expect(after).toBe(
+      threePartBody("_Transcript pending (part 1)._", TRANSCRIPT_LIMIT_REACHED, "_Transcript pending (part 3)._"),
+    );
+  });
+
+  it("a retried success replaces a prior parted unavailable marker in its slot", () => {
+    const body = threePartBody(
+      "already part one text",
+      "_Transcription unavailable (part 2)._",
+      "_Transcript pending (part 3)._",
+    );
+    expect(bodyWithTranscript(body, "recovered part two", 2)).toBe(
+      threePartBody("already part one text", "recovered part two", "_Transcript pending (part 3)._"),
+    );
+  });
+
+  it("bodyWithPendingRestored restores a part's pending marker over its unavailable marker", () => {
+    const body = threePartBody(
+      "_Transcript pending (part 1)._",
+      "_Transcription unavailable (part 2)._",
+      "done part three",
+    );
+    expect(bodyWithPendingRestored(body, 2)).toBe(
+      threePartBody("_Transcript pending (part 1)._", "_Transcript pending (part 2)._", "done part three"),
+    );
+  });
+
+  it("bodyWithPendingRestored (bare) restores the pending marker over unavailable OR limit", () => {
+    const memo = (m: string) => `# 🎙️ Voice memo\n\n${m}\n\n![[memo.webm]]\n`;
+    expect(bodyWithPendingRestored(memo(TRANSCRIPT_UNAVAILABLE))).toBe(memo("_Transcript pending._"));
+    expect(bodyWithPendingRestored(memo(TRANSCRIPT_LIMIT_REACHED))).toBe(memo("_Transcript pending._"));
+    // Nothing terminal to restore → untouched (never inject a spurious spinner).
+    expect(bodyWithPendingRestored(memo("user wrote this"))).toBe(memo("user wrote this"));
+  });
+
+  it("a segment success appends (never destroys) when its slot marker is gone", () => {
+    const body = "# memo\n\nuser rewrote everything\n";
+    expect(bodyWithTranscript(body, "part two text", 2)).toBe(`${body}\n\npart two text`);
   });
 });
