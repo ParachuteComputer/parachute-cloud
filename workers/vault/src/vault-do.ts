@@ -104,10 +104,11 @@ import {
 } from "@openparachute/core/src/transcription/provider.js";
 import { WorkersAiProvider, MAX_TRANSCRIBE_BYTES } from "./transcription/workers-ai.js";
 import {
-  TRANSCRIPT_UNAVAILABLE,
   TRANSCRIPT_LIMIT_REACHED,
   bodyWithFailureMarker,
   bodyWithTranscript,
+  segmentPart,
+  unavailableMarker,
 } from "./transcription/pipeline.js";
 import { cleanupTranscript, type TextGeneratorLike } from "./transcription/cleanup.js";
 import type { EmbeddingProvider, EmbedInput, EmbedResult, ProviderAvailability } from "@openparachute/core/src/embedding/provider.js";
@@ -2385,11 +2386,18 @@ export class VaultDO extends DurableObject {
     const meta: Record<string, unknown> = { ...(fresh.metadata ?? {}) };
     if (meta.transcribe_status !== "pending") return;
     const attempts = typeof meta.transcribe_attempts === "number" ? meta.transcribe_attempts : 0;
+    // Per-segment slot (voice W2): a segmented attachment resolves into its
+    // OWN `(part N)` marker in the shared note body; an un-segmented one keeps
+    // the bare markers byte-identically. `markTerminal` re-derives the same
+    // part from `meta` for the body write — only the "unavailable" marker
+    // STRING is parted here (the limit marker stays un-parted by design).
+    const part = segmentPart(meta);
+    const unavailable = unavailableMarker(part);
 
     // --- Entitlement gate: no plan voice → honest terminal, no eternal spinner.
     const ent = this.config?.transcription;
     if (!ent?.enabled) {
-      await this.markTerminal(vaultName, attachment, meta, "voice not enabled for this plan", TRANSCRIPT_UNAVAILABLE);
+      await this.markTerminal(vaultName, attachment, meta, "voice not enabled for this plan", unavailable);
       return;
     }
     // --- Soft cap: out of monthly minutes → limit marker, never touch text.
@@ -2407,19 +2415,23 @@ export class VaultDO extends DurableObject {
     const key = r2Key(vaultName, attachment.path);
     const head = await this.env.ATTACHMENTS.head(key);
     if (head && head.size > MAX_TRANSCRIBE_BYTES) {
+      // Stamp the non-retriable code so the retry endpoint leaves this one
+      // terminal (a retry can't shrink the file) — same `audio_too_large` code
+      // the provider's own byteLength backstop raises, made explicit for the
+      // HEAD-gate path that never reaches the provider.
       await this.markTerminal(
         vaultName,
         attachment,
-        meta,
+        { ...meta, transcribe_error_code: "audio_too_large" },
         `audio too large (${head.size} bytes)`,
-        TRANSCRIPT_UNAVAILABLE,
+        unavailable,
       );
       return;
     }
     const obj = await this.env.ATTACHMENTS.get(key);
     if (!obj) {
       // Audio gone — nothing to transcribe. Terminal (never loops).
-      await this.markTerminal(vaultName, attachment, meta, "audio file not found", TRANSCRIPT_UNAVAILABLE);
+      await this.markTerminal(vaultName, attachment, meta, "audio file not found", unavailable);
       return;
     }
     const audio = new Uint8Array(await obj.arrayBuffer());
@@ -2448,7 +2460,7 @@ export class VaultDO extends DurableObject {
           attachment,
           { ...meta, transcribe_attempts: nextAttempts, ...(apiErr?.code ? { transcribe_error_code: apiErr.code } : {}) },
           errMsg,
-          TRANSCRIPT_UNAVAILABLE,
+          unavailable,
         );
         return;
       }
@@ -2492,11 +2504,17 @@ export class VaultDO extends DurableObject {
 
     // --- Success. Surgically patch the note (legacy voice-memo stub path): the
     // body shows the cleaned view; the RAW transcript is stamped into the note's
-    // own metadata so it is always recoverable.
+    // own metadata so it is always recoverable. `part` scopes the replace to
+    // this segment's own slot; keep the note's `transcribe_stub` opt-in alive
+    // while OTHER segments of the same note are still pending (else the first
+    // segment to resolve would opt the note out and strand the rest — this
+    // attachment is still `pending` here, so exclude it from the check).
+    const keepStub = await this.otherSegmentsPending(attachment.noteId, attachment.id);
     await this.patchNoteBody(
       attachment.noteId,
-      (content) => bodyWithTranscript(content, display),
+      (content) => bodyWithTranscript(content, display, part),
       (noteMeta) => ({ ...noteMeta, raw_transcript: text }),
+      keepStub,
     );
 
     const doneMeta: Record<string, unknown> = {
@@ -2548,24 +2566,59 @@ export class VaultDO extends DurableObject {
       transcribe_status: "failed",
       transcribe_error: error,
     });
-    await this.patchNoteBody(attachment.noteId, (content) => bodyWithFailureMarker(content, marker));
+    // `part` scopes the body replace to this segment's slot; the marker STRING
+    // is already parted (or the un-parted limit marker) by the caller. Keep the
+    // note's stub alive while sibling segments are still pending (this
+    // attachment is already `failed` above, so it can't count itself).
+    const part = segmentPart(meta);
+    const keepStub = await this.otherSegmentsPending(attachment.noteId, attachment.id);
+    await this.patchNoteBody(
+      attachment.noteId,
+      (content) => bodyWithFailureMarker(content, marker, part),
+      undefined,
+      keepStub,
+    );
     if ((this.config?.audio_retention ?? "keep") === "never") {
       try { await this.deleteObject(vaultName, attachment.path); } catch { /* best-effort */ }
     }
   }
 
   /**
+   * True when the note has an attachment OTHER than `excludeAttachmentId` still
+   * in `transcribe_status: "pending"` — i.e. a multi-part voice memo whose other
+   * segments haven't resolved yet. Used to keep the note's `transcribe_stub`
+   * opt-in alive across segments (see {@link patchNoteBody}). A single-attachment
+   * note always returns false, so its behavior is byte-identical to pre-W2.
+   */
+  private async otherSegmentsPending(noteId: string, excludeAttachmentId: string): Promise<boolean> {
+    try {
+      const atts = await this.store.getAttachments(noteId);
+      return atts.some(
+        (a) =>
+          a.id !== excludeAttachmentId &&
+          (a.metadata as Record<string, unknown> | undefined)?.transcribe_status === "pending",
+      );
+    } catch {
+      return false; // best-effort — a read failure just falls back to clearing the stub
+    }
+  }
+
+  /**
    * Apply a surgical body transform to the voice-memo note, gated on the
    * `transcribe_stub` opt-in (the notes handler stamps it on transcribe:true;
-   * a user edit clearing it opts out of the overwrite) and clearing the stub on
-   * write. Single-writer DO + `if_updated_at` precondition guard a concurrent
-   * user edit: on conflict, re-read once and re-apply against fresh content;
-   * best-effort thereafter (never crash the alarm).
+   * a user edit clearing it opts out of the overwrite). Normally the stub is
+   * CLEARED on write (one-shot) — but `keepStub` leaves it set so a multi-part
+   * memo's remaining segments can still patch their own slots (the flag is only
+   * dropped when the LAST pending segment resolves). Single-writer DO +
+   * `if_updated_at` precondition guard a concurrent user edit: on conflict,
+   * re-read once and re-apply against fresh content; best-effort thereafter
+   * (never crash the alarm).
    */
   private async patchNoteBody(
     noteId: string,
     transform: (content: string) => string,
     metaTransform?: (meta: Record<string, unknown>) => Record<string, unknown>,
+    keepStub = false,
   ): Promise<void> {
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -2575,7 +2628,8 @@ export class VaultDO extends DurableObject {
         if (noteMeta.transcribe_stub !== true) return; // opted out / not a stub note
         const body = transform(note.content);
         const { transcribe_stub: _drop, ...restMeta } = noteMeta;
-        const nextMeta = metaTransform ? metaTransform(restMeta) : restMeta;
+        const base = keepStub ? { ...restMeta, transcribe_stub: true } : restMeta;
+        const nextMeta = metaTransform ? metaTransform(base) : base;
         try {
           await this.store.updateNote(note.id, {
             content: body,

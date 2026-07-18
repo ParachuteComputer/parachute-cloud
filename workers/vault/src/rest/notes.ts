@@ -10,7 +10,7 @@
  *   - transcription: cloud v1 is data-only (design §3.1) — the attachment POST
  *     records the row but does not enqueue a scribe job (no scribe in cloud).
  */
-import type { Store, Note } from "@openparachute/core/src/types.js";
+import type { Store, Note, Attachment } from "@openparachute/core/src/types.js";
 import {
   getNotes,
   getNoteTags,
@@ -58,6 +58,7 @@ import {
   tagScopeForbidden,
 } from "./tag-scope.js";
 import { logStrictBypass } from "./shims.js";
+import { bodyWithPendingRestored, segmentPart } from "../transcription/pipeline.js";
 
 /**
  * Runtime deps a handler needs beyond the store. `deleteObject` is provided by
@@ -139,6 +140,109 @@ async function applySchemaDefaults(store: Store, db: any, noteIds: string[], tag
     mutated.push(noteId);
   }
   return mutated;
+}
+
+/**
+ * Failure classes a retry can never fix — the SAME bytes will always fail
+ * (too large / too long / undecodable). These stay terminal on retry; every
+ * other failed attachment (transient upstream, a since-fixed config, an
+ * over-budget cap that may have since reset) resets to pending.
+ */
+const NON_RETRIABLE_ERROR_CODES = new Set(["audio_too_large", "audio_too_long", "audio_decode_failed"]);
+
+/**
+ * POST /notes/:idOrPath/retry-transcription (voice W2) — reset the note's
+ * FAILED audio attachments back to pending, restore their pending markers, and
+ * re-arm the DO alarm so the pipeline re-runs off the request path. The wire
+ * shape mirrors self-host's `handleRetryTranscription` legacy in-body path
+ * (the only shape cloud has — cloud never materializes sibling transcript
+ * notes): 202 `{ status: "queued", attachment_id, attachment_path,
+ * transcript_note_id, worker }`, plus an additive `retried` count for the
+ * multi-segment case. A note with nothing retriable answers the honest 400
+ * `no_failed_attachment`.
+ *
+ * The pipeline re-applies ALL its gates naturally on the next wake (entitlement,
+ * monthly minutes, size ceiling) — a retry never bypasses them; a still-over-
+ * budget memo just re-terminals with the limit marker.
+ */
+async function handleRetryTranscription(store: Store, note: Note, deps: RestDeps): Promise<Response> {
+  const atts = await store.getAttachments(note.id);
+  const attMeta = (a: Attachment) => (a.metadata as Record<string, unknown> | undefined) ?? {};
+  const failed = atts.filter((a) => attMeta(a).transcribe_status === "failed");
+  const retriable = failed.filter((a) => {
+    const code = attMeta(a).transcribe_error_code;
+    return !(typeof code === "string" && NON_RETRIABLE_ERROR_CODES.has(code));
+  });
+  if (retriable.length === 0) {
+    return json(
+      {
+        error: "no_failed_attachment",
+        error_type: "no_failed_attachment",
+        message:
+          failed.length > 0
+            ? "The note's failed transcription(s) are non-retriable (the audio is too large or long, or could not be decoded)."
+            : "The note has no audio attachment with a failed transcription to retry.",
+      },
+      400,
+    );
+  }
+
+  // Reset each retriable attachment to pending — preserve `transcribe_origin`
+  // and `segment_index`, clear the failure bookkeeping so the pipeline treats
+  // it as fresh (attempts/backoff/error/error_code gone).
+  for (const att of retriable) {
+    const m = { ...attMeta(att) };
+    m.transcribe_status = "pending";
+    m.transcribe_requested_at = new Date().toISOString();
+    m.transcribe_origin = typeof m.transcribe_origin === "string" ? m.transcribe_origin : "legacy";
+    delete m.transcribe_attempts;
+    delete m.transcribe_backoff_until;
+    delete m.transcribe_error;
+    delete m.transcribe_error_code;
+    delete m.transcribe_done_at;
+    await store.setAttachmentMetadata(att.id, m);
+  }
+
+  // Restore each retried part's pending marker in the note body (replacing the
+  // terminal marker it shows) and RE-STAMP `transcribe_stub` — the terminal
+  // write cleared it, and the pipeline's success path gates on it. One read +
+  // all restorations + one write, OC-guarded with a single conflict-retry;
+  // best-effort (the attachments are already reset, so a lost body write only
+  // costs the restored spinner, never the re-transcription itself).
+  const parts = retriable.map((a) => segmentPart(attMeta(a)));
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const fresh = await store.getNote(note.id);
+    if (!fresh) break;
+    const meta = (fresh.metadata as Record<string, unknown> | undefined) ?? {};
+    let content = fresh.content;
+    for (const part of parts) content = bodyWithPendingRestored(content, part);
+    try {
+      await store.updateNote(fresh.id, {
+        content,
+        metadata: { ...meta, transcribe_stub: true },
+        skipUpdatedAt: true,
+        if_updated_at: fresh.updatedAt,
+      });
+      break;
+    } catch (err: any) {
+      if (!err || err.code !== "CONFLICT" || attempt === 1) break; // give up quietly — attachments already reset
+    }
+  }
+
+  await deps.scheduleTranscription();
+
+  const first = retriable[0]!;
+  return json(
+    {
+      status: "queued",
+      attachment_id: first.id,
+      attachment_path: first.path,
+      transcript_note_id: note.id,
+      worker: "alarm-armed",
+      retried: retriable.length,
+    },
+    202,
+  );
 }
 
 export async function handleNotes(
@@ -663,7 +767,7 @@ async function handleNotesInner(
       const note = await resolveNote(store, idOrPath);
       if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
-      const body = await req.json() as { path: string; mimeType: string; transcribe?: boolean };
+      const body = await req.json() as { path: string; mimeType: string; transcribe?: boolean; segment_index?: unknown };
       if (!body.path || !body.mimeType) {
         return json(
           { error: "path and mimeType are required", error_type: "missing_required_field", hint: "pass both `path` and `mimeType`" },
@@ -677,12 +781,22 @@ async function handleNotesInner(
       // entitlement + monthly minutes cap; a vault without voice resolves the
       // note to an honest marker rather than an eternal spinner. Without the
       // flag it's a plain data attachment (Daily / non-voice callers).
+      //
+      // Per-segment slots (voice W2): an optional `segment_index` (integer ≥ 0)
+      // lets one recording split across several attachments on ONE note, each
+      // resolving into its own `(part N)` marker (N = segment_index + 1). Stored
+      // on the attachment metadata so the pipeline reads it at completion time;
+      // a malformed value is ignored (falls back to the bare, un-segmented
+      // markers). Only meaningful alongside `transcribe:true`.
       const optIn = body.transcribe === true;
+      const segIdx = body.segment_index;
+      const validSegment = typeof segIdx === "number" && Number.isInteger(segIdx) && segIdx >= 0;
       const attMeta = optIn
         ? {
             transcribe_status: "pending" as const,
             transcribe_requested_at: new Date().toISOString(),
             transcribe_origin: "legacy" as const,
+            ...(validSegment ? { segment_index: segIdx } : {}),
           }
         : undefined;
       const attachment = await store.addAttachment(note.id, body.path, body.mimeType, attMeta);
@@ -705,6 +819,19 @@ async function handleNotesInner(
       return json(await store.getAttachments(note.id));
     }
     return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+  }
+
+  // Retry transcription — POST /notes/:idOrPath/retry-transcription (voice W2,
+  // door parity with self-host's own route). Write-scoped (the DO's verb gate
+  // already 403s a read token before this handler runs). Re-runs transcription
+  // for the note's FAILED audio attachments; a non-retriable failure class
+  // (audio_too_large/…) stays terminal.
+  if (sub === "/retry-transcription") {
+    if (method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+    const note = await resolveNote(store, idOrPath);
+    if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
+    return handleRetryTranscription(store, note, deps);
   }
 
   const attMatch = sub.match(/^\/attachments\/([^/]+)$/);
