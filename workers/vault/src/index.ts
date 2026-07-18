@@ -15,7 +15,8 @@
  * static sites on any origin can call the API; writes still require a token.
  */
 import type { Env } from "./env.js";
-import { handleDiscovery } from "./discovery.js";
+import { handleDiscovery, rootMcpWwwAuthenticate } from "./discovery.js";
+import { deriveVaultFromToken } from "./auth.js";
 
 export { VaultDO } from "./vault-do.js";
 
@@ -105,7 +106,48 @@ export default {
     if (discovery) return discovery;
 
     const resolved = resolveVault(url, env);
-    if (!resolved) return json({ error: "vault not addressable" }, 404);
+    if (!resolved) {
+      // Canonical root `/mcp` — token-derived vault dispatch (U1). Reached ONLY
+      // when the request names no vault by URL: an apex/zone host (`u.` today,
+      // `my.` when Phase A's zone routes land) with no `/vault/<name>` path and
+      // no tenant subdomain. We derive the target vault from the TOKEN, then
+      // forward to the SAME per-vault DO the URL-addressed `/vault/<name>/mcp`
+      // uses — the DO re-runs its strict `aud=vault.<name>` check, so a bad
+      // derivation fails INSIDE the DO rather than bypassing it (defense in
+      // depth). A subdomain or `/vault/<name>` request resolves a vault above
+      // and never reaches here, so every per-vault route (incl. the subdomain
+      // `/mcp`) is byte-untouched.
+      if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
+        const derived = await deriveVaultFromToken(request, env);
+        if ("error" in derived) {
+          // No / invalid / unnameable token → 401 whose WWW-Authenticate names
+          // the ROOT PRM, so a spec-following MCP client discovers the issuer
+          // and requests the un-narrowed scopes its consent picker narrows to a
+          // chosen vault.
+          return withCors(
+            Response.json(
+              { error: "Unauthorized", message: "API key required" },
+              { status: 401, headers: { "WWW-Authenticate": rootMcpWwwAuthenticate(request) } },
+            ),
+          );
+        }
+        // Rewrite to the wire-contract per-vault path + forward to the derived
+        // vault's DO exactly as resolveVault would have for the URL-addressed
+        // twin (`url.pathname` already starts with `/mcp`).
+        const rootCanonical = new URL(url);
+        rootCanonical.pathname = `/vault/${derived.vaultName}${url.pathname}`;
+        const rootForwarded = new Request(rootCanonical.toString(), request);
+        const rootId = env.VAULT.idFromName(derived.vaultName);
+        const rootStub = env.VAULT.get(rootId);
+        try {
+          return withCors(await rootStub.fetch(rootForwarded));
+        } catch (err) {
+          console.error(`[router ${request.method} ${url.pathname}]`, err);
+          return json({ error: "Internal server error" }, 500);
+        }
+      }
+      return json({ error: "vault not addressable" }, 404);
+    }
 
     // Canonicalize to `/vault/<name><rel>` so the DO sees the wire-contract path.
     const canonical = new URL(url);

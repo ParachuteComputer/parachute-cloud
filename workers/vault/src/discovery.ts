@@ -107,6 +107,32 @@ function protectedResource(req: Request, env: Env, vaultName: string): Response 
 }
 
 /**
+ * RFC 9728 Protected Resource Metadata for the CANONICAL ROOT `/mcp` endpoint
+ * (U1). Vault-AGNOSTIC — the vault is derived from the token, not the URL — so
+ * two deliberate differences from the per-vault {@link protectedResource}:
+ *
+ *   - `resource` is the origin-root `<origin>/mcp`, not a `/vault/<name>/mcp`.
+ *   - `scopes_supported` advertises the UN-NARROWED `vault:read` / `vault:write`
+ *     (there's no vault name to narrow to here). A spec-following client reads
+ *     these and requests the broad forms; the Identity Worker's consent picker
+ *     narrows the grant to a chosen vault at authorization time, minting a token
+ *     stamped with a `vault:<name>:<verb>` scope + `aud=vault.<name>` — exactly
+ *     what the root endpoint derives the target vault from.
+ *
+ * Served at the RFC 9728 §3.1 path-insertion location for the root resource:
+ * `/.well-known/oauth-protected-resource/mcp`. Mirrors
+ * parachute-vault/src/oauth-discovery.ts's `handleRootProtectedResource`.
+ */
+function rootProtectedResource(req: Request, env: Env): Response {
+  return jsonDoc({
+    resource: `${publicOrigin(req)}/mcp`,
+    authorization_servers: [env.ISSUER_ORIGIN],
+    scopes_supported: ["vault:read", "vault:write"],
+    bearer_methods_supported: ["header"],
+  });
+}
+
+/**
  * RFC 8414 Authorization Server Metadata — a *forwarder* naming the Identity
  * Worker's endpoints (issuer + every endpoint point at ISSUER_ORIGIN). Mirrors
  * the Identity Worker's own `/.well-known/oauth-authorization-server` shape,
@@ -137,7 +163,19 @@ export function handleDiscovery(url: URL, req: Request, env: Env): Response | nu
   const m = matchDiscovery(url.pathname);
   if (!m) return null;
   const vaultName = m.nameFromPath ?? subdomainVault(url, env);
-  if (!vaultName) return new Response(JSON.stringify({ error: "vault not addressable" }), { status: 404, headers: { "Content-Type": "application/json", ...CORS } });
+  if (!vaultName) {
+    // No vault in context: an apex/zone host with no `/vault/<name>` segment and
+    // no tenant subdomain. The canonical root `/mcp` PRM (U1) is the one
+    // vault-agnostic discovery doc — served for the protected-resource `/mcp`
+    // form; every other no-vault discovery path stays 404. A tenant subdomain
+    // always resolves a vault above, so its
+    // `.../oauth-protected-resource/mcp` keeps returning the per-vault PRM
+    // (byte-untouched).
+    if (m.type === "protected-resource" && url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+      return rootProtectedResource(req, env);
+    }
+    return new Response(JSON.stringify({ error: "vault not addressable" }), { status: 404, headers: { "Content-Type": "application/json", ...CORS } });
+  }
   return m.type === "protected-resource" ? protectedResource(req, env, vaultName) : authorizationServer(env, vaultName);
 }
 
@@ -150,4 +188,17 @@ export function handleDiscovery(url: URL, req: Request, env: Env): Response | nu
 export function mcpWwwAuthenticate(req: Request, vaultName: string): string {
   const origin = publicOrigin(req);
   return `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/vault/${vaultName}/mcp"`;
+}
+
+/**
+ * The RFC 9728 `WWW-Authenticate` challenge value for the canonical ROOT `/mcp`
+ * 401 (U1), when the token is absent / invalid / names no single vault. Points
+ * at the ROOT PRM (`/.well-known/oauth-protected-resource/mcp`), NOT a
+ * vault-scoped one, since the root resource is vault-agnostic. A spec-following
+ * MCP client follows this pointer to the root PRM, discovers the Identity
+ * Worker, and requests the un-narrowed scopes its consent picker narrows to a
+ * chosen vault. Mirrors parachute-vault/src/routing.ts's `rootMcpChallenge`.
+ */
+export function rootMcpWwwAuthenticate(req: Request): string {
+  return `Bearer resource_metadata="${publicOrigin(req)}/.well-known/oauth-protected-resource/mcp"`;
 }
