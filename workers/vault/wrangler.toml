@@ -39,17 +39,20 @@ workers_dev = true
 pattern = "u.parachute.computer"
 custom_domain = true
 
-# my.parachute.computer/vault/* — the one-origin door (Phase A1, URL-TOPOLOGY.md
-# rev 2). THREE ZONE ROUTES (not a Custom Domain — my. is already a Custom Domain
-# on the IDENTITY worker, workers/identity/wrangler.toml; a zone route on the SAME
-# hostname takes PRECEDENCE over a Custom Domain there, confirmed against CF's
-# "Interaction with Routes" docs, 2026-07-16, so this worker answers my./vault/*
-# at the platform layer before the identity worker or its Static Assets ever see
-# the request — zero code, zero proxy hop, no new worker). The router below is
-# ALREADY host-agnostic (path routing "works on any host") — no code change.
+# my.parachute.computer/vault/* — the one-origin door (Phase A1 + the U1 root
+# /mcp extension, URL-TOPOLOGY.md rev 2). FIVE ZONE ROUTES (not a Custom Domain —
+# my. is already a Custom Domain on the IDENTITY worker,
+# workers/identity/wrangler.toml; a zone route on the SAME hostname takes
+# PRECEDENCE over a Custom Domain there, confirmed against CF's "Interaction with
+# Routes" docs, 2026-07-16, so this worker answers my./vault/* + my./mcp at the
+# platform layer before the identity worker or its Static Assets ever see the
+# request — zero code, zero proxy hop, no new worker). The router below is
+# ALREADY host-agnostic (path routing "works on any host"; resolveVault() returns
+# null for the my. apex just as it does for u., so the root /mcp branch fires) —
+# no code change.
 #
-# Three patterns, not one, because RFC 9728/8414 discovery needs more than the
-# REST/MCP path itself:
+# The first THREE patterns are the Phase-A1 /vault-scoped surface; RFC 9728/8414
+# discovery needs more than the REST/MCP path itself:
 #   - /vault/*                                             REST, MCP, SSE, and
 #     the path-APPEND discovery form (/vault/<name>/.well-known/...) — all
 #     already live under /vault/, handled by handleDiscovery (discovery.ts).
@@ -79,6 +82,33 @@ pattern = "my.parachute.computer/.well-known/oauth-protected-resource/vault/*"
 zone_name = "parachute.computer"
 [[routes]]
 pattern = "my.parachute.computer/.well-known/oauth-authorization-server/vault/*"
+zone_name = "parachute.computer"
+
+# The remaining TWO patterns are the U1 CANONICAL ROOT /mcp extension (U1 cloud,
+# #192): a vault-agnostic /mcp at the origin ROOT where the target vault is
+# derived from the TOKEN, not the URL. #192 shipped the handler (index.ts root
+# branch + discovery.ts root PRM) but deliberately left my. UNROUTED ("`my.` when
+# Phase A's zone routes land") — these two routes land it, giving my. the same
+# root-/mcp surface u. already has under its whole-host Custom Domain.
+#   - /mcp*                                                 the token-derived root
+#     MCP endpoint (index.ts: `url.pathname === "/mcp" || startsWith("/mcp/")`).
+#     The trailing `*` is deliberate, NOT a bare `/mcp`: CF route patterns match
+#     the FULL request URL INCLUDING the query string, and `*` matches zero-or-
+#     more characters — so `/mcp*` covers `/mcp`, `/mcp?…`, and the `/mcp/` sub-
+#     paths the handler accepts, exactly the surface the whole-host u. Custom
+#     Domain already serves. A bare `/mcp` would MISS a query string outright.
+#   - /.well-known/oauth-protected-resource/mcp*            the ROOT PRM the root
+#     /mcp's 401 WWW-Authenticate names (discovery.ts rootMcpWwwAuthenticate →
+#     served at exactly `/.well-known/oauth-protected-resource/mcp`). `mcp*` (glob,
+#     query-tolerant) never shadows the BARE issuer PRM
+#     `/.well-known/oauth-protected-resource` (no `/mcp` suffix → stays the
+#     IDENTITY worker's own issuer metadata), nor the per-vault PRM under
+#     /vault/<name> (its own route above).
+[[routes]]
+pattern = "my.parachute.computer/mcp*"
+zone_name = "parachute.computer"
+[[routes]]
+pattern = "my.parachute.computer/.well-known/oauth-protected-resource/mcp*"
 zone_name = "parachute.computer"
 
 # Workers Logs: persist invocation logs + console.* (router errors, DO logs) so
