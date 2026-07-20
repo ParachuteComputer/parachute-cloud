@@ -12,10 +12,11 @@ import {
   narrowVaultScopes,
   resolveResourceVault,
   unnamedVaultVerbs,
+  widenUnnamedVaultVerb,
 } from "./audience.ts";
 import { approveClient, getClient, requireRegisteredRedirectUri } from "./clients.ts";
 import { isCoveredByGrant, recordGrant } from "./grants.ts";
-import { listVaultsForOwner, unownedNamedVaults } from "./vaults.ts";
+import { listVaultsForOwner, unownedNamedVaults, userOwnsVault } from "./vaults.ts";
 import { SESSION_COOKIE, buildSessionCookie, createSession, findActiveSession, parseSessionCookie } from "./sessions.ts";
 import { getUserByEmail, getUserById, needsRehash, setPassword, verifyPassword } from "./users.ts";
 import { isTotpEnrolled } from "./two-factor.ts";
@@ -225,6 +226,15 @@ async function authorizeCore(
   // Only the unnamed-verb pick branch needs the owner's vault list (the dropdown
   // that replaced the free-text input); every other branch skips the extra read.
   const ownedVaults = needsVaultPick ? (await listVaultsForOwner(db, session.userId)).map((v) => v.name) : [];
+  // hub#689 port — the owner-elected read/write/admin selector. Offered only on
+  // the unnamed-verb pick branch when the owner has at least one pickable
+  // (owned) vault AND the client requested an upgradeable unnamed
+  // `vault:read`/`vault:write` verb. Ownership === admin authority in the cloud,
+  // so every pickable vault is one the owner holds admin on (the hub's render
+  // precondition). An already-admin unnamed request (`vault:admin`) yields an
+  // empty upgradeable set → no selector (it is already the top level).
+  const upgradeableVerbs = unnamedVaultVerbs(requestedScopes).filter((v) => v === "read" || v === "write");
+  const verbSelector = needsVaultPick && ownedVaults.length > 0 && upgradeableVerbs.length > 0 ? { requestedVerbs: upgradeableVerbs } : null;
   return htmlResponse(
     renderConsent({
       params,
@@ -234,6 +244,7 @@ async function authorizeCore(
       lockedVault,
       needsVaultPick,
       ownedVaults,
+      verbSelector,
       // The "issued by <host>" trust line — the DOOR the user came through (the
       // bound request/resource origin, e.g. my.parachute.computer for a my./mcp
       // connect), else the issuer. Bound-gated in consentIssuedByHost, so never
@@ -442,6 +453,21 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
     const picked = String(form.get("vault_pick") ?? "") || (params.vault ?? "");
     if (!picked || !VAULT_NAME_RE.test(picked)) {
       return htmlError("Vault required", "Choose a vault to authorize.", 400);
+    }
+    // hub#689 port — owner-elected verb widening. `verb_select` is an UNTRUSTED
+    // hint from the consent radio; re-level the unnamed read/write verb(s) to the
+    // elected level ONLY after re-deriving, server-side, that this user OWNS the
+    // picked vault (ownership === admin authority in the cloud). The ownership
+    // gate below (`denyUnownedVaults`) and the token-mint re-check remain the
+    // backstops, so a forged `verb_select=admin` on an unowned vault is refused
+    // regardless. Absent/invalid `verb_select` ⇒ scopes untouched (byte-identical
+    // to the pre-selector behavior).
+    const electedVerb = String(form.get("verb_select") ?? "").trim();
+    if (
+      (electedVerb === "read" || electedVerb === "write" || electedVerb === "admin") &&
+      (await userOwnsVault(db, session.userId, picked))
+    ) {
+      scopes = widenUnnamedVaultVerb(scopes, electedVerb);
     }
     scopes = narrowVaultScopes(scopes, picked);
   }

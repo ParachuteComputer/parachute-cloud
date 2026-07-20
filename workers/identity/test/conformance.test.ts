@@ -1467,6 +1467,210 @@ describe("consent vault picker — a dropdown of the owner's vaults (not free te
   });
 });
 
+/**
+ * hub#689 port — the owner-elected read/write/admin selector on the unnamed-verb
+ * consent. A vault owner may WIDEN a client's unnamed `vault:read`/`vault:write`
+ * request to admin in-flow (the least-privilege default keeps the radio on the
+ * requested level, admin one click away). `verb_select` is an UNTRUSTED hint:
+ * widening is gated on server-side ownership re-derivation + the existing
+ * ownership backstop, so a forged pick is refused.
+ */
+describe("consent verb selector — owner-elected vault:admin (port hub#689)", () => {
+  const consentFields = (
+    clientId: string,
+    challenge: string,
+    extra: Record<string, string> = {},
+  ): Record<string, string> => ({
+    client_id: clientId,
+    redirect_uri: REDIRECT_URI,
+    response_type: "code",
+    scope: "vault:read vault:write",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    vault_pick: "myvault",
+    ...extra,
+  });
+
+  // --- render pins (extends the vault-picker consent-shape pins above) ------
+
+  test("renders the read/write/admin radio, DEFAULT-selected to write, for an owner", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("myvault", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const query = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:read vault:write",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    };
+    const res = await handleAuthorizeGet(env.DB, authorizeGetReq(query, sessionId), deps());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('name="verb_select" value="read"');
+    expect(html).toContain('name="verb_select" value="write" checked');
+    expect(html).toContain('name="verb_select" value="admin"');
+    // Least-privilege default: admin is NOT pre-selected (the hosted-door
+    // divergence from the hub, which pre-selects admin).
+    expect(html).not.toContain('value="admin" checked');
+  });
+
+  test("a read-only request defaults the radio to read (not write)", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("myvault", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const query = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:read",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    };
+    const html = await (await handleAuthorizeGet(env.DB, authorizeGetReq(query, sessionId), deps())).text();
+    expect(html).toContain('name="verb_select" value="read" checked');
+    expect(html).not.toContain('value="write" checked');
+  });
+
+  test("no selector when the owner has ZERO vaults (nothing to grant admin on)", async () => {
+    const { id: userId } = await seedUser();
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const query = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:read vault:write",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    };
+    const html = await (await handleAuthorizeGet(env.DB, authorizeGetReq(query, sessionId), deps())).text();
+    expect(html).not.toContain('name="verb_select"');
+  });
+
+  test("no selector when the client already requested unnamed vault:admin", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("myvault", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const query = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:admin",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    };
+    const html = await (await handleAuthorizeGet(env.DB, authorizeGetReq(query, sessionId), deps())).text();
+    expect(html).not.toContain('name="verb_select"');
+    // The scope list already shows the admin label — no re-leveling needed.
+    expect(html).toContain("Full administrative access to your vault");
+  });
+
+  // --- submit + token behavior ---------------------------------------------
+
+  async function codeFromConsent(res: Response): Promise<string> {
+    expect(res.status).toBe(200);
+    return new URL(bridgeTarget(await res.text())!).searchParams.get("code")!;
+  }
+
+  async function mintFromCode(clientId: string, code: string, verifier: string): Promise<Response> {
+    return handleToken(
+      env.DB,
+      tokenReq({
+        grant_type: "authorization_code",
+        code,
+        client_id: clientId,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: verifier,
+      }),
+      deps(),
+    );
+  }
+
+  test("(a) owner elects admin → the minted token carries vault:<name>:admin", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("myvault", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { verifier, challenge } = await makePkce();
+    const consent = await handleAuthorizePost(
+      env.DB,
+      consentReq(consentFields(clientId, challenge, { verb_select: "admin" }), { sessionId }),
+      deps(),
+    );
+    const code = await codeFromConsent(consent);
+    const tokenRes = await mintFromCode(clientId, code, verifier);
+    expect(tokenRes.status).toBe(200);
+    const pair = (await tokenRes.json()) as { scope: string; access_token: string };
+    // read+write both re-leveled + deduped to a single admin scope.
+    expect(pair.scope).toBe("vault:myvault:admin");
+    const validated = await validateAccessToken(env.DB, pair.access_token, ISSUER);
+    expect(validated.payload.aud).toBe("vault.myvault");
+  });
+
+  test("(b) forged verb_select=admin on an UNOWNED vault → denied (invalid_scope), no widening", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("mine", userId); // owns one vault, but forges a pick of another
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizePost(
+      env.DB,
+      consentReq(
+        consentFields(clientId, challenge, { vault_pick: "stranger", verb_select: "admin" }),
+        { sessionId },
+      ),
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    const target = new URL(bridgeTarget(await res.text())!);
+    expect(target.searchParams.get("error")).toBe("invalid_scope");
+  });
+
+  test("(c) absent verb_select ⇒ scopes byte-identical to the pre-selector behavior", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("myvault", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { verifier, challenge } = await makePkce();
+    const consent = await handleAuthorizePost(
+      env.DB,
+      consentReq(consentFields(clientId, challenge), { sessionId }), // no verb_select
+      deps(),
+    );
+    const code = await codeFromConsent(consent);
+    const tokenRes = await mintFromCode(clientId, code, verifier);
+    expect(tokenRes.status).toBe(200);
+    const pair = (await tokenRes.json()) as { scope: string };
+    expect(pair.scope).toBe("vault:myvault:read vault:myvault:write");
+  });
+
+  test("owner elects read (downgrade) on a read+write request → token carries only read", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("myvault", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { verifier, challenge } = await makePkce();
+    const consent = await handleAuthorizePost(
+      env.DB,
+      consentReq(consentFields(clientId, challenge, { verb_select: "read" }), { sessionId }),
+      deps(),
+    );
+    const code = await codeFromConsent(consent);
+    const tokenRes = await mintFromCode(clientId, code, verifier);
+    const pair = (await tokenRes.json()) as { scope: string };
+    expect(pair.scope).toBe("vault:myvault:read");
+  });
+});
+
 // --- E2E through the real router ------------------------------------------
 
 describe("E2E through the router: DCR → authorize → consent → token", () => {

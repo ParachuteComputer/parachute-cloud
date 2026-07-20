@@ -55,6 +55,40 @@ export function narrowVaultScopes(scopes: readonly string[], pickedVault: string
   });
 }
 
+/**
+ * Owner-elected verb re-leveling (cloud port of hub#689). Rewrites every
+ * UNNAMED upgradeable `vault:read`/`vault:write` verb to `vault:<electedVerb>`,
+ * then dedupes the resulting unnamed vault verbs (so `read`+`write` both elected
+ * to `admin` collapse to a single `vault:admin` rather than a doubled scope).
+ * Everything else is left byte-identical: an unnamed `vault:admin` (not
+ * upgradeable), an already-named `vault:<name>:<verb>`, and every non-vault
+ * scope pass through untouched, in order.
+ *
+ * The vault enforces a verb hierarchy (`admin` ⊇ `write` ⊇ `read`), so
+ * collapsing an unnamed `read`+`write` request to a single `<electedVerb>` is
+ * capability-faithful. This runs BEFORE {@link narrowVaultScopes}, and ONLY when
+ * the caller has re-derived server-side that the consenting user owns the picked
+ * vault (ownership === admin authority in the cloud); the ownership gate at
+ * consent-submit + the token-mint re-check remain the backstops.
+ */
+export function widenUnnamedVaultVerb(scopes: readonly string[], electedVerb: "read" | "write" | "admin"): string[] {
+  const out: string[] = [];
+  const seenElected = new Set<string>();
+  for (const s of scopes) {
+    const parts = s.split(":");
+    const upgradeableUnnamed = parts.length === 2 && parts[0] === "vault" && (parts[1] === "read" || parts[1] === "write");
+    if (!upgradeableUnnamed) {
+      out.push(s);
+      continue;
+    }
+    const elected = `vault:${electedVerb}`;
+    if (seenElected.has(elected)) continue; // dedupe the collapsed unnamed verb
+    seenElected.add(elected);
+    out.push(elected);
+  }
+  return out;
+}
+
 const VAULT_MCP_PATH_RE = /^\/vault\/([^/]+)\/mcp\/?$/;
 const VAULT_PRM_PATH_RE = /^\/vault\/([^/]+)\/\.well-known\/oauth-protected-resource\/?$/;
 const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
