@@ -15,7 +15,7 @@ import {
 } from "./audience.ts";
 import { approveClient, getClient, requireRegisteredRedirectUri } from "./clients.ts";
 import { isCoveredByGrant, recordGrant } from "./grants.ts";
-import { unownedNamedVaults } from "./vaults.ts";
+import { listVaultsForOwner, unownedNamedVaults } from "./vaults.ts";
 import { SESSION_COOKIE, buildSessionCookie, createSession, findActiveSession, parseSessionCookie } from "./sessions.ts";
 import { getUserByEmail, getUserById, needsRehash, setPassword, verifyPassword } from "./users.ts";
 import { isTotpEnrolled } from "./two-factor.ts";
@@ -25,6 +25,7 @@ import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { type AuthorizeParams, describeScopes, renderConsent, renderError, renderLogin, renderRedirectBridge } from "./ui.ts";
 import {
   type OAuthDeps,
+  consentIssuedByHost,
   findNonRequestableScopes,
   htmlResponse,
   isCrossOrigin,
@@ -214,12 +215,16 @@ async function authorizeCore(
   }
 
   const lockedVault = params.vault && VAULT_NAME_RE.test(params.vault) ? params.vault : null;
+  const needsVaultPick = hasUnnamedVault && !lockedVault;
   const csrf = ensureCsrfToken(req);
   const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
   // The session is already proven live (findActiveSession JOINs users WHERE
   // suspended_at IS NULL), so the user row always resolves here — `?? ""` is
   // defensive only, matching the codebase's convention elsewhere.
   const consentUser = await getUserById(db, session.userId);
+  // Only the unnamed-verb pick branch needs the owner's vault list (the dropdown
+  // that replaced the free-text input); every other branch skips the extra read.
+  const ownedVaults = needsVaultPick ? (await listVaultsForOwner(db, session.userId)).map((v) => v.name) : [];
   return htmlResponse(
     renderConsent({
       params,
@@ -227,10 +232,14 @@ async function authorizeCore(
       clientName: client.clientName ?? client.clientId,
       scopeDescriptions: describeScopes(requestedScopes),
       lockedVault,
-      needsVaultPick: hasUnnamedVault && !lockedVault,
-      // From CONFIG (deps.issuer), never from the request — the "issued by
-      // <host>" trust line on the consent page (#42).
-      issuerHost: new URL(deps.issuer).host,
+      needsVaultPick,
+      ownedVaults,
+      // The "issued by <host>" trust line — the DOOR the user came through (the
+      // bound request/resource origin, e.g. my.parachute.computer for a my./mcp
+      // connect), else the issuer. Bound-gated in consentIssuedByHost, so never
+      // an arbitrary host; DISPLAY ONLY — iss/aud/JWKS unchanged (#42 + the
+      // my.-origin consent-face fix).
+      issuerHost: consentIssuedByHost(req, params.resource, deps),
       // Auth redesign §3 move 1: "Signed in as {email} · Not you?" — the
       // ceremony now names the account approving the grant. `notYouNext`
       // reconstructs THIS exact pending authorize URL, so a "Not you?"

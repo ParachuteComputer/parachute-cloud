@@ -276,6 +276,56 @@ export function ceremonyOrigin(req: Request, deps: OAuthDeps): string {
 }
 
 /**
+ * The host shown on the consent page's "issued by <host>" trust line — the DOOR
+ * the user came through, resolved to a TRUSTED origin only. Preference order:
+ *   1. the request's own bound origin (Origin/Referer, when it's a bound member
+ *      — the ceremony genuinely ran on a bound serving origin like app./my.),
+ *      then
+ *   2. the bound origin of the RFC 8707 `resource` the client is connecting to.
+ *      A `my.parachute.computer/mcp` connect sends `resource=https://my.…/mcp`,
+ *      and — because `authorization_endpoint` stays pinned to the issuer origin
+ *      (cloud.) through Phase 4 — the browser's authorize request itself always
+ *      lands on cloud., so on that leg the `resource` is the ONLY carrier of
+ *      "which door the user pasted". It also survives every login round-trip
+ *      (hiddenParams / buildAuthorizeUrl both preserve `resource`), so the
+ *      consent shows the right face whether the user arrived signed-in or via
+ *      magic-link/password/code, then
+ *   3. the issuer host (the pre-existing behavior).
+ *
+ * BOTH inputs are attacker-writable (Origin/Referer headers; the `resource`
+ * query param), so BOTH are gated to `resolveBoundOrigins` — the SAME trusted
+ * accept-set the same-origin gate uses. A foreign / opaque / unbound value can
+ * never be reflected; it falls through to the issuer. This is coherent, not
+ * misleading: every host it can show is a bound Custom Domain of THIS SAME
+ * identity worker/authority.
+ *
+ * DISPLAY ONLY — iss, JWKS, OAuth discovery `issuer`, and `aud` all stay
+ * `deps.issuer`. Never widen this beyond the bound set.
+ */
+export function consentIssuedByHost(req: Request, resource: string | null | undefined, deps: OAuthDeps): string {
+  const bound = resolveBoundOrigins(deps);
+  const origin = boundOriginFromHeader(req, bound) ?? boundOriginOf(resource, bound) ?? deps.issuer;
+  return new URL(origin).host;
+}
+
+/** The request's Origin (or Referer) as an origin string, but only when it's a bound member — else null. */
+function boundOriginFromHeader(req: Request, bound: readonly string[]): string | null {
+  const raw = req.headers.get("origin") ?? req.headers.get("referer");
+  return raw ? boundOriginOf(raw, bound) : null;
+}
+
+/** `value`'s origin when `value` parses AND its origin is a bound member — else null. */
+function boundOriginOf(value: string | null | undefined, bound: readonly string[]): string | null {
+  if (!value) return null;
+  try {
+    const origin = new URL(value).origin;
+    return bound.includes(origin) ? origin : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * True when `location` (relative or absolute) resolves to a different origin
  * than `base`. The gate for {@link redirectResponse} vs the cross-origin
  * bridge (ui.ts `renderRedirectBridge`, see the `form-action` note on

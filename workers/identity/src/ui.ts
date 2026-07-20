@@ -101,8 +101,8 @@ const STYLE = `
   h2{font-family:var(--font-serif);font-weight:400;font-size:1.3rem;margin:0 0 .5rem}
   .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius-card);padding:1.6rem;margin-bottom:1.1rem;box-shadow:var(--shadow-soft)}
   label{display:block;font-family:var(--font-round);font-size:.82rem;font-weight:600;margin:.85rem 0 .3rem;color:var(--ink)}
-  input[type=email],input[type=password],input[type=text]{width:100%;padding:.6rem .7rem;border:1px solid var(--line-2);border-radius:var(--radius-control);font-size:1rem;background:var(--field);font-family:inherit}
-  input:focus{outline:2px solid var(--accent);outline-offset:0;border-color:var(--accent)}
+  input[type=email],input[type=password],input[type=text],select.field{width:100%;padding:.6rem .7rem;border:1px solid var(--line-2);border-radius:var(--radius-control);font-size:1rem;background:var(--field);font-family:inherit}
+  input:focus,select.field:focus{outline:2px solid var(--accent);outline-offset:0;border-color:var(--accent)}
   button{font-size:1rem;font-family:var(--font-round);padding:.62rem 1rem;border-radius:var(--radius-control);border:0;cursor:pointer}
   .primary{background:var(--accent);color:#fff;width:100%;margin-top:1.1rem;font-weight:600;border-radius:var(--pill)}
   .primary:hover{background:var(--accent-strong)}
@@ -263,9 +263,20 @@ export interface ConsentProps {
   /** True when an unnamed vault verb needs a vault chosen at submit time. */
   needsVaultPick: boolean;
   /**
-   * The issuer's host, derived from CONFIG (deps.issuer — never request/user
-   * input): the "issued by <host>" trust line so the user can verify WHERE
-   * they're consenting (#42; also disambiguates staging vs production).
+   * The signed-in owner's vault names — the options for the `needsVaultPick`
+   * dropdown (replacing the old free-text input). Only read when `needsVaultPick`
+   * is true; empty renders the "no vaults yet" guidance instead of a picker.
+   * The submit path re-validates ownership server-side regardless, so this list
+   * is a UX convenience, not the security boundary.
+   */
+  ownedVaults: string[];
+  /**
+   * The "issued by <host>" trust line so the user can verify WHERE they're
+   * consenting (#42). Resolved by `consentIssuedByHost` (oauth-shared.ts) to the
+   * DOOR the user came through — the bound request/resource origin (e.g.
+   * my.parachute.computer for a my./mcp connect), else the issuer host. Always a
+   * bound/trusted origin or the issuer — never an arbitrary request value; a
+   * DISPLAY face only (the token `iss`/`aud` stay the issuer).
    */
   issuerHost: string;
   /** The authenticated account approving this grant — the "Signed in as" line. */
@@ -300,8 +311,28 @@ export function describeScopes(scopes: string[]): Array<{ scope: string; label: 
   return scopes.map((scope) => ({ scope, label: scopeLabel(scope) }));
 }
 
+/**
+ * The unnamed-verb vault chooser: a SELECT of the owner's vaults (replacing the
+ * old free-text `vault_pick` input — no more typing a name from memory). A lone
+ * vault is pre-selected; a single-select for now (multi-select is a later wave).
+ * Zero vaults renders guidance instead of an empty dropdown — the person needs a
+ * vault before a connector can bind to one. No inline script, so the strict
+ * consent CSP is untouched. The submit path re-validates ownership server-side,
+ * so this list is UX, not the security boundary.
+ */
+function renderVaultPicker(ownedVaults: string[]): string {
+  if (ownedVaults.length === 0) {
+    return `<p class="muted" data-testid="no-vaults" style="margin:.85rem 0 0">You don't have a vault yet — <a href="/console">create one</a>, then reconnect to authorize it.</p>`;
+  }
+  const options = ownedVaults
+    .map((name, i) => `<option value="${esc(name)}"${i === 0 ? " selected" : ""}>${esc(name)}</option>`)
+    .join("");
+  return `<label for="vault_pick">Vault</label>
+         <select id="vault_pick" name="vault_pick" class="field" required>${options}</select>`;
+}
+
 export function renderConsent(props: ConsentProps): string {
-  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, issuerHost, email, notYouNext } = props;
+  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext } = props;
   const scopeList = scopeDescriptions
     .map((s) => `<li><strong>${esc(s.label)}</strong><br><span class="muted">${esc(s.scope)}</span></li>`)
     .join("\n");
@@ -309,8 +340,7 @@ export function renderConsent(props: ConsentProps): string {
   const vaultField = lockedVault
     ? `<input type="hidden" name="vault_pick" value="${esc(lockedVault)}">`
     : needsVaultPick
-      ? `<label for="vault_pick">Vault name</label>
-         <input id="vault_pick" name="vault_pick" type="text" required>`
+      ? renderVaultPicker(ownedVaults)
       : "";
   return page(
     "Authorize — Parachute",
