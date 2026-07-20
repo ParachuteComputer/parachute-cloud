@@ -145,6 +145,14 @@ const STYLE = `
   .chips label{display:inline-block;margin:0;padding:.4rem .85rem;border:1px solid var(--line-2);border-radius:var(--pill);font-family:var(--font-round);font-size:.88rem;font-weight:500;cursor:pointer;background:var(--field);color:var(--ink)}
   .chips input:checked+label{background:var(--accent);border-color:var(--accent);color:#fff}
   .chips input:focus-visible+label{outline:2px solid var(--accent);outline-offset:2px}
+  fieldset.verbsel{border:1px solid var(--line);border-radius:var(--radius-panel);padding:.4rem .9rem .9rem;margin:1rem 0 0}
+  fieldset.verbsel>legend{font-family:var(--font-round);font-size:.82rem;font-weight:600;padding:0 .35rem;color:var(--ink)}
+  .verbopt{display:flex;align-items:flex-start;gap:.6rem;margin:.55rem 0 0;padding:0;font-weight:400;font-family:var(--font-body)}
+  .verbopt input{margin:.2rem 0 0;flex:none}
+  .verbopt-body{display:flex;flex-direction:column;gap:.1rem}
+  .verbopt-title{font-family:var(--font-round);font-size:.9rem;font-weight:600;display:flex;align-items:center;gap:.4rem}
+  .verbopt-desc{color:var(--muted);font-size:.84rem}
+  .verbbadge{display:inline-block;background:var(--accent-soft);border:1px solid var(--accent-soft-line);color:var(--accent-soft-ink);border-radius:var(--pill);font-family:var(--font-round);font-size:.68rem;font-weight:700;letter-spacing:.03em;text-transform:uppercase;padding:.05rem .45rem}
   .check{list-style:none;padding:0;margin:.3rem 0 0}
   .check>li{border-top:1px solid var(--line)}
   .check>li:first-child{border-top:0}
@@ -283,6 +291,30 @@ export interface ConsentProps {
   email: string;
   /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `buildAuthorizeUrl`). */
   notYouNext: string;
+  /**
+   * hub#689 port — the owner-elected read/write/admin selector, or null. Set
+   * only on the unnamed-verb (vault-picker) branch when the consenting user owns
+   * at least one pickable vault AND the client requested an upgradeable unnamed
+   * `vault:read`/`vault:write` verb. Because ownership === admin authority in the
+   * cloud, every pickable vault is one the owner holds admin on — the hub's
+   * "owner holds admin on every pickable vault" render precondition. Deliberately
+   * DEFAULTS to the requested level (write), not admin (the hosted-door
+   * least-privilege default; the hub pre-selects admin). `verb_select` is an
+   * UNTRUSTED hint re-checked server-side (`handleConsentSubmit` re-derives
+   * ownership of the picked vault before widening; the ownership gate + token
+   * mint are the backstops).
+   */
+  verbSelector: OwnerVerbSelector | null;
+}
+
+export interface OwnerVerbSelector {
+  /**
+   * The upgradeable unnamed verbs the client requested (`read`/`write`). Words
+   * the help text and sets the pre-selected level: `write` when it is present
+   * (the common request), else `read`. An unnamed `vault:admin` request never
+   * reaches here — it is already admin and needs no selector.
+   */
+  requestedVerbs: string[];
 }
 
 /**
@@ -331,8 +363,38 @@ function renderVaultPicker(ownedVaults: string[]): string {
          <select id="vault_pick" name="vault_pick" class="field" required>${options}</select>`;
 }
 
+/**
+ * hub#689 port — the owner-elected read/write/admin level selector on the
+ * unnamed-verb consent. Three radios, DEFAULT-selected to the requested level
+ * (write when the client asked for write, else read) — deliberately NOT admin:
+ * the hosted door's least-privilege default keeps admin one click away rather
+ * than pre-selected (the hub, a single-operator surface, pre-selects admin).
+ * `verb_select` is an untrusted hint re-validated server-side; this template
+ * only renders the choice. No inline script — the strict consent CSP is
+ * untouched.
+ */
+function renderVerbSelector(selector: OwnerVerbSelector): string {
+  const defaultVerb = selector.requestedVerbs.includes("write") ? "write" : "read";
+  const asked = selector.requestedVerbs.map((v) => `<code>vault:${esc(v)}</code>`).join(" and ");
+  const option = (verb: "read" | "write" | "admin", title: string, desc: string): string => {
+    const checked = verb === defaultVerb ? " checked" : "";
+    const badge = verb === "admin" ? ` <span class="verbbadge">admin</span>` : "";
+    return `<label class="verbopt${verb === "admin" ? " verbopt-admin" : ""}">
+             <input type="radio" name="verb_select" value="${verb}"${checked}>
+             <span class="verbopt-body"><span class="verbopt-title">${esc(title)}${badge}</span><span class="verbopt-desc">${esc(desc)}</span></span>
+           </label>`;
+  };
+  return `<fieldset class="verbsel">
+           <legend>Access level</legend>
+           <p class="muted" style="margin:.3rem 0 0;font-size:.84rem">This app asked for ${asked} access. Because you own this vault, you can grant a different level.</p>
+           ${option("read", "Read only", "View notes, tags, and attachments.")}
+           ${option("write", "Read & write", "Create, edit, and delete notes, tags, and attachments.")}
+           ${option("admin", "Full admin", "Everything above, plus vault config and minting tokens.")}
+         </fieldset>`;
+}
+
 export function renderConsent(props: ConsentProps): string {
-  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext } = props;
+  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector } = props;
   const scopeList = scopeDescriptions
     .map((s) => `<li><strong>${esc(s.label)}</strong><br><span class="muted">${esc(s.scope)}</span></li>`)
     .join("\n");
@@ -342,6 +404,7 @@ export function renderConsent(props: ConsentProps): string {
     : needsVaultPick
       ? renderVaultPicker(ownedVaults)
       : "";
+  const verbSelectorField = verbSelector ? renderVerbSelector(verbSelector) : "";
   return page(
     "Authorize — Parachute",
     `<h1>Authorize ${esc(clientName)}</h1>
@@ -356,6 +419,7 @@ export function renderConsent(props: ConsentProps): string {
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
          ${hiddenParams(params)}
          ${vaultField}
+         ${verbSelectorField}
          <div class="row">
            <button class="deny" type="submit" name="decision" value="deny">Deny</button>
            <button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Approve</button>

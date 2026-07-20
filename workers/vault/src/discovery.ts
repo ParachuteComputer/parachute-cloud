@@ -16,10 +16,15 @@
  *  - `authorization_servers` / issuer name the Identity Worker (`ISSUER_ORIGIN`),
  *    not a hub.
  *  - `scopes_supported` is `["vault:<name>:read","vault:<name>:write"]` — the
- *    admin scope bun advertises is dropped, because the cloud issuer only mints
- *    read/write (identity's `ADVERTISED_SCOPES`); advertising a scope the issuer
- *    won't grant breaks Claude's consent. The narrowing (never broad
- *    `vault:read`) is the load-bearing bit — see oauth-discovery.ts:38.
+ *    admin scope bun advertises is dropped. NOT because the cloud issuer can't
+ *    mint vault admin (it can: a vault OWNER may ELECT admin at the consent
+ *    screen, and an owner-held `vault:<name>:admin` mints fine — see identity's
+ *    consent verb-selector, port of hub#689). It's dropped because ADVERTISING
+ *    admin makes spec-following clients auto-REQUEST it — the opposite of the
+ *    least-privilege default we want. Admin is owner-elected-at-consent, never
+ *    door-advertised (identity's `ADVERTISED_SCOPES`); per-vault-PRM admin parity
+ *    is a deferred follow-up. The narrowing (never broad `vault:read`) is the
+ *    load-bearing bit — see oauth-discovery.ts:38.
  *
  * The advertised MCP resource is always the path form `<origin>/vault/<name>/mcp`
  * (both addressing modes route it to the same DO), so the PRM `resource`, the
