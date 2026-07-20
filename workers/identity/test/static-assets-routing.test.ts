@@ -169,6 +169,20 @@ describe("the Host-branched root (P1.1)", () => {
     expect(await res.text()).toContain('id="root"');
   });
 
+  test("`/` on my.parachute.computer → serves the SPA shell (the one-origin door Host-branches like app.)", async () => {
+    // my. is a THIRD Custom Domain on this worker (Phase A) and is NOT
+    // CONSOLE_REDIRECT_HOST (which stays cloud.), so its `/` falls to
+    // serveSpaShell exactly as app. does — the browser gets the app at my.,
+    // while my./vault/* and my./mcp are peeled off to the vault worker by
+    // platform-layer zone routes (workers/vault/wrangler.toml). `env` carries
+    // the committed top-level [vars] here (CONSOLE_REDIRECT_HOST=cloud.), so
+    // this pins the real production Host-branch for the my. origin.
+    const res = await worker.fetch(new Request("https://my.parachute.computer/"), env);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type") ?? "").toContain("text/html");
+    expect(await res.text()).toContain('id="root"');
+  });
+
   test("the worker-served SPA shell (`/`) carries the SPA Content-Security-Policy (P1.1.5)", async () => {
     // `/` is worker-served via env.ASSETS.fetch — `_headers` can't be relied on
     // to reach it, so serveSpaShell stamps the SPA CSP explicitly. The stub

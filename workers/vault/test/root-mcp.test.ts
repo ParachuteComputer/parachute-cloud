@@ -35,6 +35,14 @@ const ISSUER = "https://id.test.example"; // == ISSUER_ORIGIN in vitest.config.t
 // resolveVault() returns null and the root `/mcp` branch is reached. A
 // `<name>.u.parachute.computer` host would resolve a per-vault subdomain first.
 const APEX = "https://u.parachute.computer";
+// The my.parachute.computer one-origin door (Phase A). Also an apex host —
+// resolveVault() returns null for it (not a `<name>.u.parachute.computer`
+// subdomain, `/mcp` names no vault by URL) — so the root /mcp branch fires
+// identically to u. The my./mcp* + root-PRM zone routes that put this worker
+// in front of that host live in workers/vault/wrangler.toml (pinned in
+// test-bun/my-topology-routes.test.ts); this constant drives the CODE-level
+// proof that the handling is host-agnostic once a request arrives.
+const MY_APEX = "https://my.parachute.computer";
 
 const BOTH_ACCEPT = "application/json, text/event-stream";
 const INIT = {
@@ -199,6 +207,52 @@ describe("root /mcp — PRM + 401 challenge (U1)", () => {
     expect(res.headers.get("WWW-Authenticate")).toBe(
       'Bearer resource_metadata="https://vault.example.com/.well-known/oauth-protected-resource/mcp"',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Host-agnostic on my.parachute.computer — the one-origin door (Phase A). The
+// router treats the my. apex EXACTLY like the u. apex: resolveVault() returns
+// null (my. is not a `<name>.u.parachute.computer` subdomain and `/mcp` names no
+// vault by URL), so the root branch fires and the root PRM + 401 challenge are
+// origin-derived. These pin the CODE-level host-agnosticism; the wrangler.toml
+// my./mcp* + root-PRM zone routes that put this worker in front of that host are
+// pinned separately in test-bun/my-topology-routes.test.ts (SELF.fetch bypasses
+// CF routing, so routing config can't be exercised here).
+// ---------------------------------------------------------------------------
+describe("root /mcp — host-agnostic on my.parachute.computer (Phase A one-origin door)", () => {
+  it("the root PRM on my. names the my. root resource (origin-derived, un-narrowed scopes)", async () => {
+    const res = await SELF.fetch(`${MY_APEX}/.well-known/oauth-protected-resource/mcp`);
+    expect(res.status).toBe(200);
+    const prm = (await res.json()) as { resource: string; authorization_servers: string[]; scopes_supported: string[] };
+    expect(prm.resource).toBe(`${MY_APEX}/mcp`); // the my. origin, not u.
+    expect(prm.scopes_supported).toEqual(["vault:read", "vault:write"]);
+    expect(prm.authorization_servers).toEqual([ISSUER]); // issuer STAYS cloud. (Phase A: my. is a serving origin only)
+  });
+
+  it("unauthenticated root /mcp on my. → 401 whose challenge names the my. root PRM (self-consistent chain)", async () => {
+    const res = await mcpPostUrl(`${MY_APEX}/mcp`, null, INIT);
+    expect(res.status).toBe(401);
+    const prmUrl = res.headers.get("WWW-Authenticate")!.match(/resource_metadata="([^"]+)"/)![1]!;
+    expect(prmUrl).toBe(`${MY_APEX}/.well-known/oauth-protected-resource/mcp`);
+    const prmRes = await SELF.fetch(prmUrl); // the pointer resolves to a real PRM naming the my. root resource
+    expect(prmRes.status).toBe(200);
+    expect(((await prmRes.json()) as { resource: string }).resource).toBe(`${MY_APEX}/mcp`);
+  });
+
+  it("a vault-A token at my./mcp === the same token at u./mcp (my. is just another apex origin for one host-agnostic router)", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "my-apex equivalence fixture #probe", tags: ["probe"] });
+    const token = await mintToken({ vault: v, scopes: `vault:${v}:admin vault:${v}:write vault:${v}:read` });
+    for (const rpc of [INIT, LIST, QUERY]) {
+      const myRes = await mcpPostUrl(`${MY_APEX}/mcp`, token, rpc);
+      const uRes = await mcpPostUrl(`${APEX}/mcp`, token, rpc);
+      expect(myRes.status).toBe(200);
+      expect(uRes.status).toBe(200);
+      // Byte-identical JSON-RPC frames: both apex origins derived `v` and hit the
+      // SAME DO — the response never depends on which serving origin was used.
+      expect(await frame(myRes)).toEqual(await frame(uRes));
+    }
   });
 });
 
