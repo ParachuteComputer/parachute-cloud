@@ -20,6 +20,7 @@ import app from "../src/index.ts";
 import { CSRF_COOKIE, CSRF_FIELD } from "../src/csrf.ts";
 import { handleLogoutPost } from "../src/console.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "../src/oauth-authorize.ts";
+import { consentIssuedByHost } from "../src/oauth-shared.ts";
 import { ADVERTISED_SCOPES } from "../src/oauth-metadata.ts";
 import { handleRevoke } from "../src/oauth-revoke.ts";
 import { handleToken } from "../src/oauth-token.ts";
@@ -980,12 +981,14 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     expect(await res.text()).toContain("Incorrect email or password");
   });
 
-  test("consent page displays 'issued by <issuer host>' from CONFIG (#42)", async () => {
+  test("consent 'issued by' FALLS BACK to the issuer host when no bound request/resource origin (#42)", async () => {
     const { id: userId } = await seedUser();
     await seedVault("default", userId);
     const { clientId } = await seedApprovedClient({ clientName: "Claude" });
     const sessionId = await seedSession(userId);
     const { challenge } = await makePkce();
+    // No Origin/Referer, no `resource`, and deps() binds only the issuer — so
+    // consentIssuedByHost has no bound door to show and falls back to the issuer.
     const res = await handleAuthorizeGet(
       env.DB,
       authorizeGetReq(
@@ -1003,8 +1006,7 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     );
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("issued by");
-    expect(html).toContain(new URL(ISSUER).host);
+    expect(html).toContain(`issued by <strong>${new URL(ISSUER).host}</strong>`);
   });
 
   // Auth redesign §3, move 1 ("one visible identity") — the consent page
@@ -1247,6 +1249,221 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     );
     expect(res.status).toBe(302);
     expect(new URL(res.headers.get("location")!).searchParams.get("error")).toBe("invalid_scope");
+  });
+});
+
+// --- consent UX: the "issued by" face + the vault dropdown -----------------
+
+/**
+ * Fix 1 — the consent "issued by <host>" line reflects the DOOR the user came
+ * through (my.parachute.computer for a my./mcp connect), resolved bound-gated by
+ * consentIssuedByHost. The browser authorize request itself always lands on the
+ * issuer origin (authorization_endpoint stays cloud. through Phase 4), so the
+ * RFC 8707 `resource` is the carrier of "which door" on that leg; a bound request
+ * Origin also resolves. DISPLAY ONLY — this suite asserts the shown host only;
+ * the token iss/aud are covered (unchanged) by the aud-narrowing + token suites.
+ */
+describe("consent 'issued by' face — the bound door, never an arbitrary host (#42 + my.-origin)", () => {
+  const MY_ORIGIN = "https://my.parachute.computer";
+  const ISSUER_HOST = new URL(ISSUER).host;
+  /** deps with my. added to the bound set — production's BOUND_ORIGINS shape. */
+  function boundDeps() {
+    return { ...deps(), boundOrigins: () => [ISSUER, MY_ORIGIN] };
+  }
+  async function seedConsent() {
+    const { id: userId } = await seedUser();
+    await seedVault("work", userId); // so needsVaultPick renders the dropdown, not the empty-state
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    return { clientId, sessionId, challenge };
+  }
+  const base = (clientId: string, challenge: string): Record<string, string> => ({
+    client_id: clientId,
+    redirect_uri: REDIRECT_URI,
+    response_type: "code",
+    scope: "vault:read", // unnamed root /mcp verb → the U1 my./mcp connect shape
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  });
+
+  test("resource on a bound my. origin (a my./mcp connect) → 'issued by my.parachute.computer'", async () => {
+    const { clientId, sessionId, challenge } = await seedConsent();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq({ ...base(clientId, challenge), resource: `${MY_ORIGIN}/mcp` }, sessionId),
+      boundDeps(),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("issued by <strong>my.parachute.computer</strong>");
+  });
+
+  test("a bound my. request Origin (the ceremony ran on my.) → 'issued by my.parachute.computer'", async () => {
+    const { clientId, sessionId, challenge } = await seedConsent();
+    const url = new URL(`${ISSUER}/oauth/authorize`);
+    for (const [k, v] of Object.entries(base(clientId, challenge))) url.searchParams.set(k, v);
+    const res = await handleAuthorizeGet(
+      env.DB,
+      new Request(url.toString(), { headers: { origin: MY_ORIGIN, cookie: `${SESSION_COOKIE}=${sessionId}` } }),
+      boundDeps(),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("issued by <strong>my.parachute.computer</strong>");
+  });
+
+  test("a resource on the issuer origin (a cloud. connect) still shows the issuer host", async () => {
+    const { clientId, sessionId, challenge } = await seedConsent();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq({ ...base(clientId, challenge), resource: `${ISSUER}/mcp` }, sessionId),
+      boundDeps(),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(`issued by <strong>${ISSUER_HOST}</strong>`);
+  });
+
+  test("an UNBOUND/arbitrary resource origin is NEVER reflected — falls back to the issuer host", async () => {
+    const { clientId, sessionId, challenge } = await seedConsent();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq({ ...base(clientId, challenge), resource: "https://evil.example.com/mcp" }, sessionId),
+      boundDeps(),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The trust FACE is the issuer, never the attacker origin (which only
+    // round-trips inertly + esc'd through the hidden `resource` form field).
+    expect(html).toContain(`issued by <strong>${ISSUER_HOST}</strong>`);
+    expect(html).not.toContain("issued by <strong>evil.example.com</strong>");
+  });
+
+  // The pure resolver — the full trust matrix without the render machinery.
+  describe("consentIssuedByHost (the resolver)", () => {
+    const d = { ...deps(), boundOrigins: () => [ISSUER, MY_ORIGIN] };
+    const reqWith = (headers: Record<string, string> = {}) =>
+      new Request(`${ISSUER}/oauth/authorize`, { headers });
+
+    test("request Origin takes precedence over resource when both are bound", () => {
+      expect(consentIssuedByHost(reqWith({ origin: MY_ORIGIN }), `${ISSUER}/mcp`, d)).toBe("my.parachute.computer");
+    });
+    test("bound resource origin resolves when the request carries no bound Origin/Referer", () => {
+      expect(consentIssuedByHost(reqWith(), `${MY_ORIGIN}/mcp`, d)).toBe("my.parachute.computer");
+    });
+    test("an unbound resource origin → issuer host (attacker-writable, never reflected)", () => {
+      expect(consentIssuedByHost(reqWith(), "https://evil.example.com/mcp", d)).toBe(ISSUER_HOST);
+    });
+    test("an unbound request Origin → issuer host", () => {
+      expect(consentIssuedByHost(reqWith({ origin: "https://evil.example.com" }), null, d)).toBe(ISSUER_HOST);
+    });
+    test("no signal at all → issuer host", () => {
+      expect(consentIssuedByHost(reqWith(), null, d)).toBe(ISSUER_HOST);
+    });
+    test("a malformed resource → issuer host (never throws)", () => {
+      expect(consentIssuedByHost(reqWith(), "not a url", d)).toBe(ISSUER_HOST);
+    });
+  });
+});
+
+/**
+ * Fix 2 — the unnamed-verb consent replaces the free-text vault input with a
+ * SELECT of the owner's own vaults. The submit contract is unchanged (server-side
+ * ownership re-validation still bites), so this is a render change plus a
+ * defense-in-depth confirmation that an unowned pick is still refused.
+ */
+describe("consent vault picker — a dropdown of the owner's vaults (not free text)", () => {
+  const base = (clientId: string, challenge: string, extra: Record<string, string> = {}): Record<string, string> => ({
+    client_id: clientId,
+    redirect_uri: REDIRECT_URI,
+    response_type: "code",
+    scope: "vault:read", // unnamed → needsVaultPick
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    ...extra,
+  });
+
+  test("renders a <select> of the owner's vaults — not a free-text input", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("alpha", userId);
+    await seedVault("beta", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(env.DB, authorizeGetReq(base(clientId, challenge), sessionId), deps());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<select id="vault_pick" name="vault_pick" class="field" required>');
+    expect(html).toContain('<option value="alpha"');
+    expect(html).toContain('<option value="beta"');
+    // The old free-text field is gone.
+    expect(html).not.toContain('name="vault_pick" type="text"');
+  });
+
+  test("exactly ONE vault is pre-selected", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("solo", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(env.DB, authorizeGetReq(base(clientId, challenge), sessionId), deps());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('<option value="solo" selected>solo</option>');
+  });
+
+  test("ZERO vaults → graceful guidance, no empty dropdown", async () => {
+    const { id: userId } = await seedUser();
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(env.DB, authorizeGetReq(base(clientId, challenge), sessionId), deps());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-testid="no-vaults"');
+    expect(html).not.toContain('<select id="vault_pick"');
+  });
+
+  test("the lockedVault path is UNCHANGED — a hidden vault_pick, no dropdown", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("work", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq(base(clientId, challenge, { vault: "work" }), sessionId),
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<input type="hidden" name="vault_pick" value="work">');
+    expect(html).not.toContain('<select id="vault_pick"');
+  });
+
+  test("SUBMIT still re-validates ownership — an unowned pick is refused (invalid_scope)", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("mine", userId); // the user owns a vault, but picks another
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizePost(
+      env.DB,
+      consentReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope: "vault:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          vault_pick: "stranger", // not owned by this user — the form is attacker-writable
+        },
+        { sessionId },
+      ),
+      deps(),
+    );
+    // Cross-origin REDIRECT_URI → the error redirect is bridged to a 200 page.
+    expect(res.status).toBe(200);
+    const target = new URL(bridgeTarget(await res.text())!);
+    expect(target.searchParams.get("error")).toBe("invalid_scope");
   });
 });
 

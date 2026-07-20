@@ -38,6 +38,7 @@ import {
   seedApprovedClient,
   seedSession,
   seedUser,
+  seedVault,
 } from "./helpers.ts";
 
 function getSetCookies(res: Response): string[] {
@@ -559,6 +560,11 @@ describe("magic link resumes a pending authorize request", () => {
     const sessionId = cookieVal(verify, "parachute_id_session");
     expect(sessionId).toBeTruthy();
 
+    // The resumed user owns a vault, so the unnamed-verb consent renders the
+    // vault-pick dropdown (the free-text input was replaced — consent UX fix).
+    const resumeUser = await getUserByEmail(env.DB, "resume@example.com");
+    await seedVault("resume-vault", resumeUser!.id);
+
     // Following the redirect WITH the fresh session lands on consent for that
     // exact request (vault:read → the vault-pick consent).
     const resumed = await handleAuthorizeGet(
@@ -570,7 +576,8 @@ describe("magic link resumes a pending authorize request", () => {
     const html = await resumed.text();
     expect(html).toContain("Authorize Claude");
     expect(html).toContain('name="state" value="st-resume-1"');
-    expect(html).toContain('name="vault_pick"');
+    expect(html).toContain('<select id="vault_pick" name="vault_pick"');
+    expect(html).toContain('<option value="resume-vault"');
   });
 
   test("the resume handle is SINGLE-USE: a second verify of the same link → 400", async () => {
