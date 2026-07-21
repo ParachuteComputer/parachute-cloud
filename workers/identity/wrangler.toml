@@ -228,16 +228,19 @@ CONSOLE_REDIRECT_HOST = "cloud.parachute.computer"
 # that never reads this worker's cookies (see the vault worker's Bearer-only
 # conformance pin, workers/vault/test/bearer-only.test.ts).
 BOUND_ORIGINS = "https://app.parachute.computer,https://my.parachute.computer"
-# APP_ORIGIN (#116) — where a new arrival lands: the app deep-link target for the
-# post-create 303, the vault cards' "Open your notes" door, the checklist doors,
-# and the day-0 welcome email link. Now that app.parachute.computer serves the app
-# + ceremonies on ONE origin, this completes the same-origin journey (signup →
-# create → land at app.parachute.computer/?add=…, zero cross-origin hops after
-# marketing). UNSET ⇒ the legacy standalone Notes PWA (a stale config degrades to
-# a live serving origin, not a 404). NOTE: PWAs installed from notes.parachute.
-# computer keep working (that origin still serves; Phase 4 bridges them) — this
-# only changes where NEW arrivals land.
-APP_ORIGIN = "https://app.parachute.computer"
+# APP_ORIGIN (#116; my.-canonical Phase 1) — where a new arrival lands: the app
+# deep-link target for the post-create 303, the vault cards' "Open your notes"
+# door, the checklist doors, and the day-0 welcome email link. Re-pointed from
+# app. → my. now that my.parachute.computer is the ONE advertised human origin
+# (VAULT_PUBLIC_ORIGIN is already my.): a new arrival lands at
+# my.parachute.computer/?add=… on the SAME origin its vault URL already names, so
+# the whole journey (signup → create → notes) is one origin end-to-end. app.
+# still serves the identical SPA (a co-equal Custom Domain on this worker) and is
+# additionally 301'd to my. by the app-redirect zone-route worker — so this only
+# changes where NEW arrivals are POINTED. UNSET ⇒ the legacy standalone Notes PWA
+# (a stale config degrades to a live serving origin, not a 404). The token issuer
+# is UNCHANGED (still cloud.): this is an advertised-origin change only.
+APP_ORIGIN = "https://my.parachute.computer"
 # Cloud addressing base. With VAULT_ORIGIN set (below) the service-catalog +
 # console cards use the path form; unset it to fall back to `https://<name>.<base>`.
 VAULT_BASE_DOMAIN = "u.parachute.computer"

@@ -44,8 +44,9 @@ export interface OAuthDeps {
    * The origin new arrivals land on — the app deep-link target for the post-create
    * arrival, the vault cards' Notes door, and the checklist doors. Resolved from
    * `env.APP_ORIGIN` (default the legacy Notes PWA) via `resolveAppOrigin`. Prod =
-   * `https://app.parachute.computer` (the same-origin app); staging = its own
-   * issuer origin (self-referential — the app is served there). No trailing slash.
+   * `https://my.parachute.computer` (the one canonical human origin, my.-canonical
+   * Phase 1); staging = its own issuer origin (self-referential — the app is
+   * served there). No trailing slash.
    */
   appOrigin: string;
   /** Deterministic clock for tests. */
@@ -153,7 +154,7 @@ export const DEFAULT_APP_ORIGIN = "https://notes.parachute.computer";
 
 /**
  * The app deep-link origin — `env.APP_ORIGIN` when set (prod =
- * `app.parachute.computer`; staging = its own issuer origin, self-referential),
+ * `my.parachute.computer`; staging = its own issuer origin, self-referential),
  * else `DEFAULT_APP_ORIGIN`. Trailing slash normalized off so `${origin}/?add=…`
  * never doubles up. The single resolver for both `depsForEnv().appOrigin` (the
  * console/cards) and the drip email link, so they can never disagree.

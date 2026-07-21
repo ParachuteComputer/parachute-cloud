@@ -21,7 +21,7 @@ import app from "../src/index.ts";
 import { CSRF, ISSUER, bridgeTarget, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 // The app deep-link origin — the wrangler-configured APP_ORIGIN (#116).
-const APP_ORIGIN = "https://app.parachute.computer";
+const APP_ORIGIN = "https://my.parachute.computer";
 
 function post(path: string, fields: Record<string, string>, cookie: string): Request {
   return new Request(`${ISSUER}${path}`, {

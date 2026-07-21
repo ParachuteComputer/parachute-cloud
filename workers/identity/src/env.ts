@@ -55,7 +55,8 @@ export interface Env {
    * The origin new arrivals land on — the app deep-link target for the
    * post-create 303, the vault cards' "Open your notes" door, the getting-started
    * checklist doors, and the day-0 welcome email link. Production =
-   * `https://app.parachute.computer` (the same-origin app + ceremonies); staging =
+   * `https://my.parachute.computer` (the one canonical human origin, my.-canonical
+   * Phase 1); staging =
    * its own workers.dev identity origin (the app is served AT the issuer there, so
    * the value is self-referential and correct). UNSET ⇒ the legacy standalone
    * Notes PWA (`https://notes.parachute.computer`), so a stale config degrades to

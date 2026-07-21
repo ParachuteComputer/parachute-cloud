@@ -1,0 +1,13 @@
+name = "parachute-app-redirect"
+main = "index.js"
+compatibility_date = "2026-07-21"
+workers_dev = false
+# Zone route on app.parachute.computer/* — takes precedence over the app. Custom
+# Domain declared on the identity worker (CF "Interaction with Routes"), so this
+# redirect worker intercepts EVERY app. request (root + deep SPA paths) at the
+# platform layer and 301s it to my. (my.-canonical Phase 1). The identity
+# worker's app. Custom Domain stays DECLARED (my-topology-routes.test.ts pins it)
+# but is shadowed by this route.
+routes = [
+  { pattern = "app.parachute.computer/*", zone_name = "parachute.computer" },
+]

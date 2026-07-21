@@ -14,6 +14,16 @@ import { handleToken } from "../src/oauth-token.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
 
 export const ISSUER = env.ISSUER;
+/**
+ * The canonical HUMAN origin (my.parachute.computer — VAULT_PUBLIC_ORIGIN in the
+ * committed prod [vars]). my.-canonical Phase 1: in PRODUCTION the legacy cloud.
+ * console front door 301/302s the human GET ceremony pages (/login, /console, /)
+ * to here, so a test that RENDERS those pages under a PRODUCTION-shaped env must
+ * drive them on THIS serving origin (my. is never CONSOLE_REDIRECT_HOST, so it
+ * serves them in EVERY env). The redirect itself is pinned in
+ * canonical-redirect.test.ts.
+ */
+export const CANONICAL_ORIGIN = (env.VAULT_PUBLIC_ORIGIN ?? env.ISSUER).replace(/\/$/, "");
 export const VAULT_BASE = env.VAULT_BASE_DOMAIN;
 export const REDIRECT_URI = "https://app.example/cb";
 export const CSRF = "test-csrf-token";

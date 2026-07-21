@@ -154,9 +154,12 @@ describe("the ASSETS binding serves the SPA shell (P1.1)", () => {
 });
 
 describe("the Host-branched root (P1.1)", () => {
-  test("`/` on the console host (CONSOLE_REDIRECT_HOST) → 302 /console (unchanged for cloud.)", async () => {
+  test("`/` on the console host (CONSOLE_REDIRECT_HOST) → 302 /console (non-production shape)", async () => {
     // ISSUER's host === cloud.parachute.computer === CONSOLE_REDIRECT_HOST in
-    // the test [vars], so this exercises the legacy console front door.
+    // the test [vars], so this exercises the legacy console front door. The test
+    // env is NON-production (ENVIRONMENT="test"), so `/` keeps the byte-identical
+    // RELATIVE /console redirect. The my.-canonical Phase 1 PRODUCTION shape (`/`
+    // → https://my.parachute.computer/console) is pinned in canonical-redirect.test.ts.
     const res = await worker.fetch(new Request(`${ISSUER}/`), env);
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/console");

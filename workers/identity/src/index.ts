@@ -53,7 +53,14 @@ import {
 } from "./oauth-metadata.ts";
 import { handleRegister } from "./oauth-register.ts";
 import { handleRevoke } from "./oauth-revoke.ts";
-import { type OAuthDeps, depsForEnv, oauthPreflight, withReflectedCors, withWildcardCors } from "./oauth-shared.ts";
+import {
+  type OAuthDeps,
+  depsForEnv,
+  frontDoorOrigin,
+  oauthPreflight,
+  withReflectedCors,
+  withWildcardCors,
+} from "./oauth-shared.ts";
 import { handleToken } from "./oauth-token.ts";
 import { handleScheduled } from "./ops.ts";
 import { handleUnsubscribe, runDrip } from "./drip.ts";
@@ -144,13 +151,54 @@ app.post("/oauth/register", async (c) =>
 );
 app.post("/oauth/revoke", async (c) => withWildcardCors(await handleRevoke(c.env.DB, c.req.raw, depsFor(c.env))));
 
+/**
+ * my.-canonical Phase 1 — the LEGACY cloud. front-door redirect for the HUMAN
+ * HTML-GET ceremony pages that still RENDER on cloud. today (`/login`,
+ * `/console`). When a GET arrives on `env.CONSOLE_REDIRECT_HOST` (the legacy
+ * console front door, `cloud.parachute.computer`), 301 it — path + query
+ * preserved — to the SAME path on the canonical human origin (`frontDoorOrigin`
+ * = my.parachute.computer in prod). Returns `null` when it does not apply, so
+ * the caller falls through to the real handler.
+ *
+ * SCOPE is the load-bearing correctness property. This is wired into ONLY the
+ * GET `/login` and GET `/console` routes below, so it is PHYSICALLY unreachable
+ * from any MACHINE path — `/oauth/*` (cloud. is the OAuth issuer), `/auth/verify`
+ * + `/auth/code` (magic-link + code consumption; old emails point at cloud.),
+ * `/unsubscribe` (RFC 8058 one-click POST won't follow a 3xx), `/billing/webhook`
+ * (Stripe's dashboard pins cloud.), and `/.well-known/*` (discovery) all keep
+ * serving on cloud., untouched. (`/signup` is deliberately NOT wired here:
+ * handleSignupGet ALREADY 302s to the my. front door on every host AND sets the
+ * headless CSRF cookie — a path-preserving 301 would double-redirect and swallow
+ * that cookie. The cloud→my property already holds for it.)
+ *
+ * PRODUCTION-GATED (`env.ENVIRONMENT === "production"`): the `cloud.` Custom
+ * Domain exists in NO other environment — staging is workers.dev only, and the
+ * handler-integration suite drives this worker on the ISSUER host in a
+ * NON-production env. Gating on production is therefore behavior-identical in
+ * every real deploy (only prod ever sees a `cloud.` host) while keeping that
+ * suite rendering these pages in place. The production behavior is pinned by
+ * canonical-redirect.test.ts via an explicit ENVIRONMENT="production" env — the
+ * same override pattern auth.test.ts uses for the production magic-link echo.
+ */
+function cloudFrontDoorRedirect(env: Env, req: Request): Response | null {
+  if (env.ENVIRONMENT !== "production") return null;
+  const host = env.CONSOLE_REDIRECT_HOST;
+  if (!host) return null;
+  const url = new URL(req.url);
+  if (url.host !== host) return null;
+  return new Response(null, {
+    status: 301,
+    headers: { location: `${frontDoorOrigin(depsFor(env))}${url.pathname}${url.search}` },
+  });
+}
+
 // --- console (accounts + vaults) ---
 app.get("/signup", (c) => handleSignupGet(c.req.raw, depsFor(c.env)));
 app.post("/signup", (c) => handleSignupPost(c.env.DB, c.req.raw, depsFor(c.env)));
-app.get("/login", (c) => handleLoginGet(c.req.raw));
+app.get("/login", (c) => cloudFrontDoorRedirect(c.env, c.req.raw) ?? handleLoginGet(c.req.raw));
 app.post("/login", (c) => handleLoginPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/logout", (c) => handleLogoutPost(c.env.DB, c.req.raw, depsFor(c.env)));
-app.get("/console", (c) => handleConsoleGet(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/console", (c) => cloudFrontDoorRedirect(c.env, c.req.raw) ?? handleConsoleGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/vaults", (c) => handleCreateVaultPost(c.env.DB, c.req.raw, depsFor(c.env)));
 // Pick/change the tier a TRIAL mirrors — NO Stripe (it only sets the internal
 // pending_plan that drives the mirrored caps). Session + CSRF + same-origin.
@@ -389,16 +437,24 @@ async function serveSpaShell(env: Env, req: Request): Promise<Response> {
 }
 
 // Host-branched root (P1.1). The legacy console front door
-// (env.CONSOLE_REDIRECT_HOST — cloud.parachute.computer in production) keeps its
-// 302→/console during the bridge; every OTHER host that reaches `/` (the
-// app.parachute.computer Custom Domain added in P1.2, and the staging
-// workers.dev origin) serves the SPA shell. `/` is run-worker-first so the
-// worker sees it before Static Assets — the one path where "worker-first" and
-// "server ceremony" diverge (route-manifest.ts ROOT_PATH).
+// (env.CONSOLE_REDIRECT_HOST — cloud.parachute.computer in production) 302s to
+// the console; every OTHER host that reaches `/` (the app.parachute.computer +
+// my.parachute.computer Custom Domains, and the staging workers.dev origin)
+// serves the SPA shell. `/` is run-worker-first so the worker sees it before
+// Static Assets — the one path where "worker-first" and "server ceremony"
+// diverge (route-manifest.ts ROOT_PATH).
+//
+// my.-canonical Phase 1: in PRODUCTION the cloud. console front door 302s to the
+// canonical my. console (absolute `${frontDoorOrigin}/console`), so a human who
+// lands on cloud./ is carried to my. — one origin. Non-production keeps the
+// byte-identical RELATIVE `/console` (cloud. exists only in production; the
+// handler suite + staging drive `/` on the ISSUER host and exercise it in
+// place). Same production-gate + rationale as `cloudFrontDoorRedirect`.
 app.get("/", (c) => {
   const host = new URL(c.req.url).host;
   if (c.env.CONSOLE_REDIRECT_HOST && host === c.env.CONSOLE_REDIRECT_HOST) {
-    return c.redirect("/console", 302);
+    const target = c.env.ENVIRONMENT === "production" ? `${frontDoorOrigin(depsFor(c.env))}/console` : "/console";
+    return c.redirect(target, 302);
   }
   return serveSpaShell(c.env, c.req.raw);
 });

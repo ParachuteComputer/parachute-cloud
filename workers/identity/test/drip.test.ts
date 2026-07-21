@@ -114,13 +114,14 @@ describe("day-0 welcome", () => {
     expect(mail.replyTo).toBe(DRIP_REPLY_TO);
     // The three doors: the app (the user's real vault), the app's Connect-AI
     // surface, reply-to-a-human. The vault door uses the configured APP_ORIGIN
-    // (wrangler default; #116); the connect door does too (post-cutover to app).
-    expect(mail.text).toContain("https://app.parachute.computer/?add=");
+    // (wrangler default my.parachute.computer, my.-canonical Phase 1; #116); the
+    // connect door does too.
+    expect(mail.text).toContain("https://my.parachute.computer/?add=");
     // The vault door advertises the PUBLIC origin (VAULT_PUBLIC_ORIGIN — my.
     // in the committed prod config), not the machine VAULT_ORIGIN (A3 URL
     // coherence); reading the env var keeps this test config-driven either way.
     expect(mail.text).toContain(encodeURIComponent(`${env.VAULT_PUBLIC_ORIGIN ?? env.VAULT_ORIGIN}/vault/freshvault`));
-    expect(mail.text).toContain("https://app.parachute.computer/connect");
+    expect(mail.text).toContain("https://my.parachute.computer/connect");
     expect(mail.text).not.toContain(`${ISSUER}/console`);
     expect(mail.text).toContain("Reply to this email. A person reads it.");
     // The unsubscribe link rides the footer AND the header field.
@@ -210,7 +211,7 @@ describe("day-3 connect nudge", () => {
     expect(sender.sent.map((m) => m.to)).toEqual(["due@example.com"]);
     const mail = sender.sent[0]!;
     expect(mail.subject).toBe("Connect your AI to your vault");
-    expect(mail.text).toContain("https://app.parachute.computer/connect");
+    expect(mail.text).toContain("https://my.parachute.computer/connect");
     expect(mail.text).not.toContain(`${ISSUER}/console`);
     expect(mail.text).toContain(mail.unsubscribeUrl);
   });
