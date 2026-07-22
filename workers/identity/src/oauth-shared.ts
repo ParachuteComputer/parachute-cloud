@@ -8,6 +8,7 @@
  * conformance corpus can inject `now` for the rotation-grace timing tests while
  * the Worker (index.ts) calls them with the request-time deps.
  */
+import { isRequestableAccountScope } from "@openparachute/door-contract";
 import { VAULT_VERBS } from "./audience.ts";
 import { billingConfig, mockBillingEnabled } from "./billing-config.ts";
 import { randomBase64url } from "./crypto.ts";
@@ -552,15 +553,22 @@ export function oauthErrorRedirect(
  * which the picker narrows) stays requestable — the vault owner grants it.
  * Mirrors the hub's behavior asserted by its DCR/authorize tests.
  *
- * The `account:*` namespace (`account:<id>:{admin,read}`, C1/SCOPE-c) is ALWAYS
- * non-requestable: account tokens are cookie-minted only (`POST /account/token`,
- * C2) and must never flow through `/oauth/authorize`. The 3-part account grammar
- * would slip past the 2-part service-admin rule below, so the whole namespace is
- * refused up front — an `account:<id>:read` is as un-requestable as its admin.
+ * The `account:*` namespace is non-requestable BY DEFAULT — account tokens are
+ * cookie-minted (`POST /account/token`, C2) and `account:<id>:{admin,read}` /
+ * `account:admin` / `account:read` must never flow through `/oauth/authorize`.
+ * The ONE deliberate exception (Wave A) is the account-vaults CONNECTION scope
+ * `account:vaults` (un-narrowed, PRM-advertised) and its consent-bound blanket
+ * `account:<id>:vaults` — the narrow surface that opens the account-MCP door.
+ * The 4-part consent-NARROWED form `account:<id>:vaults:<vault>` stays
+ * non-requestable (a client asks for the blanket; consent narrows it — a client
+ * cannot pre-narrow itself). The single source of that grammar is the shared
+ * `isRequestableAccountScope` (door-contract), so cloud and hub agree
+ * byte-for-byte and casing variants fail closed. The service-admin rule below is
+ * BYTE-IDENTICAL to before.
  */
 export function isNonRequestableScope(scope: string): boolean {
   const parts = scope.split(":");
-  if (parts[0] === "account") return true;
+  if (parts[0] === "account") return !isRequestableAccountScope(scope);
   return parts.length === 2 && parts[1] === "admin" && parts[0] !== "vault";
 }
 

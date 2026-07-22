@@ -170,6 +170,50 @@ describe("C3 — the Bearer gate", () => {
     expect(res.status).toBe(401);
     expect(((await res.json()) as { error: string }).error).toBe("invalid_token");
   });
+
+  test("403 insufficient_scope: a Wave A account-vaults token has NO /account/* REST authority", async () => {
+    // A `account:<id>:vaults` token (aud=account, sub===id) VALIDATES — the belt
+    // covers the vaults family — but it opens the account-MCP surface, NOT the
+    // REST tier. The read/admin gate (`hasAccountScope`) finds no authority → 403.
+    const { id } = await seedUser("vaults-scoped@example.com");
+    const vaultsToken = await signAccessToken(db(), {
+      sub: id,
+      scopes: [`account:${id}:vaults`],
+      audience: ACCOUNT_TOKEN_AUDIENCE,
+      clientId: ACCOUNT_TOKEN_CLIENT_ID,
+      issuer: ISSUER,
+      vaultScope: [],
+      ttlSeconds: 600,
+    });
+    const res = await handleAccountVaultsList(
+      db(),
+      accountReq("GET", "/account/vaults", { token: vaultsToken.token }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("insufficient_scope");
+  });
+
+  test("403 insufficient_scope: a NARROWED 4-part account-vaults token also has no REST authority", async () => {
+    const { id } = await seedUser("vaults-narrowed@example.com");
+    await seedVault("alpha", id);
+    const narrowedToken = await signAccessToken(db(), {
+      sub: id,
+      scopes: [`account:${id}:vaults:alpha`],
+      audience: ACCOUNT_TOKEN_AUDIENCE,
+      clientId: ACCOUNT_TOKEN_CLIENT_ID,
+      issuer: ISSUER,
+      vaultScope: [],
+      ttlSeconds: 600,
+    });
+    const res = await handleAccountVaultCreate(
+      db(),
+      accountReq("POST", "/account/vaults", { token: narrowedToken.token, body: { name: "nope" } }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("insufficient_scope");
+  });
 });
 
 // --- GET /account/vaults -----------------------------------------------------

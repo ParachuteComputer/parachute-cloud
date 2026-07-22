@@ -2,7 +2,21 @@
  * Grants — "user U approved scope-set S for client C". Port of the hub's
  * `grants.ts`. UNION-merge on record; skip consent iff every requested scope is
  * already in the grant's set (a strict superset re-prompts).
+ *
+ * ACCOUNT-VAULTS EXCEPTION (Wave A) — union-merge is one-way for a NARROWING
+ * choice: if a user first grants the blanket `account:<id>:vaults` and later
+ * re-consents to a NARROWED subset (4-part scopes), a plain union would keep the
+ * blanket too, silently re-widening the grant. So when a recorded consent
+ * carries account-vaults-family scopes, the existing account-vaults family for
+ * that grant is DROPPED before the merge (family-replace), letting a later
+ * narrowing actually narrow. Every other scope family stays union-merged.
  */
+import { parseAccountVaultsScope } from "@openparachute/door-contract";
+
+/** An `account:<id>:vaults[:<vault>]` (blanket or 4-part narrowed) scope — the family a re-consent REPLACES rather than unions. */
+function isAccountVaultsFamilyScope(scope: string): boolean {
+  return parseAccountVaultsScope(scope) !== null;
+}
 
 export interface Grant {
   userId: string;
@@ -44,7 +58,14 @@ export async function recordGrant(
   now: Date = new Date(),
 ): Promise<Grant> {
   const existing = await findGrant(db, userId, clientId);
-  const merged = new Set<string>(existing?.scopes ?? []);
+  // Family-replace the account-vaults family when this consent carries one, so a
+  // narrowing re-consent is not silently re-widened by a union with the prior
+  // blanket. Every other scope family is preserved (union).
+  const recordingAccountVaults = newScopes.some(isAccountVaultsFamilyScope);
+  const base = (existing?.scopes ?? []).filter(
+    (s) => !(recordingAccountVaults && isAccountVaultsFamilyScope(s)),
+  );
+  const merged = new Set<string>(base);
   for (const s of newScopes) if (s.length > 0) merged.add(s);
   const scopes = Array.from(merged).sort();
   const grantedAt = now.toISOString();

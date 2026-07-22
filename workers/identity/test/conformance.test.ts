@@ -1671,6 +1671,318 @@ describe("consent verb selector — owner-elected vault:admin (port hub#689)", (
   });
 });
 
+/**
+ * Wave A — the account-vaults consent + token path. `account:vaults` is the ONE
+ * requestable account scope; the consent narrows it to a BLANKET
+ * (`account:<id>:vaults`) or a per-vault NARROWED set (4-part scopes). The
+ * narrowing rides the SCOPE STRING (not `vault_scope`, which is inert for account
+ * tokens and reset on refresh), so the load-bearing property is that a refresh
+ * preserves the narrowed set byte-identically. The account id is ALWAYS the
+ * session user; a forged/foreign id or an unowned vault is refused.
+ */
+describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () => {
+  const fields = (clientId: string, challenge: string, extra: Record<string, string> = {}): Record<string, string> => ({
+    client_id: clientId,
+    redirect_uri: REDIRECT_URI,
+    response_type: "code",
+    scope: "account:vaults",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    ...extra,
+  });
+
+  /** POST /oauth/authorize consent carrying N `vault_include` checkboxes. */
+  function accountVaultsConsentReq(
+    fieldMap: Record<string, string>,
+    vaultIncludes: string[],
+    opts: { sessionId: string; decision?: string },
+  ): Request {
+    const body = new URLSearchParams({
+      __action: "consent",
+      __csrf: CSRF,
+      decision: opts.decision ?? "approve",
+      ...fieldMap,
+    });
+    for (const v of vaultIncludes) body.append("vault_include", v);
+    return new Request(`${ISSUER}/oauth/authorize`, {
+      method: "POST",
+      body,
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: ISSUER,
+        cookie: `${SESSION_COOKIE}=${opts.sessionId}; parachute_id_csrf=${CSRF}`,
+      },
+    });
+  }
+
+  async function codeFromConsent(res: Response): Promise<string> {
+    expect(res.status).toBe(200);
+    return new URL(bridgeTarget(await res.text())!).searchParams.get("code")!;
+  }
+
+  async function mintFromCode(clientId: string, code: string, verifier: string): Promise<Response> {
+    return handleToken(
+      env.DB,
+      tokenReq({ grant_type: "authorization_code", code, client_id: clientId, redirect_uri: REDIRECT_URI, code_verifier: verifier }),
+      deps(),
+    );
+  }
+
+  /** Issue an auth code with arbitrary scopes (bypassing consent) + redeem it —
+   *  drives the token-endpoint mint gate directly (denyForeignAccountMint). */
+  async function mintTokenWithScopes(clientId: string, userId: string, scopes: string[]): Promise<Response> {
+    const { issueAuthCode } = await import("../src/auth-codes.ts");
+    const { verifier, challenge } = await makePkce();
+    const code = await issueAuthCode(env.DB, {
+      clientId,
+      userId,
+      redirectUri: REDIRECT_URI,
+      scopes,
+      codeChallenge: challenge,
+      codeChallengeMethod: "S256",
+    });
+    return handleToken(
+      env.DB,
+      tokenReq({ grant_type: "authorization_code", code: code.code, client_id: clientId, redirect_uri: REDIRECT_URI, code_verifier: verifier }),
+      deps(),
+    );
+  }
+
+  // --- render ---------------------------------------------------------------
+
+  test("consent renders a CHECKED checkbox per owned vault + the create-new line + static copy", async () => {
+    const { id: userId } = await seedUser("av-render@example.com");
+    await seedVault("alpha", userId);
+    await seedVault("beta", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(env.DB, authorizeGetReq(fields(clientId, challenge), sessionId), deps());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-testid="account-vaults"');
+    expect(html).toContain('name="vault_include" value="alpha" checked');
+    expect(html).toContain('name="vault_include" value="beta" checked');
+    // The always-visible "Create new vaults" line (static copy, describes the blanket).
+    expect(html).toContain('data-testid="account-vaults-create-new"');
+    expect(html).toContain("vaults you create later are included automatically");
+    // The scope label copy.
+    expect(html).toContain("List, create, and search across the vaults in your account");
+    // NOT the vault-picker / verb-selector surface (mutually exclusive).
+    expect(html).not.toContain('name="vault_pick"');
+    expect(html).not.toContain('name="verb_select"');
+    // No inline script — the strict consent CSP admits none.
+    expect(html).not.toContain("<script");
+  });
+
+  // --- consent narrowing → token vectors ------------------------------------
+
+  test("blanket (all vaults checked) → the single 3-part account:<id>:vaults, aud=account", async () => {
+    const { id: userId } = await seedUser("av-blanket@example.com");
+    await seedVault("alpha", userId);
+    await seedVault("beta", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { verifier, challenge } = await makePkce();
+    const consent = await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, challenge), ["alpha", "beta"], { sessionId }),
+      deps(),
+    );
+    const code = await codeFromConsent(consent);
+    const tokenRes = await mintFromCode(clientId, code, verifier);
+    expect(tokenRes.status).toBe(200);
+    const pair = (await tokenRes.json()) as { scope: string; access_token: string };
+    // Exactly the blanket — no 4-part scopes.
+    expect(pair.scope.split(" ")).toEqual([`account:${userId}:vaults`]);
+    expect(decodeJwtPayload(pair.access_token).aud).toBe("account");
+  });
+
+  test("narrowed (subset checked) → one 4-part scope per checked vault, NO bare 3-part", async () => {
+    const { id: userId } = await seedUser("av-narrow@example.com");
+    await seedVault("alpha", userId);
+    await seedVault("beta", userId);
+    await seedVault("gamma", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { verifier, challenge } = await makePkce();
+    const consent = await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, challenge), ["alpha", "gamma"], { sessionId }),
+      deps(),
+    );
+    const code = await codeFromConsent(consent);
+    const tokenRes = await mintFromCode(clientId, code, verifier);
+    expect(tokenRes.status).toBe(200);
+    const pair = (await tokenRes.json()) as { scope: string; access_token: string };
+    expect(pair.scope.split(" ").sort()).toEqual([`account:${userId}:vaults:alpha`, `account:${userId}:vaults:gamma`]);
+    // No bare 3-part blanket smuggled in alongside.
+    expect(pair.scope.split(" ")).not.toContain(`account:${userId}:vaults`);
+    expect(decodeJwtPayload(pair.access_token).aud).toBe("account");
+  });
+
+  test("THE LOAD-BEARING PIN: refresh rotation preserves a NARROWED set byte-identically (never widens to blanket)", async () => {
+    const { id: userId } = await seedUser("av-refresh-narrow@example.com");
+    await seedVault("alpha", userId);
+    await seedVault("beta", userId);
+    await seedVault("gamma", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { verifier, challenge } = await makePkce();
+    const consent = await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, challenge), ["alpha", "gamma"], { sessionId }),
+      deps(),
+    );
+    const code = await codeFromConsent(consent);
+    const tokenRes = await mintFromCode(clientId, code, verifier);
+    const pair = (await tokenRes.json()) as { scope: string; refresh_token: string };
+    const expected = [`account:${userId}:vaults:alpha`, `account:${userId}:vaults:gamma`];
+    expect(pair.scope.split(" ").sort()).toEqual(expected);
+    // Rotate. The narrowing rides the scope string, so it MUST survive intact —
+    // a vault_scope-carried narrowing would silently widen to blanket here.
+    const refreshed = await refreshAt(clientId, pair.refresh_token, new Date());
+    expect(refreshed.status).toBe(200);
+    const rp = (await refreshed.json()) as { scope: string; access_token: string };
+    expect(rp.scope).toBe(pair.scope); // byte-identical
+    expect(rp.scope).not.toBe(`account:${userId}:vaults`); // NOT widened to blanket
+    expect((decodeJwtPayload(rp.access_token).scope as string).split(" ").sort()).toEqual(expected);
+    expect(decodeJwtPayload(rp.access_token).aud).toBe("account");
+  });
+
+  test("refresh rotation preserves a BLANKET grant (stays the single 3-part)", async () => {
+    const { id: userId } = await seedUser("av-refresh-blanket@example.com");
+    await seedVault("alpha", userId);
+    await seedVault("beta", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { verifier, challenge } = await makePkce();
+    const consent = await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, challenge), ["alpha", "beta"], { sessionId }),
+      deps(),
+    );
+    const code = await codeFromConsent(consent);
+    const pair = (await (await mintFromCode(clientId, code, verifier)).json()) as { scope: string; refresh_token: string };
+    expect(pair.scope).toBe(`account:${userId}:vaults`);
+    const refreshed = await refreshAt(clientId, pair.refresh_token, new Date());
+    const rp = (await refreshed.json()) as { scope: string };
+    expect(rp.scope).toBe(`account:${userId}:vaults`);
+  });
+
+  // --- recordGrant family-replace -------------------------------------------
+
+  test("re-consenting NARROWED after BLANKET DROPS the blanket (narrowing is not one-way)", async () => {
+    const { id: userId } = await seedUser("av-replace@example.com");
+    await seedVault("alpha", userId);
+    await seedVault("beta", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge: c1 } = await makePkce();
+    await handleAuthorizePost(env.DB, accountVaultsConsentReq(fields(clientId, c1), ["alpha", "beta"], { sessionId }), deps());
+    const { challenge: c2 } = await makePkce();
+    await handleAuthorizePost(env.DB, accountVaultsConsentReq(fields(clientId, c2), ["alpha"], { sessionId }), deps());
+    const { findGrant } = await import("../src/grants.ts");
+    const grant = await findGrant(env.DB, userId, clientId);
+    // Family-replace: the blanket `account:<id>:vaults` is gone, only the 4-part.
+    expect(grant?.scopes).toEqual([`account:${userId}:vaults:alpha`]);
+  });
+
+  // --- refusals -------------------------------------------------------------
+
+  test("a forged vault_include naming an UNOWNED vault is refused (invalid_scope)", async () => {
+    const { id: userId } = await seedUser("av-forge@example.com");
+    await seedVault("mine", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const consent = await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, challenge), ["mine", "stranger"], { sessionId }),
+      deps(),
+    );
+    // Cross-origin error redirect → bridged to a 200 page carrying the error.
+    expect(consent.status).toBe(200);
+    const target = new URL(bridgeTarget(await consent.text())!);
+    expect(target.searchParams.get("error")).toBe("invalid_scope");
+  });
+
+  test("zero vaults checked → a 400 error (no grant, no code)", async () => {
+    const { id: userId } = await seedUser("av-zero@example.com");
+    await seedVault("mine", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const consent = await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, challenge), [], { sessionId }),
+      deps(),
+    );
+    expect(consent.status).toBe(400);
+  });
+
+  test("a request naming account:<other>:vaults is refused at authorize (foreign-id gate)", async () => {
+    const { id: userId } = await seedUser("av-foreign@example.com");
+    const { id: otherId } = await seedUser("av-other@example.com");
+    await seedVault("mine", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq(fields(clientId, challenge, { scope: `account:${otherId}:vaults` }), sessionId),
+      deps(),
+    );
+    // GET path → a direct 302 error redirect (not bridged).
+    expect(res.status).toBe(302);
+    expect(new URL(res.headers.get("location")!).searchParams.get("error")).toBe("invalid_scope");
+  });
+
+  test("a MIXED account:vaults + vault:read request is refused at authorize", async () => {
+    const { id: userId } = await seedUser("av-mixed@example.com");
+    await seedVault("mine", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq(fields(clientId, challenge, { scope: "account:vaults vault:read" }), sessionId),
+      deps(),
+    );
+    expect(res.status).toBe(302);
+    expect(new URL(res.headers.get("location")!).searchParams.get("error")).toBe("invalid_scope");
+  });
+
+  // --- token-endpoint mint gate (denyForeignAccountMint) --------------------
+
+  test("an UN-NARROWED account:vaults reaching the token endpoint is refused (consent must narrow)", async () => {
+    const { id: userId } = await seedUser("av-mint-unnarrowed@example.com");
+    const { clientId } = await seedApprovedClient();
+    const res = await mintTokenWithScopes(clientId, userId, ["account:vaults"]);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
+  });
+
+  test("an account:<other>:vaults reaching the token endpoint is refused (subject mismatch)", async () => {
+    const { id: userId } = await seedUser("av-mint-foreign@example.com");
+    const { clientId } = await seedApprovedClient();
+    const res = await mintTokenWithScopes(clientId, userId, ["account:someone-else:vaults"]);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
+  });
+
+  test("a 4-part account:<userId>:vaults:<vault> mints cleanly (aud=account, scope preserved)", async () => {
+    const { id: userId } = await seedUser("av-mint-narrowed@example.com");
+    await seedVault("alpha", userId);
+    const { clientId } = await seedApprovedClient();
+    const res = await mintTokenWithScopes(clientId, userId, [`account:${userId}:vaults:alpha`]);
+    expect(res.status).toBe(200);
+    const pair = (await res.json()) as { scope: string; access_token: string };
+    expect(pair.scope).toBe(`account:${userId}:vaults:alpha`);
+    expect(decodeJwtPayload(pair.access_token).aud).toBe("account");
+  });
+});
+
 // --- E2E through the real router ------------------------------------------
 
 describe("E2E through the router: DCR → authorize → consent → token", () => {

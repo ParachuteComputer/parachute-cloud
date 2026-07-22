@@ -153,6 +153,10 @@ const STYLE = `
   .verbopt-title{font-family:var(--font-round);font-size:.9rem;font-weight:600;display:flex;align-items:center;gap:.4rem}
   .verbopt-desc{color:var(--muted);font-size:.84rem}
   .verbbadge{display:inline-block;background:var(--accent-soft);border:1px solid var(--accent-soft-line);color:var(--accent-soft-ink);border-radius:var(--pill);font-family:var(--font-round);font-size:.68rem;font-weight:700;letter-spacing:.03em;text-transform:uppercase;padding:.05rem .45rem}
+  fieldset.vaultinclude{border:1px solid var(--line);border-radius:var(--radius-panel);padding:.4rem .9rem .9rem;margin:1rem 0 0}
+  fieldset.vaultinclude>legend{font-family:var(--font-round);font-size:.82rem;font-weight:600;padding:0 .35rem;color:var(--ink)}
+  .vaultopt{display:flex;align-items:center;gap:.6rem;margin:.4rem 0 0;font-family:var(--font-round);font-size:.92rem}
+  .vaultopt input{margin:0;flex:none}
   .check{list-style:none;padding:0;margin:.3rem 0 0}
   .check>li{border-top:1px solid var(--line)}
   .check>li:first-child{border-top:0}
@@ -305,6 +309,23 @@ export interface ConsentProps {
    * mint are the backstops).
    */
   verbSelector: OwnerVerbSelector | null;
+  /**
+   * Wave A account-vaults consent block, or null. Non-null ONLY for an
+   * account-vaults request (`account:vaults` / `account:<id>:vaults`) — carries
+   * the owner's vault names, each rendered as a CHECKED checkbox
+   * (`name="vault_include"`). Leaving every box checked records the BLANKET grant
+   * (`account:<id>:vaults`, covering vaults created later); unchecking some
+   * narrows to a 4-part scope per checked vault. Mutually exclusive with the
+   * vault-picker / verb-selector branch (a mixed account+vault request is refused
+   * upstream). The submit re-validates every checked name against ownership
+   * server-side, so this list is UX, not the security boundary.
+   */
+  accountVaults: AccountVaultsConsent | null;
+}
+
+export interface AccountVaultsConsent {
+  /** The signed-in owner's vault names — one CHECKED checkbox each (default all). */
+  ownedVaults: string[];
 }
 
 export interface OwnerVerbSelector {
@@ -336,6 +357,11 @@ function scopeLabel(scope: string): string {
   if (scope === "vault:read" || /^vault:[^:]+:read$/.test(scope)) return "Read your vault notes";
   if (scope === "vault:write" || /^vault:[^:]+:write$/.test(scope)) return "Create and edit your vault notes";
   if (scope === "vault:admin" || /^vault:[^:]+:admin$/.test(scope)) return "Full administrative access to your vault";
+  // Wave A account-vaults connection scope: the un-narrowed request form
+  // (`account:vaults`) and the consent-bound blanket (`account:<id>:vaults`).
+  if (scope === "account:vaults" || /^account:[^:]+:vaults$/.test(scope)) {
+    return "List, create, and search across the vaults in your account";
+  }
   return scope;
 }
 
@@ -393,8 +419,36 @@ function renderVerbSelector(selector: OwnerVerbSelector): string {
          </fieldset>`;
 }
 
+/**
+ * Wave A account-vaults consent block — one CHECKED checkbox per vault the owner
+ * holds (`name="vault_include"`, all checked by default, the ratified
+ * "all-vaults-checked" default), plus a SEPARATE always-visible "Create new
+ * vaults" line of static copy explaining the blanket behavior. NO inline script
+ * (the strict consent CSP admits none). The submit re-validates each checked
+ * name against ownership server-side (`handleConsentSubmit`), so this render is
+ * UX, not the boundary. Zero owned vaults renders guidance instead of an empty
+ * list — a person needs a vault before the account-MCP surface is useful.
+ */
+function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
+  if (consent.ownedVaults.length === 0) {
+    return `<p class="muted" data-testid="account-vaults-none" style="margin:.85rem 0 0">You don't have a vault yet — <a href="/console">create one</a>, then reconnect to grant access.</p>`;
+  }
+  const boxes = consent.ownedVaults
+    .map(
+      (name) =>
+        `<label class="vaultopt"><input type="checkbox" name="vault_include" value="${esc(name)}" checked> <span>${esc(name)}</span></label>`,
+    )
+    .join("\n");
+  return `<fieldset class="vaultinclude" data-testid="account-vaults">
+           <legend>Vaults to include</legend>
+           <p class="muted" style="margin:.3rem 0 .6rem;font-size:.84rem">Choose which vaults this app can list, create in, and search across. All are selected by default.</p>
+           ${boxes}
+           <p class="muted" data-testid="account-vaults-create-new" style="margin:.7rem 0 0;font-size:.84rem">Create new vaults — while every vault stays selected, vaults you create later are included automatically.</p>
+         </fieldset>`;
+}
+
 export function renderConsent(props: ConsentProps): string {
-  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector } = props;
+  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults } = props;
   const scopeList = scopeDescriptions
     .map((s) => `<li><strong>${esc(s.label)}</strong><br><span class="muted">${esc(s.scope)}</span></li>`)
     .join("\n");
@@ -405,6 +459,7 @@ export function renderConsent(props: ConsentProps): string {
       ? renderVaultPicker(ownedVaults)
       : "";
   const verbSelectorField = verbSelector ? renderVerbSelector(verbSelector) : "";
+  const accountVaultsField = accountVaults ? renderAccountVaultsBlock(accountVaults) : "";
   return page(
     "Authorize — Parachute",
     `<h1>Authorize ${esc(clientName)}</h1>
@@ -420,6 +475,7 @@ export function renderConsent(props: ConsentProps): string {
          ${hiddenParams(params)}
          ${vaultField}
          ${verbSelectorField}
+         ${accountVaultsField}
          <div class="row">
            <button class="deny" type="submit" name="decision" value="deny">Deny</button>
            <button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Approve</button>

@@ -31,6 +31,9 @@ import {
   deps,
   makePkce,
   seedApprovedClient,
+  seedSession,
+  seedUser,
+  seedVault,
 } from "./helpers.ts";
 
 const ACCOUNT_ID = "user-c1";
@@ -192,5 +195,111 @@ describe("validateAccountToken — aud=account pinned + principal derivation", (
     if (!res.ok) return;
     expect(hasAccountScope(res.token.scopes, res.token.accountId, "read")).toBe(true);
     expect(hasAccountScope(res.token.scopes, res.token.accountId, "admin")).toBe(false);
+  });
+});
+
+// --- Wave A: the account-vaults wall exception ------------------------------
+
+const VAULTS_UNNARROWED = "account:vaults";
+const VAULTS_BLANKET = `account:${ACCOUNT_ID}:vaults`;
+const VAULTS_NARROWED = `account:${ACCOUNT_ID}:vaults:work`;
+
+describe("account-vaults scope grammar — the one requestable account scope", () => {
+  test("account:vaults (un-narrowed) + account:<id>:vaults (blanket) ARE requestable", () => {
+    expect(isNonRequestableScope(VAULTS_UNNARROWED)).toBe(false);
+    expect(isNonRequestableScope(VAULTS_BLANKET)).toBe(false);
+  });
+
+  test("the 4-part narrowed form + admin/read stay NON-requestable (wall stays closed)", () => {
+    // A client asks for the blanket; consent narrows it — never a pre-narrowed request.
+    expect(isNonRequestableScope(VAULTS_NARROWED)).toBe(true);
+    expect(isNonRequestableScope(ADMIN)).toBe(true);
+    expect(isNonRequestableScope(READ)).toBe(true);
+    expect(isNonRequestableScope("account:admin")).toBe(true);
+    expect(isNonRequestableScope("account:read")).toBe(true);
+  });
+
+  test("a mis-cased verb on the account namespace fails CLOSED (exact-lowercase grammar)", () => {
+    // A lowercase `account:` prefix with a mis-cased verb enters the account
+    // branch and is refused (the canon's exact-lowercase rule). (A fully
+    // capitalized `Account:...` never enters the account namespace at all and is
+    // inert downstream — startsWith("account:") + both parsers reject it — so it
+    // grants nothing regardless of what the wall labels it.)
+    expect(isNonRequestableScope("account:Vaults")).toBe(true);
+    expect(isNonRequestableScope("account:VAULTS")).toBe(true);
+    expect(isNonRequestableScope(`account:${ACCOUNT_ID}:Vaults`)).toBe(true);
+  });
+
+  test("the service-admin + vault rules are BYTE-IDENTICAL (regression)", () => {
+    expect(isNonRequestableScope("hub:admin")).toBe(true);
+    expect(isNonRequestableScope("vault:field-notes:admin")).toBe(false);
+    expect(isNonRequestableScope("vault:read")).toBe(false);
+  });
+
+  test("findNonRequestableScopes flags admin/read but NOT the vaults connection scope", () => {
+    expect(findNonRequestableScopes([VAULTS_UNNARROWED, VAULTS_BLANKET, ADMIN, READ])).toEqual([ADMIN, READ]);
+  });
+});
+
+describe("account-vaults at /oauth/authorize — renders consent, not refused (live)", () => {
+  test("a signed-in owner's account:vaults request renders the consent block (not invalid_scope)", async () => {
+    const { id: userId } = await seedUser("av-consent@example.com");
+    await seedVault("work", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Some App" });
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(
+      db(),
+      authorizeGetReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope: VAULTS_UNNARROWED,
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        },
+        sessionId,
+      ),
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-testid="account-vaults"');
+    expect(html).toContain('name="vault_include" value="work" checked');
+  });
+});
+
+describe("validateAccountToken — the Wave A vaults family (belt covers it, no REST authority)", () => {
+  test("a vaults-only token VALIDATES (sub===id belt) but carries NO admin/read authority", async () => {
+    const token = await mintAccountToken({ scopes: [VAULTS_BLANKET] });
+    const res = await validateAccountToken(db(), token, { issuer: ISSUER });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.token.accountId).toBe(ACCOUNT_ID);
+    expect(res.token.scopes).toEqual([VAULTS_BLANKET]);
+    // The vaults family opens the account-MCP surface, NOT the /account/* REST tier.
+    expect(hasAccountScope(res.token.scopes, res.token.accountId, "read")).toBe(false);
+    expect(hasAccountScope(res.token.scopes, res.token.accountId, "admin")).toBe(false);
+  });
+
+  test("a narrowed 4-part vaults token validates + returns its scopes verbatim", async () => {
+    const scopes = [`account:${ACCOUNT_ID}:vaults:work`, `account:${ACCOUNT_ID}:vaults:home`];
+    const token = await mintAccountToken({ scopes });
+    const res = await validateAccountToken(db(), token, { issuer: ISSUER });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.token.accountId).toBe(ACCOUNT_ID);
+    expect(res.token.scopes).toEqual(scopes);
+  });
+
+  test("a vaults scope whose <id> ≠ sub trips the cross-account belt (401)", async () => {
+    // sub defaults to ACCOUNT_ID; the scope names a DIFFERENT account.
+    const token = await mintAccountToken({ scopes: ["account:someone-else:vaults"] });
+    const res = await validateAccountToken(db(), token, { issuer: ISSUER });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.status).toBe(401);
+    expect(res.error).toBe("invalid_token");
   });
 });

@@ -113,7 +113,7 @@ describe("served SPA source", () => {
       stderr: "pipe",
     });
     expect(result.exitCode, result.stderr.toString()).toBe(0);
-    expect(result.stdout.toString()).toContain("door-contract v0.4.0");
+    expect(result.stdout.toString()).toContain("door-contract v0.5.0");
     expect(existsSync(resolve(pinnedHub, "packages/door-contract/dist/index.js"))).toBe(true);
   });
 
