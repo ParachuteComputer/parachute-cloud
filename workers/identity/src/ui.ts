@@ -422,12 +422,19 @@ function renderVerbSelector(selector: OwnerVerbSelector): string {
 /**
  * Wave A account-vaults consent block — one CHECKED checkbox per vault the owner
  * holds (`name="vault_include"`, all checked by default, the ratified
- * "all-vaults-checked" default), plus a SEPARATE always-visible "Create new
- * vaults" line of static copy explaining the blanket behavior. NO inline script
- * (the strict consent CSP admits none). The submit re-validates each checked
- * name against ownership server-side (`handleConsentSubmit`), so this render is
- * UX, not the boundary. Zero owned vaults renders guidance instead of an empty
- * list — a person needs a vault before the account-MCP surface is useful.
+ * "all-vaults-checked" default) governing which EXISTING vaults this connection
+ * can see and search, plus a SEPARATE always-visible "Create new vaults" line.
+ * Creating a vault is an ACCOUNT-LEVEL capability (the scope label is "list,
+ * create, and search"), orthogonal to which existing vaults are selected — so
+ * the copy frames it as always available and does NOT tie it to "every vault
+ * stays selected" (which wrongly implied create was gated on a blanket grant).
+ * The one nuance a person needs: a vault created while the grant is NARROWED
+ * won't be part of THIS connection until they reconnect (blanket auto-includes
+ * future vaults; a narrowed grant is a fixed list). NO inline script (the strict
+ * consent CSP admits none). The submit re-validates each checked name against
+ * ownership server-side (`handleConsentSubmit`), so this render is UX, not the
+ * boundary. Zero owned vaults renders guidance instead of an empty list — a
+ * person needs a vault before the account-MCP surface is useful.
  */
 function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
   if (consent.ownedVaults.length === 0) {
@@ -441,9 +448,9 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
     .join("\n");
   return `<fieldset class="vaultinclude" data-testid="account-vaults">
            <legend>Vaults to include</legend>
-           <p class="muted" style="margin:.3rem 0 .6rem;font-size:.84rem">Choose which vaults this app can list, create in, and search across. All are selected by default.</p>
+           <p class="muted" style="margin:.3rem 0 .6rem;font-size:.84rem">Choose which vaults this app can see and search across. All are selected by default.</p>
            ${boxes}
-           <p class="muted" data-testid="account-vaults-create-new" style="margin:.7rem 0 0;font-size:.84rem">Create new vaults — while every vault stays selected, vaults you create later are included automatically.</p>
+           <p class="muted" data-testid="account-vaults-create-new" style="margin:.7rem 0 0;font-size:.84rem">Create new vaults — this app can always create new vaults in your account, regardless of the selection above. A vault you create while some are unselected won't be part of this connection until you reconnect.</p>
          </fieldset>`;
 }
 

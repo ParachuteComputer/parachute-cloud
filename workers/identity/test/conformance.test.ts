@@ -1763,9 +1763,12 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     expect(html).toContain('data-testid="account-vaults"');
     expect(html).toContain('name="vault_include" value="alpha" checked');
     expect(html).toContain('name="vault_include" value="beta" checked');
-    // The always-visible "Create new vaults" line (static copy, describes the blanket).
+    // The always-visible "Create new vaults" line: create is an ACCOUNT-LEVEL
+    // capability, NOT gated on all-vaults-selected, with the reconnect nuance
+    // for vaults made under a narrowed grant.
     expect(html).toContain('data-testid="account-vaults-create-new"');
-    expect(html).toContain("vaults you create later are included automatically");
+    expect(html).toContain("regardless of the selection above");
+    expect(html).toContain("won't be part of this connection until you reconnect");
     // The scope label copy.
     expect(html).toContain("List, create, and search across the vaults in your account");
     // NOT the vault-picker / verb-selector surface (mutually exclusive).

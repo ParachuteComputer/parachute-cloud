@@ -2109,6 +2109,266 @@ async function main() {
     }
   }
 
+  // 21. Account-level MCP (Wave A) — the whole account-MCP door end to end, on
+  //     a throwaway account with TWO seeded vaults:
+  //       blanket consent → account token (aud=account + refresh) → PRM shape →
+  //       initialize + tools/list (EXACTLY 3) → query-notes fan-out with
+  //       per-vault attribution → create-vault (no token leaked) → refresh the
+  //       grant → the new vault is covered (blanket-covers-future) → a NARROWED
+  //       re-consent (uncheck a vault) → that vault is excluded.
+  //     Wrapped non-fatal so a hiccup can't abort a partial run.
+  try {
+    const stamp = Date.now();
+    const amEmail = `smoke-acct+${stamp}@example.com`;
+    const amPassword = b64url(crypto.getRandomValues(new Uint8Array(18)));
+    const vaultA = `acct-a-${stamp}`;
+    const vaultB = `acct-b-${stamp}`;
+    // FTS-safe single-token markers (lowercase alphanumerics — no hyphens, which
+    // FTS5 can read as operators). `shared` lands in BOTH notes; `uniqA`/`uniqB`
+    // are per-vault so an attribution probe can isolate one vault's content.
+    const sharedTok = `acctshared${stamp}`;
+    const uniqA = `acctuniqa${stamp}`;
+    const uniqB = `acctuniqb${stamp}`;
+
+    // Signup a fresh throwaway account.
+    const suGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
+    const suCsrf = cookieVal(suGet.headers.getSetCookie(), "parachute_id_csrf");
+    const suRes = await fetch(`${IDENTITY}/signup`, {
+      method: "POST",
+      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${suCsrf}` },
+      redirect: "manual",
+      body: form({ __csrf: suCsrf!, email: amEmail, password: amPassword }),
+    });
+    const amSession = cookieVal(suRes.headers.getSetCookie(), "parachute_id_session");
+    assert(suRes.status === 302 && !!amSession, "account-mcp: throwaway account signed up", `status ${suRes.status}`);
+
+    // Create TWO vaults (the trial includes 5, so both succeed).
+    const conGet = await fetch(`${IDENTITY}/console`, { headers: { cookie: `parachute_id_session=${amSession}` }, redirect: "manual" });
+    const amCsrf = cookieVal(conGet.headers.getSetCookie(), "parachute_id_csrf") ?? suCsrf;
+    for (const v of [vaultA, vaultB]) {
+      const cv = await fetch(`${IDENTITY}/console/vaults`, {
+        method: "POST",
+        headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_session=${amSession}; parachute_id_csrf=${amCsrf}` },
+        redirect: "manual",
+        body: form({ __csrf: amCsrf!, name: v }),
+      });
+      assert(cv.status === 303, `account-mcp: created vault ${v}`, `status ${cv.status}`);
+    }
+
+    // Seed a distinctive note in each vault through the REAL vault REST door.
+    for (const [v, uniq] of [[vaultA, uniqA], [vaultB, uniqB]] as const) {
+      const owner = await authorizeFor(amEmail, amPassword, v);
+      if (!owner.token) {
+        fail(`account-mcp: seed token for ${v}`, owner.error);
+        continue;
+      }
+      const w = await fetch(`${VAULT}/vault/${v}/api/notes`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${owner.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: `account-mcp seed ${sharedTok} ${uniq}`, tags: ["smoke"] }),
+      });
+      assert(w.status === 201, `account-mcp: seeded a note in ${v}`, `status ${w.status}`);
+    }
+
+    // --- blanket consent → account token -------------------------------------
+    const blanket = await accountVaultsAuthorize(amEmail, amPassword, [vaultA, vaultB]);
+    assert(!!blanket.access, "account-mcp: blanket consent (all vaults checked) → account token minted", blanket.error ?? "");
+    if (blanket.access) {
+      const bClaims = decodeJwt(blanket.access);
+      const accountId = String(bClaims.sub);
+      assert(bClaims.aud === "account", "account-mcp: access token aud=account", String(bClaims.aud));
+      assert(!!blanket.refresh, "account-mcp: refresh_token present on the account token", blanket.refresh ? "yes" : "MISSING");
+      assert(
+        blanket.scope === `account:${accountId}:vaults`,
+        "account-mcp: blanket scope is the single 3-part account:<id>:vaults",
+        String(blanket.scope),
+      );
+
+      // PRM discovery — resource = front-door origin, authorization_servers = issuer.
+      // On staging VAULT_PUBLIC_ORIGIN is unset so the front door == the issuer origin.
+      const prm = (await (await fetch(`${IDENTITY}/.well-known/oauth-protected-resource/account/mcp`)).json()) as {
+        resource?: string;
+        authorization_servers?: string[];
+        scopes_supported?: string[];
+      };
+      assert(
+        prm.resource === `${IDENTITY}/account/mcp` &&
+          Array.isArray(prm.authorization_servers) &&
+          prm.authorization_servers.includes(IDENTITY),
+        "account-mcp: PRM resource names the front door + authorization_servers names the issuer",
+        `resource=${prm.resource} as=${JSON.stringify(prm.authorization_servers)}`,
+      );
+      assert(
+        Array.isArray(prm.scopes_supported) && prm.scopes_supported.includes("account:vaults"),
+        "account-mcp: PRM advertises the un-narrowed account:vaults request scope",
+        JSON.stringify(prm.scopes_supported),
+      );
+
+      // initialize.
+      const initRes = await accountMcpCall(blanket.access, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "smoke", version: "1" } },
+      });
+      const initJson = (await initRes.json()) as any;
+      assert(
+        initRes.status === 200 && initJson.result?.serverInfo?.name === "parachute-account",
+        "account-mcp: POST /account/mcp initialize → parachute-account server",
+        `status ${initRes.status}`,
+      );
+
+      // tools/list — EXACTLY the three tools.
+      const listRes = await accountMcpCall(blanket.access, { jsonrpc: "2.0", id: 2, method: "tools/list" });
+      const listJson = (await listRes.json()) as any;
+      const toolNames = (listJson.result?.tools ?? []).map((t: any) => t.name).sort();
+      assert(
+        listRes.status === 200 && toolNames.length === 3 && toolNames.join(",") === "create-vault,list-vaults,query-notes",
+        "account-mcp: tools/list → EXACTLY 3 tools (create-vault, list-vaults, query-notes)",
+        toolNames.join(","),
+      );
+
+      // query-notes fan-out across BOTH vaults on the shared token → both non-empty.
+      const qShared = await accountMcpCall(blanket.access, {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "query-notes", arguments: { search: sharedTok } },
+      });
+      const qSharedPayload = JSON.parse((await qShared.json()).result?.content?.[0]?.text ?? "{}");
+      const queried = [...(qSharedPayload.vaults_queried ?? [])].sort();
+      const entryA = (qSharedPayload.results ?? []).find((r: any) => r.vault === vaultA);
+      const entryB = (qSharedPayload.results ?? []).find((r: any) => r.vault === vaultB);
+      assert(
+        qShared.status === 200 &&
+          queried.includes(vaultA) &&
+          queried.includes(vaultB) &&
+          Array.isArray(entryA?.notes) &&
+          entryA.notes.length >= 1 &&
+          Array.isArray(entryB?.notes) &&
+          entryB.notes.length >= 1,
+        "account-mcp: query-notes fans out across BOTH vaults, results grouped per vault",
+        `queried=${queried.join(",")} A=${entryA?.notes?.length} B=${entryB?.notes?.length}`,
+      );
+
+      // Attribution: the A-only token appears UNDER vaultA and is ABSENT from vaultB.
+      const qUniqA = await accountMcpCall(blanket.access, {
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: { name: "query-notes", arguments: { search: uniqA } },
+      });
+      const qUniqAPayload = JSON.parse((await qUniqA.json()).result?.content?.[0]?.text ?? "{}");
+      const uA = (qUniqAPayload.results ?? []).find((r: any) => r.vault === vaultA);
+      const uB = (qUniqAPayload.results ?? []).find((r: any) => r.vault === vaultB);
+      assert(
+        Array.isArray(uA?.notes) && uA.notes.length >= 1 && Array.isArray(uB?.notes) && uB.notes.length === 0,
+        "account-mcp: per-vault attribution — A's unique note is under vaultA, absent from vaultB",
+        `A=${uA?.notes?.length} B=${uB?.notes?.length}`,
+      );
+
+      // create-vault → a new vault, and NO token ever in the result body.
+      const vaultC = `acct-c-${stamp}`;
+      const cvRes = await accountMcpCall(blanket.access, {
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: { name: "create-vault", arguments: { name: vaultC } },
+      });
+      const cvText = await cvRes.text();
+      const cvPayload = JSON.parse(JSON.parse(cvText).result?.content?.[0]?.text ?? "{}");
+      assert(
+        cvRes.status === 200 && cvPayload.name === vaultC && typeof cvPayload.url === "string",
+        "account-mcp: create-vault → new vault (name + url returned)",
+        `name=${cvPayload.name}`,
+      );
+      assert(
+        !/eyJ|vault_token|access_token|refresh_token/.test(cvText),
+        "account-mcp: create-vault result carries NO token (no credential leak)",
+        "scanned raw response body",
+      );
+
+      // Blanket-covers-future: refresh the grant (proves rotation preserves the
+      // blanket), then list-vaults on the refreshed token covers A, B AND C — a
+      // vault created AFTER consent.
+      const refreshRes = await fetch(`${IDENTITY}/oauth/token`, {
+        method: "POST",
+        headers: FORM,
+        body: form({ grant_type: "refresh_token", refresh_token: blanket.refresh!, client_id: blanket.clientId! }),
+      });
+      const refreshTok = (await refreshRes.json()) as { access_token?: string; scope?: string };
+      assert(
+        refreshRes.status === 200 && typeof refreshTok.access_token === "string",
+        "account-mcp: refresh the blanket grant → a new access token",
+        `status ${refreshRes.status}`,
+      );
+      if (refreshTok.access_token) {
+        const rClaims = decodeJwt(refreshTok.access_token);
+        assert(
+          rClaims.aud === "account" && refreshTok.scope === blanket.scope,
+          "account-mcp: refreshed token preserves aud=account + the blanket scope byte-identically",
+          `aud=${rClaims.aud} scope=${refreshTok.scope}`,
+        );
+        const listAfter = await accountMcpCall(refreshTok.access_token, {
+          jsonrpc: "2.0",
+          id: 6,
+          method: "tools/call",
+          params: { name: "list-vaults", arguments: {} },
+        });
+        const listAfterPayload = JSON.parse((await listAfter.json()).result?.content?.[0]?.text ?? "{}");
+        const coveredNames = (listAfterPayload.vaults ?? []).map((v: any) => v.name);
+        assert(
+          listAfterPayload.covered === "all" &&
+            coveredNames.includes(vaultA) &&
+            coveredNames.includes(vaultB) &&
+            coveredNames.includes(vaultC),
+          "account-mcp: blanket-covers-future — a vault created AFTER consent is in coverage (covered=all)",
+          `covered=${listAfterPayload.covered} names=${coveredNames.join(",")}`,
+        );
+      }
+
+      // NARROWED re-consent (uncheck vaultB and vaultC — grant ONLY vaultA) →
+      // the new grant EXCLUDES the unchecked vaults from list AND query.
+      const narrowed = await accountVaultsAuthorize(amEmail, amPassword, [vaultA]);
+      assert(!!narrowed.access, "account-mcp: narrowed re-consent (only vaultA checked) → token minted", narrowed.error ?? "");
+      if (narrowed.access) {
+        const nClaims = decodeJwt(narrowed.access);
+        assert(
+          narrowed.scope === `account:${accountId}:vaults:${vaultA}`,
+          "account-mcp: narrowed scope is the 4-part account:<id>:vaults:<vault> (no bare 3-part)",
+          String(narrowed.scope),
+        );
+        const listN = await accountMcpCall(narrowed.access, {
+          jsonrpc: "2.0",
+          id: 7,
+          method: "tools/call",
+          params: { name: "list-vaults", arguments: {} },
+        });
+        const listNPayload = JSON.parse((await listN.json()).result?.content?.[0]?.text ?? "{}");
+        const nNames = (listNPayload.vaults ?? []).map((v: any) => v.name);
+        assert(
+          listNPayload.covered === "listed" && nNames.includes(vaultA) && !nNames.includes(vaultB) && !nNames.includes(vaultC),
+          "account-mcp: narrowed grant EXCLUDES the unchecked vaults (covered=listed, only vaultA)",
+          `covered=${listNPayload.covered} names=${nNames.join(",")}`,
+        );
+        const qN = await accountMcpCall(narrowed.access, {
+          jsonrpc: "2.0",
+          id: 8,
+          method: "tools/call",
+          params: { name: "query-notes", arguments: { search: sharedTok } },
+        });
+        const qNQueried = JSON.parse((await qN.json()).result?.content?.[0]?.text ?? "{}").vaults_queried ?? [];
+        assert(
+          qNQueried.length === 1 && qNQueried[0] === vaultA,
+          "account-mcp: query-notes under the narrowed grant reaches ONLY vaultA (B, C excluded)",
+          qNQueried.join(","),
+        );
+      }
+    }
+  } catch (err) {
+    fail("account-mcp: live section threw (non-fatal — summary follows)", String(err));
+  }
+
   // --- summary ---
   console.log(`\n${"=".repeat(60)}\nSMOKE ${failures === 0 ? "PASSED" : "FAILED"} — ${results.filter((r) => r.includes("PASS")).length} pass, ${failures} fail\n${"=".repeat(60)}`);
   console.log(results.join("\n"));
@@ -2180,6 +2440,79 @@ async function authorizeFor(email: string, password: string, vaultName: string):
   if (tokenRes.status !== 200) return { error: `token status ${tokenRes.status}` };
   const tok = (await tokenRes.json()) as { access_token: string };
   return { token: tok.access_token };
+}
+
+/**
+ * Run the account-vaults (Wave A) authorize flow for `email`/`password`,
+ * submitting `vaultIncludes` as the consent's checked `vault_include` set
+ * (ALL owned → blanket `account:<id>:vaults`; a subset → one 4-part
+ * `account:<id>:vaults:<vault>` per checked vault). Returns the minted account
+ * token pair (aud=account) + the client id/verifier for a later refresh, or the
+ * OAuth error. A fresh DCR client each call — account-vaults ALWAYS re-renders
+ * consent (never skip-consent), so no standing-grant surprises.
+ */
+async function accountVaultsAuthorize(
+  email: string,
+  password: string,
+  vaultIncludes: string[],
+): Promise<{ access?: string; refresh?: string; scope?: string; clientId?: string; error?: string }> {
+  const scope = "account:vaults";
+  const reg = await (
+    await fetch(`${IDENTITY}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris: [REDIRECT_URI], client_name: "smoke-account-mcp", scope }),
+    })
+  ).json();
+  const clientId: string = reg.client_id;
+  const { verifier, challenge } = await pkce();
+  const shared = { client_id: clientId, redirect_uri: REDIRECT_URI, response_type: "code", scope, code_challenge: challenge, code_challenge_method: "S256" };
+  const loginPage = await fetch(`${IDENTITY}/oauth/authorize?${form(shared)}`, { redirect: "manual" });
+  const csrf = cookieVal(loginPage.headers.getSetCookie(), "parachute_id_csrf");
+  const loginRes = await fetch(`${IDENTITY}/oauth/authorize`, {
+    method: "POST",
+    headers: { ...FORM, cookie: `parachute_id_csrf=${csrf}`, origin: IDENTITY },
+    redirect: "manual",
+    body: form({ __action: "login", __csrf: csrf!, email, password, ...shared }),
+  });
+  if (loginRes.status !== 200) return { error: `login status ${loginRes.status}` };
+  const session = cookieVal(loginRes.headers.getSetCookie(), "parachute_id_session");
+  // Consent — approve, carrying one vault_include per checked vault.
+  const consentForm = new URLSearchParams({ __action: "consent", __csrf: csrf!, decision: "approve", ...shared });
+  for (const v of vaultIncludes) consentForm.append("vault_include", v);
+  const consentRes = await fetch(`${IDENTITY}/oauth/authorize`, {
+    method: "POST",
+    headers: { ...FORM, cookie: `parachute_id_session=${session}; parachute_id_csrf=${csrf}`, origin: IDENTITY },
+    redirect: "manual",
+    body: consentForm.toString(),
+  });
+  if (consentRes.status !== 200) return { error: `consent status ${consentRes.status}` };
+  const bridgeUrl = bridgeTarget(await consentRes.text());
+  if (!bridgeUrl) return { error: "consent status 200 (no bridge)" };
+  const u = new URL(bridgeUrl);
+  const code = u.searchParams.get("code");
+  if (!code) return { error: u.searchParams.get("error") ?? "no-code" };
+  const tokenRes = await fetch(`${IDENTITY}/oauth/token`, {
+    method: "POST",
+    headers: FORM,
+    body: form({ grant_type: "authorization_code", code, client_id: clientId, redirect_uri: REDIRECT_URI, code_verifier: verifier }),
+  });
+  if (tokenRes.status !== 200) return { error: `token status ${tokenRes.status}` };
+  const tok = (await tokenRes.json()) as { access_token: string; refresh_token?: string; scope: string };
+  return { access: tok.access_token, refresh: tok.refresh_token, scope: tok.scope, clientId };
+}
+
+/** POST a JSON-RPC body to the account-MCP endpoint with an account bearer. */
+async function accountMcpCall(token: string, body: unknown): Promise<Response> {
+  return fetch(`${IDENTITY}/account/mcp`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+    },
+    body: JSON.stringify(body),
+  });
 }
 
 // Minimal POSIX ustar reader (mirror of export.ts toTar): 512-byte blocks.
