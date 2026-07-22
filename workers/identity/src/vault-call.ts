@@ -64,14 +64,26 @@ export async function callVaultApi(
      *  Mutually exclusive with jsonBody; `rawContentType` sets its header. */
     rawBody?: BodyInit;
     rawContentType?: string;
+    /**
+     * `client_id` stamped on the minted token. Defaults to
+     * {@link FIRST_PARTY_CLIENT_ID} ("parachute-console") so every EXISTING
+     * caller is byte-identical. The account-MCP fan-out (account-mcp.ts) passes
+     * `"parachute-account"` instead — the tenant-facing id that CANNOT satisfy
+     * the vault worker's first-party internal-config seam even at admin verb, so
+     * a cross-vault read is exactly as powerful as an owner's public-OAuth mint.
+     */
+    clientId?: string;
+    /** Optional abort signal (the fan-out arms a per-vault timeout so one hung
+     *  vault can't stall the whole cross-vault read). */
+    signal?: AbortSignal;
   },
 ): Promise<Response> {
-  const { userId, vaultName, method, apiPath, verb, jsonBody, rawBody, rawContentType } = opts;
+  const { userId, vaultName, method, apiPath, verb, jsonBody, rawBody, rawContentType, clientId, signal } = opts;
   const signed = await signAccessToken(db, {
     sub: userId,
     scopes: [`vault:${vaultName}:${verb}`],
     audience: `vault.${vaultName}`,
-    clientId: FIRST_PARTY_CLIENT_ID,
+    clientId: clientId ?? FIRST_PARTY_CLIENT_ID,
     issuer: deps.issuer,
     vaultScope: [vaultName],
     ttlSeconds: INTERNAL_MINT_TTL_SECONDS,
@@ -91,6 +103,7 @@ export async function callVaultApi(
     method,
     headers,
     ...(body !== undefined ? { body } : {}),
+    ...(signal !== undefined ? { signal } : {}),
   });
 }
 

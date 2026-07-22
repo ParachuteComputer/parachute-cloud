@@ -9,7 +9,7 @@
  * `/account/setup`, hub#748) in a follow-up.
  */
 import type { AccountPlanSummary, ParachuteAccountDescriptor } from "@openparachute/door-contract";
-import { type OAuthDeps, jsonResponse, vaultAdvertisedUrl } from "./oauth-shared.ts";
+import { type OAuthDeps, frontDoorOrigin, jsonResponse, vaultAdvertisedUrl } from "./oauth-shared.ts";
 import { PAID_TIERS, PLAN_SPECS, TIER_PRICE_MONTHLY_USD, type TierIntervalAvailability, tierIntervals } from "./plans.ts";
 
 /**
@@ -84,6 +84,13 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // Cloud v1: create yes; rename NO (the vault name is the immutable global
     // slug / DO address / URL); delete not yet (handleAccountVaultDelete is 501).
     capabilities: { vault_create: true, vault_rename: false, vault_delete: false },
+    // The account-level MCP endpoint (Wave A PR3) — one connection across the
+    // account's vaults (list-vaults / create-vault / query-notes). Advertised at
+    // the FRONT DOOR origin (`my.` in prod, self-referential in staging), where
+    // the endpoint actually lands, NOT `iss` (which stays `cloud.` through Phase
+    // 4). Its RFC 9728 PRM sits at `<frontDoor>/.well-known/oauth-protected-
+    // resource/account/mcp`.
+    account_mcp_endpoint: `${frontDoorOrigin(deps)}/account/mcp`,
     plans: planLadder(),
     // A `{name}`-placeholder template the app substitutes to preview a vault's
     // address pre-creation. Derived from the SAME vaultAdvertisedUrl the real
