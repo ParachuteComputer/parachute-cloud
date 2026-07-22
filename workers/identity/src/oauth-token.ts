@@ -21,6 +21,11 @@ import {
   AuthCodeUsedError,
   redeemAuthCode,
 } from "./auth-codes.ts";
+import {
+  ACCOUNT_VAULTS_UNNARROWED,
+  parseAccountScope,
+  parseAccountVaultsScope,
+} from "@openparachute/door-contract";
 import { inferAudience } from "./audience.ts";
 import { type OAuthClient, getClient, verifyClientSecret } from "./clients.ts";
 import {
@@ -69,6 +74,41 @@ async function denyUnownedVaultMint(
     { error: "invalid_scope", error_description: `subject does not own vault(s): ${unowned.join(", ")}` },
     400,
   );
+}
+
+/**
+ * Account-scope mint gate (Wave A, defense-in-depth). Two refusals, in BOTH the
+ * code-redemption and refresh-rotation mint paths — because `vault_scope` is
+ * inert for account tokens and the SCOPE STRING is the only carrier, the token
+ * path is where the account-vaults narrowing is finally trusted:
+ *   1. An UN-NARROWED `account:vaults` must never reach signing — consent binds
+ *      the id AND the vault set. If a bare `account:vaults` is here, the consent
+ *      narrowing was bypassed → refuse.
+ *   2. Any id-bearing account scope's `<id>` MUST equal the token subject. The
+ *      consent submit always keys the scope to `session.userId` and the auth
+ *      code's `userId` is that same subject, so a divergence means a cross-account
+ *      mint ("a bearer for A carrying account:B:*") — refused STRUCTURALLY here,
+ *      not merely by trusting consent discipline. Covers the vaults family
+ *      (`account:<id>:vaults[:<vault>]`) AND the cookie-only admin/read family.
+ * Returns a 400 `invalid_scope`, or null to pass.
+ */
+function denyForeignAccountMint(sub: string, scopes: readonly string[]): Response | null {
+  for (const s of scopes) {
+    if (s === ACCOUNT_VAULTS_UNNARROWED) {
+      return jsonResponse(
+        { error: "invalid_scope", error_description: "account:vaults must be narrowed at consent before minting" },
+        400,
+      );
+    }
+    const id = parseAccountVaultsScope(s)?.id ?? parseAccountScope(s)?.id ?? null;
+    if (id !== null && id !== sub) {
+      return jsonResponse(
+        { error: "invalid_scope", error_description: `account scope subject mismatch: ${s}` },
+        400,
+      );
+    }
+  }
+  return null;
 }
 
 function extractClientCredentials(
@@ -189,6 +229,8 @@ async function handleTokenAuthorizationCode(
   }
   const ownershipDenied = await denyUnownedVaultMint(db, redeemed.userId, redeemed.scopes);
   if (ownershipDenied) return ownershipDenied;
+  const foreignAccountDenied = denyForeignAccountMint(redeemed.userId, redeemed.scopes);
+  if (foreignAccountDenied) return foreignAccountDenied;
   const audience = inferAudience(redeemed.scopes);
   const access = await signAccessToken(db, {
     sub: redeemed.userId,
@@ -293,6 +335,8 @@ async function rotateAndRespond(
   const refreshUserId = row.userId ?? "";
   const ownershipDenied = await denyUnownedVaultMint(db, refreshUserId, row.scopes);
   if (ownershipDenied) return ownershipDenied;
+  const foreignAccountDenied = denyForeignAccountMint(refreshUserId, row.scopes);
+  if (foreignAccountDenied) return foreignAccountDenied;
   const audience = inferAudience(row.scopes);
   const access = await signAccessToken(db, {
     sub: refreshUserId,

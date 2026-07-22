@@ -26,6 +26,7 @@ import {
   ACCOUNT_VERB_RANK,
   hasAccountScope,
   parseAccountScope,
+  parseAccountVaultsScope,
 } from "@openparachute/door-contract";
 import { validateAccessToken } from "./tokens.ts";
 
@@ -40,14 +41,26 @@ export { ACCOUNT_VERB_RANK, hasAccountScope };
  */
 export const ACCOUNT_TOKEN_AUDIENCE = "account";
 
-/** The distinct account ids named by the `account:<id>:*` scopes in the set. */
+/**
+ * The distinct account ids named by the account-FAMILY scopes in the set — the
+ * `account:<id>:{admin,read}` grammar AND the Wave A account-vaults family
+ * (`account:<id>:vaults[:<vault>]`). Both families name an account principal, so
+ * both feed the single-principal + `sub===id` belt in {@link validateAccountToken}
+ * — a vaults-only token's `<id>` is checked against `sub` exactly as an admin
+ * token's is (even though it carries no read/admin AUTHORITY at the REST tier).
+ */
 function accountIdsIn(scopes: readonly string[]): string[] {
   const ids = new Set<string>();
   for (const s of scopes) {
-    const d = parseAccountScope(s);
+    const d = parseAccountScope(s) ?? parseAccountVaultsScope(s);
     if (d) ids.add(d.id);
   }
   return [...ids];
+}
+
+/** Any account-family scope — admin/read OR the Wave A vaults family. */
+function isAccountFamilyScope(s: string): boolean {
+  return parseAccountScope(s) !== null || parseAccountVaultsScope(s) !== null;
 }
 
 export interface ValidatedAccountToken {
@@ -113,12 +126,17 @@ export async function validateAccountToken(
 
   const scope = typeof payload.scope === "string" ? payload.scope : "";
   const scopes = scope.split(" ").filter((s) => s.length > 0);
-  const accountScopes = scopes.filter((s) => parseAccountScope(s) !== null);
+  // Account-family scopes = admin/read (parseAccountScope) + the Wave A vaults
+  // family (parseAccountVaultsScope). The returned `scopes` carry BOTH so a
+  // caller can read the vaults grant (`accountVaultsGrant`), while the REST-tier
+  // gate (`hasAccountScope`, admin/read only) still refuses a vaults-only token
+  // with a 403 — the vaults family opens the account-MCP surface, not `/account/*`.
+  const accountScopes = scopes.filter(isAccountFamilyScope);
   const ids = accountIdsIn(accountScopes);
 
-  // A validly-signed `aud=account` token with no account scope carries no
-  // account authority (403). More than one distinct `<id>` is malformed — an
-  // account token speaks for exactly one owner (401).
+  // A validly-signed `aud=account` token with no account-family scope at all
+  // carries no account principal (403). More than one distinct `<id>` is
+  // malformed — an account token speaks for exactly one owner (401).
   if (ids.length === 0) {
     return { ok: false, status: 403, error: "insufficient_scope", message: "token carries no account scope" };
   }

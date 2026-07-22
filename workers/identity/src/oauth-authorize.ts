@@ -6,8 +6,10 @@
  * session (single-consent); prior grants skip consent; resource/`vault=` bind the
  * consent + minted scopes to a named vault.
  */
+import { parseAccountVaultsScope } from "@openparachute/door-contract";
 import { issueAuthCode } from "./auth-codes.ts";
 import {
+  narrowAccountVaultsScopes,
   narrowResourceVaultScopes,
   narrowVaultScopes,
   resolveResourceVault,
@@ -40,6 +42,47 @@ const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 
 function htmlError(title: string, message: string, status: number): Response {
   return htmlResponse(renderError({ title, message }), status);
+}
+
+/**
+ * The account-vaults request scopes in the set (Wave A). Called only AFTER the
+ * wall gate ({@link findNonRequestableScopes}) has rejected every non-requestable
+ * `account:*` scope, so the sole `account:` scopes that can survive to here are
+ * the requestable account-vaults forms — the un-narrowed `account:vaults` and the
+ * blanket `account:<id>:vaults`. The 4-part narrowed form is non-requestable and
+ * never reaches this list. Shared by the authorize gate and the consent submit so
+ * both agree on what an account-vaults request is.
+ */
+function accountVaultsRequestScopes(scopes: readonly string[]): string[] {
+  return scopes.filter((s) => s.startsWith("account:"));
+}
+
+/**
+ * Refuse an account-vaults request that (1) mixes with any non-account scope
+ * (two audiences can't share one grant) or (2) names — in a 3-part
+ * `account:<id>:vaults` — a DIFFERENT account than the signed-in owner (a
+ * cross-account request; consent always re-keys to `session.userId`, but a
+ * mismatched id is refused loudly rather than silently rewritten). Returns an
+ * `invalid_scope` error redirect, or null to pass. Runs at BOTH the authorize
+ * gate and the consent submit (defense-in-depth). `accountScopes` is the output
+ * of {@link accountVaultsRequestScopes}, non-empty.
+ */
+function denyMixedOrForeignAccountVaults(
+  accountScopes: readonly string[],
+  allScopes: readonly string[],
+  userId: string,
+  params: AuthorizeParams,
+): Response | null {
+  if (allScopes.some((s) => !s.startsWith("account:"))) {
+    return oauthErrorRedirect(params.redirectUri, "invalid_scope", "account:vaults cannot be combined with other scopes", params.state);
+  }
+  for (const s of accountScopes) {
+    const parsed = parseAccountVaultsScope(s); // null for the 2-part un-narrowed form
+    if (parsed && parsed.id !== userId) {
+      return oauthErrorRedirect(params.redirectUri, "invalid_scope", "account:vaults names a different account", params.state);
+    }
+  }
+  return null;
 }
 
 /**
@@ -201,6 +244,38 @@ async function authorizeCore(
 
   if (!session) return renderLoginPage(req, params);
 
+  // Account-vaults (Wave A) — a wholly separate consent surface from the vault
+  // picker. Refuse a mixed/foreign-id request, then ALWAYS render consent (never
+  // skip-consent — the owner re-elects the vault set every time) with a checkbox
+  // per owned vault. Returns before the vault-picker/verb-selector path below.
+  const accountVaultsScopes = accountVaultsRequestScopes(requestedScopes);
+  if (accountVaultsScopes.length > 0) {
+    const refused = denyMixedOrForeignAccountVaults(accountVaultsScopes, requestedScopes, session.userId, params);
+    if (refused) return refused;
+    const csrf = ensureCsrfToken(req);
+    const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
+    const consentUser = await getUserById(db, session.userId);
+    const ownedVaults = (await listVaultsForOwner(db, session.userId)).map((v) => v.name);
+    return htmlResponse(
+      renderConsent({
+        params,
+        csrfToken: csrf.token,
+        clientName: client.clientName ?? client.clientId,
+        scopeDescriptions: describeScopes(requestedScopes),
+        lockedVault: null,
+        needsVaultPick: false,
+        ownedVaults: [],
+        verbSelector: null,
+        accountVaults: { ownedVaults },
+        issuerHost: consentIssuedByHost(req, params.resource, deps),
+        email: consentUser?.email ?? "",
+        notYouNext: buildAuthorizeUrl(deps.issuer, params),
+      }),
+      200,
+      extra,
+    );
+  }
+
   // Ownership gate for ALREADY-named vaults (resource-bound or directly-scoped)
   // — refuse before consent so the user never approves a vault they can't get.
   // The unnamed `vault:<verb>` + pick case is gated at consent submit; the token
@@ -245,6 +320,7 @@ async function authorizeCore(
       needsVaultPick,
       ownedVaults,
       verbSelector,
+      accountVaults: null,
       // The "issued by <host>" trust line — the DOOR the user came through (the
       // bound request/resource origin, e.g. my.parachute.computer for a my./mcp
       // connect), else the issuer. Bound-gated in consentIssuedByHost, so never
@@ -446,6 +522,37 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
       `requested scopes are not available via the public authorization endpoint: ${blocked.join(", ")}`,
       params.state,
     );
+  }
+
+  // Account-vaults (Wave A) — the separate consent surface. Read the checked
+  // vaults, RE-VALIDATE every one against ownership server-side (the checkbox
+  // names are an untrusted, attacker-writable hint), then record the BLANKET or
+  // NARROWED grant. The account id is ALWAYS `session.userId` — never a form value
+  // — so a forged id can never key a scope to someone else's account.
+  const accountVaultsScopes = accountVaultsRequestScopes(scopes);
+  if (accountVaultsScopes.length > 0) {
+    const refused = denyMixedOrForeignAccountVaults(accountVaultsScopes, scopes, session.userId, params);
+    if (refused) return refused;
+    const owned = (await listVaultsForOwner(db, session.userId)).map((v) => v.name);
+    const included = [
+      ...new Set(form.getAll("vault_include").filter((v): v is string => typeof v === "string")),
+    ];
+    if (included.length === 0) {
+      return htmlError("Vault required", "Select at least one vault to grant access to.", 400);
+    }
+    const ownedSet = new Set(owned);
+    const unowned = included.filter((v) => !ownedSet.has(v));
+    if (unowned.length > 0) {
+      return oauthErrorRedirect(
+        params.redirectUri,
+        "invalid_scope",
+        `you do not own ${unowned.length > 1 ? "these vaults" : "the vault"}: ${unowned.join(", ")}`,
+        params.state,
+      );
+    }
+    const accountScopes = narrowAccountVaultsScopes(session.userId, included, owned);
+    await recordGrant(db, session.userId, client.clientId, accountScopes, deps.now?.() ?? new Date());
+    return issueAuthCodeRedirect(db, { ...params, scope: accountScopes.join(" ") }, accountScopes, session.userId, deps);
   }
 
   // Narrow unnamed vault verbs to the picked vault (form pick or `vault=` hint).

@@ -17,12 +17,15 @@ import {
   ACCESS_TOKEN_TTL_SECONDS as CANON_ACCESS_TTL,
   ACCOUNT_SELF_ADMIN_SCOPE,
   ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_VAULTS_UNNARROWED,
   REFRESH_GRACE_MS as CANON_REFRESH_GRACE,
   REFRESH_TOKEN_TTL_MS as CANON_REFRESH_TTL,
   accountScope,
+  accountVaultsScope,
   checkAuthorizationServerMetadata,
   checkProtectedResourceMetadata,
   hasAccountScope as canonHasAccountScope,
+  isRequestableAccountScope,
 } from "@openparachute/door-contract";
 import { type AccountVerb, hasAccountScope } from "../src/account-auth.ts";
 import {
@@ -30,6 +33,7 @@ import {
   authorizationServerMetadata,
   protectedResourceMetadata,
 } from "../src/oauth-metadata.ts";
+import { isNonRequestableScope } from "../src/oauth-shared.ts";
 import { ACCESS_TOKEN_TTL_SECONDS, REFRESH_GRACE_MS, REFRESH_TOKEN_TTL_MS } from "../src/tokens.ts";
 import { ISSUER, deps } from "./helpers.ts";
 
@@ -69,6 +73,50 @@ describe("door-contract parity — account scope grammar", () => {
   test("the canon's self scopes are the hub-side spelling of cloud's grammar", () => {
     expect(accountScope("self", "admin")).toBe(ACCOUNT_SELF_ADMIN_SCOPE);
     expect(accountScope("self", "read")).toBe(ACCOUNT_SELF_READ_SCOPE);
+  });
+});
+
+describe("door-contract parity — the account-vaults wall exception (Wave A)", () => {
+  // Cloud's LIVE wall (`isNonRequestableScope`) delegates its `account:*` branch
+  // to the shared `isRequestableAccountScope`. Bind the two by asserting the
+  // account branch is EXACTLY the negation of the canon on every vector — never
+  // re-derive the grammar here, so any drift forces the change through the shared
+  // package (and the hub twin).
+  // Every vector literally starts with the lowercase `account:` prefix — the
+  // condition under which cloud's wall enters its account branch and delegates to
+  // the canon. (A fully-capitalized `Account:...` never enters the account
+  // namespace and is handled by the untouched service-admin rule; it's inert
+  // downstream regardless, so it isn't part of THIS parity claim.)
+  const accountVectors = [
+    ACCOUNT_VAULTS_UNNARROWED, // account:vaults
+    accountVaultsScope("u_1"), // account:u_1:vaults
+    "account:u_1:vaults:work", // 4-part narrowed
+    "account:u_1:admin",
+    "account:u_1:read",
+    "account:admin",
+    "account:read",
+    "account:Vaults", // mis-cased verb fails closed
+    "account:u_1:Vaults",
+  ];
+
+  test("cloud's live wall's account branch is the exact negation of the canon", () => {
+    for (const s of accountVectors) {
+      expect(isNonRequestableScope(s)).toBe(!isRequestableAccountScope(s));
+    }
+  });
+
+  test("only the account-vaults connection scopes pass the wall; every other account scope is refused", () => {
+    expect(isNonRequestableScope(ACCOUNT_VAULTS_UNNARROWED)).toBe(false);
+    expect(isNonRequestableScope(accountVaultsScope("u_1"))).toBe(false);
+    expect(isNonRequestableScope("account:u_1:vaults:work")).toBe(true);
+    expect(isNonRequestableScope("account:u_1:admin")).toBe(true);
+    expect(isNonRequestableScope("account:u_1:read")).toBe(true);
+  });
+
+  test("the non-account rules are untouched by the exception (service-admin + vault)", () => {
+    expect(isNonRequestableScope("hub:admin")).toBe(true);
+    expect(isNonRequestableScope("vault:x:admin")).toBe(false);
+    expect(isNonRequestableScope("vault:read")).toBe(false);
   });
 });
 
