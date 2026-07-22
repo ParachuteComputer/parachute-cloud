@@ -80,6 +80,7 @@ import {
 } from "./billing.ts";
 import { handleStripeWebhookPost } from "./billing-webhook.ts";
 import { handlePromoRedeemPost } from "./promo.ts";
+import { handleAccountMcp, accountMcpProtectedResource } from "./account-mcp-http.ts";
 import { spaCspForHtml } from "./spa-csp.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
@@ -125,6 +126,10 @@ app.get("/.well-known/oauth-protected-resource", (c) => protectedResourceMetadat
 app.get("/.well-known/jwks.json", (c) => handleJwks(c.env.DB));
 app.get("/.well-known/parachute-revocation.json", (c) => handleRevocationList(c.env.DB, depsFor(c.env)));
 app.get("/.well-known/parachute-account", (c) => accountDescriptor(depsFor(c.env)));
+// The account-MCP resource's RFC 9728 PRM (Wave A PR3) — the discovery carrier
+// for the `account:vaults` connection scope. Sits under the `/.well-known`
+// ceremony prefix, so it is already run-worker-first (no manifest change).
+app.get("/.well-known/oauth-protected-resource/account/mcp", (c) => accountMcpProtectedResource(depsFor(c.env)));
 
 // --- OAuth ---
 // CORS is applied at the route so success AND error paths carry it: wildcard on
@@ -226,6 +231,18 @@ app.post("/account/handle", (c) => handleAccountHandleClaim(c.env.DB, c.req.raw,
 // correct for this auth boundary, not a lapsed gate.
 app.post("/account/billing/portal", (c) => handleAccountBillingPortalPost(c.env, c.req.raw, depsFor(c.env)));
 app.post("/account/billing/checkout", (c) => handleAccountBillingCheckoutPost(c.env, c.req.raw, depsFor(c.env)));
+
+// --- account-level MCP endpoint (Wave A PR3, my.parachute.computer/account/mcp) ---
+// The account-vaults connection door: list-vaults / create-vault / query-notes,
+// all coverage-resolved by OWNERSHIP at request time (account-mcp.ts). Bearer-
+// gated by an account token carrying an account-vaults scope (aud="account"),
+// distinct from the /account/* REST surface's admin/read tier. `app.all` so
+// EVERY method is worker-owned (the /mcp-style defensive backstop — the path
+// already sits under the /account/* run_worker_first rule, and this handler is
+// what answers, so it can never fall through to the SPA shell); the handler
+// itself does the POST-only JSON-RPC framing (GET→405, DELETE→200, OPTIONS
+// preflight). Wildcard CORS + WWW-Authenticate exposed live inside the handler.
+app.all("/account/mcp", (c) => handleAccountMcp(c.env.DB, c.req.raw, depsFor(c.env)));
 
 // --- operator admin console (Wave 4c) ---
 // EVERY route (GET and POST) resolves the session and requires role='operator'

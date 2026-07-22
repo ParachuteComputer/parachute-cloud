@@ -557,7 +557,9 @@ export function oauthErrorRedirect(
  * cookie-minted (`POST /account/token`, C2) and `account:<id>:{admin,read}` /
  * `account:admin` / `account:read` must never flow through `/oauth/authorize`.
  * The ONE deliberate exception (Wave A) is the account-vaults CONNECTION scope
- * `account:vaults` (un-narrowed, PRM-advertised) and its consent-bound blanket
+ * `account:vaults` (the un-narrowed request form, advertised by the account-MCP
+ * resource's RFC 9728 PRM — `account-mcp-http.ts` `accountMcpProtectedResource`,
+ * NOT the AS metadata doc / ADVERTISED_SCOPES) and its consent-bound blanket
  * `account:<id>:vaults` — the narrow surface that opens the account-MCP door.
  * The 4-part consent-NARROWED form `account:<id>:vaults:<vault>` stays
  * non-requestable (a client asks for the blanket; consent narrows it — a client

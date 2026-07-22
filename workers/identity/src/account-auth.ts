@@ -149,13 +149,18 @@ export async function validateAccountToken(
   // STRUCTURAL cross-account belt (money surface): the account principal is the
   // scope's `<id>`, and the token's `sub` MUST be that same id. Every mint path
   // upholds this by construction — C2 (account-token.ts) mints
-  // `account:<session.userId>:admin` with `sub=session.userId`, and `account:*`
-  // is non-requestable at `/oauth/authorize` (isNonRequestableScope, oauth-
-  // shared.ts) so no auth-code/refresh token can ever carry an account scope
-  // with a divergent `sub`. This assertion closes the "bearer for A acts on B"
-  // class STRUCTURALLY rather than by trusting that discipline: a token whose
-  // `sub` and `account:<id>` scope disagree can never authorize anything. It is
-  // pure belt (no legitimate token trips it), so it rejects auth-shaped (401).
+  // `account:<session.userId>:admin` with `sub=session.userId`; the admin/read
+  // family stays non-requestable at `/oauth/authorize` (isNonRequestableScope,
+  // oauth-shared.ts). The Wave A account-vaults family (`account:<id>:vaults[:…]`)
+  // IS requestable, so for it the invariant rests instead on
+  // `denyForeignAccountMint` (oauth-token.ts) — applied in BOTH code redemption
+  // AND refresh rotation, it refuses to sign a token carrying an account-vaults
+  // scope whose `<id>` is not the redeeming subject. Either way, no
+  // auth-code/refresh token can carry an account scope with a divergent `sub`.
+  // This assertion closes the "bearer for A acts on B" class STRUCTURALLY rather
+  // than by trusting that discipline: a token whose `sub` and `account:<id>`
+  // scope disagree can never authorize anything. It is pure belt (no legitimate
+  // token trips it), so it rejects auth-shaped (401).
   if (typeof payload.sub !== "string" || payload.sub !== accountId) {
     return {
       ok: false,
