@@ -31,7 +31,6 @@
  * seam is gated on. These fan-out reads are exactly as powerful as a vault token
  * the owner can already mint through public OAuth, and no more.
  */
-import { accountVaultsGrant } from "@openparachute/door-contract";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { type OAuthDeps, vaultAdvertisedUrl } from "./oauth-shared.ts";
 import {
@@ -55,6 +54,12 @@ import { latestUsageForVaults } from "./usage.ts";
 /** Per-vault timeout for the query-notes fan-out — a single server-side hop that
  *  must never let one slow/hung vault stall the whole cross-vault read. */
 export const FANOUT_TIMEOUT_MS = 10_000;
+
+/** The per-vault `limit` ceiling on a fan-out query. Clamped at this seam
+ *  (`buildNotesQuery`) as defense-in-depth: the vault RS enforces its own cap,
+ *  but a fan-out multiplies per-call cost across every covered vault, so an
+ *  unbounded `limit` is capped BEFORE the mint. */
+export const MAX_NOTES_LIMIT = 100;
 
 /**
  * The grant an authenticated account-MCP token carries — the OWNERSHIP-agnostic
@@ -113,13 +118,6 @@ export async function resolveCoverage(
   const byName = new Map(owned.map((v) => [v.name, v]));
   const vaults = grant.vaults.map((n) => byName.get(n)).filter((v): v is Vault => v !== undefined);
   return { covered: "listed", vaults, names: vaults.map((v) => v.name) };
-}
-
-/** Re-derive the grant from a token's scopes (auth gate has proven it non-null,
- *  but the tools re-derive rather than thread the object, so the ownership seam
- *  reads the scopes exactly once per concern). */
-export function grantFromScopes(scopes: readonly string[], accountId: string): AccountVaultsGrant | null {
-  return accountVaultsGrant(scopes, accountId);
 }
 
 /** The per-call context the tool executors run against. */
@@ -248,13 +246,21 @@ function buildNotesQuery(args: Record<string, unknown>): string {
   const rawTags = Array.isArray(args.tag) ? args.tag : typeof args.tag === "string" ? [args.tag] : [];
   for (const t of rawTags) if (typeof t === "string" && t.length > 0) p.append("tag", t);
   if (args.metadata && typeof args.metadata === "object") p.set("metadata", JSON.stringify(args.metadata));
-  const limit =
+  const rawLimit =
     typeof args.limit === "number"
       ? args.limit
       : typeof args.limit === "string"
         ? Number.parseInt(args.limit, 10)
         : undefined;
-  if (limit !== undefined && Number.isFinite(limit)) p.set("limit", String(limit));
+  if (rawLimit !== undefined && Number.isFinite(rawLimit)) {
+    // Defense-in-depth clamp to [1, MAX_NOTES_LIMIT]. A fan-out multiplies each
+    // vault's per-call cost by the number of covered vaults, so an unbounded
+    // `limit` passed straight through is a cheap way to amplify a cross-vault
+    // read. The vault RS also enforces its own ceiling; we clamp here too so the
+    // amplification is capped at THIS seam, before the mint fans out.
+    const clamped = Math.min(Math.max(1, Math.floor(rawLimit)), MAX_NOTES_LIMIT);
+    p.set("limit", String(clamped));
+  }
   return p.toString();
 }
 

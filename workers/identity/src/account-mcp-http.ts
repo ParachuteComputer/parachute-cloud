@@ -284,7 +284,10 @@ async function handleOne(m: JsonRpcMessage, ctx: AccountToolContext): Promise<Js
           })),
         });
       case "tools/call":
-        return handleToolCall(id, params, ctx);
+        // `await` (not a bare return) so a rejected tool-call promise unwinds
+        // INTO this try/catch and becomes a JSON-RPC INTERNAL_ERROR — a bare
+        // return would settle the promise outside the guard.
+        return await handleToolCall(id, params, ctx);
       case "ping":
         return result(id, {});
       default:
@@ -342,6 +345,13 @@ export async function handleAccountMcp(db: D1Database, req: Request, deps: OAuth
     return jsonRpcHttpError(400, PARSE_ERROR, "Parse error: Invalid JSON");
   }
 
+  // A JSON-RPC batch (top-level array) is accepted with NO explicit size cap in
+  // v1 — EXACT parity with the vault door's `handleMcp`, whose transport framing
+  // this file transcribes. A batch-size ceiling is a legitimate shared-transport
+  // hardening, but it belongs on BOTH doors at once (a per-door cap would diverge
+  // the wire contract the two conformance suites pin); defer it to the shared
+  // Streamable-HTTP transport work rather than forking it here. Each request in
+  // the batch is still auth-gated (the gate ran above) and answered serially.
   const rawMessages = Array.isArray(raw) ? raw : [raw];
   const messages: JsonRpcMessage[] = [];
   for (const m of rawMessages) {

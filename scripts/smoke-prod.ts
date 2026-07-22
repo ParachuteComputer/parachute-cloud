@@ -30,6 +30,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY = (process.env.IDENTITY ?? "https://cloud.parachute.computer").replace(/\/$/, "");
 const VAULT = (process.env.VAULT ?? "https://u.parachute.computer").replace(/\/$/, "");
 const VAULT_NAME = process.env.VAULT_NAME ?? "demo";
+// The advertised human front door (VAULT_PUBLIC_ORIGIN in prod) — the account-MCP
+// PRM `resource` names it, NOT the issuer (which stays cloud. through Phase 4).
+const FRONT_DOOR = (process.env.FRONT_DOOR ?? "https://my.parachute.computer").replace(/\/$/, "");
 
 // --- tiny test harness -----------------------------------------------------
 let failures = 0;
@@ -95,6 +98,68 @@ async function main() {
       Array.isArray(jwks.keys) && jwks.keys.length >= 1 && jwks.keys[0].kty === "RSA",
       "JWKS advertises an RS256 key",
       `${jwks.keys?.length} key(s)`,
+    );
+  }
+
+  // 1b. Account-level MCP (Wave A) — discovery + the auth gate, all state-free.
+  //     The account-MCP door lives at <front-door>/account/mcp; the identity
+  //     worker serves both cloud. and my. (same worker), so hitting IDENTITY
+  //     reaches the handler + the well-known. What this pins:
+  //       - the RFC 9728 PRM shape (resource = front door, AS = issuer,
+  //         scopes_supported advertises the un-narrowed account:vaults);
+  //       - an UNAUTHED POST /account/mcp → 401 carrying the PRM challenge, as
+  //         JSON — NOT a 200 SPA shell;
+  //       - /account/mcp NEVER serves HTML (the run_worker_first backstop:
+  //         the path must not fall through to the app's index.html).
+  {
+    const prm = (await (await fetch(`${IDENTITY}/.well-known/oauth-protected-resource/account/mcp`)).json()) as {
+      resource?: string;
+      authorization_servers?: string[];
+      scopes_supported?: string[];
+    };
+    assert(
+      prm.resource === `${FRONT_DOOR}/account/mcp` &&
+        Array.isArray(prm.authorization_servers) &&
+        prm.authorization_servers.includes(IDENTITY),
+      "account-mcp PRM: resource = front door + authorization_servers = issuer",
+      `resource=${prm.resource} as=${JSON.stringify(prm.authorization_servers)}`,
+    );
+    assert(
+      Array.isArray(prm.scopes_supported) && prm.scopes_supported.includes("account:vaults"),
+      "account-mcp PRM: advertises the un-narrowed account:vaults request scope",
+      JSON.stringify(prm.scopes_supported),
+    );
+
+    // Unauthed POST → 401 + PRM challenge, and JSON (never a 200 SPA shell).
+    const unauthed = await fetch(`${IDENTITY}/account/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      redirect: "manual",
+    });
+    const challenge = unauthed.headers.get("www-authenticate") ?? "";
+    const unauthedCt = unauthed.headers.get("content-type") ?? "";
+    const unauthedBody = await unauthed.text();
+    assert(
+      unauthed.status === 401 && challenge.includes("resource_metadata=") && challenge.includes("/account/mcp"),
+      "account-mcp: unauthed POST → 401 carrying the RFC 9728 PRM challenge",
+      `status ${unauthed.status} www-authenticate=${challenge || "(absent)"}`,
+    );
+    assert(
+      unauthedCt.includes("application/json") && !unauthedCt.includes("text/html") && !unauthedBody.trimStart().startsWith("<"),
+      "account-mcp: the 401 is JSON, NOT a 200 SPA shell (never HTML)",
+      `content-type=${unauthedCt}`,
+    );
+
+    // Belt-and-suspenders: an unauthed GET is refused too (the auth gate runs
+    // before method framing) and likewise never HTML — the path can't SPA-shell.
+    const getProbe = await fetch(`${IDENTITY}/account/mcp`, { redirect: "manual" });
+    const getCt = getProbe.headers.get("content-type") ?? "";
+    const getBody = await getProbe.text();
+    assert(
+      getProbe.status === 401 && !getCt.includes("text/html") && !getBody.trimStart().startsWith("<"),
+      "account-mcp: unauthed GET /account/mcp → 401, never the HTML SPA shell",
+      `status ${getProbe.status} content-type=${getCt}`,
     );
   }
 
