@@ -2109,13 +2109,17 @@ async function main() {
     }
   }
 
-  // 21. Account-level MCP (Wave A) — the whole account-MCP door end to end, on
-  //     a throwaway account with TWO seeded vaults:
-  //       blanket consent → account token (aud=account + refresh) → PRM shape →
+  // 21. Account-level MCP (Wave A door, COMPOSED consent — MCP Phase 2) — the
+  //     whole account-MCP door end to end, on a throwaway account with TWO seeded
+  //     vaults, driving the composed scope grammar PR3 emits:
+  //       WILDCARD read+write+create consent → account token (aud=account +
+  //       refresh; scope = vaults:*:write + vault-create) → PRM shape →
   //       initialize + tools/list (EXACTLY 3) → query-notes fan-out with
   //       per-vault attribution → create-vault (no token leaked) → refresh the
-  //       grant → the new vault is covered (blanket-covers-future) → a NARROWED
-  //       re-consent (uncheck a vault) → that vault is excluded.
+  //       grant → the new vault is covered (wildcard-covers-future) → a SPECIFIC
+  //       re-consent (only one vault) → the others are excluded → a READ-ONLY
+  //       wildcard grant lists + queries but is REFUSED create (the composed
+  //       create capability is a separate, unchecked box).
   //     Wrapped non-fatal so a hiccup can't abort a partial run.
   try {
     const stamp = Date.now();
@@ -2170,17 +2174,21 @@ async function main() {
       assert(w.status === 201, `account-mcp: seeded a note in ${v}`, `status ${w.status}`);
     }
 
-    // --- blanket consent → account token -------------------------------------
-    const blanket = await accountVaultsAuthorize(amEmail, amPassword, [vaultA, vaultB]);
-    assert(!!blanket.access, "account-mcp: blanket consent (all vaults checked) → account token minted", blanket.error ?? "");
+    // --- composed WILDCARD consent → account token ---------------------------
+    // "Any vault, read & write, + create new vaults" → the composed wildcard set:
+    // `account:<id>:vaults:*:write` (every owned vault, current + future) plus the
+    // separate `account:<id>:vault-create` capability.
+    const blanket = await accountVaultsAuthorize(amEmail, amPassword, { mode: "wildcard", verb: "write", create: true });
+    assert(!!blanket.access, "account-mcp: composed wildcard consent (any vault · read & write · + create) → account token minted", blanket.error ?? "");
     if (blanket.access) {
       const bClaims = decodeJwt(blanket.access);
       const accountId = String(bClaims.sub);
       assert(bClaims.aud === "account", "account-mcp: access token aud=account", String(bClaims.aud));
       assert(!!blanket.refresh, "account-mcp: refresh_token present on the account token", blanket.refresh ? "yes" : "MISSING");
       assert(
-        blanket.scope === `account:${accountId}:vaults`,
-        "account-mcp: blanket scope is the single 3-part account:<id>:vaults",
+        [...(blanket.scope ?? "").split(" ")].sort().join(" ") ===
+          [`account:${accountId}:vaults:*:write`, `account:${accountId}:vault-create`].sort().join(" "),
+        "account-mcp: composed wildcard scope = vaults:*:write + vault-create (no legacy 3-part)",
         String(blanket.scope),
       );
 
@@ -2288,9 +2296,9 @@ async function main() {
         "scanned raw response body",
       );
 
-      // Blanket-covers-future: refresh the grant (proves rotation preserves the
-      // blanket), then list-vaults on the refreshed token covers A, B AND C — a
-      // vault created AFTER consent.
+      // Wildcard-covers-future: refresh the grant (proves rotation preserves the
+      // composed wildcard set byte-identically), then list-vaults on the refreshed
+      // token covers A, B AND C — a vault created AFTER consent.
       const refreshRes = await fetch(`${IDENTITY}/oauth/token`, {
         method: "POST",
         headers: FORM,
@@ -2306,7 +2314,7 @@ async function main() {
         const rClaims = decodeJwt(refreshTok.access_token);
         assert(
           rClaims.aud === "account" && refreshTok.scope === blanket.scope,
-          "account-mcp: refreshed token preserves aud=account + the blanket scope byte-identically",
+          "account-mcp: refreshed token preserves aud=account + the composed wildcard scope byte-identically",
           `aud=${rClaims.aud} scope=${refreshTok.scope}`,
         );
         const listAfter = await accountMcpCall(refreshTok.access_token, {
@@ -2322,20 +2330,20 @@ async function main() {
             coveredNames.includes(vaultA) &&
             coveredNames.includes(vaultB) &&
             coveredNames.includes(vaultC),
-          "account-mcp: blanket-covers-future — a vault created AFTER consent is in coverage (covered=all)",
+          "account-mcp: wildcard-covers-future — a vault created AFTER consent is in coverage (covered=all)",
           `covered=${listAfterPayload.covered} names=${coveredNames.join(",")}`,
         );
       }
 
-      // NARROWED re-consent (uncheck vaultB and vaultC — grant ONLY vaultA) →
+      // SPECIFIC re-consent (only vaultA in the set — vaultB and vaultC excluded) →
       // the new grant EXCLUDES the unchecked vaults from list AND query.
-      const narrowed = await accountVaultsAuthorize(amEmail, amPassword, [vaultA]);
-      assert(!!narrowed.access, "account-mcp: narrowed re-consent (only vaultA checked) → token minted", narrowed.error ?? "");
+      const narrowed = await accountVaultsAuthorize(amEmail, amPassword, { mode: "specific", verb: "write", include: [vaultA] });
+      assert(!!narrowed.access, "account-mcp: specific re-consent (only vaultA in the set) → token minted", narrowed.error ?? "");
       if (narrowed.access) {
         const nClaims = decodeJwt(narrowed.access);
         assert(
-          narrowed.scope === `account:${accountId}:vaults:${vaultA}`,
-          "account-mcp: narrowed scope is the 4-part account:<id>:vaults:<vault> (no bare 3-part)",
+          narrowed.scope === `account:${accountId}:vaults:${vaultA}:write`,
+          "account-mcp: composed specific scope = one 5-part account:<id>:vaults:<vault>:write (no bare 3-part, no wildcard)",
           String(narrowed.scope),
         );
         const listN = await accountMcpCall(narrowed.access, {
@@ -2362,6 +2370,60 @@ async function main() {
           qNQueried.length === 1 && qNQueried[0] === vaultA,
           "account-mcp: query-notes under the narrowed grant reaches ONLY vaultA (B, C excluded)",
           qNQueried.join(","),
+        );
+      }
+
+      // READ-ONLY composed grant (any vault · read only · create WITHHELD) →
+      // `account:<id>:vaults:*:read`, NO vault-create. It can list + query across
+      // every vault, but create-vault is REFUSED (create_not_granted) — the composed
+      // create capability is a separate box that read-only consent leaves unchecked.
+      const readOnly = await accountVaultsAuthorize(amEmail, amPassword, { mode: "wildcard", verb: "read", create: false });
+      assert(!!readOnly.access, "account-mcp: read-only composed consent (any vault · read only · no create) → token minted", readOnly.error ?? "");
+      if (readOnly.access) {
+        assert(
+          readOnly.scope === `account:${accountId}:vaults:*:read`,
+          "account-mcp: read-only composed scope = vaults:*:read (no vault-create)",
+          String(readOnly.scope),
+        );
+        // list-vaults still covers every vault (read is coverage, not a verb gate here).
+        const listRO = await accountMcpCall(readOnly.access, {
+          jsonrpc: "2.0",
+          id: 9,
+          method: "tools/call",
+          params: { name: "list-vaults", arguments: {} },
+        });
+        const listROPayload = JSON.parse((await listRO.json()).result?.content?.[0]?.text ?? "{}");
+        const roNames = (listROPayload.vaults ?? []).map((v: any) => v.name);
+        assert(
+          listRO.status === 200 && listROPayload.covered === "all" && roNames.includes(vaultA) && roNames.includes(vaultB),
+          "account-mcp: read-only composed grant lists all vaults (covered=all)",
+          `covered=${listROPayload.covered} names=${roNames.join(",")}`,
+        );
+        // query-notes works read-only (the per-vault mint is a vault:<name>:read token).
+        const qRO = await accountMcpCall(readOnly.access, {
+          jsonrpc: "2.0",
+          id: 10,
+          method: "tools/call",
+          params: { name: "query-notes", arguments: { search: sharedTok } },
+        });
+        const qROQueried = JSON.parse((await qRO.json()).result?.content?.[0]?.text ?? "{}").vaults_queried ?? [];
+        assert(
+          qRO.status === 200 && qROQueried.length >= 2,
+          "account-mcp: read-only composed grant can query-notes across vaults",
+          `queried=${qROQueried.join(",")}`,
+        );
+        // create-vault is REFUSED — the read-only grant never carries vault-create.
+        const cvRO = await accountMcpCall(readOnly.access, {
+          jsonrpc: "2.0",
+          id: 11,
+          method: "tools/call",
+          params: { name: "create-vault", arguments: { name: `acct-ro-${stamp}` } },
+        });
+        const cvROText = await cvRO.text();
+        assert(
+          /create_not_granted/.test(cvROText) && !/"name":"acct-ro-/.test(cvROText),
+          "account-mcp: a read-only composed grant CANNOT create-vault (create_not_granted)",
+          cvROText.slice(0, 140),
         );
       }
     }
@@ -2443,18 +2505,21 @@ async function authorizeFor(email: string, password: string, vaultName: string):
 }
 
 /**
- * Run the account-vaults (Wave A) authorize flow for `email`/`password`,
- * submitting `vaultIncludes` as the consent's checked `vault_include` set
- * (ALL owned → blanket `account:<id>:vaults`; a subset → one 4-part
- * `account:<id>:vaults:<vault>` per checked vault). Returns the minted account
- * token pair (aud=account) + the client id/verifier for a later refresh, or the
- * OAuth error. A fresh DCR client each call — account-vaults ALWAYS re-renders
- * consent (never skip-consent), so no standing-grant surprises.
+ * Run the account-vaults COMPOSED consent flow (MCP Phase 2 PR3) for
+ * `email`/`password`, driving the four consent controls directly:
+ *   - `mode` — the vault-set radio: "wildcard" (any vault, current + future →
+ *     one `account:<id>:vaults:*:<verb>`) or "specific" (a fixed set → one 5-part
+ *     `account:<id>:vaults:<vault>:<verb>` per `include` box);
+ *   - `verb` — the access-level radio, {read, write} ONLY (admin is never rendered);
+ *   - `create` — the "Create new vaults" checkbox → `account:<id>:vault-create`.
+ * Returns the minted account token pair (aud=account) + the client id for a later
+ * refresh, or the OAuth error. A fresh DCR client each call — account-vaults ALWAYS
+ * re-renders consent (never skip-consent), so no standing-grant surprises.
  */
 async function accountVaultsAuthorize(
   email: string,
   password: string,
-  vaultIncludes: string[],
+  opts: { mode: "wildcard" | "specific"; verb: "read" | "write"; create?: boolean; include?: string[] },
 ): Promise<{ access?: string; refresh?: string; scope?: string; clientId?: string; error?: string }> {
   const scope = "account:vaults";
   const reg = await (
@@ -2477,9 +2542,14 @@ async function accountVaultsAuthorize(
   });
   if (loginRes.status !== 200) return { error: `login status ${loginRes.status}` };
   const session = cookieVal(loginRes.headers.getSetCookie(), "parachute_id_session");
-  // Consent — approve, carrying one vault_include per checked vault.
+  // Consent — approve, carrying the composed controls: the vault-set mode + the
+  // access verb (+ the optional create checkbox + the per-vault include boxes for
+  // specific mode). The submit handler emits the composed scope grammar from these.
   const consentForm = new URLSearchParams({ __action: "consent", __csrf: csrf!, decision: "approve", ...shared });
-  for (const v of vaultIncludes) consentForm.append("vault_include", v);
+  consentForm.set("vault_mode", opts.mode);
+  consentForm.set("access_verb", opts.verb);
+  if (opts.create) consentForm.set("vault_create", "1");
+  for (const v of opts.include ?? []) consentForm.append("vault_include", v);
   const consentRes = await fetch(`${IDENTITY}/oauth/authorize`, {
     method: "POST",
     headers: { ...FORM, cookie: `parachute_id_session=${session}; parachute_id_csrf=${csrf}`, origin: IDENTITY },

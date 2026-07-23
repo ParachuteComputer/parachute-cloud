@@ -2173,11 +2173,14 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
   });
 
   // --- composed-scope mint enforcement (MCP Phase 2 PR2) --------------------
-  // The composed grammar is non-requestable, so consent never emits these forms
-  // today; these tests hand-plant them to exercise `denyForeignAccountMint` on
-  // BOTH mint paths. `mintTokenWithScopes` issues an auth code directly (the code
-  // path); `refreshWithPlantedScopes` inserts a refresh row directly (the
-  // refresh-rotation path — "a hand-planted composed scope in a refresh row").
+  // Consent (PR3) now emits composed read/write/create forms — but ONLY for the
+  // SESSION user, and never the admin ceiling or a module scope. It NEVER emits a
+  // FOREIGN-account form (the account id is always `session.userId`). These tests
+  // hand-plant exactly those non-emittable shapes (foreign ids, malformed/admin
+  // verbs) to exercise `denyForeignAccountMint` on BOTH mint paths.
+  // `mintTokenWithScopes` issues an auth code directly (the code path);
+  // `refreshWithPlantedScopes` inserts a refresh row directly (the refresh-rotation
+  // path — "a hand-planted composed scope in a refresh row").
 
   /** Plant a refresh-token row carrying arbitrary scopes (bypassing the
    *  code-exchange gate), then drive one rotation — the refresh-path mint gate. */

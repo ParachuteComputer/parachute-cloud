@@ -129,6 +129,20 @@ async function main() {
       "account-mcp PRM: advertises the un-narrowed account:vaults request scope",
       JSON.stringify(prm.scopes_supported),
     );
+    // Composed forms (MCP Phase 2) are a CONSENT-TIME narrowing, never a
+    // requestable scope — the PRM must advertise ONLY the un-narrowed
+    // `account:vaults`, never a composed `:vaults:*:read|write` / `vault-create`
+    // form. Prod is read-only (no account creation), so the composed grant itself
+    // — mint → list/query/create → refresh — is exercised by smoke-staging + the
+    // identity unit suite; here we pin the discovery invariant that keeps the
+    // composed grammar non-requestable.
+    const advertised = prm.scopes_supported ?? [];
+    const anyComposed = advertised.some((s) => /:vaults:.+:(read|write|admin)$/.test(s) || /:vault-create$/.test(s));
+    assert(
+      !anyComposed,
+      "account-mcp PRM: composed narrowings are NOT advertised (non-requestable — consent-time only)",
+      JSON.stringify(advertised),
+    );
 
     // Unauthed POST → 401 + PRM challenge, and JSON (never a 200 SPA shell).
     const unauthed = await fetch(`${IDENTITY}/account/mcp`, {
