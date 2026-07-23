@@ -310,21 +310,26 @@ export interface ConsentProps {
    */
   verbSelector: OwnerVerbSelector | null;
   /**
-   * Wave A account-vaults consent block, or null. Non-null ONLY for an
-   * account-vaults request (`account:vaults` / `account:<id>:vaults`) — carries
-   * the owner's vault names, each rendered as a CHECKED checkbox
-   * (`name="vault_include"`). Leaving every box checked records the BLANKET grant
-   * (`account:<id>:vaults`, covering vaults created later); unchecking some
-   * narrows to a 4-part scope per checked vault. Mutually exclusive with the
+   * The account-vaults COMPOSED consent block, or null. Non-null ONLY for an
+   * account-vaults request (`account:vaults` / `account:<id>:vaults`) — the sole
+   * requestable trigger; the composed forms it EMITS are non-requestable, so this
+   * screen is their sole author (MCP Phase 2 PR3). It composes the grant from
+   * four visible controls (see `renderAccountVaultsBlock`): an always-on "see the
+   * vaults" line (no control), a CHECKED-by-default "Create new vaults" checkbox
+   * (`vault_create`), a vault-set mode radio (`vault_mode` — wildcard DEFAULT vs a
+   * specific set of `vault_include` boxes), and an access-level radio (`access_verb`
+   * — read | write DEFAULT, NEVER admin: the ceiling). Mutually exclusive with the
    * vault-picker / verb-selector branch (a mixed account+vault request is refused
-   * upstream). The submit re-validates every checked name against ownership
-   * server-side, so this list is UX, not the security boundary.
+   * upstream). The submit RE-VALIDATES server-side (verb ∈ {read,write}, every
+   * named vault against ownership, id forced to `session.userId`) and emits the
+   * composed scopes via the door-contract builders — so this render is UX, not the
+   * security boundary.
    */
   accountVaults: AccountVaultsConsent | null;
 }
 
 export interface AccountVaultsConsent {
-  /** The signed-in owner's vault names — one CHECKED checkbox each (default all). */
+  /** The signed-in owner's vault names — one CHECKED checkbox each (the "only these" set). */
   ownedVaults: string[];
 }
 
@@ -420,21 +425,34 @@ function renderVerbSelector(selector: OwnerVerbSelector): string {
 }
 
 /**
- * Wave A account-vaults consent block — one CHECKED checkbox per vault the owner
- * holds (`name="vault_include"`, all checked by default, the ratified
- * "all-vaults-checked" default) governing which EXISTING vaults this connection
- * can see and search, plus a SEPARATE always-visible "Create new vaults" line.
- * Creating a vault is an ACCOUNT-LEVEL capability (the scope label is "list,
- * create, and search"), orthogonal to which existing vaults are selected — so
- * the copy frames it as always available and does NOT tie it to "every vault
- * stays selected" (which wrongly implied create was gated on a blanket grant).
- * The one nuance a person needs: a vault created while the grant is NARROWED
- * won't be part of THIS connection until they reconnect (blanket auto-includes
- * future vaults; a narrowed grant is a fixed list). NO inline script (the strict
- * consent CSP admits none). The submit re-validates each checked name against
- * ownership server-side (`handleConsentSubmit`), so this render is UX, not the
- * boundary. Zero owned vaults renders guidance instead of an empty list — a
- * person needs a vault before the account-MCP surface is useful.
+ * The account-vaults COMPOSED consent screen (MCP Phase 2 PR3, design spec §2).
+ * ONE screen composes the whole grant; nothing here is requestable — consent is
+ * the sole author of the composed scopes the submit emits. Four visible controls:
+ *
+ *   1. "See the vaults in this connection" — a visible always-on line, NO
+ *      checkbox: listing is inherent to the grant (coverage-resolved), never
+ *      opt-out.
+ *   2. "Create new vaults" — its own line, a checkbox (`vault_create`) CHECKED by
+ *      default (unchecking allowed). Checked → the submit emits
+ *      `account:<id>:vault-create`; unchecked → no create scope (the MCP create
+ *      tool already refuses without it). Checked-by-default also means a
+ *      re-consent PRESERVES the create capability unless the owner unchecks it.
+ *   3. Vault set — a mode RADIO (`vault_mode`): "Any vault — current and future"
+ *      (wildcard, DEFAULT) vs "Only these vaults" (a fixed set of `vault_include`
+ *      boxes, all checked when shown). The MODE decides, not the box count:
+ *      "only these" with every box checked emits the SPECIFIC fixed set, NOT the
+ *      wildcard. The copy states the future-vaults difference.
+ *   4. Access level — a RADIO (`access_verb`): "Read only" vs "Read & write"
+ *      (DEFAULT). NO admin option, EVER — the ceiling (per-vault admin stays the
+ *      separate owner-elected tier-3 path). The server also whitelists the verb.
+ *
+ * NO inline script (the strict consent CSP admits none), so the per-vault boxes
+ * are always in the DOM under "Only these vaults" — the server simply ignores
+ * them when `vault_mode=wildcard`. NO billing / vault-delete / token-mint control
+ * ever appears here. The submit RE-VALIDATES everything server-side
+ * (`handleConsentSubmit` — verb whitelist, ownership, id=session.userId), so this
+ * render is UX, not the boundary. Zero owned vaults renders guidance instead of an
+ * empty set — a person needs a vault before the account-MCP surface is useful.
  */
 function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
   if (consent.ownedVaults.length === 0) {
@@ -446,11 +464,28 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
         `<label class="vaultopt"><input type="checkbox" name="vault_include" value="${esc(name)}" checked> <span>${esc(name)}</span></label>`,
     )
     .join("\n");
+  const opt = (name: string, value: string, title: string, desc: string, checked: boolean): string =>
+    `<label class="verbopt">
+               <input type="${name === "vault_create" ? "checkbox" : "radio"}" name="${name}" value="${value}"${checked ? " checked" : ""}>
+               <span class="verbopt-body"><span class="verbopt-title">${title}</span><span class="verbopt-desc">${esc(desc)}</span></span>
+             </label>`;
   return `<fieldset class="vaultinclude" data-testid="account-vaults">
-           <legend>Vaults to include</legend>
-           <p class="muted" style="margin:.3rem 0 .6rem;font-size:.84rem">Choose which vaults this app can see and search across. All are selected by default.</p>
-           ${boxes}
-           <p class="muted" data-testid="account-vaults-create-new" style="margin:.7rem 0 0;font-size:.84rem">Create new vaults — this app can always create new vaults in your account, regardless of the selection above. A vault you create while some are unselected won't be part of this connection until you reconnect.</p>
+           <legend>What this connection can do</legend>
+           <p class="verbopt" data-testid="account-vaults-list" style="margin:.35rem 0 0">
+             <span class="verbopt-body"><span class="verbopt-title">See the vaults in this connection</span><span class="verbopt-desc">Listing your vaults is part of connecting — always included.</span></span>
+           </p>
+           ${opt("vault_create", "1", "Create new vaults", "Let this app create new vaults in your account. Uncheck to withhold.", true)}
+           <div data-testid="account-vaults-set" style="margin:1rem 0 0">
+             <p class="verbopt-title" style="margin:0 0 .2rem">Which vaults</p>
+             ${opt("vault_mode", "wildcard", "Any vault — current and future", "Every vault you own now, plus any you create later.", true)}
+             ${opt("vault_mode", "specific", "Only these vaults", "A fixed set. A vault you create later won't be part of this connection until you reconnect.", false)}
+             <div data-testid="account-vaults-boxes" style="margin:.5rem 0 0 1.7rem">${boxes}</div>
+           </div>
+           <fieldset class="verbsel" data-testid="account-vaults-access" style="margin-top:1rem">
+             <legend>Access level</legend>
+             ${opt("access_verb", "read", "Read only", "View notes, tags, and attachments.", false)}
+             ${opt("access_verb", "write", "Read &amp; write", "View, create, edit, and delete notes, tags, and attachments.", true)}
+           </fieldset>
          </fieldset>`;
 }
 

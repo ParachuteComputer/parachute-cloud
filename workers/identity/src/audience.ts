@@ -5,44 +5,16 @@
  * a token's `aud` and rewrite unnamed `vault:<verb>` into the named,
  * audience-correct `vault:<name>:<verb>` shape a vault accepts.
  */
-import { accountVaultsScope } from "@openparachute/door-contract";
-
 export const VAULT_VERBS = new Set(["read", "write", "admin"]);
 
-/**
- * Build the consent-narrowed account-vaults scope set (Wave A) from the owner's
- * checked vault selection. `included` is the vault names the user consented to
- * (already ownership-validated by the caller — this is a pure shape builder, NOT
- * the security boundary); `owned` is every vault the account owns.
- *
- *   - checked === every owned vault → the BLANKET scope `account:<id>:vaults`
- *     (a single 3-part scope; resolved live as scope ∩ ownership at every call,
- *     so vaults created LATER are auto-included and can never reach an unowned
- *     vault); else
- *   - a strict subset → one 4-part `account:<id>:vaults:<vault>` per checked
- *     vault, and NO bare 3-part.
- *
- * The narrowing RIDES THE SCOPE STRING deliberately: `vault_scope` is not
- * persisted and is hard-reset to `[]` on refresh, so a `vault_scope`-carried
- * narrowing would silently widen to blanket on the first token refresh (the
- * load-bearing correction — see oauth-token.ts). Expressing "these vaults" as a
- * set of 4-part scopes is the only carrier that survives rotation. The 4-part
- * form is inert everywhere else (parseAccountScope/inferAudience/decompose all
- * null it; a vault slug can never contain `:`).
- *
- * `included` is de-duped; caller guarantees it is non-empty and a subset of
- * `owned` (a zero-checked or forged-unowned submit is refused upstream).
- */
-export function narrowAccountVaultsScopes(
-  accountId: string,
-  included: readonly string[],
-  owned: readonly string[],
-): string[] {
-  const includedSet = new Set(included);
-  const coversAll = owned.length > 0 && owned.every((v) => includedSet.has(v));
-  if (coversAll) return [accountVaultsScope(accountId)];
-  return [...includedSet].map((v) => `${accountVaultsScope(accountId)}:${v}`);
-}
+// The legacy `narrowAccountVaultsScopes` emitter (Wave A blanket/4-part narrowing)
+// was RETIRED from the consent submit path in MCP Phase 2 PR3 — new consents now
+// EMIT the composed grammar via the door-contract builders
+// (`composedWildcardVaultsScope` / `composedVaultScope` / `composedVaultCreateScope`),
+// composed straight in `oauth-authorize.ts handleConsentSubmit`. Existing legacy
+// grants and their refresh rotations keep their frozen legacy semantics (enforced
+// by PR2's `denyForeignAccountMint` + `parseComposedAccountScope`), so nothing
+// re-emits the legacy forms and this helper had no remaining caller.
 
 /**
  * Named `vault:<name>:<verb>` → `aud="vault.<name>"` (RFC 8707 resource

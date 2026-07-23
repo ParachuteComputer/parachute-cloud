@@ -6,10 +6,14 @@
  * session (single-consent); prior grants skip consent; resource/`vault=` bind the
  * consent + minted scopes to a named vault.
  */
-import { parseAccountVaultsScope } from "@openparachute/door-contract";
+import {
+  composedVaultCreateScope,
+  composedVaultScope,
+  composedWildcardVaultsScope,
+  parseAccountVaultsScope,
+} from "@openparachute/door-contract";
 import { issueAuthCode } from "./auth-codes.ts";
 import {
-  narrowAccountVaultsScopes,
   narrowResourceVaultScopes,
   narrowVaultScopes,
   resolveResourceVault,
@@ -524,35 +528,67 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
     );
   }
 
-  // Account-vaults (Wave A) — the separate consent surface. Read the checked
-  // vaults, RE-VALIDATE every one against ownership server-side (the checkbox
-  // names are an untrusted, attacker-writable hint), then record the BLANKET or
-  // NARROWED grant. The account id is ALWAYS `session.userId` — never a form value
-  // — so a forged id can never key a scope to someone else's account.
+  // Account-vaults (MCP Phase 2 PR3) — the COMPOSED consent surface. The screen
+  // is the SOLE author of the composed scopes (they are non-requestable); this
+  // submit COMPOSES the grant from the form and EMITS the composed forms PR2
+  // enforces. Every input is UNTRUSTED and RE-VALIDATED server-side, fail-closed:
+  //   - the account id is ALWAYS `session.userId` — never a form value — so a
+  //     forged/foreign id can never key a scope to another account;
+  //   - the access verb is whitelisted to {read, write} ONLY — anything else,
+  //     INCLUDING "admin" (the ceiling), is a 400 (belt-and-suspenders: the
+  //     door-contract builders also throw on a bad slot, but we reject explicitly);
+  //   - every named vault (specific mode) is re-checked against OWNERSHIP.
+  // NEW consents emit composed forms; legacy grants + refresh rows keep their
+  // frozen legacy semantics (PR2 handles both). recordGrant family-replaces the
+  // whole vault family (legacy + composed) so a re-consent replaces, never widens.
   const accountVaultsScopes = accountVaultsRequestScopes(scopes);
   if (accountVaultsScopes.length > 0) {
     const refused = denyMixedOrForeignAccountVaults(accountVaultsScopes, scopes, session.userId, params);
     if (refused) return refused;
+
+    // Access level — fail-closed verb whitelist. NEVER admin, never anything else.
+    const verb = String(form.get("access_verb") ?? "");
+    if (verb !== "read" && verb !== "write") {
+      return htmlError("Invalid request", "Choose a valid access level (read or read & write).", 400);
+    }
+
     const owned = (await listVaultsForOwner(db, session.userId)).map((v) => v.name);
-    const included = [
-      ...new Set(form.getAll("vault_include").filter((v): v is string => typeof v === "string")),
-    ];
-    if (included.length === 0) {
-      return htmlError("Vault required", "Select at least one vault to grant access to.", 400);
-    }
     const ownedSet = new Set(owned);
-    const unowned = included.filter((v) => !ownedSet.has(v));
-    if (unowned.length > 0) {
-      return oauthErrorRedirect(
-        params.redirectUri,
-        "invalid_scope",
-        `you do not own ${unowned.length > 1 ? "these vaults" : "the vault"}: ${unowned.join(", ")}`,
-        params.state,
-      );
+    const composedScopes: string[] = [];
+
+    // Vault set — the MODE radio decides, not the box count. "specific" with every
+    // box checked emits the fixed 5-part set, NOT the wildcard.
+    const mode = String(form.get("vault_mode") ?? "");
+    if (mode === "specific") {
+      const included = [
+        ...new Set(form.getAll("vault_include").filter((v): v is string => typeof v === "string")),
+      ];
+      if (included.length === 0) {
+        return htmlError("Vault required", "Select at least one vault, or choose “Any vault.”", 400);
+      }
+      const unowned = included.filter((v) => !ownedSet.has(v));
+      if (unowned.length > 0) {
+        return oauthErrorRedirect(
+          params.redirectUri,
+          "invalid_scope",
+          `you do not own ${unowned.length > 1 ? "these vaults" : "the vault"}: ${unowned.join(", ")}`,
+          params.state,
+        );
+      }
+      for (const v of included) composedScopes.push(composedVaultScope(session.userId, v, verb));
+    } else if (mode === "wildcard") {
+      composedScopes.push(composedWildcardVaultsScope(session.userId, verb));
+    } else {
+      return htmlError("Invalid request", "Choose which vaults to include.", 400);
     }
-    const accountScopes = narrowAccountVaultsScopes(session.userId, included, owned);
-    await recordGrant(db, session.userId, client.clientId, accountScopes, deps.now?.() ?? new Date());
-    return issueAuthCodeRedirect(db, { ...params, scope: accountScopes.join(" ") }, accountScopes, session.userId, deps);
+
+    // Create new vaults — a checkbox CHECKED by default; present ⇒ grant it.
+    if (form.get("vault_create") !== null) {
+      composedScopes.push(composedVaultCreateScope(session.userId));
+    }
+
+    await recordGrant(db, session.userId, client.clientId, composedScopes, deps.now?.() ?? new Date());
+    return issueAuthCodeRedirect(db, { ...params, scope: composedScopes.join(" ") }, composedScopes, session.userId, deps);
   }
 
   // Narrow unnamed vault verbs to the picked vault (form pick or `vault=` hint).

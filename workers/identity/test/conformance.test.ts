@@ -1691,11 +1691,26 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     ...extra,
   });
 
-  /** POST /oauth/authorize consent carrying N `vault_include` checkboxes. */
+  /**
+   * POST /oauth/authorize consent for the COMPOSED account-vaults screen (PR3).
+   * `mode` picks the vault-set radio (wildcard default); `verb` the access-level
+   * radio (write default — pass an explicit value, incl. a spoofed "admin"/"" for
+   * fail-closed vectors); `create` the create-new checkbox (present by default);
+   * `include` the per-vault boxes consulted only in specific mode. Field names
+   * intentionally OMITTED (undefined) to exercise the server's fail-closed defaults.
+   */
   function accountVaultsConsentReq(
     fieldMap: Record<string, string>,
-    vaultIncludes: string[],
-    opts: { sessionId: string; decision?: string },
+    opts: {
+      sessionId: string;
+      decision?: string;
+      mode?: string;
+      verb?: string;
+      create?: boolean;
+      include?: string[];
+      omitMode?: boolean;
+      omitVerb?: boolean;
+    },
   ): Request {
     const body = new URLSearchParams({
       __action: "consent",
@@ -1703,7 +1718,10 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
       decision: opts.decision ?? "approve",
       ...fieldMap,
     });
-    for (const v of vaultIncludes) body.append("vault_include", v);
+    if (!opts.omitMode) body.set("vault_mode", opts.mode ?? "wildcard");
+    if (!opts.omitVerb) body.set("access_verb", opts.verb ?? "write");
+    if (opts.create ?? true) body.set("vault_create", "1");
+    for (const v of opts.include ?? []) body.append("vault_include", v);
     return new Request(`${ISSUER}/oauth/authorize`, {
       method: "POST",
       body,
@@ -1750,7 +1768,7 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
 
   // --- render ---------------------------------------------------------------
 
-  test("consent renders a CHECKED checkbox per owned vault + the create-new line + static copy", async () => {
+  test("consent renders the COMPOSED screen: always-on list line, create checkbox (checked), mode + access radios, NO admin/billing/delete/mint", async () => {
     const { id: userId } = await seedUser("av-render@example.com");
     await seedVault("alpha", userId);
     await seedVault("beta", userId);
@@ -1761,16 +1779,34 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('data-testid="account-vaults"');
+    // 1. "See the vaults" — a visible always-on line, NO control (no checkbox/radio for listing).
+    expect(html).toContain('data-testid="account-vaults-list"');
+    expect(html).toContain("See the vaults in this connection");
+    // 2. "Create new vaults" — its own checkbox, CHECKED by default.
+    expect(html).toContain('name="vault_create" value="1" checked');
+    // 3. Vault set — a mode radio, wildcard DEFAULT (checked); "only these" reveals boxes (all checked).
+    expect(html).toContain('name="vault_mode" value="wildcard" checked');
+    expect(html).toContain('name="vault_mode" value="specific"');
     expect(html).toContain('name="vault_include" value="alpha" checked');
     expect(html).toContain('name="vault_include" value="beta" checked');
-    // The always-visible "Create new vaults" line: create is an ACCOUNT-LEVEL
-    // capability, NOT gated on all-vaults-selected, with the reconnect nuance
-    // for vaults made under a narrowed grant.
-    expect(html).toContain('data-testid="account-vaults-create-new"');
-    expect(html).toContain("regardless of the selection above");
-    expect(html).toContain("won't be part of this connection until you reconnect");
-    // The scope label copy.
+    expect(html).toContain("Any vault");
+    expect(html).toContain("be part of this connection until you reconnect");
+    // 4. Access level — the radio offers EXACTLY read + write; the admin ceiling
+    // is NEVER rendered.
+    const verbValues = [...html.matchAll(/name="access_verb" value="([^"]+)"/g)].map((m) => m[1]).sort();
+    expect(verbValues).toEqual(["read", "write"]);
+    expect(html).toContain('name="access_verb" value="write" checked');
+    expect(html).not.toContain('value="admin"');
+    expect(html).not.toContain("Full admin");
+    // The requested-scope label copy is unchanged.
     expect(html).toContain("List, create, and search across the vaults in your account");
+    // The screen offers NO billing / vault-delete / token-mint / admin CONTROL —
+    // asserted over the actual input control NAMES (robust against copy like
+    // "delete notes", which write access legitimately allows, and against emails).
+    const inputNames = [...html.matchAll(/<input[^>]*\bname="([^"]+)"/g)].map((m) => m[1]);
+    for (const name of inputNames) {
+      expect(/billing|delete|mint|admin/i.test(name), `unexpected control name: ${name}`).toBe(false);
+    }
     // NOT the vault-picker / verb-selector surface (mutually exclusive).
     expect(html).not.toContain('name="vault_pick"');
     expect(html).not.toContain('name="verb_select"');
@@ -1780,8 +1816,8 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
 
   // --- consent narrowing → token vectors ------------------------------------
 
-  test("blanket (all vaults checked) → the single 3-part account:<id>:vaults, aud=account", async () => {
-    const { id: userId } = await seedUser("av-blanket@example.com");
+  test("wildcard mode + write → composedWildcardVaultsScope + vault-create, aud=account", async () => {
+    const { id: userId } = await seedUser("av-wildcard@example.com");
     await seedVault("alpha", userId);
     await seedVault("beta", userId);
     const { clientId } = await seedApprovedClient({ clientName: "Claude" });
@@ -1789,20 +1825,24 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     const { verifier, challenge } = await makePkce();
     const consent = await handleAuthorizePost(
       env.DB,
-      accountVaultsConsentReq(fields(clientId, challenge), ["alpha", "beta"], { sessionId }),
+      accountVaultsConsentReq(fields(clientId, challenge), { sessionId, mode: "wildcard", verb: "write" }),
       deps(),
     );
     const code = await codeFromConsent(consent);
     const tokenRes = await mintFromCode(clientId, code, verifier);
     expect(tokenRes.status).toBe(200);
     const pair = (await tokenRes.json()) as { scope: string; access_token: string };
-    // Exactly the blanket — no 4-part scopes.
-    expect(pair.scope.split(" ")).toEqual([`account:${userId}:vaults`]);
+    // The composed wildcard grant + the checked-by-default create capability — NO
+    // legacy blanket/4-part forms.
+    expect(pair.scope.split(" ").sort()).toEqual(
+      [`account:${userId}:vaults:*:write`, `account:${userId}:vault-create`].sort(),
+    );
+    expect(pair.scope.split(" ")).not.toContain(`account:${userId}:vaults`);
     expect(decodeJwtPayload(pair.access_token).aud).toBe("account");
   });
 
-  test("narrowed (subset checked) → one 4-part scope per checked vault, NO bare 3-part", async () => {
-    const { id: userId } = await seedUser("av-narrow@example.com");
+  test("specific mode + read → one 5-part composedVaultScope per checked vault, NOT a wildcard", async () => {
+    const { id: userId } = await seedUser("av-specific@example.com");
     await seedVault("alpha", userId);
     await seedVault("beta", userId);
     await seedVault("gamma", userId);
@@ -1811,21 +1851,87 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     const { verifier, challenge } = await makePkce();
     const consent = await handleAuthorizePost(
       env.DB,
-      accountVaultsConsentReq(fields(clientId, challenge), ["alpha", "gamma"], { sessionId }),
+      accountVaultsConsentReq(fields(clientId, challenge), {
+        sessionId,
+        mode: "specific",
+        verb: "read",
+        include: ["alpha", "gamma"],
+        create: false,
+      }),
       deps(),
     );
     const code = await codeFromConsent(consent);
     const tokenRes = await mintFromCode(clientId, code, verifier);
     expect(tokenRes.status).toBe(200);
     const pair = (await tokenRes.json()) as { scope: string; access_token: string };
-    expect(pair.scope.split(" ").sort()).toEqual([`account:${userId}:vaults:alpha`, `account:${userId}:vaults:gamma`]);
-    // No bare 3-part blanket smuggled in alongside.
-    expect(pair.scope.split(" ")).not.toContain(`account:${userId}:vaults`);
+    expect(pair.scope.split(" ").sort()).toEqual([
+      `account:${userId}:vaults:alpha:read`,
+      `account:${userId}:vaults:gamma:read`,
+    ]);
+    // The MODE decides — no wildcard smuggled in, and (create unchecked) no create.
+    expect(pair.scope).not.toContain(":vaults:*:");
+    expect(pair.scope).not.toContain("vault-create");
     expect(decodeJwtPayload(pair.access_token).aud).toBe("account");
   });
 
-  test("THE LOAD-BEARING PIN: refresh rotation preserves a NARROWED set byte-identically (never widens to blanket)", async () => {
-    const { id: userId } = await seedUser("av-refresh-narrow@example.com");
+  test("specific mode with EVERY box checked still emits the fixed 5-part set, NOT the wildcard (the mode radio decides, not the box count)", async () => {
+    const { id: userId } = await seedUser("av-specific-all@example.com");
+    await seedVault("alpha", userId);
+    await seedVault("beta", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { verifier, challenge } = await makePkce();
+    const consent = await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, challenge), {
+        sessionId,
+        mode: "specific",
+        verb: "write",
+        include: ["alpha", "beta"],
+        create: false,
+      }),
+      deps(),
+    );
+    const code = await codeFromConsent(consent);
+    const pair = (await (await mintFromCode(clientId, code, verifier)).json()) as { scope: string };
+    expect(pair.scope.split(" ").sort()).toEqual([
+      `account:${userId}:vaults:alpha:write`,
+      `account:${userId}:vaults:beta:write`,
+    ]);
+    expect(pair.scope).not.toContain(":vaults:*:");
+  });
+
+  test("create checkbox toggles account:<id>:vault-create (present ⇒ granted, absent ⇒ withheld)", async () => {
+    const { id: userId } = await seedUser("av-create-toggle@example.com");
+    await seedVault("alpha", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    // create present (default checkbox)
+    {
+      const { verifier, challenge } = await makePkce();
+      const consent = await handleAuthorizePost(
+        env.DB,
+        accountVaultsConsentReq(fields(clientId, challenge), { sessionId, mode: "wildcard", verb: "read", create: true }),
+        deps(),
+      );
+      const pair = (await (await mintFromCode(clientId, await codeFromConsent(consent), verifier)).json()) as { scope: string };
+      expect(pair.scope.split(" ")).toContain(`account:${userId}:vault-create`);
+    }
+    // create absent (unchecked) — same connection, re-consent WITHOUT it
+    {
+      const { verifier, challenge } = await makePkce();
+      const consent = await handleAuthorizePost(
+        env.DB,
+        accountVaultsConsentReq(fields(clientId, challenge), { sessionId, mode: "wildcard", verb: "read", create: false }),
+        deps(),
+      );
+      const pair = (await (await mintFromCode(clientId, await codeFromConsent(consent), verifier)).json()) as { scope: string };
+      expect(pair.scope.split(" ")).not.toContain(`account:${userId}:vault-create`);
+    }
+  });
+
+  test("THE LOAD-BEARING PIN: refresh rotation preserves a SPECIFIC composed set byte-identically (never widens to wildcard)", async () => {
+    const { id: userId } = await seedUser("av-refresh-specific@example.com");
     await seedVault("alpha", userId);
     await seedVault("beta", userId);
     await seedVault("gamma", userId);
@@ -1834,27 +1940,33 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     const { verifier, challenge } = await makePkce();
     const consent = await handleAuthorizePost(
       env.DB,
-      accountVaultsConsentReq(fields(clientId, challenge), ["alpha", "gamma"], { sessionId }),
+      accountVaultsConsentReq(fields(clientId, challenge), {
+        sessionId,
+        mode: "specific",
+        verb: "write",
+        include: ["alpha", "gamma"],
+        create: false,
+      }),
       deps(),
     );
     const code = await codeFromConsent(consent);
     const tokenRes = await mintFromCode(clientId, code, verifier);
     const pair = (await tokenRes.json()) as { scope: string; refresh_token: string };
-    const expected = [`account:${userId}:vaults:alpha`, `account:${userId}:vaults:gamma`];
+    const expected = [`account:${userId}:vaults:alpha:write`, `account:${userId}:vaults:gamma:write`];
     expect(pair.scope.split(" ").sort()).toEqual(expected);
-    // Rotate. The narrowing rides the scope string, so it MUST survive intact —
-    // a vault_scope-carried narrowing would silently widen to blanket here.
+    // Rotate. The composed set rides the scope string, so it MUST survive intact —
+    // a vault_scope-carried narrowing would silently widen here (vault_scope stays []).
     const refreshed = await refreshAt(clientId, pair.refresh_token, new Date());
     expect(refreshed.status).toBe(200);
     const rp = (await refreshed.json()) as { scope: string; access_token: string };
-    expect(rp.scope).toBe(pair.scope); // byte-identical
-    expect(rp.scope).not.toBe(`account:${userId}:vaults`); // NOT widened to blanket
+    expect(rp.scope.split(" ").sort()).toEqual(expected); // byte-identical set
+    expect(rp.scope).not.toContain(":vaults:*:"); // NOT widened to wildcard
     expect((decodeJwtPayload(rp.access_token).scope as string).split(" ").sort()).toEqual(expected);
     expect(decodeJwtPayload(rp.access_token).aud).toBe("account");
   });
 
-  test("refresh rotation preserves a BLANKET grant (stays the single 3-part)", async () => {
-    const { id: userId } = await seedUser("av-refresh-blanket@example.com");
+  test("refresh rotation preserves a WILDCARD composed grant (stays the 5-part wildcard)", async () => {
+    const { id: userId } = await seedUser("av-refresh-wildcard@example.com");
     await seedVault("alpha", userId);
     await seedVault("beta", userId);
     const { clientId } = await seedApprovedClient();
@@ -1862,38 +1974,87 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     const { verifier, challenge } = await makePkce();
     const consent = await handleAuthorizePost(
       env.DB,
-      accountVaultsConsentReq(fields(clientId, challenge), ["alpha", "beta"], { sessionId }),
+      accountVaultsConsentReq(fields(clientId, challenge), { sessionId, mode: "wildcard", verb: "read", create: false }),
       deps(),
     );
     const code = await codeFromConsent(consent);
     const pair = (await (await mintFromCode(clientId, code, verifier)).json()) as { scope: string; refresh_token: string };
-    expect(pair.scope).toBe(`account:${userId}:vaults`);
+    expect(pair.scope).toBe(`account:${userId}:vaults:*:read`);
     const refreshed = await refreshAt(clientId, pair.refresh_token, new Date());
     const rp = (await refreshed.json()) as { scope: string };
-    expect(rp.scope).toBe(`account:${userId}:vaults`);
+    expect(rp.scope).toBe(`account:${userId}:vaults:*:read`);
   });
 
   // --- recordGrant family-replace -------------------------------------------
 
-  test("re-consenting NARROWED after BLANKET DROPS the blanket (narrowing is not one-way)", async () => {
+  test("re-consenting a SPECIFIC set after a WILDCARD grant DROPS the wildcard (family-replace, narrowing narrows)", async () => {
     const { id: userId } = await seedUser("av-replace@example.com");
     await seedVault("alpha", userId);
     await seedVault("beta", userId);
     const { clientId } = await seedApprovedClient();
     const sessionId = await seedSession(userId);
     const { challenge: c1 } = await makePkce();
-    await handleAuthorizePost(env.DB, accountVaultsConsentReq(fields(clientId, c1), ["alpha", "beta"], { sessionId }), deps());
+    await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, c1), { sessionId, mode: "wildcard", verb: "write", create: false }),
+      deps(),
+    );
     const { challenge: c2 } = await makePkce();
-    await handleAuthorizePost(env.DB, accountVaultsConsentReq(fields(clientId, c2), ["alpha"], { sessionId }), deps());
+    await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, c2), { sessionId, mode: "specific", verb: "read", include: ["alpha"], create: false }),
+      deps(),
+    );
     const { findGrant } = await import("../src/grants.ts");
     const grant = await findGrant(env.DB, userId, clientId);
-    // Family-replace: the blanket `account:<id>:vaults` is gone, only the 4-part.
-    expect(grant?.scopes).toEqual([`account:${userId}:vaults:alpha`]);
+    // Family-replace (recordGrant, PR2): the wildcard is gone, only the 5-part.
+    expect(grant?.scopes).toEqual([`account:${userId}:vaults:alpha:read`]);
   });
 
-  // --- refusals -------------------------------------------------------------
+  // --- server-side fail-closed re-validation --------------------------------
 
-  test("a forged vault_include naming an UNOWNED vault is refused (invalid_scope)", async () => {
+  test("SERVER REJECTS verb=admin — a hand-crafted submit carrying the ceiling verb is a 400 (fail-closed, not just hidden in the UI)", async () => {
+    const { id: userId } = await seedUser("av-verb-admin@example.com");
+    await seedVault("alpha", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const consent = await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, challenge), { sessionId, mode: "wildcard", verb: "admin" }),
+      deps(),
+    );
+    expect(consent.status).toBe(400);
+    // No code was issued, no grant recorded.
+    const { findGrant } = await import("../src/grants.ts");
+    expect(await findGrant(env.DB, userId, clientId)).toBeNull();
+  });
+
+  test("SERVER REJECTS an unrecognized verb (fail-closed) — anything not read|write is a 400", async () => {
+    const { id: userId } = await seedUser("av-verb-bogus@example.com");
+    await seedVault("alpha", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    for (const verb of ["delete", "owner", ""]) {
+      const consent = await handleAuthorizePost(
+        env.DB,
+        accountVaultsConsentReq(fields(clientId, challenge), { sessionId, mode: "wildcard", verb }),
+        deps(),
+      );
+      expect(consent.status, `verb=${JSON.stringify(verb)}`).toBe(400);
+    }
+    // An OMITTED access_verb is likewise fail-closed.
+    const { challenge: c2 } = await makePkce();
+    const omitted = await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, c2), { sessionId, mode: "wildcard", omitVerb: true }),
+      deps(),
+    );
+    expect(omitted.status).toBe(400);
+  });
+
+  test("SERVER REJECTS an UNOWNED vault name in specific mode — the checkbox names are re-checked against ownership (invalid_scope)", async () => {
     const { id: userId } = await seedUser("av-forge@example.com");
     await seedVault("mine", userId);
     const { clientId } = await seedApprovedClient();
@@ -1901,7 +2062,12 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     const { challenge } = await makePkce();
     const consent = await handleAuthorizePost(
       env.DB,
-      accountVaultsConsentReq(fields(clientId, challenge), ["mine", "stranger"], { sessionId }),
+      accountVaultsConsentReq(fields(clientId, challenge), {
+        sessionId,
+        mode: "specific",
+        verb: "read",
+        include: ["mine", "stranger"],
+      }),
       deps(),
     );
     // Cross-origin error redirect → bridged to a 200 page carrying the error.
@@ -1910,7 +2076,28 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     expect(target.searchParams.get("error")).toBe("invalid_scope");
   });
 
-  test("zero vaults checked → a 400 error (no grant, no code)", async () => {
+  test("the emitted account id is ALWAYS session.userId — the request carries no id (bare account:vaults) yet the composed scope keys to the session user", async () => {
+    const { id: userId } = await seedUser("av-id-forced@example.com");
+    await seedVault("alpha", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { verifier, challenge } = await makePkce();
+    // The request scope is the bare `account:vaults` (no id at all); the emission
+    // sources the id from the SESSION, never from any form value.
+    const consent = await handleAuthorizePost(
+      env.DB,
+      accountVaultsConsentReq(fields(clientId, challenge), { sessionId, mode: "wildcard", verb: "write", create: false }),
+      deps(),
+    );
+    const pair = (await (await mintFromCode(clientId, await codeFromConsent(consent), verifier)).json()) as {
+      scope: string;
+      access_token: string;
+    };
+    expect(pair.scope).toBe(`account:${userId}:vaults:*:write`);
+    expect(decodeJwtPayload(pair.access_token).sub).toBe(userId);
+  });
+
+  test("zero vaults selected in specific mode → a 400 (no grant, no code)", async () => {
     const { id: userId } = await seedUser("av-zero@example.com");
     await seedVault("mine", userId);
     const { clientId } = await seedApprovedClient();
@@ -1918,7 +2105,7 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     const { challenge } = await makePkce();
     const consent = await handleAuthorizePost(
       env.DB,
-      accountVaultsConsentReq(fields(clientId, challenge), [], { sessionId }),
+      accountVaultsConsentReq(fields(clientId, challenge), { sessionId, mode: "specific", verb: "read", include: [] }),
       deps(),
     );
     expect(consent.status).toBe(400);
