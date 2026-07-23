@@ -3,19 +3,32 @@
  * `grants.ts`. UNION-merge on record; skip consent iff every requested scope is
  * already in the grant's set (a strict superset re-prompts).
  *
- * ACCOUNT-VAULTS EXCEPTION (Wave A) — union-merge is one-way for a NARROWING
- * choice: if a user first grants the blanket `account:<id>:vaults` and later
- * re-consents to a NARROWED subset (4-part scopes), a plain union would keep the
- * blanket too, silently re-widening the grant. So when a recorded consent
- * carries account-vaults-family scopes, the existing account-vaults family for
- * that grant is DROPPED before the merge (family-replace), letting a later
- * narrowing actually narrow. Every other scope family stays union-merged.
+ * ACCOUNT-VAULTS EXCEPTION — union-merge is one-way for a NARROWING choice: if a
+ * user first grants the blanket `account:<id>:vaults` and later re-consents to a
+ * NARROWED subset, a plain union would keep the blanket too, silently re-widening
+ * the grant. So when a recorded consent carries account-vaults-FAMILY scopes, the
+ * existing family for that grant is DROPPED before the merge (family-replace),
+ * letting a later narrowing actually narrow. Every other scope family stays
+ * union-merged.
+ *
+ * The family spans BOTH the legacy Wave A forms (`account:<id>:vaults[:<vault>]`)
+ * AND the composed grammar (`account:<id>:vaults:*:<verb>`, the 5-part per-vault
+ * form, and the `account:<id>:vault-create` capability) — recognized via
+ * `parseComposedAccountScope`, the superset recognizer. So a composed re-consent
+ * REPLACES a legacy family and vice-versa, and narrowing narrows across the
+ * legacy→composed migration. MODULE grants (`account:<id>:mod:…`) are deliberately
+ * EXCLUDED — they are a disjoint family whose replace semantics Phase 3 decides;
+ * a vault re-consent must not wipe a module grant (or vice-versa).
  */
-import { parseAccountVaultsScope } from "@openparachute/door-contract";
+import { parseComposedAccountScope } from "@openparachute/door-contract";
 
-/** An `account:<id>:vaults[:<vault>]` (blanket or 4-part narrowed) scope — the family a re-consent REPLACES rather than unions. */
+/**
+ * A vault-family account scope the re-consent REPLACES rather than unions — every
+ * composed/legacy vault form and the create capability, but NOT module grants.
+ */
 function isAccountVaultsFamilyScope(scope: string): boolean {
-  return parseAccountVaultsScope(scope) !== null;
+  const kind = parseComposedAccountScope(scope)?.kind;
+  return kind !== undefined && kind !== "module";
 }
 
 export interface Grant {

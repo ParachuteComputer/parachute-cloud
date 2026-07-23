@@ -21,20 +21,22 @@
  *
  * ## The auth gate runs BEFORE any JSON-RPC (the enforcement seam)
  * Bearer → `validateAccountToken` (kid + `iss` pin + jti revocation + strict
- * `aud="account"` + `sub===id` belt) → `accountVaultsGrant` non-null (a
+ * `aud="account"` + `sub===id` belt) → `buildAccountConnectionGrant` non-null (a
  * read/admin-only account token — the 10-min cookie bearer — does NOT pass; only
- * the account-vaults connection scope opens this door) → suspended-owner refusal.
+ * a legacy account-vaults OR composed connection grant opens this door) →
+ * suspended-owner refusal.
  * A failure is a 401/403 carrying the RFC 9728 `WWW-Authenticate` challenge that
  * points at THIS resource's PRM, so a bare 401 walks a spec-following client to
  * discovery.
  */
-import { ACCOUNT_VAULTS_UNNARROWED, accountVaultsGrant } from "@openparachute/door-contract";
+import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import { validateAccountToken } from "./account-auth.ts";
 import {
   ACCOUNT_MCP_TOOLS,
+  type AccountConnectionGrant,
   type AccountToolContext,
-  type AccountVaultsGrant,
   AccountToolError,
+  buildAccountConnectionGrant,
 } from "./account-mcp.ts";
 import { type OAuthDeps, frontDoorOrigin, jsonResponse } from "./oauth-shared.ts";
 import { type User, getUserById } from "./users.ts";
@@ -166,7 +168,7 @@ function bearerToken(req: Request): string | null {
 }
 
 type AuthResult =
-  | { ok: true; accountId: string; grant: AccountVaultsGrant; user: User }
+  | { ok: true; accountId: string; grant: AccountConnectionGrant; user: User }
   | { ok: false; status: 401 | 403; error: string; message: string };
 
 /**
@@ -175,9 +177,10 @@ type AuthResult =
  *   2. `validateAccountToken` — kid + `iss` pin + jti revocation + strict
  *      `aud="account"` + `sub===id` belt (account-auth.ts). Failure → its
  *      401/403.
- *   3. `accountVaultsGrant(scopes, sub)` non-null — the account-vaults family is
- *      REQUIRED. A read/admin-only account token (the cookie-minted 10-min
- *      bearer) carries no vaults grant → 403; it is not an MCP credential.
+ *   3. `buildAccountConnectionGrant(scopes, sub)` non-null — a legacy OR composed
+ *      connection grant is REQUIRED. A read/admin-only account token (the
+ *      cookie-minted 10-min bearer) carries no such grant → 403; not an MCP
+ *      credential.
  *   4. Suspended-owner refusal (the read-time chokepoint C1's stateless
  *      validator defers to the caller) → 401.
  */
@@ -191,7 +194,12 @@ async function authenticate(db: D1Database, req: Request, deps: OAuthDeps): Prom
   }
   const accountId = validated.token.accountId;
 
-  const grant = accountVaultsGrant(validated.token.scopes, accountId);
+  // Accept a LEGACY account-vaults grant OR a COMPOSED grant (unified /mcp):
+  // buildAccountConnectionGrant unifies both and returns null only when the token
+  // confers nothing that opens this door (no all-vaults grant, no per-vault grant,
+  // no create capability). A read/admin-only account token (the cookie-minted
+  // 10-min bearer) carries no such grant → 403; it is not an MCP credential.
+  const grant = buildAccountConnectionGrant(validated.token.scopes, accountId);
   if (grant === null) {
     return {
       ok: false,

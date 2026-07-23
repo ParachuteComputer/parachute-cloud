@@ -1984,6 +1984,174 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     expect(pair.scope).toBe(`account:${userId}:vaults:alpha`);
     expect(decodeJwtPayload(pair.access_token).aud).toBe("account");
   });
+
+  // --- composed-scope mint enforcement (MCP Phase 2 PR2) --------------------
+  // The composed grammar is non-requestable, so consent never emits these forms
+  // today; these tests hand-plant them to exercise `denyForeignAccountMint` on
+  // BOTH mint paths. `mintTokenWithScopes` issues an auth code directly (the code
+  // path); `refreshWithPlantedScopes` inserts a refresh row directly (the
+  // refresh-rotation path — "a hand-planted composed scope in a refresh row").
+
+  /** Plant a refresh-token row carrying arbitrary scopes (bypassing the
+   *  code-exchange gate), then drive one rotation — the refresh-path mint gate. */
+  async function refreshWithPlantedScopes(clientId: string, userId: string, scopes: string[]): Promise<Response> {
+    const { signRefreshToken } = await import("../src/tokens.ts");
+    const planted = await signRefreshToken(env.DB, { jti: crypto.randomUUID(), userId, clientId, scopes });
+    return refreshAt(clientId, planted.token, new Date());
+  }
+
+  test("DENY-UNKNOWN: a malformed account scope is refused at mint (code path)", async () => {
+    const { id: userId } = await seedUser("av-deny-unknown-code@example.com");
+    const { clientId } = await seedApprovedClient();
+    const res = await mintTokenWithScopes(clientId, userId, [`account:${userId}:bogus:seg:ment`]);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
+  });
+
+  test("DENY-UNKNOWN: a malformed account scope in a refresh row is refused at rotation", async () => {
+    const { id: userId } = await seedUser("av-deny-unknown-refresh@example.com");
+    const { clientId } = await seedApprovedClient();
+    const res = await refreshWithPlantedScopes(clientId, userId, [`account:${userId}:bogus:seg:ment`]);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
+  });
+
+  test("FOREIGN-ID: a 5-part composed scope for another account is refused at mint (#765-2 hole)", async () => {
+    const { id: userId } = await seedUser("av-composed-foreign-code@example.com");
+    const { clientId } = await seedApprovedClient();
+    // A 5-part composed scope used to null in BOTH legacy parsers, so its <id>
+    // was NEVER checked and it skipped the gate. Pin that it is now id-refused.
+    const res = await mintTokenWithScopes(clientId, userId, ["account:someone-else:vaults:x:read"]);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
+  });
+
+  test("FOREIGN-ID: a hand-planted foreign composed scope in a refresh row cannot cross accounts", async () => {
+    const { id: userId } = await seedUser("av-composed-foreign-refresh@example.com");
+    const { clientId } = await seedApprovedClient();
+    const res = await refreshWithPlantedScopes(clientId, userId, ["account:someone-else:vaults:x:read"]);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
+  });
+
+  test("CEILING: a wildcard-vaults ADMIN scope is refused on BOTH the code and refresh paths", async () => {
+    const { id: userId } = await seedUser("av-wildcard-admin@example.com");
+    await seedVault("alpha", userId);
+    const { clientId } = await seedApprovedClient();
+    const code = await mintTokenWithScopes(clientId, userId, [`account:${userId}:vaults:*:admin`]);
+    expect(code.status).toBe(400);
+    expect(((await code.json()) as { error: string }).error).toBe("invalid_scope");
+    const refresh = await refreshWithPlantedScopes(clientId, userId, [`account:${userId}:vaults:*:admin`]);
+    expect(refresh.status).toBe(400);
+    expect(((await refresh.json()) as { error: string }).error).toBe("invalid_scope");
+  });
+
+  test("CEILING: a 5-part per-vault ADMIN scope is refused on BOTH paths (tier-3 reserved)", async () => {
+    const { id: userId } = await seedUser("av-vault-admin@example.com");
+    await seedVault("alpha", userId);
+    const { clientId } = await seedApprovedClient();
+    const code = await mintTokenWithScopes(clientId, userId, [`account:${userId}:vaults:alpha:admin`]);
+    expect(code.status).toBe(400);
+    const refresh = await refreshWithPlantedScopes(clientId, userId, [`account:${userId}:vaults:alpha:admin`]);
+    expect(refresh.status).toBe(400);
+  });
+
+  test("CEILING: a module scope is refused at mint (no module consent exists yet)", async () => {
+    const { id: userId } = await seedUser("av-module@example.com");
+    const { clientId } = await seedApprovedClient();
+    const res = await mintTokenWithScopes(clientId, userId, [`account:${userId}:mod:calendar:read`]);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
+  });
+
+  test("NIT-1: the cookie-only admin/read family is UNMINTABLE via /oauth/token (code + refresh)", async () => {
+    // account:<id>:{admin,read} is cookie-minted only (signed directly by
+    // POST /account/token, never through this endpoint) and non-requestable at
+    // both authorize gates. Refuse it outright here — defense-in-depth on the
+    // crown-jewels gate. (The cookie mint path is unaffected — account-token.test.)
+    const { id: userId } = await seedUser("av-adminread-mint@example.com");
+    const { clientId } = await seedApprovedClient();
+    for (const scope of [`account:${userId}:admin`, `account:${userId}:read`]) {
+      const res = await mintTokenWithScopes(clientId, userId, [scope]);
+      expect(res.status, scope).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
+    }
+    // Also refused on the refresh-rotation path (a hand-planted admin scope).
+    const refresh = await refreshWithPlantedScopes(clientId, userId, [`account:${userId}:admin`]);
+    expect(refresh.status).toBe(400);
+    expect(((await refresh.json()) as { error: string }).error).toBe("invalid_scope");
+  });
+
+  test("NIT-2: a non-canonical-cased account prefix (Account:/ACCOUNT:) is refused at mint (fail-closed)", async () => {
+    const { id: userId } = await seedUser("av-casing-mint@example.com");
+    const { clientId } = await seedApprovedClient();
+    for (const scope of [`Account:${userId}:vaults`, `ACCOUNT:${userId}:vaults:*:read`]) {
+      const res = await mintTokenWithScopes(clientId, userId, [scope]);
+      expect(res.status, scope).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
+    }
+  });
+
+  test("a self composed wildcard-READ + vault-create mints cleanly (aud=account) and rotates byte-identically", async () => {
+    const { id: userId } = await seedUser("av-composed-clean@example.com");
+    await seedVault("alpha", userId);
+    const { clientId } = await seedApprovedClient();
+    const scopes = [`account:${userId}:vaults:*:read`, `account:${userId}:vault-create`];
+    const res = await mintTokenWithScopes(clientId, userId, scopes);
+    expect(res.status).toBe(200);
+    const pair = (await res.json()) as { scope: string; access_token: string; refresh_token: string };
+    expect(pair.scope.split(" ").sort()).toEqual([...scopes].sort());
+    expect(decodeJwtPayload(pair.access_token).aud).toBe("account");
+    // Rotation preserves the composed set byte-identically (the scope string is
+    // the carrier — vault_scope stays inert `[]` for account tokens).
+    const refreshed = await refreshAt(clientId, pair.refresh_token, new Date());
+    expect(refreshed.status).toBe(200);
+    const rp = (await refreshed.json()) as { scope: string };
+    expect(rp.scope.split(" ").sort()).toEqual([...scopes].sort());
+  });
+
+  test("GOLDEN: a legacy Wave A blanket grant mints + rotates BYTE-IDENTICALLY (enforcement is additive)", async () => {
+    const { id: userId } = await seedUser("av-golden-legacy@example.com");
+    await seedVault("alpha", userId);
+    const { clientId } = await seedApprovedClient();
+    const res = await mintTokenWithScopes(clientId, userId, [`account:${userId}:vaults`]);
+    expect(res.status).toBe(200);
+    const pair = (await res.json()) as { scope: string; access_token: string; refresh_token: string };
+    expect(pair.scope).toBe(`account:${userId}:vaults`);
+    expect(decodeJwtPayload(pair.access_token).aud).toBe("account");
+    const refreshed = await refreshAt(clientId, pair.refresh_token, new Date());
+    expect(((await refreshed.json()) as { scope: string }).scope).toBe(`account:${userId}:vaults`);
+  });
+
+  // --- family-replace across the legacy→composed migration ------------------
+
+  test("re-consenting a COMPOSED wildcard after a legacy BLANKET drops the legacy family (narrowing narrows)", async () => {
+    const { id: userId } = await seedUser("av-family-composed@example.com");
+    await seedVault("alpha", userId);
+    const { clientId } = await seedApprovedClient();
+    const { recordGrant, findGrant } = await import("../src/grants.ts");
+    // First a legacy blanket grant, then a composed wildcard re-consent. The
+    // composed re-consent REPLACES the legacy vaults family — the blanket must be
+    // gone, not unioned (a one-way union would silently re-widen).
+    await recordGrant(env.DB, userId, clientId, [`account:${userId}:vaults`]);
+    await recordGrant(env.DB, userId, clientId, [`account:${userId}:vaults:*:read`]);
+    const grant = await findGrant(env.DB, userId, clientId);
+    expect(grant?.scopes).toEqual([`account:${userId}:vaults:*:read`]);
+  });
+
+  test("family-replace EXCLUDES modules — a vaults re-consent keeps a prior module grant", async () => {
+    const { id: userId } = await seedUser("av-family-module@example.com");
+    const { clientId } = await seedApprovedClient();
+    const { recordGrant, findGrant } = await import("../src/grants.ts");
+    // A module grant coexists; a later vaults re-consent must NOT wipe it (module
+    // replace semantics are Phase 3's call).
+    await recordGrant(env.DB, userId, clientId, [`account:${userId}:mod:calendar:read`, `account:${userId}:vaults`]);
+    await recordGrant(env.DB, userId, clientId, [`account:${userId}:vaults:alpha:read`]);
+    const grant = await findGrant(env.DB, userId, clientId);
+    expect(grant?.scopes.sort()).toEqual(
+      [`account:${userId}:mod:calendar:read`, `account:${userId}:vaults:alpha:read`].sort(),
+    );
+  });
 });
 
 // --- E2E through the real router ------------------------------------------

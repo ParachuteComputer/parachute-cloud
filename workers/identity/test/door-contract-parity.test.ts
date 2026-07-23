@@ -24,10 +24,16 @@ import {
   accountVaultsScope,
   checkAuthorizationServerMetadata,
   checkProtectedResourceMetadata,
+  composedAccountGrant,
+  composedVaultCreateScope,
+  composedVaultScope,
+  composedWildcardVaultsScope,
   hasAccountScope as canonHasAccountScope,
   isRequestableAccountScope,
+  parseComposedAccountScope,
 } from "@openparachute/door-contract";
 import { type AccountVerb, hasAccountScope } from "../src/account-auth.ts";
+import { buildAccountConnectionGrant } from "../src/account-mcp.ts";
 import {
   ADVERTISED_SCOPES,
   authorizationServerMetadata,
@@ -117,6 +123,61 @@ describe("door-contract parity — the account-vaults wall exception (Wave A)", 
     expect(isNonRequestableScope("hub:admin")).toBe(true);
     expect(isNonRequestableScope("vault:x:admin")).toBe(false);
     expect(isNonRequestableScope("vault:read")).toBe(false);
+  });
+});
+
+describe("door-contract parity — the composed account-scope grammar (MCP Phase 2)", () => {
+  const ID = "u_1";
+
+  test("the vendored contract exports the composed grammar cloud enforces on", () => {
+    // Bind cloud's dependency on the composed API: these are the EXACT symbols
+    // denyForeignAccountMint (oauth-token.ts), the grants family-replace
+    // (grants.ts), and buildAccountConnectionGrant (account-mcp.ts) import from
+    // the vendored contract. A materialized contract missing any fails here.
+    expect(typeof parseComposedAccountScope).toBe("function");
+    expect(typeof composedAccountGrant).toBe("function");
+    expect(typeof composedWildcardVaultsScope).toBe("function");
+    expect(typeof composedVaultScope).toBe("function");
+    expect(typeof composedVaultCreateScope).toBe("function");
+  });
+
+  test("the composed builders round-trip through the canon's parser", () => {
+    expect(parseComposedAccountScope(composedWildcardVaultsScope(ID, "read"))).toEqual({
+      kind: "wildcard-vaults",
+      id: ID,
+      verb: "read",
+    });
+    expect(parseComposedAccountScope(composedVaultScope(ID, "work", "write"))).toEqual({
+      kind: "vault",
+      id: ID,
+      vault: "work",
+      verb: "write",
+    });
+    expect(parseComposedAccountScope(composedVaultCreateScope(ID))).toEqual({ kind: "vault-create", id: ID });
+  });
+
+  test("cloud's live connection-grant builder agrees with the canon's composed coverage", () => {
+    // buildAccountConnectionGrant delegates to the canon's composedAccountGrant +
+    // accountVaultsGrant — bind the LIVE builder to the canon on a composed set.
+    const scopes = [
+      composedWildcardVaultsScope(ID, "read"),
+      composedVaultScope(ID, "work", "write"),
+      composedVaultCreateScope(ID),
+    ];
+    const canon = composedAccountGrant(scopes, ID);
+    const live = buildAccountConnectionGrant(scopes, ID);
+    expect(live).not.toBeNull();
+    expect(live!.wildcard).toBe(canon.wildcard);
+    expect(live!.create).toBe(canon.create);
+    expect([...live!.vaults.entries()].sort()).toEqual([...canon.vaults.entries()].sort());
+  });
+
+  test("a composed grant for a FOREIGN id confers nothing (cloud + canon agree)", () => {
+    const scopes = [composedWildcardVaultsScope("other", "admin")];
+    expect(buildAccountConnectionGrant(scopes, ID)).toBeNull();
+    const canon = composedAccountGrant(scopes, ID);
+    expect(canon.wildcard).toBeNull();
+    expect(canon.vaults.size).toBe(0);
   });
 });
 

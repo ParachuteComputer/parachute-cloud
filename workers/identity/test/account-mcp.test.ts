@@ -555,3 +555,126 @@ describe("account MCP — discovery + wiring", () => {
     expect(res.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${expected}"`);
   });
 });
+
+// --- composed grants (MCP Phase 2 PR2) ---------------------------------------
+
+describe("account MCP — composed grants open the door + verb-aware coverage", () => {
+  /** Mint an account bearer carrying ONLY composed scopes (no legacy vaults family). */
+  async function mintComposed(userId: string, composed: string[]): Promise<string> {
+    return (await mintVaultsToken(userId, { blanket: false, vaults: [], extraScopes: composed })).token;
+  }
+
+  test("a composed wildcard-READ token opens the door; list-vaults covers ALL owned vaults", async () => {
+    const id = await seedOwner("comp-wildcard@example.com");
+    await seedVault("work", id);
+    await seedVault("home", id);
+    const token = await mintComposed(id, [`account:${id}:vaults:*:read`]);
+    const res = await handleAccountMcp(db(), mcpReq(token, rpc("tools/call", { name: "list-vaults", arguments: {} })), mcpDeps());
+    expect(res.status).toBe(200);
+    const out = toolPayload((await callJson(res)).body);
+    expect(out.covered).toBe("all");
+    expect(out.vaults.map((v: any) => v.name).sort()).toEqual(["home", "work"]);
+  });
+
+  test("a composed PER-VAULT grant lists only the granted, owned vault (covered: listed)", async () => {
+    const id = await seedOwner("comp-pervault@example.com");
+    await seedVault("work", id);
+    await seedVault("home", id);
+    const token = await mintComposed(id, [`account:${id}:vaults:work:read`]);
+    const res = await handleAccountMcp(db(), mcpReq(token, rpc("tools/call", { name: "list-vaults", arguments: {} })), mcpDeps());
+    const out = toolPayload((await callJson(res)).body);
+    expect(out.covered).toBe("listed");
+    expect(out.vaults.map((v: any) => v.name)).toEqual(["work"]);
+  });
+
+  test("create-vault REQUIRES the composed create capability (refused without vault-create, allowed with it)", async () => {
+    const id = await seedOwner("comp-create@example.com", "standard");
+    await seedVault("work", id);
+    // A composed grant WITHOUT vault-create can list/query but not create.
+    const noCreate = await mintComposed(id, [`account:${id}:vaults:*:read`]);
+    const denied = await handleAccountMcp(
+      db(),
+      mcpReq(noCreate, rpc("tools/call", { name: "create-vault", arguments: { name: "fresh" } })),
+      mcpDeps(),
+    );
+    expect((await callJson(denied)).body.error.data.error_type).toBe("create_not_granted");
+
+    // WITH vault-create it succeeds (the SAME plan/cap machinery as a legacy grant).
+    const withCreate = await mintComposed(id, [`account:${id}:vault-create`]);
+    const ok = await handleAccountMcp(
+      db(),
+      mcpReq(withCreate, rpc("tools/call", { name: "create-vault", arguments: { name: "fresh" } })),
+      mcpDeps(),
+    );
+    expect(toolPayload((await callJson(ok)).body).name).toBe("fresh");
+  });
+
+  test("a legacy account-vaults grant still confers create UNCONDITIONALLY (Wave A frozen)", async () => {
+    const id = await seedOwner("comp-legacy-create@example.com", "standard");
+    const { token } = await mintVaultsToken(id, { blanket: true });
+    const res = await handleAccountMcp(
+      db(),
+      mcpReq(token, rpc("tools/call", { name: "create-vault", arguments: { name: "legacycreate" } })),
+      mcpDeps(),
+    );
+    expect(toolPayload((await callJson(res)).body).name).toBe("legacycreate");
+  });
+
+  test("a MODULE-only token does NOT open the account MCP (403 — not this door's tools)", async () => {
+    const id = await seedOwner("comp-module-only@example.com");
+    const token = await mintComposed(id, [`account:${id}:mod:calendar:read`]);
+    const res = await handleAccountMcp(db(), mcpReq(token, rpc("tools/list")), mcpDeps());
+    expect(res.status).toBe(403);
+  });
+});
+
+// --- the bridge write-clamp (vault-call.ts) ----------------------------------
+
+describe("account bridge mint — the admin write-clamp (hard ceiling)", () => {
+  test("an account-bridge mint (client_id=parachute-account) at verb=admin is REFUSED", async () => {
+    const id = await seedOwner("bridge-admin@example.com");
+    await seedVault("work", id);
+    const { callVaultApi } = await import("../src/vault-call.ts");
+    await expect(
+      callVaultApi(db(), mcpDeps(), {
+        userId: id,
+        vaultName: "work",
+        method: "PUT",
+        apiPath: "/api/internal/config",
+        verb: "admin",
+        clientId: ACCOUNT_TOKEN_CLIENT_ID,
+      }),
+    ).rejects.toThrow(/admin/);
+  });
+
+  test("an account-bridge READ mint is allowed (the fan-out path is uncapped)", async () => {
+    const id = await seedOwner("bridge-read@example.com");
+    await seedVault("work", id);
+    const { callVaultApi } = await import("../src/vault-call.ts");
+    const res = await callVaultApi(db(), mcpDeps(), {
+      userId: id,
+      vaultName: "work",
+      method: "GET",
+      apiPath: "/api/notes",
+      verb: "read",
+      clientId: ACCOUNT_TOKEN_CLIENT_ID,
+    });
+    expect(res.status).toBe(200); // the mcpDeps vaultFetch stub
+  });
+
+  test("a first-party console mint at verb=admin is NOT clamped (plan-cap push still works)", async () => {
+    const id = await seedOwner("bridge-console-admin@example.com");
+    await seedVault("work", id);
+    const { callVaultApi } = await import("../src/vault-call.ts");
+    // Default clientId = FIRST_PARTY_CLIENT_ID (parachute-console) — the clamp
+    // targets only the tenant-facing account id, never the platform mint.
+    const res = await callVaultApi(db(), mcpDeps(), {
+      userId: id,
+      vaultName: "work",
+      method: "PUT",
+      apiPath: "/api/internal/config",
+      verb: "admin",
+    });
+    expect(res.status).toBe(200);
+  });
+});
