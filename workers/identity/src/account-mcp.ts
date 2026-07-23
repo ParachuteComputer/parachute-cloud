@@ -15,7 +15,7 @@
  *     is NOT fanned out in v1).
  *
  * THE OWNERSHIP SEAM (hard requirement from the PR2 review). Every tool call
- * computes the coverage set LIVE as `accountVaultsGrant(scopes, sub)` ∩
+ * computes the coverage set LIVE as `buildAccountConnectionGrant(scopes, sub)` ∩
  * `listVaultsForOwner(sub)` — {@link resolveCoverage}. A narrowed grant naming a
  * since-deleted (or re-registered-to-someone-else) vault silently DROPS it
  * (fail-closed); a blanket grant means every vault the account CURRENTLY owns,
@@ -31,6 +31,12 @@
  * seam is gated on. These fan-out reads are exactly as powerful as a vault token
  * the owner can already mint through public OAuth, and no more.
  */
+import {
+  type ComposedVaultVerb,
+  COMPOSED_VERB_RANK,
+  accountVaultsGrant,
+  composedAccountGrant,
+} from "@openparachute/door-contract";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { type OAuthDeps, vaultAdvertisedUrl } from "./oauth-shared.ts";
 import {
@@ -62,12 +68,70 @@ export const FANOUT_TIMEOUT_MS = 10_000;
 export const MAX_NOTES_LIMIT = 100;
 
 /**
- * The grant an authenticated account-MCP token carries — the OWNERSHIP-agnostic
- * form straight off the scope string (`accountVaultsGrant`). The auth gate has
- * already proven it is non-null; {@link resolveCoverage} is what turns it into a
- * live, ownership-checked set.
+ * The grant an authenticated account-MCP token carries — the verb-aware,
+ * OWNERSHIP-agnostic form straight off the scope string. Unifies the legacy
+ * Wave A account-vaults family AND the composed grammar (unified `/mcp`):
+ *   - `wildcard` — a grant over EVERY owned vault at this verb: `read` for a
+ *     legacy blanket (`account:<id>:vaults`, Wave A read-level, FROZEN) or the
+ *     composed wildcard's own verb (`account:<id>:vaults:*:<verb>`); `null` if
+ *     no all-vaults grant is present.
+ *   - `vaults` — a per-vault-name → verb map: `read` for a legacy narrowed vault
+ *     (`account:<id>:vaults:<vault>`), the composed per-vault verb for a 5-part
+ *     grant (`account:<id>:vaults:<vault>:<verb>`).
+ *   - `create` — the create-vault capability: ALWAYS true under a legacy
+ *     account-vaults grant (Wave A create is unconditional), or the composed
+ *     `account:<id>:vault-create` flag.
+ * The auth gate has already proven it confers SOME coverage (non-null);
+ * {@link resolveCoverage} turns it into a live, ownership-checked set.
  */
-export type AccountVaultsGrant = { blanket: true } | { vaults: string[] };
+export interface AccountConnectionGrant {
+  wildcard: ComposedVaultVerb | null;
+  vaults: Map<string, ComposedVaultVerb>;
+  create: boolean;
+}
+
+/** Fold `verb` into `map[name]`, keeping the higher rung (`admin ⊇ write ⊇ read`). */
+function raiseVaultVerb(map: Map<string, ComposedVaultVerb>, name: string, verb: ComposedVaultVerb): void {
+  const cur = map.get(name);
+  if (!cur || COMPOSED_VERB_RANK[verb] > COMPOSED_VERB_RANK[cur]) map.set(name, verb);
+}
+
+/**
+ * Build the connection grant for the account-MCP door from a validated token's
+ * account scopes, unifying legacy Wave A + composed. Returns `null` when the set
+ * confers NOTHING that opens the door (no all-vaults grant, no per-vault grant,
+ * no create capability) — the auth gate maps that to a 403.
+ *
+ * LEGACY (Wave A) semantics are FROZEN — a legacy grant always confers `create`
+ * and read-level vault coverage, byte-identically to the pre-composed behavior:
+ * a deployed Wave A account token opens the same tools at the same coverage.
+ * COMPOSED grants add verb-awareness (a per-vault write/admin, a wildcard verb)
+ * and a distinct create capability. Module grants are NOT part of THIS door
+ * (Phase 3) and never open it on their own.
+ */
+export function buildAccountConnectionGrant(
+  scopes: readonly string[],
+  accountId: string,
+): AccountConnectionGrant | null {
+  const composed = composedAccountGrant(scopes, accountId);
+  let wildcard = composed.wildcard;
+  const vaults = new Map(composed.vaults);
+  let create = composed.create;
+
+  // Fold in the legacy Wave A account-vaults family at read-level (FROZEN).
+  const legacy = accountVaultsGrant(scopes, accountId);
+  if (legacy !== null) {
+    create = true; // a Wave A account-vaults connection can always create
+    if ("blanket" in legacy) {
+      if (wildcard === null) wildcard = "read"; // blanket → all owned, read
+    } else {
+      for (const name of legacy.vaults) raiseVaultVerb(vaults, name, "read");
+    }
+  }
+
+  const opensDoor = wildcard !== null || vaults.size > 0 || create;
+  return opensDoor ? { wildcard, vaults, create } : null;
+}
 
 /**
  * A business-level tool failure that maps to a structured JSON-RPC error
@@ -95,29 +159,35 @@ export interface Coverage {
   vaults: Vault[];
   /** Just the names — the fan-out target set. */
   names: string[];
+  /** Whether the connection may create new vaults (grant.create). */
+  create: boolean;
 }
 
 /**
  * THE ENFORCEMENT SEAM. Resolve what a grant covers by OWNERSHIP, live, at call
  * time:
- *   - blanket → every vault the account currently owns (future vaults
- *     auto-included; an unowned vault can never appear);
- *   - narrowed → the granted names INTERSECTED with current ownership (a name
+ *   - a wildcard grant (legacy blanket OR composed `vaults:*:<verb>`) → every
+ *     vault the account currently owns (future vaults auto-included; an unowned
+ *     vault can never appear);
+ *   - otherwise the per-vault names INTERSECTED with current ownership (a name
  *     for a since-deleted / re-registered vault silently drops — fail-closed).
- * Never trusts the scope names alone.
+ * Never trusts the scope names alone. `create` rides through from the grant (it
+ * is an account-level capability, independent of any specific vault's ownership).
  */
 export async function resolveCoverage(
   db: D1Database,
   accountId: string,
-  grant: AccountVaultsGrant,
+  grant: AccountConnectionGrant,
 ): Promise<Coverage> {
   const owned = await listVaultsForOwner(db, accountId);
-  if ("blanket" in grant) {
-    return { covered: "all", vaults: owned, names: owned.map((v) => v.name) };
+  if (grant.wildcard !== null) {
+    return { covered: "all", vaults: owned, names: owned.map((v) => v.name), create: grant.create };
   }
   const byName = new Map(owned.map((v) => [v.name, v]));
-  const vaults = grant.vaults.map((n) => byName.get(n)).filter((v): v is Vault => v !== undefined);
-  return { covered: "listed", vaults, names: vaults.map((v) => v.name) };
+  const vaults = [...grant.vaults.keys()]
+    .map((n) => byName.get(n))
+    .filter((v): v is Vault => v !== undefined);
+  return { covered: "listed", vaults, names: vaults.map((v) => v.name), create: grant.create };
 }
 
 /** The per-call context the tool executors run against. */
@@ -125,7 +195,7 @@ export interface AccountToolContext {
   db: D1Database;
   deps: OAuthDeps;
   accountId: string;
-  grant: AccountVaultsGrant;
+  grant: AccountConnectionGrant;
   /** The account owner, loaded once by the auth gate (suspended-refusal) and
    *  reused by create-vault's plan gate — never re-read per tool. */
   user: User;
@@ -187,6 +257,17 @@ const createVaultTool: AccountMcpTool = {
   },
   async execute(args, ctx) {
     const { db, deps, user } = ctx;
+    // Capability gate — the connection must carry the create-vault capability.
+    // Legacy Wave A account-vaults grants confer it unconditionally (create is a
+    // frozen Wave A capability); a composed grant confers it only via
+    // `account:<id>:vault-create`. A composed connection WITHOUT it can list +
+    // query but never create.
+    if (!ctx.grant.create) {
+      throw new AccountToolError(
+        "create_not_granted",
+        "This connection was not granted permission to create vaults.",
+      );
+    }
     // Plan vault-count gate — IDENTICAL to handleAccountVaultCreate / the
     // console's handleCreateVaultPost: `>=` grandfathers users already over a
     // cap (an expired plan has vault_count=0 → refused here).

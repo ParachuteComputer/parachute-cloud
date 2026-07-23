@@ -26,7 +26,7 @@ import {
   ACCOUNT_VERB_RANK,
   hasAccountScope,
   parseAccountScope,
-  parseAccountVaultsScope,
+  parseComposedAccountScope,
 } from "@openparachute/door-contract";
 import { validateAccessToken } from "./tokens.ts";
 
@@ -43,24 +43,29 @@ export const ACCOUNT_TOKEN_AUDIENCE = "account";
 
 /**
  * The distinct account ids named by the account-FAMILY scopes in the set — the
- * `account:<id>:{admin,read}` grammar AND the Wave A account-vaults family
- * (`account:<id>:vaults[:<vault>]`). Both families name an account principal, so
- * both feed the single-principal + `sub===id` belt in {@link validateAccountToken}
- * — a vaults-only token's `<id>` is checked against `sub` exactly as an admin
- * token's is (even though it carries no read/admin AUTHORITY at the REST tier).
+ * `account:<id>:{admin,read}` grammar (parseAccountScope) AND every vaults/module
+ * form the composed grammar recognizes (parseComposedAccountScope, a SUPERSET of
+ * the legacy Wave A `account:<id>:vaults[:<vault>]` forms). Both families name an
+ * account principal, so both feed the single-principal + `sub===id` belt in
+ * {@link validateAccountToken} — a vaults/composed-only token's `<id>` is checked
+ * against `sub` exactly as an admin token's is (even though it carries no
+ * read/admin AUTHORITY at the REST tier — hasAccountScope still ignores it there).
+ * Recognizing composed forms here is what lets a composed-scope token survive
+ * validation and reach the account-MCP gate; the REST `/account/*` tier stays
+ * admin/read-only because its gate is `hasAccountScope`, not this recognizer.
  */
 function accountIdsIn(scopes: readonly string[]): string[] {
   const ids = new Set<string>();
   for (const s of scopes) {
-    const d = parseAccountScope(s) ?? parseAccountVaultsScope(s);
-    if (d) ids.add(d.id);
+    const id = parseAccountScope(s)?.id ?? parseComposedAccountScope(s)?.id ?? null;
+    if (id !== null) ids.add(id);
   }
   return [...ids];
 }
 
-/** Any account-family scope — admin/read OR the Wave A vaults family. */
+/** Any account-family scope — admin/read OR any composed/legacy vaults·module form. */
 function isAccountFamilyScope(s: string): boolean {
-  return parseAccountScope(s) !== null || parseAccountVaultsScope(s) !== null;
+  return parseAccountScope(s) !== null || parseComposedAccountScope(s) !== null;
 }
 
 export interface ValidatedAccountToken {
@@ -126,11 +131,13 @@ export async function validateAccountToken(
 
   const scope = typeof payload.scope === "string" ? payload.scope : "";
   const scopes = scope.split(" ").filter((s) => s.length > 0);
-  // Account-family scopes = admin/read (parseAccountScope) + the Wave A vaults
-  // family (parseAccountVaultsScope). The returned `scopes` carry BOTH so a
-  // caller can read the vaults grant (`accountVaultsGrant`), while the REST-tier
-  // gate (`hasAccountScope`, admin/read only) still refuses a vaults-only token
-  // with a 403 — the vaults family opens the account-MCP surface, not `/account/*`.
+  // Account-family scopes = admin/read (parseAccountScope) + every vaults/module
+  // form the composed grammar recognizes (parseComposedAccountScope, a superset of
+  // the legacy Wave A vaults family). The returned `scopes` carry ALL of them so
+  // a caller can read the connection grant (buildAccountConnectionGrant), while
+  // the REST-tier gate (`hasAccountScope`, admin/read only) still refuses a
+  // vaults/composed-only token with a 403 — those forms open the account-MCP
+  // surface, not `/account/*`.
   const accountScopes = scopes.filter(isAccountFamilyScope);
   const ids = accountIdsIn(accountScopes);
 

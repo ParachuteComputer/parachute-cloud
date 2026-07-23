@@ -24,7 +24,7 @@ import {
 import {
   ACCOUNT_VAULTS_UNNARROWED,
   parseAccountScope,
-  parseAccountVaultsScope,
+  parseComposedAccountScope,
 } from "@openparachute/door-contract";
 import { inferAudience } from "./audience.ts";
 import { type OAuthClient, getClient, verifyClientSecret } from "./clients.ts";
@@ -76,36 +76,75 @@ async function denyUnownedVaultMint(
   );
 }
 
+/** A `400 invalid_scope` refusal — the single shape every account-mint gate uses. */
+function invalidScope(description: string): Response {
+  return jsonResponse({ error: "invalid_scope", error_description: description }, 400);
+}
+
 /**
- * Account-scope mint gate (Wave A, defense-in-depth). Two refusals, in BOTH the
- * code-redemption and refresh-rotation mint paths — because `vault_scope` is
- * inert for account tokens and the SCOPE STRING is the only carrier, the token
- * path is where the account-vaults narrowing is finally trusted:
- *   1. An UN-NARROWED `account:vaults` must never reach signing — consent binds
- *      the id AND the vault set. If a bare `account:vaults` is here, the consent
- *      narrowing was bypassed → refuse.
- *   2. Any id-bearing account scope's `<id>` MUST equal the token subject. The
- *      consent submit always keys the scope to `session.userId` and the auth
- *      code's `userId` is that same subject, so a divergence means a cross-account
- *      mint ("a bearer for A carrying account:B:*") — refused STRUCTURALLY here,
- *      not merely by trusting consent discipline. Covers the vaults family
- *      (`account:<id>:vaults[:<vault>]`) AND the cookie-only admin/read family.
- * Returns a 400 `invalid_scope`, or null to pass.
+ * Account-scope mint gate (defense-in-depth), applied in BOTH the code-redemption
+ * and refresh-rotation mint paths — because `vault_scope` is inert for account
+ * tokens and the SCOPE STRING is the only carrier, the token path is where the
+ * account grant is finally trusted. Every `account:`-prefixed scope in the set is
+ * checked (non-`account:` scopes — the vault/service families — are governed
+ * elsewhere and pass through untouched). The refusals, in order:
+ *
+ *   1. UN-NARROWED `account:vaults` — must never reach signing. Consent binds the
+ *      id AND the vault set; a bare `account:vaults` means that narrowing was
+ *      bypassed → refuse.
+ *   2. DENY-UNKNOWN. The `<id>` is extracted via `parseComposedAccountScope` (the
+ *      SUPERSET recognizer: composed vault/module forms + the legacy Wave A
+ *      `account:<id>:vaults[:<vault>]` forms) OR `parseAccountScope` (the
+ *      admin/read family). If NEITHER recognizes the scope, it is an
+ *      account-namespaced form no parser understands → refuse. This closes the
+ *      #765-2 hole: a 5-part composed scope used to null in both legacy parsers,
+ *      so its `<id>` was NEVER checked and it skipped the gate. Never skip-on-null.
+ *   3. FOREIGN-ID. The recognized `<id>` MUST equal the token subject. The consent
+ *      submit keys every account scope to `session.userId` and the auth code's
+ *      `userId` is that same subject, so a divergence means a cross-account mint
+ *      ("a bearer for A carrying account:B:*") — refused STRUCTURALLY, not by
+ *      trusting consent discipline. Covers the vaults family, the composed
+ *      families, AND the cookie-only admin/read family.
+ *   4. CEILING refusals — structural at mint, reserved capabilities with no consent
+ *      path yet, fail-closed until their own phase lands:
+ *        - a `wildcard-vaults` grant at verb `admin` (all owned vaults, admin);
+ *        - a 5-part per-`vault` grant at verb `admin`
+ *          (both reserved for the separate tier-3 owner-elected path);
+ *        - ANY `module` grant (no module consent exists yet).
+ *      The read/write composed forms + `vault-create` are NOT ceilinged — they are
+ *      additive capabilities a later consent phase will legitimately mint.
+ *
+ * Returns a 400 `invalid_scope`, or null to pass. Additive over NEW forms: the
+ * legacy Wave A vaults family (`account:<sub>:vaults[:<vault>]`) parses cleanly,
+ * matches `sub`, and hits no ceiling, so a deployed Wave A token mints identically.
  */
 function denyForeignAccountMint(sub: string, scopes: readonly string[]): Response | null {
   for (const s of scopes) {
+    // Only account-namespaced scopes are this gate's concern; every scope that
+    // `inferAudience` maps to `aud="account"` starts with `account:`.
+    if (!s.startsWith("account:")) continue;
     if (s === ACCOUNT_VAULTS_UNNARROWED) {
-      return jsonResponse(
-        { error: "invalid_scope", error_description: "account:vaults must be narrowed at consent before minting" },
-        400,
-      );
+      return invalidScope("account:vaults must be narrowed at consent before minting");
     }
-    const id = parseAccountVaultsScope(s)?.id ?? parseAccountScope(s)?.id ?? null;
-    if (id !== null && id !== sub) {
-      return jsonResponse(
-        { error: "invalid_scope", error_description: `account scope subject mismatch: ${s}` },
-        400,
-      );
+    const composed = parseComposedAccountScope(s);
+    const id = composed?.id ?? parseAccountScope(s)?.id ?? null;
+    if (id === null) {
+      // DENY-UNKNOWN — an account-namespaced form no parser recognizes.
+      return invalidScope(`unrecognized account scope: ${s}`);
+    }
+    if (id !== sub) {
+      return invalidScope(`account scope subject mismatch: ${s}`);
+    }
+    if (composed) {
+      if (composed.kind === "wildcard-vaults" && composed.verb === "admin") {
+        return invalidScope(`account wildcard admin is not mintable: ${s}`);
+      }
+      if (composed.kind === "vault" && composed.verb === "admin") {
+        return invalidScope(`account per-vault admin is not mintable: ${s}`);
+      }
+      if (composed.kind === "module") {
+        return invalidScope(`account module scopes are not mintable yet: ${s}`);
+      }
     }
   }
   return null;

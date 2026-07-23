@@ -30,6 +30,7 @@
  * propagate from callVaultApi; pushVaultCap/applyPlanToVaults are the no-throw
  * best-effort layer on top.
  */
+import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { signAccessToken } from "./tokens.ts";
 import { type OAuthDeps, vaultInstanceUrl } from "./oauth-shared.ts";
 import { type VaultEntitlement, entitlementPlanFor, planEntitlement } from "./plans.ts";
@@ -79,6 +80,19 @@ export async function callVaultApi(
   },
 ): Promise<Response> {
   const { userId, vaultName, method, apiPath, verb, jsonBody, rawBody, rawContentType, clientId, signal } = opts;
+  // BRIDGE WRITE-CLAMP (hard ceiling): an account-bridge mint — `client_id`
+  // "parachute-account" (ACCOUNT_TOKEN_CLIENT_ID), the tenant-facing id the
+  // account-MCP fan-out uses — may NEVER carry the `admin` verb. The cross-vault
+  // reads it powers are exactly as powerful as a vault token the owner can mint
+  // through public OAuth, and no more — never the platform's first-party
+  // internal-config authority. Wave A account tools are read + create-vault (no
+  // write tool exists yet), but this ceiling lands NOW so a future account-bridge
+  // write tool structurally cannot escalate to admin through this one seam. The
+  // console/plan mints (default FIRST_PARTY_CLIENT_ID) legitimately push caps at
+  // admin and are unaffected.
+  if ((clientId ?? FIRST_PARTY_CLIENT_ID) === ACCOUNT_TOKEN_CLIENT_ID && verb === "admin") {
+    throw new Error("account-bridge mint refused: client_id=parachute-account may never carry the admin verb");
+  }
   const signed = await signAccessToken(db, {
     sub: userId,
     scopes: [`vault:${vaultName}:${verb}`],
