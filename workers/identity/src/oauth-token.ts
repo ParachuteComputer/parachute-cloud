@@ -85,27 +85,39 @@ function invalidScope(description: string): Response {
  * Account-scope mint gate (defense-in-depth), applied in BOTH the code-redemption
  * and refresh-rotation mint paths — because `vault_scope` is inert for account
  * tokens and the SCOPE STRING is the only carrier, the token path is where the
- * account grant is finally trusted. Every `account:`-prefixed scope in the set is
+ * account grant is finally trusted. Every account-namespaced scope in the set is
  * checked (non-`account:` scopes — the vault/service families — are governed
  * elsewhere and pass through untouched). The refusals, in order:
  *
- *   1. UN-NARROWED `account:vaults` — must never reach signing. Consent binds the
+ *   1. NON-CANONICAL CASING. The `account:` prefix is detected CASE-INSENSITIVELY,
+ *      but only the exact lowercase `account:` is legitimate (the parsers
+ *      exact-match lowercase and `aud` is pinned exact). A `Account:`/`ACCOUNT:`
+ *      variant is inert today but never legitimate → refuse it outright rather
+ *      than let it pass as a dud (fail-closed; eliminates the dud-token path).
+ *   2. UN-NARROWED `account:vaults` — must never reach signing. Consent binds the
  *      id AND the vault set; a bare `account:vaults` means that narrowing was
  *      bypassed → refuse.
- *   2. DENY-UNKNOWN. The `<id>` is extracted via `parseComposedAccountScope` (the
+ *   3. DENY-UNKNOWN. The `<id>` is extracted via `parseComposedAccountScope` (the
  *      SUPERSET recognizer: composed vault/module forms + the legacy Wave A
  *      `account:<id>:vaults[:<vault>]` forms) OR `parseAccountScope` (the
  *      admin/read family). If NEITHER recognizes the scope, it is an
  *      account-namespaced form no parser understands → refuse. This closes the
  *      #765-2 hole: a 5-part composed scope used to null in both legacy parsers,
  *      so its `<id>` was NEVER checked and it skipped the gate. Never skip-on-null.
- *   3. FOREIGN-ID. The recognized `<id>` MUST equal the token subject. The consent
+ *   4. FOREIGN-ID. The recognized `<id>` MUST equal the token subject. The consent
  *      submit keys every account scope to `session.userId` and the auth code's
  *      `userId` is that same subject, so a divergence means a cross-account mint
  *      ("a bearer for A carrying account:B:*") — refused STRUCTURALLY, not by
- *      trusting consent discipline. Covers the vaults family, the composed
- *      families, AND the cookie-only admin/read family.
- *   4. CEILING refusals — structural at mint, reserved capabilities with no consent
+ *      trusting consent discipline. Covers the vaults family and the composed
+ *      families; a foreign admin/read scope is caught here too (the admin/read
+ *      family is then refused outright regardless of id by the next check).
+ *   5. ADMIN/READ FAMILY. The cookie-only `account:<id>:{admin,read}` family never
+ *      legitimately traverses `/oauth/token` — it is non-requestable at both
+ *      authorize gates, and the cookie mint (`POST /account/token`) signs it
+ *      DIRECTLY via `signAccessToken`, not through this endpoint. Refuse it here
+ *      outright: a bearer that somehow carried it cannot mint. Pure
+ *      defense-in-depth on the crown-jewels gate — no legitimate mint carries it.
+ *   6. CEILING refusals — structural at mint, reserved capabilities with no consent
  *      path yet, fail-closed until their own phase lands:
  *        - a `wildcard-vaults` grant at verb `admin` (all owned vaults, admin);
  *        - a 5-part per-`vault` grant at verb `admin`
@@ -120,20 +132,34 @@ function invalidScope(description: string): Response {
  */
 function denyForeignAccountMint(sub: string, scopes: readonly string[]): Response | null {
   for (const s of scopes) {
-    // Only account-namespaced scopes are this gate's concern; every scope that
-    // `inferAudience` maps to `aud="account"` starts with `account:`.
-    if (!s.startsWith("account:")) continue;
+    // Detect the account namespace CASE-INSENSITIVELY (every scope `inferAudience`
+    // maps to `aud="account"` is `account:`-prefixed); non-account scopes are
+    // governed elsewhere and pass through untouched.
+    const lower = s.toLowerCase();
+    if (!lower.startsWith("account:")) continue;
+    // ...but only the canonical lowercase `account:` prefix is legitimate. A
+    // mixed-case account prefix (`Account:`/`ACCOUNT:`) is a dud today — refuse it
+    // outright rather than skip it (fail-closed).
+    if (!s.startsWith("account:")) {
+      return invalidScope(`non-canonical account scope casing: ${s}`);
+    }
     if (s === ACCOUNT_VAULTS_UNNARROWED) {
       return invalidScope("account:vaults must be narrowed at consent before minting");
     }
     const composed = parseComposedAccountScope(s);
-    const id = composed?.id ?? parseAccountScope(s)?.id ?? null;
+    const legacyAccount = parseAccountScope(s);
+    const id = composed?.id ?? legacyAccount?.id ?? null;
     if (id === null) {
       // DENY-UNKNOWN — an account-namespaced form no parser recognizes.
       return invalidScope(`unrecognized account scope: ${s}`);
     }
     if (id !== sub) {
       return invalidScope(`account scope subject mismatch: ${s}`);
+    }
+    // The cookie-only admin/read account family is never minted through this
+    // endpoint (non-requestable + cookie mint signs directly) — refuse outright.
+    if (legacyAccount) {
+      return invalidScope(`account admin/read scope is not mintable via /oauth/token: ${s}`);
     }
     if (composed) {
       if (composed.kind === "wildcard-vaults" && composed.verb === "admin") {

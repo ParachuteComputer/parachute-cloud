@@ -214,6 +214,35 @@ describe("C3 — the Bearer gate", () => {
     expect(res.status).toBe(403);
     expect(((await res.json()) as { error: string }).error).toBe("insufficient_scope");
   });
+
+  test("403 insufficient_scope: COMPOSED account-vaults tokens (wildcard + 5-part) have NO /account/* REST authority", async () => {
+    // The composed grammar opens the account-MCP surface, NEVER the REST tier:
+    // `hasAccountScope` (requireAccount's gate) ignores composed forms, so a
+    // composed token — even though it VALIDATES (aud=account, sub===id) — carries
+    // no read/admin authority here. This LOCKS that boundary so a future
+    // hasAccountScope/requireAccount refactor cannot silently widen an MCP token
+    // into REST admin. Mirrors the legacy-vaults 403 pins above.
+    const { id } = await seedUser("vaults-composed@example.com");
+    await seedVault("alpha", id);
+    for (const scope of [`account:${id}:vaults:*:read`, `account:${id}:vaults:alpha:read`]) {
+      const composedToken = await signAccessToken(db(), {
+        sub: id,
+        scopes: [scope],
+        audience: ACCOUNT_TOKEN_AUDIENCE,
+        clientId: ACCOUNT_TOKEN_CLIENT_ID,
+        issuer: ISSUER,
+        vaultScope: [],
+        ttlSeconds: 600,
+      });
+      const res = await handleAccountVaultsList(
+        db(),
+        accountReq("GET", "/account/vaults", { token: composedToken.token }),
+        accountDeps(),
+      );
+      expect(res.status, `scope=${scope}`).toBe(403);
+      expect(((await res.json()) as { error: string }).error).toBe("insufficient_scope");
+    }
+  });
 });
 
 // --- GET /account/vaults -----------------------------------------------------

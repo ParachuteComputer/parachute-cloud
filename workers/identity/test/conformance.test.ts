@@ -2064,6 +2064,34 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
   });
 
+  test("NIT-1: the cookie-only admin/read family is UNMINTABLE via /oauth/token (code + refresh)", async () => {
+    // account:<id>:{admin,read} is cookie-minted only (signed directly by
+    // POST /account/token, never through this endpoint) and non-requestable at
+    // both authorize gates. Refuse it outright here — defense-in-depth on the
+    // crown-jewels gate. (The cookie mint path is unaffected — account-token.test.)
+    const { id: userId } = await seedUser("av-adminread-mint@example.com");
+    const { clientId } = await seedApprovedClient();
+    for (const scope of [`account:${userId}:admin`, `account:${userId}:read`]) {
+      const res = await mintTokenWithScopes(clientId, userId, [scope]);
+      expect(res.status, scope).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
+    }
+    // Also refused on the refresh-rotation path (a hand-planted admin scope).
+    const refresh = await refreshWithPlantedScopes(clientId, userId, [`account:${userId}:admin`]);
+    expect(refresh.status).toBe(400);
+    expect(((await refresh.json()) as { error: string }).error).toBe("invalid_scope");
+  });
+
+  test("NIT-2: a non-canonical-cased account prefix (Account:/ACCOUNT:) is refused at mint (fail-closed)", async () => {
+    const { id: userId } = await seedUser("av-casing-mint@example.com");
+    const { clientId } = await seedApprovedClient();
+    for (const scope of [`Account:${userId}:vaults`, `ACCOUNT:${userId}:vaults:*:read`]) {
+      const res = await mintTokenWithScopes(clientId, userId, [scope]);
+      expect(res.status, scope).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("invalid_scope");
+    }
+  });
+
   test("a self composed wildcard-READ + vault-create mints cleanly (aud=account) and rotates byte-identically", async () => {
     const { id: userId } = await seedUser("av-composed-clean@example.com");
     await seedVault("alpha", userId);
