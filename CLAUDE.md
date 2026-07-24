@@ -9,7 +9,7 @@
 - `workers/vault/` — the Vault DO + edge router: REST wire contract, MCP endpoint, SSE live queries, R2 attachments + export. Conformance suite runs under real workerd (`@cloudflare/vitest-pool-workers`).
 - `workers/identity/` — OAuth issuer (hub-contract-exact) + self-serve console + `/account/*` API + ops crons + Stripe billing + operator admin. The feature list lives in the git/PR history + the `src/` filenames — read those, it is not restated here.
 - `src/` — the OLD control plane. Dormant; harvest material only.
-- `scripts/` — deploy + smoke: `deploy-staging.sh`/`smoke-staging.ts` (full live smoke, creates test debris) for staging; `deploy-prod.sh`/`smoke-prod.ts` (read-only checks) for production.
+- `scripts/` — deploy + smoke: `deploy-staging.sh`/`smoke-staging.ts` (full live smoke, creates test debris) for staging; `deploy-prod.sh`/`smoke-prod.ts` (read-only checks) for production. Deploys also build + embed the app SPA from the commit pinned in `scripts/spa-source.env` — promote the app by bumping the pin.
 
 ## Commands
 
@@ -37,7 +37,7 @@ bun scripts/smoke-prod.ts           # READ-ONLY live checks vs production
 - **Staging's `routes = []` override is load-bearing** — without it staging inherits prod's custom-domain route.
 - **The first-party `client_id` (`parachute-console`) is the vault-side platform-vs-tenant gate** (`workers/vault/src/auth.ts` `FIRST_PARTY_CLIENT_ID`) — scope/verb alone can't distinguish, because a vault owner can mint `vault:<name>:admin` via public OAuth.
 - **`__test/*` + mock-billing endpoints must 404 in production** — smoke-prod-pinned; keep them pinned.
-- **Stripe dep pinned EXACT** (`22.1.0`) — caret drift broke types on fresh installs (bun.lock is gitignored).
+- **Stripe dep pinned EXACT** (`22.1.0`) — caret drift broke types on fresh installs (bun.lock committed since #104; the exact pin is defense-in-depth).
 - **Snapshots carry NO attachment binaries** — say it everywhere user-facing; on-demand `/api/export` DOES stream them.
 - **Raw transcript is sacred** — the cleaned note body is a derived view; the raw is always preserved on note + attachment metadata.
 - **SPA CSP lives in `workers/identity/src/spa-csp.ts`**, shipped through TWO surfaces that must not drift: the generated `dist-assets/_headers` (`scripts/gen-spa-headers.ts`) + the worker's `/` Host-branch.
