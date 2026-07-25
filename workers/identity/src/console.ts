@@ -371,7 +371,7 @@ async function renderConsoleFor(
       firstRun: opts.firstRun,
       plan: user.plan,
       // Honest paid-until surface: a scheduled downgrade to the expired floor
-      // (the 30-day trial clock, a promo comp's expiry, or a real subscription's
+      // (the trial clock, a promo comp's expiry, or a real subscription's
       // scheduled cancel) shows its date on the plan line — never a silent cliff.
       planUntil: user.pendingPlan === "expired" && user.planDowngradeAt ? user.planDowngradeAt : null,
       totalUsedBytes,
@@ -528,9 +528,9 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
  * churned/lapsed account without payment. They're pointed at checkout
  * (`plan_err=reactivate`) instead; pending_plan/plan stay untouched (still
  * frozen). Effect for a trial: set `pending_plan=<tier>` (KEEP plan_downgrade_at
- * — changing tier mid-trial doesn't reset or extend the 30-day clock), then
+ * — changing tier mid-trial doesn't reset or extend the trial clock), then
  * re-apply the entitlement so the two-meter caps + voice update immediately
- * across every owned vault. The day-30 sweep still floors this trial to expired
+ * across every owned vault. The expiry sweep still floors this trial to expired
  * (billing-lifecycle.ts #84 guard) — picking a paid tier is a preview, not a
  * free upgrade.
  */
@@ -556,7 +556,7 @@ export async function handleChoosePlanPost(db: D1Database, req: Request, deps: O
   }
   // Set the chosen tier as the pending plan — KEEP the plan_downgrade_at clock.
   // CONDITIONAL WRITE AS GUARD (the runBillingSweep #84 pattern): the `plan !=
-  // 'trial'` check above was read from the session snapshot, so the day-30 sweep
+  // 'trial'` check above was read from the session snapshot, so the expiry sweep
   // could FLOOR this user to `expired` in the read→write window. Pin the write to
   // `plan = 'trial'` so a raced-to-expired row can't be re-mirrored to a paid
   // tier — changes=0 means the sweep won reading, we must NOT push the chosen

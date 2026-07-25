@@ -206,16 +206,22 @@ async function checkoutCore(
   if (!price) return { ok: false, reason: "invalid" };
 
   // TRIAL-AWARE CHECKOUT (card-on-file conversion): a user still inside their
-  // 30-day trial who picks a plan enters card details TODAY, and the Stripe
-  // subscription starts billing when the free 30 days end —
+  // trial who picks a plan enters card details TODAY, and the Stripe
+  // subscription starts billing when the free months end —
   // `subscription_data.trial_end` = the trial clock (plan_downgrade_at). The
   // webhook conversion path runs UNCHANGED at session completion
   // (checkout.session.completed → plan flips + pending pair clears
   // immediately — entitlements from the picked tier while the Stripe-trial
-  // runs is correct: they chose a plan, the subscription exists). Stripe
-  // refuses trial_end closer than 48h out — less runway than that omits the
-  // field and bills immediately (STRIPE_MIN_TRIAL_END_MS). Expired users
-  // (canStartCheckout's other half) have no runway — always bill now.
+  // runs is correct: they chose a plan, the subscription exists).
+  //
+  // STRIPE'S TRIAL WINDOW, both ends: it refuses a trial_end closer than 48h
+  // out — less runway than that omits the field and bills immediately
+  // (STRIPE_MIN_TRIAL_END_MS) — and it refuses one more than 730 days (2 years)
+  // out. plan_downgrade_at is always now + TRIAL_DURATION_DAYS (90, the "three
+  // months free" campaign), so the ceiling has ~8x headroom and only the 48h
+  // floor is ever reachable here; a future trial length would have to pass 730
+  // days before this call could 400. Expired users (canStartCheckout's other
+  // half) have no runway — always bill now.
   const now = deps.now?.() ?? new Date();
   let trialEnd: number | null = null;
   if (user.plan === "trial" && user.planDowngradeAt) {

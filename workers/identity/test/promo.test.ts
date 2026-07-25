@@ -61,7 +61,7 @@ function redeemReq(code: string, sessionId: string, opts: { csrf?: string; origi
 }
 
 /** A fresh trial user with a live session (the redemption prerequisites —
- *  every new account starts the 30-day no-card trial, which IS redeem-eligible). */
+ *  every new account starts the no-card trial, which IS redeem-eligible). */
 async function seedTrialUser(email: string): Promise<{ id: string; sessionId: string }> {
   const { id } = await seedUser(email);
   const sessionId = await seedSession(id);

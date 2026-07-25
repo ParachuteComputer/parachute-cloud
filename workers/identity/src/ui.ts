@@ -10,6 +10,7 @@ import {
   PAID_TIERS,
   PLAN_SPECS,
   TIER_PRICE_LABEL,
+  TRIAL_LENGTH_COPY,
   type PaidTier,
   type PlanId,
   formatPlanBytes,
@@ -643,7 +644,7 @@ export function renderSignup(opts: { csrfToken: string; error?: string; email?: 
     `<h1>Create your account</h1>
      <div class="lead" data-testid="signup-context">
        <p style="margin:.2rem 0 .5rem">A private vault your AI can read and write — your notes, and everything you want it to remember, in one place you own.</p>
-       <p class="pricepill" data-testid="signup-pricing">From $1/mo · 30 days free · no card to start</p>
+       <p class="pricepill" data-testid="signup-pricing">From $1/mo · ${TRIAL_LENGTH_COPY} free · no card to start</p>
      </div>
      <div class="card">
        ${magicForm(csrfToken, email, "Email me a sign-in link", showPassword ? undefined : error)}
@@ -1491,7 +1492,7 @@ function renderPlanCards(opts: {
   const noCardLine = checkoutAvailable
     ? ""
     : isTrial
-      ? `<p class="muted" data-testid="no-card-line" style="margin:.6rem 0 0">You're on your 30-day free trial — no card needed. We'll ask before it ends.</p>`
+      ? `<p class="muted" data-testid="no-card-line" style="margin:.6rem 0 0">You're on your free trial — ${TRIAL_LENGTH_COPY} free, no card needed. We'll ask before it ends.</p>`
       : `<p class="muted" data-testid="reactivate-line" style="margin:.6rem 0 0">Add a payment method to reactivate a plan — your notes stay readable and exportable anytime.</p>`;
   const mockNote = mockBillingEnabled
     ? ` <span class="muted" data-testid="mock-billing-note">test mode &mdash; no real charge</span>`

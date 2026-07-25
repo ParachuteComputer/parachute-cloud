@@ -164,7 +164,7 @@ describe("GET /admin/users — the accounts table", () => {
 
     const html = await (await app.fetch(get("/admin/users", cookie), env)).text();
     expect(html).toContain("table-user@example.com");
-    expect(html).toContain(">Trial<"); // seedUser → the 30-day trial default
+    expect(html).toContain(">Trial<"); // seedUser → the no-card trial default
     expect(html).toContain(">2</td>"); // vault count
     expect(html).toContain(">2/5</td>"); // checklist progress, hidden excluded
     expect(html).toContain("drip-unsub");
@@ -274,12 +274,12 @@ describe("POST /admin/users/plan — the comp lever", () => {
     expect(JSON.parse(body!)).toEqual(planEntitlement("standard"));
   });
 
-  test("the comp CLEARS the trial clock (pending_plan + plan_downgrade_at) — the day-30 revert can't re-enter", async () => {
+  test("the comp CLEARS the trial clock (pending_plan + plan_downgrade_at) — the expiry revert can't re-enter", async () => {
     const { cookie } = await seedOperator("comp-clock-op@example.com");
     const { id } = await seedUser("comp-clock-user@example.com");
     await seedVault("comp-clock-box", id);
 
-    // A fresh signup is a trial with the 30-day clock armed (createUser).
+    // A fresh signup is a trial with the clock armed (createUser).
     const before = (await getUserById(env.DB, id))!;
     expect(before.pendingPlan).toBe("expired");
     expect(before.planDowngradeAt).not.toBeNull();
@@ -295,7 +295,7 @@ describe("POST /admin/users/plan — the comp lever", () => {
     const after = (await getUserById(env.DB, id))!;
     expect(after.plan).toBe("plus");
     // Without the clock-clear (admin.ts) the hourly sweep would revert this
-    // comped user to expired at day 30.
+    // comped user to expired when the trial clock struck.
     expect(after.pendingPlan).toBeNull();
     expect(after.planDowngradeAt).toBeNull();
   });
