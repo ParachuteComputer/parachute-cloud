@@ -124,6 +124,11 @@ describe("day-0 welcome", () => {
     expect(mail.text).toContain("https://my.parachute.computer/connect");
     expect(mail.text).not.toContain(`${ISSUER}/console`);
     expect(mail.text).toContain("Reply to this email. A person reads it.");
+    // The HTML part (multipart/alternative) mirrors the text part's doors —
+    // same canonical my. links, same unsubscribe.
+    expect(mail.html).toContain("https://my.parachute.computer/?add=");
+    expect(mail.html).toContain("https://my.parachute.computer/connect");
+    expect(mail.html).toContain(mail.unsubscribeUrl);
     // The unsubscribe link rides the footer AND the header field, and is built
     // from the advertised human FRONT DOOR (my. in the committed prod config),
     // not the issuer — the legacy cloud./unsubscribe keeps serving old emails'
@@ -221,6 +226,9 @@ describe("day-3 connect nudge", () => {
     expect(mail.text).toContain("https://my.parachute.computer/connect");
     expect(mail.text).not.toContain(`${ISSUER}/console`);
     expect(mail.text).toContain(mail.unsubscribeUrl);
+    // The HTML part carries the same canonical connect door + unsubscribe.
+    expect(mail.html).toContain("https://my.parachute.computer/connect");
+    expect(mail.html).toContain(mail.unsubscribeUrl);
   });
 
   test("AI activity suppresses the nudge: a minted token for a non-console client", async () => {
@@ -283,6 +291,8 @@ describe("day-14 feedback", () => {
     expect(mail.subject).toBe("How's your vault?");
     expect(mail.replyTo).toBe(DRIP_REPLY_TO);
     expect(mail.text).toContain("A human reads every reply.");
+    // The HTML part exists and carries the unsubscribe link too.
+    expect(mail.html).toContain(mail.unsubscribeUrl);
     expect(await ledgerRows(due.id)).toEqual(["feedback"]);
 
     const again = await quietly(() => runDrip(env, sender, at));
@@ -410,28 +420,44 @@ describe("unsubscribe", () => {
 // --- copy shape (pinned verbatim-ish: flat, short, no marketing) ---------------------
 
 describe("copy", () => {
-  test("every email footer carries the unsubscribe link; no HTML anywhere", () => {
-    const unsubscribeUrl = "https://cloud.example/unsubscribe?t=x";
-    const all = [
-      welcomeCopy({
-        notesUrl: "https://notes.example/?add=y",
-        consoleUrl: "https://cloud.example/console",
-        connectUrl: "https://app.example/connect",
-        unsubscribeUrl,
-      }),
-      welcomeCopy({
-        notesUrl: null,
-        consoleUrl: "https://cloud.example/console",
-        connectUrl: "https://app.example/connect",
-        unsubscribeUrl,
-      }),
-      connectNudgeCopy({ connectUrl: "https://app.example/connect", unsubscribeUrl }),
-      feedbackCopy({ unsubscribeUrl }),
-    ];
-    for (const c of all) {
+  const unsubscribeUrl = "https://cloud.example/unsubscribe?t=x";
+  const allCopies = () => [
+    welcomeCopy({
+      notesUrl: "https://notes.example/?add=y",
+      consoleUrl: "https://cloud.example/console",
+      connectUrl: "https://app.example/connect",
+      unsubscribeUrl,
+    }),
+    welcomeCopy({
+      notesUrl: null,
+      consoleUrl: "https://cloud.example/console",
+      connectUrl: "https://app.example/connect",
+      unsubscribeUrl,
+    }),
+    connectNudgeCopy({ connectUrl: "https://app.example/connect", unsubscribeUrl }),
+    feedbackCopy({ unsubscribeUrl }),
+  ];
+
+  test("every email footer carries the unsubscribe link; the PLAINTEXT part stays plain", () => {
+    for (const c of allCopies()) {
       expect(c.text).toContain(`Stop these emails: ${unsubscribeUrl}`);
-      expect(c.text).not.toContain("<"); // plain text only
+      expect(c.text).not.toContain("<"); // the text part is honest plain text, no markup
     }
+  });
+
+  test("every template's HTML part carries the unsubscribe link + its door link", () => {
+    const [withVault, noVault, nudge, feedback] = allCopies();
+    for (const c of allCopies()) {
+      expect(c.html).toContain("<!doctype html>");
+      expect(c.html).toContain(unsubscribeUrl); // footer "Stop these emails" link
+      expect(c.html).toContain("Parachute"); // the text wordmark — no image assets
+      expect(c.html).not.toContain("<img"); // nothing depends on remote assets
+    }
+    expect(withVault!.html).toContain("https://notes.example/?add=y");
+    expect(withVault!.html).toContain("https://app.example/connect");
+    expect(noVault!.html).toContain("https://cloud.example/console");
+    expect(nudge!.html).toContain("https://app.example/connect");
+    expect(feedback!.html).toContain("A human reads every reply.");
   });
 });
 
