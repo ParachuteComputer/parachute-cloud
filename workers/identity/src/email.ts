@@ -36,6 +36,7 @@
  * still echoes the header (the headless dev/smoke flow keeps working).
  */
 import { EmailMessage } from "cloudflare:email";
+import { magicLinkEmail } from "./email-templates.ts";
 
 /**
  * The subset of the Cloudflare `send_email` binding we use. Takes the real
@@ -56,15 +57,18 @@ export interface OpsEmail {
 }
 
 /**
- * A plain-text onboarding-drip email (drip.ts). Always carries the unsubscribe
- * URL — the binding sender turns it into RFC 8058 List-Unsubscribe headers in
- * addition to the footer link the copy already contains — and a Reply-To
- * pointed at a human.
+ * An onboarding-drip email (drip.ts): honest plaintext part + optional HTML
+ * part (the branded templates in email-templates.ts — the sender builds a
+ * proper multipart/alternative when it's present). Always carries the
+ * unsubscribe URL — the binding sender turns it into RFC 8058 List-Unsubscribe
+ * headers in addition to the footer link the copy already contains — and a
+ * Reply-To pointed at a human.
  */
 export interface DripEmail {
   to: string;
   subject: string;
   text: string;
+  html?: string;
   unsubscribeUrl: string;
   replyTo?: string;
 }
@@ -85,11 +89,6 @@ export interface EmailSender {
 }
 
 const FROM_NAME = "Parachute";
-
-/** "481227" → "481 227" — a readable grouping for a lock-screen notification. */
-function formatCode(code: string): string {
-  return code.length === 6 ? `${code.slice(0, 3)} ${code.slice(3)}` : code;
-}
 
 // --- raw RFC 5322 building ---------------------------------------------------
 
@@ -209,55 +208,6 @@ export function buildRawEmail(opts: RawEmailOpts): string {
   ].join(CRLF);
 }
 
-// --- message bodies ------------------------------------------------------------
-
-/**
- * The two magic-link variants (G5), chosen at send time on user-exists — the
- * earliest honest moment to tell new-vs-returning, and enumeration-safe because
- * only the address owner ever reads it (the on-page copy stays neutral). `to` is
- * the recipient (a validated email — safe to embed) so the returning copy can
- * say "as X". `code` (auth redesign §2) is the SAME single-use token's 6-digit
- * short-form spelling — the subject carries it so it's readable from a
- * lock-screen notification on a DIFFERENT device than the one signing in.
- */
-function magicLinkBodies(
-  link: string,
-  code: string,
-  newAccount: boolean,
-  to: string,
-): { subject: string; html: string; text: string } {
-  const formatted = formatCode(code);
-  const subject = newAccount ? `Welcome to Parachute — your code: ${formatted}` : `Your Parachute code: ${formatted}`;
-  const heading = newAccount ? "Welcome to Parachute" : "Welcome back";
-  const intro = newAccount
-    ? "This link signs you in and creates a brand-new account — nothing is created unless you click it. You'll make your first vault right after."
-    : `This link signs you in as ${to}. Your vault is where you left it.`;
-  const buttonLabel = newAccount ? "Create my account & sign in" : "Sign me in";
-  const codeLine = `Or, from another device, enter this code where you're signing in: ${formatted}`;
-  const footer = newAccount
-    ? "If you didn't request this, you can safely ignore this email — nothing is created and no one can sign in without the link or code."
-    : "If you didn't request this, you can safely ignore this email — no one can sign in without the link or code.";
-  const text = [heading, "", intro, "", "It works once and expires in 10 minutes.", "", link, "", codeLine, "", footer].join(
-    "\n",
-  );
-  const html = `<!doctype html><html><body style="margin:0;padding:0;background:#f4f6f1">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f1;padding:2.5rem 1rem">
-    <tr><td align="center">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:32rem;background:#ffffff;border:1px solid #dde3d6;border-radius:14px;padding:2rem;font-family:'DM Sans',-apple-system,system-ui,sans-serif;color:#2b332a">
-        <tr><td style="font-family:Georgia,serif;font-size:1.05rem;color:#4c6547;padding-bottom:1.25rem">Parachute</td></tr>
-        <tr><td style="font-family:Georgia,serif;font-size:1.6rem;line-height:1.2;padding-bottom:.6rem">${heading}</td></tr>
-        <tr><td style="color:#6a7566;line-height:1.55;padding-bottom:1.4rem">${intro} It works once and expires in 10 minutes.</td></tr>
-        <tr><td style="padding-bottom:1.4rem"><a href="${link}" style="display:inline-block;background:#5f7a57;color:#ffffff;text-decoration:none;padding:.7rem 1.4rem;border-radius:9px;font-weight:600">${buttonLabel}</a></td></tr>
-        <tr><td style="color:#6a7566;font-size:.85rem;line-height:1.5;word-break:break-all">Or paste this link into your browser:<br><a href="${link}" style="color:#4c6547">${link}</a></td></tr>
-        <tr><td style="color:#6a7566;font-size:.9rem;line-height:1.5;padding-top:1rem">Signing in on another device? Enter this code instead:<br><span style="display:inline-block;margin-top:.35rem;font-family:'SFMono-Regular',Consolas,monospace;font-size:1.3rem;letter-spacing:.08em;background:#f4f6f1;border:1px solid #dde3d6;border-radius:8px;padding:.5rem .9rem">${formatted}</span></td></tr>
-        <tr><td style="color:#9aa693;font-size:.8rem;line-height:1.5;padding-top:1.4rem;border-top:1px solid #eef1ea;margin-top:1rem">${footer}</td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body></html>`;
-  return { subject, html, text };
-}
-
 // --- senders -------------------------------------------------------------------
 
 /**
@@ -284,14 +234,16 @@ export function bindingSender(binding: SendEmailBinding, fromAddress: string): E
   return {
     kind: "binding",
     async sendMagicLink(to, link, code, newAccount) {
-      const { subject, html, text } = magicLinkBodies(link, code, newAccount, to);
+      // Bodies come from email-templates.ts — the branded HTML part plus the
+      // honest plaintext part, sent as multipart/alternative.
+      const { subject, html, text } = magicLinkEmail(link, code, newAccount, to);
       return send({ to, subject, html, text });
     },
     async sendOps({ to, subject, text }) {
       return send({ to, subject, text });
     },
-    async sendDrip({ to, subject, text, unsubscribeUrl, replyTo }) {
-      return send({ to, subject, text, unsubscribeUrl, replyTo });
+    async sendDrip({ to, subject, text, html, unsubscribeUrl, replyTo }) {
+      return send({ to, subject, text, html, unsubscribeUrl, replyTo });
     },
   };
 }
@@ -313,6 +265,8 @@ export function devLogSender(): EmailSender {
     async sendDrip({ to, subject, text }) {
       // Same posture as sendOps: staging's deterministic drip "send" is a log
       // line (the address is fine here — this sender never runs in production).
+      // Deliberately logs only the PLAINTEXT part — the readable form; the
+      // HTML part is presentation, not information.
       console.log(`[drip-email] would email ${to}: ${subject}\n${text}`);
       return { ok: true };
     },
