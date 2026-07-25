@@ -20,10 +20,17 @@
  * other reasons (storage rollups, session rows, OAuth token rows). Every proxy
  * renders with a one-line "how measured" note naming its blind spot, because a
  * growth number whose limits aren't stated is a number that will be believed
- * too hard. The known limits, in one place:
- *   - `vault_usage` is a DAILY rollup, so content written and removed between
- *     two rollups is invisible, as is anything written before a vault's first
- *     rollup row ever landed;
+ * too hard. Proxies err in BOTH directions and the copy must say which. The
+ * known limits, in one place:
+ *   - `vault_usage` is a DAILY rollup measured as latest MINUS earliest, and
+ *     the earliest row IS the baseline — so a vault's entire first rollup is
+ *     invisible, permanently. A day-0 import of 10 MB that lands before the
+ *     first cron tick shows zero growth forever, not merely until the next
+ *     rollup. Content written and removed between two rollups is invisible too;
+ *   - a `user_checklist` row records a CLICK, not a write: console.ts's
+ *     checklist door marks the item and redirects in one gesture, so
+ *     `write-note` means "opened the editor", not "saved a note". That branch
+ *     OVER-counts;
  *   - `sessions` rows last 90 days and SLIDE on use (sessions.ts), so someone
  *     who returns on an existing cookie creates no new row — the week-2 return
  *     signal UNDER-counts by construction;
@@ -142,9 +149,14 @@ export async function collectArrival(db: D1Database, now: Date): Promise<Arrival
  * The stages, and exactly what each predicate believes:
  *
  *   created vault   EXACT. A `vaults` row owned by the account.
- *   has content     PROXY. The checklist recorded write-note or import-notes,
- *                   OR some owned vault's storage grew > CONTENT_GROWTH_BYTES
- *                   between its earliest and latest daily rollup.
+ *   has content     PROXY, and it errs BOTH ways. The checklist recorded
+ *                   write-note or import-notes — which is a CLICK on the
+ *                   checklist door, not a saved note (console.ts marks the item
+ *                   and redirects), so that branch OVER-counts — OR some owned
+ *                   vault's storage grew > CONTENT_GROWTH_BYTES between its
+ *                   earliest and latest daily rollup, which UNDER-counts,
+ *                   because the earliest row is the baseline and everything up
+ *                   to a vault's first rollup is therefore invisible forever.
  *   connected AI    EXACT for OAuth. A `tokens` or `grants` row for any client
  *                   that is not the console itself — the precise INVERSE of the
  *                   day-3 connect-nudge eligibility query (drip.ts), reusing
@@ -271,10 +283,24 @@ export async function collectPlanMix(db: D1Database): Promise<{ mix: Array<{ pla
 /**
  * The money-adjacent counts.
  *
+ * `subscribers` is gated on the PLAN, not on the Stripe id alone.
+ * `stripe_subscription_id` is write-once and never cleared: the sole writer is
+ * billing-lifecycle.ts's checkout CAS, and a cancellation records only
+ * `pending_plan` / `plan_downgrade_at`, so a fully-churned account sits on the
+ * expired floor still carrying its old subscription id forever (promo.ts's
+ * header documents this exact behaviour — the redeem gate keys on the plan for
+ * the same reason). `IS NOT NULL` alone would therefore count EVER-subscribed
+ * and quietly ratchet upward, never down — the worst possible failure mode for
+ * the one tile on this page that reads as revenue. ANDing the paid tiers makes
+ * it CURRENTLY-subscribed. A subscriber mid-cancellation still counts, which is
+ * correct: they are paid through the period.
+ *
+ * `comps` is the mirror: a paid tier with NO subscription id.
+ *
  * `scheduledChurn` deliberately EXCLUDES trials. `pending_plan = 'expired'` is
  * the deferred-downgrade flag (migration 0012), but every fresh signup is
- * written with it — it IS the 30-day trial clock (users.ts createUser). Counting
- * it unqualified would report "scheduled churn" that is just the trial cohort
+ * written with it — it IS the trial clock (users.ts createUser). Counting it
+ * unqualified would report "scheduled churn" that is just the trial cohort
  * again. Restricted to non-trial accounts it means what it says: a paid or
  * comped account with a downgrade already on the books.
  */
@@ -285,12 +311,12 @@ export async function collectTrialPipeline(db: D1Database, now: Date): Promise<T
     .prepare(
       `SELECT
          SUM(CASE WHEN plan = 'trial' AND plan_downgrade_at IS NOT NULL AND plan_downgrade_at <= ? THEN 1 ELSE 0 END) AS trials_expiring,
-         SUM(CASE WHEN stripe_subscription_id IS NOT NULL THEN 1 ELSE 0 END) AS subscribers,
+         SUM(CASE WHEN stripe_subscription_id IS NOT NULL AND plan IN (${paidPlaceholders}) THEN 1 ELSE 0 END) AS subscribers,
          SUM(CASE WHEN stripe_subscription_id IS NULL AND plan IN (${paidPlaceholders}) THEN 1 ELSE 0 END) AS comps,
          SUM(CASE WHEN pending_plan = 'expired' AND plan <> 'trial' THEN 1 ELSE 0 END) AS scheduled_churn
        FROM users`,
     )
-    .bind(horizon, ...PAID_TIERS)
+    .bind(horizon, ...PAID_TIERS, ...PAID_TIERS)
     .first<{ trials_expiring: number | null; subscribers: number | null; comps: number | null; scheduled_churn: number | null }>();
   return {
     trialsExpiringSoon: row?.trials_expiring ?? 0,

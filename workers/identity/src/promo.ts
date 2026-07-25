@@ -140,10 +140,16 @@ export async function handlePromoRedeemPost(db: D1Database, req: Request, deps: 
   // 2. RECORD THE REDEMPTION — PRIMARY KEY(user_id) is the one-promo-per-
   //    account gate. A constraint loss (concurrent double-submit) gives the
   //    slot back and answers the same friendly copy as the fast path.
+  //    `promo.code` (the validated ROW), not the request's `code`: byte-equal
+  //    today only because the input was uppercased and the lookup collates
+  //    BINARY. The ledger is the one place operator-facing growth reporting
+  //    reads a stored string back out (/admin/growth's campaign card), so its
+  //    provenance is made structural — it can only ever be a value that came
+  //    from the promo_codes table — rather than incidentally sanitized.
   try {
     await db
       .prepare("INSERT INTO promo_redemptions (user_id, code, redeemed_at) VALUES (?, ?, ?)")
-      .bind(user.id, code, now.toISOString())
+      .bind(user.id, promo.code, now.toISOString())
       .run();
   } catch (err) {
     await releaseSlot(db, code);

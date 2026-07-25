@@ -14,7 +14,17 @@
  */
 import { esc, page } from "./ui.ts";
 import { ADMIN_STYLE, adminHeader } from "./admin-ui.ts";
-import { PLAN_SPECS } from "./plans.ts";
+// Durations in the copy are INTERPOLATED from their defining constants, never
+// spelled as literals. The trial length is in flight (30 → 90) and the session
+// / refresh TTLs are equally free to move; a page whose whole premise is honest
+// measurement must not be the thing that goes stale.
+import { PLAN_SPECS, TRIAL_DURATION_DAYS } from "./plans.ts";
+import { SESSION_TTL_MS } from "./sessions.ts";
+import { REFRESH_TOKEN_TTL_MS } from "./tokens.ts";
+
+const MS_PER_DAY = 86_400_000;
+const SESSION_TTL_DAYS = Math.round(SESSION_TTL_MS / MS_PER_DAY);
+const REFRESH_TTL_DAYS = Math.round(REFRESH_TOKEN_TTL_MS / MS_PER_DAY);
 import {
   ARRIVAL_WEEKS,
   CONTENT_GROWTH_BYTES,
@@ -184,9 +194,9 @@ export function renderAdminGrowth(props: GrowthProps): string {
        <p class="muted" style="margin:.1rem 0 .3rem">Two cohorts, so a week-2 number is only ever read off accounts old enough to have one. Stages are measured INDEPENDENTLY, not nested &mdash; someone can connect an AI before writing anything, so a later bar may exceed an earlier one.</p>
        <div class="cohorts">${cohorts.map(cohortColumn).join("\n")}</div>
        <p class="how"><strong>Created a vault</strong> &mdash; exact: a <code>vaults</code> row owned by the account.</p>
-       <p class="how"><strong>Has content</strong> &mdash; proxy: the getting-started checklist recorded <code>write-note</code> or <code>import-notes</code>, OR an owned vault's storage grew more than ${Math.round(CONTENT_GROWTH_BYTES / 1024)} KiB between its earliest and latest daily rollup. Blind spots: someone who wrote on day 0 and left before the first rollup ever ran, and anything written and deleted between two rollups.</p>
+       <p class="how"><strong>Has content</strong> &mdash; proxy, and it errs in BOTH directions: the getting-started checklist recorded <code>write-note</code> or <code>import-notes</code>, OR an owned vault's storage grew more than ${Math.round(CONTENT_GROWTH_BYTES / 1024)} KiB between its earliest and latest daily rollup. It OVER-counts, because a checklist row records a CLICK on the checklist door rather than a saved note &mdash; the console marks the item and sends you to the editor in one gesture, so someone who opened the editor and typed nothing still counts here. It UNDER-counts, because growth is latest-minus-earliest and the earliest rollup IS the baseline: a vault's entire first rollup is invisible permanently &mdash; a day-0 import that lands before the first rollup ever runs shows zero growth forever, not just until tomorrow. Anything written and deleted between two rollups is invisible too.</p>
        <p class="how"><strong>Connected an AI</strong> &mdash; exact for OAuth: an issued token or a standing grant for any client that isn't the console itself. This is the precise inverse of the day-3 connect-nudge query, so the nudge and this bar can never disagree.</p>
-       <p class="how"><strong>Came back in week 2</strong> &mdash; proxy, and an UNDER-count: a new session row, a new token row, or rolled-up vault bytes that changed, dated inside that account's own days 7&ndash;14. Session cookies last 90 days and slide on use, so someone who returns on an existing cookie leaves no new row; an MCP client reading inside its 30-day refresh cycle leaves none either. Read a low number as "at least this many", never as "only this many".</p>
+       <p class="how"><strong>Came back in week 2</strong> &mdash; proxy, and an UNDER-count: a new session row, a new token row, or rolled-up vault bytes that changed, dated inside that account's own days 7&ndash;14. Session cookies last ${SESSION_TTL_DAYS} days and slide on use, so someone who returns on an existing cookie leaves no new row; an MCP client reading inside its ${REFRESH_TTL_DAYS}-day refresh cycle leaves none either. Read a low number as "at least this many", never as "only this many".</p>
      </div>
 
      <div class="card">
@@ -202,11 +212,11 @@ export function renderAdminGrowth(props: GrowthProps): string {
        <h2>Trial pipeline</h2>
        <div class="statgrid">
          ${stat(`Trials ending ≤${TRIAL_HORIZON_DAYS}d`, trials.trialsExpiringSoon)}
-         ${stat("Paying subscribers", trials.subscribers, "Stripe subscription on file")}
-         ${stat("Comped", trials.comps, "paid tier, no subscription")}
+         ${stat("Paying subscribers", trials.subscribers, "paid plan + live subscription")}
+         ${stat("Comped", trials.comps, "paid plan, no subscription")}
          ${stat("Scheduled churn", trials.scheduledChurn, "downgrade already booked")}
        </div>
-       <p class="how">How measured: a trial is "ending" when <code>plan_downgrade_at</code> falls within ${TRIAL_HORIZON_DAYS} days (this includes any already past due and waiting on the hourly sweep). A subscriber has a <code>stripe_subscription_id</code>; a comp is a paid tier with none. <strong>Scheduled churn excludes trials on purpose</strong>: every new account is written with <code>pending_plan='expired'</code> because that flag IS the 30-day trial clock, so counting it unqualified would just re-report the trial cohort. Here it means a paid or comped account with a downgrade on the books.</p>
+       <p class="how">How measured: a trial is "ending" when <code>plan_downgrade_at</code> falls within ${TRIAL_HORIZON_DAYS} days (this includes any already past due and waiting on the hourly sweep). A subscriber is on a PAID PLAN <em>and</em> carries a <code>stripe_subscription_id</code>; a comp is a paid plan with none. <strong>The plan half of that is load-bearing</strong>: the subscription id is write-once and never cleared, so a churned account keeps its old id forever on the expired floor &mdash; counting the id alone would report everyone who has EVER paid, a number that can only ever go up. <strong>Scheduled churn excludes trials on purpose</strong>: every new account is written with <code>pending_plan='expired'</code> because that flag IS the ${TRIAL_DURATION_DAYS}-day trial clock, so counting it unqualified would just re-report the trial cohort. Here it means a paid or comped account with a downgrade on the books.</p>
      </div>
 
      <div class="card">

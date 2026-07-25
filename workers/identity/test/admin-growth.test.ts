@@ -25,6 +25,9 @@ import app from "../src/index.ts";
 import { CONSOLE_CLIENT_ID } from "../src/drip.ts";
 import { CONTENT_GROWTH_BYTES } from "../src/admin-growth.ts";
 import { GROWTH_PRIVACY_FOOTER } from "../src/admin-growth-ui.ts";
+import { TRIAL_DURATION_DAYS } from "../src/plans.ts";
+import { SESSION_TTL_MS } from "../src/sessions.ts";
+import { REFRESH_TOKEN_TTL_MS } from "../src/tokens.ts";
 import { CSRF, ISSUER, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 const DAY_MS = 86_400_000;
@@ -162,6 +165,11 @@ describe("the Activation funnel", () => {
       expect(html, label).toContain(label);
     }
     expect(html).toContain("measured INDEPENDENTLY, not nested");
+    // Has-content is a two-sided proxy and the copy must name BOTH directions:
+    // the checklist branch counts a click, the byte branch can't see a vault's
+    // first rollup at all.
+    expect(html).toContain("records a CLICK on the checklist door rather than a saved note");
+    expect(html).toContain("the earliest rollup IS the baseline");
   });
 
   test("created-vault + has-content: the checklist path and the byte-growth path both count", async () => {
@@ -316,14 +324,47 @@ describe("Plan mix + the trial pipeline", () => {
     expect(html).toContain("Share of 5");
 
     // Trial pipeline tiles.
-    expect(html).toContain("<div class=\"v\">1</div><div class=\"sub\">Stripe subscription on file</div>");
-    expect(html).toContain("<div class=\"v\">1</div><div class=\"sub\">paid tier, no subscription</div>");
+    expect(html).toContain("<div class=\"v\">1</div><div class=\"sub\">paid plan + live subscription</div>");
+    expect(html).toContain("<div class=\"v\">1</div><div class=\"sub\">paid plan, no subscription</div>");
     // Scheduled churn counts the comp's booked downgrade — and NOT the three
     // trials, which all carry pending_plan='expired' as their trial clock.
     expect(html).toContain("<div class=\"v\">1</div><div class=\"sub\">downgrade already booked</div>");
     expect(html).toContain("Scheduled churn excludes trials on purpose");
     // Trials ending within the 7-day horizon: pm-t1 only.
     expect(html).toContain("Trials ending ≤7d</div><div class=\"v\">1</div>");
+  });
+
+  test("a CHURNED subscriber does NOT count as paying — the subscription id is never cleared", async () => {
+    const { cookie } = await seedOperator("churn-op@example.com");
+    await env.DB.batch([
+      // Live: on a paid plan AND carrying a subscription id.
+      env.DB.prepare(
+        "INSERT INTO users (id, email, password_hash, created_at, plan, stripe_subscription_id) VALUES ('ch-live', 'ch-live@example.com', '', ?, 'standard', 'sub_live')",
+      ).bind(new Date().toISOString()),
+      // Churned: the sweep dropped them to the expired floor, but
+      // billing-lifecycle.ts never clears stripe_subscription_id — the stale id
+      // survives forever (promo.ts's header documents exactly this). Keyed on
+      // the id alone, this account would read as paying, permanently, and the
+      // revenue tile could only ever ratchet up.
+      env.DB.prepare(
+        "INSERT INTO users (id, email, password_hash, created_at, plan, stripe_subscription_id) VALUES ('ch-dead', 'ch-dead@example.com', '', ?, 'expired', 'sub_dead')",
+      ).bind(new Date().toISOString()),
+    ]);
+
+    const html = await growthHtml(cookie);
+    expect(html).toContain("<div class=\"v\">1</div><div class=\"sub\">paid plan + live subscription</div>");
+    // …and the copy names why the plan half of the predicate is load-bearing.
+    expect(html).toContain("counting the id alone would report everyone who has EVER paid");
+  });
+
+  test("durations in the copy come from their defining constants, not literals", async () => {
+    const { cookie } = await seedOperator("duration-op@example.com");
+    const html = await growthHtml(cookie);
+    // The trial length is in flight (30 → 90). A literal would go stale on the
+    // one page whose entire premise is honest measurement.
+    expect(html).toContain(`IS the ${TRIAL_DURATION_DAYS}-day trial clock`);
+    expect(html).toContain(`Session cookies last ${Math.round(SESSION_TTL_MS / DAY_MS)} days`);
+    expect(html).toContain(`its ${Math.round(REFRESH_TOKEN_TTL_MS / DAY_MS)}-day refresh cycle`);
   });
 });
 
@@ -389,11 +430,19 @@ describe("PRIVACY — the Growth page renders counts, never a person", () => {
     expect(marks(html, "growth-cohort")).toBe(2);
     expect(marks(html, "growth-promo-row")).toBeGreaterThan(0);
 
-    // THE PIN: no seeded address, no user id, and nothing email-SHAPED at all.
+    // THE PIN: no seeded address, no user id, no VAULT NAME, and nothing
+    // email-SHAPED at all. Vault names are user-chosen free text and identify a
+    // person just as well as an address does, so they are pinned explicitly
+    // rather than left to the email-shape regex.
     for (const email of emails) expect(html, email).not.toContain(email);
     expect(html).not.toContain("privacy-op@example.com");
     expect(html).not.toContain("priv-0");
+    expect(html).not.toContain("priv-box-");
     expect(html).not.toMatch(/[\w.+-]+@[\w-]+\.[\w-]+/);
+
+    // Control: those vault names ARE renderable — /admin/vaults shows them.
+    const vaultsHtml = await (await app.fetch(get("/admin/vaults", cookie), env)).text();
+    expect(vaultsHtml).toContain("priv-box-0");
   });
 
   test("the privacy footer renders verbatim", async () => {
