@@ -33,7 +33,7 @@
 import { randomBase64url } from "./crypto.ts";
 import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
-import { htmlResponse, resolveAppOrigin } from "./oauth-shared.ts";
+import { depsForEnv, frontDoorOrigin, htmlResponse, resolveAppOrigin } from "./oauth-shared.ts";
 
 /** The three drip emails, in send order (most time-sensitive first). */
 export const DRIP_KINDS = ["welcome", "connect-nudge", "feedback"] as const;
@@ -248,8 +248,14 @@ export async function getOrMintUnsubToken(db: D1Database, userId: string): Promi
   return (await read())?.t ?? null;
 }
 
-export function unsubscribeUrlFor(issuer: string, token: string): string {
-  return `${issuer.replace(/\/$/, "")}/unsubscribe?t=${encodeURIComponent(token)}`;
+/**
+ * Built from the advertised human front door (`frontDoorOrigin` — my. in prod),
+ * not `env.ISSUER`: the link is for a person's mail client. The legacy
+ * cloud./unsubscribe keeps serving forever regardless (MUST-NEVER-REDIRECT
+ * pin, index.ts) — old emails' links never break.
+ */
+export function unsubscribeUrlFor(origin: string, token: string): string {
+  return `${origin.replace(/\/$/, "")}/unsubscribe?t=${encodeURIComponent(token)}`;
 }
 
 /**
@@ -362,7 +368,9 @@ function connectUrlFor(env: Env): string {
 }
 
 async function copyFor(kind: DripKind, env: Env, userId: string, unsubscribeUrl: string): Promise<DripCopy> {
-  const consoleUrl = `${env.ISSUER.replace(/\/$/, "")}/console`;
+  // The advertised human front door (my. in prod), NOT env.ISSUER — the
+  // console a person opens from email lives on the canonical origin.
+  const consoleUrl = `${frontDoorOrigin(depsForEnv(env))}/console`;
   const connectUrl = connectUrlFor(env);
   switch (kind) {
     case "welcome": {
@@ -385,6 +393,7 @@ async function copyFor(kind: DripKind, env: Env, userId: string, unsubscribeUrl:
 export async function runDrip(env: Env, sender: EmailSender, deps: DripDeps = {}): Promise<DripRunSummary> {
   const now = deps.now?.() ?? new Date();
   const summary: DripRunSummary = { sent: { welcome: 0, "connect-nudge": 0, feedback: 0 }, failed: 0, capped: false };
+  const frontDoor = frontDoorOrigin(depsForEnv(env));
   let budget = DRIP_RUN_CAP;
 
   for (const kind of DRIP_KINDS) {
@@ -399,7 +408,7 @@ export async function runDrip(env: Env, sender: EmailSender, deps: DripDeps = {}
       budget--;
       const token = await getOrMintUnsubToken(env.DB, user.id);
       if (!token) continue; // user row vanished between query and send
-      const unsubscribeUrl = unsubscribeUrlFor(env.ISSUER, token);
+      const unsubscribeUrl = unsubscribeUrlFor(frontDoor, token);
       const copy = await copyFor(kind, env, user.id, unsubscribeUrl);
       const result = await sender.sendDrip({
         to: user.email,

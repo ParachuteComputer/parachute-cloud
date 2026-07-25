@@ -84,7 +84,7 @@ export interface EmailSender {
   sendDrip(msg: DripEmail): Promise<SendResult>;
 }
 
-const FROM_NAME = "Parachute Cloud";
+const FROM_NAME = "Parachute";
 
 /** "481227" → "481 227" — a readable grouping for a lock-screen notification. */
 function formatCode(code: string): string {
