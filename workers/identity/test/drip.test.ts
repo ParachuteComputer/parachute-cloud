@@ -26,7 +26,7 @@ import {
 } from "../src/drip.ts";
 import { DRIP_CRON } from "../src/ops.ts";
 import { createUser } from "../src/users.ts";
-import { ISSUER, seedVault } from "./helpers.ts";
+import { CANONICAL_ORIGIN, ISSUER, seedVault } from "./helpers.ts";
 
 const NOW = new Date("2026-07-10T12:00:00Z");
 const daysAgo = (n: number) => new Date(NOW.getTime() - n * 24 * 60 * 60 * 1000);
@@ -114,18 +114,23 @@ describe("day-0 welcome", () => {
     expect(mail.replyTo).toBe(DRIP_REPLY_TO);
     // The three doors: the app (the user's real vault), the app's Connect-AI
     // surface, reply-to-a-human. The vault door uses the configured APP_ORIGIN
-    // (wrangler default; #116); the connect door does too (post-cutover to app).
-    expect(mail.text).toContain("https://app.parachute.computer/?add=");
+    // (wrangler default my.parachute.computer, my.-canonical Phase 1; #116); the
+    // connect door does too.
+    expect(mail.text).toContain("https://my.parachute.computer/?add=");
     // The vault door advertises the PUBLIC origin (VAULT_PUBLIC_ORIGIN — my.
     // in the committed prod config), not the machine VAULT_ORIGIN (A3 URL
     // coherence); reading the env var keeps this test config-driven either way.
     expect(mail.text).toContain(encodeURIComponent(`${env.VAULT_PUBLIC_ORIGIN ?? env.VAULT_ORIGIN}/vault/freshvault`));
-    expect(mail.text).toContain("https://app.parachute.computer/connect");
+    expect(mail.text).toContain("https://my.parachute.computer/connect");
     expect(mail.text).not.toContain(`${ISSUER}/console`);
     expect(mail.text).toContain("Reply to this email. A person reads it.");
-    // The unsubscribe link rides the footer AND the header field.
+    // The unsubscribe link rides the footer AND the header field, and is built
+    // from the advertised human FRONT DOOR (my. in the committed prod config),
+    // not the issuer — the legacy cloud./unsubscribe keeps serving old emails'
+    // links (MUST-NEVER-REDIRECT pin, canonical-redirect.test.ts).
     expect(mail.text).toContain(mail.unsubscribeUrl);
-    expect(mail.unsubscribeUrl).toContain(`${ISSUER}/unsubscribe?t=`);
+    expect(mail.unsubscribeUrl).toContain(`${CANONICAL_ORIGIN}/unsubscribe?t=`);
+    expect(mail.unsubscribeUrl).not.toContain(`${ISSUER}/unsubscribe`);
     // Ledger row written.
     expect(await ledgerRows(u.id)).toEqual(["welcome"]);
     expect(await dripEventCount("welcome:sent")).toBe(1);
@@ -151,6 +156,9 @@ describe("day-0 welcome", () => {
     expect(sender.sent).toHaveLength(1);
     expect(sender.sent[0]!.text).toContain("name your vault");
     expect(sender.sent[0]!.text).not.toContain("notes.parachute.computer");
+    // The console door is the advertised human front door (my.), NOT the issuer.
+    expect(sender.sent[0]!.text).toContain(`${CANONICAL_ORIGIN}/console`);
+    expect(sender.sent[0]!.text).not.toContain(`${ISSUER}/console`);
   });
 
   test("window edges: older than the welcome window → never welcomed retroactively", async () => {
@@ -210,7 +218,7 @@ describe("day-3 connect nudge", () => {
     expect(sender.sent.map((m) => m.to)).toEqual(["due@example.com"]);
     const mail = sender.sent[0]!;
     expect(mail.subject).toBe("Connect your AI to your vault");
-    expect(mail.text).toContain("https://app.parachute.computer/connect");
+    expect(mail.text).toContain("https://my.parachute.computer/connect");
     expect(mail.text).not.toContain(`${ISSUER}/console`);
     expect(mail.text).toContain(mail.unsubscribeUrl);
   });

@@ -1551,12 +1551,13 @@ describe("console — vaults", () => {
       env,
     );
     // Create lands the user straight in the new vault's app UI — the
-    // configured APP_ORIGIN (wrangler default app.parachute.computer; #116),
-    // cross-origin from the issuer so the no-JS 303 bridges (P0 REVENUE fix,
-    // console.ts appDeepLinkRedirect) rather than a direct redirect.
+    // configured APP_ORIGIN (wrangler default my.parachute.computer, my.-canonical
+    // Phase 1; #116), cross-origin from the ISSUER (still cloud.) so the no-JS 303
+    // bridges (P0 REVENUE fix, console.ts appDeepLinkRedirect) rather than a
+    // direct redirect.
     expect(create.status).toBe(200);
     expect(bridgeTarget(await create.text())).toBe(
-      "https://app.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fmy-notes",
+      "https://my.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fmy-notes",
     );
 
     // The console stays reachable for management; the created-notice + connect
@@ -1577,7 +1578,7 @@ describe("console — vaults", () => {
     // Primary door: the app connect deep-link with the url-encoded vault URL,
     // opening in a new tab.
     expect(html).toContain(
-      'href="https://app.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fmy-notes"',
+      'href="https://my.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fmy-notes"',
     );
     expect(html).toContain("Open your notes");
     expect(html).toContain('target="_blank" rel="noopener"');
@@ -1673,7 +1674,7 @@ describe("console — vaults", () => {
     // Exactly one vault → the direct Open-notes link in the nav (#99).
     expect(html).toContain('data-testid="nav-open-notes"');
     expect(html).toContain(
-      'href="https://app.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fnav-box"',
+      'href="https://my.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fnav-box"',
     );
   });
 

@@ -9,9 +9,12 @@
  * staging (scripts/smoke-staging.ts). What this checks:
  *
  *   - identity: health of the discovery surface (AS metadata, PRM, JWKS),
- *     console login page renders, and POST /auth/magic for the operator account
- *     returns the neutral 200 WITHOUT the `x-parachute-dev-magic-link` echo
- *     header (the production guarantee — ENVIRONMENT="production" drops it).
+ *     the my.-canonical Phase 1 front door (cloud. human GET paths 301/302 to my.,
+ *     path + query preserved, while every machine path on cloud. keeps serving —
+ *     never a 3xx to my.), the console login page renders on my., and POST
+ *     /auth/magic for the operator account returns the neutral 200 WITHOUT the
+ *     `x-parachute-dev-magic-link` echo header (the production guarantee —
+ *     ENVIRONMENT="production" drops it).
  *     [The magic send does write one single-use, ~10-minute-TTL magic_links row
  *     and emails the operator address — ours, accepted; everything else here is
  *     pure GET.]
@@ -33,6 +36,13 @@ const VAULT_NAME = process.env.VAULT_NAME ?? "demo";
 // The advertised human front door (VAULT_PUBLIC_ORIGIN in prod) — the account-MCP
 // PRM `resource` names it, NOT the issuer (which stays cloud. through Phase 4).
 const FRONT_DOOR = (process.env.FRONT_DOOR ?? "https://my.parachute.computer").replace(/\/$/, "");
+// The canonical HUMAN origin (my.-canonical Phase 1). The cloud. front door now
+// 301/302s the human ceremony pages here; the SPA + ceremonies all SERVE on my.
+// So the login-page + magic flow below run on my. (both served here), and a
+// dedicated section asserts the cloud.→my. redirects PLUS that every MACHINE path
+// on cloud. still serves (never a 3xx to my.). The TOKEN ISSUER is unchanged
+// (cloud.) — section 1's discovery still asserts issuer === IDENTITY (cloud.).
+const MY = (process.env.MY ?? "https://my.parachute.computer").replace(/\/$/, "");
 
 // --- tiny test harness -----------------------------------------------------
 let failures = 0;
@@ -48,6 +58,12 @@ function fail(label: string, detail = "") {
 }
 function assert(cond: unknown, label: string, detail = "") {
   cond ? ok(label, detail) : fail(label, detail);
+}
+
+/** True unless `res` is a 3xx whose Location points at the my. canonical origin. */
+function notRedirectedToMy(res: Response): boolean {
+  const loc = res.headers.get("location") ?? "";
+  return !(res.status >= 300 && res.status < 400 && loc.startsWith(MY));
 }
 
 function cookieVal(setCookies: string[], name: string): string | null {
@@ -177,22 +193,60 @@ async function main() {
     );
   }
 
-  // 2. Console login page renders on the custom domain.
-  const loginGet = await fetch(`${IDENTITY}/login`, { redirect: "manual" });
+  // 1c. my.-canonical Phase 1 — the LEGACY cloud. front door 301/302s the HUMAN
+  //     ceremony pages to the canonical my. origin, path + query preserved, while
+  //     every MACHINE path on cloud. keeps serving (never a 3xx to my.). This is
+  //     the single most important correctness property of the phase. All GETs,
+  //     read-only. The token issuer is UNCHANGED (section 1 pinned iss === cloud.).
+  {
+    const root = await fetch(`${IDENTITY}/`, { redirect: "manual" });
+    assert(root.status === 302 && root.headers.get("location") === `${MY}/console`, "cloud./ → 302 my./console", `status ${root.status} → ${root.headers.get("location")}`);
+
+    const login = await fetch(`${IDENTITY}/login?next=%2Fsettings`, { redirect: "manual" });
+    assert(login.status === 301 && login.headers.get("location") === `${MY}/login?next=%2Fsettings`, "cloud./login?next=… → 301 my./login (path+query preserved)", `status ${login.status} → ${login.headers.get("location")}`);
+
+    const con = await fetch(`${IDENTITY}/console?created=demo`, { redirect: "manual" });
+    assert(con.status === 301 && con.headers.get("location") === `${MY}/console?created=demo`, "cloud./console?created=… → 301 my./console (path+query preserved)", `status ${con.status} → ${con.headers.get("location")}`);
+
+    const su = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
+    assert(su.status === 302 && su.headers.get("location") === `${MY}/`, "cloud./signup → 302 my./ (handler front door, unchanged)", `status ${su.status} → ${su.headers.get("location")}`);
+
+    // MUST-NEVER-REDIRECT: machine paths on cloud. keep serving (never 3xx→my.).
+    const machinePaths = [
+      "/oauth/authorize?client_id=unknown&redirect_uri=https%3A%2F%2Fx.example%2Fcb&response_type=code",
+      `/auth/verify?token=bogus-${Date.now()}`,
+      `/unsubscribe?t=bogus-${Date.now()}`,
+      "/.well-known/oauth-authorization-server",
+      "/.well-known/parachute-account",
+    ];
+    for (const p of machinePaths) {
+      const res = await fetch(`${IDENTITY}${p}`, { redirect: "manual" });
+      assert(notRedirectedToMy(res), `MUST-NEVER-REDIRECT: cloud.${p.split("?")[0]} is served, not 3xx→my.`, `status ${res.status} loc=${res.headers.get("location") ?? "—"}`);
+    }
+    // The magic-link + code POST families + the Stripe webhook are pinned by
+    // section 3 (magic) and section 3d (webhook) below — those already prove
+    // non-redirect responses on cloud.
+  }
+
+  // 2. Console login page renders on the CANONICAL origin (my.). cloud./login now
+  //    301s to here (asserted in 1c); my. is where the page + CSRF cookie live.
+  const loginGet = await fetch(`${MY}/login`, { redirect: "manual" });
   const csrf = cookieVal(loginGet.headers.getSetCookie(), "parachute_id_csrf");
   {
     const html = await loginGet.text();
-    assert(loginGet.status === 200 && /email/i.test(html), "console login page → 200 + email form", `status ${loginGet.status}`);
-    assert(!!csrf, "login page sets the CSRF cookie");
+    assert(loginGet.status === 200 && /email/i.test(html), "console login page (my.) → 200 + email form", `status ${loginGet.status}`);
+    assert(!!csrf, "login page (my.) sets the CSRF cookie");
   }
 
-  // 3. POST /auth/magic for the operator account: neutral 200, and the
+  // 3. POST /auth/magic for the operator account on my.: neutral 200, and the
   //    x-parachute-dev-magic-link echo header MUST be absent in production.
   //    (Sends the operator a real email + writes one short-TTL magic_links row.)
+  //    Runs on my. (a bound origin the same-origin gate accepts) so the CSRF
+  //    cookie from the my. login page above matches the request host + origin.
   {
-    const res = await fetch(`${IDENTITY}/auth/magic`, {
+    const res = await fetch(`${MY}/auth/magic`, {
       method: "POST",
-      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${csrf}` },
+      headers: { ...FORM, origin: MY, cookie: `parachute_id_csrf=${csrf}` },
       redirect: "manual",
       body: form({ __csrf: csrf!, email: operatorEmail }),
     });

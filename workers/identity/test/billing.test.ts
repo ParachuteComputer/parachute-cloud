@@ -44,7 +44,7 @@ import {
 import { billingConfig, priceFor } from "../src/billing-config.ts";
 import { STRIPE_MIN_TRIAL_END_MS } from "../src/billing.ts";
 import { getUserById, setUserPlan } from "../src/users.ts";
-import { CSRF, ISSUER, bridgeTarget, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
+import { CANONICAL_ORIGIN, CSRF, ISSUER, bridgeTarget, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 // --- the configured test environment -----------------------------------------
 
@@ -231,8 +231,11 @@ function dbInjectingBeforeRun(realDb: D1Database, sqlNeedle: string, inject: () 
 }
 
 async function consoleHtml(sessionId: string, testEnv: typeof env = env, query = ""): Promise<string> {
+  // Render on the CANONICAL origin (my.): under a PRODUCTION-shaped testEnv the
+  // legacy cloud. front door 301s /console (my.-canonical Phase 1), so the page
+  // renders on my. (which serves it in every env). Byte-identical console HTML.
   const res = await app.fetch(
-    new Request(`${ISSUER}/console${query}`, { headers: { cookie: sessionCookie(sessionId) } }),
+    new Request(`${CANONICAL_ORIGIN}/console${query}`, { headers: { cookie: sessionCookie(sessionId) } }),
     testEnv,
   );
   expect(res.status).toBe(200);
