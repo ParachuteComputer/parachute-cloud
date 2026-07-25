@@ -41,6 +41,7 @@ import {
   handleAdminUsersGet,
   handleAdminVaultsGet,
 } from "./admin.ts";
+import { handleAdminGrowthGet } from "./admin-growth.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
 import { accountDescriptor } from "./account-descriptor.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
@@ -297,6 +298,11 @@ app.all("/account/mcp", (c) => handleAccountMcp(c.env.DB, c.req.raw, depsFor(c.e
 // inside the handler; anything else answers the router's own 404 shape — the
 // surface never reveals itself (admin.ts). POSTs add CSRF + same-origin.
 app.get("/admin", (c) => handleAdminOverviewGet(c.env.DB, c.req.raw, depsFor(c.env)));
+// /admin/growth — the Growth panel (arrival, activation funnel, plan mix,
+// campaign). Same operator gate, same 404 posture; counts only, never a person
+// (admin-growth.ts's privacy rule). `/admin` in CEREMONY_PREFIXES already
+// covers it, so no route-manifest change is needed.
+app.get("/admin/growth", (c) => handleAdminGrowthGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/admin/users", (c) => handleAdminUsersGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/admin/vaults", (c) => handleAdminVaultsGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/admin/users/plan", (c) => handleAdminSetPlanPost(c.env.DB, c.req.raw, depsFor(c.env)));

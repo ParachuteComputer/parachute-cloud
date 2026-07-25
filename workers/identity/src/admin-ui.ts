@@ -12,8 +12,12 @@ import { CHECKLIST_ITEMS } from "./checklist.ts";
 import { PLAN_SPECS, type PlanId, formatPlanBytes, formatUsageBytes, isCompPlan } from "./plans.ts";
 import type { DigestStats } from "./ops.ts";
 
-/** Widen the ui.ts shell (30rem is right for forms, not fleet tables). */
-const ADMIN_STYLE = `<style>
+/**
+ * Widen the ui.ts shell (30rem is right for forms, not fleet tables). Exported
+ * so every admin view — including the Growth panel's own file — dresses in the
+ * same chrome instead of growing a parallel stylesheet.
+ */
+export const ADMIN_STYLE = `<style>
   body{max-width:64rem}
   table.fleet{width:100%;border-collapse:collapse;font-size:.88rem;margin-top:.4rem}
   table.fleet th{text-align:left;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);padding:.45rem .5rem;border-bottom:1px solid var(--line)}
@@ -36,12 +40,13 @@ const ADMIN_STYLE = `<style>
 </style>`;
 
 /** Shared header: title, section nav, way back to the console. */
-function adminHeader(title: string, active: "overview" | "users" | "vaults"): string {
+export function adminHeader(title: string, active: "overview" | "growth" | "users" | "vaults"): string {
   const link = (href: string, label: string, key: string) =>
     active === key ? `<strong>${esc(label)}</strong>` : `<a href="${esc(href)}">${esc(label)}</a>`;
   return `<div class="h2row"><h1 style="margin:0">${esc(title)}</h1><a href="/console">&larr; Console</a></div>
     <div class="adminnav">
       ${link("/admin", "Overview", "overview")}
+      ${link("/admin/growth", "Growth", "growth")}
       ${link("/admin/users", "Users", "users")}
       ${link("/admin/vaults", "Vaults", "vaults")}
     </div>`;
