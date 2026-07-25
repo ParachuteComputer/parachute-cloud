@@ -31,6 +31,7 @@
  * clock, mirroring ops.ts, so the tests drive the same code the cron does.
  */
 import { randomBase64url } from "./crypto.ts";
+import { connectNudgeCopy, feedbackCopy, welcomeCopy, type DripCopy } from "./email-templates.ts";
 import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
 import { depsForEnv, frontDoorOrigin, htmlResponse, resolveAppOrigin } from "./oauth-shared.ts";
@@ -137,96 +138,12 @@ export async function eligibleFor(
 }
 
 // --- the copy (ratified voice: plain, short, human) ------------------------------
+//
+// The bodies themselves (subject + plaintext + branded HTML, composed together
+// so copy and rendering can't drift) live in email-templates.ts; re-exported
+// here so drip consumers and tests keep one import site.
 
-export interface DripCopy {
-  subject: string;
-  text: string;
-}
-
-function footer(unsubscribeUrl: string): string {
-  return ["", "Parachute", `Stop these emails: ${unsubscribeUrl}`].join("\n");
-}
-
-/**
- * Day-0 welcome: the vault's three doors. `notesUrl` is the user's first
- * vault's Notes-PWA door when they already have a vault; a user who signed up
- * but hasn't named a vault yet gets the name-your-vault variant instead.
- * `connectUrl` is the app's Connect-your-AI surface (post-cutover; vault
- * creation itself still lives in the console, hence `consoleUrl` stays for
- * the no-vault variant).
- */
-export function welcomeCopy(opts: {
-  notesUrl: string | null;
-  consoleUrl: string;
-  connectUrl: string;
-  unsubscribeUrl: string;
-}): DripCopy {
-  const subject = "Welcome to Parachute";
-  if (opts.notesUrl === null) {
-    return {
-      subject,
-      text: [
-        "Your account is ready. First step: name your vault.",
-        "",
-        opts.consoleUrl,
-        "",
-        "Once it exists you get three doors: your notes in the browser, your AI over MCP, and this email address. Reply any time. A person reads it.",
-        footer(opts.unsubscribeUrl),
-      ].join("\n"),
-    };
-  }
-  return {
-    subject,
-    text: [
-      "Your vault is ready. It has three doors.",
-      "",
-      "Open your notes:",
-      opts.notesUrl,
-      "That's your vault in the browser. Write anything.",
-      "",
-      "Connect your AI:",
-      opts.connectUrl,
-      "Your vault speaks MCP. Open Connect your AI in the app for your MCP URL and a copy-paste command for Claude.",
-      "",
-      "Talk to a human:",
-      "Reply to this email. A person reads it.",
-      "",
-      "The vault is yours.",
-      footer(opts.unsubscribeUrl),
-    ].join("\n"),
-  };
-}
-
-/** Day-3 connect nudge — only reaches accounts with no AI activity. */
-export function connectNudgeCopy(opts: { connectUrl: string; unsubscribeUrl: string }): DripCopy {
-  return {
-    subject: "Connect your AI to your vault",
-    text: [
-      "You signed up for Parachute a few days ago. Your vault hasn't met your AI yet.",
-      "",
-      "Your vault speaks MCP. Point Claude, or any assistant that speaks it, at your vault and it can read and write your notes. You approve what it can touch.",
-      "",
-      "The connection URL and a copy-paste command are in the app's Connect your AI:",
-      opts.connectUrl,
-      "",
-      "If you just want a notes app, ignore this. The vault works fine without an AI.",
-      footer(opts.unsubscribeUrl),
-    ].join("\n"),
-  };
-}
-
-/** Day-14 feedback ask. */
-export function feedbackCopy(opts: { unsubscribeUrl: string }): DripCopy {
-  return {
-    subject: "How's your vault?",
-    text: [
-      "You've had your Parachute vault for two weeks.",
-      "",
-      "How is it going? Reply and tell us one thing: what you wanted it to do that it didn't, or what surprised you. A human reads every reply.",
-      footer(opts.unsubscribeUrl),
-    ].join("\n"),
-  };
-}
+export { connectNudgeCopy, feedbackCopy, welcomeCopy, type DripCopy } from "./email-templates.ts";
 
 // --- unsubscribe -----------------------------------------------------------------
 
@@ -289,13 +206,15 @@ export async function unsubscribeByToken(
 }
 
 function unsubscribePage(valid: boolean): string {
+  // Styled to match the email templates it's reached from (email-templates.ts):
+  // warm paper card on the cream ground, serif display, coral wordmark.
   const body = valid
     ? "<h1>You're unsubscribed</h1><p>Parachute won't send you any more onboarding emails. Sign-in links and account emails still work as normal.</p>"
     : "<h1>This link isn't valid</h1><p>The unsubscribe link may have been copied incompletely. Use the link from the footer of the email.</p>";
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Parachute</title></head>
-<body style="margin:0;padding:2.5rem 1rem;background:#f4f6f1;font-family:-apple-system,system-ui,sans-serif;color:#2b332a">
-<div style="max-width:32rem;margin:0 auto;background:#fff;border:1px solid #dde3d6;border-radius:14px;padding:2rem">
-<div style="font-family:Georgia,serif;color:#4c6547;padding-bottom:1rem">Parachute</div>${body}</div></body></html>`;
+<body style="margin:0;padding:2.5rem 1rem;background:#f7f1e6;font-family:-apple-system,system-ui,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#2a2521;line-height:1.6">
+<div style="max-width:32rem;margin:0 auto;background:#fdfaf4;border:1px solid #ece5d8;border-radius:18px;padding:2rem 2.25rem">
+<div style="font-family:ui-serif,'New York','Iowan Old Style',Georgia,'Times New Roman',serif;font-weight:600;color:#bf4a2a;padding-bottom:1rem">Parachute&nbsp;&#x1FA82;</div>${body}</div></body></html>`;
 }
 
 /**
@@ -414,6 +333,7 @@ export async function runDrip(env: Env, sender: EmailSender, deps: DripDeps = {}
         to: user.email,
         subject: copy.subject,
         text: copy.text,
+        html: copy.html,
         unsubscribeUrl,
         replyTo: DRIP_REPLY_TO,
       });
