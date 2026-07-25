@@ -1,8 +1,8 @@
 {
   "name": "@openparachute/cloud",
-  "version": "0.0.8-rc.119",
+  "version": "0.0.8-rc.120",
   "private": true,
-  "description": "Open Parachute PBC's Vault Cloud — one Durable Object per vault on Cloudflare, OAuth issuer + self-serve console (accounts + vault ownership).",
+  "description": "Open Parachute PBC's Vault Cloud \u2014 one Durable Object per vault on Cloudflare, OAuth issuer + self-serve console (accounts + vault ownership).",
   "license": "AGPL-3.0",
   "type": "module",
   "main": "src/server.ts",
