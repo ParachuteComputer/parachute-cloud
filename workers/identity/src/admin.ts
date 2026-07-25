@@ -52,16 +52,23 @@ export const ADMIN_PAGE_SIZE = 50;
 /**
  * The one non-operator response: byte-identical to Hono's default 404 for an
  * unknown route, so probing /admin looks exactly like probing /nonsense.
+ *
+ * Exported so every /admin surface (admin-growth.ts) answers with THIS response
+ * rather than a hand-rolled look-alike that could drift a byte.
  */
-function notFound(): Response {
+export function notFound(): Response {
   return new Response("404 Not Found", {
     status: 404,
     headers: { "content-type": "text/plain; charset=UTF-8" },
   });
 }
 
-/** Resolve the requesting operator, or null (→ the caller returns 404). */
-async function operatorFor(db: D1Database, req: Request, deps: OAuthDeps): Promise<User | null> {
+/**
+ * Resolve the requesting operator, or null (→ the caller returns 404). Exported
+ * with `notFound` above: the pair IS the /admin trust boundary, and a new admin
+ * page must reuse it, never re-implement it.
+ */
+export async function operatorFor(db: D1Database, req: Request, deps: OAuthDeps): Promise<User | null> {
   const user = await sessionUser(db, req, deps);
   return user && user.role === "operator" ? user : null;
 }
