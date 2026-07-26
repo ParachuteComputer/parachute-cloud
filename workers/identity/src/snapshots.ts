@@ -75,21 +75,33 @@ export interface SnapshotSweepSummary {
 /**
  * One nightly tick: snapshot every vault under its owner's plan policy and
  * mirror each returned manifest into D1. `opts.runCap` exists only for tests.
+ *
+ * `opts.onlyVault` scopes the run to a SINGLE vault instead of the whole fleet.
+ * The nightly cron never sets it; the staging-only /__test/snapshot-run trigger
+ * passes it so the live smoke's restore round-trip (smoke-staging.ts §17) stays
+ * O(1) rather than O(fleet) — a fleet-wide sweep outgrew the smoke's client
+ * timeout as staging debris accumulated (cloud#166).
  */
 export async function runSnapshotSweep(
   env: Env,
   deps: OAuthDeps,
-  opts: { runCap?: number } = {},
+  opts: { runCap?: number; onlyVault?: string } = {},
 ): Promise<SnapshotSweepSummary> {
   const runCap = opts.runCap ?? SNAPSHOT_RUN_CAP;
   const now = deps.now?.() ?? new Date();
   const day = now.toISOString().slice(0, 10);
 
-  const res = await env.DB.prepare(
-    `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id ORDER BY v.name LIMIT ?`,
-  )
-    .bind(runCap + 1)
-    .all<{ name: string; owner_user_id: string; plan: string }>();
+  const res = opts.onlyVault
+    ? await env.DB.prepare(
+        `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name = ? LIMIT 1`,
+      )
+        .bind(opts.onlyVault)
+        .all<{ name: string; owner_user_id: string; plan: string }>()
+    : await env.DB.prepare(
+        `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id ORDER BY v.name LIMIT ?`,
+      )
+        .bind(runCap + 1)
+        .all<{ name: string; owner_user_id: string; plan: string }>();
   const rows = res.results ?? [];
   const capped = rows.length > runCap;
   const vaults = capped ? rows.slice(0, runCap) : rows;
