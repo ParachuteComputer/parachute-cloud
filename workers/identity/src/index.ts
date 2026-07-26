@@ -372,7 +372,12 @@ app.post("/__test/usage-run", async (c) => {
 app.post("/__test/snapshot-run", async (c) => {
   const deps = depsFor(c.env);
   if (!deps.exposeDevLinks) return c.notFound();
-  return c.json(await runSnapshotSweep(c.env, deps));
+  // Optional single-vault scope: smoke-staging §17 passes ?vault=<its own fresh
+  // vault> so its restore round-trip stays O(1) instead of sweeping the whole
+  // staging fleet (which outgrew the smoke's client timeout — cloud#166). No
+  // param → the full fleet sweep, unchanged.
+  const onlyVault = c.req.query("vault") || undefined;
+  return c.json(await runSnapshotSweep(c.env, deps, onlyVault ? { onlyVault } : {}));
 });
 
 /**

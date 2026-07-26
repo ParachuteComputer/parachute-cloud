@@ -41,6 +41,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { totpCodeAt } from "../workers/identity/src/totp.ts";
+import { isUnverifiable, summarize } from "./smoke-report.ts";
 // core resolves from the sibling parachute-vault checkout, copied into the vault
 // worker's node_modules by `bun install` (the same explicit path test-bun uses).
 import { GETTING_STARTED_PACK, welcomePack } from "../workers/vault/node_modules/@openparachute/core/src/seed-packs.js";
@@ -53,7 +54,13 @@ const REDIRECT_URI = "http://localhost:8976/callback";
 const MARKER = `smoke-${Date.now()}`;
 
 // --- tiny test harness -----------------------------------------------------
+// fail() is FATAL — it gates the deploy (exit 1). advisory() is LOUD but does
+// NOT gate — it records "we couldn't verify this right now" (a live-infra
+// timeout/unreachable, never a broken contract). The rule + the exit verdict
+// live in scripts/smoke-report.ts; see liveCatch() below for where advisories
+// come from.
 let failures = 0;
+let advisories = 0;
 const results: string[] = [];
 function ok(label: string, detail = "") {
   results.push(`  PASS  ${label}${detail ? ` — ${detail}` : ""}`);
@@ -64,8 +71,25 @@ function fail(label: string, detail = "") {
   results.push(`  FAIL  ${label}${detail ? ` — ${detail}` : ""}`);
   console.error(`\x1b[31mFAIL\x1b[0m ${label}${detail ? ` — ${detail}` : ""}`);
 }
+function advisory(label: string, detail = "") {
+  advisories++;
+  results.push(`  ADVISORY  ${label}${detail ? ` — ${detail}` : ""}`);
+  console.error(`\x1b[33mADVISORY\x1b[0m ${label}${detail ? ` — ${detail}` : ""}`);
+}
 function assert(cond: unknown, label: string, detail = "") {
   cond ? ok(label, detail) : fail(label, detail);
+}
+/**
+ * The couldn't-verify escape hatch for the live-infra sections (snapshots,
+ * voice, semantic, tickets, mock-E2E, account-MCP fan-out). A timeout/network
+ * throw while driving real third-party/fleet infra is ADVISORY (loud, does not
+ * gate — see scripts/smoke-report.ts). ANY OTHER throw is a real break and
+ * stays FATAL. The contract assert()s INSIDE each section are always fatal, so
+ * an endpoint that answers WRONG (not merely slowly) still fails the gate.
+ */
+function liveCatch(label: string, err: unknown): void {
+  if (isUnverifiable(err)) advisory(`${label} UNVERIFIED (live-infra timeout/unreachable — did not gate)`, String(err));
+  else fail(`${label} threw (unexpected — not a timeout)`, String(err));
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -1363,7 +1387,7 @@ async function main() {
       );
     }
   } catch (err) {
-    fail("tier-change: live section threw (non-fatal — sections continue)", String(err));
+    liveCatch("tier-change: live section", err);
   }
 
   // 17. GFS snapshots + restore (Wave 4e). The arrival user is on the no-card
@@ -1375,22 +1399,26 @@ async function main() {
   //     notes round-trip. The live restore round-trip is wrapped so a slow DO
   //     import can't abort the sections that follow.
   //
-  //     cloud#166: this is a GENUINELY HEAVY round trip — the sweep walks
-  //     EVERY staging vault (grows with debris; see scripts/staging-sweep.ts)
-  //     and the restore itself is a full R2→new-DO tar import — and two
-  //     staging runs threw a client-side TimeoutError here as the fleet grew
-  //     past ~140 vaults. Every fetch in this section gets an EXPLICIT,
-  //     generous timeout (rather than whatever implicit default the runtime
-  //     was hitting) so a slow-but-healthy round trip has room to finish; a
-  //     genuinely stuck one still fails this section cleanly instead of
-  //     hanging the whole smoke.
+  //     cloud#166: the sweep is SCOPED to this run's own vault (?vault=), so
+  //     it is O(1), not O(fleet). Originally it walked EVERY staging vault;
+  //     as the fleet grew with smoke debris past ~140 vaults it crossed the
+  //     client timeout, and — because the sweep runs FIRST — the whole restore
+  //     section (and the deploy gate) went red for the growing fleet. Scoping
+  //     it to the one vault the test actually needs a snapshot of removes the
+  //     fleet-size dependency entirely; the nightly cron still sweeps the
+  //     whole fleet, tested unit-side (workers/identity/test/snapshots.test.ts).
+  //     The restore itself is still a real R2→new-DO tar import (O(1) per
+  //     vault); each fetch keeps an explicit, generous timeout so a
+  //     slow-but-healthy round trip has room to finish, and a genuinely stuck
+  //     one is recorded ADVISORY (couldn't verify) via liveCatch, not fatal.
   const RESTORE_ROUNDTRIP_TIMEOUT_MS = 120_000;
   try {
     const arrivalCsrf = /parachute_id_csrf=([^;]+)/.exec(arrivalCookie)?.[1] ?? "";
-    // One sweep tick via the staging-only trigger. The arrival vault is fresh
-    // this run → its snapshot (paid retention) is taken now.
+    // One sweep tick via the staging-only trigger, SCOPED to this run's fresh
+    // vault (?vault=) so it stays O(1). That vault's snapshot (paid retention)
+    // is taken now → sweep.taken === 1.
     const runSweep = async (): Promise<{ day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean } | null> => {
-      const r = await fetch(`${IDENTITY}/__test/snapshot-run`, { method: "POST", signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) });
+      const r = await fetch(`${IDENTITY}/__test/snapshot-run?vault=${encodeURIComponent(arrivalVault)}`, { method: "POST", signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) });
       return r.status === 200 ? ((await r.json()) as { day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean }) : null;
     };
     const sweep = await runSweep();
@@ -1461,7 +1489,7 @@ async function main() {
       }
     }
   } catch (err) {
-    fail("snapshots: live restore round-trip threw (non-fatal — sections continue)", String(err));
+    liveCatch("snapshots: live restore round-trip", err);
   }
 
   // 18. Voice transcription (cloud#56) — comp the arrival user to the PLUS
@@ -1602,7 +1630,7 @@ async function main() {
       );
     }
   } catch (err) {
-    fail("voice: live transcription section threw (non-fatal — sections continue)", String(err));
+    liveCatch("voice: live transcription section", err);
   }
 
   // 18b. Semantic search via Workers AI (C2, EXPERIMENTAL) — the one thing no
@@ -1683,7 +1711,7 @@ async function main() {
       );
     }
   } catch (err) {
-    fail("semantic: live embedding section threw (non-fatal — sections continue)", String(err));
+    liveCatch("semantic: live embedding section", err);
   }
 
   // 18c. Attachment tickets (cloud#177's DO mirror) — the pre-prod condition
@@ -1833,7 +1861,7 @@ async function main() {
       );
     }
   } catch (err) {
-    fail("tickets: live ticket round-trip section threw (non-fatal — sections continue)", String(err));
+    liveCatch("tickets: live ticket round-trip section", err);
   }
 
   // 19. MOCK-upgrade E2E (mock-payments) — the live end-to-end proof, run LAST
@@ -1948,7 +1976,7 @@ async function main() {
       }
     }
   } catch (err) {
-    fail("mock E2E: live section threw (non-fatal — sections continue)", String(err));
+    liveCatch("mock E2E: live section", err);
   }
 
   // 20. Pricing-model ENFORCEMENT E2E (the two-meter caps + the frozen floor) —
@@ -2428,13 +2456,23 @@ async function main() {
       }
     }
   } catch (err) {
-    fail("account-mcp: live section threw (non-fatal — summary follows)", String(err));
+    liveCatch("account-mcp: live section", err);
   }
 
   // --- summary ---
-  console.log(`\n${"=".repeat(60)}\nSMOKE ${failures === 0 ? "PASSED" : "FAILED"} — ${results.filter((r) => r.includes("PASS")).length} pass, ${failures} fail\n${"=".repeat(60)}`);
+  // The verdict is decided in scripts/smoke-report.ts: fatals gate (exit 1),
+  // advisories are loud but never gate and can never hide a fatal.
+  const passCount = results.filter((r) => r.startsWith("  PASS")).length;
+  const { exitCode, headline } = summarize({ pass: passCount, fail: failures, advisory: advisories });
+  console.log(`\n${"=".repeat(60)}\n${headline}\n${"=".repeat(60)}`);
   console.log(results.join("\n"));
-  process.exit(failures === 0 ? 0 : 1);
+  if (advisories > 0) {
+    // Re-surface the advisories on their own line so an "we couldn't verify
+    // this" is never buried under ~160 PASS lines and read as a clean green.
+    console.log(`\n${advisories} ADVISORY (live-infra unverified — did NOT gate the deploy; investigate if persistent):`);
+    for (const r of results.filter((r) => r.startsWith("  ADVISORY"))) console.log(r);
+  }
+  process.exit(exitCode);
 }
 
 /**

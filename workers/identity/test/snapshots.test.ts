@@ -323,6 +323,30 @@ describe("runSnapshotSweep", () => {
     expect(summary).toEqual({ day: TODAY, vaults: 2, taken: 2, skipped: 0, failed: 0, capped: true });
     expect(SNAPSHOT_RUN_CAP).toBe(500);
   });
+
+  test("onlyVault scopes the run to a SINGLE vault — the rest of the fleet is untouched (O(1), not O(fleet))", async () => {
+    const { id: owner } = await seedUser("sweep-scope@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(owner).run();
+    await seedVault("scope-mine", owner);
+    await seedVault("scope-other", owner);
+    // ONLY the scoped vault's DO is intercepted. The other vault must not be
+    // called at all — an unexpected call would trip disableNetConnect, and
+    // assertNoPendingInterceptors (afterEach) proves the scoped interceptor was
+    // the sole fetch.
+    const manifest = [wireEntry("scope-mine", "2026-07-03T04:00:00.000Z")];
+    interceptSnapshotPost("scope-mine", { skipped: false, manifest });
+
+    const summary = await quietly(() => runSnapshotSweep(env, sweepDeps(), { onlyVault: "scope-mine" }));
+    expect(summary).toEqual({ day: TODAY, vaults: 1, taken: 1, skipped: 0, failed: 0, capped: false });
+    // Only the scoped vault's mirror row exists — scope-other was never swept.
+    expect((await mirrorRows()).map((r) => r.vault_name)).toEqual(["scope-mine"]);
+  });
+
+  test("onlyVault for an unknown name → an empty, clean run (no vault calls)", async () => {
+    const summary = await quietly(() => runSnapshotSweep(env, sweepDeps(), { onlyVault: "does-not-exist" }));
+    expect(summary).toEqual({ day: TODAY, vaults: 0, taken: 0, skipped: 0, failed: 0, capped: false });
+    expect(await mirrorRows()).toEqual([]);
+  });
 });
 
 // --- listSnapshotsForVaults ---------------------------------------------------------
@@ -616,5 +640,23 @@ describe("staging snapshot trigger", () => {
 
     const prod = await worker.fetch(req(), { ...env, ENVIRONMENT: "production" });
     expect(prod.status).toBe(404);
+  });
+
+  test("?vault=<name> scopes the trigger to that one vault (smoke §17's O(1) restore setup)", async () => {
+    const { id: owner } = await seedUser("trigger-scope@example.com");
+    await seedVault("trig-scope-a", owner);
+    await seedVault("trig-scope-b", owner);
+    const manifest = [wireEntry("trig-scope-a", "2026-06-29T04:00:00.000Z")];
+    interceptSnapshotPost("trig-scope-a", { skipped: false, manifest });
+
+    const res = await quietly(async () =>
+      worker.fetch(new Request(`${ISSUER}/__test/snapshot-run?vault=trig-scope-a`, { method: "POST" }), env),
+    );
+    expect(res.status).toBe(200);
+    const summary = (await res.json()) as { vaults: number; taken: number };
+    expect(summary.vaults).toBe(1); // only the scoped vault, not the fleet
+    expect(summary.taken).toBe(1);
+    // trig-scope-b was never snapshotted — no interceptor + assertNoPendingInterceptors.
+    expect((await mirrorRows()).map((r) => r.vault_name)).toEqual(["trig-scope-a"]);
   });
 });
