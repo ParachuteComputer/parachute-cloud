@@ -521,7 +521,7 @@ export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date
       // paid tier there for entitlement mirroring (plans.ts
       // entitlementPlanFor); a real conversion clears the pair via
       // checkout.session.completed long before the sweep sees it, so applying
-      // a paid pending tier here would be a FREE upgrade at day 30 — floor it.
+      // a paid pending tier here would be a FREE upgrade at trial's end — floor it.
       // Folded into the `plan` bound into the CONDITIONAL write below, never a
       // separate read-then-write.
       const plan: PlanId = coercePlanId(row.plan) === "trial" && isPaidTier(pending) ? "expired" : pending;
@@ -531,7 +531,7 @@ export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date
       // atomically (billing-lifecycle handleCheckoutSessionCompleted). If we
       // wrote `plan` unconditionally here we'd overwrite the just-paid plan
       // with the 'expired' floor and push frozen caps over the ones the webhook
-      // already pushed — flooring a person who paid at the day-30 deadline. So
+      // already pushed — flooring a person who paid at the trial deadline. So
       // the sweep's OWN write is the guard: it applies ONLY while the pending
       // pair is still set and still due (same `now` the SELECT used). A
       // conversion that won the race leaves this UPDATE matching 0 rows.

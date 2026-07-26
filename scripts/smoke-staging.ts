@@ -374,7 +374,7 @@ async function main() {
     assert(cvRes.status === 303 && (cvRes.headers.get("location") ?? "").includes(encodeURIComponent(`/vault/${newVault}`)), "console create vault → lands in Notes (303)", `status ${cvRes.status} loc ${cvRes.headers.get("location")}`);
 
     // The console page shows the connect card with the reachable URL shape,
-    // plus the plan line (fresh signup = the 30-day no-card TRIAL, which mirrors
+    // plus the plan line (fresh signup = the no-card TRIAL, which mirrors
     // PLUS entitlements) rendered from PLAN_SPECS.
     const conPage = await fetch(`${IDENTITY}/console`, { headers: { cookie: `parachute_id_session=${newSession}` } });
     const conHtml = await conPage.text();
@@ -1182,7 +1182,7 @@ async function main() {
     }
     const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
     assert(
-      // The arrival user is on the 30-day trial (mirrors Plus): the card cap
+      // The arrival user is on the no-card trial (mirrors Plus): the card cap
       // renders "of 8.5 GiB" (500 MB notes + 8 GiB attachments, summed).
       conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 8\.5 GiB/.test(conHtml),
       "usage: the vault card shows 'Using X of Y' from the rollup row",
@@ -1366,7 +1366,7 @@ async function main() {
     fail("tier-change: live section threw (non-fatal — sections continue)", String(err));
   }
 
-  // 17. GFS snapshots + restore (Wave 4e). The arrival user is on the 30-day
+  // 17. GFS snapshots + restore (Wave 4e). The arrival user is on the no-card
   //     trial, which mirrors PLUS entitlements — so restore is ENABLED (the
   //     new no-restore floor is `expired`, exercised in §20). Flow: drive one
   //     snapshot sweep via the staging-only trigger (POST /__test/snapshot-run,

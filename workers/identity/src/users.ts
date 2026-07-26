@@ -212,13 +212,15 @@ function base64urlToBytes(s: string): Uint8Array {
  * login fails until one is set via {@link setPassword}. `emailVerified` starts
  * true for a magic-link signup (the link proves the address).
  *
- * EVERY new account STARTS THE 30-DAY NO-CARD TRIAL (the pricing model — there
- * is no perpetual free tier; self-host is the free-forever option). We write
- * the full trial state machine right here so BOTH signup paths (password
- * /signup and the first magic-link, auth-handlers.ts) land on it identically:
+ * EVERY new account STARTS THE NO-CARD TRIAL (the pricing model — there is no
+ * perpetual free tier; self-host is the free-forever option). Its LENGTH is
+ * plans.ts `TRIAL_DURATION_DAYS` — 90 days, the "three months free" campaign
+ * (2026-07-25) — and this is the only place it's stamped. We write the full
+ * trial state machine right here so BOTH signup paths (password /signup and the
+ * first magic-link, auth-handlers.ts) land on it identically:
  *   - plan            = 'trial'   (mirrors PLUS entitlements — full experience)
- *   - pending_plan    = 'expired' (the floor the hourly sweep flips to at day 30)
- *   - plan_downgrade_at = now + 30d (when the sweep applies it)
+ *   - pending_plan    = 'expired' (the floor the hourly sweep flips to when due)
+ *   - plan_downgrade_at = now + TRIAL_DURATION_DAYS (when the sweep applies it)
  * A fresh account owns no vaults yet, so there is nothing to push caps into
  * here — the vault-creation path (console.ts) pushes the trial entitlement as
  * each vault is made; the sweep + any checkout/comp re-push on a plan change.

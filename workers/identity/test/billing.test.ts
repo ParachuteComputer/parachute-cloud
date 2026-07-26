@@ -304,8 +304,8 @@ function readBarrierDb(real: D1Database, barrier: { arrive: () => Promise<void> 
 /** Seed a paid user wired to Stripe (the post-checkout shape) — lands on the
  *  `standard` tier, the anchor purchasable tier the monthly/yearly Prices back.
  *  Clears pending_plan/plan_downgrade_at too: seedUser's createUser stamps
- *  EVERY fresh signup with the 30-day trial pair (pending_plan='expired',
- *  plan_downgrade_at=+30d) — a real checkout webhook's CAS write clears both
+ *  EVERY fresh signup with the trial pair (pending_plan='expired',
+ *  plan_downgrade_at=+TRIAL_DURATION_DAYS) — a real checkout webhook's CAS write clears both
  *  (billing-lifecycle.ts), so this fixture mirrors that "settled, no pending
  *  change" post-checkout shape rather than leaking the pre-purchase trial clock. */
 async function seedPaidUser(
@@ -549,7 +549,7 @@ describe("POST /console/plan — pick/change your trial tier (no Stripe)", () =>
       .reply(200, { ok: true }, { headers: { "content-type": "application/json" } });
   }
 
-  test("a TRIAL user picks a tier: pending_plan set, the CHOSEN tier's caps push to every vault, the 30-day clock is KEPT, 302 plan_chosen", async () => {
+  test("a TRIAL user picks a tier: pending_plan set, the CHOSEN tier's caps push to every vault, the trial clock is KEPT, 302 plan_chosen", async () => {
     const { id } = await seedUser("plan-pick@example.com"); // trial, clock armed
     await seedVault("plan-pick-box", id);
     const before = (await getUserById(env.DB, id))!;
@@ -568,7 +568,7 @@ describe("POST /console/plan — pick/change your trial tier (no Stripe)", () =>
     const after = (await getUserById(env.DB, id))!;
     expect(after.plan).toBe("trial"); // still a trial — a free preview, not a purchase
     expect(after.pendingPlan).toBe("power"); // now mirrors Power
-    expect(after.planDowngradeAt).toBe(before.planDowngradeAt); // the 30-day clock is UNTOUCHED
+    expect(after.planDowngradeAt).toBe(before.planDowngradeAt); // the trial clock is UNTOUCHED
     // The re-push carried the CHOSEN tier's two-meter caps + voice (Power: 1 GiB
     // notes / 50 GiB attach / 1200 min), not the plus-mirroring trial default.
     expect(JSON.parse(pushed)).toEqual(planEntitlement("power"));
@@ -634,7 +634,7 @@ describe("POST /console/plan — pick/change your trial tier (no Stripe)", () =>
     expect(after.pendingPlan).toBeNull(); // untouched
   });
 
-  test("SECURITY (F1 TOCTOU): the day-30 sweep floors the trial to expired INSIDE the read→write window → the conditional write matches 0 rows → reactivate + NO cap push (never un-freeze at paid caps)", async () => {
+  test("SECURITY (F1 TOCTOU): the expiry sweep floors the trial to expired INSIDE the read→write window → the conditional write matches 0 rows → reactivate + NO cap push (never un-freeze at paid caps)", async () => {
     const { id } = await seedUser("plan-toctou@example.com"); // trial, clock armed
     await seedVault("plan-toctou-box", id);
     expect((await getUserById(env.DB, id))!.plan).toBe("trial"); // trial when the handler reads it
@@ -799,10 +799,41 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
     expect(params.get("subscription_data[metadata][user_id]")).toBe(id);
     expect(params.get("subscription_data[metadata][plan]")).toBe("standard"); // the updated-webhook fallback tag
     expect(params.get("metadata[plan]")).toBe("standard");
-    // A fresh trial (clock ~30d out) converts card-on-file: trial_end rides
-    // the subscription so billing starts when the free 30 days end.
+    // A fresh trial (clock ~90d out) converts card-on-file: trial_end rides
+    // the subscription so billing starts when the free three months end.
     const user = (await getUserById(env.DB, id))!;
     expect(params.get("subscription_data[trial_end]")).toBe(String(Math.floor(Date.parse(user.planDowngradeAt!) / 1000)));
+  });
+
+  test("THREE-MONTH TRIAL through checkout: a DEFAULT-clock trialist's trial_end is ~90 days out and inside Stripe's window", async () => {
+    // The one place a longer trial could genuinely break: Stripe rejects a
+    // subscription trial_end under 48h out (STRIPE_MIN_TRIAL_END_MS) or more
+    // than 730 days (2 years) out. The campaign's 90 days sits between them
+    // with ~8x headroom above, so the untouched createUser clock must forward
+    // cleanly — no clamping, no omission.
+    const { id } = await seedUser("trial-90d-checkout@example.com"); // untouched clock
+    const sessionId = await seedSession(id);
+    let raw = "";
+    interceptCheckoutCreate((b) => (raw = b));
+    const before = Date.now();
+    const res = await app.fetch(
+      post("/billing/checkout", { __csrf: CSRF, interval: "monthly", plan: "plus" }, sessionCookie(sessionId)),
+      BILLING_ENV,
+    );
+    expect(res.status).toBe(200);
+    const trialEnd = new URLSearchParams(raw).get("subscription_data[trial_end]");
+    expect(trialEnd).not.toBeNull();
+    const trialEndMs = Number(trialEnd) * 1000;
+    const daysOut = (trialEndMs - before) / 86_400_000;
+    expect(daysOut).toBeGreaterThan(89);
+    expect(daysOut).toBeLessThan(91);
+    // Stripe's window, both ends — the assertion that would fail if the trial
+    // length ever grew past what Stripe accepts.
+    expect(trialEndMs - before).toBeGreaterThanOrEqual(STRIPE_MIN_TRIAL_END_MS);
+    expect(daysOut).toBeLessThan(730);
+    // It is exactly the row's clock, forwarded unmodified.
+    const user = (await getUserById(env.DB, id))!;
+    expect(trialEnd).toBe(String(Math.floor(Date.parse(user.planDowngradeAt!) / 1000)));
   });
 
   test("yearly button → the yearly env price", async () => {
@@ -894,7 +925,7 @@ describe("POST /billing/checkout — hosted Checkout session", () => {
   // --- trial-aware checkout (card-on-file conversion) -----------------------
 
   test("TRIAL_END forwarding: a trial with ≥48h runway checks out with subscription_data[trial_end] = its plan_downgrade_at", async () => {
-    const { id } = await seedUser("trial-end-fwd@example.com"); // trial, clock ~30d out
+    const { id } = await seedUser("trial-end-fwd@example.com"); // trial, clock ~90d out
     const downgradeAt = new Date(Date.now() + 10 * 86_400_000); // 10 days runway
     await env.DB.prepare("UPDATE users SET plan_downgrade_at = ? WHERE id = ?")
       .bind(downgradeAt.toISOString(), id)
@@ -1221,7 +1252,7 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
 
   test("TRIAL CONVERSION lands IMMEDIATELY at session completion: metadata.plan routes the tier, the pair clears, the tier's caps push (while the Stripe-trial still runs)", async () => {
     // The card-on-file flow: checkout.session.completed fires when the card is
-    // entered — the Stripe subscription is still TRIALING (trial_end = day 30)
+    // entered — the Stripe subscription is still TRIALING (trial_end = the trial clock)
     // but the plan + entitlements flip NOW. They picked a plan; the sub exists.
     const { id } = await seedUser("trial-convert@example.com"); // trial, clock armed
     await seedVault("trial-convert-box", id);
@@ -1239,7 +1270,7 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
 
     const user = (await getUserById(env.DB, id))!;
     expect(user.plan).toBe("entry"); // immediately — not at trial_end
-    expect(user.pendingPlan).toBeNull(); // the day-30 sweep can't revert the conversion
+    expect(user.pendingPlan).toBeNull(); // the expiry sweep can't revert the conversion
     expect(user.planDowngradeAt).toBeNull();
     expect(JSON.parse(pushed)).toEqual(planEntitlement("entry")); // the PICKED tier's entitlement
   });

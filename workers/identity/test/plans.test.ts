@@ -1,12 +1,13 @@
 /**
  * Plans — the pricing-model entitlement layer (the new ladder + two-meter caps
- * + the 30-day trial state machine; payments are billing.test.ts).
+ * + the trial state machine; payments are billing.test.ts).
  *
  * Pins:
  *   - PLAN_SPECS carries the ratified ladder numbers (entry|standard|plus|power)
  *     and is the SINGLE SOURCE the console renders from,
- *   - EVERY new signup starts on the 30-day no-card TRIAL (plan='trial',
- *     pending_plan='expired', plan_downgrade_at≈now+30d); a legacy/garbage plan
+ *   - EVERY new signup starts on the no-card TRIAL, TRIAL_DURATION_DAYS long
+ *     (90 — "three months free", 2026-07-25): plan='trial',
+ *     pending_plan='expired', plan_downgrade_at ≈ now+90d; a legacy/garbage plan
  *     coerces to the 'expired' FLOOR (never grants unknown entitlements),
  *   - vault-count enforcement at create with the friendly per-plan message —
  *     including the GRANDFATHER contract,
@@ -22,6 +23,8 @@ import app from "../src/index.ts";
 import { validateAccessToken } from "../src/tokens.ts";
 import {
   PLAN_SPECS,
+  TRIAL_DURATION_DAYS,
+  TRIAL_LENGTH_COPY,
   canStartCheckout,
   cheapestInterval,
   coercePlanId,
@@ -242,8 +245,15 @@ describe("PLAN_SPECS — the ratified ladder", () => {
 
 // --- signup → trial; coercion → the expired floor ----------------------------
 
-describe("plan defaults — signup starts the 30-day trial", () => {
-  test("a fresh signup lands on plan 'trial' with pending_plan='expired' + a ~30d clock", async () => {
+describe("plan defaults — signup starts the three-months-free trial", () => {
+  // THE CAMPAIGN PIN (2026-07-25): the trial is THREE MONTHS, not thirty days.
+  // A literal, not `TRIAL_DURATION_DAYS`, so silently editing the constant can
+  // never silently move the offer — the number and this test change together.
+  test("TRIAL_DURATION_DAYS is 90 — the one derivation of every trial clock", () => {
+    expect(TRIAL_DURATION_DAYS).toBe(90);
+  });
+
+  test("a fresh signup lands on plan 'trial' with pending_plan='expired' + a ~90d clock (NOT 30)", async () => {
     const res = await app.fetch(
       post("/signup", { __csrf: CSRF, email: "trialstart@example.com", password: "longenough1" }, `parachute_id_csrf=${CSRF}`),
       env,
@@ -255,10 +265,43 @@ describe("plan defaults — signup starts the 30-day trial", () => {
     expect(row!.plan).toBe("trial");
     expect(row!.pending_plan).toBe("expired");
     const daysOut = (Date.parse(row!.plan_downgrade_at!) - Date.now()) / 86_400_000;
-    expect(daysOut).toBeGreaterThan(29);
-    expect(daysOut).toBeLessThan(31);
+    expect(daysOut).toBeGreaterThan(89);
+    expect(daysOut).toBeLessThan(91);
+    // The regression this replaces: a 30-day clock would land here.
+    expect(daysOut).toBeGreaterThan(31);
     const user = await getUserByEmail(env.DB, "trialstart@example.com");
     expect(user!.plan).toBe("trial");
+  });
+
+  // --- the OFFER COPY, pinned at every surface that states a length ----------
+
+  test("TRIAL_LENGTH_COPY is the '3 months' phrase every length-claiming surface renders", () => {
+    expect(TRIAL_LENGTH_COPY).toBe("3 months");
+  });
+
+  test("the signup page's price pill says '3 months free', never '30 days free'", async () => {
+    // GET /signup 302s to the front-door SPA (console.ts handleSignupGet), so
+    // the server-rendered signup page reaches a human on the ERROR re-render —
+    // still a real, user-visible surface, and the one that carries the pill.
+    const res = await app.fetch(
+      post("/signup", { __csrf: CSRF, email: "not-an-email", password: "longenough1" }, `parachute_id_csrf=${CSRF}`),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-testid="signup-pricing"');
+    expect(html).toContain("From $1/mo · 3 months free · no card to start");
+    expect(html).not.toContain("30 days free");
+  });
+
+  test("the console's no-card line states 3 months, never '30-day'", async () => {
+    const { id } = await seedUser("nocardcopy@example.com"); // seedUser → trial
+    await seedVault("nocardcopy-box", id);
+    // PROD_ENV carries no Stripe keys → the calm no-card stand-in renders.
+    const html = await consoleHtml(await seedSession(id), PROD_ENV);
+    expect(html).toContain('data-testid="no-card-line"');
+    expect(html).toContain("You're on your free trial — 3 months free, no card needed.");
+    expect(html).not.toContain("30-day free trial");
   });
 
   test("a legacy-shaped INSERT (no plan named) reads back the 'expired' floor (coercion; DEFAULT is 'free')", async () => {

@@ -264,7 +264,7 @@ export async function applyPlanToVaults(
   // One entitlement for all the owner's vaults: the two-meter caps, the voice
   // entitlement, and frozen — a plan change flips them together. A TRIAL
   // mirrors the CHOSEN tier when pending_plan names one (plans.ts
-  // entitlementPlanFor — "try any plan free for 30 days").
+  // entitlementPlanFor — "try any plan free for three months").
   const entitlement = planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan));
   const vaults = await listVaultsForOwner(db, userId);
   const results: CapPushResult[] = [];

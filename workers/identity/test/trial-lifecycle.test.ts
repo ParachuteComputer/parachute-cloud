@@ -1,6 +1,7 @@
 /**
  * The trial → expired state machine (the pricing model's buffer):
- *   signup → plan='trial', pending_plan='expired', plan_downgrade_at=now+30d
+ *   signup → plan='trial', pending_plan='expired',
+ *            plan_downgrade_at = now + TRIAL_DURATION_DAYS (90 — three months)
  *   the hourly billing sweep flips a DUE trial → expired and pushes frozen:true
  *   into the owner's vault DOs (writes freeze; reads/export stay).
  *
@@ -10,6 +11,7 @@
 import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import { runBillingSweep } from "../src/billing-lifecycle.ts";
+import { TRIAL_DURATION_DAYS } from "../src/plans.ts";
 import { getUserById } from "../src/users.ts";
 import { deps, seedSession, seedUser, seedVault } from "./helpers.ts";
 
@@ -96,7 +98,7 @@ describe("trial → expired sweep", () => {
     // The tier-picker path stamps the CHOSEN tier into pending_plan so the
     // trial's entitlements mirror it (plans.ts entitlementPlanFor). A real
     // conversion clears the pair via checkout.session.completed; a trial that
-    // reaches day 30 UNCONVERTED must floor, not be granted the tier free.
+    // runs out UNCONVERTED must floor, not be granted the tier free.
     const { id } = await seedUser("sweepguard@example.com");
     await seedVault("sweepguard-box", id);
     await env.DB.prepare("UPDATE users SET pending_plan = 'power', plan_downgrade_at = ? WHERE id = ?")
@@ -156,7 +158,7 @@ describe("trial → expired sweep", () => {
   test("a trial whose clock hasn't struck is left ALONE (still trial, still ticking)", async () => {
     const { id } = await seedUser("sweepfuture@example.com");
     await seedVault("sweepfuture-box", id);
-    // Default createUser clock is ~30 days out → not due.
+    // Default createUser clock is TRIAL_DURATION_DAYS (~90 days) out → not due.
     const { d, pushes } = recordingDeps();
     await runBillingSweep(env.DB, d, new Date());
     const user = await getUserById(env.DB, id);
@@ -165,14 +167,16 @@ describe("trial → expired sweep", () => {
     expect(pushes.length).toBe(0); // nothing pushed
   });
 
-  test("createUser establishes the full trial state machine", async () => {
+  test("createUser establishes the full trial state machine — a THREE-MONTH clock", async () => {
     const { id } = await seedUser("machinestate@example.com");
     const user = await getUserById(env.DB, id);
     expect(user!.plan).toBe("trial");
     expect(user!.pendingPlan).toBe("expired");
     const daysOut = (Date.parse(user!.planDowngradeAt!) - Date.now()) / 86_400_000;
-    expect(daysOut).toBeGreaterThan(29);
-    expect(daysOut).toBeLessThan(31);
+    // The campaign length (plans.ts TRIAL_DURATION_DAYS = 90), not the old 30.
+    expect(daysOut).toBeGreaterThan(89);
+    expect(daysOut).toBeLessThan(91);
+    expect(TRIAL_DURATION_DAYS).toBe(90);
     // seedSession keeps the helper import exercised (a live trial can sign in).
     expect(await seedSession(id)).toBeTruthy();
   });

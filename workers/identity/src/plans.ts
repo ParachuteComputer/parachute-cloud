@@ -15,8 +15,10 @@
  *   already ~25k+ typical notes. Start small + increase later beats start big +
  *   claw back; the same price points will carry more FEATURES over time, so we
  *   hold higher margins here. Attachments/voice/vault-count unchanged.
- *   trial     mirrors PLUS entitlements — the 30-day no-card trial every new
- *             account starts on (full paid experience → stickiness)
+ *   trial     mirrors PLUS entitlements — the no-card trial every new account
+ *             starts on (full paid experience → stickiness). Length lives in
+ *             ONE place: TRIAL_DURATION_DAYS (90 — "three months free",
+ *             2026-07-25).
  *   expired   the post-trial FLOOR: 0 new vaults, notes/attach writes FROZEN
  *             (reads + export UNTOUCHED — "your notes are safe"), voice off,
  *             free-tier disaster-recovery snapshot only
@@ -28,11 +30,12 @@
  * turns a 0 attachment budget into a distinct 403 `attachments_not_included`.
  *
  * THE TRIAL / EXPIRED STATE MACHINE:
- *   signup → plan='trial', pending_plan='expired', plan_downgrade_at=now+30d
- *   (users.ts createUser). The hourly billing sweep flips a due trial → expired
- *   and pushes `frozen: true` into the owner's vault DOs (billing-lifecycle.ts).
- *   A checkout / promo / admin comp before day 30 clears the pair and lifts the
- *   paid caps — the trial converts, never a data cliff.
+ *   signup → plan='trial', pending_plan='expired',
+ *   plan_downgrade_at = now + TRIAL_DURATION_DAYS (users.ts createUser). The
+ *   hourly billing sweep flips a due trial → expired and pushes `frozen: true`
+ *   into the owner's vault DOs (billing-lifecycle.ts). A checkout / promo /
+ *   admin comp before the clock strikes clears the pair and lifts the paid caps
+ *   — the trial converts, never a data cliff.
  *
  * Everything that speaks about a plan reads THIS module: the console, vault-count
  * enforcement (console.ts), the cap+entitlement push (vault-call.ts), billing
@@ -49,8 +52,33 @@ export type PlanId = "entry" | "standard" | "plus" | "power" | "trial" | "expire
 export type PaidTier = "entry" | "standard" | "plus" | "power";
 export const PAID_TIERS: readonly PaidTier[] = ["entry", "standard", "plus", "power"] as const;
 
-/** The 30-day no-card trial length. Signup stamps plan_downgrade_at = now+this. */
-export const TRIAL_DURATION_DAYS = 30;
+/**
+ * The no-card trial length in days — the ONE derivation of a new account's trial
+ * clock. Signup stamps plan_downgrade_at = now + this (users.ts createUser), and
+ * nothing else expresses the length, so changing it here moves the whole product:
+ * the clock, `trial_days_left` (account-api.ts), the console trial banner, and
+ * the Stripe `trial_end` a converting trialist's subscription carries.
+ *
+ * WHY 90 — the "three months free" campaign, ratified 2026-07-25. Thirty days is
+ * not long enough for a second brain to become someone's second brain: the habit
+ * forms over months, and a trialist who never got there had nothing to convert
+ * on. Three months is the honest length of the experiment we're asking people to
+ * run. NEW SIGNUPS ONLY — this constant does not reach back and re-stamp accounts
+ * already on the clock; extending those is a separate operator data-operation.
+ *
+ * REVISIT once the first 90-day cohort lands (earliest new-signup expiries are
+ * ~late October 2026) — that's the first real read on whether the longer runway
+ * converts. Headroom is ample: Stripe caps a subscription trial at 730 days (2
+ * years), and the floor is STRIPE_MIN_TRIAL_END_MS (48h), under which checkout
+ * drops trial_end and bills immediately (billing.ts).
+ */
+export const TRIAL_DURATION_DAYS = 90;
+
+/** {@link TRIAL_DURATION_DAYS} as user-facing copy — the ONE phrase every
+ *  "how long is the trial?" surface renders, so the number and the words can
+ *  never drift apart. "3 months", not "90 days": months are how people hold a
+ *  span this long. */
+export const TRIAL_LENGTH_COPY = "3 months";
 
 /** GFS snapshot retention per rank (the vault worker's snapshots.ts owns the
  *  rotation algorithm; THIS is the per-plan policy fed into it). */
@@ -136,8 +164,9 @@ export const PLAN_SPECS: Record<PlanId, PlanSpec> = {
     voice_enabled: true,
     transcribe_minutes: 1200,
   },
-  // The 30-day no-card trial mirrors PLUS entitlements exactly (best taste →
-  // best conversion) — the only difference is the clock (pending_plan='expired').
+  // The no-card trial (TRIAL_DURATION_DAYS long) mirrors PLUS entitlements
+  // exactly (best taste → best conversion) — the only difference is the clock
+  // (pending_plan='expired').
   trial: {
     id: "trial",
     label: "Trial",
@@ -357,11 +386,11 @@ export interface VaultEntitlement {
 
 /**
  * The plan whose SPEC drives a user's live entitlements — "try any plan free
- * for 30 days": a TRIAL user's entitlement mirrors the tier they CHOSE
+ * for three months": a TRIAL user's entitlement mirrors the tier they CHOSE
  * (`pending_plan` when it names a purchasable tier — an Entry trialist
  * experiences Entry (no attachments: an honest preview, no data-loss trap at
  * conversion), a Power trialist experiences Power). When no tier is chosen —
- * signup stamps pending_plan='expired', the day-30 floor, which is NOT a
+ * signup stamps pending_plan='expired', the end-of-trial floor, which is NOT a
  * chosen tier — the trial keeps its plus-mirroring spec (PLAN_SPECS.trial).
  * Every non-trial plan is its own spec. Callers: applyPlanToVaults
  * (vault-call.ts) + the console's vault-creation cap pushes.
@@ -470,7 +499,7 @@ export function tierCapSummary(tier: PaidTier): string {
 /**
  * The confirmation copy after a TRIAL user picks/changes their tier with no
  * Stripe (POST /console/plan) — the trial now mirrors this tier's caps for the
- * rest of the 30 days (the clock is unchanged; the day-30 sweep still floors).
+ * rest of the trial (the clock is unchanged; the expiry sweep still floors).
  */
 export function trialTierChosenMessage(tier: PaidTier): string {
   return `You're now trying ${PLAN_SPECS[tier].label} — ${tierCapSummary(tier)} — for the rest of your trial.`;
