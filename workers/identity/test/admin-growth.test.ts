@@ -362,7 +362,10 @@ describe("Plan mix + the trial pipeline", () => {
     const html = await growthHtml(cookie);
     // The trial length is in flight (30 → 90). A literal would go stale on the
     // one page whose entire premise is honest measurement.
-    expect(html).toContain(`IS the ${TRIAL_DURATION_DAYS}-day trial clock`);
+    // The clock is stamped per row at signup, so the page must NOT claim one
+    // length for the whole cohort — it names the length only for NEW signups.
+    expect(html).toContain("IS the trial clock");
+    expect(html).toContain(`new signups get ${TRIAL_DURATION_DAYS} days`);
     expect(html).toContain(`Session cookies last ${Math.round(SESSION_TTL_MS / DAY_MS)} days`);
     expect(html).toContain(`its ${Math.round(REFRESH_TOKEN_TTL_MS / DAY_MS)}-day refresh cycle`);
   });

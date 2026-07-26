@@ -305,7 +305,7 @@ function readBarrierDb(real: D1Database, barrier: { arrive: () => Promise<void> 
  *  `standard` tier, the anchor purchasable tier the monthly/yearly Prices back.
  *  Clears pending_plan/plan_downgrade_at too: seedUser's createUser stamps
  *  EVERY fresh signup with the trial pair (pending_plan='expired',
- *  plan_downgrade_at=+30d) — a real checkout webhook's CAS write clears both
+ *  plan_downgrade_at=+TRIAL_DURATION_DAYS) — a real checkout webhook's CAS write clears both
  *  (billing-lifecycle.ts), so this fixture mirrors that "settled, no pending
  *  change" post-checkout shape rather than leaking the pre-purchase trial clock. */
 async function seedPaidUser(
