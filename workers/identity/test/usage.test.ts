@@ -235,6 +235,27 @@ describe("runUsageRollup", () => {
     expect((await usageRows()).map((r) => r.vault_name)).toEqual(["cap-a", "cap-b"]);
     expect(USAGE_RUN_CAP).toBe(500); // the real bound the cron runs with
   });
+
+  test("onlyVault scopes the run to a SINGLE vault — the rest of the fleet is untouched (O(1), not O(fleet))", async () => {
+    const { id: owner } = await seedUser("usage-scope@example.com");
+    await seedVault("uscope-mine", owner);
+    await seedVault("uscope-other", owner);
+    // ONLY the scoped vault's config read is intercepted; uscope-other must not
+    // be read at all — an unexpected call trips disableNetConnect, and
+    // assertNoPendingInterceptors (afterEach) proves the scoped interceptor was
+    // consumed. This is what keeps smoke §14's rollup O(1) as the fleet grows
+    // (cloud#224, mirroring the snapshot-sweep scope in cloud#166/#218).
+    interceptConfigGet("uscope-mine", splitBody(3333, 111));
+    const summary = await quietly(() => runUsageRollup(env, rollupDeps(), { onlyVault: "uscope-mine" }));
+    expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, capped: false });
+    expect((await usageRows()).map((r) => r.vault_name)).toEqual(["uscope-mine"]);
+  });
+
+  test("onlyVault for an unknown name → an empty, clean run (no vault reads)", async () => {
+    const summary = await quietly(() => runUsageRollup(env, rollupDeps(), { onlyVault: "does-not-exist" }));
+    expect(summary).toEqual({ day: TODAY, vaults: 0, recorded: 0, failed: 0, capped: false });
+    expect(await usageRows()).toEqual([]);
+  });
 });
 
 // --- latestUsageForVaults --------------------------------------------------------
@@ -347,5 +368,22 @@ describe("staging usage trigger", () => {
 
     const prod = await worker.fetch(req(), { ...env, ENVIRONMENT: "production" });
     expect(prod.status).toBe(404);
+  });
+
+  test("?vault=<name> scopes the trigger to that one vault (smoke §14's O(1) rollup setup)", async () => {
+    const { id: owner } = await seedUser("trigger-scope-usage@example.com");
+    await seedVault("utrig-a", owner);
+    await seedVault("utrig-b", owner);
+    // Only utrig-a is intercepted; utrig-b must never be read — no interceptor
+    // + assertNoPendingInterceptors proves the trigger scoped to the one vault.
+    interceptConfigGet("utrig-a", splitBody(555, 5));
+    const res = await quietly(async () =>
+      worker.fetch(new Request(`${ISSUER}/__test/usage-run?vault=utrig-a`, { method: "POST" }), env),
+    );
+    expect(res.status).toBe(200);
+    const summary = (await res.json()) as { vaults: number; recorded: number };
+    expect(summary.vaults).toBe(1); // only the scoped vault, not the fleet
+    expect(summary.recorded).toBe(1);
+    expect((await usageRows()).map((r) => r.vault_name)).toEqual(["utrig-a"]);
   });
 });

@@ -53,20 +53,32 @@ export interface UsageRunSummary {
  * right transport per environment; `deps.now` is the injectable clock.
  * `opts.runCap` exists ONLY so tests can exercise the cap path without
  * seeding 500 vaults; the cron always runs the default.
+ *
+ * `opts.onlyVault` scopes the run to a SINGLE vault instead of the whole fleet.
+ * The USAGE_CRON never sets it; the staging-only /__test/usage-run trigger
+ * passes it so the live smoke's rollup assertion (smoke-staging.ts §14) stays
+ * O(1) rather than O(fleet) — a fleet-wide rollup outgrew the smoke's client
+ * timeout as staging debris accumulated (cloud#224, the same cliff the snapshot
+ * sweep hit in cloud#166/#218).
  */
 export async function runUsageRollup(
   env: Env,
   deps: OAuthDeps,
-  opts: { runCap?: number } = {},
+  opts: { runCap?: number; onlyVault?: string } = {},
 ): Promise<UsageRunSummary> {
   const runCap = opts.runCap ?? USAGE_RUN_CAP;
   const now = deps.now?.() ?? new Date();
   const day = now.toISOString().slice(0, 10);
 
   // +1 over the cap so "stopped at the cap" is distinguishable from "drained".
-  const res = await env.DB.prepare("SELECT name, owner_user_id FROM vaults ORDER BY name LIMIT ?")
-    .bind(runCap + 1)
-    .all<{ name: string; owner_user_id: string }>();
+  // `onlyVault` narrows to a single row (the run is inherently uncapped then).
+  const res = opts.onlyVault
+    ? await env.DB.prepare("SELECT name, owner_user_id FROM vaults WHERE name = ? LIMIT 1")
+        .bind(opts.onlyVault)
+        .all<{ name: string; owner_user_id: string }>()
+    : await env.DB.prepare("SELECT name, owner_user_id FROM vaults ORDER BY name LIMIT ?")
+        .bind(runCap + 1)
+        .all<{ name: string; owner_user_id: string }>();
   const rows = res.results ?? [];
   const capped = rows.length > runCap;
   const vaults = capped ? rows.slice(0, runCap) : rows;

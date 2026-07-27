@@ -363,7 +363,13 @@ app.post("/__test/drip-run", async (c) => {
 app.post("/__test/usage-run", async (c) => {
   const deps = depsFor(c.env);
   if (!deps.exposeDevLinks) return c.notFound();
-  return c.json(await runUsageRollup(c.env, deps));
+  // Optional single-vault scope: smoke-staging §14 passes ?vault=<its own fresh
+  // vault> so its rollup assertion stays O(1) instead of enumerating the whole
+  // staging fleet (which outgrew the smoke's client timeout — cloud#224, the
+  // same cliff as the snapshot sweep in cloud#166/#218). No param → the full
+  // fleet rollup, unchanged (the nightly USAGE_CRON path).
+  const onlyVault = c.req.query("vault") || undefined;
+  return c.json(await runUsageRollup(c.env, deps, onlyVault ? { onlyVault } : {}));
 });
 
 // Staging/dev-only snapshot-sweep trigger — same gate + rationale (404 in

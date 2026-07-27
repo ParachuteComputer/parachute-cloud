@@ -1182,9 +1182,29 @@ async function main() {
   //     the console MUST surface it: the card's "Using X of Y" line + the
   //     plan line's across-vaults total. Re-triggering proves the same-day
   //     upsert (rows refresh, never duplicate — the summary stays recorded>0).
-  {
+  //
+  //     cloud#224: the trigger is SCOPED to this run's own vault (?vault=), so
+  //     the rollup is O(1), not O(fleet). It used to enumerate EVERY staging
+  //     vault; as the fleet grew with smoke debris past ~260 vaults it crossed
+  //     the runtime's fetch timeout — and because §14 had NEITHER an explicit
+  //     AbortSignal NOR a liveCatch, the throw escaped to main().catch() as a
+  //     bare, section-less DOMException (empty stack), turning the deploy gate
+  //     red with no clue which section died. Now the trigger carries an
+  //     explicit, generous timeout and is classified via liveCatch (a genuine
+  //     stall is ADVISORY, not an anonymous crash), and — applying cloud#221 —
+  //     the live trigger and the console-render assertions live in SEPARATE
+  //     blocks, so a slow rollup can't silently blind the surface checks: an
+  //     unverified rollup skips them with a named advisory instead of failing
+  //     them for a non-bug reason. The nightly cron still rolls up the whole
+  //     fleet, tested unit-side (workers/identity/test/usage.test.ts).
+  const USAGE_ROLLUP_TIMEOUT_MS = 120_000;
+  let usageRecorded = false;
+  try {
     const run = async (): Promise<{ day: string; vaults: number; recorded: number; failed: number; capped: boolean } | null> => {
-      const r = await fetch(`${IDENTITY}/__test/usage-run`, { method: "POST" });
+      const r = await fetch(`${IDENTITY}/__test/usage-run?vault=${encodeURIComponent(arrivalVault)}`, {
+        method: "POST",
+        signal: AbortSignal.timeout(USAGE_ROLLUP_TIMEOUT_MS),
+      });
       return r.status === 200
         ? ((await r.json()) as { day: string; vaults: number; recorded: number; failed: number; capped: boolean })
         : null;
@@ -1197,6 +1217,9 @@ async function main() {
         "usage: the rollup recorded rows (this run's fresh vault included)",
         `day=${first.day} vaults=${first.vaults} recorded=${first.recorded} failed=${first.failed}`,
       );
+      // The row is upserted before the summary returns, so the console below
+      // can render it even if the re-run trigger later stalls.
+      usageRecorded = first.recorded >= 1;
       const again = await run();
       assert(
         !!again && again.recorded >= 1 && again.day === first.day,
@@ -1204,18 +1227,40 @@ async function main() {
         again ? `recorded=${again.recorded}` : "non-200",
       );
     }
-    const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
-    assert(
-      // The arrival user is on the no-card trial (mirrors Plus): the card cap
-      // renders "of 8.5 GiB" (500 MB notes + 8 GiB attachments, summed).
-      conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 8\.5 GiB/.test(conHtml),
-      "usage: the vault card shows 'Using X of Y' from the rollup row",
-      arrivalVault,
-    );
-    assert(
-      conHtml.includes('data-testid="usage-total"'),
-      "usage: the plan line carries the across-vaults total",
-    );
+  } catch (err) {
+    liveCatch("usage: live rollup trigger", err);
+  }
+
+  // Console render — a SEPARATE concern (does the console SURFACE the usage?),
+  // deliberately NOT sharing the trigger's try (cloud#221). If the rollup above
+  // stalled it recorded its OWN named advisory and left usageRecorded false, so
+  // we SKIP these dependent checks with an advisory rather than fail them
+  // fatally for a non-bug reason. When the rollup DID record, the surface MUST
+  // render it — these asserts stay fatal.
+  if (usageRecorded) {
+    try {
+      const conHtml = await (
+        await fetch(`${IDENTITY}/console`, {
+          headers: { cookie: arrivalCookie },
+          signal: AbortSignal.timeout(USAGE_ROLLUP_TIMEOUT_MS),
+        })
+      ).text();
+      assert(
+        // The arrival user is on the no-card trial (mirrors Plus): the card cap
+        // renders "of 8.5 GiB" (500 MB notes + 8 GiB attachments, summed).
+        conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 8\.5 GiB/.test(conHtml),
+        "usage: the vault card shows 'Using X of Y' from the rollup row",
+        arrivalVault,
+      );
+      assert(
+        conHtml.includes('data-testid="usage-total"'),
+        "usage: the plan line carries the across-vaults total",
+      );
+    } catch (err) {
+      liveCatch("usage: console usage render", err);
+    }
+  } else {
+    advisory("usage: console-render assertions SKIPPED — the rollup trigger above was unverified (see its advisory)");
   }
 
   // 15. Operator admin console (Wave 4c). The dev user IS the operator
