@@ -358,6 +358,19 @@ export class VaultDO extends DurableObject {
   private r2Bytes = 0;
   private stateLoaded = false;
 
+  /**
+   * True once {@link handleDestroy} has wiped this instance's storage.
+   * `fetch()` checks this BEFORE `ensureState()` — see that call site's
+   * comment for why the ordering matters (it's what stops a later request on
+   * this same warm instance from re-arming alarms or re-persisting config
+   * into a DO whose storage was just deleted). Never persisted: it only needs
+   * to hold for the rest of THIS warm instance's life — a later cold wake
+   * (post-eviction) boots a fresh instance with `destroyed = false`, which is
+   * the documented residue (an `idFromName`-addressed empty-schema DO, same
+   * property any never-created vault name already has).
+   */
+  private destroyed = false;
+
   // Monthly voice-minutes meter (loaded lazily with the rest of DO state).
   // `transcribeMinutes` is the running float of minutes used in
   // `transcribeMonth` (UTC "YYYY-MM"); a month rollover resets it lazily.
@@ -514,6 +527,32 @@ export class VaultDO extends DurableObject {
     if (!m) return json({ error: "Not found" }, 404);
     const vaultName = decodeURIComponent(m[1]!);
     const rest = m[2] ?? "";
+
+    // Vault destroy (cloud#226 PR-1) — dispatched BEFORE ensureState and
+    // everything else, deliberately. `handleDestroy` touches only R2 + DO
+    // storage + WS sockets (never `this.config`/`this.store`), so it's safe
+    // to run this early — and it MUST run this early: ensureState's
+    // maybeArmEmbeddingBackfill re-arms the embedding alarm on every wake
+    // unless the backfill is already known-done, which would re-fire the
+    // very alarm `handleDestroy` just cleared. Running the destroy route
+    // (idempotent retries included) ahead of ensureState is what keeps a
+    // warm-but-destroyed instance from resurrecting any state. Auth here is
+    // the SAME gate every other /internal/* route uses
+    // (authenticateVaultRequest + internalForbidden) — neither depends on DO
+    // state, so hoisting them ahead of ensureState changes nothing about what
+    // they enforce.
+    if (rest === "/api/internal/destroy") {
+      const destroyAuth = await authenticateVaultRequest(request, this.env, vaultName);
+      if ("error" in destroyAuth) return destroyAuth.error;
+      const destroyForbidden = this.internalForbidden(destroyAuth, vaultName);
+      if (destroyForbidden) return destroyForbidden;
+      return this.handleDestroy(request, vaultName);
+    }
+    // Every OTHER route on an already-destroyed warm instance: 410, no
+    // writes, no ensureState (the same resurrection concern as above).
+    if (this.destroyed) {
+      return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
+    }
 
     await this.ensureState(vaultName);
 
@@ -690,6 +729,8 @@ export class VaultDO extends DurableObject {
     // fixes it), and a FULL vault especially needs its nightly snapshot to
     // land. One shared authorization gate (first-party/operator only — see
     // internalForbidden); the wire contract for these is cloud-runtime only.
+    // NOTE: /internal/destroy is NOT listed below — it's dispatched at the
+    // very top of `fetch()`, ahead of `ensureState()`; see that call site.
     if (apiPath.startsWith("/internal/")) {
       const forbidden = this.internalForbidden(auth, vaultName);
       if (forbidden) return forbidden;
@@ -1404,21 +1445,93 @@ export class VaultDO extends DurableObject {
     });
   }
 
-  /** Delete every object under the vault's attachments prefix (paginated,
-   *  R2 bulk-delete caps at 1000/call). The R2 half of a blow-away import —
-   *  distinct from the `exports/` + `snapshots/` prefixes, which it never
-   *  touches. */
-  private async purgeAttachments(vaultName: string): Promise<void> {
-    const prefix = r2Key(vaultName, "");
+  /** Delete every object under `prefix` (paginated, R2 bulk-delete caps at
+   *  1000/call). Returns the count deleted. Generalized from the import
+   *  blow-away's attachments-only purge ({@link purgeAttachments}) so
+   *  {@link handleDestroy} can reuse it over the WHOLE `vault-<name>/` prefix
+   *  in one pass — attachments/, snapshots/, and exports/ together. */
+  private async purgePrefix(prefix: string): Promise<number> {
     let cursor: string | undefined;
+    let deleted = 0;
     do {
       const page = await this.env.ATTACHMENTS.list({ prefix, ...(cursor ? { cursor } : {}) });
       const keys = page.objects.map((o) => o.key);
       for (let i = 0; i < keys.length; i += 1000) {
-        await this.env.ATTACHMENTS.delete(keys.slice(i, i + 1000));
+        const batch = keys.slice(i, i + 1000);
+        await this.env.ATTACHMENTS.delete(batch);
+        deleted += batch.length;
       }
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
+    return deleted;
+  }
+
+  /** Delete every object under the vault's attachments prefix. The R2 half of
+   *  a blow-away import — distinct from the `exports/` + `snapshots/`
+   *  prefixes, which it never touches (unlike {@link handleDestroy}'s
+   *  whole-vault purge). */
+  private async purgeAttachments(vaultName: string): Promise<void> {
+    await this.purgePrefix(r2Key(vaultName, ""));
+  }
+
+  /**
+   * POST /api/internal/destroy — irrevocably erase this vault (PR-1 of the
+   * vault-delete train, cloud#226). Dispatched from `fetch()` BEFORE
+   * `ensureState()` (see that call site's comment) — this method never
+   * touches `this.config`/`this.store`, only R2 + DO storage + WS sockets, so
+   * running it that early is safe. Body: `{"confirm":"<vault name>"}`, an
+   * exact match against the canonical (already-lowercased) vault name —
+   * defense-in-depth at the internal seam; the PRIMARY guard is the caller's
+   * auth gate (`internalForbidden`, already enforced in `fetch()` before this
+   * runs).
+   *
+   * Sequence (each step precedes the next):
+   *   1. Close every hibernatable WebSocket with 1001 (Going Away) — live-
+   *      query sockets die now rather than lingering to their TTL.
+   *   2. Purge every R2 object under `vault-<name>/` — ONE prefix covers all
+   *      three families (attachments/, snapshots/, exports/), generalizing
+   *      {@link purgeAttachments} via {@link purgePrefix}. The trailing slash
+   *      is load-bearing: `vault-foo/` must never also match `vault-foobar/`.
+   *   3. `deleteAlarm()` THEN `deleteAll()` — `deleteAll()` does NOT clear a
+   *      pending alarm, and this DO arms transcription/embedding alarms that
+   *      must not fire against a destroyed vault.
+   *   4. Set `this.destroyed` — `fetch()` checks this on every later request
+   *      to this warm instance and short-circuits to 410 before
+   *      `ensureState()` can re-persist anything.
+   *
+   * Idempotent: a second call (the identity-side cascade's retry) short-
+   * circuits on the flag, skips the R2 rescan, and returns the same shape
+   * with zero new deletions. Deliberately does NOT call `ctx.abort()` before
+   * responding — that would kill this reply in flight, and it's unnecessary:
+   * the flag alone already guarantees no further write lands.
+   */
+  private async handleDestroy(request: Request, vaultName: string): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    let body: { confirm?: unknown };
+    try {
+      body = (await request.json()) as { confirm?: unknown };
+    } catch {
+      return json({ error: "Invalid JSON body" }, 400);
+    }
+    if (body.confirm !== vaultName) {
+      return json(
+        { error: "confirm must exactly match the vault name", error_type: "destroy_confirm_mismatch" },
+        400,
+      );
+    }
+    if (this.destroyed) return json({ destroyed: true, r2_objects_deleted: 0 });
+
+    for (const ws of this.ctx.getWebSockets()) this.closeWs(ws, 1001, "vault destroyed");
+
+    const deleted = await this.purgePrefix(`vault-${vaultName}/`);
+
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+
+    this.destroyed = true;
+
+    console.log(`[destroy ${vaultName}] r2_objects_deleted=${deleted}`);
+    return json({ destroyed: true, r2_objects_deleted: deleted });
   }
 
   private importTooLargeResponse(): Response {
