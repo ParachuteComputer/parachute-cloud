@@ -11,12 +11,25 @@
  * suite pins the confirm-body defense-in-depth on top of it, plus the
  * destructive sequence itself: the prefix-boundary pin (a missing trailing
  * slash would over-delete a sibling vault), the warm-instance 410 with NO
- * storage write landing, and idempotency (the identity-side cascade retries
- * this call).
+ * storage write landing, idempotency (the identity-side cascade retries this
+ * call), and `purgePrefix`'s own pagination/chunking loop at past-1000-object
+ * scale (a fake-bucket unit test — see the closing `describe`).
+ *
+ * NOT covered here: the `destroyed` guard added to `webSocketMessage` /
+ * `webSocketClose` / `webSocketError` / `alarm()`. Verified by mutation that
+ * it is CURRENTLY UNREACHABLE dead code — after `deleteAll()`, storage has no
+ * `config` key, so every one of those methods already no-ops via its OWN
+ * pre-existing `if (!vaultName) return` before the new guard could matter.
+ * That's the point: it's durability hardening against a FUTURE change to
+ * those methods' config-recovery path, not a behavior fixable/observable
+ * today — see the field doc on `VaultDO.destroyed`. A test asserting "nothing
+ * bad happens" here would pass identically with the guard deleted, which is
+ * exactly the vacuous-sentinel shape to avoid, so none is written.
  */
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
+import { purgePrefix } from "../src/vault-do.ts";
 import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
 
 function firstPartyToken(vault: string): Promise<string> {
@@ -176,5 +189,53 @@ describe("POST /api/internal/destroy — the erasure sequence", () => {
     const second = await destroyReq(v, token, v);
     expect(second.status).toBe(200);
     expect((await second.json()) as any).toEqual({ destroyed: true, r2_objects_deleted: 0 });
+  });
+
+  // "Cold idempotence" (destroy, evict, destroy again → same 200/0 shape) was
+  // requested on review but is SKIPPED, not just omitted: `__simulateEviction`
+  // (vault-do.ts, the vitest-pool-can't-evict-a-SQLite-DO workaround) only
+  // drops in-memory SUBSCRIPTION state — manager hooks, `wsSubs`, the
+  // rehydration flag. It never touches `this.destroyed`, so calling it between
+  // two destroys would leave `destroyed` still `true` on the SAME instance,
+  // making that test byte-for-byte the warm-instance idempotent-retry test
+  // above (a duplicate that only LOOKS like new coverage). A true cold
+  // instance is exactly what a fresh-`idFromName` `freshVault()` already gives
+  // every OTHER test in this file — there is no way, in this harness, to
+  // evict-and-rewake the SAME instance to get a genuinely fresh `destroyed`.
+});
+
+describe("purgePrefix — paginated listing (unit, fake bucket)", () => {
+  it("walks truncated list pages and deletes every key, chunking deletes at 1000", async () => {
+    // 1500 keys across 2 pages exercises the cursor loop (list's own page cap)
+    // AND the 1000-key delete-chunking loop, without 1500 real R2 objects —
+    // same convention as `pruneExportTarballs`'s fake-bucket test in
+    // export.test.ts.
+    const mk = (i: number) => `vault-x/attachments/2026-01-01/${String(i).padStart(4, "0")}.bin`;
+    const all = Array.from({ length: 1500 }, (_, i) => mk(i));
+    const pages = [all.slice(0, 1000), all.slice(1000)];
+    const deleted: string[][] = [];
+    let listCalls = 0;
+    const fake = {
+      list: async (opts: { prefix?: string; cursor?: string }) => {
+        expect(opts.prefix).toBe("vault-x/");
+        const idx = opts.cursor ? Number(opts.cursor) : 0;
+        listCalls++;
+        const truncated = idx < pages.length - 1;
+        return {
+          objects: pages[idx]!.map((key) => ({ key })),
+          truncated,
+          ...(truncated ? { cursor: String(idx + 1) } : {}),
+        };
+      },
+      delete: async (keys: string | string[]) => {
+        deleted.push(Array.isArray(keys) ? keys : [keys]);
+      },
+    } as unknown as R2Bucket;
+
+    const count = await purgePrefix(fake, "vault-x/");
+    expect(listCalls).toBe(2);
+    expect(count).toBe(1500);
+    for (const chunk of deleted) expect(chunk.length).toBeLessThanOrEqual(1000);
+    expect(deleted.flat()).toEqual(all);
   });
 });

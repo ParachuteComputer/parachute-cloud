@@ -322,6 +322,33 @@ function liveSocketCount(sockets: WebSocket[]): number {
  */
 const revocationTracker = new RevocationTracker();
 
+/**
+ * Delete every object under `prefix` (paginated, R2 bulk-delete caps at
+ * 1000/call). Returns the count deleted. Used by {@link VaultDO.purgeAttachments}
+ * (the import blow-away's attachments-only purge) and `handleDestroy` (the
+ * WHOLE `vault-<name>/` prefix in one pass — attachments/, snapshots/, and
+ * exports/ together). A free function taking `bucket` explicitly, not a
+ * method — same reason as `pruneExportTarballs` in `export.ts`: it lets the
+ * cursor/chunking loop be pinned against a fake bucket in a test, without
+ * thousands of real R2 objects and without mutating the DO's shared `env`
+ * binding (which every other DO in the isolate also reads).
+ */
+export async function purgePrefix(bucket: R2Bucket, prefix: string): Promise<number> {
+  let cursor: string | undefined;
+  let deleted = 0;
+  do {
+    const page = await bucket.list({ prefix, ...(cursor ? { cursor } : {}) });
+    const keys = page.objects.map((o) => o.key);
+    for (let i = 0; i < keys.length; i += 1000) {
+      const batch = keys.slice(i, i + 1000);
+      await bucket.delete(batch);
+      deleted += batch.length;
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return deleted;
+}
+
 export class VaultDO extends DurableObject {
   private shim: DatabaseShim;
   private store!: DoSqliteStore;
@@ -368,6 +395,17 @@ export class VaultDO extends DurableObject {
    * (post-eviction) boots a fresh instance with `destroyed = false`, which is
    * the documented residue (an `idFromName`-addressed empty-schema DO, same
    * property any never-created vault name already has).
+   *
+   * Also checked, explicitly, at the top of every OTHER entry point that can
+   * fire on a warm instance: `webSocketMessage`, `webSocketClose`,
+   * `webSocketError`, `alarm()`. Today those four are safe without the guard
+   * too — `ensureStateForWake`'s warm fast-path never re-arms, and a non-warm
+   * instance reads null config from wiped storage — but that's EMERGENT
+   * safety, riding on other code's current shape. It would silently break if
+   * `ensureStateForWake` ever called `ensureState` unconditionally, or if the
+   * embedding provider got cached in a way that survives `deleteAll`, and no
+   * test would catch it. The guard makes the invariant durable instead of
+   * incidental, on the exact primitive the account-delete cascade extends.
    */
   private destroyed = false;
 
@@ -1445,33 +1483,12 @@ export class VaultDO extends DurableObject {
     });
   }
 
-  /** Delete every object under `prefix` (paginated, R2 bulk-delete caps at
-   *  1000/call). Returns the count deleted. Generalized from the import
-   *  blow-away's attachments-only purge ({@link purgeAttachments}) so
-   *  {@link handleDestroy} can reuse it over the WHOLE `vault-<name>/` prefix
-   *  in one pass — attachments/, snapshots/, and exports/ together. */
-  private async purgePrefix(prefix: string): Promise<number> {
-    let cursor: string | undefined;
-    let deleted = 0;
-    do {
-      const page = await this.env.ATTACHMENTS.list({ prefix, ...(cursor ? { cursor } : {}) });
-      const keys = page.objects.map((o) => o.key);
-      for (let i = 0; i < keys.length; i += 1000) {
-        const batch = keys.slice(i, i + 1000);
-        await this.env.ATTACHMENTS.delete(batch);
-        deleted += batch.length;
-      }
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
-    return deleted;
-  }
-
   /** Delete every object under the vault's attachments prefix. The R2 half of
    *  a blow-away import — distinct from the `exports/` + `snapshots/`
    *  prefixes, which it never touches (unlike {@link handleDestroy}'s
    *  whole-vault purge). */
   private async purgeAttachments(vaultName: string): Promise<void> {
-    await this.purgePrefix(r2Key(vaultName, ""));
+    await purgePrefix(this.env.ATTACHMENTS, r2Key(vaultName, ""));
   }
 
   /**
@@ -1485,7 +1502,8 @@ export class VaultDO extends DurableObject {
    * auth gate (`internalForbidden`, already enforced in `fetch()` before this
    * runs).
    *
-   * Sequence (each step precedes the next):
+   * Sequence (each step precedes the next), run inside a SINGLE
+   * `blockConcurrencyWhile` (see below for why):
    *   1. Close every hibernatable WebSocket with 1001 (Going Away) — live-
    *      query sockets die now rather than lingering to their TTL.
    *   2. Purge every R2 object under `vault-<name>/` — ONE prefix covers all
@@ -1495,9 +1513,26 @@ export class VaultDO extends DurableObject {
    *   3. `deleteAlarm()` THEN `deleteAll()` — `deleteAll()` does NOT clear a
    *      pending alarm, and this DO arms transcription/embedding alarms that
    *      must not fire against a destroyed vault.
-   *   4. Set `this.destroyed` — `fetch()` checks this on every later request
-   *      to this warm instance and short-circuits to 410 before
-   *      `ensureState()` can re-persist anything.
+   *   4. Set `this.destroyed` LAST — `fetch()` checks this on every later
+   *      request to this warm instance and short-circuits to 410 before
+   *      `ensureState()` can re-persist anything. Setting it any earlier
+   *      would let a failed purge leave a flagged instance that then SKIPS
+   *      re-purge on retry — an R2 leak, worse than what this guards.
+   *
+   * Steps 1-4 run inside `ctx.blockConcurrencyWhile` — `purgePrefix` awaits
+   * multiple R2 round-trips, and DO event interleaving across awaits means a
+   * concurrent write request could otherwise land a new note in the gap
+   * between the purge finishing and `deleteAll()` clearing storage (the same
+   * DO-event-interleaving hazard `handleSnapshot`'s CONCURRENCY NOTE names
+   * above, for a far lower-stakes verb). `blockConcurrencyWhile` defers every
+   * other event on this instance — fetch, alarm, WS — until the callback
+   * resolves, closing that window. The response is still only built and
+   * returned AFTER the callback resolves, so this doesn't reintroduce the
+   * "respond before flush" problem `ctx.abort()` would cause.
+   *
+   * The `this.destroyed` short-circuit ABOVE the block (next line) still
+   * matters even with the lock: it's what makes a retry skip the R2 rescan
+   * instead of paying for a full (now-empty) `list()` pass every time.
    *
    * Idempotent: a second call (the identity-side cascade's retry) short-
    * circuits on the flag, skips the R2 rescan, and returns the same shape
@@ -1521,14 +1556,17 @@ export class VaultDO extends DurableObject {
     }
     if (this.destroyed) return json({ destroyed: true, r2_objects_deleted: 0 });
 
-    for (const ws of this.ctx.getWebSockets()) this.closeWs(ws, 1001, "vault destroyed");
+    const deleted = await this.ctx.blockConcurrencyWhile(async () => {
+      for (const ws of this.ctx.getWebSockets()) this.closeWs(ws, 1001, "vault destroyed");
 
-    const deleted = await this.purgePrefix(`vault-${vaultName}/`);
+      const n = await purgePrefix(this.env.ATTACHMENTS, `vault-${vaultName}/`);
 
-    await this.ctx.storage.deleteAlarm();
-    await this.ctx.storage.deleteAll();
+      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.deleteAll();
 
-    this.destroyed = true;
+      this.destroyed = true;
+      return n;
+    });
 
     console.log(`[destroy ${vaultName}] r2_objects_deleted=${deleted}`);
     return json({ destroyed: true, r2_objects_deleted: deleted });
@@ -1759,6 +1797,10 @@ export class VaultDO extends DurableObject {
       this.closeWs(ws, WS_CLOSE.PROTOCOL, "vault unavailable");
       return;
     }
+    // Explicit guard, not just emergent safety from `ensureStateForWake`'s
+    // warm fast-path never re-arming: see the field doc on `destroyed` for
+    // why this can't be left to fall out of other code incidentally.
+    if (this.destroyed) return;
     const vaultName = await this.ensureStateForWake();
     if (!vaultName) {
       this.closeWs(ws, WS_CLOSE.PROTOCOL, "vault not initialized");
@@ -1795,6 +1837,7 @@ export class VaultDO extends DurableObject {
 
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
     if (this.bootError) return;
+    if (this.destroyed) return;
     await this.ensureStateForWake();
     await this.ensureSubscriptionsRehydrated();
     this.cleanupSocket(ws);
@@ -1802,6 +1845,7 @@ export class VaultDO extends DurableObject {
 
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     if (this.bootError) return;
+    if (this.destroyed) return;
     await this.ensureStateForWake();
     await this.ensureSubscriptionsRehydrated();
     this.cleanupSocket(ws);
@@ -2175,6 +2219,7 @@ export class VaultDO extends DurableObject {
    */
   async alarm(): Promise<void> {
     if (this.bootError) return;
+    if (this.destroyed) return;
     // Reentrancy guard (cloud#171 hardening), checked+set SYNCHRONOUSLY
     // before any `await` — closes it against a genuinely CONCURRENT second
     // `alarm()` invocation on this same DO instance, not just a mid-wake
