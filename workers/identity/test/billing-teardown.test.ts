@@ -84,9 +84,19 @@ async function seedBilledUser(
   opts: { customer?: string | null; subscription?: string | null } = {},
 ): Promise<{ id: string }> {
   const { id } = await seedUser(email);
+  // `??` coalesces on `null` as well as `undefined`, so `opts.subscription ??
+  // "sub_test_1"` would silently discard a caller's DELIBERATE `null` (no
+  // stored subscription) and substitute the stub default — the exact bug
+  // that let the "genuinely-null" test above pass on unfixed code without
+  // exercising the branch it names. `=== undefined` treats "omitted" and
+  // "explicitly null" as the two distinct things they are.
   await db()
     .prepare("UPDATE users SET stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ?")
-    .bind(opts.customer ?? "cus_test_1", opts.subscription ?? "sub_test_1", id)
+    .bind(
+      opts.customer === undefined ? "cus_test_1" : opts.customer,
+      opts.subscription === undefined ? "sub_test_1" : opts.subscription,
+      id,
+    )
     .run();
   return { id };
 }
@@ -211,6 +221,26 @@ describe("teardownBilling — cancel everything, delete the customer, NULL the i
     expect(calls.canceled.filter((s) => s === "sub_a")).toHaveLength(1);
     expect(calls.canceled).toContain("sub_b");
     expect(calls.deletedCustomers).toEqual(["cus_orphan"]);
+    expect(await stripeIdsOf(id)).toEqual({ customer: null, subscription: null });
+  });
+
+  test("a genuinely-null stored subscription id (the cloud#64 orphan shape: customer exists, stored sub id lost or never set) — the belt is the ONLY path to a live subscription, and teardown still cancels it, deletes the customer, and NULLs both ids", async () => {
+    const { id } = await seedBilledUser("teardown-null-subscription@example.com", { customer: "cus_nullsub", subscription: null });
+    // Pin the seed itself: this must be a REAL null in the row, not the helper's
+    // stub default silently substituted for it — that substitution is exactly
+    // the bug this test exists to catch.
+    expect(await stripeIdsOf(id)).toEqual({ customer: "cus_nullsub", subscription: null });
+
+    const { stub, calls } = makeStripeStub({
+      listByCustomer: { cus_nullsub: [{ id: "sub_only_in_belt", status: "active" }] },
+    });
+
+    const result = await teardownBilling(stub, db(), id);
+    expect(result).toEqual({ converged: true });
+    // Exact equality, not toContain: with a real (non-null) stripeSubscriptionId
+    // there would ALSO be a direct-step cancel call, which toContain wouldn't catch.
+    expect(calls.canceled).toEqual(["sub_only_in_belt"]);
+    expect(calls.deletedCustomers).toEqual(["cus_nullsub"]);
     expect(await stripeIdsOf(id)).toEqual({ customer: null, subscription: null });
   });
 
