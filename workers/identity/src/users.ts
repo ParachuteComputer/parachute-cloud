@@ -71,6 +71,20 @@ export interface User {
    */
   suspendedAt: string | null;
   /**
+   * ISO-8601 timestamp when the account entered its 24-hour delete-undo
+   * window (migration 0023); null = not deleted. A-1 (this substrate) never
+   * WRITES this — only reads it, at the read-time refusal chokepoints
+   * documented on the migration. Set by the future `DELETE /account` route
+   * (A-3), cleared by the undo endpoint (A-4).
+   */
+  deletedAt: string | null;
+  /** Opaque hash of the mailed undo token (migration 0023). Unused until the
+   *  delete route (A-3) starts writing it. */
+  deleteUndoHash: string | null;
+  /** ISO-8601 timestamp the deletion-notice email was sent (migration 0023).
+   *  Unused until the delete route (A-3) starts writing it. */
+  deleteNoticeSentAt: string | null;
+  /**
    * Stripe linkage (migration 0012) — set by the checkout.session.completed
    * webhook; null for free users and comped accounts. The lifecycle handlers
    * resolve events by these ids (billing-lifecycle.ts).
@@ -108,6 +122,9 @@ interface Row {
   plan: string;
   role: string;
   suspended_at: string | null;
+  deleted_at: string | null;
+  delete_undo_hash: string | null;
+  delete_notice_sent_at: string | null;
   stripe_customer_id: string | null;
   stripe_subscription_id: string | null;
   pending_plan: string | null;
@@ -130,6 +147,9 @@ function rowToUser(r: Row): User {
     plan: coercePlanId(r.plan),
     role: coerceRole(r.role),
     suspendedAt: r.suspended_at,
+    deletedAt: r.deleted_at,
+    deleteUndoHash: r.delete_undo_hash,
+    deleteNoticeSentAt: r.delete_notice_sent_at,
     stripeCustomerId: r.stripe_customer_id,
     stripeSubscriptionId: r.stripe_subscription_id,
     // Same defensive coercion as `plan`; null stays null (no pending change).
@@ -259,6 +279,9 @@ export async function createUser(
     plan: "trial",
     role: "user",
     suspendedAt: null,
+    deletedAt: null,
+    deleteUndoHash: null,
+    deleteNoticeSentAt: null,
     stripeCustomerId: null,
     stripeSubscriptionId: null,
     pendingPlan: "expired",

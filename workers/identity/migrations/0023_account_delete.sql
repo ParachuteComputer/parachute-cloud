@@ -1,0 +1,42 @@
+-- Account deletion (A-1): the substrate for the 24-hour undo window Aaron
+-- ratified. `DELETE /account` (A-3, a later PR) severs authentication and
+-- mails an undo token, but defers all actual destruction to an hourly sweep
+-- (A-4) that runs past the window — this migration only adds the columns
+-- that state lives in. NOTHING WRITES THEM YET: there is no route, no setter,
+-- and no sweep in this PR. It is proven inert by the full existing suite
+-- staying green with these columns present but always NULL.
+--
+-- NOTE ON MIGRATION NUMBERING: the vault-delete train's PR-2a also wanted
+-- 0023; this train claimed it first, so PR-2a re-bases onto 0024 (see
+-- cloud#226).
+--
+-- `users.deleted_at` — ISO-8601 timestamp when the account entered its
+-- delete-undo window (NULL = not deleted; this PR never sets it). Mirrors
+-- migration 0011's `suspended_at` no-oracle posture rather than inventing a
+-- second style — the tombstoned row stays in `users` until the sweep
+-- converges, so every read path that can act on an account must also refuse
+-- one whose `deleted_at` is set, the same way they already refuse a
+-- suspended one:
+--   - sessions: the session JOIN refuses a deleted user, same as suspended
+--     (findActiveSession, sessions.ts);
+--   - login/magic: blocked with the SAME neutral responses an unknown
+--     account or a suspended one gets (wrong-password message / "check your
+--     email" page / "that code didn't work") — deletion is never revealed,
+--     no oracle, and — unlike suspension — never distinguishably so: the
+--     account-bearer gate (requireAccount, account-api.ts) answers a deleted
+--     owner with the exact SAME body as a missing row (401 `invalid_token`),
+--     not the distinguishable `account_suspended` a live-but-suspended owner
+--     gets, because "deleted" is a stronger, one-way fact than "suspended";
+--   - the onboarding drip + the billing/usage/snapshot sweeps: every
+--     enumeration excludes a tombstoned owner, so a deleted account is never
+--     emailed and never wakes a vault DO;
+--   - vault DATA: untouched by this PR — its fate is A-2/A-4's job.
+--
+-- `users.delete_undo_hash` — opaque hash of the mailed undo token (NULL until
+-- the future delete route sets it, A-3). Unused by anything in this PR.
+--
+-- `users.delete_notice_sent_at` — ISO-8601 timestamp the deletion-notice
+-- email was sent (NULL until A-3). Unused by anything in this PR.
+ALTER TABLE users ADD COLUMN deleted_at TEXT;
+ALTER TABLE users ADD COLUMN delete_undo_hash TEXT;
+ALTER TABLE users ADD COLUMN delete_notice_sent_at TEXT;

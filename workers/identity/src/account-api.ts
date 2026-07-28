@@ -125,17 +125,20 @@ export async function readJsonBody(req: Request): Promise<Record<string, unknown
  * The Bearer gate every `/account/*` route runs first, in order:
  *   1. extract + validate the token (C1 — kid + iss + jti-revocation +
  *      `aud="account"` pin) → 401 on missing/invalid;
- *   2. resolve the account owner, and REFUSE A SUSPENDED OWNER (401
- *      `account_suspended`) — the read-time suspend chokepoint. C1's validator
- *      is stateless by design (SCOPE-d), so suspension is enforced HERE: the
- *      account bearer is the account-admin equivalent of a session, and the
- *      session path already refuses suspended owners read-time
- *      (findActiveSession). Applying the same chokepoint to the bearer means a
- *      moderation suspend severs the account surface immediately, not after the
- *      token's short TTL lapses. (This is stricter than the "OAuth tokens expire
- *      naturally" note on migration 0011, deliberately so — that note governs
- *      VAULT tokens spent at the vault RS, which has no user table to consult;
- *      the account surface runs at the issuer, which can and does check.)
+ *   2. resolve the account owner, and REFUSE A DELETED OR SUSPENDED OWNER —
+ *      the read-time refusal chokepoint. C1's validator is stateless by
+ *      design (SCOPE-d), so both are enforced HERE: the account bearer is the
+ *      account-admin equivalent of a session, and the session path already
+ *      refuses deleted/suspended owners read-time (findActiveSession).
+ *      Applying the same chokepoint to the bearer means a moderation suspend
+ *      (or a self-serve delete, migration 0023) severs the account surface
+ *      immediately, not after the token's short TTL lapses. A deleted owner
+ *      gets the SAME 401 `invalid_token` body as a missing row (no oracle,
+ *      not even the distinguishable `account_suspended` a suspended owner
+ *      gets); (this is stricter than the "OAuth tokens expire naturally" note
+ *      on migration 0011, deliberately so — that note governs VAULT tokens
+ *      spent at the vault RS, which has no user table to consult; the
+ *      account surface runs at the issuer, which can and does check.)
  *   3. require `verb`-or-higher account authority → 403 on an underscoped token.
  *
  * Returns the account id AND the loaded owner (so callers needing the plan don't
@@ -165,7 +168,12 @@ export async function requireAccount(
   }
   const accountId = result.token.accountId;
   const user = await getUserById(db, accountId);
-  if (!user) {
+  // A DELETED account (migration 0023) gets the exact SAME response as a
+  // missing row — no oracle, and deliberately NOT the distinguishable
+  // `account_suspended` a live-but-suspended owner gets below: deletion is a
+  // stronger, one-way fact than suspension, so it degrades all the way to
+  // "doesn't exist" rather than to a named refusal.
+  if (!user || user.deletedAt !== null) {
     return { ok: false, response: authError(401, "invalid_token", "account not found") };
   }
   if (user.suspendedAt !== null) {

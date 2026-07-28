@@ -72,11 +72,17 @@ export async function runUsageRollup(
 
   // +1 over the cap so "stopped at the cap" is distinguishable from "drained".
   // `onlyVault` narrows to a single row (the run is inherently uncapped then).
+  // JOIN users + exclude a tombstoned owner (`deleted_at`, migration 0023) —
+  // otherwise a deleted account's vault still wakes its DO every night.
   const res = opts.onlyVault
-    ? await env.DB.prepare("SELECT name, owner_user_id FROM vaults WHERE name = ? LIMIT 1")
+    ? await env.DB.prepare(
+        "SELECT v.name, v.owner_user_id FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name = ? AND u.deleted_at IS NULL LIMIT 1",
+      )
         .bind(opts.onlyVault)
         .all<{ name: string; owner_user_id: string }>()
-    : await env.DB.prepare("SELECT name, owner_user_id FROM vaults ORDER BY name LIMIT ?")
+    : await env.DB.prepare(
+        "SELECT v.name, v.owner_user_id FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE u.deleted_at IS NULL ORDER BY v.name LIMIT ?",
+      )
         .bind(runCap + 1)
         .all<{ name: string; owner_user_id: string }>();
   const rows = res.results ?? [];

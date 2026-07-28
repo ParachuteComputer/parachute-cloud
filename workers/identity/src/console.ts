@@ -205,10 +205,11 @@ export async function handleLoginPost(db: D1Database, req: Request, deps: OAuthD
     return loginError(req, "Too many attempts. Please wait a few minutes and try again.", email);
   }
   const user = email ? await getUserByEmail(db, email) : null;
-  // A SUSPENDED account fails with the exact wrong-password message — even on
-  // the correct password (suspension is never revealed; migration 0011). The
-  // failure is recorded like any other so the fence stays indistinguishable.
-  if (!user || !(await verifyPassword(user, password)) || user.suspendedAt) {
+  // A SUSPENDED or DELETED account fails with the exact wrong-password
+  // message — even on the correct password (neither is ever revealed;
+  // migrations 0011 + 0023). The failure is recorded like any other so the
+  // fence stays indistinguishable.
+  if (!user || !(await verifyPassword(user, password)) || user.suspendedAt || user.deletedAt) {
     await recordLoginFailure(deps.rateLimiter, key, now);
     return loginError(req, "Incorrect email or password.", email);
   }
