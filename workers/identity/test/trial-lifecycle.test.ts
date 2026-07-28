@@ -167,6 +167,26 @@ describe("trial → expired sweep", () => {
     expect(pushes.length).toBe(0); // nothing pushed
   });
 
+  // A-1 (migration 0023): a DUE trial whose owner is DELETED must be excluded
+  // from the sweep entirely — no downgrade applied, no vault-worker push
+  // (waking a DO for an owner already mid-deletion).
+  test("a due, DELETED account is excluded from the sweep — no downgrade, no vault push", async () => {
+    const { id } = await seedUser("sweepdeleted@example.com");
+    await seedVault("sweepdeleted-box", id);
+    await env.DB.prepare("UPDATE users SET plan_downgrade_at = ?, deleted_at = ? WHERE id = ?")
+      .bind(new Date(Date.now() - 60_000).toISOString(), new Date().toISOString(), id)
+      .run();
+
+    const { d, pushes } = recordingDeps();
+    const summary = await runBillingSweep(env.DB, d, new Date());
+    expect(summary).toEqual({ due: 0, applied: 0 });
+
+    const user = await getUserById(env.DB, id);
+    expect(user!.plan).toBe("trial"); // untouched
+    expect(user!.pendingPlan).toBe("expired"); // still armed — the sweep never saw it
+    expect(pushes.length).toBe(0); // zero vault-worker fetches
+  });
+
   test("createUser establishes the full trial state machine — a THREE-MONTH clock", async () => {
     const { id } = await seedUser("machinestate@example.com");
     const user = await getUserById(env.DB, id);

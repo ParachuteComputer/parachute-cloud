@@ -981,6 +981,33 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     expect(await res.text()).toContain("Incorrect email or password");
   });
 
+  // A-1 (migration 0023): the OTHER public login-submit path (auth/authorize's
+  // own inline form) needs the same refusal console.ts's /login already has.
+  test("login submit for a DELETED account gets the same wrong-password message, even on the correct password — no session", async () => {
+    const { id } = await seedUser("del-authz@example.com", "hunter2");
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(new Date().toISOString(), id).run();
+    const { clientId } = await seedApprovedClient();
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizePost(
+      env.DB,
+      loginReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        },
+        { email: "del-authz@example.com", password: "hunter2" },
+      ),
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Incorrect email or password");
+    expect(res.headers.get("set-cookie") ?? "").not.toContain("parachute_id_session=");
+  });
+
   test("consent 'issued by' FALLS BACK to the issuer host when no bound request/resource origin (#42)", async () => {
     const { id: userId } = await seedUser();
     await seedVault("default", userId);

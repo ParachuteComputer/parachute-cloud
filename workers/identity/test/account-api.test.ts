@@ -584,6 +584,26 @@ describe("C3 — suspended owner refused across the surface", () => {
   });
 });
 
+// --- A-1: the read-time DELETE chokepoint (migration 0023) -------------------
+
+describe("C3/A-1 — deleted owner refused across the surface, indistinguishably from missing", () => {
+  test("a deleted owner's live account token → 401 invalid_token, 'account not found' — the EXACT missing-row body, never account_suspended", async () => {
+    const { userId, token } = await seedOwnerWithPlan("deleted@example.com");
+    await seedVault("tombstoned", userId);
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?")
+      .bind(new Date().toISOString(), userId)
+      .run();
+
+    // The token was minted while active, but the account surface re-checks
+    // deletion read-time — and unlike suspension above, degrades ALL THE WAY
+    // to the same body a token for a row that never existed gets (no oracle
+    // that "deleted" is a distinct state from "never had an account").
+    const res = await handleAccountVaultsList(db(), accountReq("GET", "/account/vaults", { token }), accountDeps());
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "invalid_token", error_description: "account not found" });
+  });
+});
+
 // --- validateVaultScopes (pure — now @openparachute/door-contract's shared
 // canon, re-exported from account-api.ts; hub-parity P3) -------------------
 

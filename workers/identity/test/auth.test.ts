@@ -241,6 +241,20 @@ describe("magic link — send + verify", () => {
     expect(user!.emailVerified).toBe(true);
   });
 
+  // A-1 (migration 0023): a DELETED account gets the identical neutral page,
+  // and — unlike an ordinary unknown-email request — nothing is minted or
+  // sent at all (mirrors the suspended-account branch right above it in
+  // auth-handlers.ts handleMagicRequestPost).
+  test("a DELETED account's magic-link request → the same neutral page, but NOTHING is sent", async () => {
+    const { id } = await seedUser("del-magic-req@example.com", "correct horse");
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(new Date().toISOString(), id).run();
+    const sender = captureSender();
+    const res = await handleMagicRequestPost(env.DB, magicReq("del-magic-req@example.com"), deps(), sender);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Check your email");
+    expect(sender.sent).toHaveLength(0);
+  });
+
   test("rate-limited: past the window max, further sends emit nothing (still neutral 200)", async () => {
     const sender = captureSender();
     const now = new Date("2026-07-02T12:00:00Z");
@@ -731,6 +745,21 @@ describe("sign-in code — verify by CODE instead of the link", () => {
     expect(cookieVal(res, "parachute_id_session")).toBeNull();
   });
 
+  // A-1 (migration 0023): same story, but DELETED — resolveVerifiedUser's
+  // deleted_at branch, mirroring the suspended one directly above.
+  test("a magic code minted before the account gets DELETED refuses to mint after — same neutral failure, no oracle", async () => {
+    const sender = captureSender();
+    const now = new Date("2026-07-16T12:00:00Z");
+    await handleMagicRequestPost(env.DB, magicReq("predel-code@example.com"), deps(() => now), sender);
+    const { code } = sender.sent[0]!;
+    const created = await createUser(env.DB, "predel-code@example.com", "", now, { emailVerified: false });
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(now.toISOString(), created.id).run();
+    const res = await handleCodeVerifyPost(env.DB, codeVerifyReq("predel-code@example.com", code), deps(() => now));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("request a fresh link");
+    expect(cookieVal(res, "parachute_id_session")).toBeNull();
+  });
+
   test("brute-force fence: repeated wrong codes for one (ip,email) lock out — a subsequently CORRECT code is refused too", async () => {
     const sender = captureSender();
     const now = new Date("2026-07-16T12:00:00Z");
@@ -943,6 +972,27 @@ describe("TOTP 2FA — enroll, login gate, backup codes, disable", () => {
     const pending2 = cookieVal(login2, "parachute_id_pending")!;
     const replay = await handleLogin2faPost(env.DB, login2faReq(code, pending2), deps(() => T_LOGIN));
     expect(await replay.text()).toContain("match");
+  });
+
+  // A-1 (migration 0023): the account is deleted BETWEEN the password step
+  // (which stashed the pending login) and the code step — handleLogin2faPost's
+  // own re-check must refuse, never trusting the pending row alone.
+  test("a pending 2FA login whose account gets DELETED before the code step refuses — no session, cookie cleared", async () => {
+    const { id } = await seedUser("totp-del@example.com", "correct horse");
+    const sessionId = await seedSession(id);
+    const { secret } = await enroll(sessionId);
+    const login = await handleLoginPost(env.DB, consoleLoginReq("totp-del@example.com", "correct horse"), deps(() => T_LOGIN));
+    const pending = cookieVal(login, "parachute_id_pending")!;
+
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(T_LOGIN.toISOString(), id).run();
+
+    const code = await totpCodeAt(secret, T_LOGIN);
+    const res = await handleLogin2faPost(env.DB, login2faReq(code, pending), deps(() => T_LOGIN));
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/login");
+    expect(cookieVal(res, "parachute_id_session")).toBeNull();
+    // The pending cookie is cleared, not left dangling for a retry.
+    expect(getSetCookies(res).some((c) => c.startsWith("parachute_id_pending=;"))).toBe(true);
   });
 
   test("a backup code signs in once, then is consumed", async () => {

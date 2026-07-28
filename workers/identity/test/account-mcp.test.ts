@@ -339,6 +339,22 @@ describe("account MCP — auth gate", () => {
     expect(((await res.json()) as any).error).toBe("account_suspended");
     expectChallenge(res);
   });
+
+  // A-1 (migration 0023): a deleted owner degrades to the SAME "account not
+  // found" body a missing row gets — not the distinguishable account_suspended
+  // above (deletion is a stronger, one-way fact).
+  test("a deleted owner → 401 invalid_token, same body as a missing account", async () => {
+    const id = await seedOwner("a-deleted@example.com");
+    const { token } = await mintVaultsToken(id, { blanket: true });
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(new Date().toISOString(), id).run();
+    const res = await handleAccountMcp(db(), mcpReq(token, rpc("tools/list")), mcpDeps());
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({
+      error: "invalid_token",
+      error_description: "account not found",
+    });
+    expectChallenge(res);
+  });
 });
 
 // --- THE OWNERSHIP SEAM: coverage resolves by ownership, live ----------------
