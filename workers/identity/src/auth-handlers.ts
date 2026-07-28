@@ -100,10 +100,11 @@ function checkForm(req: Request, form: FormData, deps: OAuthDeps): boolean {
  * DON'T mint a session — stash a pending login and send them to the code prompt.
  * Otherwise mint the session and go to `next`.
  *
- * SUSPENDED accounts never mint here — this is the chokepoint every primary-auth
- * path funnels through, so the guard is defense-in-depth behind the per-surface
- * neutral responses (login's wrong-password message, magic's neutral pages). The
- * bare /login redirect is deliberately indistinct from a lapsed session.
+ * SUSPENDED or DELETED accounts never mint here — this is the chokepoint every
+ * primary-auth path funnels through, so the guard is defense-in-depth behind
+ * the per-surface neutral responses (login's wrong-password message, magic's
+ * neutral pages). The bare /login redirect is deliberately indistinct from a
+ * lapsed session.
  */
 export async function finishPrimaryAuth(
   db: D1Database,
@@ -113,7 +114,7 @@ export async function finishPrimaryAuth(
 ): Promise<Response> {
   const now = deps.now?.() ?? new Date();
   const user = await getUserById(db, userId);
-  if (!user || user.suspendedAt) return redirectResponse("/login");
+  if (!user || user.suspendedAt || user.deletedAt) return redirectResponse("/login");
   if (await isTotpEnrolled(db, userId)) {
     const token = await createPendingLogin(db, userId, next, now);
     return redirectResponse("/login/2fa", { "set-cookie": buildPendingLoginCookie(token) });
@@ -221,10 +222,10 @@ export async function handleMagicRequestPost(
   // reveals account existence nor lets the endpoint be used to bomb an inbox.
   if (throttle.allowed) {
     const existing = await getUserByEmail(db, email);
-    // SUSPENDED account: the exact same neutral "check your email" page as
-    // every other outcome (no oracle), but nothing is minted or sent — no
-    // magic_links row, no email, and no dev echo header (there is no link).
-    if (existing?.suspendedAt) {
+    // SUSPENDED or DELETED account: the exact same neutral "check your email"
+    // page as every other outcome (no oracle), but nothing is minted or sent —
+    // no magic_links row, no email, and no dev echo header (there is no link).
+    if (existing?.suspendedAt || existing?.deletedAt) {
       const csrfToken = ensureCsrfToken(req).token;
       return wantsJson ? jsonResponse({ ok: true }, 200) : htmlResponse(renderMagicSent({ email, csrfToken }), 200);
     }
@@ -284,15 +285,15 @@ function magicError(req: Request, message: string, email: string): Response {
  * their email; otherwise create-or-fetch (a concurrent link for a new address
  * could have created the row first). Shared by the link's GET /auth/verify
  * and the code's POST /auth/code so both spellings resolve identically.
- * Returns null for a SUSPENDED account — the never-mint chokepoint; the
- * caller decides how that surfaces (the link's dead-link page vs the code's
- * neutral failure message), but neither ever mints.
+ * Returns null for a SUSPENDED or DELETED account — the never-mint
+ * chokepoint; the caller decides how that surfaces (the link's dead-link page
+ * vs the code's neutral failure message), but neither ever mints.
  */
 async function resolveVerifiedUser(db: D1Database, consumed: ConsumedMagicLink, now: Date): Promise<string | null> {
   let userId = consumed.userId;
   const existing = userId ? await getUserById(db, userId) : await getUserByEmail(db, consumed.email);
   if (existing) {
-    if (existing.suspendedAt) return null;
+    if (existing.suspendedAt || existing.deletedAt) return null;
     userId = existing.id;
     await markEmailVerified(db, userId);
     return userId;
@@ -460,10 +461,11 @@ export async function handleLogin2faPost(db: D1Database, req: Request, deps: OAu
   }
   await clearLoginFailures(deps.rateLimiter, key);
   await consumePendingLogin(db, rawToken);
-  // A pending login can predate a suspension (the 2FA path mints its own
-  // session, bypassing finishPrimaryAuth) — same never-mint rule applies.
+  // A pending login can predate a suspension or deletion (the 2FA path mints
+  // its own session, bypassing finishPrimaryAuth) — same never-mint rule
+  // applies.
   const pendingUser = await getUserById(db, pending.userId);
-  if (!pendingUser || pendingUser.suspendedAt) {
+  if (!pendingUser || pendingUser.suspendedAt || pendingUser.deletedAt) {
     return redirectResponse("/login", { "set-cookie": clearPendingLoginCookie() });
   }
   const session = await createSession(db, pending.userId, now);

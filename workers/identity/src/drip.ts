@@ -98,6 +98,10 @@ const NO_LEDGER_ROW = "NOT EXISTS (SELECT 1 FROM drip_sends d WHERE d.user_id = 
  * rows are minted-token evidence (the auth-code grant always writes one);
  * grants rows are consent evidence (written at approval even if redemption
  * failed) — either one means the user already met their AI, so no nudge.
+ *
+ * Every kind also excludes a tombstoned account (`deleted_at`, migration
+ * 0023) — a deleted account inside any window would otherwise be emailed,
+ * since these queries select straight from `users` by `created_at`.
  */
 export async function eligibleFor(
   db: D1Database,
@@ -112,14 +116,14 @@ export async function eligibleFor(
   switch (kind) {
     case "welcome":
       sql = `SELECT u.id, u.email FROM users u
-             WHERE u.created_at > ?2 AND u.drip_unsubscribed IS NULL AND ${NO_LEDGER_ROW}
+             WHERE u.created_at > ?2 AND u.drip_unsubscribed IS NULL AND u.deleted_at IS NULL AND ${NO_LEDGER_ROW}
              ORDER BY u.created_at LIMIT ?3`;
       binds = [kind, t(WELCOME_WINDOW_MS), limit];
       break;
     case "connect-nudge":
       sql = `SELECT u.id, u.email FROM users u
              WHERE u.created_at <= ?2 AND u.created_at > ?3
-               AND u.drip_unsubscribed IS NULL AND ${NO_LEDGER_ROW}
+               AND u.drip_unsubscribed IS NULL AND u.deleted_at IS NULL AND ${NO_LEDGER_ROW}
                AND NOT EXISTS (SELECT 1 FROM tokens t WHERE t.user_id = u.id AND t.client_id <> ?4)
                AND NOT EXISTS (SELECT 1 FROM grants g WHERE g.user_id = u.id AND g.client_id <> ?4)
              ORDER BY u.created_at LIMIT ?5`;
@@ -128,7 +132,7 @@ export async function eligibleFor(
     case "feedback":
       sql = `SELECT u.id, u.email FROM users u
              WHERE u.created_at <= ?2 AND u.created_at > ?3
-               AND u.drip_unsubscribed IS NULL AND ${NO_LEDGER_ROW}
+               AND u.drip_unsubscribed IS NULL AND u.deleted_at IS NULL AND ${NO_LEDGER_ROW}
              ORDER BY u.created_at LIMIT ?4`;
       binds = [kind, t(FEEDBACK_MIN_AGE_MS), t(FEEDBACK_MAX_AGE_MS), limit];
       break;

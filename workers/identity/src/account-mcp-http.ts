@@ -210,7 +210,12 @@ async function authenticate(db: D1Database, req: Request, deps: OAuthDeps): Prom
   }
 
   const user = await getUserById(db, accountId);
-  if (!user) return { ok: false, status: 401, error: "invalid_token", message: "account not found" };
+  // A DELETED account (migration 0023) gets the exact same "account not
+  // found" response as a missing row — no oracle, mirroring requireAccount
+  // (account-api.ts) — never the distinguishable `account_suspended` below.
+  if (!user || user.deletedAt !== null) {
+    return { ok: false, status: 401, error: "invalid_token", message: "account not found" };
+  }
   if (user.suspendedAt !== null) {
     return { ok: false, status: 401, error: "account_suspended", message: "this account is suspended" };
   }

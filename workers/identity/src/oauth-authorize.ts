@@ -299,8 +299,9 @@ async function authorizeCore(
   const csrf = ensureCsrfToken(req);
   const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
   // The session is already proven live (findActiveSession JOINs users WHERE
-  // suspended_at IS NULL), so the user row always resolves here — `?? ""` is
-  // defensive only, matching the codebase's convention elsewhere.
+  // suspended_at IS NULL AND deleted_at IS NULL), so the user row always
+  // resolves here — `?? ""` is defensive only, matching the codebase's
+  // convention elsewhere.
   const consentUser = await getUserById(db, session.userId);
   // Only the unnamed-verb pick branch needs the owner's vault list (the dropdown
   // that replaced the free-text input); every other branch skips the extra read.
@@ -436,9 +437,10 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
     return renderLoginPage(req, params, "Too many attempts. Please wait a few minutes and try again.");
   }
   const user = email ? await getUserByEmail(db, email) : null;
-  // SUSPENDED accounts get the same wrong-password message here too (this is
-  // the other public login-submit path) — never a session, never an oracle.
-  if (!user || !(await verifyPassword(user, password)) || user.suspendedAt) {
+  // SUSPENDED or DELETED accounts get the same wrong-password message here
+  // too (this is the other public login-submit path) — never a session,
+  // never an oracle.
+  if (!user || !(await verifyPassword(user, password)) || user.suspendedAt || user.deletedAt) {
     await recordLoginFailure(deps.rateLimiter, key, now);
     return renderLoginPage(req, params, "Incorrect email or password.");
   }

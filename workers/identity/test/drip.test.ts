@@ -208,6 +208,17 @@ describe("day-0 welcome", () => {
     expect(second.sent.welcome).toBe(1);
     expect(await ledgerRows(u.id)).toEqual(["welcome"]);
   });
+
+  // A-1 (migration 0023): a tombstoned account inside the welcome window must
+  // never be emailed — the predicate this test would fail without.
+  test("a DELETED account inside the welcome window does NOT get welcomed", async () => {
+    const u = await seedUserAt("del-welcome@example.com", minutesAgo(10));
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(NOW.toISOString(), u.id).run();
+    const sender = dripSender();
+    const summary = await quietly(() => runDrip(env, sender, at));
+    expect(summary.sent.welcome).toBe(0);
+    expect(sender.sent).toHaveLength(0);
+  });
 });
 
 // --- day-3 connect nudge --------------------------------------------------------
@@ -274,6 +285,17 @@ describe("day-3 connect nudge", () => {
     const third = await quietly(() => runDrip(env, sender, at));
     expect(third.sent["connect-nudge"]).toBe(0);
   });
+
+  // A-1 (migration 0023): a tombstoned account 3-4 days old, with no AI
+  // activity, must still never get the nudge.
+  test("a DELETED account due for the nudge does NOT get it", async () => {
+    const u = await seedUserAt("del-nudge@example.com", daysAgo(3.5));
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(NOW.toISOString(), u.id).run();
+    const sender = dripSender();
+    const summary = await quietly(() => runDrip(env, sender, at));
+    expect(summary.sent["connect-nudge"]).toBe(0);
+    expect(sender.sent).toHaveLength(0);
+  });
 });
 
 // --- day-14 feedback --------------------------------------------------------------
@@ -305,6 +327,17 @@ describe("day-14 feedback", () => {
     const sender = dripSender();
     const summary = await quietly(() => runDrip(env, sender, at));
     expect(summary.sent.feedback).toBe(0);
+  });
+
+  // A-1 (migration 0023): a tombstoned account 14-15 days old must not get
+  // the feedback ask either.
+  test("a DELETED account due for feedback does NOT get it", async () => {
+    const u = await seedUserAt("del-fb@example.com", daysAgo(14.5));
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(NOW.toISOString(), u.id).run();
+    const sender = dripSender();
+    const summary = await quietly(() => runDrip(env, sender, at));
+    expect(summary.sent.feedback).toBe(0);
+    expect(sender.sent).toHaveLength(0);
   });
 });
 

@@ -347,6 +347,19 @@ describe("runSnapshotSweep", () => {
     expect(summary).toEqual({ day: TODAY, vaults: 0, taken: 0, skipped: 0, failed: 0, capped: false });
     expect(await mirrorRows()).toEqual([]);
   });
+
+  // A-1 (migration 0023): a tombstoned owner's vault is excluded from
+  // enumeration entirely. No interceptor is registered for it — if the sweep
+  // tried to snapshot it anyway, disableNetConnect would refuse the fetch and
+  // this test would fail loudly.
+  test("a tombstoned owner's vault is excluded from the sweep — zero vault-worker fetches", async () => {
+    const { id: owner } = await seedUser("deleted-snapshot@example.com");
+    await seedVault("deleted-snapshot-v", owner);
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(new Date().toISOString(), owner).run();
+    const summary = await quietly(() => runSnapshotSweep(env, sweepDeps()));
+    expect(summary).toEqual({ day: TODAY, vaults: 0, taken: 0, skipped: 0, failed: 0, capped: false });
+    expect(await mirrorRows()).toEqual([]);
+  });
 });
 
 // --- listSnapshotsForVaults ---------------------------------------------------------

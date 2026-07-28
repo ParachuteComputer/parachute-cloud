@@ -91,14 +91,16 @@ export async function runSnapshotSweep(
   const now = deps.now?.() ?? new Date();
   const day = now.toISOString().slice(0, 10);
 
+  // Excludes a tombstoned owner (`deleted_at`, migration 0023) — otherwise a
+  // deleted account's vault still gets snapshotted nightly.
   const res = opts.onlyVault
     ? await env.DB.prepare(
-        `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name = ? LIMIT 1`,
+        `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name = ? AND u.deleted_at IS NULL LIMIT 1`,
       )
         .bind(opts.onlyVault)
         .all<{ name: string; owner_user_id: string; plan: string }>()
     : await env.DB.prepare(
-        `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id ORDER BY v.name LIMIT ?`,
+        `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE u.deleted_at IS NULL ORDER BY v.name LIMIT ?`,
       )
         .bind(runCap + 1)
         .all<{ name: string; owner_user_id: string; plan: string }>();

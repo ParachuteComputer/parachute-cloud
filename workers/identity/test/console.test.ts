@@ -451,6 +451,22 @@ describe("console — signup", () => {
     expect(await dupe.text()).toContain("already exists");
   });
 
+  // A-1 (migration 0023): the tombstoned row still resolves by email (nothing
+  // filters getUserByEmail), so the ordinary collision path already degrades
+  // neutrally — no route change needed. Pins that: no 500, no second row.
+  test("signup against a DELETED account's email degrades to the same collision message — never a 500, never a second row", async () => {
+    const { id } = await seedUser("del-signup@example.com", "longenough1");
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(new Date().toISOString(), id).run();
+
+    const res = await signup("del-signup@example.com", "anotherpassword1");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("already exists");
+    const rows = await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE email = ?")
+      .bind("del-signup@example.com")
+      .first<{ n: number }>();
+    expect(rows?.n).toBe(1); // still just the one (tombstoned) row
+  });
+
   test("signup without the CSRF token is refused", async () => {
     const res = await app.fetch(
       new Request(`${ISSUER}/signup`, {
@@ -534,6 +550,31 @@ describe("login brute-force fence", () => {
     }
     // Same email, different IP: still gets the normal "incorrect", not a lockout.
     expect(await (await loginAttempt("shared@example.com", "wrong", "198.51.100.2")).text()).toContain("Incorrect email or password");
+  });
+});
+
+// --- A-1: the delete chokepoint (migration 0023) ------------------------------
+
+describe("A-1 — a deleted account's password login", () => {
+  async function loginAttempt(email: string, password: string): Promise<Response> {
+    return app.fetch(
+      new Request(`${ISSUER}/login`, {
+        method: "POST",
+        body: new URLSearchParams({ __csrf: CSRF, email, password }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: ISSUER, cookie: `parachute_id_csrf=${CSRF}` },
+      }),
+      env,
+    );
+  }
+
+  test("the exact wrong-password message, even on the CORRECT password — no oracle, no session minted", async () => {
+    const { id } = await seedUser("del-login@example.com", "correcthorse9");
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(new Date().toISOString(), id).run();
+
+    const res = await loginAttempt("del-login@example.com", "correcthorse9");
+    expect(res.status).toBe(200); // the error re-render, not a redirect
+    expect(await res.text()).toContain("Incorrect email or password");
+    expect(res.headers.get("set-cookie") ?? "").not.toContain("parachute_id_session=");
   });
 });
 

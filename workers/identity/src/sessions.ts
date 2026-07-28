@@ -50,18 +50,20 @@ export async function createSession(db: D1Database, userId: string, now: Date = 
 
 /**
  * Find a live (un-expired) session by id. A session whose user is SUSPENDED
- * (users.suspended_at, migration 0011) is refused here — the single read-time
- * chokepoint that invalidates a suspended user's sessions on their next
- * request, across every cookie-authed surface (console, /oauth/authorize
- * login-skip, consent submit). The suspend action (admin.ts) also deletes the
- * rows outright; this join is the backstop for anything it raced.
+ * (users.suspended_at, migration 0011) or DELETED (users.deleted_at,
+ * migration 0023) is refused here — the single read-time chokepoint that
+ * invalidates such a user's sessions on their next request, across every
+ * cookie-authed surface (console, /oauth/authorize login-skip, consent
+ * submit). The suspend action (admin.ts) also deletes the rows outright; this
+ * join is the backstop for anything it raced (and, once the delete route
+ * exists, will be the backstop there too).
  */
 export async function findActiveSession(db: D1Database, id: string, now: Date = new Date()): Promise<Session | null> {
   const row = await db
     .prepare(
       `SELECT s.id, s.user_id, s.created_at, s.expires_at FROM sessions s
        JOIN users u ON u.id = s.user_id
-       WHERE s.id = ? AND u.suspended_at IS NULL`,
+       WHERE s.id = ? AND u.suspended_at IS NULL AND u.deleted_at IS NULL`,
     )
     .bind(id)
     .first<Row>();

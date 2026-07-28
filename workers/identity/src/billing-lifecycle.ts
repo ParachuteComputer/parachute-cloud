@@ -496,6 +496,10 @@ interface DueRow {
  * pair, and push the new caps into their vault DOs. Runs on the hourly cron
  * tick (ops.ts, alongside the drip); per-user failures log + continue (the
  * drip/usage posture — self-heals next hour). NEVER deletes anything.
+ *
+ * Excludes a tombstoned account (`deleted_at`, migration 0023) — a deleted
+ * account due for a downgrade would otherwise still get its caps pushed,
+ * waking a vault DO for an owner already mid-deletion.
  */
 export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date): Promise<BillingSweepSummary> {
   // Bind the SELECT and every per-row conditional write to the SAME instant, so
@@ -506,6 +510,7 @@ export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date
     .prepare(
       `SELECT id, plan, pending_plan FROM users
        WHERE pending_plan IS NOT NULL AND plan_downgrade_at IS NOT NULL AND plan_downgrade_at <= ?
+         AND deleted_at IS NULL
        ORDER BY plan_downgrade_at ASC LIMIT ?`,
     )
     .bind(nowIso, BILLING_SWEEP_CAP)

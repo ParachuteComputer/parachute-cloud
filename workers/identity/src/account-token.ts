@@ -28,9 +28,9 @@
  * with its own status so the refusal reason is legible):
  *   1. **Session.** A live `parachute_id_session` cookie. `sessionUser` resolves
  *      it through `findActiveSession`, which JOINs `users` on `suspended_at IS
- *      NULL` — so a SUSPENDED owner's session is refused here (the read-time
- *      chokepoint, admin.ts suspend lever), and no account token is minted. No
- *      session / suspended → 401.
+ *      NULL AND deleted_at IS NULL` — so a SUSPENDED (admin.ts suspend lever)
+ *      or DELETED (migration 0023) owner's session is refused here, and no
+ *      account token is minted. No session / suspended / deleted → 401.
  *   2. **CSRF.** A POST that performs a privileged mint, so it carries the
  *      double-submit token (`__csrf` in the JSON body — the SDK posts JSON, not a
  *      form; same `csrfTokenValid` core as the console's form POSTs).
@@ -96,7 +96,8 @@ function jsonError(status: number, error: string, description: string): Response
 
 export async function handleAccountToken(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   // Gate 1 — session. `sessionUser` refuses a missing cookie AND a suspended
-  // owner (findActiveSession's suspended_at JOIN) — the mint chokepoint.
+  // or deleted owner (findActiveSession's suspended_at/deleted_at JOIN) —
+  // the mint chokepoint.
   const user = await sessionUser(db, req, deps);
   if (!user) {
     return jsonError(401, "unauthenticated", "no active session — sign in first");

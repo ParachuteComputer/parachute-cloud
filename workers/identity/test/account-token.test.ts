@@ -228,3 +228,18 @@ describe("POST /account/token — suspended owner refused at mint", () => {
     expect(((await res.json()) as { error: string }).error).toBe("unauthenticated");
   });
 });
+
+// --- A-1: the delete chokepoint (migration 0023) ------------------------------
+
+describe("POST /account/token — deleted owner refused at mint", () => {
+  test("a deleted owner's session refuses at mint (findActiveSession's deleted_at JOIN)", async () => {
+    const { userId, sessionId } = await seedOwner("deleted-c2@example.com");
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?")
+      .bind(new Date().toISOString(), userId)
+      .run();
+
+    const res = await handleAccountToken(db(), goodReq(sessionId), deps());
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: string }).error).toBe("unauthenticated");
+  });
+});
