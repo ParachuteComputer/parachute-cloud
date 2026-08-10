@@ -23,6 +23,7 @@ import {
   authenticateVaultToken,
   hasScopeForVault,
   insufficientScope,
+  isTagSchemaMutation,
   vaultVerbRank,
   verbForMethod,
   type AuthResult,
@@ -747,9 +748,20 @@ export class VaultDO extends DurableObject {
     const auth = await authenticateVaultRequest(request, this.env, vaultName);
     if ("error" in auth) return auth.error;
 
-    const verb = verbForMethod(request.method);
-    if (verb === "write" && auth.permission !== "full") {
-      return insufficientScope("write", vaultName, auth.scopes);
+    // REST scope gate — mirrors bun's routing.ts: GET/HEAD/OPTIONS → read,
+    // other methods → write, EXCEPT the enumerated tag-schema mutations
+    // (isTagSchemaMutation: PUT/DELETE /tags/:name, POST /tags/merge, POST
+    // /tags/:name/rename), which require `vault:admin` — the vault 0.7.1
+    // write/admin re-tier (cloud#134 A.1). Gating on `auth.scopes` via
+    // `hasScopeForVault` (never the coarse `auth.permission` summary, which
+    // collapses write and admin) is what makes the write/admin distinction
+    // real on this door: a `vault:<name>:write` token keeps every genuine
+    // write, and can never confer the admin tier it wasn't minted at.
+    const requiredVerb = isTagSchemaMutation(request.method, apiPath)
+      ? "admin"
+      : verbForMethod(request.method);
+    if (requiredVerb !== "read" && !hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
+      return insufficientScope(requiredVerb, vaultName, auth.scopes);
     }
 
     const writeCtx = { actor: auth.actor, via: auth.via };

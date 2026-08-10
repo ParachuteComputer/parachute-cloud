@@ -546,6 +546,155 @@ describe("auth matrix", () => {
   });
 });
 
+/**
+ * The write/admin scope split (cloud#134 A.1) — the tag-schema/taxonomy
+ * mutation carve-out, mirroring bun routing.ts's `isTagSchemaMutation` (the
+ * vault 0.7.1 re-tier). Before this, cloud's REST gate collapsed write and
+ * admin into `permission: "full"`, so a `vault:<name>:write` token could
+ * rename/merge/delete/update tag schemas. The four admin-only REST operations
+ * are pinned INDIVIDUALLY (a write token is refused on each, and the mutation
+ * must not land), and the write tier is pinned to keep every genuine write —
+ * the split must never break a limited write token's legitimate work.
+ */
+describe("write/admin scope split — tag-schema mutations require vault:admin", () => {
+  const WRITE = (v: string) => mintToken({ vault: v, scopes: `vault:${v}:write vault:${v}:read` });
+  // Admin-only mint (no explicit write/read) — the scope ladder (admin ⊇ write
+  // ⊇ read) must carry the lower tiers, pinning "a higher-tier credential
+  // still works" alongside "a lower-tier credential never escalates".
+  const ADMIN = (v: string) => mintToken({ vault: v, scopes: `vault:${v}:admin` });
+
+  function asToken(token: string, method: string, body?: unknown): RequestInit {
+    return {
+      method,
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    };
+  }
+
+  async function expectAdminRefused(res: Response, grantedContains: string) {
+    expect(res.status).toBe(403);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:admin");
+    expect(body.granted_scopes).toContain(grantedContains);
+  }
+
+  it("write token: PUT /api/tags/:name → 403 vault:admin, schema NOT persisted", async () => {
+    const v = freshVault();
+    const token = await WRITE(v);
+    const res = await SELF.fetch(
+      `${base(v)}/api/tags/project`,
+      asToken(token, "PUT", { description: "by write token", fields: { status: { type: "string" } } }),
+    );
+    await expectAdminRefused(res, `vault:${v}:write`);
+    // The refusal happened at the gate — nothing landed.
+    const tag = await (await op(v, "/api/tags/project")).json() as any;
+    expect(tag.description).toBeNull();
+    expect(tag.fields).toBeNull();
+  });
+
+  it("write token: DELETE /api/tags/:name → 403 vault:admin, tag survives", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "x", tags: ["keepme"] });
+    const res = await SELF.fetch(`${base(v)}/api/tags/keepme`, asToken(await WRITE(v), "DELETE"));
+    await expectAdminRefused(res, `vault:${v}:write`);
+    const tags = await (await op(v, "/api/tags")).json() as any[];
+    expect(tags.some((t) => t.name === "keepme")).toBe(true);
+  });
+
+  it("write token: POST /api/tags/merge → 403 vault:admin, sources survive", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "x", tags: ["m1"] });
+    await createNote(v, { content: "y", tags: ["m2"] });
+    const res = await SELF.fetch(
+      `${base(v)}/api/tags/merge`,
+      asToken(await WRITE(v), "POST", { sources: ["m1", "m2"], target: "merged" }),
+    );
+    await expectAdminRefused(res, `vault:${v}:write`);
+    const tags = await (await op(v, "/api/tags")).json() as any[];
+    expect(tags.some((t) => t.name === "m1")).toBe(true);
+    expect(tags.some((t) => t.name === "merged")).toBe(false);
+  });
+
+  it("write token: POST /api/tags/:name/rename → 403 vault:admin, name unchanged", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "x", tags: ["oldname"] });
+    const res = await SELF.fetch(
+      `${base(v)}/api/tags/oldname/rename`,
+      asToken(await WRITE(v), "POST", { new_name: "newname" }),
+    );
+    await expectAdminRefused(res, `vault:${v}:write`);
+    const tags = await (await op(v, "/api/tags")).json() as any[];
+    expect(tags.some((t) => t.name === "oldname")).toBe(true);
+    expect(tags.some((t) => t.name === "newname")).toBe(false);
+  });
+
+  it("admin token: all four tag-schema mutations succeed (admin ⊇ write ⊇ read)", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "x", tags: ["t1"] });
+    await createNote(v, { content: "y", tags: ["t2"] });
+    await createNote(v, { content: "z", tags: ["victim"] });
+    const admin = await ADMIN(v);
+
+    const put = await SELF.fetch(
+      `${base(v)}/api/tags/t1`,
+      asToken(admin, "PUT", { description: "curated", fields: { status: { type: "string" } } }),
+    );
+    expect(put.status).toBe(200);
+
+    const rename = await SELF.fetch(
+      `${base(v)}/api/tags/t1/rename`,
+      asToken(admin, "POST", { new_name: "t1r" }),
+    );
+    expect(rename.status).toBe(200);
+
+    const merge = await SELF.fetch(
+      `${base(v)}/api/tags/merge`,
+      asToken(admin, "POST", { sources: ["t1r"], target: "t2" }),
+    );
+    expect(merge.status).toBe(200);
+
+    const del = await SELF.fetch(`${base(v)}/api/tags/victim`, asToken(admin, "DELETE"));
+    expect(del.status).toBe(200);
+  });
+
+  it("write token keeps every genuine write-tier operation (no breaking change)", async () => {
+    const v = freshVault();
+    const token = await WRITE(v);
+
+    // Note create / update / delete — the write tier's actual job.
+    const created = await SELF.fetch(
+      `${base(v)}/api/notes`,
+      asToken(token, "POST", { content: "write tier lives #wt" }),
+    );
+    expect(created.status).toBe(201);
+    const note = await created.json() as any;
+    const patched = await SELF.fetch(
+      `${base(v)}/api/notes/${note.id}`,
+      asToken(token, "PATCH", { content: "edited", if_updated_at: note.updatedAt ?? note.createdAt }),
+    );
+    expect(patched.status).toBe(200);
+
+    // Tag READS stay read-tier — the carve-out matches mutations only.
+    const list = await SELF.fetch(`${base(v)}/api/tags`, asToken(token, "GET"));
+    expect(list.status).toBe(200);
+    const detail = await SELF.fetch(`${base(v)}/api/tags/wt`, asToken(token, "GET"));
+    expect(detail.status).toBe(200);
+
+    // POST /tags/:name/conformance (2 path segments) is deliberately NOT in
+    // the admin enumeration — a schema-tightening preview stays available to
+    // a write token (bun even allows it at read tier).
+    const conf = await SELF.fetch(
+      `${base(v)}/api/tags/wt/conformance`,
+      asToken(token, "POST", { fields: { status: { type: "string" } } }),
+    );
+    expect(conf.status).toBe(200);
+
+    const del = await SELF.fetch(`${base(v)}/api/notes/${note.id}`, asToken(token, "DELETE"));
+    expect(del.status).toBe(200);
+  });
+});
+
 describe("storage — R2 round-trip + caps", () => {
   it("upload → serve round-trips the bytes with nosniff", async () => {
     const v = freshVault();

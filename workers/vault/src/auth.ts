@@ -47,6 +47,14 @@ export type VaultVerb = "read" | "write" | "admin";
 const VERB_RANK: Record<VaultVerb, number> = { read: 0, write: 1, admin: 2 };
 
 export interface AuthResult {
+  /**
+   * COARSE two-level summary (bun token-store back-compat shape): "full" =
+   * the token can write, "read" = read-only. It deliberately collapses
+   * write and admin — NEVER use it to authorize an admin-tier operation
+   * (that collapse was the cloud#134 A.1 gap). Admin gating goes through
+   * `hasScopeForVault(auth.scopes, vaultName, "admin")` on the real scope
+   * list, which preserves the read < write < admin ladder.
+   */
   permission: "full" | "read";
   scopes: string[];
   /** null = unscoped (the only shape cloud v1 issues). */
@@ -145,6 +153,39 @@ export function narrowedVaultNames(granted: string[]): string[] {
 export function verbForMethod(method: string): VaultVerb {
   const m = method.toUpperCase();
   return m === "GET" || m === "HEAD" || m === "OPTIONS" ? "read" : "write";
+}
+
+/**
+ * ADMIN-ONLY REST operations — the tag-schema/taxonomy mutation carve-out,
+ * ported verbatim from parachute-vault/src/routing.ts `isTagSchemaMutation`
+ * (the vault 0.7.1 write/admin re-tier). These operations define a tag's
+ * SCHEMA or restructure the tag graph across every note carrying it —
+ * structure, not content — the same distinction that keeps create-note/
+ * update-note/delete-note at `write` while moving these to `admin`.
+ *
+ * The list is an EXPLICIT enumeration (no default-allow-into-admin): exactly
+ * these four operations require `vault:admin`; everything else keeps the
+ * generic verbForMethod tier. `apiPath` is the path after `/api` (the DO
+ * dispatcher's `apiPath`), matching bun's `apiSubpath` shape:
+ *
+ *   - PUT    /tags/:name          (update-tag)
+ *   - DELETE /tags/:name          (delete-tag)
+ *   - POST   /tags/merge          (merge-tags)
+ *   - POST   /tags/:name/rename   (rename-tag)
+ *
+ * Deliberately does NOT match POST /tags/:name/conformance (2 path segments,
+ * not 1 — a read-only preview, see bun's `isReadOnlyPost`) or plain
+ * GET /tags[/:name] (read, unaffected). Before this carve-out, cloud REST
+ * gated these at the collapsed write tier ("permission: full"), so a
+ * `vault:<name>:write` token could mutate tag schemas — the exact gap
+ * vault PR #580 closed on the self-hosted door (cloud#134 item A.1).
+ */
+export function isTagSchemaMutation(method: string, apiPath: string): boolean {
+  const m = method.toUpperCase();
+  return (
+    ((m === "PUT" || m === "DELETE") && /^\/tags\/[^/]+$/.test(apiPath)) ||
+    (m === "POST" && (apiPath === "/tags/merge" || /^\/tags\/[^/]+\/rename$/.test(apiPath)))
+  );
 }
 
 // RFC 7235: the auth-scheme token is case-insensitive (`Bearer`/`bearer`/

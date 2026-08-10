@@ -174,6 +174,40 @@ describe("MCP — tools", () => {
     expect(list.some((n) => n.content === "via mcp #m")).toBe(true);
   });
 
+  it("write token: admin-tier tools (tag-schema curation) are filtered out of tools/list AND uncallable", async () => {
+    const v = freshVault();
+    const writeToken = await mintToken({ vault: v, scopes: `vault:${v}:write vault:${v}:read` });
+    const adminToken = await mintToken({ vault: v, scopes: `vault:${v}:admin` });
+    // The admin tier's MCP surface (core 0.7.1 re-tier) — enumerated so a
+    // future core tool landing at admin without cloud noticing still gets the
+    // write-tier-exclusion property pinned for these five.
+    const ADMIN_TOOLS = ["update-tag", "delete-tag", "rename-tag", "merge-tags", "prune-schema"];
+
+    const writeList = await mcpPost(v, writeToken, { jsonrpc: "2.0", id: 7, method: "tools/list" });
+    const writeNames = ((await writeList.json() as any).result.tools as any[]).map((t) => t.name);
+    const adminList = await mcpPost(v, adminToken, { jsonrpc: "2.0", id: 8, method: "tools/list" });
+    const adminNames = ((await adminList.json() as any).result.tools as any[]).map((t) => t.name);
+    for (const tool of ADMIN_TOOLS) {
+      expect(writeNames).not.toContain(tool);
+      expect(adminNames).toContain(tool);
+    }
+    // Write-tier tools stay with the write token — the split never costs it.
+    expect(writeNames).toContain("create-note");
+    expect(writeNames).toContain("update-note");
+
+    // Dispatch runs against the filtered set: calling an admin tool with a
+    // write token is indistinguishable from calling a nonexistent one.
+    const call = await mcpPost(v, writeToken, {
+      jsonrpc: "2.0",
+      id: 9,
+      method: "tools/call",
+      params: { name: "update-tag", arguments: { tag: "x", description: "escalation attempt" } },
+    });
+    const body = (await call.json()) as any;
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("Unknown tool");
+  });
+
   it("tools/call for a filtered-out tool → in-band 'Unknown tool' (no existence leak)", async () => {
     const v = freshVault();
     const token = await mintToken({ vault: v, scopes: `vault:${v}:read` });
@@ -401,33 +435,40 @@ describe("MCP — vault-info (server-layer override)", () => {
     expect(after.stats.totalNotes).toBe(proj.stats.totalNotes + 1);
   });
 
-  it("description update: write token persists; a later read reflects it", async () => {
+  it("description update: admin token persists; a later read reflects it", async () => {
     const v = freshVault();
-    const updated = await callVaultInfo(v, await WRITE(v), { description: "A curated research vault." });
+    const updated = await callVaultInfo(v, await ADMIN(v), { description: "A curated research vault." });
     expect(updated.description).toBe("A curated research vault.");
     // Persisted across calls — a read-only token sees it too.
     const reread = await callVaultInfo(v, await READ(v), {});
     expect(reread.description).toBe("A curated research vault.");
   });
 
-  it("description update: read-only token → refused (Forbidden / vault:write), description unchanged", async () => {
-    const v = freshVault();
-    const res = await mcpPost(v, await READ(v), {
-      jsonrpc: "2.0",
-      id: 31,
-      method: "tools/call",
-      params: { name: "vault-info", arguments: { description: "should not stick" } },
+  // The description-write branch is ADMIN-tier (vault 0.7.1 re-tier: vault
+  // curation, not content authorship — bun mcp-tools.ts overrideVaultInfo
+  // parity). Refusal is pinned for BOTH lower tiers: the read token (the
+  // outer-gate bypass) and the write token (the write/admin collapse,
+  // cloud#134 A.2 — a credential minted at write must never confer admin).
+  for (const [tier, mint] of [["read-only", READ], ["write", WRITE]] as const) {
+    it(`description update: ${tier} token → refused (Forbidden / vault:admin), description unchanged`, async () => {
+      const v = freshVault();
+      const res = await mcpPost(v, await mint(v), {
+        jsonrpc: "2.0",
+        id: 31,
+        method: "tools/call",
+        params: { name: "vault-info", arguments: { description: "should not stick" } },
+      });
+      const body = (await res.json()) as any;
+      // The inner admin-scope check throws → surfaced as an in-band tool error.
+      expect(body.result?.isError).toBe(true);
+      const text = body.result.content[0].text as string;
+      expect(text).toContain("Forbidden");
+      expect(text).toContain("vault:admin");
+      // And nothing was persisted — still the fresh-vault default.
+      const proj = await callVaultInfo(v, OP, {});
+      expect(proj.description).toBe(DEFAULT_VAULT_DESCRIPTION);
     });
-    const body = (await res.json()) as any;
-    // The inner write-scope check throws → surfaced as an in-band tool error.
-    expect(body.result?.isError).toBe(true);
-    const text = body.result.content[0].text as string;
-    expect(text).toContain("Forbidden");
-    expect(text).toContain("vault:write");
-    // And nothing was persisted — still the fresh-vault default.
-    const proj = await callVaultInfo(v, OP, {});
-    expect(proj.description).toBe(DEFAULT_VAULT_DESCRIPTION);
-  });
+  }
 
   it("FROZEN vault: a description update is refused by the #82 write gate (402 plan_required); a READ still works", async () => {
     const v = freshVault();

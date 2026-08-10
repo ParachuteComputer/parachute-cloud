@@ -137,9 +137,9 @@ const ATTACHMENT_UPLOAD_MINT_TOOL = "request-attachment-upload";
  *  `requiredVerb: "read"` (a read-only caller must keep the stats projection and
  *  reads stay sacred on a frozen vault), but a call carrying `description`
  *  UPDATES the vault description — a real write. So gate it exactly when
- *  `description` is present. The inner write-SCOPE check lives in
- *  overrideVaultInfo; this is the paywall/cap half (frozen → 402, cap-full →
- *  413), mirroring the REST write path. */
+ *  `description` is present. The inner SCOPE check (`vault:admin` — the 0.7.1
+ *  re-tier) lives in overrideVaultInfo; this is the paywall/cap half (frozen →
+ *  402, cap-full → 413), mirroring the REST write path. */
 function isGatedWrite(tool: McpToolDef, args: Record<string, unknown>): boolean {
   if (tool.name === "vault-info") return args.description !== undefined;
   if (tool.name === ATTACHMENT_UPLOAD_MINT_TOOL) return false;
@@ -198,8 +198,8 @@ export interface VaultInfoContext {
    *  for `buildVaultProjection`. */
   db: Database;
   /** Persist a new vault description into the DO's config store. Called only on
-   *  the write-gated description-update branch (after the inner write-scope
-   *  check passes and the dispatch-layer frozen/cap gate has cleared). Resolves
+   *  the gated description-update branch (after the inner admin-scope check
+   *  passes and the dispatch-layer frozen/cap gate has cleared). Resolves
    *  after the config `put` lands. */
   updateDescription: (description: string) => void | Promise<void>;
 }
@@ -221,9 +221,10 @@ function publicOrigin(req: Request): string {
  * getting-started pointer, and optional stats; the door adds its own vault NAME,
  * public coordinates, and the description get/update.
  *
- * The description-UPDATE branch is a write: it (1) requires `vault:write` for THIS
+ * The description-UPDATE branch is a write: it (1) requires `vault:admin` for THIS
  * vault (the inner check here — vault-info stays `requiredVerb: "read"` so
- * read-only callers keep the stats projection) and (2) is separately routed
+ * read-only callers keep the stats projection; admin, not write, per the 0.7.1
+ * write/admin re-tier — description is curation) and (2) is separately routed
  * through the #82 write gate at the dispatch layer (`isGatedWrite` treats
  * vault-info-with-`description` as a gated write → a frozen vault refuses with the
  * SAME 402 `plan_required` shape as create-note; a plain read carries no
@@ -247,15 +248,18 @@ function overrideVaultInfo(
     let description = opts.description;
 
     if (params.description !== undefined) {
-      // Inner write-check (parity with bun's overrideVaultInfo): vault-info is
+      // Inner scope check (parity with bun's overrideVaultInfo): vault-info is
       // read-gated so read-only callers can fetch stats, but MUTATING the
-      // description requires write for THIS vault. Without this a `vault:read`
-      // token could slip a write past a tool the outer gate considers a read.
+      // description requires ADMIN for THIS vault (was `write` — tightened by
+      // the vault 0.7.1 write/admin re-tier: the vault's own description is
+      // curation, same class as update-tag et al, not content authorship).
+      // Without this a `vault:read`/`vault:write` token could slip a
+      // higher-tier mutation past a tool the outer gate considers a read.
       // (The frozen/cap paywall is applied at the dispatch layer — see
       // isGatedWrite/handleToolCall — so this only guards SCOPE.)
-      if (!hasScopeForVault(auth.scopes, vaultName, "write")) {
+      if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
         throw new Error(
-          `Forbidden: updating the vault description requires the 'vault:write' scope (or 'vault:${vaultName}:write'). Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
+          `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
         );
       }
       description = params.description as string;
