@@ -168,6 +168,13 @@ new_sqlite_classes = ["RateLimiterDO"]
 #                        503s instead of the SPA shell if the vault worker's
 #                        my./vault/* zone route (workers/vault/wrangler.toml)
 #                        ever goes missing.
+#                        `/mcp`, `/mcp/*` (parachute-cloud#196,
+#                        DEFENSIVE_PREFIXES) are the analogous backstop for
+#                        the canonical MCP connector URL: this worker 503s if
+#                        the vault worker's my./mcp* zone route ever goes
+#                        missing. The parachute-app service-worker denylist
+#                        half is a separate follow-up per PR #195's Judgment
+#                        call.
 # =============================================================================
 [assets]
 directory = "./dist-assets"
@@ -188,6 +195,7 @@ run_worker_first = [
   "/__test", "/__test/*",
   "/account/*",
   "/vault", "/vault/*",
+  "/mcp", "/mcp/*",
   "/",
   "!/oauth/callback",
 ]
@@ -400,6 +408,7 @@ run_worker_first = [
   "/__test", "/__test/*",
   "/account/*",
   "/vault", "/vault/*",
+  "/mcp", "/mcp/*",
   "/",
   "!/oauth/callback",
 ]

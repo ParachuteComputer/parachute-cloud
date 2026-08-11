@@ -42,7 +42,7 @@
  * (`parachute-surface/packages/notes-ui/src/pwa-navigation-denylist.ts`) is the
  * OTHER half of the same guarantee: the installed service worker must let these
  * same ceremonies reach the origin instead of serving its cached shell. The two
- * lists are the same set, with two DELIBERATE, documented differences — see
+ * lists are the same set, with three DELIBERATE, documented differences — see
  * `P03_DENYLIST_PREFIXES` + `KNOWN_PARITY_DIFFERENCES` in the test, which pins
  * the symmetric difference so neither can silently drift from the other.
  */
@@ -108,8 +108,16 @@ export const SUBTREE_ONLY_PREFIXES = ["/account"] as const;
  * registered handler (index.ts `vaultRouteMissing`) answers `503 route_missing`
  * — never the SPA shell, which would look like a working (but empty) vault to
  * an API/MCP client instead of an honest failure.
+ *
+ * `/mcp`: on my.parachute.computer, `/mcp*` is meant to be intercepted by a
+ * Cloudflare ZONE ROUTE that dispatches straight to the VAULT worker
+ * (`workers/vault/wrangler.toml`) — the canonical MCP connector endpoint is
+ * normally peeled off at the platform layer before this worker's my. Custom
+ * Domain sees it. This entry is the backstop for that route vanishing: the
+ * registered handler (index.ts `mcpRouteMissing`) answers `503 route_missing`
+ * instead of letting the SPA shell masquerade as the MCP endpoint.
  */
-export const DEFENSIVE_PREFIXES = ["/vault"] as const;
+export const DEFENSIVE_PREFIXES = ["/vault", "/mcp"] as const;
 
 /**
  * The subset of CEREMONY_PREFIXES that has NO live route in `index.ts` yet —

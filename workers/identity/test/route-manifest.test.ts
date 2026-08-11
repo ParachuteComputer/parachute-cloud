@@ -12,7 +12,7 @@
  *                        added without updating the manifest fails HERE, before
  *                        the SPA fallback can swallow it;
  *   4. P0.3 parity     — the set matches the parachute-app SW denylist, modulo
- *                        two documented differences.
+ *                        three documented differences.
  */
 import { describe, expect, test } from "vitest";
 import { app } from "../src/index.ts";
@@ -126,7 +126,7 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
   });
 
   // (d) P0.3 parity — provably the same set as the parachute-app service-worker
-  // denylist, modulo the two documented differences. Maintained mirror (the two
+  // denylist, modulo the three documented differences. Maintained mirror (the two
   // repos don't share a package, so we can't import it); the comment points at
   // the source, and this test fails if THIS repo's set drifts from the agreed
   // shape. See parachute-app/src/pwa-navigation-denylist.ts.
@@ -154,7 +154,7 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
       "/u", // Phase B, reserved — /^\/u\// in the app denylist, no cloud route yet
     ];
 
-    // The two DELIBERATE differences between the sets:
+    // The three DELIBERATE differences between the sets:
     // - /api, /u  : SW-denylist-only. `/api` — the vault REST lives on a
     //               DIFFERENT worker/origin (u.parachute.computer); the
     //               identity worker has no /api route, so its Static Assets
@@ -168,16 +168,27 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
     //               navigational (the SW's nav fallback only affects GET
     //               navigations) and staging-only, so the SW needn't deny them;
     //               run_worker_first includes them as genuinely server-owned.
-    const KNOWN_PARITY_DIFFERENCES = { swOnly: ["/api", "/u"], manifestOnly: ["/__test"] };
+    // - /mcp      : identity-manifest-only for this task (parachute-cloud#196).
+    //               The parachute-app SW entry `/^\/mcp(\/|$)/` is a separate
+    //               follow-up in the other repo, per PR #195's Judgment call,
+    //               so this gap is intentional until that PR lands.
+    const KNOWN_PARITY_DIFFERENCES = {
+      swOnly: ["/api", "/u"],
+      manifestOnly: [
+        "/__test",
+        "/mcp", // cloud#196 ships the identity half; parachute-app follows separately.
+      ],
+    };
 
     test("the sets are identical modulo the documented differences", () => {
       // `/account` is a SUBTREE_ONLY prefix (its `/account/*` sub-tree is server-
       // owned; the bare `/account` is the SPA shell) — still part of the manifest's
       // server-owned set, and the SW denylist matches it (`/^\/account\//`).
-      // `DEFENSIVE_PREFIXES` (`/vault`) is folded in too — the app's denylist
-      // KNOWS about my./vault/* (PR #38, `/^\/vault\//`) even though it has no
-      // HTML ceremony page, so it belongs in this comparison same as any other
-      // server-owned prefix.
+      // `DEFENSIVE_PREFIXES` (`/vault`, `/mcp`) is folded in too — the app's
+      // denylist KNOWS about my./vault/* (PR #38, `/^\/vault\//`) even though it
+      // has no HTML ceremony page, so it belongs in this comparison same as any
+      // other server-owned prefix. `/mcp` is intentionally not in the mirror
+      // yet; the separate parachute-app follow-up is documented above.
       const manifest = new Set<string>([...CEREMONY_PREFIXES, ...SUBTREE_ONLY_PREFIXES, ...DEFENSIVE_PREFIXES]);
       const denylist = new Set<string>(P03_DENYLIST_PREFIXES);
       const manifestOnly = [...manifest].filter((p) => !denylist.has(p)).sort();

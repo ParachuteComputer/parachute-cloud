@@ -89,6 +89,8 @@ describe("runsWorkerFirst — the runtime twin of CF's matcher (P1.1)", () => {
     "/__test/drip-run",
     "/vault", // Phase A1 — the my./vault/* defensive backstop (DEFENSIVE_PREFIXES)
     "/vault/some-name/mcp",
+    "/mcp", // parachute-cloud#196 — the canonical my./mcp* defensive backstop
+    "/mcp/some-vault-name",
   ];
   test.each(ceremonies)("%s runs the WORKER first (never the SPA)", (path) => {
     expect(runsWorkerFirst(path)).toBe(true);
@@ -132,6 +134,8 @@ describe("runsWorkerFirst — the runtime twin of CF's matcher (P1.1)", () => {
       "/settings",
       "/vault",
       "/vault/some-name/mcp",
+      "/mcp",
+      "/mcp/some-vault-name",
     ];
     for (const p of samples) {
       expect(runsWorkerFirst(p), `${p}: matcher/manifest disagree`).toBe(isCeremonyPath(p));
@@ -247,5 +251,60 @@ describe("the /vault defensive backstop (Phase A1, DEFENSIVE_PREFIXES)", () => {
       env,
     );
     expect(res.status).toBe(503);
+  });
+});
+
+// --- 4. the my./mcp* defensive backstop (parachute-cloud#196) ---------------
+
+describe("the /mcp defensive backstop (parachute-cloud#196, DEFENSIVE_PREFIXES)", () => {
+  // In production this identity worker never actually answers my./mcp* — a
+  // Cloudflare zone route on the vault worker intercepts the canonical MCP
+  // connector URL at the platform layer, ahead of this worker's my. Custom
+  // Domain. This suite exercises the worker DIRECTLY (bypassing the zone route
+  // entirely, as vitest always does) to prove the fallback itself is correct —
+  // the case that matters is "the zone route vanished," which looks identical
+  // to this from the worker's POV.
+  test("GET /mcp → 503 mcp_route_missing, never the SPA shell", async () => {
+    const res = await worker.fetch(new Request("https://my.example/mcp"), env);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: string; error_type: string };
+    expect(body.error_type).toBe("mcp_route_missing");
+  });
+
+  test("GET /mcp/anything → 503 route_missing, never a 200 SPA shell", async () => {
+    const res = await worker.fetch(new Request("https://my.example/mcp/anything"), env);
+    expect(res.status).toBe(503);
+    expect(res.headers.get("content-type") ?? "").toContain("application/json");
+    const body = (await res.json()) as { error: string; error_type: string };
+    expect(body.error_type).toBe("mcp_route_missing");
+  });
+
+  test("POST /mcp (the MCP JSON-RPC verb) gets the same 503, not a 404 or a redirect", async () => {
+    const res = await worker.fetch(
+      new Request("https://my.example/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(503);
+  });
+
+  // The two spellings a hand-typed or slightly-off connector URL most
+  // plausibly takes — a trailing slash, or a query string tacked on. Both
+  // must still hit the backstop, not fall through to the SPA shell.
+  test("GET /mcp/ (trailing slash) → 503 mcp_route_missing, never the SPA shell", async () => {
+    const res = await worker.fetch(new Request("https://my.example/mcp/"), env);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: string; error_type: string };
+    expect(body.error_type).toBe("mcp_route_missing");
+  });
+
+  test("GET /mcp?foo=bar (query string) → 503 mcp_route_missing, never the SPA shell", async () => {
+    const res = await worker.fetch(new Request("https://my.example/mcp?foo=bar"), env);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: string; error_type: string };
+    expect(body.error_type).toBe("mcp_route_missing");
   });
 });

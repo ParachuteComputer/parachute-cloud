@@ -423,6 +423,40 @@ app.all("/vault", vaultRouteMissing);
 app.all("/vault/*", vaultRouteMissing);
 
 /**
+ * The /mcp defensive backstop (route-manifest.ts DEFENSIVE_PREFIXES),
+ * primarily for the my.parachute.computer one-origin door (parachute-cloud#196):
+ * a Cloudflare zone route on my.parachute.computer/mcp* is meant to dispatch
+ * the canonical MCP connector endpoint straight to the VAULT worker at the
+ * platform layer, ahead of this worker's my. Custom Domain, so in normal
+ * operation THIS worker never answers a my./mcp* request. If that zone route
+ * is ever deleted or misconfigured, this is the fallback — and it must never
+ * silently serve the SPA shell as a 200 (which would make the canonical MCP
+ * connector URL look reachable while hiding the routing failure). A loud 503
+ * is the honest answer: "the MCP route is unreachable here," not "here is an
+ * MCP endpoint."
+ *
+ * This handler goes live on EVERY host this worker serves (cloud., app.,
+ * staging) the moment this PR deploys — not just my., and not only once the
+ * my. cutover happens. That's deliberate, not incidental: the identity
+ * worker's Static Assets fallback could otherwise silently serve the SPA shell
+ * at `/mcp` on any serving host. The my.-specific zone-route rationale above
+ * just explains why the pattern needed a name.
+ */
+function mcpRouteMissing(): Response {
+  return Response.json(
+    {
+      error: "route_missing",
+      error_type: "mcp_route_missing",
+      message:
+        "This identity worker never serves /mcp directly — /mcp is the canonical MCP connector endpoint, and requests are meant to be intercepted by a platform-layer route (a Cloudflare zone route) pointed at the vault worker before they reach here. If you expected the MCP connector at this URL, that route is missing or misconfigured on this origin.",
+    },
+    { status: 503 },
+  );
+}
+app.all("/mcp", mcpRouteMissing);
+app.all("/mcp/*", mcpRouteMissing);
+
+/**
  * Serve the SPA shell (index.html) through the Static Assets binding (P1.1),
  * carrying the SPA Content-Security-Policy (P1.1.5).
  *
