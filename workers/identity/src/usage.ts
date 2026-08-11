@@ -2,8 +2,10 @@
  * The daily per-vault usage rollup (Wave 4b): enumerate the `vaults` table,
  * read each vault DO's live storage split through the internal config seam
  * (vault-call.ts `readVaultUsage` — GET /api/internal/config, first-party
- * admin mint), and upsert one row per (vault, UTC day) into D1 `vault_usage`
- * (migration 0010).
+ * admin mint), compare the same response's resolved entitlement with the
+ * owner's current plan, and upsert one row per (vault, UTC day) into D1
+ * `vault_usage` (migration 0010). A mismatch reuses `pushVaultCap` so this
+ * existing daily wake is also the fleet-wide entitlement reconciler.
  *
  * Driven by USAGE_CRON (ops.ts, daily 03:30 UTC — the ratified cadence;
  * usage is a daily-granularity signal, and one row/vault/day keeps the table
@@ -12,16 +14,17 @@
  * cap ENFORCEMENT stays the v1 per-vault semantics until the billing PR (see
  * the plans.ts module note — recording and enforcing were split on purpose).
  *
- * Failure posture mirrors the drip: one vault's failed read (DO hiccup, stale
- * vault worker) logs `event=usage_fetch_failed` and the run CONTINUES — a
- * missing day for one vault self-heals tomorrow, and the console degrades to
- * "usage appears within a day" for that vault only. The run is bounded by
- * {@link USAGE_RUN_CAP}; same injectable-clock shape as ops.ts/drip.ts so the
- * tests drive the exact code the cron does.
+ * Failure posture mirrors the drip: one vault's failed read or reconciliation
+ * (DO hiccup, stale vault worker) logs and the run CONTINUES — a missing day or
+ * stale entitlement for one vault self-heals tomorrow, and the console
+ * degrades to "usage appears within a day" for that vault only. The run is
+ * bounded by {@link USAGE_RUN_CAP}; same injectable-clock shape as
+ * ops.ts/drip.ts so the tests drive the exact code the cron does.
  */
 import type { Env } from "./env.ts";
 import type { OAuthDeps } from "./oauth-shared.ts";
-import { readVaultUsage } from "./vault-call.ts";
+import { type VaultEntitlement, coercePlanId, entitlementPlanFor, planEntitlement } from "./plans.ts";
+import { type VaultUsageReading, pushVaultCap, readVaultUsage } from "./vault-call.ts";
 
 /**
  * Per-run bound on vault reads. Current vault counts are tiny (tens — one
@@ -33,6 +36,53 @@ import { readVaultUsage } from "./vault-call.ts";
  */
 export const USAGE_RUN_CAP = 500;
 
+interface RollupVaultRow {
+  name: string;
+  owner_user_id: string;
+  plan: string;
+  pending_plan: string | null;
+}
+
+/**
+ * Resolve the entitlement for the exact plan row selected with each vault.
+ * This deliberately mirrors `applyPlanToVaults` instead of calling
+ * `getUserById`: the rollup already batch-fetches owner plan columns in its
+ * enumeration query, so reconciliation must not add one D1 round-trip per
+ * vault to the cost-conscious daily job.
+ *
+ * Raw values are defensively coerced just as `users.ts` does. A hand-edited or
+ * future plan value therefore degrades to the expired floor rather than
+ * granting an entitlement this worker does not understand.
+ */
+function entitlementForRollupVault(plan: string, pendingPlan: string | null): VaultEntitlement {
+  const effectivePlan = entitlementPlanFor(
+    coercePlanId(plan),
+    pendingPlan === null ? null : coercePlanId(pendingPlan),
+  );
+  return planEntitlement(effectivePlan);
+}
+
+/**
+ * Compare every field the identity worker owns in the vault DO's resolved
+ * entitlement. Usage bytes and voice minutes are intentionally absent: they
+ * are live meters, not plan state, and must not make an otherwise converged
+ * vault look stale on every rollup.
+ *
+ * A null caps object is a real unpushed/legacy state and therefore never
+ * matches a plan entitlement. The next rollup PUTs the complete two-meter,
+ * voice, and frozen payload through the same first-party seam as plan changes.
+ */
+function resolvedEntitlementMatches(reading: VaultUsageReading, expected: VaultEntitlement): boolean {
+  return (
+    reading.caps !== null &&
+    reading.caps.notes_bytes === expected.caps.notes_bytes &&
+    reading.caps.attachment_bytes === expected.caps.attachment_bytes &&
+    reading.frozen === expected.frozen &&
+    reading.transcriptionEnabled === expected.transcription.enabled &&
+    reading.transcribeMinutesLimit === expected.transcription.minutes_limit
+  );
+}
+
 export interface UsageRunSummary {
   /** UTC day the rows were written for ("YYYY-MM-DD"). */
   day: string;
@@ -42,15 +92,18 @@ export interface UsageRunSummary {
   recorded: number;
   /** Vault reads that failed (logged, skipped — self-heal next run). */
   failed: number;
+  /** Vaults whose stale entitlement was successfully re-pushed this run. */
+  reconciled: number;
   /** True when enumeration stopped at the cap with vaults still unread. */
   capped: boolean;
 }
 
 /**
- * One rollup tick: read every vault's usage split, upsert today's row per
- * vault. Deps are the standard OAuthDeps (depsForEnv) — the internal mint
- * needs issuer + signing key access, and `vaultFetch`/`vaultOrigin` pick the
- * right transport per environment; `deps.now` is the injectable clock.
+ * One rollup tick: read every vault's usage split and resolved entitlement,
+ * upsert today's row per vault, and repair a stale plan push when necessary.
+ * Deps are the standard OAuthDeps (depsForEnv) — the internal mint needs
+ * issuer + signing key access, and `vaultFetch`/`vaultOrigin` pick the right
+ * transport per environment; `deps.now` is the injectable clock.
  * `opts.runCap` exists ONLY so tests can exercise the cap path without
  * seeding 500 vaults; the cron always runs the default.
  *
@@ -76,15 +129,15 @@ export async function runUsageRollup(
   // otherwise a deleted account's vault still wakes its DO every night.
   const res = opts.onlyVault
     ? await env.DB.prepare(
-        "SELECT v.name, v.owner_user_id FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name = ? AND u.deleted_at IS NULL LIMIT 1",
+        "SELECT v.name, v.owner_user_id, u.plan, u.pending_plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name = ? AND u.deleted_at IS NULL LIMIT 1",
       )
         .bind(opts.onlyVault)
-        .all<{ name: string; owner_user_id: string }>()
+        .all<RollupVaultRow>()
     : await env.DB.prepare(
-        "SELECT v.name, v.owner_user_id FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE u.deleted_at IS NULL ORDER BY v.name LIMIT ?",
+        "SELECT v.name, v.owner_user_id, u.plan, u.pending_plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE u.deleted_at IS NULL ORDER BY v.name LIMIT ?",
       )
         .bind(runCap + 1)
-        .all<{ name: string; owner_user_id: string }>();
+        .all<RollupVaultRow>();
   const rows = res.results ?? [];
   const capped = rows.length > runCap;
   const vaults = capped ? rows.slice(0, runCap) : rows;
@@ -92,6 +145,7 @@ export async function runUsageRollup(
 
   let recorded = 0;
   let failed = 0;
+  let reconciled = 0;
   for (const v of vaults) {
     try {
       const usage = await readVaultUsage(env.DB, deps, v.owner_user_id, v.name);
@@ -103,6 +157,16 @@ export async function runUsageRollup(
         .bind(v.name, day, usage.dbBytes, usage.r2Bytes, usage.transcribeMinutes)
         .run();
       recorded++;
+
+      const expected = entitlementForRollupVault(v.plan, v.pending_plan);
+      if (!resolvedEntitlementMatches(usage, expected)) {
+        const push = await pushVaultCap(env.DB, deps, v.owner_user_id, v.name, expected);
+        // Emit the issue-specified event for every detected mismatch. The
+        // additive `ok` field lets operators distinguish a repaired vault from
+        // a best-effort push that still needs the next daily tick.
+        console.log(`event=entitlement_reconciled vault=${v.name} ok=${push.ok} attempts=${push.attempts}`);
+        if (push.ok) reconciled++;
+      }
     } catch (err) {
       // Skip + log + continue — one vault's bad day never starves the rest.
       failed++;
@@ -112,9 +176,9 @@ export async function runUsageRollup(
     }
   }
 
-  const summary: UsageRunSummary = { day, vaults: vaults.length, recorded, failed, capped };
+  const summary: UsageRunSummary = { day, vaults: vaults.length, recorded, failed, reconciled, capped };
   console.log(
-    `event=usage_rollup day=${day} vaults=${summary.vaults} recorded=${recorded} failed=${failed} capped=${capped}`,
+    `event=usage_rollup day=${day} vaults=${summary.vaults} recorded=${recorded} failed=${failed} reconciled=${reconciled} capped=${capped}`,
   );
   return summary;
 }

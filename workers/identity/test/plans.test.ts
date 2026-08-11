@@ -15,6 +15,7 @@
  *     (fetchMock over global fetch): a first-party 60s `vault:<name>:admin`
  *     token PUTs `{ caps:{notes_bytes,attachment_bytes}, transcription, frozen }`
  *     — and is BEST-EFFORT (a 500 / unreachable vault never fails creation),
+ *     with bounded retry-at-push-time for transient failures,
  *   - applyPlanToVaults — the plan-change seam admin/Stripe/promo/sweep call.
  */
 import { env, fetchMock } from "cloudflare:test";
@@ -40,7 +41,7 @@ import {
   upgradeTeaser,
   vaultCapMessage,
 } from "../src/plans.ts";
-import { FIRST_PARTY_CLIENT_ID, applyPlanToVaults } from "../src/vault-call.ts";
+import { FIRST_PARTY_CLIENT_ID, applyPlanToVaults, pushVaultCap } from "../src/vault-call.ts";
 import { getUserByEmail, setUserPlan } from "../src/users.ts";
 import {
   CANONICAL_ORIGIN,
@@ -546,6 +547,35 @@ describe("vault-count enforcement + entitlement push", () => {
     expect(await vaultRowCount(userId)).toBe(1);
     expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_failed"))).toBe(true);
     warn.mockRestore();
+  });
+
+  test("RETRY: a transient cap-push failure heals inside the same pushVaultCap call", async () => {
+    const { id: userId } = await seedUser("push-retry@example.com");
+    const responses = [new Response("transient", { status: 503 }), Response.json({ ok: true })];
+    let calls = 0;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await pushVaultCap(
+        env.DB,
+        {
+          ...deps(),
+          vaultFetch: async () => {
+            calls++;
+            return responses.shift() ?? Response.json({ ok: true });
+          },
+        },
+        userId,
+        "push-retry-box",
+        planEntitlement("standard"),
+      );
+
+      expect(calls).toBe(2);
+      expect(result).toMatchObject({ vault: "push-retry-box", ok: true, status: 200, attempts: 2 });
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_retry"))).toBe(true);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_failed"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test("BEST-EFFORT: an UNREACHABLE vault worker never fails creation (logged)", async () => {
