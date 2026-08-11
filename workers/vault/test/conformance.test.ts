@@ -546,6 +546,210 @@ describe("auth matrix", () => {
   });
 });
 
+/**
+ * The write/admin scope split (cloud#134 A.1) — the tag-schema/taxonomy
+ * mutation carve-out, mirroring bun routing.ts's `isTagSchemaMutation` (the
+ * vault 0.7.1 re-tier). Before this, cloud's REST gate collapsed write and
+ * admin into `permission: "full"`, so a `vault:<name>:write` token could
+ * rename/merge/delete/update tag schemas. The four admin-only REST operations
+ * are pinned INDIVIDUALLY (a write token is refused on each, and the mutation
+ * must not land), and the write tier is pinned to keep every genuine write —
+ * the split must never break a limited write token's legitimate work.
+ */
+describe("write/admin scope split — tag-schema mutations require vault:admin", () => {
+  const WRITE = (v: string) => mintToken({ vault: v, scopes: `vault:${v}:write vault:${v}:read` });
+  // Admin-only mint (no explicit write/read) — the scope ladder (admin ⊇ write
+  // ⊇ read) must carry the lower tiers, pinning "a higher-tier credential
+  // still works" alongside "a lower-tier credential never escalates".
+  const ADMIN = (v: string) => mintToken({ vault: v, scopes: `vault:${v}:admin` });
+
+  function asToken(token: string, method: string, body?: unknown): RequestInit {
+    return {
+      method,
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    };
+  }
+
+  async function expectAdminRefused(res: Response, grantedContains: string) {
+    expect(res.status).toBe(403);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:admin");
+    expect(body.granted_scopes).toContain(grantedContains);
+  }
+
+  it("write token: PUT /api/tags/:name → 403 vault:admin, schema NOT persisted", async () => {
+    const v = freshVault();
+    const token = await WRITE(v);
+    const res = await SELF.fetch(
+      `${base(v)}/api/tags/project`,
+      asToken(token, "PUT", { description: "by write token", fields: { status: { type: "string" } } }),
+    );
+    await expectAdminRefused(res, `vault:${v}:write`);
+    // The refusal happened at the gate — nothing landed.
+    const tag = await (await op(v, "/api/tags/project")).json() as any;
+    expect(tag.description).toBeNull();
+    expect(tag.fields).toBeNull();
+  });
+
+  it("write token: DELETE /api/tags/:name → 403 vault:admin, tag survives", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "x", tags: ["keepme"] });
+    const res = await SELF.fetch(`${base(v)}/api/tags/keepme`, asToken(await WRITE(v), "DELETE"));
+    await expectAdminRefused(res, `vault:${v}:write`);
+    const tags = await (await op(v, "/api/tags")).json() as any[];
+    expect(tags.some((t) => t.name === "keepme")).toBe(true);
+  });
+
+  it("write token: POST /api/tags/merge → 403 vault:admin, sources survive", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "x", tags: ["m1"] });
+    await createNote(v, { content: "y", tags: ["m2"] });
+    const res = await SELF.fetch(
+      `${base(v)}/api/tags/merge`,
+      asToken(await WRITE(v), "POST", { sources: ["m1", "m2"], target: "merged" }),
+    );
+    await expectAdminRefused(res, `vault:${v}:write`);
+    const tags = await (await op(v, "/api/tags")).json() as any[];
+    expect(tags.some((t) => t.name === "m1")).toBe(true);
+    expect(tags.some((t) => t.name === "merged")).toBe(false);
+  });
+
+  it("write token: POST /api/tags/:name/rename → 403 vault:admin, name unchanged", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "x", tags: ["oldname"] });
+    const res = await SELF.fetch(
+      `${base(v)}/api/tags/oldname/rename`,
+      asToken(await WRITE(v), "POST", { new_name: "newname" }),
+    );
+    await expectAdminRefused(res, `vault:${v}:write`);
+    const tags = await (await op(v, "/api/tags")).json() as any[];
+    expect(tags.some((t) => t.name === "oldname")).toBe(true);
+    expect(tags.some((t) => t.name === "newname")).toBe(false);
+  });
+
+  it("admin token: all four tag-schema mutations succeed (admin ⊇ write ⊇ read)", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "x", tags: ["t1"] });
+    await createNote(v, { content: "y", tags: ["t2"] });
+    await createNote(v, { content: "z", tags: ["victim"] });
+    const admin = await ADMIN(v);
+
+    const put = await SELF.fetch(
+      `${base(v)}/api/tags/t1`,
+      asToken(admin, "PUT", { description: "curated", fields: { status: { type: "string" } } }),
+    );
+    expect(put.status).toBe(200);
+
+    const rename = await SELF.fetch(
+      `${base(v)}/api/tags/t1/rename`,
+      asToken(admin, "POST", { new_name: "t1r" }),
+    );
+    expect(rename.status).toBe(200);
+
+    const merge = await SELF.fetch(
+      `${base(v)}/api/tags/merge`,
+      asToken(admin, "POST", { sources: ["t1r"], target: "t2" }),
+    );
+    expect(merge.status).toBe(200);
+
+    const del = await SELF.fetch(`${base(v)}/api/tags/victim`, asToken(admin, "DELETE"));
+    expect(del.status).toBe(200);
+  });
+
+  it("write token keeps every genuine write-tier operation (no breaking change)", async () => {
+    const v = freshVault();
+    const token = await WRITE(v);
+
+    // Note create / update / delete — the write tier's actual job.
+    const created = await SELF.fetch(
+      `${base(v)}/api/notes`,
+      asToken(token, "POST", { content: "write tier lives #wt" }),
+    );
+    expect(created.status).toBe(201);
+    const note = await created.json() as any;
+    const patched = await SELF.fetch(
+      `${base(v)}/api/notes/${note.id}`,
+      asToken(token, "PATCH", { content: "edited", if_updated_at: note.updatedAt ?? note.createdAt }),
+    );
+    expect(patched.status).toBe(200);
+
+    // Tag READS stay read-tier — the carve-out matches mutations only.
+    const list = await SELF.fetch(`${base(v)}/api/tags`, asToken(token, "GET"));
+    expect(list.status).toBe(200);
+    const detail = await SELF.fetch(`${base(v)}/api/tags/wt`, asToken(token, "GET"));
+    expect(detail.status).toBe(200);
+
+    // POST /tags/:name/conformance (2 path segments) is deliberately NOT in
+    // the admin enumeration — a schema-tightening preview stays available to
+    // a write token (bun even allows it at read tier).
+    const conf = await SELF.fetch(
+      `${base(v)}/api/tags/wt/conformance`,
+      asToken(token, "POST", { fields: { status: { type: "string" } } }),
+    );
+    expect(conf.status).toBe(200);
+
+    const del = await SELF.fetch(`${base(v)}/api/notes/${note.id}`, asToken(token, "DELETE"));
+    expect(del.status).toBe(200);
+  });
+
+  /**
+   * POST /api/packs/:name — a write-tier SIDE DOOR onto the same tag-schema
+   * mutation `PUT /api/tags/:name` is admin-gated for (cloud#134 A.1
+   * adversarial-review finding, closed by `isPackApply` in auth.ts).
+   * `handleApplyPack` (vault-do.ts) reaches core's `applySeedPack`, which
+   * calls the SAME `upsertTagRecord(name, {fields, parent_names,
+   * description})` for every tag a pack declares — and `upsertTagRecord`
+   * REPLACES `fields` wholesale when a pack passes any (tag-schemas.ts:
+   * `fields = patch.fields === undefined ? existing : patch.fields` — no
+   * per-key merge). Core's own `starter-ontology` pack declares a `view` meta
+   * tag with a real schema, so re-POSTing it is a live path to clobber an
+   * owner's curated `view` fields. Before the fix, POST /packs dispatched at
+   * plain `write` (verbForMethod's default), so a `vault:<name>:write` token
+   * could reach this; the fix requires the SAME `vault:admin` the front door
+   * (`PUT /api/tags/:name`) already requires.
+   */
+  it("write token: POST /api/packs/:name → 403 vault:admin, curated tag schema NOT overwritten", async () => {
+    const v = freshVault();
+    // The owner curates `view`'s schema themselves (admin-equivalent operator
+    // token) BEFORE a write-tier token ever touches the vault.
+    const curate = await op(v, "/api/tags/view", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        description: "owner's own curated view tag — not the pack's",
+        fields: { custom_field: { type: "string" } },
+      }),
+    });
+    expect(curate.status).toBe(200);
+
+    // `starter-ontology` declares `view` WITH fields (kind/query/lane_by/
+    // date_field) — the exact shape that would land if this door were still
+    // write-gated.
+    const res = await SELF.fetch(`${base(v)}/api/packs/starter-ontology`, asToken(await WRITE(v), "POST"));
+    await expectAdminRefused(res, `vault:${v}:write`);
+
+    // Read back with the operator (admin-equivalent) token — proves nothing
+    // landed: the owner's curated `fields` survive byte-for-byte, and the
+    // pack's own tags/notes never got created.
+    const tag = (await (await op(v, "/api/tags/view")).json()) as any;
+    expect(tag.fields).toEqual({ custom_field: { type: "string" } });
+    expect(tag.description).toBe("owner's own curated view tag — not the pack's");
+    const notes = (await (await op(v, "/api/notes?include_content=true")).json()) as any[];
+    expect(notes.some((n) => n.path === "Views/All notes")).toBe(false);
+  });
+
+  it("admin token: POST /api/packs/:name applies the pack (admin ⊇ write, no breaking change for the console's own mint)", async () => {
+    const v = freshVault();
+    const res = await SELF.fetch(`${base(v)}/api/packs/surface-starter`, asToken(await ADMIN(v), "POST"));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.pack).toBe("surface-starter");
+    expect(body.applied.length).toBeGreaterThan(0);
+  });
+});
+
 describe("storage — R2 round-trip + caps", () => {
   it("upload → serve round-trips the bytes with nosniff", async () => {
     const v = freshVault();

@@ -79,7 +79,14 @@ import {
   trialTierChosenMessage,
   vaultCapMessage,
 } from "./plans.ts";
-import { applyPlanToVaults, callVaultApi, callVaultImport, pushVaultCap } from "./vault-call.ts";
+import {
+  applyPlanToVaults,
+  callVaultApi,
+  callVaultImport,
+  FIRST_PARTY_CLIENT_ID,
+  PACK_APPLY_CLIENT_ID,
+  pushVaultCap,
+} from "./vault-call.ts";
 import {
   callVaultRestore,
   isKnownSnapshot,
@@ -1120,10 +1127,29 @@ const CONSOLE_PACKS = new Set(["surface-starter"]);
 
 /**
  * THE MINT SEAM lives in vault-call.ts (shared with the plan-cap push): mint a
- * first-party 60s aud-pinned `vault:<name>:write` token, spend it on one POST.
- * This wrapper keeps the console's write-verb call sites one line.
+ * 60s aud-pinned `vault:<name>:admin` token, spend it on one POST. Admin, not
+ * write: this wrapper's only caller is pack-apply ({@link handleAddPackPost}),
+ * and POST /api/packs/:name now requires `vault:admin` (cloud#134 A.1 review
+ * follow-up — applySeedPack upserts tag schemas, the same operation
+ * PUT /tags/:name is admin-gated for). Was `verb: "write"` before that fix;
+ * left at write here the console's own "Add the Surface Starter guide" button
+ * would start 403ing itself.
+ *
+ * NOT first-party ({@link FIRST_PARTY_CLIENT_ID}) — stamped with
+ * {@link PACK_APPLY_CLIENT_ID} instead (cloud#134 A.1 review, hardening
+ * follow-up): admin verb + first-party client_id is ALSO exactly what
+ * `internalForbidden` (vault-do.ts) treats as platform authority over
+ * /api/internal/*. This mint has no business reaching that door, so it
+ * deliberately doesn't carry the credential that would let it — the vault's
+ * REST scope gate for packs checks scope only, never client_id, so this still
+ * works. See PACK_APPLY_CLIENT_ID's doc comment in vault-call.ts for the full
+ * story. NAMED `postVaultPackApply`, not the generic `postVaultApi`, on
+ * purpose: it hardcodes admin verb + this specific client_id for its one
+ * caller — a future console write call-site needs its OWN wrapper (or to call
+ * {@link callVaultApi} directly), not a silent reuse of this one's platform-
+ * adjacent shape.
  */
-async function postVaultApi(
+async function postVaultPackApply(
   db: D1Database,
   deps: OAuthDeps,
   userId: string,
@@ -1131,16 +1157,24 @@ async function postVaultApi(
   apiPath: string,
   jsonBody?: unknown,
 ): Promise<Response> {
-  return callVaultApi(db, deps, { userId, vaultName, method: "POST", apiPath, verb: "write", jsonBody });
+  return callVaultApi(db, deps, {
+    userId,
+    vaultName,
+    method: "POST",
+    apiPath,
+    verb: "admin",
+    clientId: PACK_APPLY_CLIENT_ID,
+    jsonBody,
+  });
 }
 
 /**
  * POST /console/packs — apply a seed pack to one of the user's vaults, via the
  * vault worker's POST /api/packs/:name through the shared mint seam
- * ({@link postVaultApi}). The user-facing trust boundary: session cookie +
- * CSRF + same-origin + ownership (`userOwnsVault` — the exact predicate behind
- * `unownedNamedVaults` on the OAuth mint paths) — identical to creating the
- * vault itself.
+ * ({@link postVaultPackApply}). The user-facing trust boundary: session cookie
+ * + CSRF + same-origin + ownership (`userOwnsVault` — the exact predicate
+ * behind `unownedNamedVaults` on the OAuth mint paths) — identical to creating
+ * the vault itself.
  */
 export async function handleAddPackPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
@@ -1161,7 +1195,7 @@ export async function handleAddPackPost(db: D1Database, req: Request, deps: OAut
 
   let res: Response;
   try {
-    res = await postVaultApi(db, deps, user.id, vaultName, `/api/packs/${encodeURIComponent(pack)}`);
+    res = await postVaultPackApply(db, deps, user.id, vaultName, `/api/packs/${encodeURIComponent(pack)}`);
   } catch (err) {
     console.warn(
       `event=pack_apply_unreachable vault=${vaultName} pack=${pack} error=${err instanceof Error ? err.message : String(err)}`,

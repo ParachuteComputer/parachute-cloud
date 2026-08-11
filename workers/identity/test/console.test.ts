@@ -14,6 +14,7 @@ import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import app from "../src/index.ts";
 import { handleAddPackPost, handleExportPost, handleImportPost } from "../src/console.ts";
 import { validateAccessToken } from "../src/tokens.ts";
+import { PACK_APPLY_CLIENT_ID } from "../src/vault-call.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "../src/oauth-authorize.ts";
 import { handleToken } from "../src/oauth-token.ts";
 import { issueAuthCode } from "../src/auth-codes.ts";
@@ -681,15 +682,26 @@ describe("console — Surface Starter pack button (POST /console/packs)", () => 
     // THE MINT SEAM, pinned end-to-end: the token that went over the wire is a
     // real issuer-signed JWT carrying exactly the narrow claims the vault
     // worker enforces (aud strict-pin, resource-narrowed scope, vault_scope
-    // pin) and nothing more — 60s TTL, first-party client_id.
+    // pin) and nothing more — 60s TTL, the pack-apply (NOT first-party) client_id.
     expect(auth).toBeTruthy();
     const token = auth!.replace(/^Bearer /, "");
     const { payload } = await validateAccessToken(env.DB, token, ISSUER);
     expect(payload.aud).toBe("vault.mine");
-    expect(payload.scope).toBe("vault:mine:write");
+    // Admin, not write (cloud#134 A.1 review follow-up) — POST /api/packs/:name
+    // now requires vault:admin (applySeedPack upserts tag schemas, the same
+    // operation PUT /tags/:name is admin-gated for); see console.ts
+    // postVaultPackApply.
+    expect(payload.scope).toBe("vault:mine:admin");
     expect(payload.vault_scope).toEqual(["mine"]);
     expect(payload.sub).toBe(userId);
-    expect(payload.client_id).toBe("parachute-console");
+    // NOT FIRST_PARTY_CLIENT_ID ("parachute-console") — cloud#134 A.1 review
+    // hardening: admin verb + first-party client_id is ALSO what
+    // internalForbidden (vault-do.ts) treats as platform authority over
+    // /api/internal/*. This mint is stamped with the distinct
+    // PACK_APPLY_CLIENT_ID so a leaked/misdirected pack token can't reach that
+    // door (see PACK_APPLY_CLIENT_ID's doc comment in vault-call.ts; the vault-
+    // side refusal is pinned in workers/vault/test/internal-config.test.ts).
+    expect(payload.client_id).toBe(PACK_APPLY_CLIENT_ID);
     expect((payload.exp as number) - (payload.iat as number)).toBe(60);
   });
 

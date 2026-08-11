@@ -46,6 +46,25 @@ import { listVaultsForOwner } from "./vaults.ts";
  */
 export const FIRST_PARTY_CLIENT_ID = "parachute-console";
 
+/**
+ * `client_id` for the console's pack-apply mint ONLY (`postVaultPackApply` in
+ * console.ts). Distinct from {@link FIRST_PARTY_CLIENT_ID} ON PURPOSE
+ * (cloud#134 A.1 review, hardening item): POST /api/packs/:name needs
+ * `vault:admin` (it mutates tag schemas — see auth.ts `isPackApply`), but
+ * admin verb + FIRST_PARTY_CLIENT_ID is ALSO exactly what `internalForbidden`
+ * (vault-do.ts) treats as platform authority over /api/internal/* (plan caps,
+ * snapshots, restore). Stamping the pack mint first-party would make its 60s
+ * token latently platform-tier for a door it has no business reaching —
+ * least-privilege-per-call, this module's own documented claim (see the
+ * module comment above). A non-first-party client_id can still satisfy the
+ * vault's REST scope gate (isPackApply checks `hasScopeForVault(..., verb)`
+ * only — `client_id` never enters that check), so pack-apply keeps working;
+ * `internalForbidden`'s strict-equality check on `FIRST_PARTY_CLIENT_ID`
+ * refuses it exactly like any other tenant-shaped admin token (pinned in
+ * workers/vault/test/internal-config.test.ts).
+ */
+export const PACK_APPLY_CLIENT_ID = "parachute-packs";
+
 /** TTL for internally-minted vault tokens: one server-side hop. */
 export const INTERNAL_MINT_TTL_SECONDS = 60;
 
@@ -58,7 +77,9 @@ export async function callVaultApi(
     method: "GET" | "POST" | "PUT";
     apiPath: string;
     /** "read" for read-only calls (the console export door); "write" for
-     *  content calls (packs, notes); "admin" for the internal config seam. */
+     *  content calls (notes); "admin" for the internal config seam AND pack
+     *  application (packs mutate tag schemas — cloud#134 A.1 — so no write-verb
+     *  mint remains in this module for packs; see {@link PACK_APPLY_CLIENT_ID}). */
     verb: "read" | "write" | "admin";
     jsonBody?: unknown;
     /** Raw (non-JSON) request body — the import door forwards tar bytes.
