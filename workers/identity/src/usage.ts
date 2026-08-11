@@ -23,8 +23,9 @@
  */
 import type { Env } from "./env.ts";
 import type { OAuthDeps } from "./oauth-shared.ts";
-import { type VaultEntitlement, coercePlanId, entitlementPlanFor, planEntitlement } from "./plans.ts";
-import { type VaultUsageReading, pushVaultCap, readVaultUsage } from "./vault-call.ts";
+import { type VaultEntitlement, entitlementPlanFor, isPlanId, planEntitlement } from "./plans.ts";
+import { type ResolvedVaultEntitlement, pushVaultCap, readVaultUsage } from "./vault-call.ts";
+import { getUserById } from "./users.ts";
 
 /**
  * Per-run bound on vault reads. Current vault counts are tiny (tens — one
@@ -44,25 +45,6 @@ interface RollupVaultRow {
 }
 
 /**
- * Resolve the entitlement for the exact plan row selected with each vault.
- * This deliberately mirrors `applyPlanToVaults` instead of calling
- * `getUserById`: the rollup already batch-fetches owner plan columns in its
- * enumeration query, so reconciliation must not add one D1 round-trip per
- * vault to the cost-conscious daily job.
- *
- * Raw values are defensively coerced just as `users.ts` does. A hand-edited or
- * future plan value therefore degrades to the expired floor rather than
- * granting an entitlement this worker does not understand.
- */
-function entitlementForRollupVault(plan: string, pendingPlan: string | null): VaultEntitlement {
-  const effectivePlan = entitlementPlanFor(
-    coercePlanId(plan),
-    pendingPlan === null ? null : coercePlanId(pendingPlan),
-  );
-  return planEntitlement(effectivePlan);
-}
-
-/**
  * Compare every field the identity worker owns in the vault DO's resolved
  * entitlement. Usage bytes and voice minutes are intentionally absent: they
  * are live meters, not plan state, and must not make an otherwise converged
@@ -72,15 +54,93 @@ function entitlementForRollupVault(plan: string, pendingPlan: string | null): Va
  * matches a plan entitlement. The next rollup PUTs the complete two-meter,
  * voice, and frozen payload through the same first-party seam as plan changes.
  */
-function resolvedEntitlementMatches(reading: VaultUsageReading, expected: VaultEntitlement): boolean {
+function resolvedEntitlementMatches(entitlement: ResolvedVaultEntitlement, expected: VaultEntitlement): boolean {
   return (
-    reading.caps !== null &&
-    reading.caps.notes_bytes === expected.caps.notes_bytes &&
-    reading.caps.attachment_bytes === expected.caps.attachment_bytes &&
-    reading.frozen === expected.frozen &&
-    reading.transcriptionEnabled === expected.transcription.enabled &&
-    reading.transcribeMinutesLimit === expected.transcription.minutes_limit
+    entitlement.caps !== null &&
+    entitlement.caps.notes_bytes === expected.caps.notes_bytes &&
+    entitlement.caps.attachment_bytes === expected.caps.attachment_bytes &&
+    entitlement.frozen === expected.frozen &&
+    entitlement.transcriptionEnabled === expected.transcription.enabled &&
+    entitlement.transcribeMinutesLimit === expected.transcription.minutes_limit
   );
+}
+
+/**
+ * Reconcile one vault's entitlement against its owner's plan, if needed.
+ * Returns true when a push happened AND succeeded (counts toward the run's
+ * `reconciled` total); false for every other outcome (no mismatch, a
+ * deliberate skip, or a push that itself failed — already logged by
+ * `pushVaultCap`).
+ *
+ * `v.plan`/`v.pending_plan` are a SNAPSHOT taken once at enumeration time
+ * (the batch query in `runUsageRollup`) for the WHOLE run — cheap, but stale
+ * by the time a vault late in a long run is reached. Only on a detected
+ * MISMATCH against that snapshot (rare at steady state — keeps the "no extra
+ * D1 round trip" claim for the common case where nothing is wrong) do we pay
+ * for one fresh `getUserById` and re-check against the CURRENT truth: a
+ * checkout/plan-change that completed between the snapshot and this vault's
+ * turn must never be clobbered back down to the stale snapshot value — the
+ * exact under-entitlement cloud#186 exists to prevent, now happening on an
+ * automatic timer instead of only at push time (review D1).
+ */
+async function reconcileVaultEntitlement(
+  db: D1Database,
+  deps: OAuthDeps,
+  v: RollupVaultRow,
+  entitlement: ResolvedVaultEntitlement | null,
+): Promise<boolean> {
+  if (entitlement === null) {
+    // A vault-worker response missing the entitlement fields entirely (a
+    // ROLLBACK to a pre-entitlement build, review D3) — reconciliation is
+    // simply unavailable for this vault this run; usage was still recorded.
+    console.log(`event=entitlement_reconcile_skipped_no_entitlement_data vault=${v.name}`);
+    return false;
+  }
+
+  // Review D2: an unrecognized raw plan value (a hand-edited row, a raw
+  // restore/INSERT, migration 0018's documented DEFAULT 'free' never
+  // migrated) must never actuate a push. `coercePlanId` degrading an unknown
+  // value to the 'expired' floor and then pushing `frozen:true` would freeze
+  // a live, possibly-paying vault with no human in the loop — an actuating
+  // path must fail safe by doing NOTHING, distinctly logged, not by freezing.
+  if (!isPlanId(v.plan) || (v.pending_plan !== null && !isPlanId(v.pending_plan))) {
+    console.log(
+      `event=entitlement_reconcile_skipped_unknown_plan vault=${v.name} plan=${v.plan} pending_plan=${v.pending_plan ?? "null"}`,
+    );
+    return false;
+  }
+
+  const snapshotExpected = planEntitlement(entitlementPlanFor(v.plan, v.pending_plan));
+  if (resolvedEntitlementMatches(entitlement, snapshotExpected)) return false;
+
+  // Mismatch per the snapshot — re-read the owner FRESH before pushing
+  // anything (review D1).
+  const freshUser = await getUserById(db, v.owner_user_id);
+  if (!freshUser) {
+    // Deleted between the snapshot and here — not this rollup's place to
+    // push anything for an owner that may no longer exist.
+    console.log(`event=entitlement_reconcile_skipped_owner_missing vault=${v.name}`);
+    return false;
+  }
+  const freshExpected = planEntitlement(entitlementPlanFor(freshUser.plan, freshUser.pendingPlan));
+  if (resolvedEntitlementMatches(entitlement, freshExpected)) {
+    // The owner's plan changed since the snapshot and the DO ALREADY
+    // reflects the new truth (e.g. a concurrent checkout's own push landed
+    // first) — pushing the stale snapshot value now would clobber a correct,
+    // newer state. Nothing to repair.
+    console.log(`event=entitlement_reconcile_skipped_race vault=${v.name}`);
+    return false;
+  }
+
+  // Push the FRESH truth, never the stale snapshot — closes the race window
+  // even when the owner's plan changed to a THIRD value, not just back to
+  // one that happens to already match the DO.
+  const push = await pushVaultCap(db, deps, v.owner_user_id, v.name, freshExpected);
+  // Emit the issue-specified event for every detected (and still-current)
+  // mismatch. The additive `ok` field lets operators distinguish a repaired
+  // vault from a best-effort push that still needs the next daily tick.
+  console.log(`event=entitlement_reconciled vault=${v.name} ok=${push.ok} attempts=${push.attempts}`);
+  return push.ok;
 }
 
 export interface UsageRunSummary {
@@ -158,15 +218,7 @@ export async function runUsageRollup(
         .run();
       recorded++;
 
-      const expected = entitlementForRollupVault(v.plan, v.pending_plan);
-      if (!resolvedEntitlementMatches(usage, expected)) {
-        const push = await pushVaultCap(env.DB, deps, v.owner_user_id, v.name, expected);
-        // Emit the issue-specified event for every detected mismatch. The
-        // additive `ok` field lets operators distinguish a repaired vault from
-        // a best-effort push that still needs the next daily tick.
-        console.log(`event=entitlement_reconciled vault=${v.name} ok=${push.ok} attempts=${push.attempts}`);
-        if (push.ok) reconciled++;
-      }
+      if (await reconcileVaultEntitlement(env.DB, deps, v, usage.entitlement)) reconciled++;
     } catch (err) {
       // Skip + log + continue — one vault's bad day never starves the rest.
       failed++;

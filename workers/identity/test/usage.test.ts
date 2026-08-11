@@ -290,6 +290,155 @@ describe("runUsageRollup", () => {
     }
   });
 
+  test("D1 — a plan change between the batch snapshot and this vault's turn is never clobbered back down (no downgrade push)", async () => {
+    const { id: owner } = await seedUser("race-owner@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard', pending_plan = NULL WHERE id = ?").bind(owner).run();
+    await seedVault("race-v", owner);
+
+    let getCalls = 0;
+    let putCalls = 0;
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const runDeps: OAuthDeps = {
+      ...deps(() => NOW),
+      vaultFetch: async (_input, init) => {
+        if (init?.method === "GET") {
+          getCalls++;
+          if (getCalls === 1) {
+            // Model the race: runUsageRollup's batch query already snapshot
+            // this owner as 'standard' before this fetch fires. Right here —
+            // between that snapshot and this vault's turn in the loop — a
+            // concurrent checkout completes AND its own push already landed:
+            // the DO genuinely reports 'power', ahead of D1's stale snapshot.
+            await env.DB.prepare("UPDATE users SET plan = 'power', pending_plan = NULL WHERE id = ?").bind(owner).run();
+          }
+          return Response.json(splitBody(1234, 56, planEntitlement("power")));
+        }
+        if (init?.method === "PUT") {
+          putCalls++;
+          return Response.json({ ok: true });
+        }
+        return new Response("method not allowed", { status: 405 });
+      },
+    };
+
+    try {
+      const summary = await runUsageRollup(env, runDeps, { onlyVault: "race-v" });
+      // A mismatch WAS detected against the stale snapshot ('standard' !=
+      // the DO's 'power'), but the fresh re-read shows the DO already
+      // reflects the CURRENT truth — nothing is pushed, and reconciled stays
+      // 0 (nothing needed repair).
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(putCalls).toBe(0); // never clobbered the DO back down to 'standard'
+      expect(
+        log.mock.calls.some((c) => String(c[0]).includes("event=entitlement_reconcile_skipped_race vault=race-v")),
+      ).toBe(true);
+
+      const row = await env.DB.prepare("SELECT plan FROM users WHERE id = ?").bind(owner).first<{ plan: string }>();
+      expect(row?.plan).toBe("power"); // untouched by this rollup
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("D2 — an unrecognized raw plan value skips reconcile entirely: zero pushes, never freezes a live vault", async () => {
+    const { id: owner } = await seedUser("garbage-plan@example.com");
+    // A hand-edited/raw-restored row: 'free' predates the pricing-model
+    // rewrite and isn't a current PlanId — migration 0018 documents that
+    // users.plan's column DEFAULT is still literally 'free'.
+    await env.DB.prepare("UPDATE users SET plan = 'free', pending_plan = NULL WHERE id = ?").bind(owner).run();
+    await seedVault("garbage-plan-v", owner);
+
+    let putCalls = 0;
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const runDeps: OAuthDeps = {
+      ...deps(() => NOW),
+      vaultFetch: async (_input, init) => {
+        if (init?.method === "GET") return Response.json(splitBody(10, 0, planEntitlement("trial")));
+        if (init?.method === "PUT") {
+          putCalls++;
+          return Response.json({ ok: true });
+        }
+        return new Response("method not allowed", { status: 405 });
+      },
+    };
+
+    try {
+      const summary = await runUsageRollup(env, runDeps, { onlyVault: "garbage-plan-v" });
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      // The trial reading (frozen:false) mismatches what coercePlanId('free')
+      // → 'expired' → frozen:true would have expected — the OLD code would
+      // have pushed a freeze here. Zero pushes proves the new guard runs
+      // BEFORE any entitlement is even computed.
+      expect(putCalls).toBe(0);
+      expect(
+        log.mock.calls.some((c) =>
+          String(c[0]).includes("event=entitlement_reconcile_skipped_unknown_plan vault=garbage-plan-v plan=free"),
+        ),
+      ).toBe(true);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("D3 — a vault-worker ROLLBACK (entitlement fields entirely absent) never fails the usage read; reconcile is skipped for that vault only", async () => {
+    const { id: owner } = await seedUser("rollback-owner@example.com");
+    await seedVault("rollback-v", owner);
+    // Shaped like a PRE-entitlement vault worker: the usage split is present,
+    // but caps/frozen/transcription_enabled/transcribe_minutes_limit are
+    // entirely ABSENT — distinct from the legitimate "unpushed vault" shape
+    // (splitBody's default), which still reports all four fields (caps:null).
+    interceptConfigGet("rollback-v", {
+      name: "x",
+      cap_bytes: null,
+      resolved_cap_bytes: 1,
+      used_bytes: 10,
+      db_bytes: 10,
+      r2_bytes: 0,
+    });
+
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const summary = await runUsageRollup(env, rollupDeps());
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(await usageRows()).toEqual([{ vault_name: "rollback-v", day: TODAY, db_bytes: 10, r2_bytes: 0 }]);
+      expect(
+        log.mock.calls.some((c) =>
+          String(c[0]).includes("event=entitlement_reconcile_skipped_no_entitlement_data vault=rollback-v"),
+        ),
+      ).toBe(true);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("a reconcile push that itself FAILS does not increment reconciled (the next daily tick retries)", async () => {
+    const { id: owner } = await seedUser("reconcile-fails@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard', pending_plan = NULL WHERE id = ?").bind(owner).run();
+    await seedVault("reconcile-fail-v", owner);
+
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const runDeps: OAuthDeps = {
+      ...deps(() => NOW),
+      vaultFetch: async (_input, init) => {
+        if (init?.method === "GET") return Response.json(splitBody(1234, 56, planEntitlement("trial")));
+        if (init?.method === "PUT") return new Response("boom", { status: 503 }); // persistently retryable, never heals
+        return new Response("method not allowed", { status: 405 });
+      },
+    };
+
+    try {
+      const summary = await runUsageRollup(env, runDeps, { onlyVault: "reconcile-fail-v" });
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(
+        log.mock.calls.some((c) => String(c[0]).includes("event=entitlement_reconciled vault=reconcile-fail-v ok=false")),
+      ).toBe(true);
+    } finally {
+      log.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
   test("a failing vault is skipped + logged; the run continues (self-heals next run)", async () => {
     const { id: owner } = await seedUser("skip@example.com");
     await seedVault("skip-bad", owner);

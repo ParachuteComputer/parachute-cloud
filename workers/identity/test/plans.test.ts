@@ -532,10 +532,17 @@ describe("vault-count enforcement + entitlement push", () => {
     await setUserPlan(env.DB, userId, "plus");
     const sessionId = await seedSession(userId);
     const warn = vi.spyOn(console, "warn");
+    // .persist(): a single-shot interceptor would only answer PUT #1 — PUTs
+    // #2-3 (the retry loop, cloud#186 review D4) would then hit "Mock
+    // dispatch not matched" (a TRANSPORT error), not a second/third 500, so
+    // this test would pass without ever actually exercising a real 5xx
+    // retry-then-exhaust. Persisting the mock answers every attempt with the
+    // same 500, so `attempts=3 status=500` below pins the real behavior.
     fetchMock
       .get(env.VAULT_ORIGIN!)
       .intercept({ path: "/vault/pushfail-box/api/internal/config", method: "PUT" })
-      .reply(500, { error: "Internal server error" }, { headers: { "content-type": "application/json" } });
+      .reply(500, { error: "Internal server error" }, { headers: { "content-type": "application/json" } })
+      .persist();
     const res = await app.fetch(
       post("/console/vaults", { __csrf: CSRF, name: "pushfail-box" }, sessionCookie(sessionId)),
       env,
@@ -545,7 +552,13 @@ describe("vault-count enforcement + entitlement push", () => {
       "https://my.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fpushfail-box",
     );
     expect(await vaultRowCount(userId)).toBe(1);
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_failed"))).toBe(true);
+    expect(
+      warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_failed") && String(c[0]).includes("status=500") && String(c[0]).includes("attempts=3")),
+    ).toBe(true);
+    // Every one of the 3 attempts hit the SAME persisted 500 — never a
+    // transport error from a mock running out of answers.
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes("event=plan_cap_push_retry")).length).toBe(2);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_retry") && String(c[0]).includes("error="))).toBe(false);
     warn.mockRestore();
   });
 
@@ -573,6 +586,81 @@ describe("vault-count enforcement + entitlement push", () => {
       expect(result).toMatchObject({ vault: "push-retry-box", ok: true, status: 200, attempts: 2 });
       expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_retry"))).toBe(true);
       expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_failed"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("FAIL-FAST: a 400 from the vault worker is never retried (deterministic client error, cloud#186 review D4)", async () => {
+    const { id: userId } = await seedUser("push-400@example.com");
+    let calls = 0;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await pushVaultCap(
+        env.DB,
+        {
+          ...deps(),
+          vaultFetch: async () => {
+            calls++;
+            // A 400 would repeat identically on every attempt (this code
+            // produced a malformed body) — retrying it 3x, as the pre-D4
+            // code did, only burns the budget for a guaranteed-repeat
+            // failure.
+            return new Response("bad request", { status: 400 });
+          },
+        },
+        userId,
+        "push-400-box",
+        planEntitlement("standard"),
+      );
+
+      expect(calls).toBe(1); // never retried
+      expect(result).toMatchObject({ vault: "push-400-box", ok: false, status: 400, attempts: 1 });
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("event=plan_cap_push_retry"))).toBe(false);
+      expect(
+        warn.mock.calls.some(
+          (c) => String(c[0]).includes("event=plan_cap_push_failed") && String(c[0]).includes("reason=non_retryable_status"),
+        ),
+      ).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("EXHAUSTION: 3 persisted 5xx attempts burn the whole retry budget with a clean failure result", async () => {
+    const { id: userId } = await seedUser("push-exhaust@example.com");
+    let calls = 0;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await pushVaultCap(
+        env.DB,
+        {
+          ...deps(),
+          vaultFetch: async () => {
+            calls++;
+            return new Response("boom", { status: 503 });
+          },
+        },
+        userId,
+        "push-exhaust-box",
+        planEntitlement("standard"),
+      );
+
+      expect(calls).toBe(3);
+      const ent = planEntitlement("standard");
+      expect(result).toEqual({
+        vault: "push-exhaust-box",
+        capBytes: ent.caps.notes_bytes + ent.caps.attachment_bytes,
+        ok: false,
+        status: 503,
+        attempts: 3,
+      });
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes("event=plan_cap_push_retry")).length).toBe(2);
+      expect(
+        warn.mock.calls.some(
+          (c) => String(c[0]).includes("event=plan_cap_push_failed") && String(c[0]).includes("status=503") && String(c[0]).includes("attempts=3"),
+        ),
+      ).toBe(true);
     } finally {
       warn.mockRestore();
     }
