@@ -80,6 +80,12 @@ async function main() {
   const webhook = await probe("/billing/webhook"); // GET on a POST-only route: the worker 404s; the SPA would have shelled it
   assert(webhook.status === 404 && !webhook.body.includes('id="root"'), "/billing/webhook (GET) → worker 404 (worker-owned, not the SPA shell)");
 
+  // DEFENSIVE_PREFIXES backstop (parachute-cloud#196): on staging the zone
+  // route to the vault worker doesn't exist, so this IS the live case the
+  // backstop exists for — /mcp must 503 loudly, never the SPA shell.
+  const mcp = await probe("/mcp");
+  assert(mcp.status === 503 && mcp.contentType.includes("json") && mcp.body.includes("mcp_route_missing"), "/mcp → worker 503 mcp_route_missing (DEFENSIVE_PREFIXES backstop, not the SPA shell)", `status ${mcp.status}`);
+
   // --- SPA: everything else falls through to the Static-Assets shell ----------
   console.log("\nSPA (must serve index.html):");
 

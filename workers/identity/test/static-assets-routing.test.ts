@@ -275,6 +275,8 @@ describe("the /mcp defensive backstop (parachute-cloud#196, DEFENSIVE_PREFIXES)"
     const res = await worker.fetch(new Request("https://my.example/mcp/anything"), env);
     expect(res.status).toBe(503);
     expect(res.headers.get("content-type") ?? "").toContain("application/json");
+    const body = (await res.json()) as { error: string; error_type: string };
+    expect(body.error_type).toBe("mcp_route_missing");
   });
 
   test("POST /mcp (the MCP JSON-RPC verb) gets the same 503, not a 404 or a redirect", async () => {
@@ -287,5 +289,22 @@ describe("the /mcp defensive backstop (parachute-cloud#196, DEFENSIVE_PREFIXES)"
       env,
     );
     expect(res.status).toBe(503);
+  });
+
+  // The two spellings a hand-typed or slightly-off connector URL most
+  // plausibly takes — a trailing slash, or a query string tacked on. Both
+  // must still hit the backstop, not fall through to the SPA shell.
+  test("GET /mcp/ (trailing slash) → 503 mcp_route_missing, never the SPA shell", async () => {
+    const res = await worker.fetch(new Request("https://my.example/mcp/"), env);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: string; error_type: string };
+    expect(body.error_type).toBe("mcp_route_missing");
+  });
+
+  test("GET /mcp?foo=bar (query string) → 503 mcp_route_missing, never the SPA shell", async () => {
+    const res = await worker.fetch(new Request("https://my.example/mcp?foo=bar"), env);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: string; error_type: string };
+    expect(body.error_type).toBe("mcp_route_missing");
   });
 });
