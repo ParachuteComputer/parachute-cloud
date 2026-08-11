@@ -87,6 +87,25 @@ describe("internal config — authorization matrix", () => {
     expect(((await res.json()) as any).error_type).toBe("internal_config_forbidden");
   });
 
+  it("the console's pack-apply client_id ('parachute-packs', admin verb) is refused too — cloud#134 A.1 hardening", async () => {
+    // The EXACT shape workers/identity/src/vault-call.ts's PACK_APPLY_CLIENT_ID
+    // mints (see console.ts postVaultPackApply): admin verb, correct aud +
+    // vault_scope, but NOT FIRST_PARTY_CLIENT_ID. Pack-apply needs admin for
+    // POST /api/packs/:name (packs.test.ts), but must NEVER thereby gain
+    // platform authority over /api/internal/* — this is the other half of that
+    // guarantee, pinned from the vault side.
+    const v = freshVault("ic");
+    const packToken = await mintToken({
+      vault: v,
+      scopes: `vault:${v}:admin`,
+      vaultScope: [v],
+      clientId: "parachute-packs",
+    });
+    const res = await putConfig(v, packToken, { cap_bytes: 999_999_999_999 });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as any).error_type).toBe("internal_config_forbidden");
+  });
+
   it("an admin token with NO client_id claim is refused too", async () => {
     const v = freshVault("ic");
     const bare = await mintToken({ vault: v, scopes: `vault:${v}:admin`, vaultScope: [v] });

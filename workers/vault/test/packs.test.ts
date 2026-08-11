@@ -134,6 +134,28 @@ describe("POST /api/packs/:name", () => {
     expect(((await ok.json()) as any).applied).toEqual([SURFACE_STARTER_PATH]);
   });
 
+  it("an admin JWT with the console's NON-first-party pack-apply client_id still applies (cloud#134 A.1 hardening)", async () => {
+    // "parachute-packs" mirrors PACK_APPLY_CLIENT_ID (workers/identity/src/
+    // vault-call.ts) — the client_id the console's postVaultPackApply mint
+    // stamps INSTEAD of FIRST_PARTY_CLIENT_ID ("parachute-console"), so a pack
+    // token can never satisfy internalForbidden's platform check (pinned in
+    // internal-config.test.ts). The REST scope gate for packs (isPackApply →
+    // hasScopeForVault) never looks at client_id, so this must still succeed.
+    const v = freshVault("p");
+    const admin = await mintToken({
+      vault: v,
+      scopes: `vault:${v}:admin`,
+      vaultScope: [v],
+      clientId: "parachute-packs",
+    });
+    const ok = await SELF.fetch(`${base(v)}/api/packs/surface-starter`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${admin}` },
+    });
+    expect(ok.status).toBe(200);
+    expect(((await ok.json()) as any).applied).toEqual([SURFACE_STARTER_PATH]);
+  });
+
   it("a vault:<name>:write JWT is refused (insufficient_scope, vault:admin) — the cloud#134 A.1 review finding", async () => {
     const v = freshVault("p");
     const writer = await mintToken({ vault: v, scopes: `vault:${v}:write`, vaultScope: [v] });
