@@ -23,6 +23,7 @@ import {
   authenticateVaultToken,
   hasScopeForVault,
   insufficientScope,
+  isPackApply,
   isTagSchemaMutation,
   vaultVerbRank,
   verbForMethod,
@@ -751,13 +752,17 @@ export class VaultDO extends DurableObject {
     // REST scope gate — mirrors bun's routing.ts: GET/HEAD/OPTIONS → read,
     // other methods → write, EXCEPT the enumerated tag-schema mutations
     // (isTagSchemaMutation: PUT/DELETE /tags/:name, POST /tags/merge, POST
-    // /tags/:name/rename), which require `vault:admin` — the vault 0.7.1
+    // /tags/:name/rename) AND seed-pack application (isPackApply: POST
+    // /packs/:name — applySeedPack reaches the SAME upsertTagRecord core call
+    // as PUT /tags/:name, so it carries the identical tag-schema-mutation risk
+    // and MUST be gated identically; adversarial review of cloud#134 A.1 found
+    // this side door), which require `vault:admin` — the vault 0.7.1
     // write/admin re-tier (cloud#134 A.1). Gating on `auth.scopes` via
     // `hasScopeForVault` (never the coarse `auth.permission` summary, which
     // collapses write and admin) is what makes the write/admin distinction
     // real on this door: a `vault:<name>:write` token keeps every genuine
     // write, and can never confer the admin tier it wasn't minted at.
-    const requiredVerb = isTagSchemaMutation(request.method, apiPath)
+    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath)
       ? "admin"
       : verbForMethod(request.method);
     if (requiredVerb !== "read" && !hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
@@ -826,10 +831,12 @@ export class VaultDO extends DurableObject {
     if (apiPath === "/find-path") {
       return handleFindPath(request, this.store, NO_TAG_SCOPE);
     }
-    // Seed-pack application — POST /api/packs/<name>. Write-scoped (POST →
-    // verb=write above); idempotent per item via core's applier, so re-POSTing
-    // is always safe. The console's "Add the Surface Starter guide" button is
-    // the primary caller (via the identity worker's server-side mint).
+    // Seed-pack application — POST /api/packs/<name>. Admin-scoped (isPackApply
+    // → verb=admin above, cloud#134 A.1 review follow-up): the applier upserts
+    // tag schemas, the same operation PUT /tags/:name requires admin for.
+    // Idempotent per item via core's applier, so re-POSTing is always safe.
+    // The console's "Add the Surface Starter guide" button is the primary
+    // caller (via the identity worker's server-side mint, which mints admin).
     if (apiPath.startsWith("/packs/")) {
       return this.handleApplyPack(request, apiPath.slice(7));
     }

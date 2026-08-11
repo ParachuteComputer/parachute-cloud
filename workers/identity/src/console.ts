@@ -1120,8 +1120,13 @@ const CONSOLE_PACKS = new Set(["surface-starter"]);
 
 /**
  * THE MINT SEAM lives in vault-call.ts (shared with the plan-cap push): mint a
- * first-party 60s aud-pinned `vault:<name>:write` token, spend it on one POST.
- * This wrapper keeps the console's write-verb call sites one line.
+ * first-party 60s aud-pinned `vault:<name>:admin` token, spend it on one POST.
+ * Admin, not write: this wrapper's only caller is pack-apply
+ * ({@link handleAddPackPost}), and POST /api/packs/:name now requires
+ * `vault:admin` (cloud#134 A.1 review follow-up — applySeedPack upserts tag
+ * schemas, the same operation PUT /tags/:name is admin-gated for). Was
+ * `verb: "write"` before that fix; left at write here the console's own "Add
+ * the Surface Starter guide" button would start 403ing itself.
  */
 async function postVaultApi(
   db: D1Database,
@@ -1131,7 +1136,7 @@ async function postVaultApi(
   apiPath: string,
   jsonBody?: unknown,
 ): Promise<Response> {
-  return callVaultApi(db, deps, { userId, vaultName, method: "POST", apiPath, verb: "write", jsonBody });
+  return callVaultApi(db, deps, { userId, vaultName, method: "POST", apiPath, verb: "admin", jsonBody });
 }
 
 /**

@@ -693,6 +693,61 @@ describe("write/admin scope split — tag-schema mutations require vault:admin",
     const del = await SELF.fetch(`${base(v)}/api/notes/${note.id}`, asToken(token, "DELETE"));
     expect(del.status).toBe(200);
   });
+
+  /**
+   * POST /api/packs/:name — a write-tier SIDE DOOR onto the same tag-schema
+   * mutation `PUT /api/tags/:name` is admin-gated for (cloud#134 A.1
+   * adversarial-review finding, closed by `isPackApply` in auth.ts).
+   * `handleApplyPack` (vault-do.ts) reaches core's `applySeedPack`, which
+   * calls the SAME `upsertTagRecord(name, {fields, parent_names,
+   * description})` for every tag a pack declares — and `upsertTagRecord`
+   * REPLACES `fields` wholesale when a pack passes any (tag-schemas.ts:
+   * `fields = patch.fields === undefined ? existing : patch.fields` — no
+   * per-key merge). Core's own `starter-ontology` pack declares a `view` meta
+   * tag with a real schema, so re-POSTing it is a live path to clobber an
+   * owner's curated `view` fields. Before the fix, POST /packs dispatched at
+   * plain `write` (verbForMethod's default), so a `vault:<name>:write` token
+   * could reach this; the fix requires the SAME `vault:admin` the front door
+   * (`PUT /api/tags/:name`) already requires.
+   */
+  it("write token: POST /api/packs/:name → 403 vault:admin, curated tag schema NOT overwritten", async () => {
+    const v = freshVault();
+    // The owner curates `view`'s schema themselves (admin-equivalent operator
+    // token) BEFORE a write-tier token ever touches the vault.
+    const curate = await op(v, "/api/tags/view", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        description: "owner's own curated view tag — not the pack's",
+        fields: { custom_field: { type: "string" } },
+      }),
+    });
+    expect(curate.status).toBe(200);
+
+    // `starter-ontology` declares `view` WITH fields (kind/query/lane_by/
+    // date_field) — the exact shape that would land if this door were still
+    // write-gated.
+    const res = await SELF.fetch(`${base(v)}/api/packs/starter-ontology`, asToken(await WRITE(v), "POST"));
+    await expectAdminRefused(res, `vault:${v}:write`);
+
+    // Read back with the operator (admin-equivalent) token — proves nothing
+    // landed: the owner's curated `fields` survive byte-for-byte, and the
+    // pack's own tags/notes never got created.
+    const tag = (await (await op(v, "/api/tags/view")).json()) as any;
+    expect(tag.fields).toEqual({ custom_field: { type: "string" } });
+    expect(tag.description).toBe("owner's own curated view tag — not the pack's");
+    const notes = (await (await op(v, "/api/notes?include_content=true")).json()) as any[];
+    expect(notes.some((n) => n.path === "Views/All notes")).toBe(false);
+  });
+
+  it("admin token: POST /api/packs/:name applies the pack (admin ⊇ write, no breaking change for the console's own mint)", async () => {
+    const v = freshVault();
+    const res = await SELF.fetch(`${base(v)}/api/packs/surface-starter`, asToken(await ADMIN(v), "POST"));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.pack).toBe("surface-starter");
+    expect(body.applied.length).toBeGreaterThan(0);
+  });
 });
 
 describe("storage — R2 round-trip + caps", () => {

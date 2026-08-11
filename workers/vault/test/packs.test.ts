@@ -21,8 +21,13 @@ import {
  * POST /api/packs/<name> — the on-demand seam for core's seed packs.
  * Surface Starter (opt-in, NOT default-seeded) is the motivating case; the
  * default packs are also applyable (harmless: idempotent per item). Auth is
- * the ordinary write gate (POST → verb=write), so a read-only token is
- * refused with the standard insufficient_scope envelope.
+ * `vault:admin` (isPackApply, cloud#134 A.1 review follow-up), NOT the
+ * generic write tier: `applySeedPack` upserts tag schemas via the same core
+ * call `PUT /api/tags/:name` is admin-gated for, so a write-tier token must
+ * not be able to reach it through this side door. A read-only OR write-only
+ * token is refused with the standard insufficient_scope envelope; an admin
+ * token (or the operator bearer `op()` uses, which is admin-equivalent)
+ * succeeds.
  */
 
 async function listNotes(v: string): Promise<any[]> {
@@ -117,16 +122,33 @@ describe("POST /api/packs/:name", () => {
     expect(res.status).toBe(405);
   });
 
-  it("a vault:<name>:write JWT can apply; a read-only JWT is refused (insufficient_scope)", async () => {
+  it("a vault:<name>:admin JWT can apply (the console's mint seam, cloud#134 A.1)", async () => {
+    const v = freshVault("p");
+    const admin = await mintToken({ vault: v, scopes: `vault:${v}:admin`, vaultScope: [v] });
+    const ok = await SELF.fetch(`${base(v)}/api/packs/surface-starter`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${admin}` },
+    });
+    expect(ok.status).toBe(200);
+    // Fresh vault → the pack lands (the JWT admin path is the console's seam).
+    expect(((await ok.json()) as any).applied).toEqual([SURFACE_STARTER_PATH]);
+  });
+
+  it("a vault:<name>:write JWT is refused (insufficient_scope, vault:admin) — the cloud#134 A.1 review finding", async () => {
     const v = freshVault("p");
     const writer = await mintToken({ vault: v, scopes: `vault:${v}:write`, vaultScope: [v] });
-    const ok = await SELF.fetch(`${base(v)}/api/packs/surface-starter`, {
+    const before = await listNotes(v);
+    const forbidden = await SELF.fetch(`${base(v)}/api/packs/surface-starter`, {
       method: "POST",
       headers: { Authorization: `Bearer ${writer}` },
     });
-    expect(ok.status).toBe(200);
-    // Fresh vault → the pack lands (the JWT write path is the console's seam).
-    expect(((await ok.json()) as any).applied).toEqual([SURFACE_STARTER_PATH]);
+    expect(forbidden.status).toBe(403);
+    const body = (await forbidden.json()) as any;
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:admin");
+    expect(body.granted_scopes).toContain(`vault:${v}:write`);
+    // The refusal happened at the gate — no tag/note landed from the pack.
+    expect(await listNotes(v)).toEqual(before);
   });
 
   it("read-only JWT → 403; no credentials → 401", async () => {

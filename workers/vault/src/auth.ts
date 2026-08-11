@@ -188,6 +188,25 @@ export function isTagSchemaMutation(method: string, apiPath: string): boolean {
   );
 }
 
+/**
+ * ADMIN-ONLY REST operation — seed-pack application (POST /packs/:name).
+ * Found by adversarial review of cloud#134 A.1: `handleApplyPack` (vault-do.ts)
+ * reaches core's `applySeedPack` → `upsertTagRecord(name, {fields,
+ * parent_names, description})` for every tag a pack declares — the EXACT
+ * mutation `PUT /api/tags/:name` requires `vault:admin` for via
+ * {@link isTagSchemaMutation} above. Before this, a pack route dispatched
+ * after the generic write/admin gate at plain `write`, so a write-tier token
+ * could `POST /api/packs/<any-pack-with-a-tag>` and silently overwrite an
+ * owner's curated tag schema — the tag-schema carve-out closed the front door
+ * (`PUT /tags/:name`) but left this side door open. `apiPath` is the path
+ * after `/api` (the DO dispatcher's `apiPath`, matching {@link isTagSchemaMutation}'s
+ * convention) — anything under `/packs/` is a pack-apply; the pack name itself
+ * (single path segment, URI-decoded by `handleApplyPack`) doesn't matter here.
+ */
+export function isPackApply(method: string, apiPath: string): boolean {
+  return method.toUpperCase() === "POST" && apiPath.startsWith("/packs/");
+}
+
 // RFC 7235: the auth-scheme token is case-insensitive (`Bearer`/`bearer`/
 // `BEARER`, ...) — only the scheme is matched case-insensitively, the token
 // itself is passed through verbatim. Mirrors parachute-vault/src/auth.ts's

@@ -686,7 +686,10 @@ describe("console — Surface Starter pack button (POST /console/packs)", () => 
     const token = auth!.replace(/^Bearer /, "");
     const { payload } = await validateAccessToken(env.DB, token, ISSUER);
     expect(payload.aud).toBe("vault.mine");
-    expect(payload.scope).toBe("vault:mine:write");
+    // Admin, not write (cloud#134 A.1 review follow-up) — POST /api/packs/:name
+    // now requires vault:admin (applySeedPack upserts tag schemas, the same
+    // operation PUT /tags/:name is admin-gated for); see console.ts postVaultApi.
+    expect(payload.scope).toBe("vault:mine:admin");
     expect(payload.vault_scope).toEqual(["mine"]);
     expect(payload.sub).toBe(userId);
     expect(payload.client_id).toBe("parachute-console");

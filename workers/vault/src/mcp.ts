@@ -257,6 +257,18 @@ function overrideVaultInfo(
       // higher-tier mutation past a tool the outer gate considers a read.
       // (The frozen/cap paywall is applied at the dispatch layer — see
       // isGatedWrite/handleToolCall — so this only guards SCOPE.)
+      //
+      // KNOWN GAP (cloud#134 A.2, drift vs. the REST door — NOT closed, this
+      // gate is ADVISORY): `PATCH /api/vault` (rest/vault.ts) still writes this
+      // SAME `description` field at the generic write tier — no admin carve-out
+      // exists in vault-do.ts's REST dispatcher for `/vault`, and it stays that
+      // way on purpose: the bun vault's own `routes.ts handleVault` REST PATCH
+      // has the identical write-tier gap, and re-tiering cloud's REST door
+      // alone would fork the wire contract cloud is required to keep
+      // byte-shaped with bun (see rest/vault.ts's matching annotation). So this
+      // MCP-only admin check narrows just the MCP door's tool surface; a
+      // write-tier token can still reach the exact same mutation via REST.
+      // Both doors need to move together before this stops being advisory.
       if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
         throw new Error(
           `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
