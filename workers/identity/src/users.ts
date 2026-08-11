@@ -82,8 +82,16 @@ export interface User {
    *  delete route (A-3) starts writing it. */
   deleteUndoHash: string | null;
   /** ISO-8601 timestamp the deletion-notice email was sent (migration 0023).
-   *  Unused until the delete route (A-3) starts writing it. */
+   *  Set by the delete route (A-3) on a real send only. */
   deleteNoticeSentAt: string | null;
+  /**
+   * How many convergence-sweep passes have tried and failed to finish this
+   * account's teardown (migration 0024). NULL in storage means "never
+   * deferred" and surfaces here as 0, so callers never branch on the
+   * null-vs-zero distinction — there isn't one. Reset is unnecessary: an
+   * account that converges has its row deleted.
+   */
+  deletePurgeAttempts: number;
   /**
    * Stripe linkage (migration 0012) — set by the checkout.session.completed
    * webhook; null for free users and comped accounts. The lifecycle handlers
@@ -125,6 +133,7 @@ interface Row {
   deleted_at: string | null;
   delete_undo_hash: string | null;
   delete_notice_sent_at: string | null;
+  delete_purge_attempts: number | null;
   stripe_customer_id: string | null;
   stripe_subscription_id: string | null;
   pending_plan: string | null;
@@ -150,6 +159,7 @@ function rowToUser(r: Row): User {
     deletedAt: r.deleted_at,
     deleteUndoHash: r.delete_undo_hash,
     deleteNoticeSentAt: r.delete_notice_sent_at,
+    deletePurgeAttempts: r.delete_purge_attempts ?? 0,
     stripeCustomerId: r.stripe_customer_id,
     stripeSubscriptionId: r.stripe_subscription_id,
     // Same defensive coercion as `plan`; null stays null (no pending change).
@@ -282,6 +292,7 @@ export async function createUser(
     deletedAt: null,
     deleteUndoHash: null,
     deleteNoticeSentAt: null,
+    deletePurgeAttempts: 0,
     stripeCustomerId: null,
     stripeSubscriptionId: null,
     pendingPlan: "expired",

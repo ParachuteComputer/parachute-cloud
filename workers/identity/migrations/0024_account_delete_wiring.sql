@@ -1,0 +1,55 @@
+-- Account deletion, part two (cloud#226 A-3/A-4): the two things migration
+-- 0023's substrate could not know it needed until routes actually drove it.
+-- 0023 added the columns; nothing wrote or looked anything up by them, so
+-- neither of these gaps was reachable. Both are now.
+--
+-- NOTE ON MIGRATION NUMBERING: 0023's header reserved 0024 for the
+-- vault-delete train's PR-2a (`vaults.deleting_at` / `destroy_completed_at`).
+-- That design is NOT being built — the vault delete shipped as an immediate,
+-- confirm-guarded teardown with no staging columns (see
+-- handleAccountVaultDelete's "NO UNDO WINDOW HERE"), so PR-2a has no columns
+-- to add and the slot was free. Re-based at open time, per the same
+-- assign-at-open discipline 0023 followed.
+--
+-- 1. `idx_users_delete_undo_hash` — the undo endpoint
+--    (`/account/undo-delete`) looks an account up BY THIS HASH, and it is the
+--    one account surface that is UNAUTHENTICATED by construction: a
+--    tombstoned account cannot present a bearer or a cookie (migration 0023's
+--    chokepoints refuse both), so the mailed token is the only credential
+--    there is. Without an index that lookup is a full table scan of `users`
+--    on every request, which any unauthenticated caller can drive at will —
+--    free amplification, and it gets worse exactly as the user table grows.
+--
+--    UNIQUE, not merely an index, and that is the load-bearing half: the
+--    lookup uses `.first()`, so two rows sharing a hash would resolve to an
+--    ARBITRARY one of them — restoring the wrong account. A collision is not
+--    reachable today (the token is 32 random bytes), but "not reachable
+--    today" is exactly the class of assumption that rots silently; here the
+--    database refuses instead. Same pattern and same reasoning as
+--    `idx_users_drip_unsub_token` (migration 0008).
+--
+--    SQLite treats NULLs as distinct in a UNIQUE index, so the overwhelming
+--    majority of rows (every account that is not mid-deletion, all of which
+--    carry NULL) are unconstrained — this cannot collide in normal operation.
+CREATE UNIQUE INDEX idx_users_delete_undo_hash ON users (delete_undo_hash);
+
+-- 2. `users.delete_purge_attempts` — how many convergence-sweep passes have
+--    tried and failed to finish this account's teardown (0/NULL = never
+--    deferred; reset is unnecessary because a converged account's row is
+--    deleted outright).
+--
+--    Why it must exist: the sweep is deliberately conservative — a vault
+--    whose DO destroy fails defers the WHOLE account rather than purging the
+--    row that records whose the surviving vault is. That is the right call
+--    per pass and the wrong one forever. Billing tears down on the FIRST
+--    pass, so a permanently wedged vault leaves an account paying nothing,
+--    invisible in the product, and still holding tenant data we told the user
+--    in writing was "permanently deleted" 24 hours ago. Retrying silently is
+--    how that becomes a year.
+--
+--    The counter is what lets the sweep escalate: past a threshold it pages
+--    the operator (ops_alerts) instead of quietly trying again. It is a
+--    counter rather than a first-seen timestamp so the alert tracks ATTEMPTS
+--    actually made — a cron that stops firing must not age an account into an
+--    alert that claims work was tried.
+ALTER TABLE users ADD COLUMN delete_purge_attempts INTEGER;

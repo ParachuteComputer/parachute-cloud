@@ -37,6 +37,7 @@
 import type { Env } from "./env.ts";
 import type { EmailSender } from "./email.ts";
 import { runAccountDeleteSweep } from "./account-delete.ts";
+import { markAlerted, shouldAlert } from "./ops-alerts.ts";
 import { runBillingSweep } from "./billing-lifecycle.ts";
 import { runDrip } from "./drip.ts";
 import { depsForEnv } from "./oauth-shared.ts";
@@ -53,8 +54,9 @@ export const USAGE_CRON = "30 3 * * *";
 /** Nightly GFS snapshot sweep (snapshots.ts) — 04:00 UTC, after the usage rollup. */
 export const SNAPSHOT_CRON = "0 4 * * *";
 
-/** Re-alert at most once per hour per failing check. */
-export const ALERT_DEDUPE_MS = 60 * 60 * 1000;
+/** Re-alert at most once per hour per failing check. Re-exported from the
+ *  shared alert seam (ops-alerts.ts) — existing importers keep working. */
+export { ALERT_DEDUPE_MS } from "./ops-alerts.ts";
 
 /** Budget for the vault /health round-trip before we call it down. */
 const HEALTH_FETCH_TIMEOUT_MS = 10_000;
@@ -85,7 +87,19 @@ export async function handleScheduled(cron: string, env: Env, sender: EmailSende
   if (job === "digest") {
     await sendWeeklyDigest(env, sender, deps);
   } else if (job === "drip") {
-    await runDrip(env, sender, deps);
+    // GUARDED like its two tick-mates, and for a reason the comment below only
+    // half-stated until cloud#226: an unguarded `await` here does not merely
+    // lose the drip, it starves BOTH sweeps forever. A permanently-throwing
+    // drip (a template bug, a sender outage that escapes runDrip's own
+    // handling) would mean no plan downgrade is ever applied and no deleted
+    // account is ever purged — the second of which silently breaks a promise
+    // made in writing to a user ("permanently deleted after 24 hours").
+    // Nothing downstream depends on the drip having run.
+    try {
+      await runDrip(env, sender, deps);
+    } catch (err) {
+      console.error(`event=drip_failed error=${err instanceof Error ? err.message : String(err)}`);
+    }
     // The billing sweep rides the same hourly tick (no new cron pattern):
     // apply due pending downgrades (billing-lifecycle.ts — pending_plan +
     // plan_downgrade_at, stamped by customer.subscription.deleted). Guarded
@@ -107,7 +121,9 @@ export async function handleScheduled(cron: string, env: Env, sender: EmailSende
     try {
       const purgeDeps = depsForEnv(env);
       if (deps.now) purgeDeps.now = deps.now;
-      await runAccountDeleteSweep(env, purgeDeps, deps.now?.() ?? new Date());
+      // The sender goes in so a permanently-stuck purge can page the operator
+      // (ops-alerts.ts) — see runAccountDeleteSweep's PERMANENT DEFERRAL note.
+      await runAccountDeleteSweep(env, purgeDeps, deps.now?.() ?? new Date(), { sender });
     } catch (err) {
       console.error(`event=account_delete_sweep_failed error=${err instanceof Error ? err.message : String(err)}`);
     }
@@ -166,27 +182,7 @@ export async function checkVaultHealth(vaultOrigin: string, fetchFn: typeof fetc
  * is down we can't read the dedupe row — better to alert every 10 minutes for
  * the duration of a D1 outage than to suppress the one email that matters.
  */
-async function shouldAlert(db: D1Database, key: string, now: Date): Promise<boolean> {
-  try {
-    const row = await db.prepare("SELECT last_alert_at FROM ops_alerts WHERE key = ?").bind(key).first<{ last_alert_at: string }>();
-    if (row && now.getTime() - Date.parse(row.last_alert_at) < ALERT_DEDUPE_MS) return false;
-    return true;
-  } catch {
-    return true;
-  }
-}
 
-async function markAlerted(db: D1Database, key: string, now: Date): Promise<void> {
-  try {
-    await db
-      .prepare("INSERT INTO ops_alerts (key, last_alert_at) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET last_alert_at = excluded.last_alert_at")
-      .bind(key, now.toISOString())
-      .run();
-  } catch (err) {
-    // Best-effort: a failed mark means at worst an extra alert next run.
-    console.error(`event=ops_alert_mark_failed key=${key} error=${JSON.stringify(String(err))}`);
-  }
-}
 
 /**
  * Run both checks; email the operator about any failure that hasn't alerted in

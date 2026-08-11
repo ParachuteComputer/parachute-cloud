@@ -32,11 +32,18 @@
  * never strands an un-cancelable subscription behind a deleted row that no
  * longer names it.
  *
- * NO ORACLE, same posture as the vault door: an invalid, unknown, or expired
- * undo token gets one neutral answer. The undo endpoint is the ONE account
- * surface that must work for a user whose auth was just severed, so it
- * authenticates on the mailed token alone — never a session, never a bearer,
- * both of which A-1 now refuses by construction.
+ * NO ORACLE, with ONE deliberate exception. Every undo token that cannot be
+ * used — unknown, malformed, already spent, belonging to a live account —
+ * gets the SAME neutral 400, so the endpoint never confirms whether an
+ * address has an account mid-deletion. The exception is a token that WAS
+ * valid and whose window has since closed: that gets an honest 410
+ * `undo_window_expired`. Reaching it requires having held the real token, so
+ * it reveals nothing to anyone who didn't already have it, and "you're too
+ * late" is the only useful thing to tell the person who did.
+ *
+ * The undo endpoint is the ONE account surface that must work for a user whose
+ * auth was just severed, so it authenticates on the mailed token alone — never
+ * a session, never a bearer, both of which A-1 now refuses by construction.
  */
 import type Stripe from "stripe";
 import { readJsonBody, requireAccount } from "./account-api.ts";
@@ -48,9 +55,10 @@ import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
 import { type OAuthDeps, jsonResponse } from "./oauth-shared.ts";
 import { deleteSessionsForUser } from "./sessions.ts";
+import { raiseOpsAlert } from "./ops-alerts.ts";
 import { makeStripe } from "./stripe-client.ts";
 import { type User, getUserById } from "./users.ts";
-import { callVaultDestroy } from "./vault-call.ts";
+import { callVaultDestroy, readDestroyOutcome } from "./vault-call.ts";
 import { deleteVaultD1Rows, listVaultsForOwner } from "./vaults.ts";
 
 /** The ratified undo window: 24 hours from the delete REQUEST (`deleted_at`). */
@@ -200,9 +208,31 @@ export async function handleAccountDelete(
       try {
         await resumeBilling(stripe, user.stripeSubscriptionId);
       } catch (resumeErr) {
-        console.error(
-          `event=account_delete_hold_not_released user=${user.id} error=${resumeErr instanceof Error ? resumeErr.message : String(resumeErr)}`,
-        );
+        // BOTH halves failed: the subscription is now sitting at
+        // cancel_at_period_end = true for an account that was NOT deleted, and
+        // nothing in the system will ever revisit it — the user's next attempt
+        // starts from scratch, the sweep only looks at tombstoned rows, and
+        // there is no tombstone. The user finds out when their subscription
+        // lapses at the period boundary for no reason they can see. That is
+        // exactly the invisible-money-loss shape that earns the alert channel
+        // rather than a log line (ops-alerts.ts).
+        await raiseOpsAlert(env, sender, {
+          key: `billing-hold-stuck:${user.id}`,
+          subject: "billing hold stuck on a NON-deleted account",
+          text: [
+            `A delete request placed a cancel_at_period_end hold, then failed to`,
+            `record the deletion AND failed to release the hold.`,
+            ``,
+            `  account:      ${user.id}`,
+            `  subscription: ${user.stripeSubscriptionId}`,
+            `  release error: ${resumeErr instanceof Error ? resumeErr.message : String(resumeErr)}`,
+            ``,
+            `This account is NOT deleted and has no tombstone, so no sweep will`,
+            `ever revisit it. Its subscription will silently lapse at the period`,
+            `boundary unless someone clears cancel_at_period_end in Stripe.`,
+          ].join("\n"),
+          now: deps.now?.() ?? new Date(),
+        });
       }
     }
     return deleteError(
@@ -415,6 +445,84 @@ export async function handleAccountDeleteUndo(
 
 // --- A-4: the convergence sweep ----------------------------------------------
 
+/**
+ * How many failed convergence passes an account may accumulate before the
+ * sweep stops retrying quietly and pages the operator. At one pass per hour
+ * this is two days — long enough that a transient DO or Stripe fault drains on
+ * its own without waking anyone, short enough that the gap between what the
+ * deletion email promised ("permanently deleted" after 24 hours) and what is
+ * actually still on disk never quietly becomes a month.
+ */
+export const ACCOUNT_PURGE_ALERT_AFTER_ATTEMPTS = 48;
+
+/**
+ * Record one failed convergence pass and, past the threshold, page the
+ * operator. Extracted so every `continue` in the sweep goes through the same
+ * bookkeeping — an unrecorded deferral is exactly the invisible-forever case
+ * this exists to prevent.
+ *
+ * WHY THIS NEEDS A HUMAN AND ISN'T JUST A RETRY. Billing tears down on the
+ * FIRST pass and its converged marker is durable, so a permanently wedged
+ * vault leaves an account that pays nothing, appears nowhere in the product,
+ * and still holds tenant data the user was told in writing was destroyed a day
+ * ago. Nothing about that state degrades further, and nothing about it
+ * surfaces — the sweep would go on failing identically, forever, at the same
+ * log level. The alert is the only thing that converts it into work.
+ *
+ * Best-effort throughout: neither the counter write nor the alert may throw
+ * into the sweep loop, because the account after this one still needs its
+ * pass.
+ */
+async function deferAccount(
+  env: Env,
+  sender: EmailSender | undefined,
+  user: User,
+  now: Date,
+  reason: string,
+): Promise<void> {
+  const attempts = user.deletePurgeAttempts + 1;
+  console.error(`event=account_purge_deferred user=${user.id} reason=${reason} attempts=${attempts}`);
+  try {
+    await env.DB
+      .prepare("UPDATE users SET delete_purge_attempts = ? WHERE id = ?")
+      .bind(attempts, user.id)
+      .run();
+  } catch (err) {
+    console.error(
+      `event=account_purge_attempt_write_failed user=${user.id} error=${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (attempts < ACCOUNT_PURGE_ALERT_AFTER_ATTEMPTS) return;
+
+  const requestedAt = user.deletedAt ?? "unknown";
+  await raiseOpsAlert(env, sender, {
+    // Keyed per account: one wedged vault must not dedupe away another
+    // account's alert. The hourly dedupe then applies per account.
+    key: `account-purge:${user.id}`,
+    subject: `account deletion stuck after ${attempts} passes`,
+    text: [
+      `An account past its 24-hour delete window has failed to converge for ${attempts} sweep passes.`,
+      ``,
+      `  account:      ${user.id}`,
+      `  requested at: ${requestedAt}`,
+      `  last reason:  ${reason}`,
+      ``,
+      `This account's billing is already torn down, so it is paying nothing and`,
+      `is invisible in the product — but its data is STILL PRESENT, and the`,
+      `deletion email told the user it would be permanently deleted 24 hours`,
+      `after the request. That promise is currently unmet and will stay unmet`,
+      `until someone acts.`,
+      ``,
+      `Most likely cause: a vault Durable Object that will not answer`,
+      `POST /api/internal/destroy. Check the event=account_purge_vault_failed`,
+      `lines for this account to see which vault and why.`,
+      ``,
+      `Alert repeats at most hourly per account while the condition persists.`,
+    ].join("\n"),
+    now,
+  });
+}
+
 export interface AccountDeleteSweepSummary {
   /** Accounts past their window that this pass looked at. */
   due: number;
@@ -484,6 +592,18 @@ async function purgeAccountRows(db: D1Database, userId: string): Promise<void> {
  * every read of it. So a deferral is never an exposure: it is a still-closed
  * account with residue behind it.
  *
+ * PERMANENT DEFERRAL is the failure mode that actually needs handling, and it
+ * does not look like a failure from inside the loop. Billing converges on the
+ * FIRST pass and stays converged, so an account with one permanently wedged
+ * vault settles into a steady state: paying nothing, absent from every product
+ * surface, and still holding the data we told the user in writing would be
+ * permanently deleted 24 hours after they asked. Nothing degrades, nothing
+ * escalates, and every pass logs the same line. So each deferral increments
+ * `users.delete_purge_attempts` (migration 0024) and past
+ * {@link ACCOUNT_PURGE_ALERT_AFTER_ATTEMPTS} passes it pages the operator —
+ * see {@link deferAccount}. The counter is the only reason this state is ever
+ * seen by a human.
+ *
  * Failure isolation is per account (the snapshot sweep's posture): one
  * account's Stripe outage or wedged DO must not stop the rest of the queue.
  */
@@ -491,7 +611,7 @@ export async function runAccountDeleteSweep(
   env: Env,
   deps: OAuthDeps,
   now: Date = new Date(),
-  overrides?: BillingOverrides,
+  overrides?: BillingOverrides & { sender?: EmailSender },
 ): Promise<AccountDeleteSweepSummary> {
   const cutoff = new Date(now.getTime() - DELETE_UNDO_WINDOW_MS).toISOString();
   const res = await env.DB
@@ -514,33 +634,38 @@ export async function runAccountDeleteSweep(
       if (hasBillingArtifacts(user)) {
         const stripe = stripeFor(env, overrides);
         if (!stripe) {
-          console.error(`event=account_purge_deferred user=${userId} reason=billing_not_configured`);
+          await deferAccount(env, overrides?.sender, user, now, "billing_not_configured");
           summary.deferred++;
           continue;
         }
         const billing = await teardownBilling(stripe, env.DB, userId);
         if (!billing.converged) {
-          console.error(`event=account_purge_deferred user=${userId} reason=billing error=${billing.error}`);
+          await deferAccount(env, overrides?.sender, user, now, `billing:${billing.error}`);
           summary.deferred++;
           continue;
         }
       }
 
       // 2. Vault storage — the only step that erases tenant content.
+      //
+      // The destroy REPLY is validated, not just its status, through the same
+      // `readDestroyOutcome` the single-vault door uses (vault-call.ts). This
+      // is not defensive padding: the very next statement deletes the D1 rows
+      // that are the only remaining record of whose bytes those were, so a 200
+      // that isn't the DO's real answer would orphan the storage permanently —
+      // still billed, no longer attributable, and beyond the reach of any
+      // retry, because nothing left in the system would know to try.
       let storageConverged = true;
       for (const vault of await listVaultsForOwner(env.DB, userId)) {
+        let outcome: Awaited<ReturnType<typeof readDestroyOutcome>>;
         try {
-          const destroyed = await callVaultDestroy(env.DB, deps, userId, vault.name);
-          if (!destroyed.ok) {
-            console.error(
-              `event=account_purge_vault_failed user=${userId} vault=${vault.name} status=${destroyed.status}`,
-            );
-            storageConverged = false;
-            continue;
-          }
+          outcome = await readDestroyOutcome(await callVaultDestroy(env.DB, deps, userId, vault.name));
         } catch (err) {
+          outcome = { ok: false, reason: "transport", detail: err instanceof Error ? err.message : String(err) };
+        }
+        if (!outcome.ok) {
           console.error(
-            `event=account_purge_vault_failed user=${userId} vault=${vault.name} error=${err instanceof Error ? err.message : String(err)}`,
+            `event=account_purge_vault_failed user=${userId} vault=${vault.name} reason=${outcome.reason} detail=${JSON.stringify(outcome.detail)}`,
           );
           storageConverged = false;
           continue;
@@ -548,7 +673,7 @@ export async function runAccountDeleteSweep(
         await deleteVaultD1Rows(env.DB, userId, vault.name, now);
       }
       if (!storageConverged) {
-        console.error(`event=account_purge_deferred user=${userId} reason=vault_storage`);
+        await deferAccount(env, overrides?.sender, user, now, "vault_storage");
         summary.deferred++;
         continue;
       }

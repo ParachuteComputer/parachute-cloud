@@ -71,7 +71,7 @@ import {
   validateHandle,
 } from "./handles.ts";
 import { type User, getUserById } from "./users.ts";
-import { callVaultDestroy, pushVaultCap } from "./vault-call.ts";
+import { callVaultDestroy, pushVaultCap, readDestroyOutcome } from "./vault-call.ts";
 import {
   VaultNameInvalidError,
   VaultNameTakenError,
@@ -575,35 +575,16 @@ export async function handleAccountVaultDelete(db: D1Database, req: Request, dep
       "The vault storage teardown could not be reached. No identity rows were changed; retry the request.",
     );
   }
-  if (!destroyResponse.ok) {
-    console.error(`event=vault_destroy_failed vault=${name} status=${destroyResponse.status}`);
+  // The one shared judgement (vault-call.ts readDestroyOutcome) — a 200 is not
+  // enough; the body must be the DO's real reply. See that function for why a
+  // false positive here is unrecoverable while a false negative costs a retry.
+  const outcome = await readDestroyOutcome(destroyResponse);
+  if (!outcome.ok) {
+    console.error(`event=vault_destroy_failed vault=${name} reason=${outcome.reason} detail=${JSON.stringify(outcome.detail)}`);
     return restError(
       502,
       "vault_destroy_failed",
-      `The vault storage teardown returned HTTP ${destroyResponse.status}. No identity rows were changed; retry the request.`,
-    );
-  }
-
-  let destroyBody: { destroyed?: unknown; r2_objects_deleted?: unknown };
-  try {
-    destroyBody = (await destroyResponse.json()) as { destroyed?: unknown; r2_objects_deleted?: unknown };
-  } catch {
-    return restError(
-      502,
-      "vault_destroy_failed",
-      "The vault storage teardown returned an unreadable response. No identity rows were changed; retry the request.",
-    );
-  }
-  if (
-    destroyBody.destroyed !== true ||
-    typeof destroyBody.r2_objects_deleted !== "number" ||
-    !Number.isSafeInteger(destroyBody.r2_objects_deleted) ||
-    destroyBody.r2_objects_deleted < 0
-  ) {
-    return restError(
-      502,
-      "vault_destroy_failed",
-      "The vault storage teardown returned an invalid success response. No identity rows were changed; retry the request.",
+      "The vault storage teardown did not confirm success. No identity rows were changed; retry the request.",
     );
   }
 
@@ -624,7 +605,7 @@ export async function handleAccountVaultDelete(db: D1Database, req: Request, dep
   // Ops audit line — the only durable record that a tenant's vault was torn
   // down (the rows that would have shown it are exactly what just got deleted).
   console.log(
-    `event=vault_deleted vault=${name} owner=${auth.accountId} r2_objects_deleted=${destroyBody.r2_objects_deleted} ` +
+    `event=vault_deleted vault=${name} owner=${auth.accountId} r2_objects_deleted=${outcome.r2ObjectsDeleted} ` +
       `vault_rows=${d1.vaultRowsDeleted} usage_rows=${d1.usageRowsDeleted} snapshot_rows=${d1.snapshotRowsDeleted} ` +
       `tokens_revoked=${d1.tokensRevoked} grants_rewritten=${d1.grantsRewritten} grants_dropped=${d1.grantsDropped}`,
   );
@@ -632,7 +613,7 @@ export async function handleAccountVaultDelete(db: D1Database, req: Request, dep
   return jsonResponse(
     {
       destroyed: true,
-      r2_objects_deleted: destroyBody.r2_objects_deleted,
+      r2_objects_deleted: outcome.r2ObjectsDeleted,
       d1: {
         vault_rows_deleted: d1.vaultRowsDeleted,
         vault_usage_rows_deleted: d1.usageRowsDeleted,
