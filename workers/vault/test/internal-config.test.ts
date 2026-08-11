@@ -142,6 +142,52 @@ describe("internal config — authorization matrix", () => {
     expect(body.used_bytes).toBe(body.db_bytes + body.r2_bytes);
   });
 
+  it("GET reports the RESOLVED ENTITLEMENT — caps/frozen/transcription_enabled/transcribe_minutes_limit (cloud#186 reconciler contract)", async () => {
+    // CROSS-WORKER PIN. The identity worker's daily reconciler
+    // (workers/identity/src/usage.ts) decides whether a vault's entitlement is
+    // stale by reading exactly these four field NAMES off this response
+    // (readVaultUsage → `hasEntitlementFields`). That check is deliberately
+    // non-fatal: if a field is renamed or dropped here, identity reads it as
+    // "a pre-entitlement vault worker" and SILENTLY SKIPS reconciliation —
+    // fleet-wide, at console.log level, with both test suites still green.
+    // Nothing else on either side would catch that, so it is pinned here.
+    const v = freshVault("ic");
+    await createNote(v, { content: "some bytes so the database has a size" });
+
+    // 1. UNPUSHED vault: all four fields are still PRESENT, with caps null —
+    //    the legitimate legacy/fresh state identity distinguishes from a
+    //    rollback precisely by their presence.
+    const before = (await (
+      await SELF.fetch(`${base(v)}/api/internal/config`, {
+        headers: { authorization: `Bearer ${await firstPartyToken(v)}` },
+      })
+    ).json()) as any;
+    expect(before).toHaveProperty("caps");
+    expect(before.caps).toBeNull();
+    expect(typeof before.frozen).toBe("boolean");
+    expect(typeof before.transcription_enabled).toBe("boolean");
+    expect(typeof before.transcribe_minutes_limit).toBe("number");
+
+    // 2. After a push, the GET reports back exactly what was pushed — the
+    //    round-trip the reconciler's comparison depends on.
+    const put = await putConfig(v, await firstPartyToken(v), {
+      caps: { notes_bytes: 250_000_000, attachment_bytes: 2_000_000_000 },
+      transcription: { enabled: true, minutes_limit: 60 },
+      frozen: false,
+    });
+    expect(put.status).toBe(200);
+
+    const after = (await (
+      await SELF.fetch(`${base(v)}/api/internal/config`, {
+        headers: { authorization: `Bearer ${await firstPartyToken(v)}` },
+      })
+    ).json()) as any;
+    expect(after.caps).toEqual({ notes_bytes: 250_000_000, attachment_bytes: 2_000_000_000 });
+    expect(after.frozen).toBe(false);
+    expect(after.transcription_enabled).toBe(true);
+    expect(after.transcribe_minutes_limit).toBe(60);
+  });
+
   it("GET is gated the same way: first-party reads it, a tenant read token cannot", async () => {
     const v = freshVault("ic");
     await putConfig(v, await firstPartyToken(v), { cap_bytes: 7_000_000 });

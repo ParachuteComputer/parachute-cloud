@@ -18,9 +18,10 @@
  *     implemented in drip.ts (eligibility windows, idempotence ledger,
  *     per-run cap, unsubscribe) — plus the billing sweep (Wave 4d,
  *     billing-lifecycle.ts): apply due pending plan downgrades.
- *   - daily 03:30 UTC (USAGE_CRON): the per-vault storage-usage rollup —
- *     routed here, implemented in usage.ts (internal-config reads through the
- *     vault-call seam, one D1 `vault_usage` row per vault per UTC day).
+ *   - daily 03:30 UTC (USAGE_CRON): the per-vault storage-usage rollup plus
+ *     plan-entitlement reconciler — routed here, implemented in usage.ts
+ *     (one internal-config GET and one D1 `vault_usage` row per vault per UTC
+ *     day; stale entitlements reuse the cap-push seam).
  *   - nightly 04:00 UTC (SNAPSHOT_CRON): the GFS snapshot sweep — routed
  *     here, implemented in snapshots.ts (per-plan retention, D1 manifest
  *     mirror, failure isolation per vault).

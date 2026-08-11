@@ -33,7 +33,7 @@
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { signAccessToken } from "./tokens.ts";
 import { type OAuthDeps, vaultInstanceUrl } from "./oauth-shared.ts";
-import { type VaultEntitlement, entitlementPlanFor, planEntitlement } from "./plans.ts";
+import { type PlanCaps, type VaultEntitlement, entitlementPlanFor, planEntitlement } from "./plans.ts";
 import { getUserById } from "./users.ts";
 import { listVaultsForOwner } from "./vaults.ts";
 
@@ -67,6 +67,19 @@ export const PACK_APPLY_CLIENT_ID = "parachute-packs";
 
 /** TTL for internally-minted vault tokens: one server-side hop. */
 export const INTERNAL_MINT_TTL_SECONDS = 60;
+
+/**
+ * Bounded retry budget for the entitlement PUT. The cap push is deliberately
+ * synchronous with the operation that changed the plan, so a retry can absorb
+ * a short Workers-to-DO transport hiccup without turning a user-facing create
+ * or billing tick into a multi-second job.
+ *
+ * Three total attempts cover the usual transient window while remaining cheap
+ * when a vault is genuinely unavailable. The daily rollup is the durable
+ * reconciler for anything that survives this small push-time budget.
+ */
+export const CAP_PUSH_MAX_ATTEMPTS = 3;
+export const CAP_PUSH_RETRY_BACKOFF_MS = 100;
 
 export async function callVaultApi(
   db: D1Database,
@@ -169,6 +182,19 @@ export async function callVaultImport(
   });
 }
 
+/** The DO's resolved plan entitlement, as reported by GET /api/internal/config. */
+export interface ResolvedVaultEntitlement {
+  /** The currently resolved two-meter entitlement; null means unpushed (a
+   *  legitimate legacy/fresh-vault state — the fields are still present). */
+  caps: PlanCaps | null;
+  /** The currently resolved expired-floor flag. */
+  frozen: boolean;
+  /** The currently resolved voice entitlement. */
+  transcriptionEnabled: boolean;
+  /** The currently resolved monthly voice budget. */
+  transcribeMinutesLimit: number;
+}
+
 /** The usage split GET /api/internal/config reports (the rollup's read). */
 export interface VaultUsageReading {
   dbBytes: number;
@@ -176,15 +202,57 @@ export interface VaultUsageReading {
   /** Voice minutes used this UTC month (cloud#56). 0 when the DO reports none
    *  (a pre-voice vault worker, or no transcriptions yet). */
   transcribeMinutes: number;
+  /**
+   * The DO's resolved entitlement, or null when the response didn't carry
+   * the control-plane fields AT ALL — a vault-worker ROLLBACK to a
+   * pre-entitlement build, NOT the legitimate "unpushed vault" case (that one
+   * still reports the fields, with `caps: null`). Usage recording (the byte
+   * split above) is independent of this and must never fail because of it —
+   * see {@link readVaultUsage}'s never-throws-on-this-alone contract
+   * (cloud#186 review D3): a fleet-wide rollback would otherwise silently
+   * zero out usage recording for every vault, not just reconciliation. The
+   * rollup (usage.ts) skips reconciliation for a vault with a null
+   * entitlement and logs distinctly instead.
+   */
+  entitlement: ResolvedVaultEntitlement | null;
+}
+
+/**
+ * Validate the two-meter portion of the internal config response while
+ * preserving the legitimate `null` returned by a legacy/unpushed vault.
+ *
+ * The rollup uses this value as an invariant check, not merely as display
+ * data: a malformed object must fail the vault's processing attempt rather
+ * than accidentally looking converged and hiding an entitlement problem.
+ */
+function parseResolvedCaps(raw: unknown): PlanCaps | null {
+  if (raw === null) return null;
+  if (typeof raw !== "object" || raw === null) throw new Error("internal config GET carried invalid resolved caps");
+  const caps = raw as { notes_bytes?: unknown; attachment_bytes?: unknown };
+  if (
+    typeof caps.notes_bytes !== "number" ||
+    !Number.isFinite(caps.notes_bytes) ||
+    typeof caps.attachment_bytes !== "number" ||
+    !Number.isFinite(caps.attachment_bytes)
+  ) {
+    throw new Error("internal config GET carried invalid resolved caps");
+  }
+  return { notes_bytes: caps.notes_bytes, attachment_bytes: caps.attachment_bytes };
 }
 
 /**
  * Read one vault's live storage usage through the internal seam (GET
  * /api/internal/config — the same first-party-gated endpoint the cap push
  * writes through; the DO reports its SQLite databaseSize + R2 meter, the
- * numbers its own cap gate uses). THROWS on any failure — non-2xx, transport
- * error, or a body without the split (a stale vault worker) — so the usage
- * rollup (usage.ts) can log-skip-continue per vault.
+ * numbers its own cap gate uses, and the resolved plan entitlement the daily
+ * reconciler compares). THROWS on a failure that makes the USAGE numbers
+ * themselves untrustworthy — non-2xx, transport error, or a body without the
+ * byte split (a stale/broken vault worker) — so the usage rollup (usage.ts)
+ * can log-skip-continue per vault. Missing ENTITLEMENT fields alone (e.g. a
+ * vault-worker ROLLBACK to a pre-entitlement build) do NOT throw — see
+ * {@link VaultUsageReading.entitlement} (cloud#186 review D3): usage
+ * recording must survive a rollback fleet-wide, even though reconciliation
+ * can't run for that vault until the rollback is undone.
  */
 export async function readVaultUsage(
   db: D1Database,
@@ -200,14 +268,49 @@ export async function readVaultUsage(
     verb: "admin",
   });
   if (!res.ok) throw new Error(`internal config GET → HTTP ${res.status}`);
-  const body = (await res.json()) as { db_bytes?: unknown; r2_bytes?: unknown; transcribe_minutes?: unknown };
+  const body = (await res.json()) as {
+    db_bytes?: unknown;
+    r2_bytes?: unknown;
+    caps?: unknown;
+    frozen?: unknown;
+    transcription_enabled?: unknown;
+    transcribe_minutes_limit?: unknown;
+    transcribe_minutes?: unknown;
+  };
   if (typeof body.db_bytes !== "number" || typeof body.r2_bytes !== "number") {
     throw new Error("internal config GET carried no usage split (db_bytes/r2_bytes)");
   }
   // transcribe_minutes is additive (cloud#56) — a pre-voice vault worker omits
   // it, so default 0 rather than fail the whole usage read.
   const transcribeMinutes = typeof body.transcribe_minutes === "number" ? body.transcribe_minutes : 0;
-  return { dbBytes: body.db_bytes, r2Bytes: body.r2_bytes, transcribeMinutes };
+
+  // The current DO always includes the resolved entitlement fields, including
+  // an explicit null `caps` for a legitimately unpushed vault. A response
+  // MISSING these control-plane fields entirely is different: a vault worker
+  // that doesn't know about entitlements at all (rollback). That vault's
+  // reconciliation is simply unavailable this run — never a reason to throw
+  // away an otherwise-good usage read.
+  const hasEntitlementFields =
+    body.caps !== undefined &&
+    typeof body.frozen === "boolean" &&
+    typeof body.transcription_enabled === "boolean" &&
+    typeof body.transcribe_minutes_limit === "number" &&
+    Number.isFinite(body.transcribe_minutes_limit);
+  const entitlement: ResolvedVaultEntitlement | null = hasEntitlementFields
+    ? {
+        caps: parseResolvedCaps(body.caps),
+        frozen: body.frozen as boolean,
+        transcriptionEnabled: body.transcription_enabled as boolean,
+        transcribeMinutesLimit: body.transcribe_minutes_limit as number,
+      }
+    : null;
+
+  return {
+    dbBytes: body.db_bytes,
+    r2Bytes: body.r2_bytes,
+    transcribeMinutes,
+    entitlement,
+  };
 }
 
 /** One vault's outcome from a cap push. `status` absent = transport error.
@@ -218,6 +321,22 @@ export interface CapPushResult {
   capBytes: number;
   ok: boolean;
   status?: number;
+  /** Total PUT attempts, including the successful attempt when ok is true. */
+  attempts: number;
+}
+
+/**
+ * Retryable outcomes only: 5xx (server/DO-side transient) and 429 (rate
+ * limit). A deterministic 4xx like 400 (bad request — a malformed
+ * entitlement this code produced) or 403 (auth/scope) fails IDENTICALLY on
+ * every attempt, so retrying just burns the whole budget for a guaranteed-
+ * repeat failure instead of getting to `event=plan_cap_push_failed` (and, on
+ * the reconcile path, `event=entitlement_reconciled ok=false`) promptly
+ * (cloud#186 review D4). Transport errors (the request never got a status at
+ * all) are always retried — handled separately in the catch block below.
+ */
+function isRetryableStatus(status: number): boolean {
+  return status >= 500 || status === 429;
 }
 
 /**
@@ -231,7 +350,11 @@ export interface CapPushResult {
  * push hiccup must never fail the operation. A missed push leaves the DO on
  * whatever it already had (a fresh vault → the more-generous env default; an
  * existing vault → its prior caps) — the safe direction; `applyPlanToVaults` /
- * the backfill script are the reconcilers.
+ * the backfill script are the reconcilers. A bounded retry loop absorbs the
+ * short transport/DO blips that are common at this seam — but only for
+ * {@link isRetryableStatus} outcomes and transport errors; a deterministic
+ * non-2xx fails fast on the first attempt. Only after retries are exhausted
+ * (or a fast-fail) does the existing `event=plan_cap_push_failed` warning fire.
  */
 export async function pushVaultCap(
   db: D1Database,
@@ -241,30 +364,81 @@ export async function pushVaultCap(
   entitlement: VaultEntitlement,
 ): Promise<CapPushResult> {
   const capBytes = entitlement.caps.notes_bytes + entitlement.caps.attachment_bytes;
-  try {
-    const res = await callVaultApi(db, deps, {
-      userId,
-      vaultName,
-      method: "PUT",
-      apiPath: "/api/internal/config",
-      verb: "admin",
-      jsonBody: {
-        caps: entitlement.caps,
-        transcription: entitlement.transcription,
-        frozen: entitlement.frozen,
-      },
-    });
-    if (!res.ok) {
-      console.warn(`event=plan_cap_push_failed vault=${vaultName} cap_bytes=${capBytes} status=${res.status}`);
-      return { vault: vaultName, capBytes, ok: false, status: res.status };
+  let lastStatus: number | undefined;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= CAP_PUSH_MAX_ATTEMPTS; attempt++) {
+    lastStatus = undefined;
+    lastError = undefined;
+    try {
+      // TODO(cloud#238): this retry loop is unbounded in SUBREQUEST COUNT,
+      // which is a separate axis from wall-clock and is not fixed by a
+      // timeout. `callVaultApi` supports an AbortSignal (the account-mcp
+      // fan-out uses one) and threading a per-attempt timeout here would cap
+      // a genuinely HUNG vault — but a hang is not required to hit the
+      // ceiling. Every attempt is a subrequest whether it returns in 1ms or
+      // hangs: change a PLAN_SPECS byte and EVERY vault mismatches on the
+      // next rollup, so USAGE_CRON does up to 2 × USAGE_RUN_CAP (500) = 1000
+      // subrequests from fast, healthy responses alone — at the edge of
+      // Cloudflare's per-invocation ceiling with nothing wrong anywhere.
+      // Bounding that needs a reconcile-specific cap (a RECONCILE_RUN_CAP on
+      // repairs per run), not a deadline. cloud#238 tracks all four gaps
+      // together: the AbortSignal for hangs, RECONCILE_RUN_CAP for count, the
+      // TOCTOU post-push re-read, and parseResolvedCaps degrading instead of
+      // throwing. Left undone this pass deliberately — none of them can
+      // over-grant or freeze, so they are hardening, not correctness.
+      const res = await callVaultApi(db, deps, {
+        userId,
+        vaultName,
+        method: "PUT",
+        apiPath: "/api/internal/config",
+        verb: "admin",
+        jsonBody: {
+          caps: entitlement.caps,
+          transcription: entitlement.transcription,
+          frozen: entitlement.frozen,
+        },
+      });
+      if (res.ok) return { vault: vaultName, capBytes, ok: true, status: res.status, attempts: attempt };
+      lastStatus = res.status;
+      if (!isRetryableStatus(lastStatus)) {
+        // Deterministic failure (400/403/...) — fail fast, don't burn the
+        // remaining budget on retries that can only repeat it.
+        console.warn(
+          `event=plan_cap_push_failed vault=${vaultName} cap_bytes=${capBytes} status=${lastStatus} attempts=${attempt} reason=non_retryable_status`,
+        );
+        return { vault: vaultName, capBytes, ok: false, status: lastStatus, attempts: attempt };
+      }
+    } catch (err) {
+      lastError = err;
     }
-    return { vault: vaultName, capBytes, ok: true, status: res.status };
-  } catch (err) {
-    console.warn(
-      `event=plan_cap_push_failed vault=${vaultName} cap_bytes=${capBytes} error=${err instanceof Error ? err.message : String(err)}`,
-    );
-    return { vault: vaultName, capBytes, ok: false };
+
+    if (attempt < CAP_PUSH_MAX_ATTEMPTS) {
+      const detail = lastStatus === undefined
+        ? `error=${lastError instanceof Error ? lastError.message : String(lastError)}`
+        : `status=${lastStatus}`;
+      console.warn(
+        `event=plan_cap_push_retry vault=${vaultName} cap_bytes=${capBytes} attempt=${attempt} next_attempt=${attempt + 1} backoff_ms=${CAP_PUSH_RETRY_BACKOFF_MS} ${detail}`,
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, CAP_PUSH_RETRY_BACKOFF_MS));
+    }
   }
+
+  if (lastStatus !== undefined) {
+    console.warn(
+      `event=plan_cap_push_failed vault=${vaultName} cap_bytes=${capBytes} status=${lastStatus} attempts=${CAP_PUSH_MAX_ATTEMPTS}`,
+    );
+  } else {
+    console.warn(
+      `event=plan_cap_push_failed vault=${vaultName} cap_bytes=${capBytes} attempts=${CAP_PUSH_MAX_ATTEMPTS} error=${lastError instanceof Error ? lastError.message : String(lastError)}`,
+    );
+  }
+  return {
+    vault: vaultName,
+    capBytes,
+    ok: false,
+    attempts: CAP_PUSH_MAX_ATTEMPTS,
+    ...(lastStatus === undefined ? {} : { status: lastStatus }),
+  };
 }
 
 /**
