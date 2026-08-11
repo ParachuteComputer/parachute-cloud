@@ -709,7 +709,7 @@ describe("C3 — DELETE /account/vaults/<name>", () => {
     expect(((await mint.json()) as { error: string }).error).toBe("not_owner");
   });
 
-  test("delete frees the name AND the plan's vault slot — the same name can be created again", async () => {
+  test("delete frees the D1 name claim and the plan's vault slot (NOT the same as the vault working again — see cloud#240)", async () => {
     const { userId, token } = await seedOwnerWithPlan("del-reclaim@example.com");
     await seedVault("phoenix", userId);
 
@@ -732,6 +732,25 @@ describe("C3 — DELETE /account/vaults/<name>", () => {
       .bind("phoenix")
       .first<{ owner_user_id: string }>();
     expect(owner?.owner_user_id).toBe(userId);
+
+    // SCOPE OF THIS TEST — read before trusting it, because its earlier title
+    // ("the same name can be created again") certified a property PRODUCTION
+    // DOES NOT HAVE. What is proven here is D1 bookkeeping ONLY: the name
+    // claim and the plan slot are released. Whether the RECREATED vault then
+    // works is a question about the Durable Object, and this suite cannot ask
+    // it — `accountDeps()` stubs `vaultFetch`, so no DO is involved at all.
+    //
+    // It does not work today. `idFromName` maps the reused name back to the
+    // SAME DO, whose in-memory `destroyed` latch (vault-do.ts) makes every
+    // subsequent request 410 `vault_destroyed` for as long as that instance
+    // stays resident — and each request keeps it resident. Filed as cloud#240;
+    // measured, not assumed (a probe confirmed the 410, and confirmed that
+    // deleteAll() drops every SQLite table, so the latch cannot simply be
+    // cleared: initSchema runs in the DO constructor).
+    //
+    // A test asserting the recreated vault is USABLE belongs in the vault
+    // worker's suite against a real DO, and would fail today. Asserting it
+    // here against a stub would only re-certify the same false property.
   });
 
   test("500 d1_cleanup_failed is honest when the sweep fails AFTER an irreversible destroy", async () => {
@@ -853,8 +872,23 @@ describe("C3 — DELETE /account/vaults/<name>", () => {
   test.each([
     ["non-2xx", async () => Response.json({ error: "busy" }, { status: 503 })],
     ["transport", async () => { throw new Error("vault worker unreachable"); }],
+    // THE 200-THAT-ISN'T cases. Each of these is a plausible way the seam
+    // could answer 200 without the DO having destroyed anything: a renamed or
+    // shadowed route answering generically, a proxy/service-binding
+    // interposing, a future handler returning a different success shape. If
+    // any were believed, the D1 rows — the ONLY record of whose bytes those
+    // were — would go while the bytes stayed: orphaned storage, still billed,
+    // no longer attributable, unreachable by any retry.
+    ["200 with destroyed:false", async () => Response.json({ destroyed: false, r2_objects_deleted: 0 })],
+    ["200 with no destroyed field", async () => Response.json({ ok: true })],
+    ["200 with destroyed as a string", async () => Response.json({ destroyed: "true", r2_objects_deleted: 0 })],
+    ["200 with r2_objects_deleted missing", async () => Response.json({ destroyed: true })],
+    ["200 with r2_objects_deleted negative", async () => Response.json({ destroyed: true, r2_objects_deleted: -1 })],
+    ["200 with r2_objects_deleted fractional", async () => Response.json({ destroyed: true, r2_objects_deleted: 1.5 })],
+    ["200 with r2_objects_deleted as a string", async () => Response.json({ destroyed: true, r2_objects_deleted: "3" })],
+    ["200 with an unparseable body", async () => new Response("not json", { status: 200 })],
   ] as const)("destroy %s leaves every D1 artifact intact", async (_kind, vaultFetch) => {
-    const { userId, token } = await seedOwnerWithPlan(`del-failure-${_kind}@example.com`);
+    const { userId, token } = await seedOwnerWithPlan(`del-failure-${_kind.replace(/[^a-z0-9]+/gi, "-")}@example.com`);
     await seedVault("failure-vault", userId);
     const now = await seedDeleteArtifacts("failure-vault", userId);
     const res = await handleAccountVaultDelete(

@@ -34,6 +34,7 @@ import { describe, expect, test } from "vitest";
 import { ACCOUNT_TOKEN_AUDIENCE } from "../src/account-auth.ts";
 import { handleAccountVaultsList } from "../src/account-api.ts";
 import {
+  ACCOUNT_PURGE_ALERT_AFTER_ATTEMPTS,
   DELETE_UNDO_WINDOW_MS,
   handleAccountDelete,
   handleAccountDeleteUndo,
@@ -44,6 +45,7 @@ import type { BillingOverrides } from "../src/billing.ts";
 import { sha256Hex } from "../src/crypto.ts";
 import type { EmailSender, OpsEmail, SendResult } from "../src/email.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
+import { eligibleFor } from "../src/drip.ts";
 import { DRIP_CRON, handleScheduled } from "../src/ops.ts";
 import { findActiveSession } from "../src/sessions.ts";
 import { signAccessToken } from "../src/tokens.ts";
@@ -411,6 +413,59 @@ describe("A-3 — DELETE /account/delete opens the undo window", () => {
     // an account that still bills must not also be un-loggable-into.
     expect((await getUserById(env.DB, acct.userId))?.deletedAt).toBeNull();
     expect(await findActiveSession(env.DB, acct.sessionId, T0)).not.toBeNull();
+  });
+
+  test("a hold that is placed and then cannot be released pages the operator", async () => {
+    // The compound failure: deferBilling succeeds, the tombstone write fails,
+    // and resumeBilling ALSO fails. The subscription is left at
+    // cancel_at_period_end on an account with NO tombstone — so no sweep will
+    // ever revisit it and the user's subscription silently lapses. Nothing in
+    // the product shows this; the alert is the only way it becomes work.
+    const acct = await seedAccount("req-hold-stuck@example.com", { stripe: true });
+    let updateCalls = 0;
+    const oneWayStripe = {
+      subscriptions: {
+        update: async (_id: string, params: { cancel_at_period_end?: boolean }) => {
+          updateCalls++;
+          // The hold lands; the RELEASE is what fails.
+          if (params.cancel_at_period_end === false) throw new Error("stripe is down");
+          return { id: _id, status: "active" };
+        },
+      },
+    } as unknown as Stripe;
+    const { sender, ops } = recordingSender();
+    const alertEnv = { ...env, OPERATOR_ALERT_EMAIL: "ops@example.com", ENVIRONMENT: "test-env" };
+
+    // Fail the TOMBSTONE WRITE SPECIFICALLY. Dropping `users` would be caught
+    // earlier, by requireAccount's own read, and never reach the code under
+    // test — so block exactly the one UPDATE instead, with a trigger. (Isolated
+    // per-test storage rolls this back.)
+    await env.DB
+      .prepare(
+        "CREATE TRIGGER block_tombstone BEFORE UPDATE OF deleted_at ON users WHEN NEW.deleted_at IS NOT NULL BEGIN SELECT RAISE(ABORT, 'tombstone blocked'); END",
+      )
+      .run();
+
+    const res = await handleAccountDelete(
+      alertEnv,
+      deleteReq(acct.token, acct.email),
+      accountDeps(clock(T0)),
+      sender,
+      billing(oneWayStripe),
+    );
+    expect(res.status).toBe(500);
+    expect(((await res.json()) as { error: string }).error).toBe("delete_request_failed");
+    // Hold placed, release attempted and failed.
+    expect(updateCalls).toBe(2);
+
+    const alert = ops.find((m) => m.subject.includes("billing hold stuck"));
+    expect(alert).toBeDefined();
+    expect(alert!.to).toBe("ops@example.com");
+    expect(alert!.text).toContain(acct.userId);
+    expect(alert!.text).toContain(`sub_${acct.userId}`);
+    // The operator needs to know this account is NOT deleted — that is what
+    // makes it unreachable by every automatic path.
+    expect(alert!.text).toContain("NOT deleted");
   });
 
   test("a failed notice email does not fail the deletion, and never claims it was sent", async () => {
@@ -827,6 +882,117 @@ describe("A-4 — past the window the sweep really deletes", () => {
     expect((await getUserById(env.DB, ok.userId)) === null).toBe(true);
   });
 
+  test.each([
+    ["destroyed:false", { destroyed: false, r2_objects_deleted: 0 }],
+    ["no destroyed field", { ok: true }],
+    ["r2_objects_deleted missing", { destroyed: true }],
+    ["r2_objects_deleted negative", { destroyed: true, r2_objects_deleted: -1 }],
+    ["r2_objects_deleted fractional", { destroyed: true, r2_objects_deleted: 2.5 }],
+  ] as const)(
+    "a 200 that is not the DO's real reply (%s) defers instead of deleting the rows",
+    async (kind, body) => {
+      // THE ORPHAN CASE. The sweep used to check only `res.ok`, then delete the
+      // D1 rows — which are the only record of whose bytes a vault held. A 200
+      // from anything other than the real handler would have left the storage
+      // billed, unattributable, and unreachable by any retry.
+      const acct = await seedAccount(`purge-liar-${kind.replace(/[^a-z0-9]+/gi, "-")}@example.com`, {
+        vaults: ["notreallygone"],
+      });
+      await seedVaultMirrors("notreallygone");
+      await handleAccountDelete(env, deleteReq(acct.token, acct.email), accountDeps(clock(T0)));
+
+      const liar: VaultFetch = async () => Response.json(body, { status: 200 });
+      const summary = await runAccountDeleteSweep(
+        env,
+        accountDeps(undefined, liar),
+        plus(DELETE_UNDO_WINDOW_MS),
+      );
+      expect(summary).toEqual({ due: 1, purged: 0, deferred: 1, failed: 0 });
+      // Everything that names the vault survives, so a later real destroy can
+      // still find it.
+      expect(await countRows("vaults", "name", "notreallygone")).toBe(1);
+      expect(await countRows("vault_usage", "vault_name", "notreallygone")).toBe(1);
+      expect((await getUserById(env.DB, acct.userId))?.deletedAt).toBe(T0.toISOString());
+    },
+  );
+
+  test("an unparseable 200 body also defers", async () => {
+    const acct = await seedAccount("purge-unparseable@example.com", { vaults: ["garbled"] });
+    await handleAccountDelete(env, deleteReq(acct.token, acct.email), accountDeps(clock(T0)));
+    const liar: VaultFetch = async () => new Response("not json", { status: 200 });
+    const summary = await runAccountDeleteSweep(env, accountDeps(undefined, liar), plus(DELETE_UNDO_WINDOW_MS));
+    expect(summary).toEqual({ due: 1, purged: 0, deferred: 1, failed: 0 });
+    expect(await countRows("vaults", "name", "garbled")).toBe(1);
+  });
+
+  test("each failed pass increments the attempt counter, and past the threshold it pages the operator", async () => {
+    const acct = await seedAccount("purge-escalate@example.com", { vaults: ["forever-wedged"] });
+    await handleAccountDelete(env, deleteReq(acct.token, acct.email), accountDeps(clock(T0)));
+    const { vaultFetch } = recordingVaultFetch({ failFor: new Set(["forever-wedged"]) });
+    const { sender, ops } = recordingSender();
+    const alertEnv = { ...env, OPERATOR_ALERT_EMAIL: "ops@example.com", ENVIRONMENT: "test-env" };
+
+    // Wind the counter to one below the threshold, then take the two passes
+    // that straddle it — the second is the one that must escalate.
+    await env.DB
+      .prepare("UPDATE users SET delete_purge_attempts = ? WHERE id = ?")
+      .bind(ACCOUNT_PURGE_ALERT_AFTER_ATTEMPTS - 2, acct.userId)
+      .run();
+
+    const quiet = await runAccountDeleteSweep(
+      alertEnv,
+      accountDeps(undefined, vaultFetch),
+      plus(DELETE_UNDO_WINDOW_MS),
+      { sender },
+    );
+    expect(quiet.deferred).toBe(1);
+    expect((await getUserById(env.DB, acct.userId))?.deletePurgeAttempts).toBe(
+      ACCOUNT_PURGE_ALERT_AFTER_ATTEMPTS - 1,
+    );
+    // Below the threshold the operator is NOT woken — otherwise a transient
+    // fault would page on its first pass and train them to ignore it.
+    expect(ops).toHaveLength(0);
+
+    const loud = await runAccountDeleteSweep(
+      alertEnv,
+      accountDeps(undefined, vaultFetch),
+      plus(DELETE_UNDO_WINDOW_MS + 3_600_000),
+      { sender },
+    );
+    expect(loud.deferred).toBe(1);
+    expect((await getUserById(env.DB, acct.userId))?.deletePurgeAttempts).toBe(
+      ACCOUNT_PURGE_ALERT_AFTER_ATTEMPTS,
+    );
+    expect(ops).toHaveLength(1);
+    expect(ops[0]!.to).toBe("ops@example.com");
+    expect(ops[0]!.subject).toContain("account deletion stuck");
+    // The alert must carry the account id — an operator cannot act on "an
+    // account somewhere is stuck".
+    expect(ops[0]!.text).toContain(acct.userId);
+    // …and must say the data is still there, which is the whole reason it is
+    // an email and not a log line.
+    expect(ops[0]!.text).toContain("STILL PRESENT");
+
+    // Dedupe: another pass inside the hour does not re-page.
+    await runAccountDeleteSweep(
+      alertEnv,
+      accountDeps(undefined, vaultFetch),
+      plus(DELETE_UNDO_WINDOW_MS + 3_600_000 + 60_000),
+      { sender },
+    );
+    expect(ops).toHaveLength(1);
+  });
+
+  test("a converging account never accrues attempts", async () => {
+    // The negative control for the counter: if it incremented on success, the
+    // escalation above would eventually page for healthy deletions.
+    const acct = await seedAccount("purge-noattempts@example.com", { vaults: ["smooth"] });
+    await handleAccountDelete(env, deleteReq(acct.token, acct.email), accountDeps(clock(T0)));
+    const summary = await runAccountDeleteSweep(env, accountDeps(), plus(DELETE_UNDO_WINDOW_MS));
+    expect(summary).toEqual({ due: 1, purged: 1, deferred: 0, failed: 0 });
+    expect(await getUserById(env.DB, acct.userId)).toBeNull();
+  });
+
   test("a live (never-deleted) account is invisible to the sweep — the negative control", async () => {
     const live = await seedAccount("purge-control@example.com", { vaults: ["safe"] });
     const { vaultFetch, calls } = recordingVaultFetch();
@@ -839,6 +1005,47 @@ describe("A-4 — past the window the sweep really deletes", () => {
     expect(calls).toEqual([]);
     expect((await getUserById(env.DB, live.userId)) !== null).toBe(true);
     expect(await countRows("vaults", "name", "safe")).toBe(1);
+  });
+
+  test("a throwing drip does not starve the sweep on the same tick", async () => {
+    // The drip runs FIRST on the hourly tick. Unguarded, a permanently
+    // throwing drip meant no deleted account was ever purged — the promise in
+    // the deletion email quietly never kept, with nothing failing loudly.
+    const acct = await seedAccount("purge-drip-throws@example.com");
+    await handleAccountDelete(env, deleteReq(acct.token, acct.email), accountDeps(clock(T0)));
+
+    // A sender whose drip send throws (rather than returning !ok) is the
+    // cheapest way to make runDrip itself reject through the seam it owns.
+    const exploding: EmailSender = {
+      kind: "devlog",
+      async sendMagicLink(): Promise<SendResult> {
+        return { ok: true };
+      },
+      async sendOps(): Promise<SendResult> {
+        return { ok: true };
+      },
+      async sendDrip(): Promise<SendResult> {
+        throw new Error("drip is broken");
+      },
+    };
+    // A LIVE, welcome-window arrival, so runDrip actually reaches the sender
+    // and throws. It cannot be the deleted account: A-1 excludes a tombstoned
+    // row from every drip eligibility query, so a deleted user is by
+    // construction never drip-eligible. (This is precisely how the first
+    // version of this test came out vacuous — the mutation that removes the
+    // guard passed it, because the sender was never called at all.)
+    const tick = plus(DELETE_UNDO_WINDOW_MS);
+    const live = await seedUser("purge-drip-live@example.com");
+    await env.DB
+      .prepare("UPDATE users SET created_at = ? WHERE id = ?")
+      .bind(new Date(tick.getTime() - 60_000).toISOString(), live.id)
+      .run();
+    // Control: the drip really is about to fire for this user.
+    expect((await eligibleFor(env.DB, "welcome", tick, 5)).map((u) => u.id)).toContain(live.id);
+
+    await handleScheduled(DRIP_CRON, env, exploding, { now: () => tick });
+    // The tick survived the drip's exception and the sweep still ran.
+    expect(await getUserById(env.DB, acct.userId)).toBeNull();
   });
 
   test("the sweep is actually ON the hourly cron — not merely exported", async () => {
