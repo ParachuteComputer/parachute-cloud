@@ -28,8 +28,12 @@ IDENTITY_STAGING="https://parachute-identity-staging.openparachute.workers.dev"
 VAULT_STAGING="https://parachute-vault-do-staging.openparachute.workers.dev"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Verify and rebuild the exact shared Hub contract before the workspace install
-# snapshots the file: dependency into node_modules.
+# Verify the exact pinned vault-core commit (cloud#45, cloud#59) and the
+# shared Hub contract before the workspace install snapshots either file:
+# dependency into node_modules. This is the local-deploy close for cloud#59:
+# without it, a developer's sibling parachute-vault checkout on some other
+# branch would get silently copied into node_modules and deployed.
+bash "$ROOT/scripts/materialize-vault-core.sh"
 bash "$ROOT/scripts/materialize-door-contract.sh"
 # Refresh the copied file: dep FIRST — bun snapshots @openparachute/core into
 # node_modules at install time, so a vault-core change upstream is INVISIBLE to

@@ -68,16 +68,6 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         if: steps.gate.outputs.ready == 'true'
 
-      - name: Clone parachute-vault (sibling file dep for @openparachute/core)
-        # workers/vault builds against file:../../../parachute-vault/core — a
-        # sibling checkout outside this repo. Deploys build against
-        # parachute-vault@main, matching local practice (the deploy script's
-        # own `bun install` refreshes the copied dep from this clone).
-        if: steps.gate.outputs.ready == 'true'
-        run: |
-          git clone --depth 1 https://github.com/ParachuteComputer/parachute-vault.git "$GITHUB_WORKSPACE/../parachute-vault"
-          echo "parachute-vault @ $(git -C "$GITHUB_WORKSPACE/../parachute-vault" rev-parse HEAD)"
-
       - name: Fetch pinned Parachute App (SPA served by the identity worker)
         # scripts/spa-source.env is the single source pin. Fetching the exact
         # commit makes tagged production deploys deterministic.
@@ -95,6 +85,14 @@ jobs:
         if: steps.gate.outputs.ready == 'true'
         with:
           bun-version: 1.3.13 # keep consistent with local dev
+
+      - name: Materialize pinned vault-core dependency
+        # workers/vault builds against file:../../../parachute-vault/core — a
+        # sibling checkout outside this repo. Deploys materialize the exact
+        # commit pinned in scripts/vault-source.env (the deploy script's own
+        # `bun install` refreshes the copied dep from this checkout).
+        if: steps.gate.outputs.ready == 'true'
+        run: bash scripts/materialize-vault-core.sh
 
       - name: Materialize pinned Hub door-contract dependency
         if: steps.gate.outputs.ready == 'true'
