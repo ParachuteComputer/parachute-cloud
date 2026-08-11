@@ -254,7 +254,8 @@ app.post("/account/token", (c) => handleAccountToken(c.env.DB, c.req.raw, depsFo
 // token above (validateAccountToken + hasAccountScope — read for GET, admin for
 // mutations), account id from the TOKEN not the body. GET list, POST create
 // (returns a ready vault_token — lands the app IN the vault), per-vault mint,
-// and DELETE (501 — no delete door on the hosted side yet). account-api.ts.
+// and DELETE (cloud#226 — the real teardown: confirm-retype + ownership gate,
+// then the vault worker's destroy, then the identity D1 sweep). account-api.ts.
 app.get("/account/session", (c) => handleAccountSession(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/summary", (c) => handleAccountSummary(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, depsFor(c.env)));

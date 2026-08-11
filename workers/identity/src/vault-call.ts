@@ -182,6 +182,36 @@ export async function callVaultImport(
   });
 }
 
+/**
+ * Ask the target vault's DO to perform its irreversible teardown
+ * (`POST /api/internal/destroy`). This uses the same first-party admin mint as
+ * the config, snapshot, restore, and import seams; the identity-side ownership
+ * check happens before this helper is called, so this function only owns the
+ * issuer→vault hop.
+ *
+ * NOT best-effort: the account delete route must inspect the returned status and
+ * body before it touches D1. A transport error propagates, and a non-2xx response
+ * is returned to the caller rather than being swallowed like `pushVaultCap`'s
+ * plan-reconciliation failures. That ordering is the safe direction: a failed
+ * storage teardown must leave the ownership and accounting rows available for a
+ * retry.
+ */
+export async function callVaultDestroy(
+  db: D1Database,
+  deps: OAuthDeps,
+  userId: string,
+  vaultName: string,
+): Promise<Response> {
+  return callVaultApi(db, deps, {
+    userId,
+    vaultName,
+    method: "POST",
+    apiPath: "/api/internal/destroy",
+    verb: "admin",
+    jsonBody: { confirm: vaultName },
+  });
+}
+
 /** The DO's resolved plan entitlement, as reported by GET /api/internal/config. */
 export interface ResolvedVaultEntitlement {
   /** The currently resolved two-meter entitlement; null means unpushed (a

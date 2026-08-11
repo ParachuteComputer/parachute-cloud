@@ -82,8 +82,12 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // APP_CLIENT_ID constant stays exported below — the C5 seeded client and
     // any cross-origin native flow still use it; only the advertisement goes.
     // Cloud v1: create yes; rename NO (the vault name is the immutable global
-    // slug / DO address / URL); delete not yet (handleAccountVaultDelete is 501).
-    capabilities: { vault_create: true, vault_rename: false, vault_delete: false },
+    // slug / DO address / URL); delete YES since cloud#226 — `DELETE
+    // /account/vaults/<name>` is a real teardown (vault-worker destroy, then the
+    // identity-side D1 sweep), so the door now advertises the capability it
+    // actually has. A client that reads this flag is what turns the endpoint
+    // into a user-facing affordance; leaving it false would ship the route dark.
+    capabilities: { vault_create: true, vault_rename: false, vault_delete: true },
     // The account-level MCP endpoint (Wave A PR3) — one connection across the
     // account's vaults (list-vaults / create-vault / query-notes). Advertised at
     // the FRONT DOOR origin (`my.` in prod, self-referential in staging), where
