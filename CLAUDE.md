@@ -50,7 +50,7 @@ The engine is `@openparachute/core` (in parachute-vault) — never reimplement s
 
 ## Governance / CI
 
-Same as the workspace: PR-only, reviewer-gated, no self-merge; every code-touching PR bumps rc.N (private package — the discipline is for history legibility). `.github/workflows/ci.yml` clones parachute-vault@main as a sibling (the `file:` core dep needs it). `deploy-staging.yml` auto-runs on pushes to main; `deploy-prod.yml` is manual-dispatch only, gated on Aaron's `production` environment approval. The deploy secret-gate skips GREEN when secrets are unset — verify a NEW deployment actually landed before claiming deployed.
+Same as the workspace: PR-only, reviewer-gated, no self-merge; every code-touching PR bumps rc.N (private package — the discipline is for history legibility). `.github/workflows/ci.yml` and both deploy paths materialize the exact parachute-vault commit pinned in `scripts/vault-source.env` as a sibling (the `file:` core dep needs it) — promote vault-core by bumping the pin. `deploy-staging.yml` auto-runs on pushes to main; `deploy-prod.yml` is manual-dispatch only, gated on Aaron's `production` environment approval. The deploy secret-gate skips GREEN when secrets are unset — verify a NEW deployment actually landed before claiming deployed.
 
 ## License
 
