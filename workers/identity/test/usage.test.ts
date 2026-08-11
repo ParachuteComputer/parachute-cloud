@@ -20,6 +20,7 @@ import { validateAccessToken } from "../src/tokens.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
 import type { EmailSender, SendResult } from "../src/email.ts";
 import { planEntitlement, type VaultEntitlement } from "../src/plans.ts";
+import { CAP_PUSH_MAX_ATTEMPTS, applyPlanToVaults } from "../src/vault-call.ts";
 import { CSRF, ISSUER, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 const NOW = new Date("2026-07-03T03:30:00Z");
@@ -192,6 +193,71 @@ describe("runUsageRollup", () => {
     const map = await latestUsageForVaults(env.DB, ["voice-a", "voice-legacy"]);
     expect(map.get("voice-a")?.transcribeMinutes).toBe(12.5);
     expect(map.get("voice-legacy")?.transcribeMinutes).toBe(0);
+  });
+
+  test("END-TO-END (cloud#186): an upgrade whose push EXHAUSTS its retries leaves the customer under-entitled — the next daily rollup repairs it, and the one after is a no-op", async () => {
+    // The issue's headline scenario, driven through the REAL seams rather than
+    // a hand-placed mismatch: the two halves of the fix (push-time retry,
+    // daily reconciler) are separately tested above, but only this test proves
+    // they COMPOSE — that the state a totally-failed `applyPlanToVaults`
+    // leaves behind is exactly the state the reconciler detects and repairs.
+    const { id: owner } = await seedUser("e2e-upgrade@example.com");
+    await seedVault("e2e-v", owner);
+
+    // The DO starts on the trial entitlement it was created with.
+    let resolved = planEntitlement("trial");
+    let putAttempts = 0;
+    let vaultDown = true; // the transient window: every PUT 503s
+    const runDeps: OAuthDeps = {
+      ...deps(() => NOW),
+      vaultFetch: async (_input, init) => {
+        if (init?.method === "GET") return Response.json(splitBody(4096, 128, resolved));
+        if (init?.method === "PUT") {
+          putAttempts++;
+          if (vaultDown) return new Response("transient", { status: 503 });
+          resolved = JSON.parse(String(init.body)) as VaultEntitlement;
+          return Response.json({ ok: true });
+        }
+        return new Response("method not allowed", { status: 405 });
+      },
+    };
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      // 1. The customer pays and upgrades to standard — D1 flips...
+      await env.DB.prepare("UPDATE users SET plan = 'standard', pending_plan = NULL WHERE id = ?").bind(owner).run();
+      // ...but the entitlement push exhausts its whole retry budget.
+      const pushes = await applyPlanToVaults(env.DB, runDeps, owner);
+      expect(pushes).toHaveLength(1);
+      expect(pushes[0]).toMatchObject({ vault: "e2e-v", ok: false, status: 503, attempts: CAP_PUSH_MAX_ATTEMPTS });
+      expect(putAttempts).toBe(CAP_PUSH_MAX_ATTEMPTS);
+      // THE BUG this issue is about: a paying customer on the trial's caps and
+      // WITHOUT the voice entitlement they are now billed for.
+      expect(resolved).toEqual(planEntitlement("trial"));
+      expect(resolved.transcription.enabled).toBe(planEntitlement("trial").transcription.enabled);
+
+      // 2. The window closes; the next daily rollup wakes and self-heals.
+      vaultDown = false;
+      putAttempts = 0;
+      const heal = await runUsageRollup(env, runDeps, { onlyVault: "e2e-v" });
+      expect(heal).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 1, capped: false });
+      expect(putAttempts).toBe(1); // healthy vault → repaired on the first try
+      // Exactly what the customer pays for — caps AND voice, no operator, no
+      // scripts/backfill-plans.ts run.
+      expect(resolved).toEqual(planEntitlement("standard"));
+      expect(
+        log.mock.calls.some((c) => String(c[0]).includes("event=entitlement_reconciled vault=e2e-v ok=true")),
+      ).toBe(true);
+
+      // 3. Idempotent: nothing is wrong any more, so the next tick pushes nothing.
+      const quiet = await runUsageRollup(env, runDeps, { onlyVault: "e2e-v" });
+      expect(quiet).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(putAttempts).toBe(1); // still 1 — no second push
+    } finally {
+      warn.mockRestore();
+      log.mockRestore();
+    }
   });
 
   test("reconciles a missed plan push once, then stays idempotent on the next rollup", async () => {
