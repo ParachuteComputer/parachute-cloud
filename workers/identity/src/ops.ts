@@ -32,6 +32,7 @@
  */
 import type { Env } from "./env.ts";
 import type { EmailSender } from "./email.ts";
+import { runAccountDeleteSweep } from "./account-delete.ts";
 import { runBillingSweep } from "./billing-lifecycle.ts";
 import { runDrip } from "./drip.ts";
 import { depsForEnv } from "./oauth-shared.ts";
@@ -91,6 +92,20 @@ export async function handleScheduled(cron: string, env: Env, sender: EmailSende
       await runBillingSweep(env.DB, sweepDeps, deps.now?.() ?? new Date());
     } catch (err) {
       console.error(`event=billing_sweep_failed error=${err instanceof Error ? err.message : String(err)}`);
+    }
+    // The account-delete convergence sweep (cloud#226 A-4, account-delete.ts)
+    // rides the same hourly tick — the undo window is 24 hours, so hourly
+    // resolution is ample and a dedicated cron pattern would have to be added
+    // to two wrangler.toml [triggers] blocks for nothing. Independently
+    // guarded, in its own try, for the same reason the billing sweep is: these
+    // three jobs share a tick but must not share a failure. It goes LAST
+    // because it is the only one that destroys anything.
+    try {
+      const purgeDeps = depsForEnv(env);
+      if (deps.now) purgeDeps.now = deps.now;
+      await runAccountDeleteSweep(env, purgeDeps, deps.now?.() ?? new Date());
+    } catch (err) {
+      console.error(`event=account_delete_sweep_failed error=${err instanceof Error ? err.message : String(err)}`);
     }
   } else if (job === "usage") {
     // The rollup's vault reads go through the mint seam, so it takes the full
