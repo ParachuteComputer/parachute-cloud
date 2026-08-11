@@ -87,6 +87,14 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // identity-side D1 sweep), so the door now advertises the capability it
     // actually has. A client that reads this flag is what turns the endpoint
     // into a user-facing affordance; leaving it false would ship the route dark.
+    // NOT advertised here, deliberately: the WHOLE-ACCOUNT door (cloud#226
+    // A-3, `/account/delete` + `/account/undo-delete`) has no flag, because
+    // `AccountCapabilities` is the SHARED door contract — it lives upstream in
+    // parachute-hub's `packages/door-contract` and is CI-pinned to a reviewed
+    // commit, so a new key belongs to an upstream PR + a pin bump, not to a
+    // cloud-side wiring branch. Until that lands, a client learns the door
+    // exists from the contract's route list, not from a capability bit. The
+    // route works either way; what it lacks is the advertisement.
     capabilities: { vault_create: true, vault_rename: false, vault_delete: true },
     // The account-level MCP endpoint (Wave A PR3) — one connection across the
     // account's vaults (list-vaults / create-vault / query-notes). Advertised at

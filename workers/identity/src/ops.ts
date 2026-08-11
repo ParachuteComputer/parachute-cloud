@@ -17,7 +17,11 @@
  *   - hourly at :15 (DRIP_CRON): the onboarding email drip — routed here,
  *     implemented in drip.ts (eligibility windows, idempotence ledger,
  *     per-run cap, unsubscribe) — plus the billing sweep (Wave 4d,
- *     billing-lifecycle.ts): apply due pending plan downgrades.
+ *     billing-lifecycle.ts): apply due pending plan downgrades — plus the
+ *     account-delete convergence sweep (cloud#226 A-4, account-delete.ts):
+ *     for accounts past their 24-hour undo window, tear down billing, destroy
+ *     every owned vault, and purge the account rows. Three jobs, one tick,
+ *     three independent try blocks — they must not share a failure.
  *   - daily 03:30 UTC (USAGE_CRON): the per-vault storage-usage rollup plus
  *     plan-entitlement reconciler — routed here, implemented in usage.ts
  *     (one internal-config GET and one D1 `vault_usage` row per vault per UTC
