@@ -406,6 +406,120 @@ describe("runUsageRollup", () => {
     }
   });
 
+  test("D1 CORE — the repair PUSHES THE FRESH PLAN, not the stale snapshot, when the owner flips to a THIRD value mid-run", async () => {
+    // The D1 race test above proves we don't clobber a DO that ALREADY matches
+    // the new truth — but it returns before the push, so it cannot see WHICH
+    // entitlement the push carries. Neither can any other reconcile test here:
+    // in each of them the snapshot and the fresh re-read are the same plan, so
+    // pushing `snapshotExpected` instead of `freshExpected` would pass the
+    // entire suite. This is the test that distinguishes them: the snapshot says
+    // standard, the DO holds trial (so there IS a real repair to do), and the
+    // owner flips to a THIRD value — power — mid-run. Exactly one entitlement
+    // is correct to push, and it is neither the snapshot's nor the DO's.
+    const { id: owner } = await seedUser("fresh-push@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard', pending_plan = NULL WHERE id = ?").bind(owner).run();
+    await seedVault("fresh-push-v", owner);
+
+    let getCalls = 0;
+    const pushedBodies: VaultEntitlement[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const runDeps: OAuthDeps = {
+      ...deps(() => NOW),
+      vaultFetch: async (_input, init) => {
+        if (init?.method === "GET") {
+          getCalls++;
+          if (getCalls === 1) {
+            // After the batch query snapshot ('standard'), before this vault's
+            // reconcile: the customer upgrades again, to power.
+            await env.DB.prepare("UPDATE users SET plan = 'power', pending_plan = NULL WHERE id = ?").bind(owner).run();
+          }
+          // The DO is still on trial — a genuinely missed push, so the
+          // reconciler will reach the push rather than short-circuiting.
+          return Response.json(splitBody(1234, 56, planEntitlement("trial")));
+        }
+        if (init?.method === "PUT") {
+          pushedBodies.push(JSON.parse(String(init.body)) as VaultEntitlement);
+          return Response.json({ ok: true });
+        }
+        return new Response("method not allowed", { status: 405 });
+      },
+    };
+
+    try {
+      const summary = await runUsageRollup(env, runDeps, { onlyVault: "fresh-push-v" });
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 1, capped: false });
+      expect(pushedBodies).toHaveLength(1);
+      // THE ASSERTION: power (the fresh truth), never standard (the snapshot).
+      expect(pushedBodies[0]).toEqual(planEntitlement("power"));
+      expect(pushedBodies[0]).not.toEqual(planEntitlement("standard"));
+      // And the customer is not left short of what they now pay for.
+      const powerEnt = planEntitlement("power");
+      const standardEnt = planEntitlement("standard");
+      expect(pushedBodies[0].caps.notes_bytes + pushedBodies[0].caps.attachment_bytes).toBe(
+        powerEnt.caps.notes_bytes + powerEnt.caps.attachment_bytes,
+      );
+      expect(pushedBodies[0].caps.notes_bytes + pushedBodies[0].caps.attachment_bytes).toBeGreaterThan(
+        standardEnt.caps.notes_bytes + standardEnt.caps.attachment_bytes,
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("a reconcile-step THROW is attributed to reconciliation, never to the usage fetch (recorded + failed <= vaults holds)", async () => {
+    const { id: owner } = await seedUser("reconcile-throw@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard', pending_plan = NULL WHERE id = ?").bind(owner).run();
+    await seedVault("reconcile-throw-v", owner);
+
+    // Break ONLY the reconcile step's own D1 read (getUserById), leaving the
+    // enumeration query and the usage-row INSERT working. Before the split
+    // try/catch this threw into the usage-recording catch, counting the vault
+    // as recorded AND failed and blaming `usage_fetch_failed` for a D1 call
+    // the usage fetch never made.
+    const failingDb = new Proxy(env.DB, {
+      get(target, prop, receiver) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            if (sql.includes("SELECT * FROM users WHERE id")) throw new Error("D1 exploded mid-reconcile");
+            return target.prepare(sql);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const runDeps: OAuthDeps = {
+      ...deps(() => NOW),
+      vaultFetch: async (_input, init) => {
+        if (init?.method === "GET") return Response.json(splitBody(777, 33, planEntitlement("trial")));
+        return new Response("method not allowed", { status: 405 });
+      },
+    };
+
+    try {
+      const summary = await runUsageRollup({ ...env, DB: failingDb }, runDeps, { onlyVault: "reconcile-throw-v" });
+      // recorded stays 1, failed stays 0 — the usage read genuinely succeeded.
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(summary.recorded + summary.failed).toBeLessThanOrEqual(summary.vaults);
+      // The usage row SURVIVES a reconcile failure.
+      expect(await usageRows()).toEqual([
+        { vault_name: "reconcile-throw-v", day: TODAY, db_bytes: 777, r2_bytes: 33 },
+      ]);
+      // Blamed correctly, and NOT on the usage fetch.
+      expect(
+        errSpy.mock.calls.some((c) =>
+          String(c[0]).includes("event=entitlement_reconcile_failed vault=reconcile-throw-v"),
+        ),
+      ).toBe(true);
+      expect(errSpy.mock.calls.some((c) => String(c[0]).includes("event=usage_fetch_failed"))).toBe(false);
+    } finally {
+      log.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
   test("D2 — an unrecognized raw plan value skips reconcile entirely: zero pushes, never freezes a live vault", async () => {
     const { id: owner } = await seedUser("garbage-plan@example.com");
     // A hand-edited/raw-restored row: 'free' predates the pricing-model

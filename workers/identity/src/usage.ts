@@ -218,7 +218,23 @@ export async function runUsageRollup(
         .run();
       recorded++;
 
-      if (await reconcileVaultEntitlement(env.DB, deps, v, usage.entitlement)) reconciled++;
+      // Reconciliation is its OWN failure domain, deliberately outside the
+      // usage-recording try. It makes calls the usage read never made (a D1
+      // `getUserById`, a vault PUT), so a throw from either must not be
+      // attributed to the usage fetch: sharing the outer catch would count
+      // this vault as BOTH `recorded` and `failed` (breaking the
+      // recorded + failed <= vaults invariant the summary is read with) and
+      // log `event=usage_fetch_failed` for something that never touched the
+      // usage read — a misleading trail for whoever debugs it at 03:30 UTC.
+      // The usage row written above stands; only reconciliation is lost, and
+      // it self-heals on the next daily tick like every other skip here.
+      try {
+        if (await reconcileVaultEntitlement(env.DB, deps, v, usage.entitlement)) reconciled++;
+      } catch (err) {
+        console.error(
+          `event=entitlement_reconcile_failed vault=${v.name} error=${JSON.stringify(err instanceof Error ? err.message : String(err))}`,
+        );
+      }
     } catch (err) {
       // Skip + log + continue — one vault's bad day never starves the rest.
       failed++;

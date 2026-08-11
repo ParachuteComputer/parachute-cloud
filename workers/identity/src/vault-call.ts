@@ -370,21 +370,22 @@ export async function pushVaultCap(
     lastStatus = undefined;
     lastError = undefined;
     try {
-      // TODO(cloud#186 review D5, optional/not yet done): callVaultApi
-      // supports an AbortSignal (used by the account-mcp fan-out) but no
-      // timeout is threaded here, so a genuinely HUNG vault (not a fast
-      // error) burns the full CAP_PUSH_MAX_ATTEMPTS budget at whatever the
-      // platform's own request timeout is, not this module's. Reviewer's
-      // amplification numbers: a Stripe webhook awaiting applyPlanToVaults
-      // worst-cases at up to 10 vaults × (3 hung attempts + 200ms backoff)
-      // before the webhook handler returns; the USAGE_CRON rollup worst-cases
-      // at USAGE_RUN_CAP × up to 4 subrequests (1 GET + up to 3 PUT attempts)
-      // = 2000 subrequests in one invocation, well past what's comfortable
-      // under Cloudflare's per-invocation subrequest ceiling if vaults are
-      // hanging rather than erroring fast. Threading a short per-attempt
-      // AbortSignal timeout here would cap both without changing the retry
-      // shape — left undone this pass; do it before push volume makes a hung
-      // vault a routine occurrence rather than a theoretical one.
+      // TODO(cloud#238): this retry loop is unbounded in SUBREQUEST COUNT,
+      // which is a separate axis from wall-clock and is not fixed by a
+      // timeout. `callVaultApi` supports an AbortSignal (the account-mcp
+      // fan-out uses one) and threading a per-attempt timeout here would cap
+      // a genuinely HUNG vault — but a hang is not required to hit the
+      // ceiling. Every attempt is a subrequest whether it returns in 1ms or
+      // hangs: change a PLAN_SPECS byte and EVERY vault mismatches on the
+      // next rollup, so USAGE_CRON does up to 2 × USAGE_RUN_CAP (500) = 1000
+      // subrequests from fast, healthy responses alone — at the edge of
+      // Cloudflare's per-invocation ceiling with nothing wrong anywhere.
+      // Bounding that needs a reconcile-specific cap (a RECONCILE_RUN_CAP on
+      // repairs per run), not a deadline. cloud#238 tracks all four gaps
+      // together: the AbortSignal for hangs, RECONCILE_RUN_CAP for count, the
+      // TOCTOU post-push re-read, and parseResolvedCaps degrading instead of
+      // throwing. Left undone this pass deliberately — none of them can
+      // over-grant or freeze, so they are hardening, not correctness.
       const res = await callVaultApi(db, deps, {
         userId,
         vaultName,
