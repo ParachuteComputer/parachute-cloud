@@ -133,6 +133,161 @@ export async function userOwnsVault(db: D1Database, userId: string, name: string
   return v !== null && v.ownerUserId === userId;
 }
 
+export interface VaultDeleteD1Summary {
+  vaultRowsDeleted: number;
+  usageRowsDeleted: number;
+  snapshotRowsDeleted: number;
+  tokensRevoked: number;
+  grantsRewritten: number;
+  grantsDropped: number;
+}
+
+/**
+ * A LIKE pattern matching any scope string that CONTAINS the `vault:<name>:`
+ * segment prefix — the cheap D1-side CANDIDATE filter for the delete cascade,
+ * never the authority (see {@link deleteVaultD1Rows}). Wildcards in the name are
+ * escaped (`ESCAPE '\'`) because `_` is a LIKE single-char wildcard and legacy
+ * rows can predate today's stricter slug gate.
+ */
+function vaultScopeLikePattern(vaultName: string): string {
+  return `%vault:${vaultName.replace(/[\\%_]/g, "\\$&")}:%`;
+}
+
+/** The scope strings in a space-delimited scope column, as an array. */
+function splitScopes(scopes: string): string[] {
+  return scopes.split(" ").filter((s) => s.length > 0);
+}
+
+/**
+ * Remove the identity-side rows for one owned vault after the vault worker has
+ * erased the DO and its R2 prefix. Ports the self-hosted hub twin's cascade
+ * (`handleDeleteVault` → `revokeTokensNamingVault` + `rewriteGrantsRemovingVault`)
+ * onto D1, in the same order — identity artifacts first, ownership claim last,
+ * because revocation is the safe direction if a later step fails.
+ *
+ * MATCHING IS EXACT SCOPE-SEGMENT COMPARISON, NEVER `LIKE` — the twin's rule,
+ * kept here. A scope names this vault iff it parses as the three-part
+ * `vault:<name>:<verb>` grammar ({@link vaultScopeName}) with `<name>` equal;
+ * a substring hit is not enough. The one adaptation for D1 is that a `LIKE`
+ * pattern PRE-FILTERS which rows are read (the hub reads the whole unrevoked
+ * registry into memory; cloud's is multi-tenant and must not). That is sound in
+ * exactly one direction: every true match contains the `vault:<name>:` substring,
+ * so the pattern is a superset — it can over-fetch candidates, never miss one,
+ * and the JS check discards the extras. Do not promote the pattern to the
+ * decision; `xvault:foo:read` and `account:<id>:vaults:foo:read` are precisely
+ * the strings that must survive it.
+ *
+ * Grants are REWRITTEN, not dropped, when they name the vault — a `grants` row
+ * is keyed (user, client) and its scope set spans every vault that user ever
+ * approved for that client, so dropping the row over one vault would silently
+ * revoke the client's consent on the user's OTHER vaults. The row is deleted
+ * only when the rewrite empties it. This also closes the re-create hole: a
+ * client that held `vault:<name>:read` must face the consent screen again if a
+ * vault of that name is ever created anew.
+ *
+ * Token registry rows are retained and marked `revoked_at`, matching the
+ * identity worker's existing revocation-list convention. Only rows that were
+ * still live contribute to `tokensRevoked`, so a retry after a D1 failure is
+ * idempotent — as are the row deletes.
+ *
+ * Every write runs in ONE D1 batch (D1 has no interactive transaction; a batch
+ * is the atomic unit). A batch failure therefore leaves the whole cascade
+ * available for a retry, which matters because the preceding vault destroy is
+ * intentionally irreversible but itself idempotent. The two candidate SELECTs
+ * run before it and write nothing.
+ *
+ * REMAINING RESIDUE, stated rather than implied away: the cascade sweeps the
+ * three-part `vault:<name>:<verb>` grammar the twin defines, and NOT cloud's
+ * own composed ACCOUNT scopes (`account:<id>:vaults:<name>:<verb>`), which have
+ * no hub counterpart. Those are inert against a deleted vault — the account-MCP
+ * fan-out resolves vaults through `listVaultsForOwner` at call time, so a dead
+ * name reaches nothing — but they would still cover a same-name vault created
+ * later without a fresh consent. Sweeping them safely means reasoning about
+ * `recordGrant`'s family-replace narrowing semantics (grants.ts), which is a
+ * consent-model change and wants its own review, not a wiring slice (cloud#226).
+ */
+export async function deleteVaultD1Rows(
+  db: D1Database,
+  ownerUserId: string,
+  name: string,
+  now: Date = new Date(),
+): Promise<VaultDeleteD1Summary> {
+  const vaultName = name.toLowerCase();
+  const pattern = vaultScopeLikePattern(vaultName);
+
+  const [tokenCandidates, grantCandidates] = await Promise.all([
+    db
+      .prepare("SELECT jti, scopes FROM tokens WHERE revoked_at IS NULL AND scopes LIKE ? ESCAPE '\\'")
+      .bind(pattern)
+      .all<{ jti: string; scopes: string }>(),
+    db
+      .prepare("SELECT user_id, client_id, scopes FROM grants WHERE scopes LIKE ? ESCAPE '\\'")
+      .bind(pattern)
+      .all<{ user_id: string; client_id: string; scopes: string }>(),
+  ]);
+
+  const jtis = (tokenCandidates.results ?? [])
+    .filter((r) => splitScopes(r.scopes).some((s) => vaultScopeName(s) === vaultName))
+    .map((r) => r.jti);
+
+  const statements: D1PreparedStatement[] = [];
+
+  // Revoke in chunks: SQLite caps bound parameters (~999), and a busy account
+  // can hold more live vault tokens than one IN-list should carry.
+  const REVOKE_CHUNK = 100;
+  const revokeStatementCount = Math.ceil(jtis.length / REVOKE_CHUNK);
+  for (let i = 0; i < jtis.length; i += REVOKE_CHUNK) {
+    const chunk = jtis.slice(i, i + REVOKE_CHUNK);
+    statements.push(
+      db
+        .prepare(
+          `UPDATE tokens SET revoked_at = ? WHERE revoked_at IS NULL AND jti IN (${chunk.map(() => "?").join(", ")})`,
+        )
+        .bind(now.toISOString(), ...chunk),
+    );
+  }
+
+  let grantsRewritten = 0;
+  let grantsDropped = 0;
+  for (const row of grantCandidates.results ?? []) {
+    const scopes = splitScopes(row.scopes);
+    const kept = scopes.filter((s) => vaultScopeName(s) !== vaultName);
+    if (kept.length === scopes.length) continue; // LIKE over-fetch — not a real match.
+    if (kept.length === 0) {
+      statements.push(
+        db.prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?").bind(row.user_id, row.client_id),
+      );
+      grantsDropped++;
+    } else {
+      statements.push(
+        db
+          .prepare("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ?")
+          .bind(kept.join(" "), row.user_id, row.client_id),
+      );
+      grantsRewritten++;
+    }
+  }
+
+  const mirrorsAt = statements.length;
+  statements.push(
+    db.prepare("DELETE FROM vault_usage WHERE vault_name = ?").bind(vaultName),
+    db.prepare("DELETE FROM vault_snapshots WHERE vault_name = ?").bind(vaultName),
+    db.prepare("DELETE FROM vaults WHERE name = ? AND owner_user_id = ?").bind(vaultName, ownerUserId),
+  );
+
+  const results = await db.batch(statements);
+  let tokensRevoked = 0;
+  for (let i = 0; i < revokeStatementCount; i++) tokensRevoked += results[i]?.meta.changes ?? 0;
+  return {
+    tokensRevoked,
+    grantsRewritten,
+    grantsDropped,
+    usageRowsDeleted: results[mirrorsAt]?.meta.changes ?? 0,
+    snapshotRowsDeleted: results[mirrorsAt + 1]?.meta.changes ?? 0,
+    vaultRowsDeleted: results[mirrorsAt + 2]?.meta.changes ?? 0,
+  };
+}
+
 /**
  * Claim a vault name for a user. Validates slug + reserved, then inserts. Throws
  * VaultNameInvalidError (bad name) or VaultNameTakenError (name already owned by
@@ -193,14 +348,27 @@ export async function clearImportPending(db: D1Database, name: string, ownerUser
     .run();
 }
 
+/**
+ * The vault a single scope NAMES, or null when it names none. The one place the
+ * `vault:<name>:<verb>` grammar is decided — twin of the hub's `vaultScopeName`.
+ * Returns null for an unnamed vault scope (`vault:read`), for a non-vault scope,
+ * and for every ACCOUNT scope family (`account:<id>:vaults:<name>:<verb>` has
+ * five parts and a `vaults` head, so it can never be mistaken for this one).
+ */
+export function vaultScopeName(scope: string): string | null {
+  const parts = scope.split(":");
+  if (parts.length === 3 && parts[0] === "vault" && parts[1] && parts[2] && VAULT_VERBS.has(parts[2])) {
+    return parts[1];
+  }
+  return null;
+}
+
 /** The distinct named vaults referenced by a scope set (`vault:<name>:<verb>`). */
 export function namedVaultsInScopes(scopes: readonly string[]): string[] {
   const names = new Set<string>();
   for (const s of scopes) {
-    const parts = s.split(":");
-    if (parts.length === 3 && parts[0] === "vault" && parts[1] && parts[2] && VAULT_VERBS.has(parts[2])) {
-      names.add(parts[1]);
-    }
+    const named = vaultScopeName(s);
+    if (named !== null) names.add(named);
   }
   return Array.from(names);
 }

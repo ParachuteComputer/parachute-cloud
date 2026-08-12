@@ -129,6 +129,18 @@ describe("discovery endpoints", () => {
     // ceremony that also carries password + next.
     expect(md.auth).toEqual({ methods: ["magic_link"], signin_path: "/login" });
     expect((md.capabilities as Record<string, unknown>).vault_rename).toBe(false);
+    // cloud#226: the delete door is real (DELETE /account/vaults/<name> — vault
+    // destroy + identity D1 sweep), so the descriptor must advertise it. This
+    // flag is the ONLY thing a client reads to decide whether to offer delete;
+    // an unadvertised working route ships dark.
+    expect((md.capabilities as Record<string, unknown>).vault_delete).toBe(true);
+    // Its whole-account sibling (A-3) has NO flag yet, and that absence is
+    // pinned rather than left ambiguous: `AccountCapabilities` is the shared,
+    // CI-pinned door contract from parachute-hub, so adding a key is an
+    // upstream PR. This assertion is what will fail — loudly, and in the right
+    // place — the day someone widens the contract and forgets to light the
+    // cloud door up.
+    expect((md.capabilities as Record<string, unknown>).account_delete).toBeUndefined();
     expect(Array.isArray(md.plans) && (md.plans as unknown[]).length).toBe(4);
     // PR-2: the {name}-placeholder vault-URL template, derived from vaultInstanceUrl.
     expect(md.vault_url_template).toContain("{name}");

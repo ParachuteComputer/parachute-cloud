@@ -79,6 +79,7 @@ import {
   handleAccountVaultTokenMint,
   handleAccountVaultsList,
 } from "./account-api.ts";
+import { handleAccountDelete, handleAccountDeleteUndo } from "./account-delete.ts";
 import {
   handleAccountBillingCheckoutPost,
   handleAccountBillingPortalPost,
@@ -254,13 +255,35 @@ app.post("/account/token", (c) => handleAccountToken(c.env.DB, c.req.raw, depsFo
 // token above (validateAccountToken + hasAccountScope — read for GET, admin for
 // mutations), account id from the TOKEN not the body. GET list, POST create
 // (returns a ready vault_token — lands the app IN the vault), per-vault mint,
-// and DELETE (501 — no delete door on the hosted side yet). account-api.ts.
+// and DELETE (cloud#226 — the real teardown: confirm-retype + ownership gate,
+// then the vault worker's destroy, then the identity D1 sweep). account-api.ts.
 app.get("/account/session", (c) => handleAccountSession(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/summary", (c) => handleAccountSummary(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/vaults/:name", (c) => handleAccountVaultDelete(c.env.DB, c.req.raw, depsFor(c.env)));
+// ACCOUNT deletion (cloud#226 A-3) — the whole-account sibling of the vault
+// delete above, and a different shape on purpose: it severs auth immediately
+// (tombstone + session/token wipe) and pauses billing, but erases NOTHING for
+// 24 hours. /account/undo-delete is the way back, authenticated by the mailed
+// token alone — no bearer, no cookie, both of which the tombstone now refuses
+// (migration 0023's chokepoints). Past the window the hourly sweep
+// (account-delete.ts, ops.ts) tears down billing, destroys every owned vault,
+// and purges the account row.
+//
+// WHY `/account/delete` AND NOT A BARE `DELETE /account`: the bare `/account`
+// path is the Parachute App's own Account-manager SCREEN and is deliberately
+// SPA-owned (route-manifest.ts SUBTREE_ONLY_PREFIXES — only `/account/…` is
+// worker-first). `run_worker_first` matches on PATH, not method, so registering
+// any verb on the bare path would drag the screen into the worker and 404 a
+// cold hard-load of it. Both verbs answer here so a client can spell it either
+// way; GET and POST both answer undo — GET is the link in the notice email,
+// POST is for API clients.
+app.delete("/account/delete", (c) => handleAccountDelete(c.env, c.req.raw, depsFor(c.env), senderFor(c.env)));
+app.post("/account/delete", (c) => handleAccountDelete(c.env, c.req.raw, depsFor(c.env), senderFor(c.env)));
+app.get("/account/undo-delete", (c) => handleAccountDeleteUndo(c.env, c.req.raw, depsFor(c.env)));
+app.post("/account/undo-delete", (c) => handleAccountDeleteUndo(c.env, c.req.raw, depsFor(c.env)));
 // Handles (migration 0022, the GitHub owner-model): claim ONE global handle for
 // the account. GET reads the claimed handle + an email-derived suggestion
 // (read); GET /check tests a candidate's availability (read — public info, but

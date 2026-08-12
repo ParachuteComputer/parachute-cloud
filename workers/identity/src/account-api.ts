@@ -17,6 +17,8 @@
  *   - list   → `listVaultsForOwner` + the daily rollup's `vault_usage` rows;
  *   - mint   → the `vault-call.ts` first-party mint seam's `signAccessToken`,
  *     ownership-gated (`userOwnsVault`), scope-validated to this one vault.
+ *   - delete → the same first-party seam's destroy call, followed by the
+ *     explicit identity-side D1 sweep (the vault worker is always first).
  *
  * THE TENANT-FACING VAULT TOKEN'S client_id — a deliberate divergence from the
  * plan's literal `client_id="parachute-console"`, and it is security-load-
@@ -69,12 +71,13 @@ import {
   validateHandle,
 } from "./handles.ts";
 import { type User, getUserById } from "./users.ts";
-import { pushVaultCap } from "./vault-call.ts";
+import { callVaultDestroy, pushVaultCap, readDestroyOutcome } from "./vault-call.ts";
 import {
   VaultNameInvalidError,
   VaultNameTakenError,
   countVaultsForOwner,
   createVault,
+  deleteVaultD1Rows,
   listVaultsForOwner,
   userOwnsVault,
 } from "./vaults.ts";
@@ -97,7 +100,7 @@ function authError(status: number, error: string, description: string): Response
 /**
  * REST/business-error body (`{ error, message }`), matching the vault-call
  * response shape — used for resource-level failures (invalid name, taken,
- * at-cap, not-owned, not-implemented).
+ * at-cap, not-owned, and teardown failures).
  */
 function restError(status: number, error: string, message: string): Response {
   return jsonResponse({ error, message }, status, { "cache-control": "no-store" });
@@ -499,26 +502,129 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   );
 }
 
-// --- DELETE /account/vaults/<name> — not yet on the hosted door --------------
+// --- DELETE /account/vaults/<name> — destroy + identity cleanup ---------------
 
 /**
- * Vault teardown. The cloud console has NO delete door today (verified: no
- * vault-row delete / DO teardown anywhere in the identity worker), and inventing
- * destructive machinery here — unreviewed, on a live tenant boundary — is out of
- * scope. So this honestly answers 501: authenticated (an unauthenticated caller
- * still gets 401, not a shape leak), but the operation isn't implemented.
+ * Delete an owned vault through the hosted door. The Bearer account gate and the
+ * retype-the-name guard run before the destructive call; ownership is checked
+ * against the account id in the bearer, so an unknown vault and another user's
+ * vault share the same neutral `not_owner` response.
  *
- * When delete lands, wrap the real teardown here with the hub twin's confirm
- * shape (`{ confirm: "<name>" }` retype) + the `userOwnsVault` ownership gate,
- * mirroring the hub's `handleDeleteVault`. Scope: `account:<id>:admin`.
+ * Order is load-bearing: the vault worker is the source of truth for whether
+ * tenant data actually disappeared, so its idempotent destroy call happens
+ * BEFORE the D1 sweep. A non-2xx or transport failure leaves every identity row
+ * intact for a retry. Once destroy succeeds, the D1 batch runs the same cascade
+ * the self-hosted hub twin runs — revoke the tokens naming this vault, rewrite
+ * the grants that name it, then drop the vault, usage, and snapshot rows; a D1
+ * failure is reported separately because the storage side is already erased.
+ *
+ * Idempotency choice: after the first successful delete, the `vaults` row is
+ * gone. A second request therefore returns the same 403 `not_owner` shape as a
+ * first request for an unknown or unowned vault. This is intentional: it avoids
+ * an existence oracle while ensuring a re-delete never throws or returns 500.
+ * Scope: `account:<id>:admin`.
+ *
+ * NO UNDO WINDOW HERE — deliberately, and not to be confused with its sibling.
+ * The 24-hour undo window Aaron ratified belongs to ACCOUNT deletion (`DELETE
+ * /account`, the A-train: migration 0023's `users.deleted_at` tombstone, the
+ * `billing-teardown.ts` module, and the convergence sweep). That design can
+ * defer destruction because an account's teardown is a billing/auth state
+ * change first. A VAULT delete cannot: the only verb that erases vault content
+ * is the vault worker's `POST /api/internal/destroy` (cloud#226 PR-1), which is
+ * irreversible and immediate by construction — `deleteAll()` on the DO plus an
+ * R2 prefix purge. Staging a vault delete would need its own reversible
+ * substrate (the unmerged PR-2a `vaults.deleting_at` / `destroy_completed_at`
+ * columns plus a sweep); until that lands, the retype-the-name confirm IS the
+ * guard, exactly as the self-hosted hub twin (`handleDeleteVault`) has it.
+ *
+ * Convergence if the D1 sweep fails after a successful destroy: the response
+ * says so (`500 d1_cleanup_failed`) and the whole request is safe to repeat —
+ * destroy is idempotent on a warm instance and re-runs harmlessly on a cold
+ * one, and the D1 batch is written to be re-runnable. Until the retry lands,
+ * the stale `vaults` row presents as an empty vault, not as tenant data.
  */
 export async function handleAccountVaultDelete(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const auth = await requireAccount(db, req, deps, "admin");
   if (!auth.ok) return auth.response;
-  return restError(
-    501,
-    "not_implemented",
-    "Vault deletion is not available on the hosted door yet. Contact hello@parachute.computer.",
+
+  const name = vaultNameFromPath(req, "");
+  if (!name) return restError(404, "not_found", "no such vault route");
+
+  const body = await readJsonBody(req);
+  if (body.confirm !== name) {
+    return restError(400, "confirm_mismatch", `deleting a vault requires the body {"confirm": "${name}"}`);
+  }
+
+  // Ownership: false for BOTH "owned by someone else" and "doesn't exist" —
+  // one 403 for both, so deletion cannot become an existence oracle. This gate
+  // is intentionally before the first-party vault-worker call.
+  if (!(await userOwnsVault(db, auth.accountId, name))) {
+    return restError(403, "not_owner", `You do not own a vault named "${name}".`);
+  }
+
+  let destroyResponse: Response;
+  try {
+    destroyResponse = await callVaultDestroy(db, deps, auth.accountId, name);
+  } catch (err) {
+    console.error(
+      `event=vault_destroy_failed vault=${name} error=${JSON.stringify(err instanceof Error ? err.message : String(err))}`,
+    );
+    return restError(
+      502,
+      "vault_destroy_failed",
+      "The vault storage teardown could not be reached. No identity rows were changed; retry the request.",
+    );
+  }
+  // The one shared judgement (vault-call.ts readDestroyOutcome) — a 200 is not
+  // enough; the body must be the DO's real reply. See that function for why a
+  // false positive here is unrecoverable while a false negative costs a retry.
+  const outcome = await readDestroyOutcome(destroyResponse);
+  if (!outcome.ok) {
+    console.error(`event=vault_destroy_failed vault=${name} reason=${outcome.reason} detail=${JSON.stringify(outcome.detail)}`);
+    return restError(
+      502,
+      "vault_destroy_failed",
+      "The vault storage teardown did not confirm success. No identity rows were changed; retry the request.",
+    );
+  }
+
+  let d1: Awaited<ReturnType<typeof deleteVaultD1Rows>>;
+  try {
+    d1 = await deleteVaultD1Rows(db, auth.accountId, name, deps.now?.() ?? new Date());
+  } catch (err) {
+    console.error(
+      `event=vault_identity_cleanup_failed vault=${name} error=${JSON.stringify(err instanceof Error ? err.message : String(err))}`,
+    );
+    return restError(
+      500,
+      "d1_cleanup_failed",
+      "Vault storage was destroyed, but identity cleanup did not finish. Retry the delete request.",
+    );
+  }
+
+  // Ops audit line — the only durable record that a tenant's vault was torn
+  // down (the rows that would have shown it are exactly what just got deleted).
+  console.log(
+    `event=vault_deleted vault=${name} owner=${auth.accountId} r2_objects_deleted=${outcome.r2ObjectsDeleted} ` +
+      `vault_rows=${d1.vaultRowsDeleted} usage_rows=${d1.usageRowsDeleted} snapshot_rows=${d1.snapshotRowsDeleted} ` +
+      `tokens_revoked=${d1.tokensRevoked} grants_rewritten=${d1.grantsRewritten} grants_dropped=${d1.grantsDropped}`,
+  );
+
+  return jsonResponse(
+    {
+      destroyed: true,
+      r2_objects_deleted: outcome.r2ObjectsDeleted,
+      d1: {
+        vault_rows_deleted: d1.vaultRowsDeleted,
+        vault_usage_rows_deleted: d1.usageRowsDeleted,
+        vault_snapshot_rows_deleted: d1.snapshotRowsDeleted,
+        tokens_revoked: d1.tokensRevoked,
+        grants_rewritten: d1.grantsRewritten,
+        grants_dropped: d1.grantsDropped,
+      },
+    },
+    200,
+    { "cache-control": "no-store" },
   );
 }
 

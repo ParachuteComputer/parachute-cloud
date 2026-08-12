@@ -9,7 +9,8 @@
  *   - POST /account/vaults: the hinge — returns a usable vault_token
  *     (aud=vault.<name>, read+write, client_id=parachute-account), records
  *     ownership under the TOKEN's account, and refuses at-cap / bad-name / taken;
- *   - DELETE: 501 (no hosted delete door yet), still admin-gated;
+ *   - DELETE: confirm + ownership-gated destroy-first teardown, D1 cascade, and
+ *     honest failure/idempotency behavior;
  *   - POST /account/vaults/<name>/token: owned-only mint (unowned/unknown → one
  *     403, no oracle), scope-validated (injections 400), default read+write;
  *   - the read-time suspend chokepoint: a suspended owner's token → 401 on the
@@ -36,14 +37,19 @@ import type { OAuthDeps } from "../src/oauth-shared.ts";
 import { signAccessToken } from "../src/tokens.ts";
 import { ISSUER, db, decodeJwtPayload, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
 
+type VaultFetch = NonNullable<OAuthDeps["vaultFetch"]>;
+
 /**
  * Deps for the account surface. The create path's `pushVaultCap` PUTs the plan
- * cap to the (nonexistent, in-test) vault DO — stub `vaultFetch` 200 so create
- * is deterministic and silent. Every other route (list, mint, delete) makes no
- * outbound call.
+ * cap to the (nonexistent, in-test) vault DO — stub `vaultFetch` with a successful
+ * destroy-shaped response so create is deterministic and silent. Delete tests
+ * pass their own fetch to inspect or fail that one storage call.
  */
-function accountDeps(now?: () => Date): OAuthDeps {
-  return { ...deps(now), vaultFetch: async () => Response.json({ ok: true }, { status: 200 }) };
+function accountDeps(
+  now?: () => Date,
+  vaultFetch: VaultFetch = async () => Response.json({ destroyed: true, r2_objects_deleted: 0 }, { status: 200 }),
+): OAuthDeps {
+  return { ...deps(now), vaultFetch };
 }
 
 /** Mint an account bearer for `userId` with `verb` authority, aud="account". The
@@ -88,6 +94,132 @@ async function seedOwnerWithPlan(email: string, plan?: string): Promise<{ userId
   if (plan) await env.DB.prepare("UPDATE users SET plan = ? WHERE id = ?").bind(plan, id).run();
   const token = await mintAccountToken(id, "admin");
   return { userId: id, token };
+}
+
+/** Seed every identity-side artifact the delete cascade owns, plus two token
+ * rows that pin the registry convention: one live row to revoke and one already
+ * revoked row that must remain a no-op on the sweep. */
+async function seedDeleteArtifacts(vaultName: string, userId: string): Promise<Date> {
+  const now = new Date("2026-08-10T00:00:00.000Z");
+  const expiresAt = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+  await env.DB.batch([
+    env.DB
+      .prepare("INSERT INTO vault_usage (vault_name, day, db_bytes, r2_bytes) VALUES (?, ?, ?, ?)")
+      .bind(vaultName, "2026-08-08", 10, 20),
+    env.DB
+      .prepare("INSERT INTO vault_usage (vault_name, day, db_bytes, r2_bytes) VALUES (?, ?, ?, ?)")
+      .bind(vaultName, "2026-08-09", 30, 40),
+    env.DB
+      .prepare(
+        "INSERT INTO vault_snapshots (vault_name, key, taken_at, bytes, ranks) VALUES (?, ?, ?, ?, ?)",
+      )
+      .bind(vaultName, `vault-${vaultName}/snapshots/one.tar`, now.toISOString(), 100, "[]"),
+    env.DB
+      .prepare(
+        "INSERT INTO vault_snapshots (vault_name, key, taken_at, bytes, ranks) VALUES (?, ?, ?, ?, ?)",
+      )
+      .bind(vaultName, `vault-${vaultName}/snapshots/two.tar`, now.toISOString(), 200, "[]"),
+    env.DB
+      .prepare(
+        "INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind("delete-live-token", userId, "delete-test", `vault:${vaultName}:read vault:${vaultName}:write`, expiresAt, null, now.toISOString()),
+    env.DB
+      .prepare(
+        "INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind(
+        "delete-already-revoked-token",
+        userId,
+        "delete-test",
+        `vault:${vaultName}:admin`,
+        expiresAt,
+        now.toISOString(),
+        now.toISOString(),
+      ),
+    env.DB
+      .prepare(
+        "INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind("delete-other-vault-token", userId, "delete-test", "vault:keep:read", expiresAt, null, now.toISOString()),
+    // The near-miss the LIKE pattern must NOT catch: a COMPOSED account scope
+    // naming this same vault. It reads `vaults:<name>:` (with the s), so
+    // `%vault:<name>:%` cannot match it — and it must not, because revoking it
+    // would kill the holder's access to every OTHER vault on the account too.
+    env.DB
+      .prepare(
+        "INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind(
+        "delete-composed-account-token",
+        userId,
+        "delete-test",
+        `account:${userId}:vaults:${vaultName}:read`,
+        expiresAt,
+        null,
+        now.toISOString(),
+      ),
+    // The two near-misses that DO survive the LIKE prefilter (both contain the
+    // literal `vault:<name>:`) and must be thrown out by the exact-segment
+    // check in JS. These are what go red if `LIKE` is ever promoted from
+    // candidate filter to decision.
+    env.DB
+      .prepare(
+        "INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind("delete-prefix-suffixed", userId, "delete-test", `xvault:${vaultName}:read`, expiresAt, null, now.toISOString()),
+    env.DB
+      .prepare(
+        "INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind("delete-bogus-verb", userId, "delete-test", `vault:${vaultName}:superuser`, expiresAt, null, now.toISOString()),
+  ]);
+  // Standing consent rows, the hub twin's rewrite-don't-drop case:
+  //   - `spanning`  names this vault AND another → REWRITTEN, keeping the other;
+  //   - `only-this` names this vault alone       → DROPPED;
+  //   - `untouched` names another vault only     → left completely alone.
+  await env.DB.batch([
+    env.DB
+      .prepare("INSERT INTO grants (user_id, client_id, scopes, granted_at) VALUES (?, ?, ?, ?)")
+      .bind(userId, "grant-spanning", `vault:${vaultName}:read vault:keep:read vault:${vaultName}:write`, now.toISOString()),
+    env.DB
+      .prepare("INSERT INTO grants (user_id, client_id, scopes, granted_at) VALUES (?, ?, ?, ?)")
+      .bind(userId, "grant-only-this", `vault:${vaultName}:read`, now.toISOString()),
+    env.DB
+      .prepare("INSERT INTO grants (user_id, client_id, scopes, granted_at) VALUES (?, ?, ?, ?)")
+      .bind(userId, "grant-untouched", "vault:keep:read", now.toISOString()),
+  ]);
+  return now;
+}
+
+async function grantScopes(userId: string, clientId: string): Promise<string | null> {
+  const row = await env.DB.prepare("SELECT scopes FROM grants WHERE user_id = ? AND client_id = ?")
+    .bind(userId, clientId)
+    .first<{ scopes: string }>();
+  return row?.scopes ?? null;
+}
+
+async function deleteArtifactState(vaultName: string): Promise<{
+  vaultExists: boolean;
+  usageRows: number;
+  snapshotRows: number;
+  liveTokenRevokedAt: string | null;
+}> {
+  const [vault, usage, snapshots, token] = await Promise.all([
+    env.DB.prepare("SELECT 1 AS one FROM vaults WHERE name = ?").bind(vaultName).first<{ one: number }>(),
+    env.DB.prepare("SELECT COUNT(*) AS n FROM vault_usage WHERE vault_name = ?").bind(vaultName).first<{ n: number }>(),
+    env.DB
+      .prepare("SELECT COUNT(*) AS n FROM vault_snapshots WHERE vault_name = ?")
+      .bind(vaultName)
+      .first<{ n: number }>(),
+    env.DB.prepare("SELECT revoked_at FROM tokens WHERE jti = ?").bind("delete-live-token").first<{ revoked_at: string | null }>(),
+  ]);
+  return {
+    vaultExists: vault !== null,
+    usageRows: usage?.n ?? 0,
+    snapshotRows: snapshots?.n ?? 0,
+    liveTokenRevokedAt: token?.revoked_at ?? null,
+  };
 }
 
 // --- the Bearer gate (every route) -------------------------------------------
@@ -430,35 +562,348 @@ describe("C3 — POST /account/vaults (create lands you IN the vault)", () => {
   });
 });
 
-// --- DELETE /account/vaults/<name> — 501 -------------------------------------
+// --- DELETE /account/vaults/<name> — destroy + identity cascade ----------------
 
 describe("C3 — DELETE /account/vaults/<name>", () => {
-  test("501 not_implemented (no hosted delete door yet), for an admin token", async () => {
-    const { userId, token } = await seedOwnerWithPlan("del@example.com");
+  test("200 destroys first, then removes identity rows and revokes matching tokens", async () => {
+    const { userId, token } = await seedOwnerWithPlan("del-success@example.com");
     await seedVault("doomed", userId);
+    const now = await seedDeleteArtifacts("doomed", userId);
+    const calls: { input: RequestInfo | URL; init?: RequestInit }[] = [];
+    const vaultFetch: VaultFetch = async (input, init) => {
+      calls.push({ input, init });
+      return Response.json({ destroyed: true, r2_objects_deleted: 7 }, { status: 200 });
+    };
+
     const res = await handleAccountVaultDelete(
       db(),
-      accountReq("DELETE", "/account/vaults/doomed", { token }),
+      accountReq("DELETE", "/account/vaults/doomed", { token, body: { confirm: "doomed" } }),
+      accountDeps(() => now, vaultFetch),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      destroyed: true,
+      r2_objects_deleted: 7,
+      d1: {
+        vault_rows_deleted: 1,
+        vault_usage_rows_deleted: 2,
+        vault_snapshot_rows_deleted: 2,
+        tokens_revoked: 1,
+        grants_rewritten: 1,
+        grants_dropped: 1,
+      },
+    });
+
+    expect(calls).toHaveLength(1);
+    const outbound = new Request(calls[0]!.input, calls[0]!.init);
+    expect(outbound.method).toBe("POST");
+    expect(new URL(outbound.url).pathname).toContain("/api/internal/destroy");
+    expect(await outbound.json()).toEqual({ confirm: "doomed" });
+    const destroyToken = outbound.headers.get("authorization")?.replace(/^Bearer\s+/, "");
+    expect(destroyToken).toBeTruthy();
+    const destroyClaims = decodeJwtPayload(destroyToken!);
+    expect(destroyClaims.client_id).toBe("parachute-console");
+    expect(destroyClaims.scope).toBe("vault:doomed:admin");
+    expect(destroyClaims.aud).toBe("vault.doomed");
+
+    expect(await deleteArtifactState("doomed")).toEqual({
+      vaultExists: false,
+      usageRows: 0,
+      snapshotRows: 0,
+      liveTokenRevokedAt: now.toISOString(),
+    });
+    const unrelated = await env.DB.prepare("SELECT revoked_at FROM tokens WHERE jti = ?")
+      .bind("delete-other-vault-token")
+      .first<{ revoked_at: string | null }>();
+    expect(unrelated?.revoked_at).toBeNull();
+    // The sweep's blast radius stops at the 3-part vault grammar: a composed
+    // ACCOUNT scope naming the same vault survives. Goes red if the LIKE
+    // pattern is ever loosened (e.g. to `%<name>%` or `%vault%<name>%`).
+    // The exact-segment check is the authority, not the LIKE prefilter: the
+    // composed account scope never reaches it, and the two rows that DO reach
+    // it (`xvault:<name>:read`, `vault:<name>:superuser` — both carry the
+    // literal `vault:<name>:` substring) must be discarded by the JS match.
+    const survivors = await env.DB.prepare(
+      "SELECT jti FROM tokens WHERE revoked_at IS NULL AND jti IN (?, ?, ?) ORDER BY jti",
+    )
+      .bind("delete-composed-account-token", "delete-prefix-suffixed", "delete-bogus-verb")
+      .all<{ jti: string }>();
+    expect((survivors.results ?? []).map((r) => r.jti)).toEqual([
+      "delete-bogus-verb",
+      "delete-composed-account-token",
+      "delete-prefix-suffixed",
+    ]);
+
+    // Grants: REWRITTEN, not dropped, when the row spans other vaults — the hub
+    // twin's over-revocation guard. Dropping `grant-spanning` would silently
+    // revoke that client's consent on `keep`, a vault this delete never touched.
+    expect(await grantScopes(userId, "grant-spanning")).toBe("vault:keep:read");
+    expect(await grantScopes(userId, "grant-only-this")).toBeNull();
+    expect(await grantScopes(userId, "grant-untouched")).toBe("vault:keep:read");
+  });
+
+  test("the sweep matches scopes by exact segment, not substring — a `_` name cannot catch a neighbor", async () => {
+    // `_` is a LIKE single-char wildcard, so a naive `LIKE '%vault:my_vault:%'`
+    // sweep would also revoke `myxvault`-scoped rows. Legacy names can contain
+    // `_` (they predate today's stricter slug gate), which is exactly why the
+    // hub twin refuses to let LIKE be the decision. Both rows here would be
+    // caught by an unescaped pattern; only the real one may be revoked.
+    const { userId, token } = await seedOwnerWithPlan("del-underscore@example.com");
+    await env.DB.prepare("INSERT INTO vaults (name, owner_user_id, created_at) VALUES (?, ?, ?)")
+      .bind("my_vault", userId, new Date().toISOString())
+      .run();
+    const expiresAt = new Date(Date.now() + 3_600_000).toISOString();
+    await env.DB.batch([
+      env.DB
+        .prepare(
+          "INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, NULL, ?)",
+        )
+        .bind("underscore-real", userId, "t", "vault:my_vault:read", expiresAt, expiresAt),
+      env.DB
+        .prepare(
+          "INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, NULL, ?)",
+        )
+        .bind("underscore-neighbor", userId, "t", "vault:myxvault:read", expiresAt, expiresAt),
+    ]);
+
+    const res = await handleAccountVaultDelete(
+      db(),
+      accountReq("DELETE", "/account/vaults/my_vault", { token, body: { confirm: "my_vault" } }),
       accountDeps(),
     );
-    expect(res.status).toBe(501);
-    expect(((await res.json()) as { error: string }).error).toBe("not_implemented");
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { d1: { tokens_revoked: number } }).d1.tokens_revoked).toBe(1);
+    const neighbor = await env.DB.prepare("SELECT revoked_at FROM tokens WHERE jti = ?")
+      .bind("underscore-neighbor")
+      .first<{ revoked_at: string | null }>();
+    expect(neighbor?.revoked_at).toBeNull();
+  });
+
+  test("after the delete, the vault is gone from every read path — list, mint, and re-delete", async () => {
+    const { userId, token } = await seedOwnerWithPlan("del-after@example.com");
+    await seedVault("erased", userId);
+    await seedVault("survivor", userId);
+
+    const del = await handleAccountVaultDelete(
+      db(),
+      accountReq("DELETE", "/account/vaults/erased", { token, body: { confirm: "erased" } }),
+      accountDeps(),
+    );
+    expect(del.status).toBe(200);
+
+    // The list read path: the deleted vault is absent, its sibling untouched.
+    const list = await handleAccountVaultsList(db(), accountReq("GET", "/account/vaults", { token }), accountDeps());
+    expect(list.status).toBe(200);
+    const listed = ((await list.json()) as { vaults: { name: string }[] }).vaults.map((v) => v.name);
+    expect(listed).toEqual(["survivor"]);
+
+    // The mint path: no new token can be issued for the destroyed vault, and it
+    // refuses with the SAME neutral not_owner an unknown vault gets — the
+    // ownership row IS the gate, so removing it closes the mint by construction.
+    const mint = await handleAccountVaultTokenMint(
+      db(),
+      accountReq("POST", "/account/vaults/erased/token", { token, body: {} }),
+      accountDeps(),
+    );
+    expect(mint.status).toBe(403);
+    expect(((await mint.json()) as { error: string }).error).toBe("not_owner");
+  });
+
+  test("delete frees the D1 name claim and the plan's vault slot (NOT the same as the vault working again — see cloud#240)", async () => {
+    const { userId, token } = await seedOwnerWithPlan("del-reclaim@example.com");
+    await seedVault("phoenix", userId);
+
+    const del = await handleAccountVaultDelete(
+      db(),
+      accountReq("DELETE", "/account/vaults/phoenix", { token, body: { confirm: "phoenix" } }),
+      accountDeps(),
+    );
+    expect(del.status).toBe(200);
+
+    // Re-create: proves the ownership row really went (a lingering row would
+    // give `name_taken`) and that the vault-count cap counts the freed slot.
+    const recreated = await handleAccountVaultCreate(
+      db(),
+      accountReq("POST", "/account/vaults", { token, body: { name: "phoenix" } }),
+      accountDeps(),
+    );
+    expect(recreated.status).toBe(201);
+    const owner = await env.DB.prepare("SELECT owner_user_id FROM vaults WHERE name = ?")
+      .bind("phoenix")
+      .first<{ owner_user_id: string }>();
+    expect(owner?.owner_user_id).toBe(userId);
+
+    // SCOPE OF THIS TEST — read before trusting it, because its earlier title
+    // ("the same name can be created again") certified a property PRODUCTION
+    // DOES NOT HAVE. What is proven here is D1 bookkeeping ONLY: the name
+    // claim and the plan slot are released. Whether the RECREATED vault then
+    // works is a question about the Durable Object, and this suite cannot ask
+    // it — `accountDeps()` stubs `vaultFetch`, so no DO is involved at all.
+    //
+    // It does not work today. `idFromName` maps the reused name back to the
+    // SAME DO, whose in-memory `destroyed` latch (vault-do.ts) makes every
+    // subsequent request 410 `vault_destroyed` for as long as that instance
+    // stays resident — and each request keeps it resident. Filed as cloud#240;
+    // measured, not assumed (a probe confirmed the 410, and confirmed that
+    // deleteAll() drops every SQLite table, so the latch cannot simply be
+    // cleared: initSchema runs in the DO constructor).
+    //
+    // A test asserting the recreated vault is USABLE belongs in the vault
+    // worker's suite against a real DO, and would fail today. Asserting it
+    // here against a stub would only re-certify the same false property.
+  });
+
+  test("500 d1_cleanup_failed is honest when the sweep fails AFTER an irreversible destroy", async () => {
+    const { userId, token } = await seedOwnerWithPlan("del-d1-fail@example.com");
+    await seedVault("half-torn", userId);
+    let destroyCalls = 0;
+    const vaultFetch: VaultFetch = async () => {
+      destroyCalls++;
+      return Response.json({ destroyed: true, r2_objects_deleted: 3 }, { status: 200 });
+    };
+    // Force the D1 batch to throw the only way the runtime lets us: remove a
+    // table the cascade writes. (Isolated per-test storage rolls this back.)
+    await env.DB.exec("DROP TABLE vault_snapshots");
+
+    const res = await handleAccountVaultDelete(
+      db(),
+      accountReq("DELETE", "/account/vaults/half-torn", { token, body: { confirm: "half-torn" } }),
+      accountDeps(undefined, vaultFetch),
+    );
+    expect(res.status).toBe(500);
+    expect(((await res.json()) as { error: string }).error).toBe("d1_cleanup_failed");
+    // Destroy DID run — the response must not pretend otherwise — and the whole
+    // request stays retryable: the ownership row is still there to retry from.
+    expect(destroyCalls).toBe(1);
+    const stillThere = await env.DB.prepare("SELECT 1 AS one FROM vaults WHERE name = ?")
+      .bind("half-torn")
+      .first<{ one: number }>();
+    expect(stillThere).not.toBeNull();
+  });
+
+  test("a second delete returns the same neutral 403 as an unknown vault and never errors", async () => {
+    const { userId, token } = await seedOwnerWithPlan("del-idempotent@example.com");
+    await seedVault("gone", userId);
+    let calls = 0;
+    const vaultFetch: VaultFetch = async () => {
+      calls++;
+      return Response.json({ destroyed: true, r2_objects_deleted: 0 }, { status: 200 });
+    };
+    const first = await handleAccountVaultDelete(
+      db(),
+      accountReq("DELETE", "/account/vaults/gone", { token, body: { confirm: "gone" } }),
+      accountDeps(undefined, vaultFetch),
+    );
+    expect(first.status).toBe(200);
+
+    const second = await handleAccountVaultDelete(
+      db(),
+      accountReq("DELETE", "/account/vaults/gone", { token, body: { confirm: "gone" } }),
+      accountDeps(undefined, vaultFetch),
+    );
+    expect(second.status).toBe(403);
+    expect(((await second.json()) as { error: string }).error).toBe("not_owner");
+    expect(calls).toBe(1);
   });
 
   test("401 for an unauthenticated DELETE (no shape leak)", async () => {
-    const res = await handleAccountVaultDelete(db(), accountReq("DELETE", "/account/vaults/x"), accountDeps());
+    const res = await handleAccountVaultDelete(
+      db(),
+      accountReq("DELETE", "/account/vaults/x", { body: { confirm: "x" } }),
+      accountDeps(),
+    );
     expect(res.status).toBe(401);
   });
 
-  test("403 for a read token — the admin gate runs before the 501", async () => {
+  test("403 for a read token — the admin gate runs before confirmation or destroy", async () => {
     const { id } = await seedUser("del-read@example.com");
     const readToken = await mintAccountToken(id, "read");
     const res = await handleAccountVaultDelete(
       db(),
-      accountReq("DELETE", "/account/vaults/x", { token: readToken }),
+      accountReq("DELETE", "/account/vaults/x", { token: readToken, body: { confirm: "x" } }),
       accountDeps(),
     );
     expect(res.status).toBe(403);
+  });
+
+  test("400 confirm_mismatch is mutation-free", async () => {
+    const { userId, token } = await seedOwnerWithPlan("del-confirm@example.com");
+    await seedVault("careful", userId);
+    let calls = 0;
+    const vaultFetch: VaultFetch = async () => {
+      calls++;
+      return Response.json({ destroyed: true, r2_objects_deleted: 0 }, { status: 200 });
+    };
+    const res = await handleAccountVaultDelete(
+      db(),
+      accountReq("DELETE", "/account/vaults/careful", { token, body: { confirm: "careless" } }),
+      accountDeps(undefined, vaultFetch),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("confirm_mismatch");
+    expect(calls).toBe(0);
+    expect((await deleteArtifactState("careful")).vaultExists).toBe(true);
+  });
+
+  test("403 for both another user's vault and an unknown vault, with no destroy call", async () => {
+    const a = await seedOwnerWithPlan("del-unowned-a@example.com");
+    const b = await seedOwnerWithPlan("del-unowned-b@example.com");
+    await seedVault("belongs-to-b", b.userId);
+    let calls = 0;
+    const vaultFetch: VaultFetch = async () => {
+      calls++;
+      return Response.json({ destroyed: true, r2_objects_deleted: 0 }, { status: 200 });
+    };
+
+    for (const name of ["belongs-to-b", "does-not-exist"]) {
+      const res = await handleAccountVaultDelete(
+        db(),
+        accountReq("DELETE", `/account/vaults/${name}`, { token: a.token, body: { confirm: name } }),
+        accountDeps(undefined, vaultFetch),
+      );
+      expect(res.status).toBe(403);
+      const body = (await res.json()) as { error: string; message: string };
+      expect(body.error).toBe("not_owner");
+      expect(Object.keys(body)).toEqual(["error", "message"]);
+    }
+    expect(calls).toBe(0);
+  });
+
+  test.each([
+    ["non-2xx", async () => Response.json({ error: "busy" }, { status: 503 })],
+    ["transport", async () => { throw new Error("vault worker unreachable"); }],
+    // THE 200-THAT-ISN'T cases. Each of these is a plausible way the seam
+    // could answer 200 without the DO having destroyed anything: a renamed or
+    // shadowed route answering generically, a proxy/service-binding
+    // interposing, a future handler returning a different success shape. If
+    // any were believed, the D1 rows — the ONLY record of whose bytes those
+    // were — would go while the bytes stayed: orphaned storage, still billed,
+    // no longer attributable, unreachable by any retry.
+    ["200 with destroyed:false", async () => Response.json({ destroyed: false, r2_objects_deleted: 0 })],
+    ["200 with no destroyed field", async () => Response.json({ ok: true })],
+    ["200 with destroyed as a string", async () => Response.json({ destroyed: "true", r2_objects_deleted: 0 })],
+    ["200 with r2_objects_deleted missing", async () => Response.json({ destroyed: true })],
+    ["200 with r2_objects_deleted negative", async () => Response.json({ destroyed: true, r2_objects_deleted: -1 })],
+    ["200 with r2_objects_deleted fractional", async () => Response.json({ destroyed: true, r2_objects_deleted: 1.5 })],
+    ["200 with r2_objects_deleted as a string", async () => Response.json({ destroyed: true, r2_objects_deleted: "3" })],
+    ["200 with an unparseable body", async () => new Response("not json", { status: 200 })],
+  ] as const)("destroy %s leaves every D1 artifact intact", async (_kind, vaultFetch) => {
+    const { userId, token } = await seedOwnerWithPlan(`del-failure-${_kind.replace(/[^a-z0-9]+/gi, "-")}@example.com`);
+    await seedVault("failure-vault", userId);
+    const now = await seedDeleteArtifacts("failure-vault", userId);
+    const res = await handleAccountVaultDelete(
+      db(),
+      accountReq("DELETE", "/account/vaults/failure-vault", { token, body: { confirm: "failure-vault" } }),
+      accountDeps(() => now, vaultFetch),
+    );
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as { error: string }).error).toBe("vault_destroy_failed");
+    expect(await deleteArtifactState("failure-vault")).toEqual({
+      vaultExists: true,
+      usageRows: 2,
+      snapshotRows: 2,
+      liveTokenRevokedAt: null,
+    });
   });
 });
 

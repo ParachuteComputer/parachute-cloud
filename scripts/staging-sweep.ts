@@ -16,12 +16,14 @@
  *
  * WHAT IT ACTUALLY DELETES: only the D1 OWNERSHIP ROW (`vaults.name`) for
  * vaults matching the smoke's own throwaway prefixes, older than the cutoff.
- * There is no vault-teardown verb anywhere in this codebase — no route drops
- * a Durable Object's storage or purges its R2 attachments wholesale (see
- * `workers/identity/src/account-api.ts`'s `DELETE /account/vaults/:name`,
- * still a `501 not_implemented` stub, and `vault-do.ts`'s internal-verb
- * table, which has no delete/wipe entry) — so the underlying DO SQLite
- * storage + any R2 objects are left ORPHANED, not reclaimed. That's an
+ * A REAL teardown verb now exists (cloud#226): `vault-do.ts`'s
+ * `POST /api/internal/destroy` purges the DO storage + the whole
+ * `vault-<name>/` R2 prefix, and `DELETE /account/vaults/:name`
+ * (account-api.ts) drives it plus the identity-side D1 sweep. THIS SCRIPT
+ * STILL DOES NEITHER — its trust root is the operator's own wrangler
+ * credential against D1, not a minted account bearer, so the underlying DO
+ * SQLite storage + any R2 objects are left ORPHANED, not reclaimed. Porting
+ * this lever onto the real delete door is separate work. That's an
  * acceptable trade for what this script is FOR: the debris problem is the D1
  * `vaults` COUNT (what the console lists, what the usage/snapshot crons
  * enumerate, what the vault-count cap counts against, and what the nightly

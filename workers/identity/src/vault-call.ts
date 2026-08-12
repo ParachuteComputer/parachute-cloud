@@ -182,6 +182,92 @@ export async function callVaultImport(
   });
 }
 
+/**
+ * Ask the target vault's DO to perform its irreversible teardown
+ * (`POST /api/internal/destroy`). This uses the same first-party admin mint as
+ * the config, snapshot, restore, and import seams; the identity-side ownership
+ * check happens before this helper is called, so this function only owns the
+ * issuer→vault hop.
+ *
+ * NOT best-effort: the account delete route must inspect the returned status and
+ * body before it touches D1. A transport error propagates, and a non-2xx response
+ * is returned to the caller rather than being swallowed like `pushVaultCap`'s
+ * plan-reconciliation failures. That ordering is the safe direction: a failed
+ * storage teardown must leave the ownership and accounting rows available for a
+ * retry.
+ */
+export async function callVaultDestroy(
+  db: D1Database,
+  deps: OAuthDeps,
+  userId: string,
+  vaultName: string,
+): Promise<Response> {
+  return callVaultApi(db, deps, {
+    userId,
+    vaultName,
+    method: "POST",
+    apiPath: "/api/internal/destroy",
+    verb: "admin",
+    jsonBody: { confirm: vaultName },
+  });
+}
+
+/**
+ * Why a destroy could not be believed, or the count of R2 objects it removed.
+ * `reason` is a log/message token, never shown raw to a tenant.
+ */
+export type DestroyOutcome =
+  | { ok: true; r2ObjectsDeleted: number }
+  | { ok: false; reason: "transport" | "status" | "unreadable" | "malformed"; detail: string };
+
+/**
+ * THE ONLY PLACE A DESTROY RESPONSE IS BELIEVED. Both callers of
+ * {@link callVaultDestroy} — the single-vault door (account-api.ts) and the
+ * account sweep (account-delete.ts) — go through here, because the thing they
+ * do next is delete the D1 rows that are the ONLY remaining record of which
+ * tenant those bytes belonged to. If that record goes while the bytes stay,
+ * the storage is orphaned: still billed, no longer attributable, and not
+ * reachable by any retry, because nothing left in the system knows to try.
+ *
+ * So a 200 is NOT sufficient. The body must be the DO's real reply — a
+ * literal `destroyed: true` plus an `r2_objects_deleted` that is a safe,
+ * non-negative integer. A 200 carrying anything else (a renamed route
+ * answering generically, a service-binding or proxy quirk, a future handler
+ * that returns `{ok:true}`) is treated exactly like a failed destroy: the
+ * caller must leave every row in place.
+ *
+ * The asymmetry is deliberate and is the whole point. A false negative costs
+ * one retry of an idempotent call. A false positive is unrecoverable.
+ *
+ * Takes the already-resolved `Response` (or the thrown error) rather than
+ * making the call itself, so each caller keeps its own control flow — the
+ * door answers a tenant with an HTTP status, the sweep defers an account —
+ * while sharing the one judgement that must not diverge between them.
+ */
+export async function readDestroyOutcome(res: Response): Promise<DestroyOutcome> {
+  if (!res.ok) return { ok: false, reason: "status", detail: `HTTP ${res.status}` };
+  let body: { destroyed?: unknown; r2_objects_deleted?: unknown };
+  try {
+    body = (await res.json()) as { destroyed?: unknown; r2_objects_deleted?: unknown };
+  } catch {
+    return { ok: false, reason: "unreadable", detail: "response body was not JSON" };
+  }
+  const count = body.r2_objects_deleted;
+  if (
+    body.destroyed !== true ||
+    typeof count !== "number" ||
+    !Number.isSafeInteger(count) ||
+    count < 0
+  ) {
+    return {
+      ok: false,
+      reason: "malformed",
+      detail: `destroyed=${JSON.stringify(body.destroyed)} r2_objects_deleted=${JSON.stringify(count)}`,
+    };
+  }
+  return { ok: true, r2ObjectsDeleted: count };
+}
+
 /** The DO's resolved plan entitlement, as reported by GET /api/internal/config. */
 export interface ResolvedVaultEntitlement {
   /** The currently resolved two-meter entitlement; null means unpushed (a
