@@ -514,32 +514,69 @@ async function main() {
         tagRows.map((r) => r.name).join(", "),
       );
 
-      // Surface Starter is NOT default-seeded; POST /api/packs applies it.
-      const packRes = await fetch(`${VAULT}/vault/${newVault}/api/packs/surface-starter`, {
+      // --- Seed packs. POST /api/packs/:name requires `vault:admin` since
+      // cloud#235 (the write/admin re-tier): applySeedPack reaches core's
+      // upsertTagRecord for every tag a pack declares — the SAME mutation
+      // PUT /api/tags/:name is admin-gated for — so the pack route is gated
+      // identically (workers/vault/src/auth.ts `isPackApply`). The three
+      // apply/idempotency/unknown checks below therefore need an ADMIN token;
+      // OWN_AUTH (read+write) now correctly 403s them, which is what turned
+      // this whole section red after #235 landed (cloud#242).
+      //
+      // FIRST, the denial — that a plain write token CANNOT apply a pack is
+      // part of #235's contract, not an accident of this smoke, so it gets its
+      // own check rather than being silently designed around. Run before the
+      // apply so the vault is still pack-free: a 403 here must come from the
+      // scope gate, never from the pack already being present.
+      const packAsWrite = await fetch(`${VAULT}/vault/${newVault}/api/packs/surface-starter`, {
         method: "POST",
         headers: OWN_AUTH,
       });
-      const packJson = (await packRes.json()) as { applied?: string[]; skipped?: string[] };
+      const packAsWriteBody = (await packAsWrite.json()) as { error_type?: string; required_scope?: string };
       assert(
-        packRes.status === 200 && (packJson.applied ?? []).includes("Surface Starter"),
-        "POST /api/packs/surface-starter applies the pack",
-        `status ${packRes.status}, applied=${JSON.stringify(packJson.applied)}`,
+        packAsWrite.status === 403 &&
+          packAsWriteBody.error_type === "insufficient_scope" &&
+          packAsWriteBody.required_scope === "vault:admin",
+        "pack-apply with a plain WRITE token → 403 insufficient_scope (the cloud#235 admin gate)",
+        `status ${packAsWrite.status}, error_type=${packAsWriteBody.error_type}, required_scope=${packAsWriteBody.required_scope}`,
       );
-      const packAgain = await fetch(`${VAULT}/vault/${newVault}/api/packs/surface-starter`, {
-        method: "POST",
-        headers: OWN_AUTH,
-      });
-      const againJson = (await packAgain.json()) as { applied?: string[]; skipped?: string[] };
-      assert(
-        packAgain.status === 200 && (againJson.applied ?? []).length === 0 && (againJson.skipped ?? []).includes("Surface Starter"),
-        "re-POSTing the pack is idempotent (skipped, not duplicated)",
-        `applied=${JSON.stringify(againJson.applied)} skipped=${JSON.stringify(againJson.skipped)}`,
-      );
-      const unknownPack = await fetch(`${VAULT}/vault/${newVault}/api/packs/nonsense`, {
-        method: "POST",
-        headers: OWN_AUTH,
-      });
-      assert(unknownPack.status === 404, "unknown pack → 404", `status ${unknownPack.status}`);
+
+      // The owner mints an ADMIN-scoped token for their own vault through the
+      // same real authorize flow (ownership === admin authority in the cloud).
+      const packAdmin = await authorizeFor(newEmail, newPassword, newVault, ["read", "write", "admin"]);
+      if (!packAdmin.token) {
+        fail("packs: owner mints a vault:admin token for their own vault", packAdmin.error ?? "no token");
+      } else {
+        ok("packs: owner mints a vault:admin token for their own vault");
+        const ADMIN_AUTH = { authorization: `Bearer ${packAdmin.token}` };
+
+        // Surface Starter is NOT default-seeded; POST /api/packs applies it.
+        const packRes = await fetch(`${VAULT}/vault/${newVault}/api/packs/surface-starter`, {
+          method: "POST",
+          headers: ADMIN_AUTH,
+        });
+        const packJson = (await packRes.json()) as { applied?: string[]; skipped?: string[] };
+        assert(
+          packRes.status === 200 && (packJson.applied ?? []).includes("Surface Starter"),
+          "POST /api/packs/surface-starter applies the pack",
+          `status ${packRes.status}, applied=${JSON.stringify(packJson.applied)}`,
+        );
+        const packAgain = await fetch(`${VAULT}/vault/${newVault}/api/packs/surface-starter`, {
+          method: "POST",
+          headers: ADMIN_AUTH,
+        });
+        const againJson = (await packAgain.json()) as { applied?: string[]; skipped?: string[] };
+        assert(
+          packAgain.status === 200 && (againJson.applied ?? []).length === 0 && (againJson.skipped ?? []).includes("Surface Starter"),
+          "re-POSTing the pack is idempotent (skipped, not duplicated)",
+          `applied=${JSON.stringify(againJson.applied)} skipped=${JSON.stringify(againJson.skipped)}`,
+        );
+        const unknownPack = await fetch(`${VAULT}/vault/${newVault}/api/packs/nonsense`, {
+          method: "POST",
+          headers: ADMIN_AUTH,
+        });
+        assert(unknownPack.status === 404, "unknown pack → 404", `status ${unknownPack.status}`);
+      }
 
       // The console button path — the identity worker mints its own scoped
       // token server-side and calls the vault worker (idempotent, so the pack
@@ -2524,9 +2561,23 @@ async function main() {
  * Run the full DCR → login → consent → token dance for `email`/`password`
  * against `vaultName`, returning the access token or the OAuth error. Ownership
  * refusal surfaces as a 302 error redirect at the post-login authorize step.
+ *
+ * `verbs` defaults to the read+write pair every other call site wants. A caller
+ * that needs the ADMIN tier (pack-apply and the tag-schema mutations since
+ * cloud#235 — see the pack section) passes it explicitly: a NAMED
+ * `vault:<name>:admin` is requestable through the PUBLIC authorize endpoint
+ * (`isNonRequestableScope` in oauth-shared.ts exempts `vault:`) and the
+ * ownership gate grants it to the vault's owner, so this is the same real DCR →
+ * consent → token dance, just one verb wider. Nothing here is a shortcut around
+ * the door.
  */
-async function authorizeFor(email: string, password: string, vaultName: string): Promise<{ token?: string; error?: string }> {
-  const scope = `vault:${vaultName}:read vault:${vaultName}:write`;
+async function authorizeFor(
+  email: string,
+  password: string,
+  vaultName: string,
+  verbs: readonly ("read" | "write" | "admin")[] = ["read", "write"],
+): Promise<{ token?: string; error?: string }> {
+  const scope = verbs.map((v) => `vault:${vaultName}:${v}`).join(" ");
   const reg = await (
     await fetch(`${IDENTITY}/oauth/register`, {
       method: "POST",
