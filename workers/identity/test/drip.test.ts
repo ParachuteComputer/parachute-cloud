@@ -344,17 +344,27 @@ describe("day-14 feedback", () => {
 // --- the per-run cap ---------------------------------------------------------------
 
 describe("per-run cap", () => {
-  test(`a backlog drains at ${DRIP_RUN_CAP} attempts per run, finishing on later runs`, async () => {
-    const total = DRIP_RUN_CAP + 10;
+  test("a backlog drains at the run cap, finishing on later runs", async () => {
+    // The production cap is 50; pinning the mechanism at 50 means seeding 60
+    // users sequentially then running two sweeps — ~267ms locally, over the
+    // 5s vitest budget on a loaded CI runner (cloud#188, cloud#233). The
+    // invariant is "stops at N, remainder drains next run", which does not
+    // depend on N=50. Inject a small cap; keep the production constant
+    // pinned separately so a silent raise/drop still fails a test.
+    expect(DRIP_RUN_CAP).toBe(50);
+    const cap = 3;
+    const remainder = 2;
+    const total = cap + remainder;
     for (let i = 0; i < total; i++) await seedUserAt(`bulk-${i}@example.com`, minutesAgo(30));
     const sender = dripSender();
+    const deps = { ...at, runCap: cap };
 
-    const first = await quietly(() => runDrip(env, sender, at));
-    expect(first.sent.welcome).toBe(DRIP_RUN_CAP);
+    const first = await quietly(() => runDrip(env, sender, deps));
+    expect(first.sent.welcome).toBe(cap);
     expect(first.capped).toBe(true);
 
-    const second = await quietly(() => runDrip(env, sender, at));
-    expect(second.sent.welcome).toBe(10);
+    const second = await quietly(() => runDrip(env, sender, deps));
+    expect(second.sent.welcome).toBe(remainder);
     expect(second.capped).toBe(false);
     expect(sender.sent).toHaveLength(total);
     // No duplicates across the two runs.
