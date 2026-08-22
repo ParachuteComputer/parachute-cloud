@@ -1288,9 +1288,12 @@ async function main() {
         })
       ).text();
       assert(
-        // The arrival user is on the no-card trial (mirrors Plus): the card cap
-        // renders "of 8.5 GiB" (500 MB notes + 8 GiB attachments, summed).
-        conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 8\.5 GiB/.test(conHtml),
+        // The arrival user is on the no-card trial (mirrors Plus): per-meter
+        // copy since cloud#107 — per-vault numerators, pooled denominators
+        // named explicitly (notes 500 MB pool, attachments 8 GiB pool).
+        conHtml.includes('data-testid="vault-usage"') &&
+          /This vault: notes \d+(\.\d+)? [KM]B of 500 MB/.test(conHtml) &&
+          conHtml.includes("pooled across your vaults"),
         "usage: the vault card shows 'Using X of Y' from the rollup row",
         arrivalVault,
       );
