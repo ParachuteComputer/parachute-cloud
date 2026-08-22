@@ -38,6 +38,7 @@ import {
   BILLING_SWEEP_CAP,
   DOWNGRADE_GRACE_PERIOD_MS,
   handleCheckoutSessionCompleted,
+  handleSubscriptionUpdated,
   planForPrice,
   runBillingSweep,
 } from "../src/billing-lifecycle.ts";
@@ -1212,6 +1213,54 @@ describe("checkout.session.completed — plan flips, ids persist, caps lift", ()
     expect(JSON.parse(pushed)).toEqual(planEntitlement("standard"));
   });
 
+  // cloud#234: an in-flight checkout that lands during the undo window must
+  // still RECORD the paid subscription on D1 (drop would lose the charge)
+  // but MUST NOT PUT the vault DO. Positive control: spy vaultFetch (the
+  // seam pushVaultCap actually uses). disableNetConnect is vacuous here —
+  // pushVaultCap is no-throw and would swallow a stray PUT.
+  test("tombstoned owner: checkout records D1 (plan + Stripe ids) and does not wake the vault DO", async () => {
+    const { id } = await seedUser("tombstone-checkout@example.com");
+    await seedVault("tombstone-checkout-box", id);
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?")
+      .bind(new Date().toISOString(), id)
+      .run();
+
+    const capPushes: Array<{ method: string; url: string }> = [];
+    const spiedDeps = {
+      ...deps(),
+      vaultFetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        if (method === "PUT" && url.includes("/api/internal/config")) capPushes.push({ method, url });
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) satisfies NonNullable<OAuthDeps["vaultFetch"]>,
+    };
+    const event = JSON.parse(
+      makeEventPayload("checkout.session.completed", {
+        ...checkoutCompletedObject({ userId: id, customer: "cus_tomb_1", subscription: "sub_tomb_1" }),
+        metadata: { plan: "standard" },
+      }),
+    ) as Stripe.Event;
+    const result = await handleCheckoutSessionCompleted(
+      env.DB,
+      spiedDeps,
+      event,
+      {} as Stripe,
+      billingConfig(BILLING_ENV)!,
+    );
+    expect((result as { action: string }).action).toBe("checkout_completed_recorded_tombstoned");
+    expect(capPushes).toEqual([]);
+
+    const user = (await getUserById(env.DB, id))!;
+    expect(user.plan).toBe("standard");
+    expect(user.stripeCustomerId).toBe("cus_tomb_1");
+    expect(user.stripeSubscriptionId).toBe("sub_tomb_1");
+    expect(user.deletedAt).not.toBeNull();
+  });
+
   test("junk metadata.plan but a POWER line-item price → resolves Power via planForPrice (not the standard default)", async () => {
     // A completed PAID checkout whose metadata.plan tag is garbled must not
     // silently floor the buyer to `standard`. The webhook falls back to the
@@ -1608,6 +1657,25 @@ describe("customer.subscription.deleted — the deferred downgrade", () => {
     expect(at).toBeLessThanOrEqual(Date.now() + DOWNGRADE_GRACE_PERIOD_MS + 5_000);
   });
 
+  // cloud#234: do NOT gate this family. A tombstoned owner still gets the
+  // D1 downgrade schedule; the sweep already skips them, and this handler
+  // never talks to a vault DO.
+  test("tombstoned owner: subscription.deleted still schedules the D1 downgrade (ungated)", async () => {
+    const { id } = await seedPaidUser("tombstone-del@example.com", { subscription: "sub_tomb_del" });
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?")
+      .bind(new Date().toISOString(), id)
+      .run();
+    const res = await postWebhook(
+      makeEventPayload("customer.subscription.deleted", subscriptionObject({ id: "sub_tomb_del" })),
+    );
+    expect(((await res.json()) as { action: string }).action).toBe("subscription_deleted_downgrade_scheduled");
+    const user = (await getUserById(env.DB, id))!;
+    expect(user.pendingPlan).toBe("expired");
+    expect(user.planDowngradeAt).not.toBeNull();
+    expect(user.plan).toBe("standard");
+    expect(user.deletedAt).not.toBeNull();
+  });
+
   test("idempotent: an already-expired user with no pending change is left alone", async () => {
     const { id } = await seedUser("cancel3@example.com");
     // Also clear the trial pair createUser stamps at signup — this simulates
@@ -1720,6 +1788,43 @@ describe("customer.subscription.updated — cancels, un-cancels, plan syncs", ()
     expect(user.plan).toBe("power");
     expect(JSON.parse(pushed)).toEqual(planEntitlement("power"));
     fetchMock.assertNoPendingInterceptors();
+  });
+
+  // cloud#234: plan change still lands in D1 (restore should see it); the
+  // vault PUT must not fire. Spy vaultFetch — disableNetConnect would swallow
+  // a stray push (pushVaultCap is no-throw).
+  test("tombstoned owner: subscription.updated records the plan change and does not wake the vault DO", async () => {
+    const { id } = await seedPaidUser("tombstone-upd@example.com", { subscription: "sub_tomb_upd" });
+    await seedVault("tombstone-upd-box", id);
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?")
+      .bind(new Date().toISOString(), id)
+      .run();
+
+    const capPushes: Array<{ method: string; url: string }> = [];
+    const spiedDeps = {
+      ...deps(),
+      vaultFetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        if (method === "PUT" && url.includes("/api/internal/config")) capPushes.push({ method, url });
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) satisfies NonNullable<OAuthDeps["vaultFetch"]>,
+    };
+    const event = JSON.parse(
+      makeEventPayload(
+        "customer.subscription.updated",
+        subscriptionObject({ id: "sub_tomb_upd", priceId: "price_test_power_monthly" }),
+      ),
+    ) as Stripe.Event;
+    const result = await handleSubscriptionUpdated(env.DB, spiedDeps, event, billingConfig(BILLING_ENV)!);
+    expect(result.action).toBe("subscription_updated_plan_recorded_tombstoned");
+    expect(capPushes).toEqual([]);
+    const user = (await getUserById(env.DB, id))!;
+    expect(user.plan).toBe("power");
+    expect(user.deletedAt).not.toBeNull();
   });
 
   test("PORTAL downgrade: plus→entry (a quarterly Price) applies entry", async () => {

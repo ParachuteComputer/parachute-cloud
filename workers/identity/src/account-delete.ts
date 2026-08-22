@@ -58,7 +58,7 @@ import { deleteSessionsForUser } from "./sessions.ts";
 import { raiseOpsAlert } from "./ops-alerts.ts";
 import { makeStripe } from "./stripe-client.ts";
 import { type User, getUserById } from "./users.ts";
-import { callVaultDestroy, readDestroyOutcome } from "./vault-call.ts";
+import { applyPlanToVaults, callVaultDestroy, readDestroyOutcome } from "./vault-call.ts";
 import { deleteVaultD1Rows, listVaultsForOwner } from "./vaults.ts";
 
 /** The ratified undo window: 24 hours from the delete REQUEST (`deleted_at`). */
@@ -341,6 +341,9 @@ function invalidUndoToken(): Response {
  * Order mirrors the request path in reverse, and again the reversible thing
  * leads: billing is resumed BEFORE the tombstone clears, so an account that
  * comes back always comes back with its subscription state already settled.
+ * After the tombstone clears, current plan entitlement is pushed to owned
+ * vaults (cloud#234): Stripe webhooks during the window recorded D1 but
+ * skipped the DO wake, so restore — not the webhook — is what applies caps.
  * A hard Stripe failure leaves the tombstone in place and the window still
  * open — retryable, and the account stays honestly deleted meanwhile rather
  * than half-restored.
@@ -431,7 +434,20 @@ export async function handleAccountDeleteUndo(
   // token, which is exactly the answer it should get.
   if ((res.meta.changes ?? 0) === 0) return invalidUndoToken();
 
-  console.log(`event=account_delete_undone user=${user.id} billing_resumed=${billingResumed}`);
+  // cloud#234: Stripe webhooks during the window recorded D1 (plan /
+  // subscription ids) but skipped the vault-DO cap push so they would not
+  // wake a tombstoned owner. Re-apply now that the tombstone is gone. Best
+  // effort — a missed push self-heals via the entitlement reconciler; failing
+  // undo over a cap hiccup would strand a restored account behind a 5xx.
+  const capResults = await applyPlanToVaults(env.DB, deps, user.id);
+  const capFailed = capResults.filter((r) => !r.ok);
+  if (capFailed.length > 0) {
+    console.warn(
+      `event=account_undo_plan_push_partial user=${user.id} failed=${capFailed.map((f) => f.vault).join(",")}`,
+    );
+  }
+
+  console.log(`event=account_delete_undone user=${user.id} billing_resumed=${billingResumed} vaults=${capResults.length}`);
   return jsonResponse(
     {
       restored: true,

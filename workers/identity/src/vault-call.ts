@@ -542,6 +542,14 @@ export async function applyPlanToVaults(
 ): Promise<CapPushResult[]> {
   const user = await getUserById(db, userId);
   if (!user) return [];
+  // cloud#234 / A-3: never wake a tombstoned owner's vault DO. The Stripe
+  // webhook family still writes D1 (so an in-flight checkout is not lost);
+  // this seam is the one that talks to the DO. Undo (account-delete.ts)
+  // re-applies after the tombstone clears.
+  if (user.deletedAt !== null) {
+    console.log(`event=entitlement_push_skipped_tombstone user=${userId}`);
+    return [];
+  }
   // One entitlement for all the owner's vaults: the two-meter caps, the voice
   // entitlement, and frozen — a plan change flips them together. A TRIAL
   // mirrors the CHOSEN tier when pending_plan names one (plans.ts
