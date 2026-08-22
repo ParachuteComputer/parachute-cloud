@@ -682,7 +682,10 @@ export class VaultDO extends DurableObject {
           // buildVaultProjection) + a way to persist a description update into
           // the DO config store (same seam as PUT /api/internal/config).
           db: this.store.db,
-          updateDescription: (description: string) => {
+          // `string | null` — null CLEARS the description (cloud#87 widened the
+          // seam's declared type to the one it always accepted; `config.description`
+          // has been `string | null` all along).
+          updateDescription: (description: string | null) => {
             this.config!.description = description;
             return this.ctx.storage.put("config", this.config);
           },
