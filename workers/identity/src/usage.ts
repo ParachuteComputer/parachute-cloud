@@ -14,6 +14,11 @@
  * cap ENFORCEMENT stays the v1 per-vault semantics until the billing PR (see
  * the plans.ts module note — recording and enforcing were split on purpose).
  *
+ * A fleet-wide run ends by dropping `vault_usage` rows whose vault is gone from
+ * `vaults` (cloud#227) — the backstop behind the delete path's synchronous
+ * prune, without which one row per deleted vault per day accumulated forever.
+ * See {@link pruneOrphanUsageRows}.
+ *
  * Failure posture mirrors the drip: one vault's failed read or reconciliation
  * (DO hiccup, stale vault worker) logs and the run CONTINUES — a missing day or
  * stale entitlement for one vault self-heals tomorrow, and the console
@@ -200,6 +205,12 @@ export interface UsageRunSummary {
    * recorded, only repairs were deferred to the next tick.
    */
   reconcileCapped: boolean;
+  /**
+   * Orphan `vault_usage` rows deleted this run (rows whose vault no longer
+   * exists). Always 0 on an `onlyVault` run and on a prune that itself failed —
+   * see {@link pruneOrphanUsageRows}.
+   */
+  orphansPruned: number;
 }
 
 /**
@@ -306,11 +317,52 @@ export async function runUsageRollup(
     }
   }
 
-  const summary: UsageRunSummary = { day, vaults: vaults.length, recorded, failed, reconciled, capped, reconcileCapped };
+  // The orphan backstop (cloud#227) — fleet-wide runs only.
+  const orphansPruned = opts.onlyVault ? 0 : await pruneOrphanUsageRows(env.DB);
+
+  const summary: UsageRunSummary = {
+    day,
+    vaults: vaults.length,
+    recorded,
+    failed,
+    reconciled,
+    capped,
+    reconcileCapped,
+    orphansPruned,
+  };
   console.log(
-    `event=usage_rollup day=${day} vaults=${summary.vaults} recorded=${recorded} failed=${failed} reconciled=${reconciled} capped=${capped} reconcile_capped=${reconcileCapped}`,
+    `event=usage_rollup day=${day} vaults=${summary.vaults} recorded=${recorded} failed=${failed} reconciled=${reconciled} capped=${capped} reconcile_capped=${reconcileCapped} orphans_pruned=${orphansPruned}`,
   );
   return summary;
+}
+
+/**
+ * Drop `vault_usage` rows whose vault is gone (cloud#227). The twin of
+ * `pruneOrphanSnapshotRows` (snapshots.ts) — that one carries the full
+ * rationale; the same reasoning applies verb-for-verb to this table, which had
+ * 1,008 orphan rows at the 2026-07-26 staging reclamation. Each module owns its
+ * own mirror table, so the statement lives next to the upsert that writes it.
+ *
+ * Note it is `vault_usage`'s whole HISTORY that goes, every day of it, not just
+ * the latest row — which is the point: the leak is one row per orphan vault per
+ * day, so pruning only today's would never catch up.
+ *
+ * Same three properties: safe by construction (a name absent from `vaults`
+ * cannot be live, and a tombstoned owner's vault still holds its `vaults` row
+ * so its billed history survives), bounded (one DELETE, never a per-row loop),
+ * and best-effort (a failure logs and reports 0 rather than failing a rollup
+ * that recorded fine; it retries on tomorrow's tick).
+ */
+async function pruneOrphanUsageRows(db: D1Database): Promise<number> {
+  try {
+    const res = await db.prepare("DELETE FROM vault_usage WHERE vault_name NOT IN (SELECT name FROM vaults)").run();
+    return res.meta.changes ?? 0;
+  } catch (err) {
+    console.error(
+      `event=usage_orphan_prune_failed error=${JSON.stringify(err instanceof Error ? err.message : String(err))}`,
+    );
+    return 0;
+  }
 }
 
 // --- console reads -------------------------------------------------------------
