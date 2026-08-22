@@ -11,7 +11,14 @@
  * a live main() on import).
  */
 import { describe, expect, it } from "bun:test";
-import { isUnverifiable, summarize } from "../scripts/smoke-report.ts";
+import {
+  isUnverifiable,
+  MIN_ASSERTIONS_ENV,
+  resolveMinAssertions,
+  STAGING_ASSERTION_BASELINE,
+  STAGING_MIN_ASSERTIONS,
+  summarize,
+} from "../scripts/smoke-report.ts";
 
 describe("summarize — the gate verdict", () => {
   it("clean run: no fail, no advisory → exit 0, PASSED, reads clean", () => {
@@ -59,6 +66,100 @@ describe("summarize — the gate verdict", () => {
 
   it("honors a custom label (so smoke-prod could share this verdict logic)", () => {
     expect(summarize({ pass: 5, fail: 0, advisory: 0 }, "PROD SMOKE").headline).toMatch(/^PROD SMOKE PASSED/);
+  });
+
+  it("an advisory-carrying green LEADS with the caveat, not the bare word PASSED", () => {
+    // A hurried CI scan reads the first token. "PASSED (2 UNVERIFIED)" cannot be
+    // mistaken for a clean green the way a leading bare "PASSED" could.
+    const s = summarize({ pass: 170, fail: 0, advisory: 2 });
+    expect(s.headline).toMatch(/^SMOKE PASSED \(2 UNVERIFIED\) —/);
+    // ...and a genuinely clean run still reads as the unqualified PASSED.
+    expect(summarize({ pass: 170, fail: 0, advisory: 0 }).headline).toMatch(/^SMOKE PASSED —/);
+  });
+});
+
+describe("INVARIANT 4 — the executed-assertion floor: green has to be earned (cloud#219)", () => {
+  // The bug this closes: summarize() set exitCode from `fail` alone, so a run
+  // that reached almost none of its assertions exited 0 and led with PASSED.
+  // The old safety was emergent (login happens to run outside every liveCatch),
+  // not pinned — nothing failed if a future edit wrapped an early section.
+
+  it("THE REGRESSION CASE: {pass: 0, fail: 0, advisory: 7} no longer reads PASSED", () => {
+    const s = summarize({ pass: 0, fail: 0, advisory: 7 }, "SMOKE", STAGING_MIN_ASSERTIONS);
+    expect(s.exitCode).toBe(1);
+    expect(s.headline).toMatch(/FAILED \(COVERAGE FLOOR\)/);
+    expect(s.headline).not.toMatch(/PASSED/);
+    expect(s.clean).toBe(false);
+    expect(s.floorMessage).toContain("0 assertion(s) executed");
+    expect(s.floorMessage).toContain(`minimum ${STAGING_MIN_ASSERTIONS}`);
+    expect(s.floorMessage).toContain(MIN_ASSERTIONS_ENV); // the override is named in the message
+  });
+
+  it("a near-empty run — a handful of assertions before everything went dark — also gates", () => {
+    const s = summarize({ pass: 12, fail: 0, advisory: 3 }, "SMOKE", STAGING_MIN_ASSERTIONS);
+    expect(s.exitCode).toBe(1);
+    expect(s.executed).toBe(12);
+    expect(s.floorMessage).toContain("12 assertion(s) executed");
+  });
+
+  it("executed counts pass + fail — a run that FAILED its way past the floor is not also a floor breach", () => {
+    const s = summarize({ pass: 5, fail: 90, advisory: 0 }, "SMOKE", STAGING_MIN_ASSERTIONS);
+    expect(s.executed).toBe(95);
+    expect(s.exitCode).toBe(1);
+    expect(s.floorMessage).toBeNull(); // the fatals are the story, not the coverage
+    expect(s.headline).toMatch(/FAILED —/);
+  });
+
+  it("at the floor exactly → green; one below → red (the boundary is >=)", () => {
+    expect(summarize({ pass: STAGING_MIN_ASSERTIONS, fail: 0, advisory: 0 }, "SMOKE", STAGING_MIN_ASSERTIONS).exitCode).toBe(0);
+    expect(summarize({ pass: STAGING_MIN_ASSERTIONS - 1, fail: 0, advisory: 0 }, "SMOKE", STAGING_MIN_ASSERTIONS).exitCode).toBe(1);
+  });
+
+  it("INVARIANT 1 SURVIVES — advisories still cannot gate: the floor sits below total live-section blackout", () => {
+    // The nine liveCatch-wrapped sections in smoke-staging.ts hold at most 79 of
+    // the baseline's executed assertions. If every one of them aborted at its
+    // first await, the run would still execute BASELINE - 79 assertions. The
+    // floor must stay below that, or an advisory could gate by the back door.
+    const LIVE_SECTION_ASSERTIONS = 84;
+    const worstCaseAllLiveSectionsDark = STAGING_ASSERTION_BASELINE - LIVE_SECTION_ASSERTIONS;
+    expect(STAGING_MIN_ASSERTIONS).toBeLessThanOrEqual(worstCaseAllLiveSectionsDark);
+    const s = summarize({ pass: worstCaseAllLiveSectionsDark, fail: 0, advisory: 9 }, "SMOKE", STAGING_MIN_ASSERTIONS);
+    expect(s.exitCode).toBe(0);
+    expect(s.floorMessage).toBeNull();
+  });
+
+  it("the baseline itself clears the floor comfortably", () => {
+    expect(STAGING_MIN_ASSERTIONS).toBeLessThan(STAGING_ASSERTION_BASELINE);
+    expect(summarize({ pass: STAGING_ASSERTION_BASELINE, fail: 0, advisory: 0 }, "SMOKE", STAGING_MIN_ASSERTIONS).exitCode).toBe(0);
+  });
+
+  it("minAssertions defaults to 0 — an opted-out caller keeps the pre-floor behaviour", () => {
+    const s = summarize({ pass: 0, fail: 0, advisory: 7 });
+    expect(s.exitCode).toBe(0);
+    expect(s.floorMessage).toBeNull();
+  });
+});
+
+describe("resolveMinAssertions — the deliberate-scope-down override", () => {
+  it("unset or empty → the default floor", () => {
+    expect(resolveMinAssertions(STAGING_MIN_ASSERTIONS, undefined)).toBe(STAGING_MIN_ASSERTIONS);
+    expect(resolveMinAssertions(STAGING_MIN_ASSERTIONS, "")).toBe(STAGING_MIN_ASSERTIONS);
+    expect(resolveMinAssertions(STAGING_MIN_ASSERTIONS, "  ")).toBe(STAGING_MIN_ASSERTIONS);
+  });
+
+  it("a numeric override wins, and 0 disables the floor outright", () => {
+    expect(resolveMinAssertions(STAGING_MIN_ASSERTIONS, "25")).toBe(25);
+    expect(resolveMinAssertions(STAGING_MIN_ASSERTIONS, " 25 ")).toBe(25);
+    expect(resolveMinAssertions(STAGING_MIN_ASSERTIONS, "0")).toBe(0);
+    expect(summarize({ pass: 0, fail: 0, advisory: 7 }, "SMOKE", resolveMinAssertions(STAGING_MIN_ASSERTIONS, "0")).exitCode).toBe(0);
+  });
+
+  it("a MALFORMED override THROWS — it never silently reverts to the default", () => {
+    // Silently falling back is how you get a floor everyone believes is set to
+    // 10 while it is really 80, or vice versa. Fail loudly at module load.
+    for (const bad of ["abc", "-1", "12.5", "80x", "NaN"]) {
+      expect(() => resolveMinAssertions(STAGING_MIN_ASSERTIONS, bad)).toThrow(/SMOKE_MIN_ASSERTIONS/);
+    }
   });
 });
 
