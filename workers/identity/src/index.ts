@@ -157,14 +157,15 @@ app.post("/oauth/revoke", async (c) => withWildcardCors(await handleRevoke(c.env
 /**
  * my.-canonical Phase 1 — the LEGACY cloud. front-door redirect for the HUMAN
  * HTML-GET ceremony pages that still RENDER on cloud. today (`/login`,
- * `/console`). When a GET arrives on `env.CONSOLE_REDIRECT_HOST` (the legacy
- * console front door, `cloud.parachute.computer`), 301 it — path + query
+ * `/console`, `/console/security`). When a GET arrives on `env.CONSOLE_REDIRECT_HOST`
+ * (the legacy console front door, `cloud.parachute.computer`), 301 it — path + query
  * preserved — to the SAME path on the canonical human origin (`frontDoorOrigin`
  * = my.parachute.computer in prod). Returns `null` when it does not apply, so
  * the caller falls through to the real handler.
  *
  * SCOPE is the load-bearing correctness property. This is wired into ONLY the
- * GET `/login` and GET `/console` routes below, so it is PHYSICALLY unreachable
+ * GET `/login`, GET `/console` and GET `/console/security` routes below, so it is
+ * PHYSICALLY unreachable
  * from any MACHINE path — `/oauth/*` (cloud. is the OAuth issuer), `/auth/verify`
  * + `/auth/code` (magic-link + code consumption; old emails point at cloud.),
  * `/unsubscribe` (RFC 8058 one-click POST won't follow a 3xx), `/billing/webhook`
@@ -173,6 +174,29 @@ app.post("/oauth/revoke", async (c) => withWildcardCors(await handleRevoke(c.env
  * handleSignupGet ALREADY 302s to the my. front door on every host AND sets the
  * headless CSRF cookie — a path-preserving 301 would double-redirect and swallow
  * that cookie. The cloud→my property already holds for it.)
+ *
+ * `/login/2fa` is deliberately NOT wired either, and this is NOT an oversight
+ * (cloud#203 asked for it). It reads like a human ceremony page, but it is a
+ * MID-FLOW step whose only credential is the pending-login cookie — HOST-ONLY
+ * (`buildPendingLoginCookie` in pending-login.ts sets no `Domain=`) and
+ * `Path=/login`. It is reachable on cloud. from a path that MUST NEVER redirect:
+ * POST cloud./oauth/authorize 302s to a relative `/login/2fa` carrying that
+ * cookie (oauth-authorize.ts, the `isTotpEnrolled` branch), because cloud. is
+ * still the OAuth issuer this phase. A 301 to my. would drop the cookie,
+ * `getPendingLogin` would miss, and the in-flight OAuth login would be silently
+ * discarded. It canonicalizes on its own when there is nothing in flight: the
+ * handler 302s to the relative `/login`, which then 301s here to my./login.
+ * Pinned as a never-redirect member in canonical-redirect.test.ts.
+ *
+ * 301 IS CACHED BY BROWSERS — PERMANENT, AND NOT UNDONE BY A ROLLBACK. A
+ * returning visitor who has hit cloud./login or cloud./console once will keep
+ * being sent to my. by their OWN browser cache even if this worker is rolled
+ * back, with no request reaching the edge to correct it. Rolling Phase 1 back
+ * therefore restores the server but NOT those clients; my. must keep serving the
+ * human paths for as long as any cached 301 can survive. If reversibility during
+ * a soak matters more than the SEO/canonical signal, the status must be 302
+ * BEFORE the cutover deploy, not after. See workers/app-redirect/README.md
+ * ("Deploy ordering / rollback").
  *
  * PRODUCTION-GATED (`env.ENVIRONMENT === "production"`): the `cloud.` Custom
  * Domain exists in NO other environment — staging is workers.dev only, and the
@@ -233,7 +257,13 @@ app.post("/console/checklist", (c) => handleChecklistPost(c.env.DB, c.req.raw, d
 // Un-dismiss the checklist (the "Show setup guide" footer link): delete the
 // hidden row, done rows survive. Session + CSRF + same-origin.
 app.post("/console/checklist/restore", (c) => handleChecklistRestorePost(c.env.DB, c.req.raw, depsFor(c.env)));
-app.get("/console/security", (c) => handleSecurityGet(c.env.DB, c.req.raw, depsFor(c.env)));
+// Human HTML-GET ceremony page → front-door-redirected on cloud. like /console
+// (cloud#203). Same class as /console: the session cookie is host-only, so a
+// cloud. session does not travel to my. — but that is the already-accepted
+// Phase 1 tradeoff for /console and it is RECOVERABLE (you land on my. and log
+// in). Nothing single-use or in-flight is destroyed. The POST is NOT wired: a
+// 3xx would turn the form submit into a GET and strip its body.
+app.get("/console/security", (c) => cloudFrontDoorRedirect(c.env, c.req.raw) ?? handleSecurityGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/console/security", (c) => handleSecurityPost(c.env.DB, c.req.raw, depsFor(c.env)));
 // Claim the account handle from the console (session + CSRF + same-origin, the
 // console write boundary) — the SAME claimHandle core as the Bearer door
