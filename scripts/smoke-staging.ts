@@ -1493,12 +1493,30 @@ async function main() {
   //     vault); each fetch keeps an explicit, generous timeout so a
   //     slow-but-healthy round trip has room to finish, and a genuinely stuck
   //     one is recorded ADVISORY (couldn't verify) via liveCatch, not fatal.
+  //
+  //     cloud#221 — the ROOT design finding of the nine-day staging outage,
+  //     and the reason this section is now TWO blocks. The sweep and the seven
+  //     restore-round-trip assertions used to share ONE try, with the sweep
+  //     FIRST. When #218's RESTORE_ROUNDTRIP_TIMEOUT_MS landed on an
+  //     already-slow O(fleet) sweep, the abort fired at the section's first
+  //     awaited call and every assertion behind it was skipped — seven checks
+  //     that were green on 2026-07-17 silently stopped executing, and the gate
+  //     printed the same single line either way. #218 made the sweep O(1) so it
+  //     *shouldn't* time out; that is a fix that relies on the sweep never
+  //     throwing. This closes the BLINDING MECHANISM instead: the sweep gets
+  //     its own advisory-eligible block, the restore contract gets another, and
+  //     a sweep hiccup (R2 hiccup, cold DO, future growth) can no longer take
+  //     the restore contract dark. Same shape as §14 (usage): the dependency is
+  //     carried by an explicit flag, and when the setup is unverified the
+  //     dependent checks are SKIPPED with a NAMED advisory rather than failing
+  //     fatally for a non-bug reason — visible either way, never silent.
   const RESTORE_ROUNDTRIP_TIMEOUT_MS = 120_000;
+  // --- 17a. The sweep: SETUP, and its own advisory-eligible block -----------
+  // One sweep tick via the staging-only trigger, SCOPED to this run's fresh
+  // vault (?vault=) so it stays O(1). That vault's snapshot (paid retention)
+  // is taken now → sweep.taken === 1.
+  let snapshotTaken = false;
   try {
-    const arrivalCsrf = /parachute_id_csrf=([^;]+)/.exec(arrivalCookie)?.[1] ?? "";
-    // One sweep tick via the staging-only trigger, SCOPED to this run's fresh
-    // vault (?vault=) so it stays O(1). That vault's snapshot (paid retention)
-    // is taken now → sweep.taken === 1.
     const runSweep = async (): Promise<{ day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean } | null> => {
       const r = await fetch(`${IDENTITY}/__test/snapshot-run?vault=${encodeURIComponent(arrivalVault)}`, { method: "POST", signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) });
       return r.status === 200 ? ((await r.json()) as { day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean }) : null;
@@ -1511,67 +1529,86 @@ async function main() {
         "snapshots: the sweep took at least this run's fresh-vault snapshot",
         `day=${sweep.day} vaults=${sweep.vaults} taken=${sweep.taken} skipped=${sweep.skipped} failed=${sweep.failed}`,
       );
-    }
-
-    // TRIAL (restore-enabled): History lists the restore point (mirrored by the
-    // sweep) — no comp needed, the trial already has the paid restore contract.
-    const histHtml = await (
-      await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie }, signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) })
-    ).text();
-    const keyMatch = new RegExp(`name="key" value="(vault-${arrivalVault}/snapshots/[^"]+\\.tar)"`).exec(histHtml);
-    assert(
-      histHtml.includes('data-testid="restore-point"') && !!keyMatch && histHtml.includes("Restore to a new vault"),
-      "snapshots: TRIAL console History lists the restore point with a restore door",
-      keyMatch?.[1] ?? "no key found",
-    );
-
-    // Restore to a new vault → 302 with the restored target.
-    let restoredName = "";
-    if (keyMatch) {
-      const restoreRes = await fetch(`${IDENTITY}/console/vaults/restore`, {
-        method: "POST",
-        headers: { ...FORM, origin: IDENTITY, cookie: arrivalCookie },
-        redirect: "manual",
-        body: form({ __csrf: arrivalCsrf, vault: arrivalVault, key: keyMatch[1]! }),
-        signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS),
-      });
-      const loc = restoreRes.headers.get("location") ?? "";
-      restoredName = decodeURIComponent(/restored=([^&]+)/.exec(loc)?.[1] ?? "");
-      assert(
-        restoreRes.status === 302 && restoredName.startsWith(`${arrivalVault}-restored-`),
-        "snapshots: restore POST creates the new vault and redirects",
-        `status ${restoreRes.status} → ${loc}`,
-      );
-      const noticeHtml = await (
-        await fetch(`${IDENTITY}${loc}`, { headers: { cookie: arrivalCookie }, signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) })
-      ).text();
-      assert(
-        noticeHtml.includes("Snapshot restored into") && noticeHtml.includes("attachment files"),
-        "snapshots: the success notice renders with the attachments caveat",
-      );
-    }
-
-    // Live round-trip: the restored vault serves the SAME notes — this run's
-    // marker note included, welcome seed intact, nothing extra.
-    if (restoredName) {
-      const owner = await authorizeFor(arrivalEmail, arrivalPassword, restoredName);
-      assert(!!owner.token, "snapshots: owner mints a token for the RESTORED vault", owner.error ? `error=${owner.error}` : "ok");
-      if (owner.token) {
-        const notesRes = await fetch(`${VAULT}/vault/${restoredName}/api/notes?include_content=true`, {
-          headers: { authorization: `Bearer ${owner.token}` },
-          signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS),
-        });
-        const notes = (await notesRes.json()) as Array<{ path?: string; content?: string }>;
-        const mine = notes.find((n) => n.path === "My first note");
-        assert(
-          notesRes.status === 200 && notes.length === 7 && !!mine && (mine.content ?? "").includes(MARKER),
-          "snapshots: restored vault round-trips — 7 notes (6 seed + the marker note), verbatim",
-          `${notes.length} notes: ${notes.map((n) => n.path).join(", ")}`,
-        );
-      }
+      // The snapshot is written to R2 before the summary returns, so the
+      // restore block below can find its restore point.
+      snapshotTaken = sweep.taken >= 1 && !sweep.capped;
     }
   } catch (err) {
-    liveCatch("snapshots: live restore round-trip", err);
+    liveCatch("snapshots: fleet sweep trigger", err);
+  }
+
+  // --- 17b. The RESTORE CONTRACT: a separate concern, a separate block ------
+  // These seven assertions are the actual product contract (History lists the
+  // restore point → restore POST → the restored vault round-trips its notes).
+  // They no longer share a try with the sweep, so a sweep abort cannot skip
+  // them. They DO need a snapshot to exist, so an unverified sweep skips them
+  // with a named advisory (§14's shape) instead of failing them for a non-bug
+  // reason. When the sweep DID take a snapshot, every assert here stays FATAL.
+  if (snapshotTaken) {
+    try {
+      const arrivalCsrf = /parachute_id_csrf=([^;]+)/.exec(arrivalCookie)?.[1] ?? "";
+      // TRIAL (restore-enabled): History lists the restore point (mirrored by the
+      // sweep) — no comp needed, the trial already has the paid restore contract.
+      const histHtml = await (
+        await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie }, signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) })
+      ).text();
+      const keyMatch = new RegExp(`name="key" value="(vault-${arrivalVault}/snapshots/[^"]+\\.tar)"`).exec(histHtml);
+      assert(
+        histHtml.includes('data-testid="restore-point"') && !!keyMatch && histHtml.includes("Restore to a new vault"),
+        "snapshots: TRIAL console History lists the restore point with a restore door",
+        keyMatch?.[1] ?? "no key found",
+      );
+
+      // Restore to a new vault → 302 with the restored target.
+      let restoredName = "";
+      if (keyMatch) {
+        const restoreRes = await fetch(`${IDENTITY}/console/vaults/restore`, {
+          method: "POST",
+          headers: { ...FORM, origin: IDENTITY, cookie: arrivalCookie },
+          redirect: "manual",
+          body: form({ __csrf: arrivalCsrf, vault: arrivalVault, key: keyMatch[1]! }),
+          signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS),
+        });
+        const loc = restoreRes.headers.get("location") ?? "";
+        restoredName = decodeURIComponent(/restored=([^&]+)/.exec(loc)?.[1] ?? "");
+        assert(
+          restoreRes.status === 302 && restoredName.startsWith(`${arrivalVault}-restored-`),
+          "snapshots: restore POST creates the new vault and redirects",
+          `status ${restoreRes.status} → ${loc}`,
+        );
+        const noticeHtml = await (
+          await fetch(`${IDENTITY}${loc}`, { headers: { cookie: arrivalCookie }, signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) })
+        ).text();
+        assert(
+          noticeHtml.includes("Snapshot restored into") && noticeHtml.includes("attachment files"),
+          "snapshots: the success notice renders with the attachments caveat",
+        );
+      }
+
+      // Live round-trip: the restored vault serves the SAME notes — this run's
+      // marker note included, welcome seed intact, nothing extra.
+      if (restoredName) {
+        const owner = await authorizeFor(arrivalEmail, arrivalPassword, restoredName);
+        assert(!!owner.token, "snapshots: owner mints a token for the RESTORED vault", owner.error ? `error=${owner.error}` : "ok");
+        if (owner.token) {
+          const notesRes = await fetch(`${VAULT}/vault/${restoredName}/api/notes?include_content=true`, {
+            headers: { authorization: `Bearer ${owner.token}` },
+            signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS),
+          });
+          const notes = (await notesRes.json()) as Array<{ path?: string; content?: string }>;
+          const mine = notes.find((n) => n.path === "My first note");
+          assert(
+            notesRes.status === 200 && notes.length === 7 && !!mine && (mine.content ?? "").includes(MARKER),
+            "snapshots: restored vault round-trips — 7 notes (6 seed + the marker note), verbatim",
+            `${notes.length} notes: ${notes.map((n) => n.path).join(", ")}`,
+          );
+        }
+      }
+    } catch (err) {
+      liveCatch("snapshots: live restore round-trip", err);
+    }
+  } else {
+    advisory("snapshots: restore round-trip SKIPPED — the fleet sweep above took no verified snapshot (see its advisory/failure)");
   }
 
   // 18. Voice transcription (cloud#56) — comp the arrival user to the PLUS
