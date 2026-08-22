@@ -175,6 +175,9 @@ export function parseMetaBrackets(url: URL): {
       {
         error: `bracket-meta filter: cannot mix shorthand and operator forms for the same field — \`meta[${field}]=…\` and \`meta[${field}][<op>]=…\` are mutually exclusive in one request. Pick one form.`,
         code: "INVALID_QUERY",
+        error_type: "invalid_query",
+        field,
+        hint: `pick either \`meta[${field}]=value\` or \`meta[${field}][<op>]=value\`, not both`,
       },
       400,
     );
@@ -203,6 +206,9 @@ export function parseMetaBrackets(url: URL): {
             {
               error: `bracket-date filter on \`${field}\` requires an operator: meta[${field}][gte]=… (lower bound) or meta[${field}][lt]=… (upper bound, exclusive).`,
               code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field,
+              hint: `pass meta[${field}][gte]=… and/or meta[${field}][lt]=…`,
             },
             400,
           ),
@@ -214,6 +220,10 @@ export function parseMetaBrackets(url: URL): {
             {
               error: `bracket-date filter on \`${field}\` supports only \`gte\` (inclusive lower bound) and \`lt\` (exclusive upper bound). Got: \`${op}\`. The dateFilter contract is half-open by design.`,
               code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field,
+              got: op,
+              hint: `use \`gte\` or \`lt\` — meta[${field}][gte]=… / meta[${field}][lt]=…`,
             },
             400,
           ),
@@ -225,6 +235,9 @@ export function parseMetaBrackets(url: URL): {
             {
               error: `bracket-date filter cannot span both \`created_at\` and \`updated_at\` in one request — issue two queries or use one column per request.`,
               code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field,
+              hint: "issue two queries, or filter one date column per request",
             },
             400,
           ),
@@ -253,6 +266,10 @@ export function parseMetaBrackets(url: URL): {
           {
             error: `bracket-meta filter: array form \`meta[${field}][${op}][]=…\` is only valid for \`in\` and \`not_in\`. \`${op}\` takes a single value — use \`meta[${field}][${op}]=value\` instead.`,
             code: "INVALID_OPERATOR_VALUE",
+            error_type: "invalid_query",
+            field,
+            got: op,
+            hint: `use \`meta[${field}][${op}]=value\` (no \`[]\`) — array form is only for \`in\`/\`not_in\``,
           },
           400,
         ),
@@ -285,6 +302,10 @@ export function parseMetaBrackets(url: URL): {
             {
               error: `bracket-meta filter: \`exists\` on \`${field}\` requires "true" or "false", got "${value}"`,
               code: "INVALID_OPERATOR_VALUE",
+              error_type: "invalid_query",
+              field,
+              got: value,
+              hint: `pass meta[${field}][exists]=true or meta[${field}][exists]=false`,
             },
             400,
           ),
@@ -331,6 +352,9 @@ export function parseMetadataJsonAlias(url: URL): {
       {
         error: `metadata query param must be a JSON object of the form {"field":{"op":value}} — ${detail}`,
         code: "INVALID_QUERY",
+        error_type: "invalid_query",
+        field: "metadata",
+        hint: 'pass a JSON object, e.g. ?metadata={"status":{"eq":"active"}}',
       },
       400,
     );
@@ -398,6 +422,8 @@ export function parseNotesQueryOpts(url: URL): {
         {
           error: "pass metadata filters as either the JSON `metadata=` param or bracket `meta[field][op]=` form, not both.",
           code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          hint: "pick one metadata-filter form: `metadata=` or `meta[field][op]=`, not both",
         },
         400,
       ),
