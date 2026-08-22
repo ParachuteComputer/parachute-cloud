@@ -41,7 +41,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { totpCodeAt } from "../workers/identity/src/totp.ts";
-import { isUnverifiable, summarize } from "./smoke-report.ts";
+import { isUnverifiable, resolveMinAssertions, STAGING_MIN_ASSERTIONS, summarize } from "./smoke-report.ts";
 // core resolves from the sibling parachute-vault checkout, copied into the vault
 // worker's node_modules by `bun install` (the same explicit path test-bun uses).
 import { GETTING_STARTED_PACK, welcomePack } from "../workers/vault/node_modules/@openparachute/core/src/seed-packs.js";
@@ -52,6 +52,11 @@ const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.openpara
 const VAULT_NAME = process.env.VAULT_NAME ?? "demo";
 const REDIRECT_URI = "http://localhost:8976/callback";
 const MARKER = `smoke-${Date.now()}`;
+// The executed-assertion floor (cloud#219): a run that reached almost none of
+// its assertions must never read PASSED. Resolved HERE, at module load, so a
+// malformed SMOKE_MIN_ASSERTIONS fails immediately rather than after a
+// multi-minute live run. See scripts/smoke-report.ts for the derivation.
+const MIN_ASSERTIONS = resolveMinAssertions(STAGING_MIN_ASSERTIONS, process.env.SMOKE_MIN_ASSERTIONS);
 
 // --- tiny test harness -----------------------------------------------------
 // fail() is FATAL — it gates the deploy (exit 1). advisory() is LOUD but does
@@ -2543,11 +2548,14 @@ async function main() {
 
   // --- summary ---
   // The verdict is decided in scripts/smoke-report.ts: fatals gate (exit 1),
-  // advisories are loud but never gate and can never hide a fatal.
+  // advisories are loud but never gate and can never hide a fatal, and a run
+  // that executed fewer than MIN_ASSERTIONS assertions gates as a broken
+  // harness rather than reading green (cloud#219).
   const passCount = results.filter((r) => r.startsWith("  PASS")).length;
-  const { exitCode, headline } = summarize({ pass: passCount, fail: failures, advisory: advisories });
+  const { exitCode, headline, floorMessage } = summarize({ pass: passCount, fail: failures, advisory: advisories }, "SMOKE", MIN_ASSERTIONS);
   console.log(`\n${"=".repeat(60)}\n${headline}\n${"=".repeat(60)}`);
   console.log(results.join("\n"));
+  if (floorMessage) console.error(`\n\x1b[31m${floorMessage}\x1b[0m`);
   if (advisories > 0) {
     // Re-surface the advisories on their own line so an "we couldn't verify
     // this" is never buried under ~160 PASS lines and read as a clean green.
