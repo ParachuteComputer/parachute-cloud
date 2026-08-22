@@ -120,7 +120,7 @@ describe("INVARIANT 4 — the executed-assertion floor: green has to be earned (
     // the baseline's executed assertions. If every one of them aborted at its
     // first await, the run would still execute BASELINE - 79 assertions. The
     // floor must stay below that, or an advisory could gate by the back door.
-    const LIVE_SECTION_ASSERTIONS = 79;
+    const LIVE_SECTION_ASSERTIONS = 84;
     const worstCaseAllLiveSectionsDark = STAGING_ASSERTION_BASELINE - LIVE_SECTION_ASSERTIONS;
     expect(STAGING_MIN_ASSERTIONS).toBeLessThanOrEqual(worstCaseAllLiveSectionsDark);
     const s = summarize({ pass: worstCaseAllLiveSectionsDark, fail: 0, advisory: 9 }, "SMOKE", STAGING_MIN_ASSERTIONS);

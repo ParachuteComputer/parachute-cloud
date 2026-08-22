@@ -56,7 +56,7 @@
  * the 2026-08-16 baseline (172 executed, run 31963287511 — the last green
  * staging deploy) the nine liveCatch-wrapped sections hold at most 79 of those
  * assertions, so even a run where all nine abort at their first await still
- * executes ~93. STAGING_MIN_ASSERTIONS sits below that. Advisories therefore
+ * executes ~88. STAGING_MIN_ASSERTIONS sits below that. Advisories therefore
  * still cannot gate; only a structural collapse of the harness can trip it.
  *
  * Deliberate scope-downs (bisecting, running a subset) set SMOKE_MIN_ASSERTIONS
@@ -87,8 +87,8 @@ export const STAGING_ASSERTION_BASELINE = 172;
 
 /**
  * The staging floor. Deliberately far below the baseline: even if all nine
- * advisory-eligible live sections (79 assertions at most) went dark, the run
- * still executes ~93. See THE FLOOR in the module header for the derivation.
+ * advisory-eligible live sections (84 assertions at most) went dark, the run
+ * still executes ~88. See THE FLOOR in the module header for the derivation.
  */
 export const STAGING_MIN_ASSERTIONS = 80;
 
