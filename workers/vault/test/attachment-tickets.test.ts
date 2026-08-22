@@ -296,6 +296,41 @@ describe("attachment tickets — download mint → spend round trip", () => {
     expect(second.status).toBe(404);
   });
 
+  it("download Content-Type is extension-derived, not the caller-asserted row mime (vault#617)", async () => {
+    const v = freshVault("tk");
+    const note = await createNote(v, { content: "n" });
+    const bytes = new Uint8Array([137, 80, 78, 71]);
+    const uploadMint = toolResult(
+      await callTool(v, "request-attachment-upload", {
+        note: note.id,
+        filename: "photo.png",
+        size_bytes: bytes.byteLength,
+        mime_type: "text/html",
+      }),
+    );
+    const uploadPath = new URL(uploadMint.url).pathname;
+    const uploaded = (await (
+      await SELF.fetch(`https://vault.test${uploadPath}`, {
+        method: "PUT",
+        headers: { "content-type": "text/html", "content-length": String(bytes.byteLength) },
+        body: bytes,
+      })
+    ).json()) as any;
+    expect(uploaded.mimeType).toBe("text/html");
+
+    const dlMint = toolResult(await callTool(v, "request-attachment-download", { attachment_id: uploaded.id }, 2));
+    const first = await SELF.fetch(`https://vault.test${new URL(dlMint.url).pathname}`);
+    expect(first.status).toBe(200);
+    expect(first.headers.get("content-type")).toBe("image/png");
+    expect(first.headers.get("x-content-type-options")).toBe("nosniff");
+
+    // Cloud REST GET /storage/ prefers R2 httpMetadata.contentType — that
+    // must also be extension-derived, not the caller-asserted ticket mime.
+    const storage = await op(v, `/api/storage/${uploaded.path}`);
+    expect(storage.status).toBe(200);
+    expect(storage.headers.get("content-type")).toBe("image/png");
+  });
+
   it("the ROW deleted between mint and spend → the SAME uniform 404 as an unknown ticket (no oracle)", async () => {
     const v = freshVault("tk");
     const note = await createNote(v, { content: "n" });
