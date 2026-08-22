@@ -476,6 +476,41 @@ export function planLine(plan: PlanId): string {
 }
 
 /**
+ * One vault card's storage line: TWO meters, each against its OWN plan budget
+ * (#107). Reads "This vault: notes 0.1 MB of 500 MB · attachments 0.1 MB of
+ * 8 GiB — pooled across your vaults".
+ *
+ * WHY NOT a single "Using X of Y": the old line put this vault's notes+
+ * attachments SUM over {@link planTotalBytes} (the two budgets summed into one
+ * number), which is wrong twice. It double-counts — the budget is POOLED across
+ * every vault on the plan, so each card claimed the whole shared pool as its
+ * own denominator — and it hides the split, so a Power vault 3× OVER its 1 GiB
+ * notes pool rendered as a comfortable "Using 4.0 GB of 51 GiB". The meters
+ * cannot be summed because they are separate caps the vault DO enforces
+ * separately (PlanCaps).
+ *
+ * WHAT THE NUMBERS MEAN (stated in the copy, not left to inference): the
+ * NUMERATORS are THIS vault's usage ("This vault:"), the DENOMINATORS are the
+ * plan's per-meter budgets shared by every vault on the account ("pooled across
+ * your vaults"). Per-vault usage is what a per-vault card is FOR; the pooled
+ * clause is what stops the denominator reading as this vault's private
+ * allowance. The across-vaults total against the same pool rides the plan line
+ * (`usage-total`), so both halves are on screen.
+ *
+ * `attachment_bytes: 0` (the Entry notes-only tier) renders "attachments not
+ * included" — never a meter over a zero budget.
+ */
+export function vaultUsageLine(plan: PlanId, notesUsedBytes: number, attachmentUsedBytes: number): string {
+  const spec = PLAN_SPECS[plan];
+  const notes = `notes ${formatUsageBytes(notesUsedBytes)} of ${formatPlanBytes(spec.notes_bytes)}`;
+  const attach =
+    spec.attachment_bytes > 0
+      ? `attachments ${formatUsageBytes(attachmentUsedBytes)} of ${formatPlanBytes(spec.attachment_bytes)}`
+      : "attachments not included";
+  return `This vault: ${notes} · ${attach} — pooled across your vaults`;
+}
+
+/**
  * The console teaser shown while billing is UNCONFIGURED (the NEITHER state —
  * no Stripe keys, no mock). Honest: paid plans are arriving, and the launch
  * promo box ("Have a code?") sits directly below.

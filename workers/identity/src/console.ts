@@ -306,7 +306,10 @@ async function renderConsoleFor(
   const usage = await latestUsageForVaults(db, vaults.map((v) => v.name));
   for (const card of cards) {
     const row = usage.get(card.name);
-    card.usage = row ? { usedBytes: row.dbBytes + row.r2Bytes, day: row.day } : null;
+    // Kept SPLIT by meter (#107): dbBytes → the notes graph, r2Bytes → the
+    // attachment blobs. They are separate pooled budgets, so the card renders
+    // them as two meters; summing here is what hid the split.
+    card.usage = row ? { notesBytes: row.dbBytes, attachmentBytes: row.r2Bytes, day: row.day } : null;
   }
   // History (Wave 4e): restore points from the D1 snapshot mirror — paid
   // plans see the list + restore doors; free plans see the teaser (their
