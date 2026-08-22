@@ -26,7 +26,7 @@ import type {
   AttachmentTicket,
   AttachmentTicketProvider,
 } from "@openparachute/core/src/attachment/tickets.js";
-import { sanitizeAttachmentExtension } from "@openparachute/core/src/attachment/policy.js";
+import { mimeForAttachmentExtension, sanitizeAttachmentExtension } from "@openparachute/core/src/attachment/policy.js";
 import type { Store } from "@openparachute/core/src/types.js";
 
 function json(data: unknown, status = 200): Response {
@@ -297,7 +297,11 @@ async function handleUploadSpend(req: Request, ticketId: string, deps: TicketSpe
   // readable CONCURRENTLY with the pipe — start it first, await both after.
   const fixed = new FixedLengthStream(contentLength);
   const putPromise = deps.attachments.put(key, fixed.readable, {
-    httpMetadata: { contentType: ticket.mimeType },
+    // vault#617 — store the extension-derived type on the object, not the
+    // caller-asserted ticket mime. Cloud REST GET /storage/ prefers
+    // httpMetadata.contentType; leaving the asserted type here would re-open
+    // the same hole on the byte-serve door.
+    httpMetadata: { contentType: mimeForAttachmentExtension(ext) },
   });
   try {
     await req.body.pipeTo(fixed.writable);
@@ -371,10 +375,13 @@ async function handleDownloadSpend(ticketId: string, deps: TicketSpendDeps): Pro
   // Streams straight from R2 (native chunk-wise `ReadableStream`, same as
   // the existing `GET /api/storage/<path>` byte-serve and `handleExport`'s
   // final serve) — never whole-buffered.
+  // vault#617 — same discipline as bun ticket spend and bun REST GET
+  // /storage/: extension wins over the row's caller-asserted mime_type.
+  const contentType = mimeForAttachmentExtension(sanitizeAttachmentExtension(attachment.path));
   return new Response(obj.body, {
     status: 200,
     headers: {
-      "Content-Type": attachment.mimeType || "application/octet-stream",
+      "Content-Type": contentType,
       "Content-Length": String(obj.size),
       // Same defense-in-depth as every other byte-serve response on this
       // door: never let a browser MIME-sniff a stored asset into an active
