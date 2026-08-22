@@ -7,7 +7,8 @@
  *     idempotent plan-entitlement reconciliation through the same GET/PUT
  *     seam, per-vault failures skip+log+continue, the per-run cap marks `capped`,
  *   - latestUsageForVaults: newest row per vault, absent when none,
- *   - the console render: "Using X of Y" per card from the latest row,
+ *   - the console render: the card's TWO meters (notes / attachments, each of
+ *     its own pooled plan budget — #107) from the latest row,
  *     "usage appears within a day" when none, the plan line's total,
  *   - the staging-only /__test/usage-run trigger (404 in production).
  */
@@ -19,7 +20,7 @@ import { USAGE_RUN_CAP, latestUsageForVaults, runUsageRollup } from "../src/usag
 import { validateAccessToken } from "../src/tokens.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
 import type { EmailSender, SendResult } from "../src/email.ts";
-import { planEntitlement, type VaultEntitlement } from "../src/plans.ts";
+import { PLAN_SPECS, planEntitlement, vaultUsageLine, type VaultEntitlement } from "../src/plans.ts";
 import { CAP_PUSH_MAX_ATTEMPTS, applyPlanToVaults } from "../src/vault-call.ts";
 import { CSRF, ISSUER, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
 
@@ -754,15 +755,17 @@ describe("console usage display", () => {
       .run();
   }
 
-  test('a recorded vault card reads "Using X of Y" (latest row, human units, plan cap)', async () => {
+  test("a recorded vault card reads as TWO meters, each of its own pooled budget (latest row)", async () => {
     const { id: userId } = await seedUser("shows@example.com");
     await seedVault("shows-v", userId);
     await seedRow("shows-v", "2026-07-01", 100_000, 0); // stale — must lose to the newer row
-    await seedRow("shows-v", "2026-07-02", 150_000, 59_715); // ≈0.2 MiB total
+    await seedRow("shows-v", "2026-07-02", 150_000, 59_715);
     const html = await consoleHtml(await seedSession(userId));
     expect(html).toContain('data-testid="vault-usage"');
-    expect(html).toContain("Using 0.2 MB of 8.5 GiB"); // trial cap (mirrors plus: 500 MB + 8 GiB)
-    // The plan line carries the across-vaults total.
+    // The two meters, split (#107) — notes of the notes pool, attachments of
+    // the attachment pool, never the two budgets summed into one denominator.
+    expect(html).toContain(vaultUsageLine("trial", 150_000, 59_715));
+    // The plan line carries the across-vaults total against that same pool.
     expect(html).toContain('data-testid="usage-total"');
     expect(html).toMatch(/usage-total[^<]*>&middot; Using 0\.2 MB/);
   });
@@ -779,21 +782,27 @@ describe("console usage display", () => {
     const { id: userId } = await seedUser("two@example.com");
     await seedVault("two-a", userId);
     await seedVault("two-b", userId);
-    await seedRow("two-a", "2026-07-02", 1_048_576, 0); // 1.0 MB
-    await seedRow("two-b", "2026-07-02", 2_097_152, 1_048_576); // 3.0 MB
+    await seedRow("two-a", "2026-07-02", 1_048_576, 0); // 1.0 MB notes
+    await seedRow("two-b", "2026-07-02", 2_097_152, 1_048_576); // 2.0 MB notes + 1.0 MB attach
     const html = await consoleHtml(await seedSession(userId));
-    expect(html).toContain("Using 1.0 MB of 8.5 GiB"); // trial cap (500 MB notes + 8 GiB attach)
-    expect(html).toContain("Using 3.0 MB of 8.5 GiB");
+    // Each card carries its OWN per-meter numerators; the DENOMINATORS are the
+    // one pooled plan budget both vaults share, which is why the copy says so.
+    expect(html).toContain(vaultUsageLine("trial", 1_048_576, 0));
+    expect(html).toContain(vaultUsageLine("trial", 2_097_152, 1_048_576));
     expect(html).toMatch(/usage-total[^<]*>&middot; Using 4\.0 MB/);
   });
 
-  test("a power-plan card reads against its 51 GiB cap (distinct from the trial default's 8.5 GiB)", async () => {
+  test("a power-plan card reads against POWER's per-meter pools (distinct from the trial default's)", async () => {
     const { id: userId } = await seedUser("paid@example.com");
     await env.DB.prepare("UPDATE users SET plan = 'power' WHERE id = ?").bind(userId).run();
     await seedVault("paid-v", userId);
-    await seedRow("paid-v", "2026-07-02", 3_221_225_472, 0); // 3 GiB
+    await seedRow("paid-v", "2026-07-02", 3_221_225_472, 0); // 3 GiB of notes
     const html = await consoleHtml(await seedSession(userId));
-    expect(html).toContain("Using 3.0 GB of 51 GiB");
+    expect(html).toContain(vaultUsageLine("power", 3_221_225_472, 0));
+    // The point of the split: 3 GiB of notes is 3x OVER power's 1 GiB notes
+    // pool, and the old summed line ("Using 3.0 GB of 51 GiB") hid that.
+    expect(PLAN_SPECS.power.notes_bytes).toBeLessThan(3_221_225_472);
+    expect(html).not.toContain("Using 3.0 GB of 51 GiB");
   });
 });
 

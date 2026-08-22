@@ -29,6 +29,7 @@ import {
   validateVaultName,
 } from "../src/vaults.ts";
 import { getUserByEmail, hashPassword, needsRehash, verifyPassword } from "../src/users.ts";
+import { PLAN_SPECS, formatPlanBytes, formatUsageBytes, planTotalBytes } from "../src/plans.ts";
 import { hashSecret, randomUUID, verifySecret } from "../src/crypto.ts";
 import { resolveResourceVault } from "../src/audience.ts";
 import { depsForEnv, resolveBoundOrigins } from "../src/oauth-shared.ts";
@@ -1791,5 +1792,94 @@ describe("console — vaults", () => {
     const user = await getUserByEmail(env.DB, "owns@example.com");
     const vaults = await listVaultsForOwner(env.DB, user!.id);
     expect(vaults.map((v) => v.name)).toContain("owned-flow");
+  });
+});
+
+// --- the per-card usage meters (#107) --------------------------------------
+
+/**
+ * The vault card's storage line reads as TWO meters, each against its OWN
+ * POOLED plan budget (notes → PLAN_SPECS[plan].notes_bytes, attachments →
+ * .attachment_bytes), never against the two budgets SUMMED — the summed
+ * denominator double-counted the shared pool and hid the split (#107).
+ *
+ * Denominators are asserted from PLAN_SPECS, not hardcoded strings, so retuning
+ * the plan ladder can never leave these tests asserting a stale number.
+ */
+describe("console — per-card usage meters against the pooled two-meter budget (#107)", () => {
+  async function seedUsageRow(vault: string, day: string, dbBytes: number, r2Bytes: number): Promise<void> {
+    await env.DB.prepare("INSERT INTO vault_usage (vault_name, day, db_bytes, r2_bytes) VALUES (?, ?, ?, ?)")
+      .bind(vault, day, dbBytes, r2Bytes)
+      .run();
+  }
+
+  /** The rendered text of the card's `vault-usage` element. */
+  function usageLineOf(html: string): string {
+    const m = /data-testid="vault-usage"[^>]*>([^<]*)</.exec(html);
+    expect(m, "the card must render a vault-usage element").not.toBeNull();
+    return m![1]!;
+  }
+
+  async function consoleHtmlFor(userId: string): Promise<string> {
+    const sessionId = await seedSession(userId);
+    const res = await app.fetch(
+      new Request(`${ISSUER}/console`, { headers: { cookie: `parachute_id_session=${sessionId}` } }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    return res.text();
+  }
+
+  test("a recorded card shows notes and attachments as SEPARATE meters, each of its own pooled budget", async () => {
+    const { id: userId } = await seedUser("meters-trial@example.com"); // signup default: trial
+    await seedVault("meters-v", userId);
+    await seedUsageRow("meters-v", "2026-07-01", 999_999, 999_999); // stale — must lose
+    await seedUsageRow("meters-v", "2026-07-02", 150_000, 59_715);
+    const line = usageLineOf(await consoleHtmlFor(userId));
+
+    const spec = PLAN_SPECS.trial;
+    // Each meter against its OWN budget, straight from PLAN_SPECS.
+    expect(line).toContain(`notes ${formatUsageBytes(150_000)} of ${formatPlanBytes(spec.notes_bytes)}`);
+    expect(line).toContain(`attachments ${formatUsageBytes(59_715)} of ${formatPlanBytes(spec.attachment_bytes)}`);
+    // The budget is POOLED — the copy must say so, never imply a per-vault cap.
+    expect(line).toContain("pooled across your vaults");
+    // And the summed denominator (the #107 bug: notes + attachments as ONE
+    // number) must be gone.
+    expect(line).not.toContain(formatPlanBytes(planTotalBytes("trial")));
+  });
+
+  test("a notes-only tier (attachment budget 0) says attachments aren't included — no 0-byte meter", async () => {
+    const { id: userId } = await seedUser("meters-entry@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'entry' WHERE id = ?").bind(userId).run();
+    await seedVault("meters-entry-v", userId);
+    await seedUsageRow("meters-entry-v", "2026-07-02", 2_097_152, 0);
+    const line = usageLineOf(await consoleHtmlFor(userId));
+
+    const spec = PLAN_SPECS.entry;
+    expect(spec.attachment_bytes).toBe(0); // the tier this case exists for
+    expect(line).toContain(`notes ${formatUsageBytes(2_097_152)} of ${formatPlanBytes(spec.notes_bytes)}`);
+    expect(line).toContain("attachments not included");
+    expect(line).not.toContain("of 0 MB");
+  });
+
+  test("each plan reads against ITS OWN pooled budgets (power ≠ the trial default)", async () => {
+    const { id: userId } = await seedUser("meters-power@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'power' WHERE id = ?").bind(userId).run();
+    await seedVault("meters-power-v", userId);
+    await seedUsageRow("meters-power-v", "2026-07-02", 3_221_225_472, 1_073_741_824);
+    const line = usageLineOf(await consoleHtmlFor(userId));
+
+    const spec = PLAN_SPECS.power;
+    expect(line).toContain(`notes ${formatUsageBytes(3_221_225_472)} of ${formatPlanBytes(spec.notes_bytes)}`);
+    expect(line).toContain(`attachments ${formatUsageBytes(1_073_741_824)} of ${formatPlanBytes(spec.attachment_bytes)}`);
+    expect(line).not.toContain(formatPlanBytes(planTotalBytes("power")));
+  });
+
+  test("no rollup row yet → the honest 'within a day' line, never a made-up zero", async () => {
+    const { id: userId } = await seedUser("meters-fresh@example.com");
+    await seedVault("meters-fresh-v", userId);
+    const line = usageLineOf(await consoleHtmlFor(userId));
+    expect(line).toBe("Usage appears within a day.");
+    expect(line).not.toContain("0.0 MB");
   });
 });

@@ -38,8 +38,10 @@ import {
   planLine,
   tierIntervalPricing,
   tierIntervals,
+  planTotalBytes,
   upgradeTeaser,
   vaultCapMessage,
+  vaultUsageLine,
 } from "../src/plans.ts";
 import { FIRST_PARTY_CLIENT_ID, applyPlanToVaults, pushVaultCap } from "../src/vault-call.ts";
 import { getUserByEmail, setUserPlan } from "../src/users.ts";
@@ -381,6 +383,52 @@ describe("console plan display", () => {
     const html = await consoleHtml(await seedSession(id));
     expect(html).not.toContain('data-testid="vault-cap"');
     expect(html).toContain('id="name" name="name"');
+  });
+});
+
+// --- the card's two-meter usage copy (#107) ----------------------------------
+
+describe("vaultUsageLine — two meters, each of its OWN pooled budget", () => {
+  test("renders one meter per budget, both denominators straight from PLAN_SPECS", () => {
+    const spec = PLAN_SPECS.plus;
+    const line = vaultUsageLine("plus", 1_048_576, 3_145_728);
+    expect(line).toContain(`notes ${formatUsageBytes(1_048_576)} of ${formatPlanBytes(spec.notes_bytes)}`);
+    expect(line).toContain(`attachments ${formatUsageBytes(3_145_728)} of ${formatPlanBytes(spec.attachment_bytes)}`);
+  });
+
+  test("NEVER the two budgets summed — that denominator was the #107 double-count", () => {
+    for (const plan of ["entry", "standard", "plus", "power", "trial", "expired"] as const) {
+      const line = vaultUsageLine(plan, 1_048_576, 1_048_576);
+      // planTotalBytes = notes + attachments summed into one number. It is the
+      // legacy single-cap view (admin + back-compat) and must not reach a card.
+      const summed = formatPlanBytes(planTotalBytes(plan));
+      if (PLAN_SPECS[plan].attachment_bytes > 0) expect(line).not.toContain(`of ${summed}`);
+    }
+  });
+
+  test("the copy names the numerator as THIS vault and the denominator as POOLED", () => {
+    const line = vaultUsageLine("standard", 1_048_576, 1_048_576);
+    expect(line).toContain("This vault:"); // numerators = this vault
+    expect(line).toContain("pooled across your vaults"); // denominators = shared
+    // The old wording implied the whole budget belonged to this one card.
+    expect(line).not.toMatch(/^Using /);
+  });
+
+  test("a 0 attachment budget (Entry, notes-only) reads 'not included', never a meter over zero", () => {
+    expect(PLAN_SPECS.entry.attachment_bytes).toBe(0);
+    const line = vaultUsageLine("entry", 1_048_576, 0);
+    expect(line).toContain("attachments not included");
+    expect(line).not.toContain("of 0 MB");
+    expect(line).toContain(`notes ${formatUsageBytes(1_048_576)} of ${formatPlanBytes(PLAN_SPECS.entry.notes_bytes)}`);
+  });
+
+  test("usage OVER a meter's pool stays visible (the summed line used to hide it)", () => {
+    const overNotes = PLAN_SPECS.power.notes_bytes * 3;
+    const line = vaultUsageLine("power", overNotes, 0);
+    // 3 GiB of notes against power's 1 GiB notes pool — legible as over only
+    // because the meters are split; summed against 51 GiB it read as fine.
+    expect(line).toContain(`notes ${formatUsageBytes(overNotes)} of ${formatPlanBytes(PLAN_SPECS.power.notes_bytes)}`);
+    expect(overNotes).toBeGreaterThan(PLAN_SPECS.power.notes_bytes);
   });
 });
 
