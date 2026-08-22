@@ -28,6 +28,9 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+// The edge-propagation retry (cloud#207) — a pure, unit-tested module for the
+// same reason smoke-report.ts is one: this file runs a live main() on import.
+import { fetchPastPropagation, propagationNote } from "./smoke-propagation.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY = (process.env.IDENTITY ?? "https://cloud.parachute.computer").replace(/\/$/, "");
@@ -127,18 +130,42 @@ async function main() {
   //         JSON — NOT a 200 SPA shell;
   //       - /account/mcp NEVER serves HTML (the run_worker_first backstop:
   //         the path must not fall through to the app's index.html).
+  //
+  //     cloud#207: every fetch here goes through fetchPastPropagation() and the
+  //     PRM body is parsed by hand rather than with `.json()`. On the rc.116
+  //     Wave A deploy the smoke ran before the new worker reached the edge PoP,
+  //     the not-yet-existing path fell through to the SPA shell, `.json()` threw
+  //     SyntaxError, and the deploy read RED for a feature that was healthy
+  //     minutes later. HTML here is a propagation fact, not an answer.
   {
-    const prm = (await (await fetch(`${IDENTITY}/.well-known/oauth-protected-resource/account/mcp`)).json()) as {
-      resource?: string;
-      authorization_servers?: string[];
-      scopes_supported?: string[];
-    };
+    const prmUrl = `${IDENTITY}/.well-known/oauth-protected-resource/account/mcp`;
+    const prmGet = await fetchPastPropagation(prmUrl);
+    const prmNote = propagationNote(prmGet.attempts);
+    // Parse defensively: a body that is still not JSON after the retries is a
+    // REAL failure (the route is serving the shell), reported as a clean FAIL
+    // with the body prefix — never an unhandled SyntaxError that reads as
+    // "SMOKE THREW" and hides which check died.
+    let prm: { resource?: string; authorization_servers?: string[]; scopes_supported?: string[] } | null = null;
+    try {
+      prm = JSON.parse(prmGet.body) as typeof prm;
+    } catch {
+      prm = null;
+    }
+    if (!prm) {
+      fail(
+        "account-mcp PRM: body is JSON (not the SPA shell) after propagation retries",
+        `status ${prmGet.res.status} content-type=${prmGet.res.headers.get("content-type")} attempts=${prmGet.attempts} body=${prmGet.body.slice(0, 120)}`,
+      );
+      prm = {};
+    } else {
+      ok("account-mcp PRM: answers JSON, not the SPA shell", `status ${prmGet.res.status}${prmNote}`);
+    }
     assert(
       prm.resource === `${FRONT_DOOR}/account/mcp` &&
         Array.isArray(prm.authorization_servers) &&
         prm.authorization_servers.includes(IDENTITY),
       "account-mcp PRM: resource = front door + authorization_servers = issuer",
-      `resource=${prm.resource} as=${JSON.stringify(prm.authorization_servers)}`,
+      `resource=${prm.resource} as=${JSON.stringify(prm.authorization_servers)}${prmNote}`,
     );
     assert(
       Array.isArray(prm.scopes_supported) && prm.scopes_supported.includes("account:vaults"),
@@ -161,35 +188,40 @@ async function main() {
     );
 
     // Unauthed POST → 401 + PRM challenge, and JSON (never a 200 SPA shell).
-    const unauthed = await fetch(`${IDENTITY}/account/mcp`, {
+    // Same propagation retry: on a stale PoP this path doesn't exist yet and
+    // falls through to the shell. After the retries, a shell is a REAL failure.
+    const post = await fetchPastPropagation(`${IDENTITY}/account/mcp`, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
       redirect: "manual",
     });
+    const unauthed = post.res;
+    const postNote = propagationNote(post.attempts);
     const challenge = unauthed.headers.get("www-authenticate") ?? "";
     const unauthedCt = unauthed.headers.get("content-type") ?? "";
-    const unauthedBody = await unauthed.text();
+    const unauthedBody = post.body;
     assert(
       unauthed.status === 401 && challenge.includes("resource_metadata=") && challenge.includes("/account/mcp"),
       "account-mcp: unauthed POST → 401 carrying the RFC 9728 PRM challenge",
-      `status ${unauthed.status} www-authenticate=${challenge || "(absent)"}`,
+      `status ${unauthed.status} www-authenticate=${challenge || "(absent)"}${postNote}`,
     );
     assert(
       unauthedCt.includes("application/json") && !unauthedCt.includes("text/html") && !unauthedBody.trimStart().startsWith("<"),
       "account-mcp: the 401 is JSON, NOT a 200 SPA shell (never HTML)",
-      `content-type=${unauthedCt}`,
+      `content-type=${unauthedCt}${postNote}`,
     );
 
     // Belt-and-suspenders: an unauthed GET is refused too (the auth gate runs
     // before method framing) and likewise never HTML — the path can't SPA-shell.
-    const getProbe = await fetch(`${IDENTITY}/account/mcp`, { redirect: "manual" });
+    const probe = await fetchPastPropagation(`${IDENTITY}/account/mcp`, { redirect: "manual" });
+    const getProbe = probe.res;
     const getCt = getProbe.headers.get("content-type") ?? "";
-    const getBody = await getProbe.text();
+    const getBody = probe.body;
     assert(
       getProbe.status === 401 && !getCt.includes("text/html") && !getBody.trimStart().startsWith("<"),
       "account-mcp: unauthed GET /account/mcp → 401, never the HTML SPA shell",
-      `status ${getProbe.status} content-type=${getCt}`,
+      `status ${getProbe.status} content-type=${getCt}${propagationNote(probe.attempts)}`,
     );
   }
 
