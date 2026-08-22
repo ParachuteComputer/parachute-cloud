@@ -529,14 +529,24 @@ async function handleNotesInner(
       // yields a flat array (no watermark), but `?cursor=` (empty) returns the
       // `{notes, next_cursor}` envelope + first watermark — matching
       // HTTP_API.md's documented cycle ("wrapped envelope when ?cursor= is
-      // set"). An empty value maps to undefined so the store returns page 1;
-      // a non-empty value is decoded as the keyset watermark.
+      // set").
+      //
+      // The empty string is carried THROUGH to core, not folded to undefined
+      // (cloud#112, porting vault#559). Core keys cursor mode on
+      // `opts.cursor !== undefined` — `""` is the bootstrap value that engages
+      // the keyset `ORDER BY (updated_at_ms, id)` with no boundary predicate;
+      // `undefined` means "no cursor at all" and leaves the default
+      // `created_at` order in place. Folding `""` → `undefined` here made
+      // page 1 of a bootstrap walk run UNORDERED relative to the watermark it
+      // then minted, so every note excluded from that page whose `updated_at`
+      // fell below the watermark was silently skipped for the rest of the
+      // walk. Only an absent param (`null`) may become `undefined`.
       const parsed = parseNotesQueryOpts(url);
       if (parsed.error) return parsed.error;
       const queryOpts = parsed.queryOpts!;
       const hasCursorParam = url.searchParams.has("cursor");
       const cursorParam = parseQuery(url, "cursor");
-      queryOpts.cursor = cursorParam && cursorParam.length > 0 ? cursorParam : undefined;
+      queryOpts.cursor = cursorParam ?? undefined;
       const nearNoteIdEarly = parseQuery(url, "near[note_id]");
       if (hasCursorParam && nearNoteIdEarly) {
         return json(
@@ -931,7 +941,7 @@ async function handleNotesInner(
             }
           }
           const finalNote = await store.getNote(createdNote.id);
-          if (!finalNote) return json({ error: "Note disappeared" }, 500);
+          if (!finalNote) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
           const validated = attachValidationStatus(store, db, finalNote);
           const includeContentResp = body.include_content !== false;
           if (includeContentResp) return json({ ...validated, created: true });
@@ -963,6 +973,7 @@ async function handleNotesInner(
         return json(
           {
             error: "mutually_exclusive",
+            error_type: "mutually_exclusive",
             message: "`content`, `append`/`prepend`, and `content_edit` are mutually exclusive — pick one mode of content update.",
           },
           400,
@@ -996,15 +1007,45 @@ async function handleNotesInner(
       if (hasContentEdit) {
         const ce = body.content_edit as { old_text?: unknown; new_text?: unknown };
         if (typeof ce?.old_text !== "string" || typeof ce?.new_text !== "string") {
-          return json({ error: "bad_request", message: "`content_edit` requires { old_text: string, new_text: string }." }, 400);
+          return json(
+            {
+              error: "bad_request",
+              error_type: "invalid_content_edit",
+              field: "content_edit",
+              message: "`content_edit` requires { old_text: string, new_text: string }.",
+              hint: "pass { old_text: string, new_text: string }",
+            },
+            400,
+          );
         }
         const idx = note.content.indexOf(ce.old_text);
         if (idx < 0) {
-          return json({ error: "unprocessable_content", message: `content_edit: \`old_text\` not found in note "${note.id}". Re-read and retry.` }, 422);
+          // 422, not 404: the note exists and the request is syntactically
+          // valid — only the search string can't be applied to the current
+          // content. A 404 here implied "note doesn't exist" (vault#202).
+          return json(
+            {
+              error: "unprocessable_content",
+              error_type: "content_edit_not_found",
+              field: "content_edit.old_text",
+              message: `content_edit: \`old_text\` not found in note "${note.id}". Re-read and retry.`,
+              hint: "re-read the note's current content and retry with an old_text that occurs exactly once",
+            },
+            422,
+          );
         }
         const second = note.content.indexOf(ce.old_text, idx + 1);
         if (second >= 0) {
-          return json({ error: "ambiguous", message: `content_edit: \`old_text\` matches multiple times in note "${note.id}" — must match exactly once. Add surrounding context.` }, 409);
+          return json(
+            {
+              error: "ambiguous",
+              error_type: "content_edit_ambiguous",
+              field: "content_edit.old_text",
+              message: `content_edit: \`old_text\` matches multiple times in note "${note.id}" — must match exactly once. Add surrounding context.`,
+              hint: "add surrounding context to old_text so it matches exactly once",
+            },
+            409,
+          );
         }
         contentOverride = note.content.slice(0, idx) + ce.new_text + note.content.slice(idx + ce.old_text.length);
       }
@@ -1049,7 +1090,16 @@ async function handleNotesInner(
       const stBody = body.state_transition as { field?: unknown; from?: unknown; to?: unknown } | undefined;
       if (stBody !== undefined) {
         if (typeof stBody.field !== "string" || stBody.field.length === 0) {
-          return json({ error: "bad_request", message: "`state_transition.field` must be a non-empty string." }, 400);
+          return json(
+            {
+              error: "bad_request",
+              error_type: "invalid_state_transition",
+              field: "state_transition.field",
+              message: "`state_transition.field` must be a non-empty string.",
+              hint: "pass a non-empty string naming the metadata field to transition",
+            },
+            400,
+          );
         }
         updates.state_transition = { field: stBody.field, from: stBody.from, to: stBody.to };
       }
@@ -1089,7 +1139,7 @@ async function handleNotesInner(
       }
 
       const updatedNote = await store.getNote(note.id);
-      if (updatedNote === null) return json({ error: "Note disappeared" }, 404);
+      if (updatedNote === null) return json({ error: "Note disappeared", error_type: "not_found" }, 404);
       const validated: any = attachValidationStatus(store, db, updatedNote);
       const linkMutated = body.links?.add !== undefined || body.links?.remove !== undefined;
       const includeLinksResp = linkMutated || parseBool(parseQuery(url, "include_links"), false);
@@ -1109,7 +1159,7 @@ async function handleNotesInner(
       lean.created = false;
       return json(lean);
     } catch (e: any) {
-      if (e instanceof NotFoundError) return json({ error: e.message }, 404);
+      if (e instanceof NotFoundError) return json({ error: e.message, error_type: "not_found" }, 404);
       if (e && e.code === "CONFLICT") {
         return json(
           {
