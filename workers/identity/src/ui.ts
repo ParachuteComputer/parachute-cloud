@@ -411,7 +411,7 @@ function renderVerbSelector(selector: OwnerVerbSelector): string {
   const option = (verb: "read" | "write" | "admin", title: string, desc: string): string => {
     const checked = verb === defaultVerb ? " checked" : "";
     const badge = verb === "admin" ? ` <span class="verbbadge">admin</span>` : "";
-    return `<label class="verbopt${verb === "admin" ? " verbopt-admin" : ""}">
+    return `<label class="verbopt">
              <input type="radio" name="verb_select" value="${verb}"${checked}>
              <span class="verbopt-body"><span class="verbopt-title">${esc(title)}${badge}</span><span class="verbopt-desc">${esc(desc)}</span></span>
            </label>`;

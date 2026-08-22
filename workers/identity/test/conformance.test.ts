@@ -1557,6 +1557,37 @@ describe("consent verb selector — owner-elected vault:admin (port hub#689)", (
     expect(html).not.toContain('value="admin" checked');
   });
 
+  /**
+   * cloud#201 (cosmetic) — #200 shipped a `verbopt-admin` class with no CSS rule
+   * behind it. Rather than just deleting the dead hook, pin the property: every
+   * class the selector renders must exist in the shipped stylesheet, so the next
+   * styling hook either gets a rule or does not get added.
+   */
+  test("every class rendered in the verb selector has a CSS rule (no dead hooks)", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("myvault", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const query = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:read vault:write",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    };
+    const html = await (await handleAuthorizeGet(env.DB, authorizeGetReq(query, sessionId), deps())).text();
+    const stylesheet = /<style>([\s\S]*?)<\/style>/.exec(html)?.[1];
+    expect(stylesheet).toBeTruthy();
+    const fieldset = /<fieldset class="verbsel">[\s\S]*?<\/fieldset>/.exec(html)?.[0];
+    expect(fieldset).toBeTruthy();
+    const rendered = [...fieldset!.matchAll(/class="([^"]+)"/g)].flatMap((m) => m[1]!.trim().split(/\s+/));
+    expect(rendered.length).toBeGreaterThan(0); // control: the scan found classes
+    const unstyled = [...new Set(rendered)].filter((cls) => !stylesheet!.includes(`.${cls}`));
+    expect(unstyled).toEqual([]);
+  });
+
   test("a read-only request defaults the radio to read (not write)", async () => {
     const { id: userId } = await seedUser();
     await seedVault("myvault", userId);
@@ -1690,6 +1721,59 @@ describe("consent verb selector — owner-elected vault:admin (port hub#689)", (
     expect(tokenRes.status).toBe(200);
     const pair = (await tokenRes.json()) as { scope: string };
     expect(pair.scope).toBe("vault:myvault:read vault:myvault:write");
+  });
+
+  /**
+   * cloud#201 — the DEFAULT SUBMIT, which is NOT the same case as (c). (c) pins
+   * the field being ABSENT entirely; a real browser never does that, because a
+   * radio group always submits its checked member. As rendered, `write` is the
+   * checked radio on a read+write request, so a plain Approve (no radio
+   * interaction) submits `verb_select=write` and mints `vault:<name>:write`
+   * ALONE — the requested read+write PAIR collapses to one scope string on the
+   * common path. Capability-identical at the vault (write ⊇ read via VERB_RANK
+   * in workers/vault/src/auth.ts), so this pins the SCOPE STRING, not a
+   * permission change.
+   *
+   * The submitted verb is DERIVED from the rendered HTML rather than hardcoded,
+   * so flipping the rendered default fails this test instead of silently
+   * changing what the common path mints.
+   */
+  test("(d) the DEFAULT submit (the radio as rendered) mints vault:<name>:write ALONE", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("myvault", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { verifier, challenge } = await makePkce();
+    const query = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:read vault:write",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    };
+
+    // 1. Read the default off the form the way a browser would: the ONE checked
+    //    member of the `verb_select` radio group.
+    const html = await (await handleAuthorizeGet(env.DB, authorizeGetReq(query, sessionId), deps())).text();
+    const checked = [...html.matchAll(/name="verb_select" value="(read|write|admin)" checked/g)].map((m) => m[1]!);
+    expect(checked).toHaveLength(1); // a radio group submits exactly one value
+    const defaultVerb = checked[0]!;
+
+    // 2. Approve with no radio interaction — submit exactly that default.
+    const consent = await handleAuthorizePost(
+      env.DB,
+      consentReq(consentFields(clientId, challenge, { verb_select: defaultVerb }), { sessionId }),
+      deps(),
+    );
+    const code = await codeFromConsent(consent);
+    const tokenRes = await mintFromCode(clientId, code, verifier);
+    expect(tokenRes.status).toBe(200);
+    const pair = (await tokenRes.json()) as { scope: string };
+
+    // The collapse: ONE scope, not the requested read+write pair (contrast (c)).
+    expect(pair.scope).toBe("vault:myvault:write");
+    expect(pair.scope).not.toContain("vault:myvault:read");
   });
 
   test("owner elects read (downgrade) on a read+write request → token carries only read", async () => {
