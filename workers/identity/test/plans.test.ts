@@ -771,6 +771,29 @@ describe("applyPlanToVaults — the seam admin/Stripe/promo/sweep call", () => {
     expect(await applyPlanToVaults(env.DB, deps(), "no-such-user")).toEqual([]);
   });
 
+  // cloud#234: the DO-push seam itself refuses a tombstone, so a forgotten
+  // caller (not just the webhook family) cannot wake a deleted owner's vault.
+  // The dispatcher is a tripwire — if this test starts seeing a PUT, the
+  // skip is gone.
+  test("tombstoned owner → empty result set, dispatcher never called", async () => {
+    const { id: userId } = await seedUser("apply-tombstone@example.com");
+    await setUserPlan(env.DB, userId, "standard");
+    await seedVault("apply-tombstone-box", userId);
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?")
+      .bind(new Date().toISOString(), userId)
+      .run();
+    let called = 0;
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async () => {
+        called += 1;
+        return Response.json({ ok: true });
+      },
+    };
+    expect(await applyPlanToVaults(env.DB, boundDeps, userId)).toEqual([]);
+    expect(called).toBe(0);
+  });
+
   test("TRIAL MIRRORS THE CHOSEN TIER: an ENTRY trialist's push is entry's spec (no attachments, no voice — the honest preview)", async () => {
     const { id: userId } = await seedUser("trial-entry@example.com"); // trial
     await env.DB.prepare("UPDATE users SET pending_plan = 'entry' WHERE id = ?").bind(userId).run();

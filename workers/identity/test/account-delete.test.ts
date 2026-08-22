@@ -561,6 +561,35 @@ describe("A-3 — undo inside the window restores the account", () => {
     expect(((await list.json()) as { vaults: { name: string }[] }).vaults.map((v) => v.name)).toEqual(["restored"]);
   });
 
+  // cloud#234: Stripe webhooks during the window skip the DO cap push.
+  // Undo is what re-applies current plan entitlement so a checkout that
+  // landed mid-window is not lost on restore.
+  test("undo re-applies current plan entitlement to owned vaults (cloud#234)", async () => {
+    const acct = await seedAccount("undo-caps@example.com", { vaults: ["restored-caps"], stripe: true });
+    const { stripe } = makeStripeStub();
+    const { vaultFetch, calls } = recordingVaultFetch();
+    const del = await handleAccountDelete(
+      env,
+      deleteReq(acct.token, acct.email),
+      accountDeps(clock(T0), vaultFetch),
+      undefined,
+      billing(stripe),
+    );
+    const { undo_token } = (await del.json()) as { undo_token: string };
+    calls.length = 0;
+
+    const res = await handleAccountDeleteUndo(
+      env,
+      undoGetReq(undo_token),
+      accountDeps(clock(plus(60 * 60 * 1000)), vaultFetch),
+      billing(stripe),
+    );
+    expect(res.status).toBe(200);
+    const capPuts = calls.filter((c) => c.method === "PUT" && c.path.endsWith("/api/internal/config"));
+    expect(capPuts, `undo vaultFetch calls: ${JSON.stringify(calls)}`).toHaveLength(1);
+    expect(calls.some((c) => c.method === "POST" && c.path.includes("/destroy"))).toBe(false);
+  });
+
   test("POST with a JSON body is the same door (API clients have no inbox)", async () => {
     const acct = await seedAccount("undo-post@example.com");
     const del = await handleAccountDelete(env, deleteReq(acct.token, acct.email), accountDeps(clock(T0)));
