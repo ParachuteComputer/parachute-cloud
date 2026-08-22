@@ -102,9 +102,10 @@ export interface Env {
    */
   VAULT_PUBLIC_ORIGIN?: string;
   /**
-   * Deployment environment. When NOT "production", the magic-link send echoes the
-   * link back in an `X-Parachute-Dev-Magic-Link` response header (so the flow is
-   * testable without real email). MUST be "production" on any public deploy.
+   * Deployment environment. `__test/*`, the magic-link echo header, and mock
+   * billing are allowlisted to staging | development | test (`isDevExposureEnv`).
+   * Unset or misspelled values fail closed. MUST be "production" on any public
+   * deploy.
    */
   ENVIRONMENT?: string;
   /** FROM address for outbound email. Its domain must be onboarded to Email Sending. */
@@ -158,10 +159,10 @@ export interface Env {
   STRIPE_PRICE_POWER_YEARLY?: string;
   /**
    * Interim MOCK-billing opt-in (the demo path before real Stripe keys land).
-   * "1" forces the mock checkout ON — but ONLY in a non-production environment
-   * (billing-config.ts `mockBillingEnabled` hard-gates on ENVIRONMENT !==
-   * "production", so this flag can NEVER activate mock in prod). Normally left
-   * unset: the mock auto-activates on any non-prod deploy that has no real
+   * "1" forces the mock checkout ON — but ONLY on the `isDevExposureEnv`
+   * allowlist (staging | development | test). This flag can NEVER activate
+   * mock in prod, or when ENVIRONMENT is unset/misspelled. Normally left
+   * unset: the mock auto-activates on an allowlisted deploy that has no real
    * Stripe config, and stays inert the moment real keys land. See wrangler.toml.
    */
   MOCK_BILLING?: string;

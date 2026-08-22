@@ -102,10 +102,11 @@ const depsFor = (env: Env): OAuthDeps => depsForEnv(env);
 
 /**
  * The email sender: the Cloudflare binding when bound + configured, else dev-log.
- * Sender selection is INDEPENDENT of the dev echo header: in any non-production
- * environment, POST /auth/magic both sends (via whichever sender this picks) AND
- * echoes the link in `x-parachute-dev-magic-link` (deps.exposeDevLinks) — so the
- * headless test path survives the real binding. Production never echoes.
+ * Sender selection is INDEPENDENT of the dev echo header: on the
+ * `isDevExposureEnv` allowlist, POST /auth/magic both sends (via whichever
+ * sender this picks) AND echoes the link in `x-parachute-dev-magic-link`
+ * (deps.exposeDevLinks) — so the headless test path survives the real binding.
+ * Production, unset, and misspelled ENVIRONMENT never echo.
  * Exported for the tests that pin that contract (auth.test.ts).
  */
 export function senderFor(env: Env): EmailSender {
@@ -341,11 +342,12 @@ app.post("/billing/checkout", (c) => handleCheckoutPost(c.env, c.req.raw, depsFo
 app.post("/billing/portal", (c) => handlePortalPost(c.env, c.req.raw, depsFor(c.env)));
 app.post("/billing/webhook", (c) => handleStripeWebhookPost(c.env, c.req.raw, depsFor(c.env)));
 // Interim MOCK checkout (mock-payments PR) — the demo path before real Stripe
-// keys land. HARD-gated to non-production via mockBillingEnabled: this route
-// 404s (like the __test/* hooks) whenever mock is off, so a free self-upgrade
-// can NEVER be reached in production (pinned by a test + smoke-prod). When mock
-// is active, the same session + CSRF + same-origin boundary as the real
-// checkout, reusing the real post-payment lifecycle (billing.ts).
+// keys land. HARD-gated via mockBillingEnabled (`isDevExposureEnv` belt): this
+// route 404s (like the __test/* hooks) whenever mock is off, so a free
+// self-upgrade can NEVER be reached in production (pinned by a test +
+// smoke-prod). When mock is active, the same session + CSRF + same-origin
+// boundary as the real checkout, reusing the real post-payment lifecycle
+// (billing.ts).
 app.post("/billing/mock-checkout", (c) => {
   const deps = depsFor(c.env);
   if (deps.mockBillingEnabled !== true) return c.notFound();
@@ -370,19 +372,19 @@ app.post("/unsubscribe", (c) => handleUnsubscribe(c.env.DB, c.req.raw));
 
 // Staging/dev-only drip trigger: live cron firings can't be forced, so the
 // staging smoke drives one drip tick here and asserts on the returned counts
-// (PII-free summary — same shape runDrip logs). GATED OFF IN PRODUCTION: when
-// ENVIRONMENT is "production" this returns 404 like any unknown route (the
-// same gate as the x-parachute-dev-magic-link echo). Unauthenticated on
-// staging by design — the ledger + per-run cap bound what a stray caller can
-// do, and staging's sender is the devlog (no real email exists to abuse).
+// (PII-free summary — same shape runDrip logs). ALLOWLIST-GATED: off
+// staging|development|test this returns 404 like any unknown route (the same
+// gate as the x-parachute-dev-magic-link echo). Unauthenticated on staging by
+// design — the ledger + per-run cap bound what a stray caller can do, and
+// staging's sender is the devlog (no real email exists to abuse).
 app.post("/__test/drip-run", async (c) => {
   if (!depsFor(c.env).exposeDevLinks) return c.notFound();
   return c.json(await runDrip(c.env, senderFor(c.env)));
 });
 
 // Staging/dev-only usage-rollup trigger — same gate + rationale as
-// /__test/drip-run above (live cron firings can't be forced; 404 in
-// production; a stray staging caller can only refresh today's usage rows).
+// /__test/drip-run above (live cron firings can't be forced; 404 off the
+// allowlist; a stray staging caller can only refresh today's usage rows).
 app.post("/__test/usage-run", async (c) => {
   const deps = depsFor(c.env);
   if (!deps.exposeDevLinks) return c.notFound();
@@ -395,8 +397,8 @@ app.post("/__test/usage-run", async (c) => {
   return c.json(await runUsageRollup(c.env, deps, onlyVault ? { onlyVault } : {}));
 });
 
-// Staging/dev-only snapshot-sweep trigger — same gate + rationale (404 in
-// production, pinned by smoke-prod). A stray staging caller can only take
+// Staging/dev-only snapshot-sweep trigger — same gate + rationale (404 off
+// the allowlist, pinned by smoke-prod). A stray staging caller can only take
 // policy-conformant snapshots; the GFS skip/prune bounds the work.
 app.post("/__test/snapshot-run", async (c) => {
   const deps = depsFor(c.env);

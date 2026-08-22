@@ -20,6 +20,7 @@
  * charge, so entry bills quarterly/yearly).
  */
 import type { Env } from "./env.ts";
+import { isDevExposureEnv } from "./env-gates.ts";
 import type { PaidTier } from "./plans.ts";
 
 /** The billing cycles a Checkout can buy — form field `interval`. */
@@ -106,18 +107,19 @@ export function priceFor(config: BillingConfig, tier: PaidTier, interval: Billin
  *
  * THE SECURITY GATE — belt AND suspenders (a free self-upgrade in production
  * would be a disaster):
- *   BELT       ENVIRONMENT !== "production" — NEVER active in prod, full stop
- *              (the flag below cannot override this).
+ *   BELT       `isDevExposureEnv` (staging | development | test). Unset,
+ *              misspelled, or production ENVIRONMENT fails closed — the flag
+ *              below cannot override this.
  *   SUSPENDERS real Stripe not configured (billingConfig === null) OR an
  *              explicit MOCK_BILLING="1" opt-in.
- * In production the mock endpoint 404s exactly like the __test/* hooks (pinned
- * by a test + smoke-prod). When real keys ARE present (and MOCK_BILLING isn't
- * forcing mock), this returns false and the real Checkout path (#63) takes
- * over automatically — no code change to switch.
+ * Off the allowlist the mock endpoint 404s exactly like the __test/* hooks
+ * (pinned by a test + smoke-prod). When real keys ARE present (and MOCK_BILLING
+ * isn't forcing mock), this returns false and the real Checkout path (#63)
+ * takes over automatically — no code change to switch.
  */
 export function mockBillingEnabled(env: Env): boolean {
-  if (env.ENVIRONMENT === "production") return false; // belt — never in prod
-  if (env.MOCK_BILLING === "1") return true; // explicit opt-in (non-prod only)
+  if (!isDevExposureEnv(env.ENVIRONMENT)) return false; // belt — fail closed
+  if (env.MOCK_BILLING === "1") return true; // explicit opt-in (allowlist only)
   return billingConfig(env) === null; // auto: mock stands in for absent Stripe
 }
 

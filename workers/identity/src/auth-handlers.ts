@@ -257,7 +257,7 @@ export async function handleMagicRequestPost(
     await bumpMagicLinkEvent(db, sent.ok ? "sent" : "failed", now);
     const extra: Record<string, string> = {};
     // DEV ONLY: echo the link + code so the flow is testable without real
-    // email. Gated hard on ENVIRONMENT !== "production" (deps.exposeDevLinks).
+    // email. Gated hard on isDevExposureEnv (deps.exposeDevLinks).
     // The code rides a SIBLING header (not the existing link header) — callers
     // that only expect a URL there (smoke-staging's existing steps) are
     // unaffected; a new step reads x-parachute-dev-magic-code.

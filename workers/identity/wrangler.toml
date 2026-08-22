@@ -310,30 +310,32 @@ STRIPE_PRICE_POWER_QUARTERLY = "price_1TqJlKIkisoTdlLqgrtikZGG"     # $25 / 3 mo
 STRIPE_PRICE_POWER_YEARLY = "price_1TqJlJIkisoTdlLq8eE3JSBr"        # $80 / yr
 # --- interim MOCK billing (mock-payments PR) ----------------------------------
 # The mock checkout demos the full upgrade → cap/voice-lift flow BEFORE real
-# Stripe keys land. It is HARD-gated to non-production (billing-config.ts
-# mockBillingEnabled): ENVIRONMENT="production" here means the mock is ALWAYS
-# off and /billing/mock-checkout 404s — a free self-upgrade is unreachable in
-# prod (pinned by a test + smoke-prod). So there is NOTHING to set here: MOCK_BILLING
-# is intentionally NOT declared in this production block. It auto-activates only
-# on non-prod deploys with no real Stripe (staging), and goes inert the moment
-# real keys land. (MOCK_BILLING="1" is an optional non-prod-only override.)
+# Stripe keys land. It is HARD-gated to the isDevExposureEnv allowlist
+# (billing-config.ts mockBillingEnabled): ENVIRONMENT="production" here means
+# the mock is ALWAYS off and /billing/mock-checkout 404s — a free self-upgrade
+# is unreachable in prod (pinned by a test + smoke-prod). So there is NOTHING
+# to set here: MOCK_BILLING is intentionally NOT declared in this production
+# block. It auto-activates only on allowlisted deploys with no real Stripe
+# (staging), and goes inert the moment real keys land. (MOCK_BILLING="1" is
+# an optional allowlist-only override.)
 
 # --- outbound email (Cloudflare Email Sending) ------------------------------
 # Cloudflare Email Sending (public beta, Workers Paid). parachute.computer was
 # onboarded 2026-07-02 (`wrangler email sending enable` — SPF + DKIM live in the
 # zone), so the binding below makes magic-link email REAL. senderFor()
 # (src/index.ts) auto-detects it; with no binding it falls back to the dev-log
-# sender. NOTE the echo affordance is independent of the sender: while
-# ENVIRONMENT != "production", POST /auth/magic ALSO returns the link in the
-# `x-parachute-dev-magic-link` header (headless tests + smoke depend on it);
-# a production deploy (ENVIRONMENT="production") never emits the header.
+# sender. NOTE the echo affordance is independent of the sender: on the
+# isDevExposureEnv allowlist (staging | development | test), POST /auth/magic
+# ALSO returns the link in the `x-parachute-dev-magic-link` header (headless
+# tests + smoke depend on it); a production deploy (ENVIRONMENT="production"),
+# and any unset/misspelled ENVIRONMENT, never emits the header.
 [[send_email]]
 name = "EMAIL"
 
 # =============================================================================
 # STAGING — `wrangler deploy -e staging` → worker "parachute-identity-staging"
 # (named envs auto-suffix the name), served ONLY at its workers.dev URL. Own D1,
-# echo header ON (ENVIRONMENT != "production"), and DELIBERATELY no send_email
+# echo header ON (ENVIRONMENT="staging" is on the allowlist), and DELIBERATELY no send_email
 # binding: bindings are non-inheritable, so staging's sender is the dev-log
 # fallback — POST /auth/magic sends no real email and the echo header is the
 # deterministic way smoke-staging.ts completes the flow.
