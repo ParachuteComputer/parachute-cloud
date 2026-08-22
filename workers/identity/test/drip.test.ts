@@ -531,4 +531,24 @@ describe("worker wiring", () => {
     const prod = await worker.fetch(req(), { ...env, ENVIRONMENT: "production" });
     expect(prod.status).toBe(404);
   });
+
+  test("the drip trigger 404s when ENVIRONMENT is unset, misspelled, or padded (fail closed)", async () => {
+    const req = () => new Request(`${ISSUER}/__test/drip-run`, { method: "POST" });
+    for (const environment of ["", "Production", "production ", "prod", "PRODUCTION"]) {
+      const res = await worker.fetch(req(), { ...env, ENVIRONMENT: environment });
+      expect(res.status, environment || "(empty)").toBe(404);
+    }
+    const unset = { ...env } as { ENVIRONMENT?: string };
+    delete unset.ENVIRONMENT;
+    expect((await worker.fetch(req(), unset)).status).toBe(404);
+  });
+
+  test("the drip trigger stays on the allowlist (staging, development, test)", async () => {
+    await seedUserAt("allowlist-drip@example.com", new Date(Date.now() - 10 * 60 * 1000));
+    const req = () => new Request(`${ISSUER}/__test/drip-run`, { method: "POST" });
+    for (const environment of ["staging", "development", "test"] as const) {
+      const res = await quietly(async () => worker.fetch(req(), { ...env, ENVIRONMENT: environment }));
+      expect(res.status, environment).toBe(200);
+    }
+  });
 });

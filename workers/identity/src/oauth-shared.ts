@@ -13,6 +13,7 @@ import { VAULT_VERBS } from "./audience.ts";
 import { billingConfig, mockBillingEnabled } from "./billing-config.ts";
 import { randomBase64url } from "./crypto.ts";
 import type { Env } from "./env.ts";
+import { isDevExposureEnv } from "./env-gates.ts";
 import type { RateLimiterNamespace } from "./rate-limit.ts";
 
 export interface OAuthDeps {
@@ -56,7 +57,8 @@ export interface OAuthDeps {
   /**
    * DEV ONLY: when true, the magic-link send echoes the link back in an
    * `x-parachute-dev-magic-link` response header so the flow is testable without
-   * real email. Set from ENVIRONMENT !== "production"; MUST be false in prod.
+   * real email. Set from `isDevExposureEnv` (allowlist: staging | development |
+   * test). MUST be false in prod — unset/misspelled ENVIRONMENT fails closed.
    */
   exposeDevLinks?: boolean;
   /**
@@ -81,10 +83,10 @@ export interface OAuthDeps {
   billingConfigured?: boolean;
   /**
    * True when the interim MOCK billing path is active (billing-config.ts
-   * `mockBillingEnabled`): non-production AND (no real Stripe OR MOCK_BILLING=1).
-   * The console's Upgrade buttons then POST the mock checkout endpoint instead
-   * of hosted Checkout, and the mock endpoint's own hard gate reads this.
-   * ALWAYS false in production — the mock 404s there.
+   * `mockBillingEnabled`): `isDevExposureEnv` AND (no real Stripe OR
+   * MOCK_BILLING=1). The console's Upgrade buttons then POST the mock checkout
+   * endpoint instead of hosted Checkout, and the mock endpoint's own hard gate
+   * reads this. ALWAYS false off the allowlist — the mock 404s there.
    */
   mockBillingEnabled?: boolean;
 }
@@ -216,7 +218,7 @@ export function depsForEnv(env: Env): OAuthDeps {
     // ISSUER is always accepted; BOUND_ORIGINS (P0.5) adds the app origin during
     // the two-issuer window. Unset ⇒ exactly [issuer] (pre-P0.5 behavior).
     boundOrigins: () => parseBoundOrigins(issuer, env.BOUND_ORIGINS),
-    exposeDevLinks: env.ENVIRONMENT !== "production",
+    exposeDevLinks: isDevExposureEnv(env.ENVIRONMENT),
     rateLimiter: env.RATE_LIMITER,
     billingConfigured: billingConfig(env) !== null,
     mockBillingEnabled: mockBillingEnabled(env),

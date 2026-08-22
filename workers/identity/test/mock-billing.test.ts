@@ -86,6 +86,22 @@ describe("mockBillingEnabled — belt + suspenders", () => {
     expect(mockBillingEnabled(PROD_UNCONFIGURED)).toBe(false);
     expect(mockBillingEnabled(PROD_MOCK_FLAG)).toBe(false);
   });
+
+  test("unset / misspelled / padded ENVIRONMENT is NEVER mock — fail closed, even with the flag", () => {
+    for (const environment of ["", "Production", "production ", "prod"]) {
+      expect(mockBillingEnabled({ ...env, ENVIRONMENT: environment })).toBe(false);
+      expect(mockBillingEnabled({ ...env, ENVIRONMENT: environment, MOCK_BILLING: "1" })).toBe(false);
+    }
+    const unset = { ...env, ENVIRONMENT: undefined };
+    expect(mockBillingEnabled(unset)).toBe(false);
+    expect(mockBillingEnabled({ ...unset, MOCK_BILLING: "1" })).toBe(false);
+  });
+
+  test("allowlisted environments still auto-mock when Stripe is absent", () => {
+    expect(mockBillingEnabled({ ...env, ENVIRONMENT: "staging" })).toBe(true);
+    expect(mockBillingEnabled({ ...env, ENVIRONMENT: "development" })).toBe(true);
+    expect(mockBillingEnabled({ ...env, ENVIRONMENT: "test" })).toBe(true);
+  });
 });
 
 // --- THE SECURITY GATE: 404 wherever mock is off ------------------------------
@@ -102,6 +118,14 @@ describe("SECURITY: POST /billing/mock-checkout 404s wherever mock is off", () =
   test("PRODUCTION + MOCK_BILLING=1 → STILL 404 (the belt beats the flag)", async () => {
     const { id } = await seedUser("mock-prodflag@example.com");
     const res = await app.fetch(post({ __csrf: CSRF }, sessionCookie(await seedSession(id))), PROD_MOCK_FLAG);
+    expect(res.status).toBe(404);
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial");
+  });
+
+  test("unset ENVIRONMENT + MOCK_BILLING=1 → STILL 404 (fail closed)", async () => {
+    const { id } = await seedUser("mock-unset@example.com");
+    const unsetFlag = { ...env, ENVIRONMENT: "", MOCK_BILLING: "1" };
+    const res = await app.fetch(post({ __csrf: CSRF }, sessionCookie(await seedSession(id))), unsetFlag);
     expect(res.status).toBe(404);
     expect((await getUserById(env.DB, id))!.plan).toBe("trial");
   });

@@ -427,8 +427,8 @@ describe("magic link — send + verify", () => {
     // wrangler.toml binds [[send_email]] EMAIL (Email Sending onboarded
     // 2026-07-02), so senderFor picks the real binding — and the dev echo
     // header must SURVIVE it: the header is gated on exposeDevLinks
-    // (ENVIRONMENT !== "production"), independent of sender selection. The
-    // headless dev/smoke flow depends on this.
+    // (isDevExposureEnv; vitest pins ENVIRONMENT="test"), independent of
+    // sender selection. The headless dev/smoke flow depends on this.
     expect(senderFor(env as never).kind).toBe("binding");
     const res = await app.fetch(magicReq("router@example.com", "10.5.5.5"), env);
     expect(res.status).toBe(200);
@@ -442,6 +442,27 @@ describe("magic link — send + verify", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("x-parachute-dev-magic-link")).toBeNull();
     expect(await res.text()).toContain("Check your email"); // flow stays neutral-200
+  });
+
+  test("unset / misspelled / padded ENVIRONMENT never emits the echo header (fail closed)", async () => {
+    // The old denylist (`!== "production"`) treated every one of these as
+    // non-prod and echoed the link. The allowlist must not.
+    const closed: Array<{ environment?: string; email: string }> = [
+      { environment: "", email: "closed-empty@example.com" },
+      { environment: "Production", email: "closed-title@example.com" },
+      { environment: "production ", email: "closed-padded@example.com" },
+      { environment: "prod", email: "closed-prod@example.com" },
+    ];
+    for (const { environment, email } of closed) {
+      const res = await app.fetch(magicReq(email, "10.7.7.7"), { ...env, ENVIRONMENT: environment } as never);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-parachute-dev-magic-link"), environment || "(empty)").toBeNull();
+    }
+    const unset = { ...env } as { ENVIRONMENT?: string };
+    delete unset.ENVIRONMENT;
+    const res = await app.fetch(magicReq("closed-unset@example.com", "10.7.7.8"), unset as never);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-parachute-dev-magic-link")).toBeNull();
   });
 
   test("senderFor falls back to dev-log when no binding is bound", () => {
