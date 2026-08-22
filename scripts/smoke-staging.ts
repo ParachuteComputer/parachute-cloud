@@ -7,6 +7,9 @@
  *
  *   identity discovery → DCR → login → consent → token (real RS256 JWT)
  *   → vault REST create/read/update → MCP initialize/tools.list/tools.call
+ *   → the canonical ROOT /mcp (vault-agnostic, token-derived DO dispatch —
+ *     root PRM + 401 challenge + equivalence with the per-vault door +
+ *     confinement, section 6b)
  *   → SSE snapshot → portable-md export tarball (unpacked + checked)
  *   → console signup/vault-claim/ownership refusal → seed packs (default
  *     4-note seed, POST /api/packs, the console Surface-Starter button)
@@ -334,6 +337,171 @@ async function main() {
     "MCP tools/call vault-info → real projection (name + tags + stats, no placeholder)",
     info ? `name=${info.name} tags=${info.tags?.length} notes=${info.stats?.totalNotes}` : infoText.slice(0, 80).replace(/\n/g, " "),
   );
+
+  // 6b. CANONICAL ROOT /mcp — token-derived vault dispatch (U1, cloud#192).
+  //
+  // The vault worker serves a vault-AGNOSTIC `/mcp` at the ORIGIN ROOT: the URL
+  // names no vault, so the target is derived from the TOKEN and re-dispatched to
+  // that vault's DO (which re-runs its strict `aud=vault.<name>` check, so a bad
+  // derivation fails INSIDE the DO rather than bypassing it). #192 landed it with
+  // a full workerd matrix (workers/vault/test/root-mcp.test.ts) but NO live step —
+  // and "vitest-workerd ≠ real-workerd" is exactly why this file exists. This is
+  // the live probe of the new door (cloud#193).
+  //
+  // REACHABILITY on staging: the root branch fires only when `resolveVault()`
+  // returns null, i.e. the request names no vault by URL. Staging's
+  // VAULT_BASE_DOMAIN is the workers.dev host ITSELF
+  // (`parachute-vault-do-staging.openparachute.workers.dev`), and the subdomain
+  // test is `host.endsWith("." + base)` — the base host is not a subdomain OF
+  // itself, so `${VAULT}/mcp` resolves no vault and lands on the root branch,
+  // exactly as `u.parachute.computer/mcp` does in production. (If VAULT is ever
+  // overridden to a per-vault `<name>.<base>` origin, these steps would be
+  // probing the per-vault endpoint instead — the serverInfo assertions below
+  // would still hold, but the PRM/challenge ones would fail loudly rather than
+  // silently pass, which is the right failure.)
+  {
+    // (1) The root PRM — RFC 9728 §3.1 path-insertion location for the ROOT
+    // resource. Vault-agnostic, so it differs from the per-vault PRM in exactly
+    // two ways: `resource` is the origin-root `/mcp`, and `scopes_supported`
+    // advertises the UN-NARROWED `vault:read`/`vault:write` (no vault name to
+    // narrow to — the issuer's consent picker narrows them at authorize time).
+    const rootPrmRes = await fetch(`${VAULT}/.well-known/oauth-protected-resource/mcp`);
+    const rootPrm = (await rootPrmRes.json()) as {
+      resource?: string;
+      authorization_servers?: string[];
+      scopes_supported?: string[];
+      bearer_methods_supported?: string[];
+    };
+    assert(
+      rootPrmRes.status === 200 &&
+        rootPrm.resource === `${VAULT}/mcp` &&
+        JSON.stringify(rootPrm.authorization_servers) === JSON.stringify([IDENTITY]) &&
+        JSON.stringify(rootPrm.bearer_methods_supported) === JSON.stringify(["header"]),
+      "root-mcp: PRM names the ORIGIN-ROOT resource + the identity issuer",
+      `resource=${rootPrm.resource} as=${JSON.stringify(rootPrm.authorization_servers)} status ${rootPrmRes.status}`,
+    );
+    // UNNAMED scopes — the load-bearing divergence from the per-vault PRM. A
+    // `vault:<name>:<verb>` leaking in here would mean the root door had been
+    // wired to a specific vault.
+    assert(
+      JSON.stringify(rootPrm.scopes_supported) === JSON.stringify(["vault:read", "vault:write"]),
+      "root-mcp: PRM advertises the UN-NARROWED vault:read/vault:write (no vault name)",
+      JSON.stringify(rootPrm.scopes_supported),
+    );
+
+    // (2) Unauthenticated POST /mcp → 401 whose challenge names the ROOT PRM
+    // (never a per-vault one — the root resource is vault-agnostic, and pointing
+    // a bare 401 at some vault's PRM would both leak a name and mis-route the
+    // client's consent).
+    const anonRes = await fetch(`${VAULT}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "smoke", version: "0" } } }),
+    });
+    const rootChallenge = anonRes.headers.get("www-authenticate") ?? "";
+    const rootChallengeUrl = /resource_metadata="([^"]+)"/.exec(rootChallenge)?.[1] ?? "";
+    assert(
+      anonRes.status === 401 &&
+        rootChallenge.startsWith("Bearer resource_metadata=") &&
+        !!rootChallengeUrl &&
+        new URL(rootChallengeUrl).pathname === "/.well-known/oauth-protected-resource/mcp",
+      "root-mcp: unauthenticated POST /mcp → 401 + WWW-Authenticate naming the ROOT PRM",
+      `status ${anonRes.status} challenge=${rootChallenge || "(absent)"}`,
+    );
+    // The pointer has to RESOLVE — a challenge naming a 404 is a broken
+    // discovery chain, which is what a spec-following client actually walks.
+    const followRes = await fetch(rootChallengeUrl || `${VAULT}/.well-known/oauth-protected-resource/mcp`);
+    const followed = (await followRes.json()) as { resource?: string };
+    assert(
+      followRes.status === 200 && followed.resource === `${VAULT}/mcp`,
+      "root-mcp: the 401 challenge pointer resolves to the root PRM (discovery chain intact)",
+      `status ${followRes.status} resource=${followed.resource}`,
+    );
+
+    // (3) EQUIVALENCE — the single-vault token minted at step 4 (aud=vault.<name>,
+    // scopes vault:<name>:read+write) drives the root endpoint to the SAME DO the
+    // URL-addressed twin reaches. Both frames must be byte-identical: same
+    // serverInfo, same tool list. This is the property the workerd suite pins;
+    // here it runs against real workerd + a real issuer-minted RS256 token.
+    async function rootMcp(body: unknown, search = ""): Promise<{ status: number; text: string; json: any }> {
+      const r = await fetch(`${VAULT}/mcp${search}`, { method: "POST", headers: MCP_HEADERS, body: JSON.stringify(body) });
+      const text = await r.text();
+      let parsed: any = null;
+      try { parsed = JSON.parse(text); } catch { /* leave null → the assert fails with the raw text */ }
+      return { status: r.status, text, json: parsed };
+    }
+    /** Re-stringify a parsed frame so key order comes from one code path, not the wire. */
+    const canon = (v: unknown) => JSON.stringify(v);
+
+    const ROOT_INIT = { jsonrpc: "2.0", id: 101, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "smoke", version: "0" } } };
+    const ROOT_LIST = { jsonrpc: "2.0", id: 102, method: "tools/list", params: {} };
+
+    const rootInit = await rootMcp(ROOT_INIT);
+    assert(
+      rootInit.status === 200 && rootInit.json?.result?.serverInfo?.name === `parachute-vault/${VAULT_NAME}`,
+      "root-mcp: initialize at the ROOT derives our vault from the token (URL names none)",
+      `status ${rootInit.status} serverInfo=${rootInit.json?.result?.serverInfo?.name ?? rootInit.text.slice(0, 80)}`,
+    );
+    const perVaultInit = await mcp(ROOT_INIT);
+    assert(
+      rootInit.status === perVaultInit.status && canon(rootInit.json) === canon(perVaultInit.json),
+      "root-mcp: initialize at / ≡ /vault/<name>/mcp (byte-identical frame)",
+      `root ${rootInit.status} vs per-vault ${perVaultInit.status}`,
+    );
+
+    const rootList = await rootMcp(ROOT_LIST);
+    const perVaultList = await mcp(ROOT_LIST);
+    const rootToolNames: string[] = (rootList.json?.result?.tools ?? []).map((t: { name: string }) => t.name);
+    assert(
+      rootList.status === 200 && rootToolNames.includes("create-note") && rootToolNames.includes("query-notes"),
+      "root-mcp: tools/list at the ROOT → the core tools",
+      `${rootToolNames.length} tools`,
+    );
+    assert(
+      rootList.status === perVaultList.status && canon(rootList.json) === canon(perVaultList.json),
+      "root-mcp: tools/list at / ≡ /vault/<name>/mcp (byte-identical frame)",
+      `root ${rootList.status} vs per-vault ${perVaultList.status}`,
+    );
+
+    // (4) CONFINEMENT — the token names the vault, so the token is also the
+    // CEILING. Three probes, mirroring the workerd matrix's confinement block.
+    //
+    // 4a. The DO actually reached is ours: vault-info's projection is read out of
+    //     that DO's own SQLite, so a wrong dispatch would name a different vault.
+    const rootInfo = await rootMcp({ jsonrpc: "2.0", id: 103, method: "tools/call", params: { name: "vault-info", arguments: {} } });
+    let rootInfoJson: any = null;
+    try { rootInfoJson = JSON.parse(rootInfo.json?.result?.content?.[0]?.text ?? ""); } catch { /* leave null → assert fails */ }
+    assert(
+      rootInfo.status === 200 && !rootInfo.json?.result?.isError && rootInfoJson?.name === VAULT_NAME,
+      "root-mcp: confinement — the DO reached at the root IS our own vault (vault-info projection)",
+      `name=${rootInfoJson?.name ?? rootInfo.text.slice(0, 80)}`,
+    );
+
+    // 4b. The URL cannot STEER the dispatch. The root branch matches on pathname
+    //     alone and the credential extractor only ever reads `?key=`, so a
+    //     `?vault=` hint is inert — assert that rather than assume it.
+    const steer = await rootMcp(ROOT_INIT, `?vault=${encodeURIComponent(`${VAULT_NAME}-not-mine`)}`);
+    assert(
+      steer.status === 200 && steer.json?.result?.serverInfo?.name === `parachute-vault/${VAULT_NAME}`,
+      "root-mcp: confinement — a ?vault= hint on the root URL cannot steer the dispatch",
+      `serverInfo=${steer.json?.result?.serverInfo?.name ?? steer.text.slice(0, 80)}`,
+    );
+
+    // 4c. ...and the token cannot reach ANOTHER vault by URL either: the same
+    //     token at a foreign `/vault/<other>/mcp` hits that vault's DO, whose
+    //     strict `aud=vault.<other>` check refuses it — with the PER-VAULT
+    //     challenge, not the root one (the URL is the vault identity there). A
+    //     fixed probe name keeps the staging debris to one DO across runs.
+    const foreignVault = "root-mcp-not-my-vault";
+    const foreignRes = await fetch(`${VAULT}/vault/${foreignVault}/mcp`, { method: "POST", headers: MCP_HEADERS, body: JSON.stringify(ROOT_INIT) });
+    const foreignChallenge = foreignRes.headers.get("www-authenticate") ?? "";
+    assert(
+      foreignRes.status === 401 &&
+        foreignChallenge.includes(`/.well-known/oauth-protected-resource/vault/${foreignVault}/mcp`),
+      "root-mcp: confinement — our token at ANOTHER vault's URL → 401 + that vault's PRM challenge",
+      `status ${foreignRes.status} challenge=${foreignChallenge || "(absent)"}`,
+    );
+  }
 
   // 7. SSE — subscribe, snapshot arrives.
   {
