@@ -212,6 +212,44 @@ export async function revokeFamily(db: D1Database, familyId: string, now: Date):
   return res.meta.changes ?? 0;
 }
 
+/**
+ * Build (but do not execute) the statement that kills EVERY live credential
+ * this client holds for this user — the token-side half of a re-consent
+ * (cloud#211). Returned unexecuted so the caller can put it in the same D1
+ * batch as the grant write; there is no correct order for two separate
+ * statements here (see `recordGrant`), so they must not be two statements.
+ *
+ * SCOPE OF THE BLAST, precisely:
+ *
+ *   - `user_id = ? AND client_id = ?` — one user's grant to one client. Another
+ *     user's tokens for the same client, and the same user's tokens for every
+ *     OTHER client, are untouched. This is what makes it safe to run on a
+ *     surface the user drives themselves.
+ *   - It is written per (user, client) rather than per `family_id` on purpose.
+ *     A single (user, client) pair can hold SEVERAL live families at once —
+ *     one per authorization the client ever completed, e.g. a second device
+ *     that connected separately. Revoking only the newest family would leave
+ *     the older device happily minting the wider scope, which is the whole bug.
+ *   - No `refresh_token_hash IS NOT NULL` filter, and that is deliberate: the
+ *     access token and its refresh token SHARE one row and one `jti`
+ *     (oauth-token.ts), so this revokes both halves. The outstanding wide
+ *     ACCESS token is dead immediately and shows up in the revocation list
+ *     (`listActiveRevocations`), rather than living out its 15 minutes.
+ *   - `revoked_at IS NULL` keeps it idempotent and keeps `changes` honest: a
+ *     re-run reports 0 rather than re-stamping already-dead rows with a newer
+ *     timestamp.
+ */
+export function prepareRevokeClientTokens(
+  db: D1Database,
+  userId: string,
+  clientId: string,
+  now: Date,
+): D1PreparedStatement {
+  return db
+    .prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL")
+    .bind(now.toISOString(), userId, clientId);
+}
+
 /** The live (un-revoked, un-expired) refresh rows in a family as of `now`. */
 export async function liveFamilyRefreshRows(
   db: D1Database,
