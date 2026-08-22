@@ -250,14 +250,30 @@ async function main() {
       `/unsubscribe?t=bogus-${Date.now()}`,
       "/.well-known/oauth-authorization-server",
       "/.well-known/parachute-account",
+      // Not a machine path, but a never-redirect member for the same reason
+      // (cloud#203): /login/2fa is a MID-FLOW step whose pending-login cookie is
+      // host-only, and POST cloud./oauth/authorize sends an enrolled user here
+      // on cloud. while cloud. is still the issuer. A 3xx→my. would drop the
+      // cookie and silently discard the in-flight OAuth login. Free to probe:
+      // with no cookie the handler just 302s to the relative /login.
+      "/login/2fa",
     ];
     for (const p of machinePaths) {
       const res = await fetch(`${IDENTITY}${p}`, { redirect: "manual" });
       assert(notRedirectedToMy(res), `MUST-NEVER-REDIRECT: cloud.${p.split("?")[0]} is served, not 3xx→my.`, `status ${res.status} loc=${res.headers.get("location") ?? "—"}`);
     }
-    // The magic-link + code POST families + the Stripe webhook are pinned by
-    // section 3 (magic) and section 3d (webhook) below — those already prove
-    // non-redirect responses on cloud.
+    // POST families on cloud. — WHAT THIS SMOKE DOES AND DOES NOT COVER LIVE.
+    // Only the Stripe webhook POST (section 3d) still probes a cloud. POST here:
+    // section 3's magic-link POST moved to my. with the Phase 1 cutover, so it
+    // no longer says anything about cloud. non-redirect behavior. The
+    // /auth/magic + /auth/code + /unsubscribe POST families are therefore pinned
+    // by canonical-redirect.test.ts (unit, workerd) and NOT re-proved live.
+    // Deliberate: every one of them MUTATES (mints a magic link, burns a code,
+    // unsubscribes, or records a rate-limit failure that can lock out an IP),
+    // and smoke-prod is READ-ONLY against production. Do not "fix" this by
+    // adding a live POST probe — extend the unit suite instead. The GETs above
+    // plus 3d are the read-only half, and the redirect machinery's positive
+    // control is the cloud./login 301 asserted at the top of this section.
   }
 
   // 2. Console login page renders on the CANONICAL origin (my.). cloud./login now

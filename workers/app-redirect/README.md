@@ -28,3 +28,26 @@ Verify: `curl -sI https://app.parachute.computer/n/x` → `301` + `location: htt
 **Deploy ordering (Phase 1 cutover):** deploy this worker (and re-point notes-redirect) as
 part of the same change that flips `APP_ORIGIN` to `my.` — and TIME it with the announcement
 email (existing `app.`-origin sessions do a one-time reconnect on `my.`).
+
+## Rollback caveat: a 301 is cached by the browser and a rollback does NOT undo it
+
+**There is no clean rollback of Phase 1 for anyone who has already visited.** Every redirect
+in this phase is a **301 Moved Permanently** — this worker's `app.` → `my.`, notes-redirect's,
+and the in-worker `cloud./login` + `cloud./console` → `my.` (`cloudFrontDoorRedirect` in
+`workers/identity/src/index.ts`). Browsers cache a 301 aggressively and often indefinitely:
+a returning visitor who has hit one of those URLs **once** will keep being sent to `my.` by
+their own cache, and **no request reaches the edge for us to correct**. Undeploying this
+worker, reverting `APP_ORIGIN`, or rolling the identity worker back restores the SERVER
+behavior and leaves those CLIENTS pinned to `my.` — they only recover when the cache entry
+expires or the user hard-clears it.
+
+Consequences to plan around, not to discover during an incident:
+
+- **`my.` must keep serving the human paths for as long as any cached 301 can survive** — treat
+  it as one-way from the first production deploy onward, independent of what Phases 2–4 do.
+- **A rollback is a partial rollback.** It only reaches visitors who never hit the redirect.
+  Do not size a rollback plan as if it restores everyone.
+- **If reversibility during a soak matters more than the canonical/SEO signal, the status must
+  be 302 BEFORE the cutover deploy** — switching to 302 afterwards does not evict caches that
+  already hold the 301. (Open question, deliberately not decided here: cloud#203 says
+  "consider 302"; Phase 1 shipped 301.)
