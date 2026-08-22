@@ -409,6 +409,86 @@ describe("vault landing + config", () => {
     expect((await bad.json() as any).error).toBe("invalid_audio_retention");
   });
 
+  /**
+   * cloud#87 — the REST half of the description type guard (the MCP half is in
+   * mcp.test.ts, "description type guard (cloud#87)"). `description` was written
+   * straight through with only a TS `description?: string` annotation and no
+   * runtime check, so a write-scoped caller could persist a non-string. The
+   * damage lands on the OTHER door: `serverInstruction()` (mcp.ts) does
+   * `description?.trim()`, so the next MCP `initialize` answers -32603
+   * INTERNAL_ERROR and the vault is unconnectable. Rejection reuses the SAME
+   * 400 shape the sibling `audio_retention` / `auto_transcribe` validators in
+   * rest/vault.ts already emit — no new error family.
+   */
+  for (const [label, value] of [
+    ["a number", 123],
+    ["an object", { text: "nope" }],
+    ["an array", ["nope"]],
+    ["a boolean", true],
+  ] as Array<[string, unknown]>) {
+    it(`PATCH /api/vault rejects a non-string description (${label}) → 400 invalid_description`, async () => {
+      const v = freshVault();
+      const before = (await (await op(v, "/api/vault")).json()) as any;
+      const bad = await op(v, "/api/vault", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ description: value }),
+      });
+      expect(bad.status).toBe(400);
+      const err = (await bad.json()) as any;
+      expect(err.error).toBe("invalid_description");
+      expect(err.error_type).toBe("invalid_description");
+      expect(err.field).toBe("description");
+      // Nothing persisted.
+      const after = (await (await op(v, "/api/vault")).json()) as any;
+      expect(after.description).toBe(before.description);
+    });
+  }
+
+  it("PATCH /api/vault: a rejected non-string description leaves MCP initialize working (cloud#87 poison)", async () => {
+    const v = freshVault();
+    await op(v, "/api/vault", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ description: 123 }),
+    });
+    const init = await SELF.fetch(`${base(v)}/mcp`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OP}`,
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } },
+      }),
+    });
+    expect(init.status).toBe(200);
+    const body = (await init.json()) as any;
+    expect(body.error).toBeUndefined();
+    expect(typeof body.result.instructions).toBe("string");
+  });
+
+  it("PATCH /api/vault: description null clears it, and a string still persists", async () => {
+    const v = freshVault();
+    await op(v, "/api/vault", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ description: "a real one" }),
+    });
+    expect(((await (await op(v, "/api/vault")).json()) as any).description).toBe("a real one");
+    const cleared = await op(v, "/api/vault", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ description: null }),
+    });
+    expect(cleared.status).toBe(200);
+    expect(((await (await op(v, "/api/vault")).json()) as any).description).toBeNull();
+  });
+
   // C1.2 — bun's handleVault ALWAYS attaches `map` (the front-door structural
   // orientation: total note count, tags with membership counts, path buckets,
   // unfiled count). Cloud has no tag-scoped tokens, so the unscoped

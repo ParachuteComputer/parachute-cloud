@@ -2,6 +2,7 @@ import { SELF } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { DEFAULT_VAULT_DESCRIPTION } from "@openparachute/core/src/seed-packs.js";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
+import { serverInstruction } from "../src/mcp.ts";
 import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
 
 /**
@@ -507,5 +508,106 @@ describe("MCP — vault-info (server-layer override)", () => {
       });
       expect(await res.text()).not.toContain("must be configured by the server layer");
     }
+  });
+
+  /**
+   * cloud#87 — the description write path had an unchecked `as string` cast, so
+   * an admin-scoped caller could persist a NON-string description. The damage is
+   * not at the write: `serverInstruction()` does `description?.trim()`, so the
+   * poison detonates on the NEXT MCP `initialize` (INTERNAL_ERROR -32603 on
+   * connect) and the vault stays unconnectable until repaired — the connected AI
+   * can't even reach a tool to fix it, because `initialize` is the first frame.
+   *
+   * Both halves are pinned here: (a) the write is refused with the tool's normal
+   * validation shape, and (b) `initialize` survives the attempt. `null` stays
+   * legal (clearing a description). The REST half of the same door is pinned in
+   * conformance.test.ts ("PATCH /api/vault rejects a non-string description").
+   */
+  describe("description type guard (cloud#87)", () => {
+    /** Attempt a description write; returns the raw JSON-RPC body. */
+    async function attemptDescription(vault: string, token: string, description: unknown): Promise<any> {
+      const res = await mcpPost(vault, token, {
+        jsonrpc: "2.0",
+        id: 35,
+        method: "tools/call",
+        params: { name: "vault-info", arguments: { description } },
+      });
+      return res.json();
+    }
+
+    const NON_STRINGS: Array<[string, unknown]> = [
+      ["a number", 123],
+      ["an object", { text: "nope" }],
+      ["an array", ["nope"]],
+      ["a boolean", true],
+    ];
+
+    for (const [label, value] of NON_STRINGS) {
+      it(`description: ${label} → INVALID_PARAMS (invalid_description), nothing persisted`, async () => {
+        const v = freshVault();
+        const body = await attemptDescription(v, await ADMIN(v), value);
+        // The tool's NORMAL validation path — a structured JSON-RPC error
+        // (-32602 INVALID_PARAMS + `data.error_type`), the same shape every
+        // other core validation leaf takes through mapDomainError. NOT a raw
+        // throw that degrades to INTERNAL_ERROR.
+        expect(body.error).toBeTruthy();
+        expect(body.error.code).toBe(-32602);
+        expect(body.error.data.error_type).toBe("invalid_description");
+        expect(body.error.data.field).toBe("description");
+        // Nothing landed — still the fresh-vault default.
+        const proj = await callVaultInfo(v, OP, {});
+        expect(proj.description).toBe(DEFAULT_VAULT_DESCRIPTION);
+      });
+    }
+
+    it("POISON: a refused non-string description leaves MCP initialize working", async () => {
+      const v = freshVault();
+      const admin = await ADMIN(v);
+      await attemptDescription(v, admin, 123);
+      // The detonation site: serverInstruction(vaultName, description) →
+      // `description?.trim()`. If a number ever reached the config store this
+      // is a -32603 INTERNAL_ERROR and the vault is unconnectable.
+      const init = await mcpPost(v, admin, initBody);
+      expect(init.status).toBe(200);
+      const body = (await init.json()) as any;
+      expect(body.error).toBeUndefined();
+      expect(typeof body.result.instructions).toBe("string");
+      expect(body.result.instructions).toContain(v);
+    });
+
+    it("description: null is still accepted (clears the description); initialize still works", async () => {
+      const v = freshVault();
+      const admin = await ADMIN(v);
+      const cleared = await callVaultInfo(v, admin, { description: null });
+      expect(cleared.description).toBeNull();
+      const reread = await callVaultInfo(v, OP, {});
+      expect(reread.description).toBeNull();
+      const init = await mcpPost(v, admin, initBody);
+      const body = (await init.json()) as any;
+      expect(body.error).toBeUndefined();
+      expect(typeof body.result.instructions).toBe("string");
+    });
+
+    it("description: a string still persists (the guard does not over-reject)", async () => {
+      const v = freshVault();
+      const updated = await callVaultInfo(v, await ADMIN(v), { description: "  padded  " });
+      expect(updated.description).toBe("  padded  ");
+    });
+
+    // The recovery half: serverInstruction is the detonation site, so it is
+    // ALSO defensive. A vault poisoned before this fix shipped (or by any door
+    // that still lacks the guard — the bun vault's mcp-tools.ts still carries
+    // the same `as string` cast) can be RECONNECTED rather than being stuck at
+    // INTERNAL_ERROR with no reachable repair path.
+    it("serverInstruction tolerates an already-poisoned (non-string) description", () => {
+      for (const poison of [123, { a: 1 }, ["x"], true]) {
+        const out = serverInstruction("poisoned", poison as unknown as string | null);
+        expect(typeof out).toBe("string");
+        expect(out).toContain("poisoned");
+      }
+      // …and still renders a legitimate description.
+      expect(serverInstruction("v", "  A curated vault.  ")).toContain("A curated vault.");
+      expect(serverInstruction("v", null)).toContain("Parachute vault");
+    });
   });
 });
