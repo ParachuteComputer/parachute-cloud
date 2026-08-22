@@ -499,7 +499,7 @@ describe("A-4 — inside the 24-hour window nothing is destroyed", () => {
       plus(DELETE_UNDO_WINDOW_MS - 1000),
       billing(stripe),
     );
-    expect(summary).toEqual({ due: 0, purged: 0, deferred: 0, failed: 0 });
+    expect(summary).toEqual({ due: 0, purged: 0, deferred: 0, skipped: 0, failed: 0 });
     expect(destroys).toEqual([]);
     expect(calls.canceled).toEqual([]);
     expect(await residue(acct.userId, "patient")).toMatchObject({
@@ -754,7 +754,7 @@ describe("A-4 — past the window the sweep really deletes", () => {
       plus(DELETE_UNDO_WINDOW_MS),
       billing(stripe),
     );
-    expect(summary).toEqual({ due: 1, purged: 1, deferred: 0, failed: 0 });
+    expect(summary).toEqual({ due: 1, purged: 1, deferred: 0, skipped: 0, failed: 0 });
 
     // STORAGE: one destroy per owned vault, each an admin mint pinned to that
     // vault with the confirm body — the same contract the single-vault door
@@ -834,7 +834,7 @@ describe("A-4 — past the window the sweep really deletes", () => {
       accountDeps(undefined, failing.vaultFetch),
       plus(DELETE_UNDO_WINDOW_MS),
     );
-    expect(first).toEqual({ due: 1, purged: 0, deferred: 1, failed: 0 });
+    expect(first).toEqual({ due: 1, purged: 0, deferred: 1, skipped: 0, failed: 0 });
 
     // The account row SURVIVES — it is the only thing that still says whose
     // the surviving vault is. The vault that did succeed is gone (destroy is
@@ -852,7 +852,7 @@ describe("A-4 — past the window the sweep really deletes", () => {
       accountDeps(undefined, healthy.vaultFetch),
       plus(DELETE_UNDO_WINDOW_MS + 3_600_000),
     );
-    expect(second).toEqual({ due: 1, purged: 1, deferred: 0, failed: 0 });
+    expect(second).toEqual({ due: 1, purged: 1, deferred: 0, skipped: 0, failed: 0 });
     expect(healthy.calls.map((c) => (c.body as { confirm: string }).confirm)).toEqual(["wedged"]);
     expect(await residue(acct.userId, "wedged")).toMatchObject({ user: false, vaults: 0, vaultUsage: 0 });
   });
@@ -886,7 +886,7 @@ describe("A-4 — past the window the sweep really deletes", () => {
       plus(DELETE_UNDO_WINDOW_MS),
       billing(brokenStripe),
     );
-    expect(summary).toEqual({ due: 1, purged: 0, deferred: 1, failed: 0 });
+    expect(summary).toEqual({ due: 1, purged: 0, deferred: 1, skipped: 0, failed: 0 });
     // Money first, and it stops the pass: destroying the data while a
     // subscription may still be billing for it is the worst ordering.
     expect(destroys).toEqual([]);
@@ -906,7 +906,7 @@ describe("A-4 — past the window the sweep really deletes", () => {
       accountDeps(undefined, vaultFetch),
       plus(DELETE_UNDO_WINDOW_MS + 2000),
     );
-    expect(summary).toEqual({ due: 2, purged: 1, deferred: 1, failed: 0 });
+    expect(summary).toEqual({ due: 2, purged: 1, deferred: 1, skipped: 0, failed: 0 });
     expect((await getUserById(env.DB, stuck.userId)) !== null).toBe(true);
     expect((await getUserById(env.DB, ok.userId)) === null).toBe(true);
   });
@@ -936,7 +936,7 @@ describe("A-4 — past the window the sweep really deletes", () => {
         accountDeps(undefined, liar),
         plus(DELETE_UNDO_WINDOW_MS),
       );
-      expect(summary).toEqual({ due: 1, purged: 0, deferred: 1, failed: 0 });
+      expect(summary).toEqual({ due: 1, purged: 0, deferred: 1, skipped: 0, failed: 0 });
       // Everything that names the vault survives, so a later real destroy can
       // still find it.
       expect(await countRows("vaults", "name", "notreallygone")).toBe(1);
@@ -950,7 +950,7 @@ describe("A-4 — past the window the sweep really deletes", () => {
     await handleAccountDelete(env, deleteReq(acct.token, acct.email), accountDeps(clock(T0)));
     const liar: VaultFetch = async () => new Response("not json", { status: 200 });
     const summary = await runAccountDeleteSweep(env, accountDeps(undefined, liar), plus(DELETE_UNDO_WINDOW_MS));
-    expect(summary).toEqual({ due: 1, purged: 0, deferred: 1, failed: 0 });
+    expect(summary).toEqual({ due: 1, purged: 0, deferred: 1, skipped: 0, failed: 0 });
     expect(await countRows("vaults", "name", "garbled")).toBe(1);
   });
 
@@ -1018,7 +1018,7 @@ describe("A-4 — past the window the sweep really deletes", () => {
     const acct = await seedAccount("purge-noattempts@example.com", { vaults: ["smooth"] });
     await handleAccountDelete(env, deleteReq(acct.token, acct.email), accountDeps(clock(T0)));
     const summary = await runAccountDeleteSweep(env, accountDeps(), plus(DELETE_UNDO_WINDOW_MS));
-    expect(summary).toEqual({ due: 1, purged: 1, deferred: 0, failed: 0 });
+    expect(summary).toEqual({ due: 1, purged: 1, deferred: 0, skipped: 0, failed: 0 });
     expect(await getUserById(env.DB, acct.userId)).toBeNull();
   });
 
@@ -1030,7 +1030,7 @@ describe("A-4 — past the window the sweep really deletes", () => {
       accountDeps(undefined, vaultFetch),
       plus(DELETE_UNDO_WINDOW_MS * 10),
     );
-    expect(summary).toEqual({ due: 0, purged: 0, deferred: 0, failed: 0 });
+    expect(summary).toEqual({ due: 0, purged: 0, deferred: 0, skipped: 0, failed: 0 });
     expect(calls).toEqual([]);
     expect((await getUserById(env.DB, live.userId)) !== null).toBe(true);
     expect(await countRows("vaults", "name", "safe")).toBe(1);
@@ -1087,5 +1087,320 @@ describe("A-4 — past the window the sweep really deletes", () => {
       now: () => plus(DELETE_UNDO_WINDOW_MS),
     });
     expect(await getUserById(env.DB, acct.userId)).toBeNull();
+  });
+});
+
+// --- 5. the boundary race (cloud#248) ----------------------------------------
+
+/**
+ * The sweep and the undo endpoint used to decide independently, each from its
+ * own clock, whether an account's window was still open — and neither acts at
+ * the instant it reads that clock. At the 24-hour boundary both could answer
+ * "yes": undo restored the account and reported `restored: true`, and the
+ * sweep, which had SELECTed the account before the undo committed and never
+ * re-checked `deleted_at`, went on to destroy its vaults and purge its rows.
+ *
+ * HOW THE ORDERING IS INJECTED, since a real race would prove nothing: the
+ * Stripe stub is the seam. `teardownBilling` calls `subscriptions.cancel`, so a
+ * hook there runs INSIDE the sweep's per-account work, at a known point —
+ * after that account has been read and claimed, and before any vault is
+ * destroyed. Which account the hook drives an undo for decides which side of
+ * the claim the undo lands on:
+ *
+ *   - the SAME account the sweep is mid-teardown on → the undo arrives AFTER
+ *     the claim, and must lose;
+ *   - a LATER account in the same batch → the undo arrives BEFORE that
+ *     account's claim, and must win.
+ *
+ * Both are the same race; only the interleaving differs, and the fix has to
+ * get both right. A guard that just refused every concurrent undo would pass
+ * the first test and destroy a restored account in the second.
+ */
+describe("cloud#248 — the sweep and undo agree on ONE atomic point", () => {
+  /** A Stripe stub whose `cancel` runs `hook` mid-teardown, once. */
+  function stripeWithTeardownHook(hook: () => Promise<void>): { stripe: Stripe; calls: StripeCalls } {
+    const { stripe, calls } = makeStripeStub();
+    let fired = false;
+    const inner = stripe.subscriptions.cancel.bind(stripe.subscriptions);
+    (stripe.subscriptions as unknown as { cancel: (id: string) => Promise<unknown> }).cancel = async (id: string) => {
+      const out = await inner(id);
+      if (!fired) {
+        fired = true;
+        await hook();
+      }
+      return out;
+    };
+    return { stripe, calls };
+  }
+
+  /** Open a window for an account and hand back its undo token. */
+  async function requestDelete(acct: Seeded, at: Date, stripe?: Stripe): Promise<string> {
+    const del = await handleAccountDelete(
+      env,
+      deleteReq(acct.token, acct.email),
+      accountDeps(clock(at)),
+      undefined,
+      stripe ? billing(stripe) : undefined,
+    );
+    expect(del.status).toBe(200);
+    return ((await del.json()) as { undo_token: string }).undo_token;
+  }
+
+  test("an undo that lands AFTER the claim loses — and the account is destroyed exactly once", async () => {
+    // The issue's scenario, made deterministic: undo's clock says one second
+    // before expiry, the sweep's says exactly expiry, and undo commits while
+    // the sweep is inside teardownBilling for that same account.
+    const acct = await seedAccount("race-late-undo@example.com", { vaults: ["contested"], stripe: true });
+    await seedVaultMirrors("contested");
+
+    let undoStatus = 0;
+    let undoBody: Record<string, unknown> = {};
+    // The undo gets its OWN vault seam so cloud#247's entitlement push shows up
+    // as ITS calls, not the sweep's destroys.
+    const { vaultFetch: undoVault, calls: undoCalls } = recordingVaultFetch();
+
+    const { stripe } = stripeWithTeardownHook(async () => {
+      const res = await handleAccountDeleteUndo(
+        env,
+        undoGetReq(undoToken),
+        accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS - 1000)), undoVault),
+        billing(makeStripeStub().stripe),
+      );
+      undoStatus = res.status;
+      undoBody = (await res.json()) as Record<string, unknown>;
+    });
+    const undoToken = await requestDelete(acct, T0, stripe);
+
+    const { vaultFetch: sweepVault, calls: destroys } = recordingVaultFetch();
+    const summary = await runAccountDeleteSweep(
+      env,
+      accountDeps(undefined, sweepVault),
+      plus(DELETE_UNDO_WINDOW_MS),
+      billing(stripe),
+    );
+
+    // The undo lost, and was told so honestly rather than being told its link
+    // was bad — it held the real token and its account really is gone.
+    expect(undoStatus).toBe(410);
+    expect(undoBody).toEqual({
+      error: "undo_window_expired",
+      message: "The 24-hour window to restore this account has passed and its data has been deleted.",
+    });
+    expect(undoBody.restored).toBeUndefined();
+
+    // cloud#247's undo-time cap push MUST NOT have run: a PUT
+    // /api/internal/config aimed at a vault this sweep is destroying re-latches
+    // an empty Durable Object shell (the cloud#240 shape). Matched on the
+    // discriminating method+path, not on "the seam was touched".
+    expect(undoCalls.filter((c) => c.method === "PUT" && c.path === "/api/internal/config")).toEqual([]);
+
+    // And the sweep converged: one destroy, rows gone, no residue.
+    expect(summary).toEqual({ due: 1, purged: 1, deferred: 0, skipped: 0, failed: 0 });
+    expect(destroys.map((c) => c.path)).toEqual(["/api/internal/destroy"]);
+    expect(await residue(acct.userId, "contested")).toEqual({
+      user: false,
+      vaults: 0,
+      vaultUsage: 0,
+      vaultSnapshots: 0,
+      sessions: 0,
+      tokens: 0,
+      grants: 0,
+      checklist: 0,
+    });
+  });
+
+  test("the losing undo's 410 is the SAME answer a plainly-expired token gets — no new oracle", async () => {
+    // If the claimed-account branch answered differently from the clock-expired
+    // branch, the endpoint would leak "a purge is in progress right now" as a
+    // distinguishable state. Compare the full bodies, not just the status.
+    const claimed = await seedAccount("race-oracle-claimed@example.com", { stripe: true });
+    const expired = await seedAccount("race-oracle-expired@example.com");
+
+    let claimedBody: unknown;
+    const { stripe } = stripeWithTeardownHook(async () => {
+      const res = await handleAccountDeleteUndo(
+        env,
+        undoGetReq(claimedToken),
+        accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS - 1000))),
+      );
+      expect(res.status).toBe(410);
+      claimedBody = await res.json();
+    });
+    const claimedToken = await requestDelete(claimed, T0, stripe);
+    // Tombstoned LATER on purpose: the control must still have a row to answer
+    // from after the sweep below, so its window must not be due on that pass.
+    const expiredToken = await requestDelete(expired, plus(DELETE_UNDO_WINDOW_MS));
+
+    await runAccountDeleteSweep(env, accountDeps(), plus(DELETE_UNDO_WINDOW_MS), billing(stripe));
+    expect((await getUserById(env.DB, expired.userId))?.deletedAt).toBe(plus(DELETE_UNDO_WINDOW_MS).toISOString());
+
+    const late = await handleAccountDeleteUndo(
+      env,
+      undoGetReq(expiredToken),
+      accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS * 3))),
+    );
+    expect(late.status).toBe(410);
+    expect(claimedBody).toEqual(await late.json());
+  });
+
+  test("an undo that lands BEFORE the claim wins — the sweep skips it and destroys nothing", async () => {
+    // The opposite interleaving, and the one a blunt guard gets wrong. `first`
+    // is tombstoned a second earlier so the ORDER BY is deterministic; its
+    // teardown is where `second`'s undo is injected, which is strictly before
+    // `second` is read or claimed.
+    const first = await seedAccount("race-first@example.com", { stripe: true });
+    const second = await seedAccount("race-second@example.com", { vaults: ["reprieved"], stripe: true });
+    await seedVaultMirrors("reprieved");
+
+    let restored: Record<string, unknown> = {};
+    const { stripe } = stripeWithTeardownHook(async () => {
+      const res = await handleAccountDeleteUndo(
+        env,
+        undoGetReq(secondToken),
+        accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS))),
+        billing(makeStripeStub().stripe),
+      );
+      expect(res.status).toBe(200);
+      restored = (await res.json()) as Record<string, unknown>;
+    });
+    await requestDelete(first, T0, stripe);
+    const secondToken = await requestDelete(second, plus(1000), stripe);
+
+    const { vaultFetch, calls: destroys } = recordingVaultFetch();
+    const summary = await runAccountDeleteSweep(
+      env,
+      accountDeps(undefined, vaultFetch),
+      plus(DELETE_UNDO_WINDOW_MS + 1000),
+      billing(stripe),
+    );
+
+    expect(restored.restored).toBe(true);
+    // `first` converged; `second` was skipped, NOT deferred — a deferral would
+    // feed the attempt counter and eventually page an operator about a race
+    // the guard just won.
+    expect(summary).toEqual({ due: 2, purged: 1, deferred: 0, skipped: 1, failed: 0 });
+    expect(destroys).toEqual([]);
+    expect(await getUserById(env.DB, first.userId)).toBeNull();
+
+    // The restored account kept EVERYTHING: no tombstone, no claim, and every
+    // vault artifact still on disk.
+    const user = await getUserById(env.DB, second.userId);
+    expect(user?.deletedAt).toBeNull();
+    expect(user?.deletePurgeClaimedAt).toBeNull();
+    expect(user?.deletePurgeAttempts).toBe(0);
+    expect(await residue(second.userId, "reprieved")).toMatchObject({
+      user: true,
+      vaults: 1,
+      vaultUsage: 1,
+      vaultSnapshots: 1,
+    });
+  });
+
+  test("a re-delete inside the same pass opens a NEW window the stale pass must not consume", async () => {
+    // This is why the claim binds the tombstone VALUE rather than testing
+    // `deleted_at IS NOT NULL`. After the undo, `second` is re-deleted with a
+    // LATER timestamp: non-NULL again, so a bare re-check would wave the sweep
+    // straight through and destroy an account 24 hours into a fresh window.
+    const first = await seedAccount("race-redelete-first@example.com", { stripe: true });
+    const second = await seedAccount("race-redelete-second@example.com", { vaults: ["twice"], stripe: true });
+    const reDeletedAt = plus(DELETE_UNDO_WINDOW_MS + 500);
+
+    const { stripe } = stripeWithTeardownHook(async () => {
+      const undone = await handleAccountDeleteUndo(
+        env,
+        undoGetReq(secondToken),
+        accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS))),
+        billing(makeStripeStub().stripe),
+      );
+      expect(undone.status).toBe(200);
+      // …and immediately asks to be deleted again. Fresh bearer: the first
+      // delete revoked the old one.
+      const again = await handleAccountDelete(
+        env,
+        deleteReq(await mintAccountToken(second.userId), second.email),
+        accountDeps(clock(reDeletedAt)),
+        undefined,
+        billing(makeStripeStub().stripe),
+      );
+      expect(again.status).toBe(200);
+    });
+    await requestDelete(first, T0, stripe);
+    const secondToken = await requestDelete(second, plus(1000), stripe);
+
+    const { vaultFetch, calls: destroys } = recordingVaultFetch();
+    const summary = await runAccountDeleteSweep(
+      env,
+      accountDeps(undefined, vaultFetch),
+      plus(DELETE_UNDO_WINDOW_MS + 1000),
+      billing(stripe),
+    );
+
+    expect(summary).toEqual({ due: 2, purged: 1, deferred: 0, skipped: 1, failed: 0 });
+    expect(destroys).toEqual([]);
+
+    // The NEW window is intact and restorable — not claimed by the stale pass.
+    const user = await getUserById(env.DB, second.userId);
+    expect(user?.deletedAt).toBe(reDeletedAt.toISOString());
+    expect(user?.deletePurgeClaimedAt).toBeNull();
+    expect(await countRows("vaults", "name", "twice")).toBe(1);
+
+    // …and the next pass, once THAT window really expires, converges normally.
+    const later = await runAccountDeleteSweep(
+      env,
+      accountDeps(undefined, recordingVaultFetch().vaultFetch),
+      new Date(reDeletedAt.getTime() + DELETE_UNDO_WINDOW_MS),
+      billing(stripe),
+    );
+    expect(later).toEqual({ due: 1, purged: 1, deferred: 0, skipped: 0, failed: 0 });
+    expect(await getUserById(env.DB, second.userId)).toBeNull();
+  });
+
+  test("the claim is sticky across deferrals, so a wedged account still converges on retry", async () => {
+    // The claim must be re-takeable by the NEXT pass or a deferred account
+    // would be skipped forever — silently, since a skip pages no one. That
+    // depends on SQLite counting an UPDATE that matches a row whose values do
+    // not change, so pin it here rather than believing it.
+    const acct = await seedAccount("race-sticky@example.com", { vaults: ["wedged"] });
+    await handleAccountDelete(env, deleteReq(acct.token, acct.email), accountDeps(clock(T0)));
+
+    const stuck = recordingVaultFetch({ failFor: new Set(["wedged"]) });
+    const first = await runAccountDeleteSweep(env, accountDeps(undefined, stuck.vaultFetch), plus(DELETE_UNDO_WINDOW_MS));
+    expect(first).toEqual({ due: 1, purged: 0, deferred: 1, skipped: 0, failed: 0 });
+
+    // Claimed on the first pass, and NOT released by the deferral — releasing
+    // would reopen the race on every retry.
+    const mid = await getUserById(env.DB, acct.userId);
+    const claimedAt = mid?.deletePurgeClaimedAt;
+    expect(claimedAt).toBe(plus(DELETE_UNDO_WINDOW_MS).toISOString());
+    expect(mid?.deletePurgeAttempts).toBe(1);
+
+    const second = await runAccountDeleteSweep(
+      env,
+      accountDeps(undefined, recordingVaultFetch().vaultFetch),
+      plus(DELETE_UNDO_WINDOW_MS + 3_600_000),
+    );
+    // Re-claimed and converged — and the recorded timestamp still dates the
+    // FIRST claim (COALESCE), the moment the account stopped being restorable.
+    expect(second).toEqual({ due: 1, purged: 1, deferred: 0, skipped: 0, failed: 0 });
+    expect(await getUserById(env.DB, acct.userId)).toBeNull();
+  });
+
+  test("a normal undo still pushes plan entitlement — the positive control for the PUT above", async () => {
+    // Without this, "no PUT /api/internal/config" in the losing-undo test
+    // would be vacuous: it would also hold if cloud#247's push had been broken
+    // or removed outright.
+    const acct = await seedAccount("race-cap-control@example.com", { vaults: ["capped"], stripe: true });
+    const stripe = makeStripeStub().stripe;
+    const token = await requestDelete(acct, T0, stripe);
+
+    const { vaultFetch, calls } = recordingVaultFetch();
+    const res = await handleAccountDeleteUndo(
+      env,
+      undoGetReq(token),
+      accountDeps(clock(plus(1000)), vaultFetch),
+      billing(stripe),
+    );
+    expect(res.status).toBe(200);
+    expect(calls.filter((c) => c.method === "PUT" && c.path === "/api/internal/config")).toHaveLength(1);
   });
 });

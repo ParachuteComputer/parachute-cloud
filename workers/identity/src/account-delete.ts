@@ -195,7 +195,16 @@ export async function handleAccountDelete(
   let changed = 0;
   try {
     const res = await env.DB
-      .prepare("UPDATE users SET deleted_at = ?, delete_undo_hash = ? WHERE id = ? AND deleted_at IS NULL")
+      // `delete_purge_claimed_at = NULL` is hygiene, not a no-op: a NEW window
+      // means fresh restorability, and this is the only writer that opens one.
+      // A row reached here has `deleted_at IS NULL` (the CAS), so it cannot be
+      // an account a sweep is mid-purge on — the claim being cleared here can
+      // only ever be residue from a previous cycle that ended outside this
+      // module (an operator SQL restore, say). Without it, such an account
+      // would re-delete straight into an unrestorable state.
+      .prepare(
+        "UPDATE users SET deleted_at = ?, delete_undo_hash = ?, delete_purge_claimed_at = NULL WHERE id = ? AND deleted_at IS NULL",
+      )
       .bind(nowIso, undoHash, user.id)
       .run();
     changed = res.meta.changes ?? 0;
@@ -394,6 +403,30 @@ export async function handleAccountDeleteUndo(
     );
   }
 
+  // cloud#248: the clock said the window is open; the SWEEP may already have
+  // said otherwise. Its claim is authoritative over both our clock and its own
+  // — once it is set, irreversible teardown has begun and there is nothing
+  // left to restore. Checked HERE, before Stripe, so a losing undo does not
+  // un-cancel a subscription for an account that is being torn down; the CAS
+  // below is still the authority, this is only the fast path. `user` was read
+  // one statement ago, so this costs no extra query.
+  //
+  // 410, not the neutral 400, and it is the SAME 410 the clock check above
+  // returns. Reaching it requires having held the real, unspent token for an
+  // account whose window has in fact closed, so it tells that holder nothing
+  // they did not already have — and it is the one thing they need to hear.
+  // "Not valid" would send someone whose data is being deleted off to re-click
+  // a link that can never work again. That is the module's stated no-oracle
+  // exception, exercised for exactly the case it was written for.
+  if (user.deletePurgeClaimedAt !== null) {
+    console.log(`event=account_undo_lost_to_purge user=${user.id} claimed_at=${user.deletePurgeClaimedAt}`);
+    return deleteError(
+      410,
+      "undo_window_expired",
+      "The 24-hour window to restore this account has passed and its data has been deleted.",
+    );
+  }
+
   const stripe = stripeFor(env, overrides);
   let billingResumed = true;
   let billingNote: "already_canceled" | null = null;
@@ -425,13 +458,31 @@ export async function handleAccountDeleteUndo(
 
   const res = await env.DB
     .prepare(
-      "UPDATE users SET deleted_at = NULL, delete_undo_hash = NULL, delete_notice_sent_at = NULL WHERE id = ? AND deleted_at IS NOT NULL",
+      // cloud#248: `delete_purge_claimed_at IS NULL` is the half that makes
+      // this a real mutual exclusion rather than a narrow one. The Stripe
+      // round-trip above is seconds wide and the sweep can claim inside it, so
+      // the pre-check is a fast path, not a guarantee; THIS statement and the
+      // sweep's claim are two conditional UPDATEs on one row, and SQLite
+      // orders them. Whichever commits second sees the other's write and
+      // reports zero rows. Neither can be mid-flight when the other lands.
+      //
+      // Still CAS'd on `deleted_at IS NOT NULL` too — that is the concurrent-
+      // undo half, unchanged.
+      "UPDATE users SET deleted_at = NULL, delete_undo_hash = NULL, delete_notice_sent_at = NULL WHERE id = ? AND deleted_at IS NOT NULL AND delete_purge_claimed_at IS NULL",
     )
     .bind(user.id)
     .run();
   // Zero rows means the sweep or a concurrent undo got here first — the token
   // is spent either way, and it is now indistinguishable from any other dead
   // token, which is exactly the answer it should get.
+  //
+  // Deliberately NOT the 410 the pre-check gives: from here we cannot tell the
+  // two losses apart without another read, and they call for opposite answers.
+  // A concurrent undo winning means the account IS RESTORED — telling that
+  // caller "its data has been deleted" would be a flat lie, and the honest
+  // 410 is only honest when the sweep is the winner. The neutral 400 is the
+  // one answer that is true either way. The pre-check catches the sweep case
+  // in every ordering but the last few milliseconds.
   if ((res.meta.changes ?? 0) === 0) return invalidUndoToken();
 
   // cloud#234: Stripe webhooks during the window recorded D1 (plan /
@@ -539,6 +590,51 @@ async function deferAccount(
   });
 }
 
+/**
+ * Take the exclusive claim on an account before anything irreversible happens
+ * to it — the atomic point the sweep and {@link handleAccountDeleteUndo} agree
+ * on (migration 0025 carries the full argument for why a clock comparison
+ * cannot be that point).
+ *
+ * `tombstone` is the `deleted_at` the sweep's cutoff SELECT read, and it is
+ * bound, not merely tested for non-NULL. Three states fail the CAS, all three
+ * correctly:
+ *
+ *   - the account was RESTORED after the SELECT (`deleted_at` is now NULL) —
+ *     the undo won; do not touch it;
+ *   - it was restored AND RE-DELETED inside this same pass (`deleted_at` is a
+ *     different timestamp) — that is a NEW 24-hour window, and this pass
+ *     selected the old one. Honor the new window; the next pass will pick it
+ *     up when it actually expires. This is the case a bare `IS NOT NULL`
+ *     re-check would get WRONG, and it is why the CAS binds the value;
+ *   - the row is gone (a concurrent pass purged it).
+ *
+ * Idempotent across passes: the WHERE matches on the tombstone alone, so a
+ * deferred account re-claims freely on its next pass. `COALESCE` keeps the
+ * FIRST claim's timestamp, which is the forensically useful one — it dates the
+ * moment the account stopped being restorable.
+ *
+ * Note this returns true on a re-claim even though no column value changes.
+ * That is SQLite's `changes()` semantics — it counts rows the UPDATE matched,
+ * not rows whose bytes moved — and the sweep depends on it, so it is pinned by
+ * a test rather than left to belief.
+ */
+async function claimAccountForPurge(
+  db: D1Database,
+  userId: string,
+  tombstone: string,
+  now: Date,
+): Promise<boolean> {
+  const res = await db
+    .prepare(
+      `UPDATE users SET delete_purge_claimed_at = COALESCE(delete_purge_claimed_at, ?)
+       WHERE id = ? AND deleted_at = ?`,
+    )
+    .bind(now.toISOString(), userId, tombstone)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
 export interface AccountDeleteSweepSummary {
   /** Accounts past their window that this pass looked at. */
   due: number;
@@ -546,6 +642,14 @@ export interface AccountDeleteSweepSummary {
   purged: number;
   /** Accounts left for the next pass because a step did not converge. */
   deferred: number;
+  /**
+   * Accounts that were due at SELECT time but whose claim lost the race — an
+   * undo landed, or a re-delete opened a new window (cloud#248). Counted apart
+   * from `deferred` on purpose: a deferral is a FAILURE to converge and feeds
+   * the attempt counter that eventually pages an operator, whereas a skip is
+   * the guard working exactly as designed and must never page anyone.
+   */
+  skipped: number;
   /** Accounts that threw — counted separately from an orderly deferral. */
   failed: number;
 }
@@ -593,6 +697,11 @@ async function purgeAccountRows(db: D1Database, userId: string): Promise<void> {
  * Per account, in this order, stopping at the first step that does not
  * converge:
  *
+ *   0. {@link claimAccountForPurge} — the CAS that makes this pass's verdict
+ *      binding on the undo endpoint (cloud#248). Before it, everything is a
+ *      read; after it, the account cannot be restored. A lost claim means an
+ *      undo landed (or a re-delete opened a new window) between the SELECT and
+ *      here, and the account is SKIPPED, not deferred.
  *   1. {@link teardownBilling} — money first. Its NULLed Stripe ids are the
  *      converged marker, so a retry after a partial pass costs nothing.
  *   2. Every owned vault: `callVaultDestroy` (the DO's SQLite and the whole
@@ -632,19 +741,36 @@ export async function runAccountDeleteSweep(
   const cutoff = new Date(now.getTime() - DELETE_UNDO_WINDOW_MS).toISOString();
   const res = await env.DB
     .prepare(
-      `SELECT id FROM users
+      // `deleted_at` rides along because the claim below CASes on its exact
+      // value (cloud#248) — the tombstone this pass decided was expired must
+      // be the same one it destroys against.
+      `SELECT id, deleted_at FROM users
        WHERE deleted_at IS NOT NULL AND deleted_at <= ?
        ORDER BY deleted_at ASC LIMIT ?`,
     )
     .bind(cutoff, ACCOUNT_DELETE_SWEEP_CAP)
-    .all<{ id: string }>();
+    .all<{ id: string; deleted_at: string }>();
   const due = res.results ?? [];
-  const summary: AccountDeleteSweepSummary = { due: due.length, purged: 0, deferred: 0, failed: 0 };
+  const summary: AccountDeleteSweepSummary = { due: due.length, purged: 0, deferred: 0, skipped: 0, failed: 0 };
 
-  for (const { id: userId } of due) {
+  for (const { id: userId, deleted_at: tombstone } of due) {
     try {
       const user = await getUserById(env.DB, userId);
       if (!user) continue; // Raced with another pass — already gone.
+
+      // 0. THE CLAIM — before billing, before storage, before anything this
+      //    module cannot take back. Everything below is irreversible or
+      //    irreversible-adjacent, and everything above is a read; this is the
+      //    line between them, and it is one conditional UPDATE wide.
+      //
+      //    A failed claim is NOT a deferral: nothing went wrong, and routing
+      //    it through deferAccount would increment the attempt counter and
+      //    eventually page an operator about a race the guard just won.
+      if (!(await claimAccountForPurge(env.DB, userId, tombstone, now))) {
+        summary.skipped++;
+        console.log(`event=account_purge_skipped_unclaimed user=${userId} tombstone=${tombstone}`);
+        continue;
+      }
 
       // 1. Billing.
       if (hasBillingArtifacts(user)) {
@@ -707,7 +833,7 @@ export async function runAccountDeleteSweep(
   }
 
   console.log(
-    `event=account_delete_sweep due=${summary.due} purged=${summary.purged} deferred=${summary.deferred} failed=${summary.failed}`,
+    `event=account_delete_sweep due=${summary.due} purged=${summary.purged} deferred=${summary.deferred} skipped=${summary.skipped} failed=${summary.failed}`,
   );
   return summary;
 }
