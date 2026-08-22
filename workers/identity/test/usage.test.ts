@@ -5,7 +5,8 @@
  *     (claims pinned: first-party client, admin verb, aud-pinned, 60s TTL),
  *     one `vault_usage` row per (vault, UTC day), same-day re-runs REFRESH,
  *     idempotent plan-entitlement reconciliation through the same GET/PUT
- *     seam, per-vault failures skip+log+continue, the per-run cap marks `capped`,
+ *     seam, per-vault failures skip+log+continue, the per-run read cap marks
+ *     `capped` and the per-run PUSH cap marks `reconcileCapped` (cloud#238),
  *   - latestUsageForVaults: newest row per vault, absent when none,
  *   - the console render: "Using X of Y" per card from the latest row,
  *     "usage appears within a day" when none, the plan line's total,
@@ -15,7 +16,7 @@ import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import worker from "../src/index.ts";
 import { USAGE_CRON, handleScheduled, routeCron } from "../src/ops.ts";
-import { USAGE_RUN_CAP, latestUsageForVaults, runUsageRollup } from "../src/usage.ts";
+import { RECONCILE_RUN_CAP, USAGE_RUN_CAP, latestUsageForVaults, runUsageRollup } from "../src/usage.ts";
 import { validateAccessToken } from "../src/tokens.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
 import type { EmailSender, SendResult } from "../src/email.ts";
@@ -154,7 +155,7 @@ describe("runUsageRollup", () => {
     const now = new Date();
     const today = now.toISOString().slice(0, 10);
     const summary = await quietly(() => runUsageRollup(env, rollupDeps(() => now)));
-    expect(summary).toEqual({ day: today, vaults: 2, recorded: 2, failed: 0, reconciled: 0, capped: false });
+    expect(summary).toEqual({ day: today, vaults: 2, recorded: 2, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
     expect(await usageRows()).toEqual([
       { vault_name: "roll-a", day: today, db_bytes: 1111, r2_bytes: 222 },
       { vault_name: "roll-b", day: today, db_bytes: 50_000_000, r2_bytes: 0 },
@@ -241,7 +242,7 @@ describe("runUsageRollup", () => {
       vaultDown = false;
       putAttempts = 0;
       const heal = await runUsageRollup(env, runDeps, { onlyVault: "e2e-v" });
-      expect(heal).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 1, capped: false });
+      expect(heal).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 1, capped: false, reconcileCapped: false });
       expect(putAttempts).toBe(1); // healthy vault → repaired on the first try
       // Exactly what the customer pays for — caps AND voice, no operator, no
       // scripts/backfill-plans.ts run.
@@ -252,7 +253,7 @@ describe("runUsageRollup", () => {
 
       // 3. Idempotent: nothing is wrong any more, so the next tick pushes nothing.
       const quiet = await runUsageRollup(env, runDeps, { onlyVault: "e2e-v" });
-      expect(quiet).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(quiet).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
       expect(putAttempts).toBe(1); // still 1 — no second push
     } finally {
       warn.mockRestore();
@@ -292,13 +293,13 @@ describe("runUsageRollup", () => {
 
     try {
       const first = await runUsageRollup(env, runDeps, { onlyVault: "reconcile-v" });
-      expect(first).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 1, capped: false });
+      expect(first).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 1, capped: false, reconcileCapped: false });
       expect(reads).toBe(1);
       expect(pushes).toBe(1);
       expect(pushedBodies).toEqual([planEntitlement("standard")]);
 
       const second = await runUsageRollup(env, runDeps, { onlyVault: "reconcile-v" });
-      expect(second).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(second).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
       expect(reads).toBe(2);
       expect(pushes).toBe(1);
       expect(log.mock.calls.filter((c) => String(c[0]).includes("event=entitlement_reconciled")).length).toBe(1);
@@ -336,7 +337,7 @@ describe("runUsageRollup", () => {
 
     try {
       const summary = await runUsageRollup(env, runDeps, { onlyVault: "reconcile-down-v" });
-      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 1, capped: false });
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 1, capped: false, reconcileCapped: false });
       // Exactly entry's entitlement — never power's, never something in
       // between (no partial/merged grant).
       expect(pushedBodies).toEqual([planEntitlement("entry")]);
@@ -349,7 +350,7 @@ describe("runUsageRollup", () => {
 
       // Idempotent: a second tick against the now-converged DO is a no-op.
       const second = await runUsageRollup(env, runDeps, { onlyVault: "reconcile-down-v" });
-      expect(second).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(second).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
       expect(pushedBodies).toHaveLength(1);
     } finally {
       log.mockRestore();
@@ -393,7 +394,7 @@ describe("runUsageRollup", () => {
       // the DO's 'power'), but the fresh re-read shows the DO already
       // reflects the CURRENT truth — nothing is pushed, and reconciled stays
       // 0 (nothing needed repair).
-      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
       expect(putCalls).toBe(0); // never clobbered the DO back down to 'standard'
       expect(
         log.mock.calls.some((c) => String(c[0]).includes("event=entitlement_reconcile_skipped_race vault=race-v")),
@@ -447,7 +448,7 @@ describe("runUsageRollup", () => {
 
     try {
       const summary = await runUsageRollup(env, runDeps, { onlyVault: "fresh-push-v" });
-      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 1, capped: false });
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 1, capped: false, reconcileCapped: false });
       expect(pushedBodies).toHaveLength(1);
       // THE ASSERTION: power (the fresh truth), never standard (the snapshot).
       expect(pushedBodies[0]).toEqual(planEntitlement("power"));
@@ -501,7 +502,7 @@ describe("runUsageRollup", () => {
     try {
       const summary = await runUsageRollup({ ...env, DB: failingDb }, runDeps, { onlyVault: "reconcile-throw-v" });
       // recorded stays 1, failed stays 0 — the usage read genuinely succeeded.
-      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
       expect(summary.recorded + summary.failed).toBeLessThanOrEqual(summary.vaults);
       // The usage row SURVIVES a reconcile failure.
       expect(await usageRows()).toEqual([
@@ -544,7 +545,7 @@ describe("runUsageRollup", () => {
 
     try {
       const summary = await runUsageRollup(env, runDeps, { onlyVault: "garbage-plan-v" });
-      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
       // The trial reading (frozen:false) mismatches what coercePlanId('free')
       // → 'expired' → frozen:true would have expected — the OLD code would
       // have pushed a freeze here. Zero pushes proves the new guard runs
@@ -579,7 +580,7 @@ describe("runUsageRollup", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       const summary = await runUsageRollup(env, rollupDeps());
-      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
       expect(await usageRows()).toEqual([{ vault_name: "rollback-v", day: TODAY, db_bytes: 10, r2_bytes: 0 }]);
       expect(
         log.mock.calls.some((c) =>
@@ -588,6 +589,52 @@ describe("runUsageRollup", () => {
       ).toBe(true);
     } finally {
       log.mockRestore();
+    }
+  });
+
+  test("cloud#238 — a present-but-MALFORMED caps degrades to entitlement:null; the good byte split is still recorded", async () => {
+    const { id: owner } = await seedUser("malformed-caps@example.com");
+    await seedVault("malformed-caps-v", owner);
+    // NOT the D3 rollback shape: every control-plane field is PRESENT, but
+    // `caps` itself is garbage (a half-deployed vault worker, a hand-edited DO
+    // config). `parseResolvedCaps` used to throw out of `readVaultUsage`,
+    // which discarded a perfectly good db_bytes/r2_bytes split and wrote NO
+    // row — contradicting readVaultUsage's own contract that usage recording
+    // never dies from an entitlement problem.
+    interceptConfigGet("malformed-caps-v", {
+      ...splitBody(4242, 17),
+      caps: { notes_bytes: "lots", attachment_bytes: null },
+    });
+
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const summary = await runUsageRollup(env, rollupDeps());
+      expect(summary).toEqual({
+        day: TODAY,
+        vaults: 1,
+        recorded: 1,
+        failed: 0,
+        reconciled: 0,
+        capped: false,
+        reconcileCapped: false,
+      });
+      expect(await usageRows()).toEqual([{ vault_name: "malformed-caps-v", day: TODAY, db_bytes: 4242, r2_bytes: 17 }]);
+      // Degraded, never believed: an unparseable caps must not read as
+      // "converged" (silently hiding an entitlement problem) and must not
+      // actuate a push off a DO state we cannot read. Reconciliation is
+      // unavailable for this vault this run, and says so distinctly.
+      expect(
+        warn.mock.calls.some((c) => String(c[0]).includes("event=internal_config_caps_malformed vault=malformed-caps-v")),
+      ).toBe(true);
+      expect(
+        log.mock.calls.some((c) =>
+          String(c[0]).includes("event=entitlement_reconcile_skipped_no_entitlement_data vault=malformed-caps-v"),
+        ),
+      ).toBe(true);
+    } finally {
+      log.mockRestore();
+      warn.mockRestore();
     }
   });
 
@@ -609,7 +656,7 @@ describe("runUsageRollup", () => {
 
     try {
       const summary = await runUsageRollup(env, runDeps, { onlyVault: "reconcile-fail-v" });
-      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+      expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
       expect(
         log.mock.calls.some((c) => String(c[0]).includes("event=entitlement_reconciled vault=reconcile-fail-v ok=false")),
       ).toBe(true);
@@ -629,7 +676,7 @@ describe("runUsageRollup", () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const summary = await runUsageRollup(env, rollupDeps());
-    expect(summary).toEqual({ day: TODAY, vaults: 2, recorded: 1, failed: 1, reconciled: 0, capped: false });
+    expect(summary).toEqual({ day: TODAY, vaults: 2, recorded: 1, failed: 1, reconciled: 0, capped: false, reconcileCapped: false });
     expect(errSpy.mock.calls.some((c) => String(c[0]).includes("event=usage_fetch_failed vault=skip-bad"))).toBe(true);
     errSpy.mockRestore();
     logSpy.mockRestore();
@@ -666,9 +713,66 @@ describe("runUsageRollup", () => {
     interceptConfigGet("cap-a", splitBody(1, 0));
     interceptConfigGet("cap-b", splitBody(2, 0));
     const summary = await quietly(() => runUsageRollup(env, rollupDeps(), { runCap: 2 }));
-    expect(summary).toEqual({ day: TODAY, vaults: 2, recorded: 2, failed: 0, reconciled: 0, capped: true });
+    expect(summary).toEqual({ day: TODAY, vaults: 2, recorded: 2, failed: 0, reconciled: 0, capped: true, reconcileCapped: false });
     expect((await usageRows()).map((r) => r.vault_name)).toEqual(["cap-a", "cap-b"]);
     expect(USAGE_RUN_CAP).toBe(500); // the real bound the cron runs with
+  });
+
+  test("cloud#238 — RECONCILE_RUN_CAP bounds PUSHES per run; every vault is still read + recorded", async () => {
+    const { id: owner } = await seedUser("reconcile-cap@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard', pending_plan = NULL WHERE id = ?").bind(owner).run();
+    // Three vaults, ALL mismatching at once — the shape ANY byte-level
+    // PLAN_SPECS change produces fleet-wide on the first rollup after deploy,
+    // where the push count (not wall-clock) is what approaches Cloudflare's
+    // per-invocation subrequest ceiling.
+    await seedVault("rcap-a", owner);
+    await seedVault("rcap-b", owner);
+    await seedVault("rcap-c", owner);
+
+    const pushed: string[] = [];
+    let reads = 0;
+    const runDeps: OAuthDeps = {
+      ...deps(() => NOW),
+      vaultFetch: async (input, init) => {
+        const vault = new URL(String(input)).hostname.split(".")[0];
+        if (init?.method === "GET") {
+          reads++;
+          return Response.json(splitBody(10, 1, planEntitlement("trial")));
+        }
+        if (init?.method === "PUT") {
+          pushed.push(vault);
+          return Response.json({ ok: true });
+        }
+        return new Response("method not allowed", { status: 405 });
+      },
+    };
+
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const summary = await runUsageRollup(env, runDeps, { reconcileCap: 2 });
+      expect(summary).toEqual({
+        day: TODAY,
+        vaults: 3,
+        recorded: 3,
+        failed: 0,
+        reconciled: 2,
+        capped: false,
+        reconcileCapped: true,
+      });
+      // The cap bounds REPAIRS, not the rollup: every vault was still read and
+      // recorded. Enumeration is ORDER BY name, and a repaired vault matches
+      // on the next tick, so the untouched tail is repaired by the following
+      // runs rather than starved.
+      expect(pushed).toEqual(["rcap-a", "rcap-b"]);
+      expect(reads).toBe(3);
+      expect((await usageRows()).map((r) => r.vault_name)).toEqual(["rcap-a", "rcap-b", "rcap-c"]);
+      expect(err.mock.calls.some((c) => String(c[0]).includes("event=entitlement_reconcile_run_capped cap=2"))).toBe(true);
+      expect(RECONCILE_RUN_CAP).toBe(50); // the real bound the cron runs with
+    } finally {
+      log.mockRestore();
+      err.mockRestore();
+    }
   });
 
   test("onlyVault scopes the run to a SINGLE vault — the rest of the fleet is untouched (O(1), not O(fleet))", async () => {
@@ -682,13 +786,13 @@ describe("runUsageRollup", () => {
     // (cloud#224, mirroring the snapshot-sweep scope in cloud#166/#218).
     interceptConfigGet("uscope-mine", splitBody(3333, 111));
     const summary = await quietly(() => runUsageRollup(env, rollupDeps(), { onlyVault: "uscope-mine" }));
-    expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false });
+    expect(summary).toEqual({ day: TODAY, vaults: 1, recorded: 1, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
     expect((await usageRows()).map((r) => r.vault_name)).toEqual(["uscope-mine"]);
   });
 
   test("onlyVault for an unknown name → an empty, clean run (no vault reads)", async () => {
     const summary = await quietly(() => runUsageRollup(env, rollupDeps(), { onlyVault: "does-not-exist" }));
-    expect(summary).toEqual({ day: TODAY, vaults: 0, recorded: 0, failed: 0, reconciled: 0, capped: false });
+    expect(summary).toEqual({ day: TODAY, vaults: 0, recorded: 0, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
     expect(await usageRows()).toEqual([]);
   });
 
@@ -701,7 +805,7 @@ describe("runUsageRollup", () => {
     await seedVault("deleted-usage-v", owner);
     await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(new Date().toISOString(), owner).run();
     const summary = await quietly(() => runUsageRollup(env, rollupDeps()));
-    expect(summary).toEqual({ day: TODAY, vaults: 0, recorded: 0, failed: 0, reconciled: 0, capped: false });
+    expect(summary).toEqual({ day: TODAY, vaults: 0, recorded: 0, failed: 0, reconciled: 0, capped: false, reconcileCapped: false });
     expect(await usageRows()).toEqual([]);
   });
 });

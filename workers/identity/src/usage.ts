@@ -18,7 +18,8 @@
  * (DO hiccup, stale vault worker) logs and the run CONTINUES — a missing day or
  * stale entitlement for one vault self-heals tomorrow, and the console
  * degrades to "usage appears within a day" for that vault only. The run is
- * bounded by {@link USAGE_RUN_CAP}; same injectable-clock shape as
+ * bounded on two independent axes — {@link USAGE_RUN_CAP} (reads) and
+ * {@link RECONCILE_RUN_CAP} (pushes); same injectable-clock shape as
  * ops.ts/drip.ts so the tests drive the exact code the cron does.
  */
 import type { Env } from "./env.ts";
@@ -36,6 +37,28 @@ import { getUserById } from "./users.ts";
  * serially waking hundreds of DOs is the wrong shape at that scale.
  */
 export const USAGE_RUN_CAP = 500;
+
+/**
+ * Per-run bound on entitlement PUSHES (cloud#238 item 2) — a separate axis
+ * from {@link USAGE_RUN_CAP}, which bounds READS.
+ *
+ * Reconcile amplification is a SUBREQUEST-count problem, not a wall-clock one,
+ * so a timeout cannot bound it: every attempt is a subrequest whether it
+ * answers in 1ms or hangs. Any byte-level change to `PLAN_SPECS` makes EVERY
+ * vault mismatch on the first rollup after deploy, so an unbounded reconciler
+ * would do up to `USAGE_RUN_CAP` reads + 2 × that in pushes-with-retries from
+ * fast, healthy responses alone — at Cloudflare's per-invocation subrequest
+ * ceiling with nothing actually wrong. The worst case here is instead
+ * 500 reads + 50 × CAP_PUSH_MAX_ATTEMPTS (3) = 650, with headroom.
+ *
+ * Hitting the cap DEFERS repairs, it does not drop them, and it never starves
+ * a deterministic tail the way the `ORDER BY v.name` read cap does: a repaired
+ * vault matches on the next tick, so each daily run picks up the next 50
+ * mismatching vaults. A DELIBERATE fleet-wide entitlement change should not
+ * wait on that drip — run `applyPlanToVaults` / the backfill script, which is
+ * what the reconciler is a safety net for, not a substitute for.
+ */
+export const RECONCILE_RUN_CAP = 50;
 
 interface RollupVaultRow {
   name: string;
@@ -66,11 +89,26 @@ function resolvedEntitlementMatches(entitlement: ResolvedVaultEntitlement, expec
 }
 
 /**
+ * The outcome of one vault's reconcile attempt. `pushed` counts SUBREQUESTS
+ * SPENT (a push was actuated, whatever it returned) and drives
+ * {@link RECONCILE_RUN_CAP}; `repaired` counts SUCCESS and drives the run's
+ * `reconciled` total. They differ exactly when a push failed — the case where
+ * the budget is spent but nothing was fixed, which is precisely the case a
+ * cap must still count.
+ */
+interface ReconcileOutcome {
+  pushed: boolean;
+  repaired: boolean;
+}
+
+const NO_PUSH: ReconcileOutcome = { pushed: false, repaired: false };
+
+/**
  * Reconcile one vault's entitlement against its owner's plan, if needed.
- * Returns true when a push happened AND succeeded (counts toward the run's
- * `reconciled` total); false for every other outcome (no mismatch, a
- * deliberate skip, or a push that itself failed — already logged by
- * `pushVaultCap`).
+ * Returns `repaired: true` when a push happened AND succeeded; `pushed: false`
+ * for every outcome that actuated nothing (no mismatch, or a deliberate skip).
+ * A push that itself failed is `pushed: true, repaired: false` — already
+ * logged by `pushVaultCap`.
  *
  * `v.plan`/`v.pending_plan` are a SNAPSHOT taken once at enumeration time
  * (the batch query in `runUsageRollup`) for the WHOLE run — cheap, but stale
@@ -88,13 +126,13 @@ async function reconcileVaultEntitlement(
   deps: OAuthDeps,
   v: RollupVaultRow,
   entitlement: ResolvedVaultEntitlement | null,
-): Promise<boolean> {
+): Promise<ReconcileOutcome> {
   if (entitlement === null) {
     // A vault-worker response missing the entitlement fields entirely (a
     // ROLLBACK to a pre-entitlement build, review D3) — reconciliation is
     // simply unavailable for this vault this run; usage was still recorded.
     console.log(`event=entitlement_reconcile_skipped_no_entitlement_data vault=${v.name}`);
-    return false;
+    return NO_PUSH;
   }
 
   // Review D2: an unrecognized raw plan value (a hand-edited row, a raw
@@ -107,11 +145,11 @@ async function reconcileVaultEntitlement(
     console.log(
       `event=entitlement_reconcile_skipped_unknown_plan vault=${v.name} plan=${v.plan} pending_plan=${v.pending_plan ?? "null"}`,
     );
-    return false;
+    return NO_PUSH;
   }
 
   const snapshotExpected = planEntitlement(entitlementPlanFor(v.plan, v.pending_plan));
-  if (resolvedEntitlementMatches(entitlement, snapshotExpected)) return false;
+  if (resolvedEntitlementMatches(entitlement, snapshotExpected)) return NO_PUSH;
 
   // Mismatch per the snapshot — re-read the owner FRESH before pushing
   // anything (review D1).
@@ -120,7 +158,7 @@ async function reconcileVaultEntitlement(
     // Deleted between the snapshot and here — not this rollup's place to
     // push anything for an owner that may no longer exist.
     console.log(`event=entitlement_reconcile_skipped_owner_missing vault=${v.name}`);
-    return false;
+    return NO_PUSH;
   }
   const freshExpected = planEntitlement(entitlementPlanFor(freshUser.plan, freshUser.pendingPlan));
   if (resolvedEntitlementMatches(entitlement, freshExpected)) {
@@ -129,7 +167,7 @@ async function reconcileVaultEntitlement(
     // first) — pushing the stale snapshot value now would clobber a correct,
     // newer state. Nothing to repair.
     console.log(`event=entitlement_reconcile_skipped_race vault=${v.name}`);
-    return false;
+    return NO_PUSH;
   }
 
   // Push the FRESH truth, never the stale snapshot — closes the race window
@@ -140,7 +178,7 @@ async function reconcileVaultEntitlement(
   // mismatch. The additive `ok` field lets operators distinguish a repaired
   // vault from a best-effort push that still needs the next daily tick.
   console.log(`event=entitlement_reconciled vault=${v.name} ok=${push.ok} attempts=${push.attempts}`);
-  return push.ok;
+  return { pushed: true, repaired: push.ok };
 }
 
 export interface UsageRunSummary {
@@ -156,6 +194,12 @@ export interface UsageRunSummary {
   reconciled: number;
   /** True when enumeration stopped at the cap with vaults still unread. */
   capped: boolean;
+  /**
+   * True when the run stopped RECONCILING at {@link RECONCILE_RUN_CAP} —
+   * deliberately separate from `capped`: every vault was still read and
+   * recorded, only repairs were deferred to the next tick.
+   */
+  reconcileCapped: boolean;
 }
 
 /**
@@ -164,8 +208,8 @@ export interface UsageRunSummary {
  * Deps are the standard OAuthDeps (depsForEnv) — the internal mint needs
  * issuer + signing key access, and `vaultFetch`/`vaultOrigin` pick the right
  * transport per environment; `deps.now` is the injectable clock.
- * `opts.runCap` exists ONLY so tests can exercise the cap path without
- * seeding 500 vaults; the cron always runs the default.
+ * `opts.runCap`/`opts.reconcileCap` exist ONLY so tests can exercise the cap
+ * paths without seeding 500 vaults; the cron always runs the defaults.
  *
  * `opts.onlyVault` scopes the run to a SINGLE vault instead of the whole fleet.
  * The USAGE_CRON never sets it; the staging-only /__test/usage-run trigger
@@ -177,9 +221,10 @@ export interface UsageRunSummary {
 export async function runUsageRollup(
   env: Env,
   deps: OAuthDeps,
-  opts: { runCap?: number; onlyVault?: string } = {},
+  opts: { runCap?: number; reconcileCap?: number; onlyVault?: string } = {},
 ): Promise<UsageRunSummary> {
   const runCap = opts.runCap ?? USAGE_RUN_CAP;
+  const reconcileCap = opts.reconcileCap ?? RECONCILE_RUN_CAP;
   const now = deps.now?.() ?? new Date();
   const day = now.toISOString().slice(0, 10);
 
@@ -206,6 +251,8 @@ export async function runUsageRollup(
   let recorded = 0;
   let failed = 0;
   let reconciled = 0;
+  let pushes = 0;
+  let reconcileCapped = false;
   for (const v of vaults) {
     try {
       const usage = await readVaultUsage(env.DB, deps, v.owner_user_id, v.name);
@@ -229,7 +276,22 @@ export async function runUsageRollup(
       // The usage row written above stands; only reconciliation is lost, and
       // it self-heals on the next daily tick like every other skip here.
       try {
-        if (await reconcileVaultEntitlement(env.DB, deps, v, usage.entitlement)) reconciled++;
+        // cloud#238 item 2: the push budget is spent, not the read budget —
+        // keep reading and recording the rest of the fleet, just stop
+        // actuating. Checked BEFORE the call so a capped run makes zero extra
+        // subrequests (and zero extra D1 `getUserById` round trips).
+        if (pushes >= reconcileCap) {
+          if (!reconcileCapped) {
+            reconcileCapped = true;
+            console.error(
+              `event=entitlement_reconcile_run_capped cap=${reconcileCap} — repairs deferred to the next tick; use applyPlanToVaults for a deliberate fleet-wide change`,
+            );
+          }
+        } else {
+          const outcome = await reconcileVaultEntitlement(env.DB, deps, v, usage.entitlement);
+          if (outcome.pushed) pushes++;
+          if (outcome.repaired) reconciled++;
+        }
       } catch (err) {
         console.error(
           `event=entitlement_reconcile_failed vault=${v.name} error=${JSON.stringify(err instanceof Error ? err.message : String(err))}`,
@@ -244,9 +306,9 @@ export async function runUsageRollup(
     }
   }
 
-  const summary: UsageRunSummary = { day, vaults: vaults.length, recorded, failed, reconciled, capped };
+  const summary: UsageRunSummary = { day, vaults: vaults.length, recorded, failed, reconciled, capped, reconcileCapped };
   console.log(
-    `event=usage_rollup day=${day} vaults=${summary.vaults} recorded=${recorded} failed=${failed} reconciled=${reconciled} capped=${capped}`,
+    `event=usage_rollup day=${day} vaults=${summary.vaults} recorded=${recorded} failed=${failed} reconciled=${reconciled} capped=${capped} reconcile_capped=${reconcileCapped}`,
   );
   return summary;
 }
