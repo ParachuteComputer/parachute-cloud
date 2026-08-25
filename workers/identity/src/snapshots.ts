@@ -21,6 +21,13 @@
  *     validation happens in the target DO against R2, and a stale mirror row
  *     at worst 404s into a friendly error.
  *
+ *   - Orphan prune (cloud#227): a fleet-wide sweep ends by dropping
+ *     `vault_snapshots` rows whose vault is gone from `vaults` — the BACKSTOP
+ *     behind the delete path's synchronous prune (vaults.ts
+ *     `deleteVaultD1Rows`). Without it the mirror grew without bound, because
+ *     the sweep only ever revisits vaults that still exist. See
+ *     {@link pruneOrphanSnapshotRows}.
+ *
  *   - Failure posture mirrors the usage rollup: one vault's failed snapshot
  *     logs `event=snapshot_failed` (vault name only, PII-free) and the run
  *     CONTINUES — it self-heals the next night, and the GFS ranks are
@@ -70,6 +77,12 @@ export interface SnapshotSweepSummary {
   failed: number;
   /** True when enumeration stopped at the cap with vaults still unswept. */
   capped: boolean;
+  /**
+   * Orphan `vault_snapshots` rows deleted this run (mirror rows whose vault no
+   * longer exists). Always 0 on an `onlyVault` run and on a prune that itself
+   * failed — see {@link pruneOrphanSnapshotRows}.
+   */
+  orphansPruned: number;
 }
 
 /**
@@ -149,11 +162,53 @@ export async function runSnapshotSweep(
     }
   }
 
-  const summary: SnapshotSweepSummary = { day, vaults: vaults.length, taken, skipped, failed, capped };
+  // The orphan backstop (cloud#227) — fleet-wide runs only.
+  const orphansPruned = opts.onlyVault ? 0 : await pruneOrphanSnapshotRows(env.DB);
+
+  const summary: SnapshotSweepSummary = { day, vaults: vaults.length, taken, skipped, failed, capped, orphansPruned };
   console.log(
-    `event=snapshot_sweep day=${day} vaults=${summary.vaults} taken=${taken} skipped=${skipped} failed=${failed} capped=${capped}`,
+    `event=snapshot_sweep day=${day} vaults=${summary.vaults} taken=${taken} skipped=${skipped} failed=${failed} capped=${capped} orphans_pruned=${orphansPruned}`,
   );
   return summary;
+}
+
+/**
+ * Drop `vault_snapshots` rows whose vault is gone (cloud#227).
+ *
+ * WHY THIS EXISTS. The sweep only ever enumerates rows in `vaults`, so a
+ * deleted vault is never visited again and its mirror rows are never revisited
+ * or removed — they just accumulate. At the 2026-07-26 staging reclamation
+ * there were 1,524 orphan `vault_snapshots` rows (and 1,008 in `vault_usage`)
+ * for vaults that no longer existed. The delete path already prunes
+ * synchronously (`deleteVaultD1Rows` in vaults.ts, cloud#226/#241); this is the
+ * BACKSTOP for whatever that path never reached — a crash between the DO
+ * destroy and the D1 batch, a hand-deleted row, or pre-fix debris.
+ *
+ * SAFE BY CONSTRUCTION. A `vault_name` absent from `vaults` cannot belong to a
+ * live vault. Note what this deliberately does NOT catch: a TOMBSTONED owner's
+ * vault (migration 0023) is skipped by enumeration but still HOLDS its `vaults`
+ * row until its storage is actually destroyed, so it is not an orphan and its
+ * mirror survives. Dropping it here would hide still-billed storage — the same
+ * hazard purgeAccountRows (account-delete.ts) documents.
+ *
+ * BOUNDED. One statement, whatever the row count: a single DELETE with a
+ * correlated-free subquery, not a per-row loop, so it cannot approach the
+ * subrequest or statement budget however much debris has piled up.
+ *
+ * BEST-EFFORT. The prune is bookkeeping, not the sweep's job — a failure here
+ * must not turn a night of good snapshots into a failed run, so it logs under
+ * its own event and reports 0. It retries every night by construction.
+ */
+async function pruneOrphanSnapshotRows(db: D1Database): Promise<number> {
+  try {
+    const res = await db.prepare("DELETE FROM vault_snapshots WHERE vault_name NOT IN (SELECT name FROM vaults)").run();
+    return res.meta.changes ?? 0;
+  } catch (err) {
+    console.error(
+      `event=snapshot_orphan_prune_failed error=${JSON.stringify(err instanceof Error ? err.message : String(err))}`,
+    );
+    return 0;
+  }
 }
 
 /** Replace a vault's D1 mirror rows with the post-run manifest (one batch —

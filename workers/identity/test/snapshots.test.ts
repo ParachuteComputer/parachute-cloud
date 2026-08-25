@@ -5,6 +5,8 @@
  *     free 0/1/0), the mint-seam claims pinned (first-party client, admin
  *     verb, aud-pinned, 60s), the D1 `vault_snapshots` mirror replaced from
  *     the returned manifest, per-vault failure isolation, the run cap,
+ *     the cloud#227 orphan prune (fleet-wide only; spares a tombstoned owner's
+ *     vault, which still holds its `vaults` row),
  *   - the console History section: paid → restore points + doors + the
  *     attachments caveat; paid-no-rows → "begin within a day"; free → the
  *     teaser (and NEVER a snapshot key — the internal DR artifact stays ours),
@@ -237,6 +239,7 @@ describe("runSnapshotSweep", () => {
       skipped: 0,
       failed: 0,
       capped: false,
+      orphansPruned: 0,
     });
 
     // The retention policy in the body IS the owner's plan policy.
@@ -288,7 +291,7 @@ describe("runSnapshotSweep", () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const summary = await runSnapshotSweep(env, sweepDeps());
-    expect(summary).toEqual({ day: TODAY, vaults: 2, taken: 1, skipped: 0, failed: 1, capped: false });
+    expect(summary).toEqual({ day: TODAY, vaults: 2, taken: 1, skipped: 0, failed: 1, capped: false, orphansPruned: 0 });
     expect(errSpy.mock.calls.some((c) => String(c[0]).includes("event=snapshot_failed vault=sweep-bad"))).toBe(true);
     errSpy.mockRestore();
     logSpy.mockRestore();
@@ -320,7 +323,7 @@ describe("runSnapshotSweep", () => {
     interceptSnapshotPost("swcap-a", { skipped: false, manifest: [] });
     interceptSnapshotPost("swcap-b", { skipped: false, manifest: [] });
     const summary = await quietly(() => runSnapshotSweep(env, sweepDeps(), { runCap: 2 }));
-    expect(summary).toEqual({ day: TODAY, vaults: 2, taken: 2, skipped: 0, failed: 0, capped: true });
+    expect(summary).toEqual({ day: TODAY, vaults: 2, taken: 2, skipped: 0, failed: 0, capped: true, orphansPruned: 0 });
     expect(SNAPSHOT_RUN_CAP).toBe(500);
   });
 
@@ -337,14 +340,14 @@ describe("runSnapshotSweep", () => {
     interceptSnapshotPost("scope-mine", { skipped: false, manifest });
 
     const summary = await quietly(() => runSnapshotSweep(env, sweepDeps(), { onlyVault: "scope-mine" }));
-    expect(summary).toEqual({ day: TODAY, vaults: 1, taken: 1, skipped: 0, failed: 0, capped: false });
+    expect(summary).toEqual({ day: TODAY, vaults: 1, taken: 1, skipped: 0, failed: 0, capped: false, orphansPruned: 0 });
     // Only the scoped vault's mirror row exists — scope-other was never swept.
     expect((await mirrorRows()).map((r) => r.vault_name)).toEqual(["scope-mine"]);
   });
 
   test("onlyVault for an unknown name → an empty, clean run (no vault calls)", async () => {
     const summary = await quietly(() => runSnapshotSweep(env, sweepDeps(), { onlyVault: "does-not-exist" }));
-    expect(summary).toEqual({ day: TODAY, vaults: 0, taken: 0, skipped: 0, failed: 0, capped: false });
+    expect(summary).toEqual({ day: TODAY, vaults: 0, taken: 0, skipped: 0, failed: 0, capped: false, orphansPruned: 0 });
     expect(await mirrorRows()).toEqual([]);
   });
 
@@ -357,8 +360,69 @@ describe("runSnapshotSweep", () => {
     await seedVault("deleted-snapshot-v", owner);
     await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(new Date().toISOString(), owner).run();
     const summary = await quietly(() => runSnapshotSweep(env, sweepDeps()));
-    expect(summary).toEqual({ day: TODAY, vaults: 0, taken: 0, skipped: 0, failed: 0, capped: false });
+    expect(summary).toEqual({ day: TODAY, vaults: 0, taken: 0, skipped: 0, failed: 0, capped: false, orphansPruned: 0 });
     expect(await mirrorRows()).toEqual([]);
+  });
+
+  // cloud#227 — the ORPHAN BACKSTOP. The sweep enumerates `vaults` and nothing
+  // else, so a deleted vault's mirror rows were never revisited: they simply
+  // accumulated (1,524 orphan `vault_snapshots` rows at the 2026-07-26 staging
+  // reclamation). The delete path already prunes synchronously
+  // (vaults.ts `deleteVaultD1Rows`, cloud#226/#241); this is the backstop for
+  // whatever that path never reached — a crash between the DO destroy and the
+  // D1 batch, a hand-deleted row, pre-fix debris.
+  test("prunes orphan `vault_snapshots` rows whose vault is gone, and reports the count", async () => {
+    const { id: owner } = await seedUser("sweep-orphan@example.com");
+    await seedVault("orphan-live", owner);
+    // Two mirror rows for a vault with no `vaults` row at all.
+    await seedMirrorRow("orphan-gone", wireEntry("orphan-gone", "2026-07-01T04:00:00.000Z"));
+    await seedMirrorRow("orphan-gone", wireEntry("orphan-gone", "2026-07-02T04:00:00.000Z"));
+    const manifest = [wireEntry("orphan-live", "2026-07-03T04:00:00.000Z")];
+    interceptSnapshotPost("orphan-live", { skipped: false, manifest });
+
+    const summary = await quietly(() => runSnapshotSweep(env, sweepDeps()));
+    // Behaviour first: only the orphans went — the live vault's fresh mirror
+    // row stands. Then the bookkeeping the summary reports.
+    expect((await mirrorRows()).map((r) => [r.vault_name, r.key])).toEqual([["orphan-live", manifest[0]!.key]]);
+    expect(summary).toEqual({ day: TODAY, vaults: 1, taken: 1, skipped: 0, failed: 0, capped: false, orphansPruned: 2 });
+  });
+
+  // The prune keys on `vaults`, NOT on what the sweep enumerated. A tombstoned
+  // owner's vault is skipped by enumeration but still HOLDS its `vaults` row
+  // (deleteVaultD1Rows drops it only once the storage is actually destroyed),
+  // so its mirror is not an orphan and must survive. Deleting it here would
+  // hide still-billed storage from the console — the exact failure the
+  // account-delete note guards against.
+  test("the prune spares a tombstoned owner's vault — its `vaults` row still stands, so it is not an orphan", async () => {
+    const { id: owner } = await seedUser("sweep-orphan-tombstone@example.com");
+    await seedVault("tombstoned-mirror-v", owner);
+    const kept = wireEntry("tombstoned-mirror-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("tombstoned-mirror-v", kept);
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(new Date().toISOString(), owner).run();
+
+    // No interceptor: enumeration excludes the vault, and an unexpected fetch
+    // would trip disableNetConnect.
+    const summary = await quietly(() => runSnapshotSweep(env, sweepDeps()));
+    expect(summary).toEqual({ day: TODAY, vaults: 0, taken: 0, skipped: 0, failed: 0, capped: false, orphansPruned: 0 });
+    expect((await mirrorRows()).map((r) => r.key)).toEqual([kept.key]);
+  });
+
+  // A scoped run keeps scoped effects. `onlyVault` exists so the live smoke's
+  // trigger is O(1) and touches exactly the vault it names (cloud#166/#218);
+  // a fleet-wide DELETE behind it would be a blast radius the trigger does not
+  // advertise. The nightly cron always runs unscoped — that is the backstop's
+  // home.
+  test("an onlyVault run does NOT prune — the fleet-wide backstop is the unscoped cron's job", async () => {
+    const { id: owner } = await seedUser("sweep-scope-noprune@example.com");
+    await seedVault("noprune-mine", owner);
+    const orphan = wireEntry("noprune-gone", "2026-07-01T04:00:00.000Z");
+    await seedMirrorRow("noprune-gone", orphan);
+    const manifest = [wireEntry("noprune-mine", "2026-07-03T04:00:00.000Z")];
+    interceptSnapshotPost("noprune-mine", { skipped: false, manifest });
+
+    const summary = await quietly(() => runSnapshotSweep(env, sweepDeps(), { onlyVault: "noprune-mine" }));
+    expect(summary).toEqual({ day: TODAY, vaults: 1, taken: 1, skipped: 0, failed: 0, capped: false, orphansPruned: 0 });
+    expect((await mirrorRows()).map((r) => r.vault_name)).toEqual(["noprune-gone", "noprune-mine"]);
   });
 });
 
