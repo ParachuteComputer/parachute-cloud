@@ -245,9 +245,12 @@ export function prepareRevokeClientTokens(
   clientId: string,
   now: Date,
 ): D1PreparedStatement {
+  const nowIso = now.toISOString();
   return db
-    .prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL")
-    .bind(now.toISOString(), userId, clientId);
+    .prepare(
+      "UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL AND expires_at > ?",
+    )
+    .bind(nowIso, userId, clientId, nowIso);
 }
 
 /** The live (un-revoked, un-expired) refresh rows in a family as of `now`. */

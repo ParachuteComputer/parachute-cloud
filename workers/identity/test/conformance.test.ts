@@ -2547,6 +2547,33 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
       expect((await refreshAt(clientId, pair.refresh_token, new Date())).status).toBe(200);
     });
 
+    test("expired credential rows stay untouched and are not counted as live revocations", async () => {
+      const { id: userId } = await seedUser("c211-expired@example.com");
+      await seedVault("alpha", userId);
+      const { clientId } = await seedApprovedClient();
+      const sessionId = await seedSession(userId);
+
+      const expired = await consentAndMint(userId, clientId, sessionId, { mode: "wildcard", verb: "write" });
+      const expiredFamily = await familyIdFor(expired.refresh_token);
+      await env.DB.prepare("UPDATE tokens SET expires_at = ? WHERE family_id = ?")
+        .bind("2000-01-01T00:00:00.000Z", expiredFamily)
+        .run();
+
+      const { recordGrant } = await import("../src/grants.ts");
+      const result = await recordGrant(
+        env.DB,
+        userId,
+        clientId,
+        [`account:${userId}:vaults:alpha:read`],
+        new Date("2026-01-01T00:00:00.000Z"),
+      );
+      expect(result.revokedTokens).toBe(0);
+      const row = await env.DB.prepare("SELECT revoked_at FROM tokens WHERE family_id = ?")
+        .bind(expiredFamily)
+        .first<{ revoked_at: string | null }>();
+      expect(row?.revoked_at).toBeNull();
+    });
+
     test("the blast radius stops at (this user, this client) — every other grant survives", async () => {
       // Two ways this could over-reach: across clients for one user, and across
       // users for one client. Both are exercised against LIVE tokens, not row
