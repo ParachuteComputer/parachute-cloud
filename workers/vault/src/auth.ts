@@ -479,12 +479,35 @@ export async function deriveVaultFromToken(req: Request, env: Env): Promise<Vaul
   const key = extractApiKey(req);
   if (!key) return { error: "no_bearer" };
   if (!looksLikeJwt(key)) return { error: "not_derivable" };
+  // Cloud's issuer always pins a single-vault token to `aud=vault.<name>`.
+  // Read that claim only as an UNTRUSTED hint so the trust kernel can run the
+  // same strict audience check the destination DO runs. The hint grants
+  // nothing: validateHubJwt verifies the signature and requires the signed aud
+  // to contain this exact value, then the verified scope/aud/vault_scope sources
+  // below still have to agree before we dispatch. This also avoids relying on
+  // the audience-less validation path at the edge router; the first live root
+  // /mcp smoke showed that path 401ing while the same token passed the DO's
+  // audience-pinned validation.
+  let expectedAudience: string | undefined;
+  try {
+    const raw = decodeJwt(key);
+    const rawAuds =
+      typeof raw.aud === "string"
+        ? [raw.aud]
+        : Array.isArray(raw.aud)
+          ? raw.aud.filter((aud): aud is string => typeof aud === "string")
+          : [];
+    const vaultAuds = rawAuds.filter((aud) => /^vault\..+/.test(aud));
+    if (vaultAuds.length === 1) expectedAudience = vaultAuds[0];
+  } catch {
+    return { error: "not_derivable" };
+  }
   let claims: HubJwtClaims;
   try {
-    // No `expectedAudience`: the DO's trust kernel minus the aud pin (which the
-    // re-dispatch re-applies). A bad signature / iss / expiry / revoked jti
-    // throws here → not_derivable → the standard 401 root challenge.
-    claims = await getGuard(env).validateHubJwt(key, {});
+    // When a single vault audience is present, pin it here exactly as the DO
+    // does. Scope-only/vault_scope-only legacy shapes keep the audience-less
+    // fallback and are still fully signature/issuer/expiry/revocation checked.
+    claims = await getGuard(env).validateHubJwt(key, expectedAudience ? { expectedAudience } : {});
   } catch {
     return { error: "not_derivable" };
   }

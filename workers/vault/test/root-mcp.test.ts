@@ -109,6 +109,11 @@ describe("deriveVaultFromToken — root /mcp vault derivation (U1)", () => {
     expect(await deriveVaultFromToken(bearer(t), env)).toEqual({ vaultName: "journal" });
   });
 
+  it("cloud OAuth shape (vault aud + narrowed scope + empty vault_scope) → that vault", async () => {
+    const t = await sign({ aud: "vault.journal", scope: "vault:journal:read vault:journal:write", vaultScope: [] });
+    expect(await deriveVaultFromToken(bearer(t), env)).toEqual({ vaultName: "journal" });
+  });
+
   it("narrowed scope alone names the vault (non-vault aud, no vault_scope)", async () => {
     const t = await sign({ aud: "urn:opaque-resource", scope: "vault:journal:read" });
     expect(await deriveVaultFromToken(bearer(t), env)).toEqual({ vaultName: "journal" });
