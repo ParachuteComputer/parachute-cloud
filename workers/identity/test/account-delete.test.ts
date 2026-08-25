@@ -40,6 +40,7 @@ import {
   handleAccountDeleteUndo,
   runAccountDeleteSweep,
 } from "../src/account-delete.ts";
+import type { AccountDeleteSweepSummary } from "../src/account-delete.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "../src/account-token.ts";
 import type { BillingOverrides } from "../src/billing.ts";
 import { sha256Hex } from "../src/crypto.ts";
@@ -1133,6 +1134,20 @@ describe("cloud#248 — the sweep and undo agree on ONE atomic point", () => {
     return { stripe, calls };
   }
 
+  /** A Stripe stub whose resume update runs `hook` inside the network await. */
+  function stripeWithResumeHook(hook: () => Promise<void>): Stripe {
+    const { stripe } = makeStripeStub();
+    const inner = stripe.subscriptions.update.bind(stripe.subscriptions);
+    (stripe.subscriptions as unknown as { update: (id: string, params: unknown) => Promise<unknown> }).update = async (
+      id,
+      params,
+    ) => {
+      await hook();
+      return inner(id, params as Stripe.SubscriptionUpdateParams);
+    };
+    return stripe;
+  }
+
   /** Open a window for an account and hand back its undo token. */
   async function requestDelete(acct: Seeded, at: Date, stripe?: Stripe): Promise<string> {
     const del = await handleAccountDelete(
@@ -1294,6 +1309,36 @@ describe("cloud#248 — the sweep and undo agree on ONE atomic point", () => {
       vaultUsage: 1,
       vaultSnapshots: 1,
     });
+  });
+
+  test("a sweep that starts DURING Stripe resume loses before any purge side effect", async () => {
+    const acct = await seedAccount("race-during-resume@example.com", { vaults: ["preserved"], stripe: true });
+    await seedVaultMirrors("preserved");
+    const token = await requestDelete(acct, T0, makeStripeStub().stripe);
+
+    const { vaultFetch, calls: sweepCalls } = recordingVaultFetch();
+    let nestedSummary: AccountDeleteSweepSummary | null = null;
+    const resumeStripe = stripeWithResumeHook(async () => {
+      nestedSummary = await runAccountDeleteSweep(
+        env,
+        accountDeps(undefined, vaultFetch),
+        plus(DELETE_UNDO_WINDOW_MS),
+        billing(makeStripeStub().stripe),
+      );
+    });
+
+    const restored = await handleAccountDeleteUndo(
+      env,
+      undoGetReq(token),
+      accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS - 1000))),
+      billing(resumeStripe),
+    );
+
+    expect(restored.status).toBe(200);
+    expect(nestedSummary).toEqual({ due: 0, purged: 0, deferred: 0, skipped: 0, failed: 0 });
+    expect(sweepCalls).toEqual([]);
+    expect((await getUserById(env.DB, acct.userId))?.deletedAt).toBeNull();
+    expect(await residue(acct.userId, "preserved")).toMatchObject({ user: true, vaults: 1, vaultUsage: 1 });
   });
 
   test("a re-delete inside the same pass opens a NEW window the stale pass must not consume", async () => {

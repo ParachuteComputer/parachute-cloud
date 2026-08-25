@@ -347,9 +347,11 @@ function invalidUndoToken(): Response {
  * direction, so a stray prefetch can only ever un-delete something the account
  * holder asked to be able to un-delete.
  *
- * Order mirrors the request path in reverse, and again the reversible thing
- * leads: billing is resumed BEFORE the tombstone clears, so an account that
- * comes back always comes back with its subscription state already settled.
+ * The tombstone-clear CAS is the atomic winner BEFORE billing resumes. That
+ * ordering is load-bearing: if Stripe ran first, the sweep could claim during
+ * that await, leaving a purged account with a resumed subscription. A hard
+ * Stripe failure compensates by restoring the original tombstone + undo token,
+ * so the account remains honestly deleted and the same link can retry.
  * After the tombstone clears, current plan entitlement is pushed to owned
  * vaults (cloud#234): Stripe webhooks during the window recorded D1 but
  * skipped the DO wake, so restore — not the webhook — is what applies caps.
@@ -428,23 +430,53 @@ export async function handleAccountDeleteUndo(
   }
 
   const stripe = stripeFor(env, overrides);
+  if (user.stripeSubscriptionId !== null && !stripe) {
+    return deleteError(
+      503,
+      "billing_not_configured",
+      "Billing is not configured here, so this account's subscription cannot be resumed. The account was not restored; retry later.",
+    );
+  }
+
+  // THE ATOMIC WINNER. Clear the tombstone before any external side effect so
+  // a sweep selected just before this line loses its exact-tombstone claim.
+  // The inverse ordering (Stripe first, CAS second) lets the sweep claim during
+  // the network await and purge an account whose subscription was just resumed.
+  const res = await env.DB
+    .prepare(
+      "UPDATE users SET deleted_at = NULL, delete_undo_hash = NULL, delete_notice_sent_at = NULL WHERE id = ? AND deleted_at = ? AND delete_undo_hash = ? AND delete_purge_claimed_at IS NULL",
+    )
+    .bind(user.id, user.deletedAt, user.deleteUndoHash)
+    .run();
+  if ((res.meta.changes ?? 0) === 0) return invalidUndoToken();
+
   let billingResumed = true;
   let billingNote: "already_canceled" | null = null;
   if (user.stripeSubscriptionId !== null) {
-    if (!stripe) {
-      return deleteError(
-        503,
-        "billing_not_configured",
-        "Billing is not configured here, so this account's subscription cannot be resumed. The account was not restored; retry later.",
-      );
-    }
     try {
-      const result = await resumeBilling(stripe, user.stripeSubscriptionId);
+      const result = await resumeBilling(stripe!, user.stripeSubscriptionId);
       if (!result.resumed) {
         billingResumed = false;
         billingNote = result.reason;
       }
     } catch (err) {
+      // Restore the exact deletion window we won above. While the tombstone was
+      // NULL no sweep could claim it, and the delete request revoked every user
+      // credential, so no ordinary concurrent writer can open a new window.
+      const rollback = await env.DB
+        .prepare(
+          "UPDATE users SET deleted_at = ?, delete_undo_hash = ?, delete_notice_sent_at = ? WHERE id = ? AND deleted_at IS NULL AND delete_undo_hash IS NULL AND delete_purge_claimed_at IS NULL",
+        )
+        .bind(user.deletedAt, user.deleteUndoHash, user.deleteNoticeSentAt, user.id)
+        .run();
+      if ((rollback.meta.changes ?? 0) === 0) {
+        console.error(`event=account_undo_rollback_failed user=${user.id}`);
+        return deleteError(
+          500,
+          "undo_rollback_failed",
+          "Billing could not be resumed and the account restore could not be rolled back safely. Support has been notified.",
+        );
+      }
       console.error(
         `event=account_undo_billing_failed user=${user.id} error=${err instanceof Error ? err.message : String(err)}`,
       );
@@ -455,35 +487,6 @@ export async function handleAccountDeleteUndo(
       );
     }
   }
-
-  const res = await env.DB
-    .prepare(
-      // cloud#248: `delete_purge_claimed_at IS NULL` is the half that makes
-      // this a real mutual exclusion rather than a narrow one. The Stripe
-      // round-trip above is seconds wide and the sweep can claim inside it, so
-      // the pre-check is a fast path, not a guarantee; THIS statement and the
-      // sweep's claim are two conditional UPDATEs on one row, and SQLite
-      // orders them. Whichever commits second sees the other's write and
-      // reports zero rows. Neither can be mid-flight when the other lands.
-      //
-      // Still CAS'd on `deleted_at IS NOT NULL` too — that is the concurrent-
-      // undo half, unchanged.
-      "UPDATE users SET deleted_at = NULL, delete_undo_hash = NULL, delete_notice_sent_at = NULL WHERE id = ? AND deleted_at IS NOT NULL AND delete_purge_claimed_at IS NULL",
-    )
-    .bind(user.id)
-    .run();
-  // Zero rows means the sweep or a concurrent undo got here first — the token
-  // is spent either way, and it is now indistinguishable from any other dead
-  // token, which is exactly the answer it should get.
-  //
-  // Deliberately NOT the 410 the pre-check gives: from here we cannot tell the
-  // two losses apart without another read, and they call for opposite answers.
-  // A concurrent undo winning means the account IS RESTORED — telling that
-  // caller "its data has been deleted" would be a flat lie, and the honest
-  // 410 is only honest when the sweep is the winner. The neutral 400 is the
-  // one answer that is true either way. The pre-check catches the sweep case
-  // in every ordering but the last few milliseconds.
-  if ((res.meta.changes ?? 0) === 0) return invalidUndoToken();
 
   // cloud#234: Stripe webhooks during the window recorded D1 (plan /
   // subscription ids) but skipped the vault-DO cap push so they would not
