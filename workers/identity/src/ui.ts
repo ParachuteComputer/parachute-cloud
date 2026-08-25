@@ -17,11 +17,11 @@ import {
   formatUsageBytes,
   isPaidTier,
   planLine,
-  planTotalBytes,
   tierCapSummary,
   tierIntervalPricing,
   trialBannerLine,
   vaultCapMessage,
+  vaultUsageLine,
 } from "./plans.ts";
 import { type BillingInterval } from "./billing-config.ts";
 import { NONCE_ATTR } from "./oauth-shared.ts";
@@ -411,7 +411,7 @@ function renderVerbSelector(selector: OwnerVerbSelector): string {
   const option = (verb: "read" | "write" | "admin", title: string, desc: string): string => {
     const checked = verb === defaultVerb ? " checked" : "";
     const badge = verb === "admin" ? ` <span class="verbbadge">admin</span>` : "";
-    return `<label class="verbopt${verb === "admin" ? " verbopt-admin" : ""}">
+    return `<label class="verbopt">
              <input type="radio" name="verb_select" value="${verb}"${checked}>
              <span class="verbopt-body"><span class="verbopt-title">${esc(title)}${badge}</span><span class="verbopt-desc">${esc(desc)}</span></span>
            </label>`;
@@ -937,11 +937,14 @@ export interface ConsoleVaultCard {
   mcpUrl: string;
   connectCmd: string;
   /**
-   * Latest recorded storage usage (the daily rollup's `vault_usage` row):
-   * set → "Using X of Y"; null → no row yet ("usage appears within a day");
+   * Latest recorded storage usage (the daily rollup's `vault_usage` row), kept
+   * SPLIT by meter — `notesBytes` is the SQLite graph (the row's db_bytes),
+   * `attachmentBytes` the R2 blobs (r2_bytes). They are separate plan budgets
+   * (PlanCaps) and must never be summed into one number for display (#107).
+   * Set → the two-meter line; null → no row yet ("usage appears within a day");
    * undefined → caller didn't look it up (non-render paths).
    */
-  usage?: { usedBytes: number; day: string } | null;
+  usage?: { notesBytes: number; attachmentBytes: number; day: string } | null;
   /** Snapshot history (Wave 4e); undefined → caller didn't look it up. */
   history?: VaultHistory;
 }
@@ -1138,18 +1141,14 @@ function historySection(v: ConsoleVaultCard, csrfToken: string): string {
     </details>`;
 }
 
-function vaultCard(v: ConsoleVaultCard, csrfToken: string, planCapBytes: number): string {
-  // Storage line: the latest rollup row, human units against the plan cap
-  // (v1: each vault's cap IS the plan total — plans.ts). No row yet (fresh
-  // vault, or the nightly rollup hasn't reached it) → the honest "within a
-  // day" line, never a made-up zero.
-  // TODO(console-launch): the denominator here is planTotalBytes (notes +
-  // attachment budgets SUMMED into one number), but storage is now a POOLED
-  // TOTAL shared across all vaults AND a two-meter split — "of <total>" per card
-  // double-counts the shared budget and hides the notes-vs-attachment split.
-  // Show the pooled remaining, or the two meters, instead of a summed per-vault cap.
+function vaultCard(v: ConsoleVaultCard, csrfToken: string, plan: PlanId): string {
+  // Storage line: the latest rollup row as TWO meters, each against its own
+  // POOLED plan budget (vaultUsageLine — plans.ts owns the copy and the
+  // denominators, so the card can never drift from the plan ladder). No row yet
+  // (fresh vault, or the nightly rollup hasn't reached it) → the honest "within
+  // a day" line, never a made-up zero.
   const usageLine = v.usage
-    ? `Using ${formatUsageBytes(v.usage.usedBytes)} of ${formatPlanBytes(planCapBytes)}`
+    ? vaultUsageLine(plan, v.usage.notesBytes, v.usage.attachmentBytes)
     : "Usage appears within a day.";
   // Primary door: the Notes PWA connect deep-link. The Claude walkthrough +
   // MCP coordinates stay one disclosure below — demoted from the headline,
@@ -1643,7 +1642,7 @@ export function renderConsole(props: ConsoleProps): string {
     );
   }
 
-  const list = vaults.map((v) => vaultCard(v, csrfToken, planTotalBytes(plan))).join("\n");
+  const list = vaults.map((v) => vaultCard(v, csrfToken, plan)).join("\n");
   // At the plan's vault cap the create form yields to the friendly note (the
   // POST handler enforces regardless — this keeps the door honest). An error
   // still renders inside whichever card is shown.

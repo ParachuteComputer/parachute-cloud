@@ -6,7 +6,7 @@
  * ./shims.ts). Everything else is the shared wire contract.
  */
 import type { Store } from "@openparachute/core/src/types.js";
-import { stripTagHash } from "@openparachute/core/src/tag-hierarchy.js";
+import { stripTagHash, suggestSimilarTag } from "@openparachute/core/src/tag-hierarchy.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
 import { IndexedFieldError } from "@openparachute/core/src/indexed-fields.js";
 import { buildVaultProjection, resolveTagInheritance } from "@openparachute/core/src/vault-projection.js";
@@ -44,9 +44,41 @@ export async function handleTags(
       const allTags = await store.listTags();
       const found = allTags.find((t) => t.name === singleTag);
       const record = await store.getTagRecord(singleTag);
+      // cloud#113 / cloud#157, porting vault#550 — a name with no identity row
+      // AND no notes carrying it isn't a legitimate (if empty) tag; it's a
+      // typo, or a tag from a different vault. Answer honestly with a
+      // structured 404 instead of synthesizing an all-null 200 that reads as
+      // "this tag exists and is empty". Wire-visible: 200 → 404 on a genuinely
+      // unknown tag, matching the self-hosted door.
+      //
+      // `did_you_mean` candidates are restricted to the caller's allowlist
+      // when tag-scoped, so a suggestion can never name an out-of-scope tag.
+      // (Cloud v1 is unscoped everywhere — see rest/tag-scope.ts — so this is
+      // defense in depth for the day scoped tokens land, exactly as it is in
+      // bun, where the scope early-return above normally pre-empts it.)
+      if (!found && !record) {
+        const candidates = tagScope.allowed
+          ? allTags.filter((t) => tagScope.allowed!.has(t.name)).map((t) => t.name)
+          : allTags.map((t) => t.name);
+        const suggestion = suggestSimilarTag(candidates, singleTag);
+        return json(
+          {
+            error: "Tag not found",
+            error_type: "tag_not_found",
+            tag: singleTag,
+            ...(suggestion ? { did_you_mean: suggestion } : {}),
+          },
+          404,
+        );
+      }
       return json({
         name: singleTag,
         count: found?.count ?? 0,
+        // The subtypes-axis rollup (vault#550) — a parent tag whose notes are
+        // all filed under child tags reports count 0 but a truthful
+        // expanded_count. The array-shaped list form below spreads the row and
+        // picks this up for free; the hand-built single-tag bodies did not.
+        expanded_count: found?.expanded_count ?? 0,
         description: record?.description ?? null,
         fields: record?.fields ?? null,
         relationships: record?.relationships ?? null,
@@ -203,9 +235,27 @@ export async function handleTags(
     const allTags = await store.listTags();
     const found = allTags.find((t) => t.name === tagName);
     const record = await store.getTagRecord(tagName);
+    // cloud#113 / cloud#157 — see the `?tag=` form above for the rationale
+    // (no identity row + no memberships = not a real tag, not an empty one).
+    if (!found && !record) {
+      const candidates = tagScope.allowed
+        ? allTags.filter((t) => tagScope.allowed!.has(t.name)).map((t) => t.name)
+        : allTags.map((t) => t.name);
+      const suggestion = suggestSimilarTag(candidates, tagName);
+      return json(
+        {
+          error: "Tag not found",
+          error_type: "tag_not_found",
+          tag: tagName,
+          ...(suggestion ? { did_you_mean: suggestion } : {}),
+        },
+        404,
+      );
+    }
     return json({
       name: tagName,
       count: found?.count ?? 0,
+      expanded_count: found?.expanded_count ?? 0,
       description: record?.description ?? null,
       fields: record?.fields ?? null,
       relationships: record?.relationships ?? null,

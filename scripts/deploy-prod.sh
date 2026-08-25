@@ -59,6 +59,18 @@ bash "$ROOT/scripts/build-spa.sh"
 cd "$ROOT/workers/identity"
 bunx wrangler d1 migrations apply parachute-identity --remote --env=""
 # NO seed step (see the header: the operator login already exists in prod).
+
+# Capture the PRE-deploy edge version so the propagation gate at the bottom of
+# this script has a baseline to poll away from (cloud#183). Must be read BEFORE
+# the deploy — after it, "unchanged" and "not yet propagated" are the same
+# string. `|| true` so a transient /health blip doesn't abort the deploy; an
+# empty baseline just means the poll accepts any non-empty version.
+identity_health_version() {
+  curl -sf "${ISSUER_ORIGIN}/health" 2>/dev/null | grep -o '"version":"[^"]*"' | sed -e 's/"version":"//' -e 's/"$//'
+}
+BASELINE_VERSION="$(identity_health_version || true)"
+echo "Pre-deploy edge version at ${ISSUER_ORIGIN}: ${BASELINE_VERSION:-<none>}"
+
 # ISSUER + VAULT_ORIGIN are baked into the top-level [vars] (self-contained).
 bunx wrangler deploy --env=""
 
@@ -68,6 +80,49 @@ cd "$ROOT/workers/vault"
 # ISSUER_ORIGIN (baked into [vars]) must match the identity issuer so token
 # `iss` + JWKS validate.
 bunx wrangler deploy --env=""
+
+# --- propagation guard (cloud#183 — staging's cloud#174 fix, ported) ---------
+# `wrangler deploy` returning success means the upload was ACCEPTED — it does
+# NOT mean every edge PoP is already serving it. deploy-prod.sh was deliberately
+# left ungated on the reasoning that production is manual-approval-gated and so
+# under less time pressure. But the approval gate slows the DISPATCH→DEPLOY gap,
+# not the DEPLOY→SMOKE gap, and the race lives in the latter: the rc.96-98 prod
+# deploy (run 29584725832) went red on ONE smoke step — the tickets uniform-404
+# check saw a bare 404 with no error envelope — because it hit a PoP still
+# serving the pre-tickets worker seconds after wrangler reported success. A live
+# probe minutes later returned the correct enveloped 404. And a red prod run
+# reads as a FAILED DEPLOY to the operator who just clicked approve, which is
+# the real cost.
+#
+# `/health`'s `version` field (env.CF_VERSION_METADATA.id, wired identity-side —
+# see [version_metadata] in workers/identity/wrangler.toml) is the ground truth
+# for "which version is THIS PoP actually running". Poll it until it moves off
+# the pre-deploy baseline before handing off to smoke-prod.ts. Runs AFTER both
+# worker deploys so the vault deploy's own duration counts toward propagation.
+echo
+echo "Waiting for the new version to actually propagate to the edge before smoke..."
+DEPLOY_WAIT_SECS=90
+DEPLOY_POLL_INTERVAL=3
+elapsed=0
+NEW_VERSION=""
+while [ "$elapsed" -lt "$DEPLOY_WAIT_SECS" ]; do
+  NEW_VERSION="$(identity_health_version || true)"
+  if [ -n "$NEW_VERSION" ] && [ "$NEW_VERSION" != "$BASELINE_VERSION" ]; then
+    echo "New version live: ${NEW_VERSION} (was: ${BASELINE_VERSION:-<none>}) after ${elapsed}s"
+    break
+  fi
+  sleep "$DEPLOY_POLL_INTERVAL"
+  elapsed=$((elapsed + DEPLOY_POLL_INTERVAL))
+done
+if [ -z "$NEW_VERSION" ] || [ "$NEW_VERSION" == "$BASELINE_VERSION" ]; then
+  echo "ERROR: /health on ${ISSUER_ORIGIN} still reports the PRE-deploy version" \
+       "(${NEW_VERSION:-<none>}, baseline ${BASELINE_VERSION:-<none>}) after ${DEPLOY_WAIT_SECS}s." >&2
+  echo "       THE DEPLOY ITSELF SUCCEEDED — both workers uploaded and were accepted." \
+       "What failed is the propagation check: this PoP has not picked the new version up yet," \
+       "and smoking a stale edge produces false reds that read as a broken deploy." \
+       "Re-run the smoke (bun scripts/smoke-prod.ts) once propagation catches up." >&2
+  exit 1
+fi
 
 echo
 echo "Production deployed."

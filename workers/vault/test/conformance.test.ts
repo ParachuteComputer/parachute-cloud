@@ -254,8 +254,13 @@ describe("transaction seam (vault#521 / DoSqliteStore)", () => {
     expect((await b.json() as any).error_type).toBe("invalid_indexed_field");
 
     // Rollback proof: standup's schema row must NOT have been persisted.
-    const check = await (await op(v, "/api/tags/standup")).json() as any;
-    expect(check.fields).toBeNull();
+    // Post-cloud#113/#157 a name with no identity row and no notes answers
+    // with a structured 404 rather than an all-null 200 — a STRONGER rollback
+    // proof than `fields === null` was (that shape could not distinguish
+    // "declared with no fields" from "never declared").
+    const check = await op(v, "/api/tags/standup");
+    expect(check.status).toBe(404);
+    expect(((await check.json()) as any).error_type).toBe("tag_not_found");
   });
 
   it("GLOBAL 0 raw-BEGIN interceptions — boot + every free-transaction() op is DO-atomic (vault#523)", async () => {
@@ -402,6 +407,86 @@ describe("vault landing + config", () => {
     });
     expect(bad.status).toBe(400);
     expect((await bad.json() as any).error).toBe("invalid_audio_retention");
+  });
+
+  /**
+   * cloud#87 — the REST half of the description type guard (the MCP half is in
+   * mcp.test.ts, "description type guard (cloud#87)"). `description` was written
+   * straight through with only a TS `description?: string` annotation and no
+   * runtime check, so a write-scoped caller could persist a non-string. The
+   * damage lands on the OTHER door: `serverInstruction()` (mcp.ts) does
+   * `description?.trim()`, so the next MCP `initialize` answers -32603
+   * INTERNAL_ERROR and the vault is unconnectable. Rejection reuses the SAME
+   * 400 shape the sibling `audio_retention` / `auto_transcribe` validators in
+   * rest/vault.ts already emit — no new error family.
+   */
+  for (const [label, value] of [
+    ["a number", 123],
+    ["an object", { text: "nope" }],
+    ["an array", ["nope"]],
+    ["a boolean", true],
+  ] as Array<[string, unknown]>) {
+    it(`PATCH /api/vault rejects a non-string description (${label}) → 400 invalid_description`, async () => {
+      const v = freshVault();
+      const before = (await (await op(v, "/api/vault")).json()) as any;
+      const bad = await op(v, "/api/vault", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ description: value }),
+      });
+      expect(bad.status).toBe(400);
+      const err = (await bad.json()) as any;
+      expect(err.error).toBe("invalid_description");
+      expect(err.error_type).toBe("invalid_description");
+      expect(err.field).toBe("description");
+      // Nothing persisted.
+      const after = (await (await op(v, "/api/vault")).json()) as any;
+      expect(after.description).toBe(before.description);
+    });
+  }
+
+  it("PATCH /api/vault: a rejected non-string description leaves MCP initialize working (cloud#87 poison)", async () => {
+    const v = freshVault();
+    await op(v, "/api/vault", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ description: 123 }),
+    });
+    const init = await SELF.fetch(`${base(v)}/mcp`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OP}`,
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } },
+      }),
+    });
+    expect(init.status).toBe(200);
+    const body = (await init.json()) as any;
+    expect(body.error).toBeUndefined();
+    expect(typeof body.result.instructions).toBe("string");
+  });
+
+  it("PATCH /api/vault: description null clears it, and a string still persists", async () => {
+    const v = freshVault();
+    await op(v, "/api/vault", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ description: "a real one" }),
+    });
+    expect(((await (await op(v, "/api/vault")).json()) as any).description).toBe("a real one");
+    const cleared = await op(v, "/api/vault", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ description: null }),
+    });
+    expect(cleared.status).toBe(200);
+    expect(((await (await op(v, "/api/vault")).json()) as any).description).toBeNull();
   });
 
   // C1.2 — bun's handleVault ALWAYS attaches `map` (the front-door structural
@@ -587,10 +672,12 @@ describe("write/admin scope split — tag-schema mutations require vault:admin",
       asToken(token, "PUT", { description: "by write token", fields: { status: { type: "string" } } }),
     );
     await expectAdminRefused(res, `vault:${v}:write`);
-    // The refusal happened at the gate — nothing landed.
-    const tag = await (await op(v, "/api/tags/project")).json() as any;
-    expect(tag.description).toBeNull();
-    expect(tag.fields).toBeNull();
+    // The refusal happened at the gate — nothing landed. Post-cloud#113/#157
+    // "nothing landed" reads as a structured 404 (no identity row, no notes)
+    // instead of an all-null 200.
+    const tag = await op(v, "/api/tags/project");
+    expect(tag.status).toBe(404);
+    expect(((await tag.json()) as any).error_type).toBe("tag_not_found");
   });
 
   it("write token: DELETE /api/tags/:name → 403 vault:admin, tag survives", async () => {
@@ -675,7 +762,11 @@ describe("write/admin scope split — tag-schema mutations require vault:admin",
     );
     expect(patched.status).toBe(200);
 
-    // Tag READS stay read-tier — the carve-out matches mutations only.
+    // Tag READS stay read-tier — the carve-out matches mutations only. The
+    // tag has to actually exist for a 200 to mean anything: before
+    // cloud#113/#157 an unknown name 200'd too, so this assertion passed
+    // whether or not `wt` was ever created.
+    await createNote(v, { content: "carries the tag", tags: ["wt"] });
     const list = await SELF.fetch(`${base(v)}/api/tags`, asToken(token, "GET"));
     expect(list.status).toBe(200);
     const detail = await SELF.fetch(`${base(v)}/api/tags/wt`, asToken(token, "GET"));
@@ -1019,6 +1110,264 @@ describe("contracts-brief C1.4 — cross-door parity pins", () => {
       await createNote(v, { content: "u1", tags: ["notrunc"] });
       const out = await queryNotesViaMcp(v, { tag: "notrunc", limit: 50 });
       expect(Array.isArray(out)).toBe(true);
+    });
+  });
+});
+
+/**
+ * Parity residue — cloud#112 (cursor bootstrap + live-subscription cursor
+ * guard, porting parachute-vault#559), cloud#113/#157 (honest tag-not-found
+ * answers: `tag_not_found` + `did_you_mean` + `expanded_count`, porting
+ * vault#550), cloud#115 (the `error_type` taxonomy residue in rest/notes.ts,
+ * porting vault#554).
+ *
+ * The invariant these pin is "one contract, two doors": a client must not be
+ * able to tell the hosted door from the self-hosted one by the shape of an
+ * answer. Ground truth for every case below is
+ * parachute-vault/src/routes.ts + core/src/notes.ts at the pinned vault-core
+ * ref (scripts/vault-source.env).
+ */
+describe("parity residue — cloud#112 / #113 / #115 / #157", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  async function patch(vault: string, id: string, body: Record<string, unknown>): Promise<Response> {
+    return op(vault, `/api/notes/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  describe("cursor bootstrap engages keyset ordering (cloud#112 / vault#559)", () => {
+    /**
+     * The bug: `?cursor=` (present, empty) was normalized to
+     * `cursor: undefined` before reaching core, and core keys cursor mode on
+     * `cursor !== undefined`. So page 1 of a bootstrap walk ran under the
+     * DEFAULT `ORDER BY created_at ASC` while still minting a
+     * `(updated_at_ms, id)` watermark from whatever that page happened to
+     * contain — every note excluded from page 1 whose `updated_at` fell below
+     * that watermark was silently skipped for the rest of the walk.
+     *
+     * The fixture makes created_at order and updated_at order disagree:
+     * `created_at` descends as update time ascends, so a buggy page 1 holds
+     * the two most-recently-updated notes and the watermark it mints jumps
+     * clean past the third. A correct page 1 is keyset-ordered, so the walk
+     * sees all three.
+     */
+    it("?cursor= walk with limit=2 returns EVERY note (no silent skip)", async () => {
+      const v = freshVault();
+      // `?tag=walk` fences the walk off from the seeded welcome notes a fresh
+      // vault ships with — the tag is part of the query hash, so it is stable
+      // across every page of the cursor walk.
+      const mk = (c: string, at: string) => createNote(v, { content: c, created_at: at, tags: ["walk"] });
+      const n1 = await mk("a", "2024-03-01T00:00:00.000Z");
+      const n2 = await mk("b", "2024-02-01T00:00:00.000Z");
+      const n3 = await mk("c", "2024-01-01T00:00:00.000Z");
+      // Touch in created_at-DESCENDING order, spaced so `updated_at_ms` is
+      // strictly increasing: updated_at ASC == n1 < n2 < n3, created_at ASC
+      // == n3 < n2 < n1.
+      for (const n of [n1, n2, n3]) {
+        await sleep(4);
+        const res = await patch(v, n.id, { metadata: { touched: n.id }, force: true });
+        expect(res.status).toBe(200);
+      }
+
+      const seen: string[] = [];
+      let cursor = "";
+      for (let page = 0; page < 6; page++) {
+        const res = await op(v, `/api/notes?tag=walk&limit=2&cursor=${encodeURIComponent(cursor)}`);
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as any;
+        expect(Array.isArray(body.notes)).toBe(true);
+        if (body.notes.length === 0) break;
+        for (const n of body.notes) seen.push(n.id);
+        expect(typeof body.next_cursor).toBe("string");
+        cursor = body.next_cursor;
+      }
+      expect([...new Set(seen)].sort()).toEqual([n1.id, n2.id, n3.id].sort());
+    });
+
+    it("bootstrap page 1 is ordered by updated_at, not created_at", async () => {
+      const v = freshVault();
+      const mk = (c: string, at: string) => createNote(v, { content: c, created_at: at, tags: ["ord"] });
+      const n1 = await mk("a", "2024-03-01T00:00:00.000Z");
+      const n2 = await mk("b", "2024-01-01T00:00:00.000Z");
+      for (const n of [n1, n2]) {
+        await sleep(4);
+        expect((await patch(v, n.id, { metadata: { t: 1 }, force: true })).status).toBe(200);
+      }
+      const body = (await (await op(v, "/api/notes?tag=ord&cursor=")).json()) as any;
+      // updated_at ASC → n1 first. created_at ASC (the buggy order) → n2 first.
+      expect(body.notes.map((n: any) => n.id)).toEqual([n1.id, n2.id]);
+    });
+  });
+
+  describe("live-subscription cursor guard is presence-based (cloud#112 / vault#559)", () => {
+    it("GET /api/subscribe?cursor= → 400 UNSUPPORTED_SUBSCRIPTION_QUERY", async () => {
+      const v = freshVault();
+      const res = await op(v, "/api/subscribe?cursor=");
+      expect(res.status).toBe(400);
+      const err = (await res.json()) as any;
+      expect(err.code).toBe("UNSUPPORTED_SUBSCRIPTION_QUERY");
+      expect(err.error).toMatch(/cursor/i);
+    });
+
+    it("GET /api/subscribe?cursor=abc → 400 (non-empty cursor still rejected)", async () => {
+      const v = freshVault();
+      const res = await op(v, "/api/subscribe?cursor=abc");
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as any).code).toBe("UNSUPPORTED_SUBSCRIPTION_QUERY");
+    });
+  });
+
+  describe("honest tag-not-found answers (cloud#113 / #157 / vault#550)", () => {
+    it("GET /api/tags?tag={unknown} → 404 tag_not_found + did_you_mean", async () => {
+      const v = freshVault();
+      await createNote(v, { content: "x", tags: ["project"] });
+      const res = await op(v, "/api/tags?tag=projet");
+      expect(res.status).toBe(404);
+      const err = (await res.json()) as any;
+      expect(err.error_type).toBe("tag_not_found");
+      expect(err.tag).toBe("projet");
+      expect(err.did_you_mean).toBe("project");
+    });
+
+    it("GET /api/tags/{unknown} → 404 tag_not_found + did_you_mean", async () => {
+      const v = freshVault();
+      await createNote(v, { content: "x", tags: ["project"] });
+      const res = await op(v, "/api/tags/projet");
+      expect(res.status).toBe(404);
+      const err = (await res.json()) as any;
+      expect(err.error_type).toBe("tag_not_found");
+      expect(err.tag).toBe("projet");
+      expect(err.did_you_mean).toBe("project");
+    });
+
+    it("a tag with an identity row but zero notes still 200s (legitimately empty)", async () => {
+      const v = freshVault();
+      const put = await op(v, "/api/tags/empty-but-real", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ description: "declared, unused" }),
+      });
+      expect(put.status).toBe(200);
+      const res = await op(v, "/api/tags/empty-but-real");
+      expect(res.status).toBe(200);
+      const tag = (await res.json()) as any;
+      expect(tag.count).toBe(0);
+      expect(tag.expanded_count).toBe(0);
+    });
+
+    it("single-tag reads carry expanded_count (both forms)", async () => {
+      const v = freshVault();
+      await createNote(v, { content: "x", tags: ["alpha"] });
+      const byQuery = (await (await op(v, "/api/tags?tag=alpha")).json()) as any;
+      expect(byQuery.count).toBe(1);
+      expect(byQuery.expanded_count).toBe(1);
+      const byPath = (await (await op(v, "/api/tags/alpha")).json()) as any;
+      expect(byPath.count).toBe(1);
+      expect(byPath.expanded_count).toBe(1);
+    });
+
+    it("expanded_count rolls up the subtypes axis (parent counts its children's notes)", async () => {
+      const v = freshVault();
+      const declare = (name: string, body: Record<string, unknown>) =>
+        op(v, `/api/tags/${name}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      expect((await declare("parent", { description: "rollup label" })).status).toBe(200);
+      expect((await declare("child", { parent_names: ["parent"] })).status).toBe(200);
+      await createNote(v, { content: "c", tags: ["child"] });
+      const parent = (await (await op(v, "/api/tags/parent")).json()) as any;
+      // `count` alone reads as "this tag is dead"; expanded_count is the
+      // honest rollup — the whole point of the vault#550 field.
+      expect(parent.count).toBe(0);
+      expect(parent.expanded_count).toBe(1);
+    });
+
+    // NOT tested end-to-end, deliberately: bun restricts `did_you_mean`
+    // candidates to a tag-scoped token's allowlist so a suggestion can't leak
+    // an out-of-scope tag's existence. Cloud v1 has no tag-scoped tokens at
+    // all — every handler is wired with `NO_TAG_SCOPE` (see
+    // src/rest/tag-scope.ts), so that branch is unreachable from the wire
+    // here. The scope-restricted candidate list IS ported in rest/tags.ts so
+    // the door is scope-safe on the day cloud grows scoped tokens; there is
+    // just no request that can exercise it yet.
+  });
+
+  describe("error_type taxonomy residue in rest/notes.ts (cloud#115 / vault#554)", () => {
+    it("PATCH content + content_edit → 400 mutually_exclusive", async () => {
+      const v = freshVault();
+      const n = await createNote(v, { content: "hello" });
+      const res = await patch(v, n.id, {
+        content: "a",
+        content_edit: { old_text: "hello", new_text: "bye" },
+        force: true,
+      });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as any).error_type).toBe("mutually_exclusive");
+    });
+
+    it("PATCH malformed content_edit → 400 invalid_content_edit", async () => {
+      const v = freshVault();
+      const n = await createNote(v, { content: "hello" });
+      const res = await patch(v, n.id, { content_edit: { old_text: 5 }, force: true });
+      expect(res.status).toBe(400);
+      const err = (await res.json()) as any;
+      expect(err.error_type).toBe("invalid_content_edit");
+      expect(err.field).toBe("content_edit");
+      expect(typeof err.hint).toBe("string");
+    });
+
+    it("PATCH content_edit old_text absent → 422 content_edit_not_found", async () => {
+      const v = freshVault();
+      const n = await createNote(v, { content: "hello" });
+      const res = await patch(v, n.id, {
+        content_edit: { old_text: "nowhere", new_text: "x" },
+        force: true,
+      });
+      expect(res.status).toBe(422);
+      const err = (await res.json()) as any;
+      expect(err.error_type).toBe("content_edit_not_found");
+      expect(err.field).toBe("content_edit.old_text");
+      expect(typeof err.hint).toBe("string");
+    });
+
+    it("PATCH content_edit old_text ambiguous → 409 content_edit_ambiguous", async () => {
+      const v = freshVault();
+      const n = await createNote(v, { content: "dup dup" });
+      const res = await patch(v, n.id, {
+        content_edit: { old_text: "dup", new_text: "x" },
+        force: true,
+      });
+      expect(res.status).toBe(409);
+      const err = (await res.json()) as any;
+      expect(err.error_type).toBe("content_edit_ambiguous");
+      expect(err.field).toBe("content_edit.old_text");
+      expect(typeof err.hint).toBe("string");
+    });
+
+    it("PATCH state_transition.field non-string → 400 invalid_state_transition", async () => {
+      const v = freshVault();
+      const n = await createNote(v, { content: "hello" });
+      const res = await patch(v, n.id, {
+        state_transition: { field: 7, from: "a", to: "b" },
+        force: true,
+      });
+      expect(res.status).toBe(400);
+      const err = (await res.json()) as any;
+      expect(err.error_type).toBe("invalid_state_transition");
+      expect(err.field).toBe("state_transition.field");
+      expect(typeof err.hint).toBe("string");
+    });
+
+    it("PATCH an absent note (no if_missing) → 404 not_found", async () => {
+      const v = freshVault();
+      const res = await patch(v, "no-such-note", { content: "x", force: true });
+      expect(res.status).toBe(404);
+      expect(((await res.json()) as any).error_type).toBe("not_found");
     });
   });
 });

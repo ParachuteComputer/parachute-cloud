@@ -1,0 +1,61 @@
+-- Account deletion, part three (cloud#248): make the END of the undo window a
+-- STATE TRANSITION instead of a clock reading.
+--
+-- THE BUG THIS CLOSES. Two components decide independently whether an
+-- account's 24-hour window is still open, and each does it by comparing its
+-- OWN `Date.now()` against `users.deleted_at`:
+--
+--   - the sweep (runAccountDeleteSweep) selects `deleted_at <= now - 24h`;
+--   - the undo endpoint (handleAccountDeleteUndo) admits `now - deleted_at < 24h`.
+--
+-- Those two predicates are exact complements at a single instant, so they look
+-- mutually exclusive. They are not, because NEITHER COMPONENT ACTS AT THE
+-- INSTANT IT READS THE CLOCK. Undo reads its clock, then makes a Stripe
+-- round-trip (`resumeBilling`) before it writes; the sweep reads its clock,
+-- then makes a Stripe round-trip plus one Durable Object wake PER OWNED VAULT
+-- before it destroys anything. Both windows are seconds wide, and they
+-- overlap whenever undo's clock read precedes the sweep's — which is exactly
+-- the arrangement at the boundary. The sweep re-read the user row per account
+-- (`getUserById`) but never re-checked `deleted_at` after its SELECT, so an
+-- undo that committed in that gap was simply not observed: the account came
+-- back, told the user `restored: true`, and then had its vaults destroyed and
+-- its rows purged out from under it. cloud#247's undo-time entitlement push
+-- widened the tail — a cap PUT aimed at a vault mid-destroy can re-latch an
+-- empty Durable Object shell (the cloud#240 latch shape).
+--
+-- WHY A RE-CHECK ALONE IS NOT THE FIX. "Re-read `deleted_at` immediately
+-- before teardown" narrows the window; it does not close it, because there is
+-- still a gap between that read and the first irreversible write, and D1 has
+-- no interactive transactions to hold across it. The two sides must agree on
+-- ONE atomic point. This column is that point: the sweep CLAIMS the account
+-- with a single conditional UPDATE, and undo's tombstone-clear is a single
+-- conditional UPDATE that refuses a claimed row. SQLite decides the order;
+-- neither side can be mid-flight when the other commits.
+--
+-- `users.delete_purge_claimed_at` — ISO-8601 timestamp at which a sweep pass
+-- first claimed this account for irreversible teardown (NULL = unclaimed and
+-- therefore still restorable). Written ONLY by the sweep's claim, and reset to
+-- NULL only by `DELETE /account` when it opens a NEW window (a fresh window
+-- means fresh restorability; that write is itself conditional on
+-- `deleted_at IS NULL`, so it can never clear a claim on an in-flight purge).
+--
+-- The claim is CAS'd on the tombstone value the sweep read, not merely on
+-- "deleted_at IS NOT NULL": an account that was restored and re-deleted inside
+-- one sweep pass carries a DIFFERENT `deleted_at`, and its new window must be
+-- honored rather than consumed by the stale pass that selected the old one.
+--
+-- The claim is STICKY — a deferred pass does not release it, and that is
+-- deliberate twice over. Releasing would reopen the race on every retry. And
+-- it costs nothing: the sweep only ever claims rows whose `deleted_at` is
+-- already past the cutoff, so such an account is unrestorable BY THE CLOCK
+-- too. The claim does not shorten anyone's window; it makes the moment the
+-- window closed a fact one component WRITES and the other READS, rather than
+-- two components guessing at it from the same clock and disagreeing by the
+-- width of a Stripe call.
+--
+-- Not indexed, on purpose: nothing looks a row up BY this column. Both readers
+-- already have the row (the sweep by id from its cutoff SELECT, undo by the
+-- UNIQUE `delete_undo_hash` index from migration 0024), so it is only ever
+-- read as a column of a row already located, and an index would be write cost
+-- for no lookup.
+ALTER TABLE users ADD COLUMN delete_purge_claimed_at TEXT;

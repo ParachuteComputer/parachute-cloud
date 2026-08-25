@@ -35,7 +35,12 @@ export interface LiveMatcher {
  * The route layer rejects these with 400 before creating a subscription.
  */
 export function unsupportedSubscriptionReason(opts: QueryOpts): string | null {
-  if (opts.cursor) {
+  // Presence, not truthiness (cloud#112, porting vault#559). `cursor: ""` is
+  // the bootstrap value — still cursor INTENT, and still a query shape a live
+  // subscription can't evaluate note-by-note. Truthiness let an empty-string
+  // subscription through, so `?cursor=` opened a stream that silently ignored
+  // the caller's pagination intent instead of rejecting it.
+  if (opts.cursor !== undefined) {
     return "cursor pagination is not supported for live subscriptions";
   }
   if (opts.hasLinks !== undefined) {

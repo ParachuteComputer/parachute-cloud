@@ -75,6 +75,18 @@ describe("my.-canonical Phase 1 — cloud. human GET paths 301/302 to my. (produ
     expect(res.headers.get("location")).toBe(`${MY}/console?created=my-notes`);
   });
 
+  test("GET cloud./console/security → 301 my./console/security", async () => {
+    const res = await get(`${CLOUD}/console/security`, prodEnv);
+    expect(res.status).toBe(301);
+    expect(res.headers.get("location")).toBe(`${MY}/console/security`);
+  });
+
+  test("GET cloud./console/security?enrolled=1 → 301, path + query preserved", async () => {
+    const res = await get(`${CLOUD}/console/security?enrolled=1`, prodEnv);
+    expect(res.status).toBe(301);
+    expect(res.headers.get("location")).toBe(`${MY}/console/security?enrolled=1`);
+  });
+
   test("GET cloud./ → 302 my./console (the Host-branch's production arm)", async () => {
     const res = await get(`${CLOUD}/`, prodEnv);
     expect(res.status).toBe(302);
@@ -101,6 +113,12 @@ describe("the production gate — no redirect in the non-production test env", (
 
   test("GET cloud./console (ENVIRONMENT=test, no session) → relative /login, NOT my.", async () => {
     const res = await get(`${CLOUD}/console`, env);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/login");
+  });
+
+  test("GET cloud./console/security (ENVIRONMENT=test, no session) → relative /login, NOT my.", async () => {
+    const res = await get(`${CLOUD}/console/security`, env);
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/login");
   });
@@ -167,6 +185,48 @@ describe("MUST-NEVER-REDIRECT — every machine path on cloud. keeps serving (pr
 
   test("GET cloud./unsubscribe (RFC 8058 — must not follow a 3xx) → served (never 3xx to my.)", async () => {
     const res = await get(`${CLOUD}/unsubscribe?t=bogus-${Date.now()}`, prodEnv);
+    expect(notFrontDoorRedirected(res)).toBe(true);
+  });
+
+  // GET /login/2fa looks like a human ceremony page, but it is a MID-FLOW step
+  // whose only credential is the pending-login cookie — HOST-ONLY (no `Domain=`
+  // in pending-login.ts buildPendingLoginCookie) and `Path=/login`. It is
+  // reachable on cloud. from a path that MUST NEVER redirect: POST
+  // cloud./oauth/authorize 302s to `/login/2fa` on cloud. with that cookie
+  // (oauth-authorize.ts, the isTotpEnrolled branch) because cloud. is still the
+  // issuer this phase. A 301 to my. would drop the cookie, `getPendingLogin`
+  // would miss, and the in-flight OAuth login would be silently thrown away.
+  // So /login/2fa is NOT a canonicalization gap — it is a never-redirect member.
+  // (The no-pending case self-canonicalizes: the handler 302s to the relative
+  // `/login`, which then 301s to my./login.)
+  test("GET cloud./login/2fa (mid-flow second factor) → served (never 3xx to my.)", async () => {
+    const res = await get(`${CLOUD}/login/2fa`, prodEnv);
+    expect(notFrontDoorRedirected(res)).toBe(true);
+  });
+
+  test("POST cloud./login/2fa → served (never 3xx to my.)", async () => {
+    const res = await worker.fetch(
+      new Request(`${CLOUD}/login/2fa`, {
+        method: "POST",
+        body: new URLSearchParams({ code: "000000" }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: CLOUD },
+      }),
+      prodEnv,
+    );
+    expect(notFrontDoorRedirected(res)).toBe(true);
+  });
+
+  // The GET is canonicalized (above); the POST is a form submit that a 3xx would
+  // turn into a GET and strip of its body — never wired.
+  test("POST cloud./console/security → served (never 3xx to my.)", async () => {
+    const res = await worker.fetch(
+      new Request(`${CLOUD}/console/security`, {
+        method: "POST",
+        body: new URLSearchParams({ action: "noop" }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: CLOUD },
+      }),
+      prodEnv,
+    );
     expect(notFrontDoorRedirected(res)).toBe(true);
   });
 

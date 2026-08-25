@@ -180,7 +180,18 @@ export function serverInstruction(vaultName: string, description: string | null)
     `Parachute vault "${vaultName}" — an agent-native knowledge graph of notes, tags, and links. ` +
     `Read with query-notes; write with create-note / update-note; manage schema with list-tags / update-tag; ` +
     `traverse with find-path; orient with vault-info.`;
-  const d = description?.trim();
+  // cloud#87 — defensive `typeof`, not decoration: this is the DETONATION site
+  // for a non-string description. `description?.trim()` on a number throws, and
+  // `initialize` catches every throw into a -32603 INTERNAL_ERROR, so a poisoned
+  // vault could not be CONNECTED to at all — and `initialize` is the first frame,
+  // so the connected AI never reaches a tool that could repair it. Both cloud
+  // write doors now reject a non-string at the execute (overrideVaultInfo /
+  // rest/vault.ts), but a vault poisoned BEFORE this shipped — or through a door
+  // that still carries the unchecked cast (the bun vault's mcp-tools.ts still
+  // does, cloud#87 is only half-closed) — must still be able to reconnect. A
+  // non-string degrades to "no description": the vault connects with the base
+  // brief instead of refusing the session.
+  const d = typeof description === "string" ? description.trim() : undefined;
   const head = d ? `${d}\n\n${base}` : base;
   return `${head}\n\n${attachmentsInstructionBlock({ ticketsEnabled: true })}`;
 }
@@ -199,9 +210,15 @@ export interface VaultInfoContext {
   db: Database;
   /** Persist a new vault description into the DO's config store. Called only on
    *  the gated description-update branch (after the inner admin-scope check
-   *  passes and the dispatch-layer frozen/cap gate has cleared). Resolves
-   *  after the config `put` lands. */
-  updateDescription: (description: string) => void | Promise<void>;
+   *  passes, the cloud#87 type guard has run, and the dispatch-layer frozen/cap
+   *  gate has cleared). Resolves after the config `put` lands.
+   *
+   *  `string | null` — `null` CLEARS the description, and always could: the DO's
+   *  config field is `string | null` and a `description: null` argument already
+   *  flowed through here. The parameter type just said `string` and leaned on
+   *  the caller's `as string` cast to hide it; cloud#87 replaced that cast with a
+   *  real check, so the seam now states the type it actually accepts. */
+  updateDescription: (description: string | null) => void | Promise<void>;
 }
 
 /** Public-facing origin, honoring a proxy's X-Forwarded-* (Cloudflare sets Host).
@@ -274,7 +291,36 @@ function overrideVaultInfo(
           `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
         );
       }
-      description = params.description as string;
+      // cloud#87 — the RUNTIME type guard the old `as string` cast stood in
+      // for. `params` is untyped JSON off the wire, so the cast was a claim, not
+      // a check: an admin-scoped caller could persist a non-string description
+      // into the DO config, and it then detonated on the NEXT `initialize` in
+      // serverInstruction()'s `description?.trim()` → -32603 INTERNAL_ERROR on
+      // connect, with no reachable repair path.
+      //
+      // Refused through the tool's NORMAL validation channel — a duck-typed
+      // `error_type` error, which mapDomainError's generic branch turns into
+      // JSON-RPC -32602 INVALID_PARAMS carrying structured `data`. That is the
+      // SAME shape core's own validation leaves take (core/src/mcp.ts
+      // `structuredError`, e.g. update-tag's `invalid_parent_names`); no new
+      // error family, and deliberately NOT a bare throw, which would degrade to
+      // the very INTERNAL_ERROR this fix is about.
+      //
+      // `null` stays legal — it CLEARS the description.
+      const next = params.description;
+      if (next !== null && typeof next !== "string") {
+        const got = Array.isArray(next) ? "array" : typeof next;
+        throw Object.assign(
+          new Error(`vault-info: description must be a string, or null to clear it (got ${got}).`),
+          {
+            error_type: "invalid_description",
+            field: "description",
+            got: next,
+            hint: "pass a string, or null to clear the description",
+          },
+        );
+      }
+      description = next;
       await ctx.updateDescription(description);
     }
 

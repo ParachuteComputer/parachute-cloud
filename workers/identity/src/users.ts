@@ -93,6 +93,15 @@ export interface User {
    */
   deletePurgeAttempts: number;
   /**
+   * ISO-8601 timestamp at which a convergence-sweep pass first claimed this
+   * account for irreversible teardown (migration 0025); null = unclaimed, and
+   * therefore still restorable. This is the ONE atomic point the sweep and the
+   * undo endpoint agree on — see the migration for why a clock comparison on
+   * `deletedAt` alone cannot be that point. Read-only everywhere except
+   * `account-delete.ts`.
+   */
+  deletePurgeClaimedAt: string | null;
+  /**
    * Stripe linkage (migration 0012) — set by the checkout.session.completed
    * webhook; null for free users and comped accounts. The lifecycle handlers
    * resolve events by these ids (billing-lifecycle.ts).
@@ -134,6 +143,7 @@ interface Row {
   delete_undo_hash: string | null;
   delete_notice_sent_at: string | null;
   delete_purge_attempts: number | null;
+  delete_purge_claimed_at: string | null;
   stripe_customer_id: string | null;
   stripe_subscription_id: string | null;
   pending_plan: string | null;
@@ -160,6 +170,7 @@ function rowToUser(r: Row): User {
     deleteUndoHash: r.delete_undo_hash,
     deleteNoticeSentAt: r.delete_notice_sent_at,
     deletePurgeAttempts: r.delete_purge_attempts ?? 0,
+    deletePurgeClaimedAt: r.delete_purge_claimed_at,
     stripeCustomerId: r.stripe_customer_id,
     stripeSubscriptionId: r.stripe_subscription_id,
     // Same defensive coercion as `plan`; null stays null (no pending change).
@@ -292,6 +303,7 @@ export async function createUser(
     deletedAt: null,
     deleteUndoHash: null,
     deleteNoticeSentAt: null,
+    deletePurgeClaimedAt: null,
     deletePurgeAttempts: 0,
     stripeCustomerId: null,
     stripeSubscriptionId: null,

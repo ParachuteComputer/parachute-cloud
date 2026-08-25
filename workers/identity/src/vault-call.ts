@@ -308,8 +308,10 @@ export interface VaultUsageReading {
  * preserving the legitimate `null` returned by a legacy/unpushed vault.
  *
  * The rollup uses this value as an invariant check, not merely as display
- * data: a malformed object must fail the vault's processing attempt rather
- * than accidentally looking converged and hiding an entitlement problem.
+ * data, so a malformed object must never be accepted as if it were the DO's
+ * real caps — it would read as converged and hide an entitlement problem.
+ * THROWS on malformed input; {@link readVaultUsage} catches that and degrades
+ * the whole entitlement to null (cloud#238) rather than failing the usage read.
  */
 function parseResolvedCaps(raw: unknown): PlanCaps | null {
   if (raw === null) return null;
@@ -338,7 +340,8 @@ function parseResolvedCaps(raw: unknown): PlanCaps | null {
  * vault-worker ROLLBACK to a pre-entitlement build) do NOT throw — see
  * {@link VaultUsageReading.entitlement} (cloud#186 review D3): usage
  * recording must survive a rollback fleet-wide, even though reconciliation
- * can't run for that vault until the rollback is undone.
+ * can't run for that vault until the rollback is undone. A present-but-
+ * MALFORMED `caps` degrades the same way (cloud#238) rather than throwing.
  */
 export async function readVaultUsage(
   db: D1Database,
@@ -382,14 +385,32 @@ export async function readVaultUsage(
     typeof body.transcription_enabled === "boolean" &&
     typeof body.transcribe_minutes_limit === "number" &&
     Number.isFinite(body.transcribe_minutes_limit);
-  const entitlement: ResolvedVaultEntitlement | null = hasEntitlementFields
-    ? {
+  // A present-but-MALFORMED `caps` is a third case (cloud#238 item 3). It must
+  // not be believed — an unparseable caps could read as converged and hide a
+  // real entitlement problem — but it also must not throw out of here: doing
+  // so discarded a perfectly good byte split and wrote NO `vault_usage` row,
+  // contradicting this function's own never-dies-from-entitlement-problems
+  // contract. Degrade to the same `entitlement: null` a rollback produces, so
+  // the rollup records usage and skips reconciliation for this vault only.
+  let entitlement: ResolvedVaultEntitlement | null = null;
+  if (hasEntitlementFields) {
+    try {
+      entitlement = {
         caps: parseResolvedCaps(body.caps),
         frozen: body.frozen as boolean,
         transcriptionEnabled: body.transcription_enabled as boolean,
         transcribeMinutesLimit: body.transcribe_minutes_limit as number,
-      }
-    : null;
+      };
+    } catch (err) {
+      // Distinct from the rollback log the rollup emits: this vault DID answer
+      // with control-plane fields, they just weren't readable. Worth an
+      // operator's attention — it means a DO's stored caps are corrupt, which
+      // no amount of waiting self-heals.
+      console.warn(
+        `event=internal_config_caps_malformed vault=${vaultName} error=${JSON.stringify(err instanceof Error ? err.message : String(err))} caps=${JSON.stringify(body.caps).slice(0, 200)}`,
+      );
+    }
+  }
 
   return {
     dbBytes: body.db_bytes,
@@ -456,22 +477,15 @@ export async function pushVaultCap(
     lastStatus = undefined;
     lastError = undefined;
     try {
-      // TODO(cloud#238): this retry loop is unbounded in SUBREQUEST COUNT,
-      // which is a separate axis from wall-clock and is not fixed by a
-      // timeout. `callVaultApi` supports an AbortSignal (the account-mcp
-      // fan-out uses one) and threading a per-attempt timeout here would cap
-      // a genuinely HUNG vault — but a hang is not required to hit the
-      // ceiling. Every attempt is a subrequest whether it returns in 1ms or
-      // hangs: change a PLAN_SPECS byte and EVERY vault mismatches on the
-      // next rollup, so USAGE_CRON does up to 2 × USAGE_RUN_CAP (500) = 1000
-      // subrequests from fast, healthy responses alone — at the edge of
-      // Cloudflare's per-invocation ceiling with nothing wrong anywhere.
-      // Bounding that needs a reconcile-specific cap (a RECONCILE_RUN_CAP on
-      // repairs per run), not a deadline. cloud#238 tracks all four gaps
-      // together: the AbortSignal for hangs, RECONCILE_RUN_CAP for count, the
-      // TOCTOU post-push re-read, and parseResolvedCaps degrading instead of
-      // throwing. Left undone this pass deliberately — none of them can
-      // over-grant or freeze, so they are hardening, not correctness.
+      // TODO(cloud#238): still no per-attempt AbortSignal. `callVaultApi`
+      // supports one (the account-mcp fan-out uses it) and threading a
+      // deadline here would cap a genuinely HUNG vault. The SUBREQUEST-COUNT
+      // half of that item is now bounded on the reconcile path by
+      // `RECONCILE_RUN_CAP` (usage.ts) — a hang is a different axis and a
+      // deadline is the only thing that fixes it. Also still open on this
+      // seam: the TOCTOU post-push owner re-read, `Retry-After` on 429, and
+      // the fixed 100ms retry spacing. None can over-grant or freeze, so they
+      // remain hardening rather than correctness.
       const res = await callVaultApi(db, deps, {
         userId,
         vaultName,
@@ -542,6 +556,14 @@ export async function applyPlanToVaults(
 ): Promise<CapPushResult[]> {
   const user = await getUserById(db, userId);
   if (!user) return [];
+  // cloud#234 / A-3: never wake a tombstoned owner's vault DO. The Stripe
+  // webhook family still writes D1 (so an in-flight checkout is not lost);
+  // this seam is the one that talks to the DO. Undo (account-delete.ts)
+  // re-applies after the tombstone clears.
+  if (user.deletedAt !== null) {
+    console.log(`event=entitlement_push_skipped_tombstone user=${userId}`);
+    return [];
+  }
   // One entitlement for all the owner's vaults: the two-meter caps, the voice
   // entitlement, and frozen — a plan change flips them together. A TRIAL
   // mirrors the CHOSEN tier when pending_plan names one (plans.ts

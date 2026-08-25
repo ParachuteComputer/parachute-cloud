@@ -14,6 +14,25 @@
  * immediately (matching the checkout-completed contract: caps lift the
  * moment payment lands).
  *
+ * TOMBSTONE (cloud#234): A-1 gated auth / magic / drip / the three sweeps
+ * against `users.deleted_at`. The Stripe webhook family was the miss — an
+ * in-flight `checkout.session.completed` or a plan-changing
+ * `customer.subscription.updated` still called `applyPlanToVaults` and woke
+ * a tombstoned owner's vault DO. The gate is SELECTIVE, not categorical:
+ *
+ *   - D1 writes still happen. Dropping them would lose an in-flight paid
+ *     checkout (Stripe charged; the row never recorded the subscription)
+ *     and skip `pending_plan` bookkeeping from `deferBilling`'s own
+ *     `subscription.updated`. A restored account would then not have the
+ *     plan the issue says it should.
+ *   - `applyPlanToVaults` is skipped while `deleted_at` is set (and the
+ *     function itself refuses a tombstone — belt). Undo re-applies after
+ *     the tombstone clears (account-delete.ts). That is DROP of the DO
+ *     push, not DEFER of the event, and not DROP of the D1 write.
+ *   - `handleSubscriptionDeleted` stays ungated: it never talks to a DO
+ *     (it only schedules `pending_plan='expired'`). Gating it would leave
+ *     stale plan state on a row about to be purged.
+ *
  * Resolution by Stripe id (old contract, unchanged):
  *   - invoice.paid / invoice.payment_failed → look up by `customer` id.
  *   - customer.subscription.* → look up by the subscription id (set on the
@@ -279,6 +298,15 @@ export async function handleCheckoutSessionCompleted(
 
     // Caps + voice entitlement lift immediately (best-effort per vault; a miss
     // self-heals via the backfill script / the next plan event — vault-call.ts).
+    // cloud#234: a tombstoned owner still gets the D1 write above (the paid
+    // checkout must not vanish) but MUST NOT wake their vault DO. Undo
+    // re-applies after the tombstone clears.
+    if (user.deletedAt !== null) {
+      console.log(
+        `event=billing_cap_push_skipped_tombstone user=${user.id} plan=${boughtPlan} subscription=${subscriptionId ?? "-"}`,
+      );
+      return { ok: true, userId: user.id, action: "checkout_completed_recorded_tombstoned" };
+    }
     const results = await applyPlanToVaults(db, deps, user.id);
     const failed = results.filter((r) => !r.ok);
     if (failed.length > 0) {
@@ -455,6 +483,13 @@ export async function handleSubscriptionUpdated(
   if (newPlan !== user.plan) {
     await setUserPlan(db, user.id, newPlan);
     await db.prepare("UPDATE users SET pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?").bind(user.id).run();
+    // cloud#234: D1 records the plan change; the DO push waits for undo if
+    // the owner is tombstoned. `handleSubscriptionDeleted` is intentionally
+    // NOT gated this way — it never calls applyPlanToVaults.
+    if (user.deletedAt !== null) {
+      console.log(`event=billing_cap_push_skipped_tombstone user=${user.id} plan=${newPlan}`);
+      return { ok: true, userId: user.id, action: "subscription_updated_plan_recorded_tombstoned" };
+    }
     const results = await applyPlanToVaults(db, deps, user.id);
     console.log(`event=billing_plan_applied user=${user.id} plan=${newPlan} vaults=${results.length}`);
     return { ok: true, userId: user.id, action: "subscription_updated_plan_applied" };

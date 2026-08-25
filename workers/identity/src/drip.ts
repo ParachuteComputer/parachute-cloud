@@ -79,6 +79,13 @@ export const DRIP_REPLY_TO = "hello@parachute.computer";
 
 export interface DripDeps {
   now?: () => Date;
+  /**
+   * Test seam: override {@link DRIP_RUN_CAP}. Production omits this so the
+   * hourly cron always uses the exported constant. The per-run-cap test
+   * injects a small cap so it can pin "stops at N, remainder drains next
+   * run" without seeding DRIP_RUN_CAP+10 users (cloud#188, cloud#233).
+   */
+  runCap?: number;
 }
 
 // --- eligibility ---------------------------------------------------------------
@@ -317,7 +324,7 @@ export async function runDrip(env: Env, sender: EmailSender, deps: DripDeps = {}
   const now = deps.now?.() ?? new Date();
   const summary: DripRunSummary = { sent: { welcome: 0, "connect-nudge": 0, feedback: 0 }, failed: 0, capped: false };
   const frontDoor = frontDoorOrigin(depsForEnv(env));
-  let budget = DRIP_RUN_CAP;
+  let budget = deps.runCap ?? DRIP_RUN_CAP;
 
   for (const kind of DRIP_KINDS) {
     if (budget <= 0) break;

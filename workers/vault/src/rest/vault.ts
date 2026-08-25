@@ -83,13 +83,45 @@ export async function handleVault(
   // refuses it. Tracked, not silently accepted; do not "fix" only one side.
   if (req.method === "PATCH") {
     const body = await req.json() as {
-      description?: string;
+      // `unknown`, not `string` — this is parsed JSON off the wire, and the old
+      // `string` annotation read as a guarantee while guaranteeing nothing
+      // (cloud#87). Typing it honestly makes the runtime check below mandatory
+      // rather than optional.
+      description?: unknown;
       config?: { audio_retention?: string; auto_transcribe?: { enabled?: unknown } };
     };
     let dirty = false;
 
+    // cloud#87 — the RUNTIME type guard for the SAME field the MCP door guards
+    // (mcp.ts `overrideVaultInfo`). `body` is untyped JSON off the wire: the
+    // `description?: string` annotation on the cast above is a compile-time
+    // claim, not a check, so a write-scoped caller could persist a non-string
+    // here — and the damage landed on the OTHER door, three steps downstream:
+    // `serverInstruction()` does `description?.trim()`, so the next MCP
+    // `initialize` answered -32603 INTERNAL_ERROR and the vault could not be
+    // connected to until repaired. Cheap here, unrecoverable-looking there.
+    //
+    // Same 400 body shape as the sibling `audio_retention` / `auto_transcribe`
+    // validators below (error / error_type / field / got / message / hint) — a
+    // reused local shape, not a new error family. `null` stays legal: it CLEARS
+    // the description (`VaultConfigLike.description` is optional, and the DO's
+    // persist callback maps absent → null).
     if (body.description !== undefined) {
-      vaultConfig.description = body.description;
+      const d = body.description as unknown;
+      if (d !== null && typeof d !== "string") {
+        return json(
+          {
+            error: "invalid_description",
+            error_type: "invalid_description",
+            field: "description",
+            got: d,
+            message: "description must be a string, or null to clear it",
+            hint: "pass a string, or null to clear the description",
+          },
+          400,
+        );
+      }
+      vaultConfig.description = d ?? undefined;
       dirty = true;
     }
 

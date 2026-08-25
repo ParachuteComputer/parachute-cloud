@@ -7,6 +7,9 @@
  *
  *   identity discovery → DCR → login → consent → token (real RS256 JWT)
  *   → vault REST create/read/update → MCP initialize/tools.list/tools.call
+ *   → the canonical ROOT /mcp (vault-agnostic, token-derived DO dispatch —
+ *     root PRM + 401 challenge + equivalence with the per-vault door +
+ *     confinement, section 6b)
  *   → SSE snapshot → portable-md export tarball (unpacked + checked)
  *   → console signup/vault-claim/ownership refusal → seed packs (default
  *     4-note seed, POST /api/packs, the console Surface-Starter button)
@@ -41,7 +44,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { totpCodeAt } from "../workers/identity/src/totp.ts";
-import { isUnverifiable, summarize } from "./smoke-report.ts";
+import { isUnverifiable, resolveMinAssertions, STAGING_MIN_ASSERTIONS, summarize } from "./smoke-report.ts";
 // core resolves from the sibling parachute-vault checkout, copied into the vault
 // worker's node_modules by `bun install` (the same explicit path test-bun uses).
 import { GETTING_STARTED_PACK, welcomePack } from "../workers/vault/node_modules/@openparachute/core/src/seed-packs.js";
@@ -52,6 +55,11 @@ const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.openpara
 const VAULT_NAME = process.env.VAULT_NAME ?? "demo";
 const REDIRECT_URI = "http://localhost:8976/callback";
 const MARKER = `smoke-${Date.now()}`;
+// The executed-assertion floor (cloud#219): a run that reached almost none of
+// its assertions must never read PASSED. Resolved HERE, at module load, so a
+// malformed SMOKE_MIN_ASSERTIONS fails immediately rather than after a
+// multi-minute live run. See scripts/smoke-report.ts for the derivation.
+const MIN_ASSERTIONS = resolveMinAssertions(STAGING_MIN_ASSERTIONS, process.env.SMOKE_MIN_ASSERTIONS);
 
 // --- tiny test harness -----------------------------------------------------
 // fail() is FATAL — it gates the deploy (exit 1). advisory() is LOUD but does
@@ -329,6 +337,171 @@ async function main() {
     "MCP tools/call vault-info → real projection (name + tags + stats, no placeholder)",
     info ? `name=${info.name} tags=${info.tags?.length} notes=${info.stats?.totalNotes}` : infoText.slice(0, 80).replace(/\n/g, " "),
   );
+
+  // 6b. CANONICAL ROOT /mcp — token-derived vault dispatch (U1, cloud#192).
+  //
+  // The vault worker serves a vault-AGNOSTIC `/mcp` at the ORIGIN ROOT: the URL
+  // names no vault, so the target is derived from the TOKEN and re-dispatched to
+  // that vault's DO (which re-runs its strict `aud=vault.<name>` check, so a bad
+  // derivation fails INSIDE the DO rather than bypassing it). #192 landed it with
+  // a full workerd matrix (workers/vault/test/root-mcp.test.ts) but NO live step —
+  // and "vitest-workerd ≠ real-workerd" is exactly why this file exists. This is
+  // the live probe of the new door (cloud#193).
+  //
+  // REACHABILITY on staging: the root branch fires only when `resolveVault()`
+  // returns null, i.e. the request names no vault by URL. Staging's
+  // VAULT_BASE_DOMAIN is the workers.dev host ITSELF
+  // (`parachute-vault-do-staging.openparachute.workers.dev`), and the subdomain
+  // test is `host.endsWith("." + base)` — the base host is not a subdomain OF
+  // itself, so `${VAULT}/mcp` resolves no vault and lands on the root branch,
+  // exactly as `u.parachute.computer/mcp` does in production. (If VAULT is ever
+  // overridden to a per-vault `<name>.<base>` origin, these steps would be
+  // probing the per-vault endpoint instead — the serverInfo assertions below
+  // would still hold, but the PRM/challenge ones would fail loudly rather than
+  // silently pass, which is the right failure.)
+  {
+    // (1) The root PRM — RFC 9728 §3.1 path-insertion location for the ROOT
+    // resource. Vault-agnostic, so it differs from the per-vault PRM in exactly
+    // two ways: `resource` is the origin-root `/mcp`, and `scopes_supported`
+    // advertises the UN-NARROWED `vault:read`/`vault:write` (no vault name to
+    // narrow to — the issuer's consent picker narrows them at authorize time).
+    const rootPrmRes = await fetch(`${VAULT}/.well-known/oauth-protected-resource/mcp`);
+    const rootPrm = (await rootPrmRes.json()) as {
+      resource?: string;
+      authorization_servers?: string[];
+      scopes_supported?: string[];
+      bearer_methods_supported?: string[];
+    };
+    assert(
+      rootPrmRes.status === 200 &&
+        rootPrm.resource === `${VAULT}/mcp` &&
+        JSON.stringify(rootPrm.authorization_servers) === JSON.stringify([IDENTITY]) &&
+        JSON.stringify(rootPrm.bearer_methods_supported) === JSON.stringify(["header"]),
+      "root-mcp: PRM names the ORIGIN-ROOT resource + the identity issuer",
+      `resource=${rootPrm.resource} as=${JSON.stringify(rootPrm.authorization_servers)} status ${rootPrmRes.status}`,
+    );
+    // UNNAMED scopes — the load-bearing divergence from the per-vault PRM. A
+    // `vault:<name>:<verb>` leaking in here would mean the root door had been
+    // wired to a specific vault.
+    assert(
+      JSON.stringify(rootPrm.scopes_supported) === JSON.stringify(["vault:read", "vault:write"]),
+      "root-mcp: PRM advertises the UN-NARROWED vault:read/vault:write (no vault name)",
+      JSON.stringify(rootPrm.scopes_supported),
+    );
+
+    // (2) Unauthenticated POST /mcp → 401 whose challenge names the ROOT PRM
+    // (never a per-vault one — the root resource is vault-agnostic, and pointing
+    // a bare 401 at some vault's PRM would both leak a name and mis-route the
+    // client's consent).
+    const anonRes = await fetch(`${VAULT}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "smoke", version: "0" } } }),
+    });
+    const rootChallenge = anonRes.headers.get("www-authenticate") ?? "";
+    const rootChallengeUrl = /resource_metadata="([^"]+)"/.exec(rootChallenge)?.[1] ?? "";
+    assert(
+      anonRes.status === 401 &&
+        rootChallenge.startsWith("Bearer resource_metadata=") &&
+        !!rootChallengeUrl &&
+        new URL(rootChallengeUrl).pathname === "/.well-known/oauth-protected-resource/mcp",
+      "root-mcp: unauthenticated POST /mcp → 401 + WWW-Authenticate naming the ROOT PRM",
+      `status ${anonRes.status} challenge=${rootChallenge || "(absent)"}`,
+    );
+    // The pointer has to RESOLVE — a challenge naming a 404 is a broken
+    // discovery chain, which is what a spec-following client actually walks.
+    const followRes = await fetch(rootChallengeUrl || `${VAULT}/.well-known/oauth-protected-resource/mcp`);
+    const followed = (await followRes.json()) as { resource?: string };
+    assert(
+      followRes.status === 200 && followed.resource === `${VAULT}/mcp`,
+      "root-mcp: the 401 challenge pointer resolves to the root PRM (discovery chain intact)",
+      `status ${followRes.status} resource=${followed.resource}`,
+    );
+
+    // (3) EQUIVALENCE — the single-vault token minted at step 4 (aud=vault.<name>,
+    // scopes vault:<name>:read+write) drives the root endpoint to the SAME DO the
+    // URL-addressed twin reaches. Both frames must be byte-identical: same
+    // serverInfo, same tool list. This is the property the workerd suite pins;
+    // here it runs against real workerd + a real issuer-minted RS256 token.
+    async function rootMcp(body: unknown, search = ""): Promise<{ status: number; text: string; json: any }> {
+      const r = await fetch(`${VAULT}/mcp${search}`, { method: "POST", headers: MCP_HEADERS, body: JSON.stringify(body) });
+      const text = await r.text();
+      let parsed: any = null;
+      try { parsed = JSON.parse(text); } catch { /* leave null → the assert fails with the raw text */ }
+      return { status: r.status, text, json: parsed };
+    }
+    /** Re-stringify a parsed frame so key order comes from one code path, not the wire. */
+    const canon = (v: unknown) => JSON.stringify(v);
+
+    const ROOT_INIT = { jsonrpc: "2.0", id: 101, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "smoke", version: "0" } } };
+    const ROOT_LIST = { jsonrpc: "2.0", id: 102, method: "tools/list", params: {} };
+
+    const rootInit = await rootMcp(ROOT_INIT);
+    assert(
+      rootInit.status === 200 && rootInit.json?.result?.serverInfo?.name === `parachute-vault/${VAULT_NAME}`,
+      "root-mcp: initialize at the ROOT derives our vault from the token (URL names none)",
+      `status ${rootInit.status} serverInfo=${rootInit.json?.result?.serverInfo?.name ?? rootInit.text.slice(0, 80)}`,
+    );
+    const perVaultInit = await mcp(ROOT_INIT);
+    assert(
+      rootInit.status === perVaultInit.status && canon(rootInit.json) === canon(perVaultInit.json),
+      "root-mcp: initialize at / ≡ /vault/<name>/mcp (byte-identical frame)",
+      `root ${rootInit.status} vs per-vault ${perVaultInit.status}`,
+    );
+
+    const rootList = await rootMcp(ROOT_LIST);
+    const perVaultList = await mcp(ROOT_LIST);
+    const rootToolNames: string[] = (rootList.json?.result?.tools ?? []).map((t: { name: string }) => t.name);
+    assert(
+      rootList.status === 200 && rootToolNames.includes("create-note") && rootToolNames.includes("query-notes"),
+      "root-mcp: tools/list at the ROOT → the core tools",
+      `${rootToolNames.length} tools`,
+    );
+    assert(
+      rootList.status === perVaultList.status && canon(rootList.json) === canon(perVaultList.json),
+      "root-mcp: tools/list at / ≡ /vault/<name>/mcp (byte-identical frame)",
+      `root ${rootList.status} vs per-vault ${perVaultList.status}`,
+    );
+
+    // (4) CONFINEMENT — the token names the vault, so the token is also the
+    // CEILING. Three probes, mirroring the workerd matrix's confinement block.
+    //
+    // 4a. The DO actually reached is ours: vault-info's projection is read out of
+    //     that DO's own SQLite, so a wrong dispatch would name a different vault.
+    const rootInfo = await rootMcp({ jsonrpc: "2.0", id: 103, method: "tools/call", params: { name: "vault-info", arguments: {} } });
+    let rootInfoJson: any = null;
+    try { rootInfoJson = JSON.parse(rootInfo.json?.result?.content?.[0]?.text ?? ""); } catch { /* leave null → assert fails */ }
+    assert(
+      rootInfo.status === 200 && !rootInfo.json?.result?.isError && rootInfoJson?.name === VAULT_NAME,
+      "root-mcp: confinement — the DO reached at the root IS our own vault (vault-info projection)",
+      `name=${rootInfoJson?.name ?? rootInfo.text.slice(0, 80)}`,
+    );
+
+    // 4b. The URL cannot STEER the dispatch. The root branch matches on pathname
+    //     alone and the credential extractor only ever reads `?key=`, so a
+    //     `?vault=` hint is inert — assert that rather than assume it.
+    const steer = await rootMcp(ROOT_INIT, `?vault=${encodeURIComponent(`${VAULT_NAME}-not-mine`)}`);
+    assert(
+      steer.status === 200 && steer.json?.result?.serverInfo?.name === `parachute-vault/${VAULT_NAME}`,
+      "root-mcp: confinement — a ?vault= hint on the root URL cannot steer the dispatch",
+      `serverInfo=${steer.json?.result?.serverInfo?.name ?? steer.text.slice(0, 80)}`,
+    );
+
+    // 4c. ...and the token cannot reach ANOTHER vault by URL either: the same
+    //     token at a foreign `/vault/<other>/mcp` hits that vault's DO, whose
+    //     strict `aud=vault.<other>` check refuses it — with the PER-VAULT
+    //     challenge, not the root one (the URL is the vault identity there). A
+    //     fixed probe name keeps the staging debris to one DO across runs.
+    const foreignVault = "root-mcp-not-my-vault";
+    const foreignRes = await fetch(`${VAULT}/vault/${foreignVault}/mcp`, { method: "POST", headers: MCP_HEADERS, body: JSON.stringify(ROOT_INIT) });
+    const foreignChallenge = foreignRes.headers.get("www-authenticate") ?? "";
+    assert(
+      foreignRes.status === 401 &&
+        foreignChallenge.includes(`/.well-known/oauth-protected-resource/vault/${foreignVault}/mcp`),
+      "root-mcp: confinement — our token at ANOTHER vault's URL → 401 + that vault's PRM challenge",
+      `status ${foreignRes.status} challenge=${foreignChallenge || "(absent)"}`,
+    );
+  }
 
   // 7. SSE — subscribe, snapshot arrives.
   {
@@ -1283,9 +1456,12 @@ async function main() {
         })
       ).text();
       assert(
-        // The arrival user is on the no-card trial (mirrors Plus): the card cap
-        // renders "of 8.5 GiB" (500 MB notes + 8 GiB attachments, summed).
-        conHtml.includes('data-testid="vault-usage"') && /Using \d+(\.\d+)? MB of 8\.5 GiB/.test(conHtml),
+        // The arrival user is on the no-card trial (mirrors Plus): per-meter
+        // copy since cloud#107 — per-vault numerators, pooled denominators
+        // named explicitly (notes 500 MB pool, attachments 8 GiB pool).
+        conHtml.includes('data-testid="vault-usage"') &&
+          /This vault: notes \d+(\.\d+)? [KM]B of 500 MB/.test(conHtml) &&
+          conHtml.includes("pooled across your vaults"),
         "usage: the vault card shows 'Using X of Y' from the rollup row",
         arrivalVault,
       );
@@ -1493,12 +1669,30 @@ async function main() {
   //     vault); each fetch keeps an explicit, generous timeout so a
   //     slow-but-healthy round trip has room to finish, and a genuinely stuck
   //     one is recorded ADVISORY (couldn't verify) via liveCatch, not fatal.
+  //
+  //     cloud#221 — the ROOT design finding of the nine-day staging outage,
+  //     and the reason this section is now TWO blocks. The sweep and the seven
+  //     restore-round-trip assertions used to share ONE try, with the sweep
+  //     FIRST. When #218's RESTORE_ROUNDTRIP_TIMEOUT_MS landed on an
+  //     already-slow O(fleet) sweep, the abort fired at the section's first
+  //     awaited call and every assertion behind it was skipped — seven checks
+  //     that were green on 2026-07-17 silently stopped executing, and the gate
+  //     printed the same single line either way. #218 made the sweep O(1) so it
+  //     *shouldn't* time out; that is a fix that relies on the sweep never
+  //     throwing. This closes the BLINDING MECHANISM instead: the sweep gets
+  //     its own advisory-eligible block, the restore contract gets another, and
+  //     a sweep hiccup (R2 hiccup, cold DO, future growth) can no longer take
+  //     the restore contract dark. Same shape as §14 (usage): the dependency is
+  //     carried by an explicit flag, and when the setup is unverified the
+  //     dependent checks are SKIPPED with a NAMED advisory rather than failing
+  //     fatally for a non-bug reason — visible either way, never silent.
   const RESTORE_ROUNDTRIP_TIMEOUT_MS = 120_000;
+  // --- 17a. The sweep: SETUP, and its own advisory-eligible block -----------
+  // One sweep tick via the staging-only trigger, SCOPED to this run's fresh
+  // vault (?vault=) so it stays O(1). That vault's snapshot (paid retention)
+  // is taken now → sweep.taken === 1.
+  let snapshotTaken = false;
   try {
-    const arrivalCsrf = /parachute_id_csrf=([^;]+)/.exec(arrivalCookie)?.[1] ?? "";
-    // One sweep tick via the staging-only trigger, SCOPED to this run's fresh
-    // vault (?vault=) so it stays O(1). That vault's snapshot (paid retention)
-    // is taken now → sweep.taken === 1.
     const runSweep = async (): Promise<{ day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean } | null> => {
       const r = await fetch(`${IDENTITY}/__test/snapshot-run?vault=${encodeURIComponent(arrivalVault)}`, { method: "POST", signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) });
       return r.status === 200 ? ((await r.json()) as { day: string; vaults: number; taken: number; skipped: number; failed: number; capped: boolean }) : null;
@@ -1511,67 +1705,86 @@ async function main() {
         "snapshots: the sweep took at least this run's fresh-vault snapshot",
         `day=${sweep.day} vaults=${sweep.vaults} taken=${sweep.taken} skipped=${sweep.skipped} failed=${sweep.failed}`,
       );
-    }
-
-    // TRIAL (restore-enabled): History lists the restore point (mirrored by the
-    // sweep) — no comp needed, the trial already has the paid restore contract.
-    const histHtml = await (
-      await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie }, signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) })
-    ).text();
-    const keyMatch = new RegExp(`name="key" value="(vault-${arrivalVault}/snapshots/[^"]+\\.tar)"`).exec(histHtml);
-    assert(
-      histHtml.includes('data-testid="restore-point"') && !!keyMatch && histHtml.includes("Restore to a new vault"),
-      "snapshots: TRIAL console History lists the restore point with a restore door",
-      keyMatch?.[1] ?? "no key found",
-    );
-
-    // Restore to a new vault → 302 with the restored target.
-    let restoredName = "";
-    if (keyMatch) {
-      const restoreRes = await fetch(`${IDENTITY}/console/vaults/restore`, {
-        method: "POST",
-        headers: { ...FORM, origin: IDENTITY, cookie: arrivalCookie },
-        redirect: "manual",
-        body: form({ __csrf: arrivalCsrf, vault: arrivalVault, key: keyMatch[1]! }),
-        signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS),
-      });
-      const loc = restoreRes.headers.get("location") ?? "";
-      restoredName = decodeURIComponent(/restored=([^&]+)/.exec(loc)?.[1] ?? "");
-      assert(
-        restoreRes.status === 302 && restoredName.startsWith(`${arrivalVault}-restored-`),
-        "snapshots: restore POST creates the new vault and redirects",
-        `status ${restoreRes.status} → ${loc}`,
-      );
-      const noticeHtml = await (
-        await fetch(`${IDENTITY}${loc}`, { headers: { cookie: arrivalCookie }, signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) })
-      ).text();
-      assert(
-        noticeHtml.includes("Snapshot restored into") && noticeHtml.includes("attachment files"),
-        "snapshots: the success notice renders with the attachments caveat",
-      );
-    }
-
-    // Live round-trip: the restored vault serves the SAME notes — this run's
-    // marker note included, welcome seed intact, nothing extra.
-    if (restoredName) {
-      const owner = await authorizeFor(arrivalEmail, arrivalPassword, restoredName);
-      assert(!!owner.token, "snapshots: owner mints a token for the RESTORED vault", owner.error ? `error=${owner.error}` : "ok");
-      if (owner.token) {
-        const notesRes = await fetch(`${VAULT}/vault/${restoredName}/api/notes?include_content=true`, {
-          headers: { authorization: `Bearer ${owner.token}` },
-          signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS),
-        });
-        const notes = (await notesRes.json()) as Array<{ path?: string; content?: string }>;
-        const mine = notes.find((n) => n.path === "My first note");
-        assert(
-          notesRes.status === 200 && notes.length === 7 && !!mine && (mine.content ?? "").includes(MARKER),
-          "snapshots: restored vault round-trips — 7 notes (6 seed + the marker note), verbatim",
-          `${notes.length} notes: ${notes.map((n) => n.path).join(", ")}`,
-        );
-      }
+      // The snapshot is written to R2 before the summary returns, so the
+      // restore block below can find its restore point.
+      snapshotTaken = sweep.taken >= 1 && !sweep.capped;
     }
   } catch (err) {
-    liveCatch("snapshots: live restore round-trip", err);
+    liveCatch("snapshots: fleet sweep trigger", err);
+  }
+
+  // --- 17b. The RESTORE CONTRACT: a separate concern, a separate block ------
+  // These seven assertions are the actual product contract (History lists the
+  // restore point → restore POST → the restored vault round-trips its notes).
+  // They no longer share a try with the sweep, so a sweep abort cannot skip
+  // them. They DO need a snapshot to exist, so an unverified sweep skips them
+  // with a named advisory (§14's shape) instead of failing them for a non-bug
+  // reason. When the sweep DID take a snapshot, every assert here stays FATAL.
+  if (snapshotTaken) {
+    try {
+      const arrivalCsrf = /parachute_id_csrf=([^;]+)/.exec(arrivalCookie)?.[1] ?? "";
+      // TRIAL (restore-enabled): History lists the restore point (mirrored by the
+      // sweep) — no comp needed, the trial already has the paid restore contract.
+      const histHtml = await (
+        await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie }, signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) })
+      ).text();
+      const keyMatch = new RegExp(`name="key" value="(vault-${arrivalVault}/snapshots/[^"]+\\.tar)"`).exec(histHtml);
+      assert(
+        histHtml.includes('data-testid="restore-point"') && !!keyMatch && histHtml.includes("Restore to a new vault"),
+        "snapshots: TRIAL console History lists the restore point with a restore door",
+        keyMatch?.[1] ?? "no key found",
+      );
+
+      // Restore to a new vault → 302 with the restored target.
+      let restoredName = "";
+      if (keyMatch) {
+        const restoreRes = await fetch(`${IDENTITY}/console/vaults/restore`, {
+          method: "POST",
+          headers: { ...FORM, origin: IDENTITY, cookie: arrivalCookie },
+          redirect: "manual",
+          body: form({ __csrf: arrivalCsrf, vault: arrivalVault, key: keyMatch[1]! }),
+          signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS),
+        });
+        const loc = restoreRes.headers.get("location") ?? "";
+        restoredName = decodeURIComponent(/restored=([^&]+)/.exec(loc)?.[1] ?? "");
+        assert(
+          restoreRes.status === 302 && restoredName.startsWith(`${arrivalVault}-restored-`),
+          "snapshots: restore POST creates the new vault and redirects",
+          `status ${restoreRes.status} → ${loc}`,
+        );
+        const noticeHtml = await (
+          await fetch(`${IDENTITY}${loc}`, { headers: { cookie: arrivalCookie }, signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS) })
+        ).text();
+        assert(
+          noticeHtml.includes("Snapshot restored into") && noticeHtml.includes("attachment files"),
+          "snapshots: the success notice renders with the attachments caveat",
+        );
+      }
+
+      // Live round-trip: the restored vault serves the SAME notes — this run's
+      // marker note included, welcome seed intact, nothing extra.
+      if (restoredName) {
+        const owner = await authorizeFor(arrivalEmail, arrivalPassword, restoredName);
+        assert(!!owner.token, "snapshots: owner mints a token for the RESTORED vault", owner.error ? `error=${owner.error}` : "ok");
+        if (owner.token) {
+          const notesRes = await fetch(`${VAULT}/vault/${restoredName}/api/notes?include_content=true`, {
+            headers: { authorization: `Bearer ${owner.token}` },
+            signal: AbortSignal.timeout(RESTORE_ROUNDTRIP_TIMEOUT_MS),
+          });
+          const notes = (await notesRes.json()) as Array<{ path?: string; content?: string }>;
+          const mine = notes.find((n) => n.path === "My first note");
+          assert(
+            notesRes.status === 200 && notes.length === 7 && !!mine && (mine.content ?? "").includes(MARKER),
+            "snapshots: restored vault round-trips — 7 notes (6 seed + the marker note), verbatim",
+            `${notes.length} notes: ${notes.map((n) => n.path).join(", ")}`,
+          );
+        }
+      }
+    } catch (err) {
+      liveCatch("snapshots: live restore round-trip", err);
+    }
+  } else {
+    advisory("snapshots: restore round-trip SKIPPED — the fleet sweep above took no verified snapshot (see its advisory/failure)");
   }
 
   // 18. Voice transcription (cloud#56) — comp the arrival user to the PLUS
@@ -2543,11 +2756,14 @@ async function main() {
 
   // --- summary ---
   // The verdict is decided in scripts/smoke-report.ts: fatals gate (exit 1),
-  // advisories are loud but never gate and can never hide a fatal.
+  // advisories are loud but never gate and can never hide a fatal, and a run
+  // that executed fewer than MIN_ASSERTIONS assertions gates as a broken
+  // harness rather than reading green (cloud#219).
   const passCount = results.filter((r) => r.startsWith("  PASS")).length;
-  const { exitCode, headline } = summarize({ pass: passCount, fail: failures, advisory: advisories });
+  const { exitCode, headline, floorMessage } = summarize({ pass: passCount, fail: failures, advisory: advisories }, "SMOKE", MIN_ASSERTIONS);
   console.log(`\n${"=".repeat(60)}\n${headline}\n${"=".repeat(60)}`);
   console.log(results.join("\n"));
+  if (floorMessage) console.error(`\n\x1b[31m${floorMessage}\x1b[0m`);
   if (advisories > 0) {
     // Re-surface the advisories on their own line so an "we couldn't verify
     // this" is never buried under ~160 PASS lines and read as a clean green.

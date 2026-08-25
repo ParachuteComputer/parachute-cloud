@@ -446,9 +446,11 @@ export function insufficientScope(requiredVerb: VaultVerb, vaultName: string, gr
  * Both failure reasons collapse to the SAME 401 + root-PRM challenge at the edge
  * router — the distinction is for logging/tests, never leaked to the client.
  * `no_bearer` = no credential presented; `not_derivable` = a credential that
- * names no single vault (non-JWT operator/legacy bearer, invalid / expired /
- * revoked JWT, or a JWT whose scope / `aud` / `vault_scope` sources name zero or
- * conflicting vaults). Mirrors parachute-vault/src/auth.ts's `VaultDerivation`.
+ * names no single vault (non-JWT operator/legacy bearer, malformed JWT, or a JWT
+ * whose scope / `aud` / `vault_scope` sources name zero or conflicting vaults).
+ * Signature/issuer/expiry/revocation are authorization facts and are enforced by
+ * the destination DO after routing. Mirrors parachute-vault/src/auth.ts's
+ * `VaultDerivation`.
  */
 export type VaultDerivation = { vaultName: string } | { error: "no_bearer" | "not_derivable" };
 
@@ -460,12 +462,16 @@ export type VaultDerivation = { vaultName: string } | { error: "no_bearer" | "no
  * bypassing it (derive-then-redispatch, defense in depth). This function only
  * reads the claims well enough to name the vault; it is never the gate.
  *
- * The JWT is validated with the SAME scope-guard trust kernel the DO's own auth
- * uses (signature, `iss` pin, `jti` + revocation, expiry) but WITHOUT
- * `expectedAudience` — at the root we don't yet know which audience to expect;
- * that pin is re-applied by the re-dispatch. Non-JWT credentials (the operator
- * `VAULT_AUTH_TOKEN`) name no vault → `not_derivable`; they keep working at the
- * URL-addressed `/vault/<name>/*` surface.
+ * This routing step deliberately decodes without authenticating. The destination
+ * DO is the authorization boundary and runs the complete trust kernel there:
+ * signature, issuer, exact `aud=vault.<name>`, expiry, jti/revocation, and scope.
+ * A forged token can therefore select and wake a DO but cannot enter it. That is
+ * not a new resource primitive: the public URL-addressed
+ * `/vault/<arbitrary-name>/mcp` route already lets an unauthenticated caller wake
+ * the same DO and receive the same 401. Keeping validation in one place also
+ * avoids a second edge-router trust-kernel invocation diverging from the DO.
+ * Non-JWT credentials (the operator `VAULT_AUTH_TOKEN`) name no vault →
+ * `not_derivable`; they keep working at the URL-addressed surface.
  *
  * Three independent sources can name a vault: a narrowed `vault:<name>:<verb>`
  * scope, an `aud` of the form `vault.<name>`, and a single-element `vault_scope`
@@ -475,24 +481,33 @@ export type VaultDerivation = { vaultName: string } | { error: "no_bearer" | "no
  * We never pick a winner from a precedence order. Mirrors
  * parachute-vault/src/auth.ts's `deriveVaultFromToken`.
  */
-export async function deriveVaultFromToken(req: Request, env: Env): Promise<VaultDerivation> {
+export async function deriveVaultFromToken(req: Request, _env: Env): Promise<VaultDerivation> {
   const key = extractApiKey(req);
   if (!key) return { error: "no_bearer" };
   if (!looksLikeJwt(key)) return { error: "not_derivable" };
-  let claims: HubJwtClaims;
+  let raw: ReturnType<typeof decodeJwt>;
   try {
-    // No `expectedAudience`: the DO's trust kernel minus the aud pin (which the
-    // re-dispatch re-applies). A bad signature / iss / expiry / revoked jti
-    // throws here → not_derivable → the standard 401 root challenge.
-    claims = await getGuard(env).validateHubJwt(key, {});
+    raw = decodeJwt(key);
   } catch {
     return { error: "not_derivable" };
   }
   const named = new Set<string>();
-  for (const name of narrowedVaultNames(claims.scopes)) named.add(name);
-  const audMatch = claims.aud?.match(/^vault\.(.+)$/);
-  if (audMatch) named.add(audMatch[1]!);
-  if (claims.vaultScope.length === 1) named.add(claims.vaultScope[0]!);
+  const scopeRaw = typeof raw.scope === "string" ? raw.scope.trim().split(/\s+/).filter(Boolean) : [];
+  for (const name of narrowedVaultNames(scopeRaw)) named.add(name);
+  const auds =
+    typeof raw.aud === "string"
+      ? [raw.aud]
+      : Array.isArray(raw.aud)
+        ? raw.aud.filter((aud): aud is string => typeof aud === "string")
+        : [];
+  for (const aud of auds) {
+    const match = aud.match(/^vault\.(.+)$/);
+    if (match) named.add(match[1]!);
+  }
+  const vaultScope = Array.isArray(raw.vault_scope)
+    ? raw.vault_scope.filter((name): name is string => typeof name === "string")
+    : [];
+  if (vaultScope.length === 1) named.add(vaultScope[0]!);
   if (named.size !== 1) return { error: "not_derivable" };
   return { vaultName: [...named][0]! };
 }

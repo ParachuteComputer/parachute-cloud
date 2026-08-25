@@ -70,9 +70,9 @@ async function frame(res: Response): Promise<unknown> {
 // deriveVaultFromToken — the derivation precedence, unit-tested directly (the
 // allowed-issuers.test.ts pattern: a hand-built env + locally-signed tokens, so
 // a case can craft a token whose sources name no vault, or disagree — shapes
-// mintToken's `aud=vault.<name>` coupling can't produce alone). This READS a
-// validated token's claims to name the vault; it never authorizes (the router
-// re-dispatches through the full per-vault DO). Mirrors the bun twin's
+// mintToken's `aud=vault.<name>` coupling can't produce alone). This READS the
+// untrusted routing claims only; it never authorizes (the router re-dispatches
+// through the full per-vault DO, which runs the trust kernel). Mirrors the bun twin's
 // auth-hub-jwt.test.ts `deriveVaultFromToken` block.
 // ---------------------------------------------------------------------------
 describe("deriveVaultFromToken — root /mcp vault derivation (U1)", () => {
@@ -106,6 +106,11 @@ describe("deriveVaultFromToken — root /mcp vault derivation (U1)", () => {
 
   it("all three sources agree → that vault", async () => {
     const t = await sign({ aud: "vault.journal", scope: "vault:journal:write", vaultScope: ["journal"] });
+    expect(await deriveVaultFromToken(bearer(t), env)).toEqual({ vaultName: "journal" });
+  });
+
+  it("cloud OAuth shape (vault aud + narrowed scope + empty vault_scope) → that vault", async () => {
+    const t = await sign({ aud: "vault.journal", scope: "vault:journal:read vault:journal:write", vaultScope: [] });
     expect(await deriveVaultFromToken(bearer(t), env)).toEqual({ vaultName: "journal" });
   });
 
@@ -154,14 +159,14 @@ describe("deriveVaultFromToken — root /mcp vault derivation (U1)", () => {
     expect(await deriveVaultFromToken(bearer("opaque-operator-secret"), env)).toEqual({ error: "not_derivable" });
   });
 
-  it("expired JWT → not_derivable (validated with the full trust kernel)", async () => {
+  it("expired JWT still derives a route (the destination DO rejects it)", async () => {
     const t = await sign({ aud: "vault.journal", scope: "vault:journal:write", expSecondsFromNow: -10 });
-    expect(await deriveVaultFromToken(bearer(t), env)).toEqual({ error: "not_derivable" });
+    expect(await deriveVaultFromToken(bearer(t), env)).toEqual({ vaultName: "journal" });
   });
 
-  it("foreign-issuer JWT → not_derivable (iss pin runs in derivation too)", async () => {
+  it("foreign-issuer JWT still derives a route (the destination DO rejects it)", async () => {
     const t = await sign({ aud: "vault.journal", scope: "vault:journal:write", iss: "https://evil.example" });
-    expect(await deriveVaultFromToken(bearer(t), env)).toEqual({ error: "not_derivable" });
+    expect(await deriveVaultFromToken(bearer(t), env)).toEqual({ vaultName: "journal" });
   });
 });
 
@@ -315,7 +320,7 @@ describe("root /mcp — confinement + no-oracle (U1)", () => {
     expect(res.headers.get("WWW-Authenticate")).toContain("/.well-known/oauth-protected-resource/mcp");
   }
 
-  async function signRaw(opts: { scope?: string; aud?: string; vaultScope?: string[]; iss?: string }): Promise<string> {
+  async function signRaw(opts: { scope?: string; aud?: string; vaultScope?: string[]; iss?: string; expSecondsFromNow?: number }): Promise<string> {
     const key = await importJWK(TEST_PRIVATE_JWK as any, "RS256");
     return new SignJWT({
       ...(opts.scope !== undefined ? { scope: opts.scope } : {}),
@@ -327,7 +332,7 @@ describe("root /mcp — confinement + no-oracle (U1)", () => {
       .setSubject("u1-test-user")
       .setJti(`jti-${Math.random().toString(36).slice(2)}`)
       .setIssuedAt()
-      .setExpirationTime("15m")
+      .setExpirationTime(opts.expSecondsFromNow === undefined ? "15m" : Math.floor(Date.now() / 1000) + opts.expSecondsFromNow)
       .sign(key);
   }
 
@@ -349,6 +354,10 @@ describe("root /mcp — confinement + no-oracle (U1)", () => {
 
   it("a foreign-issuer JWT → 401 (no vault leaked)", async () => {
     await expectRoot401(await signRaw({ aud: "vault.alpha", scope: "vault:alpha:admin", iss: "https://evil.example" }));
+  });
+
+  it("an expired JWT → 401 at the destination DO", async () => {
+    await expectRoot401(await signRaw({ aud: "vault.alpha", scope: "vault:alpha:admin", expSecondsFromNow: -10 }));
   });
 
   it("an invalid / unverifiable garbage token → 401 + root challenge", async () => {

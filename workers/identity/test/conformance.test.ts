@@ -1557,6 +1557,37 @@ describe("consent verb selector — owner-elected vault:admin (port hub#689)", (
     expect(html).not.toContain('value="admin" checked');
   });
 
+  /**
+   * cloud#201 (cosmetic) — #200 shipped a `verbopt-admin` class with no CSS rule
+   * behind it. Rather than just deleting the dead hook, pin the property: every
+   * class the selector renders must exist in the shipped stylesheet, so the next
+   * styling hook either gets a rule or does not get added.
+   */
+  test("every class rendered in the verb selector has a CSS rule (no dead hooks)", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("myvault", userId);
+    const { clientId } = await seedApprovedClient();
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const query = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:read vault:write",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    };
+    const html = await (await handleAuthorizeGet(env.DB, authorizeGetReq(query, sessionId), deps())).text();
+    const stylesheet = /<style>([\s\S]*?)<\/style>/.exec(html)?.[1];
+    expect(stylesheet).toBeTruthy();
+    const fieldset = /<fieldset class="verbsel">[\s\S]*?<\/fieldset>/.exec(html)?.[0];
+    expect(fieldset).toBeTruthy();
+    const rendered = [...fieldset!.matchAll(/class="([^"]+)"/g)].flatMap((m) => m[1]!.trim().split(/\s+/));
+    expect(rendered.length).toBeGreaterThan(0); // control: the scan found classes
+    const unstyled = [...new Set(rendered)].filter((cls) => !stylesheet!.includes(`.${cls}`));
+    expect(unstyled).toEqual([]);
+  });
+
   test("a read-only request defaults the radio to read (not write)", async () => {
     const { id: userId } = await seedUser();
     await seedVault("myvault", userId);
@@ -1690,6 +1721,59 @@ describe("consent verb selector — owner-elected vault:admin (port hub#689)", (
     expect(tokenRes.status).toBe(200);
     const pair = (await tokenRes.json()) as { scope: string };
     expect(pair.scope).toBe("vault:myvault:read vault:myvault:write");
+  });
+
+  /**
+   * cloud#201 — the DEFAULT SUBMIT, which is NOT the same case as (c). (c) pins
+   * the field being ABSENT entirely; a real browser never does that, because a
+   * radio group always submits its checked member. As rendered, `write` is the
+   * checked radio on a read+write request, so a plain Approve (no radio
+   * interaction) submits `verb_select=write` and mints `vault:<name>:write`
+   * ALONE — the requested read+write PAIR collapses to one scope string on the
+   * common path. Capability-identical at the vault (write ⊇ read via VERB_RANK
+   * in workers/vault/src/auth.ts), so this pins the SCOPE STRING, not a
+   * permission change.
+   *
+   * The submitted verb is DERIVED from the rendered HTML rather than hardcoded,
+   * so flipping the rendered default fails this test instead of silently
+   * changing what the common path mints.
+   */
+  test("(d) the DEFAULT submit (the radio as rendered) mints vault:<name>:write ALONE", async () => {
+    const { id: userId } = await seedUser();
+    await seedVault("myvault", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { verifier, challenge } = await makePkce();
+    const query = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: "vault:read vault:write",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    };
+
+    // 1. Read the default off the form the way a browser would: the ONE checked
+    //    member of the `verb_select` radio group.
+    const html = await (await handleAuthorizeGet(env.DB, authorizeGetReq(query, sessionId), deps())).text();
+    const checked = [...html.matchAll(/name="verb_select" value="(read|write|admin)" checked/g)].map((m) => m[1]!);
+    expect(checked).toHaveLength(1); // a radio group submits exactly one value
+    const defaultVerb = checked[0]!;
+
+    // 2. Approve with no radio interaction — submit exactly that default.
+    const consent = await handleAuthorizePost(
+      env.DB,
+      consentReq(consentFields(clientId, challenge, { verb_select: defaultVerb }), { sessionId }),
+      deps(),
+    );
+    const code = await codeFromConsent(consent);
+    const tokenRes = await mintFromCode(clientId, code, verifier);
+    expect(tokenRes.status).toBe(200);
+    const pair = (await tokenRes.json()) as { scope: string };
+
+    // The collapse: ONE scope, not the requested read+write pair (contrast (c)).
+    expect(pair.scope).toBe("vault:myvault:write");
+    expect(pair.scope).not.toContain("vault:myvault:read");
   });
 
   test("owner elects read (downgrade) on a read+write request → token carries only read", async () => {
@@ -2380,6 +2464,298 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     expect(grant?.scopes.sort()).toEqual(
       [`account:${userId}:mod:calendar:read`, `account:${userId}:vaults:alpha:read`].sort(),
     );
+  });
+
+  // --- cloud#211: re-consent invalidates the credentials, not just the record -
+
+  /**
+   * Family-replace (above) fixed what the `grants` row SAYS. It did nothing to
+   * what the client HOLDS. `rotateAndRespond` re-signs `row.scopes` verbatim and
+   * never re-reads the grant, so before cloud#211 a refresh family issued under
+   * "any vault" went on minting "any vault" for up to its 30-day life — after
+   * its owner had moved that client down to a single vault and been shown a
+   * screen implying otherwise.
+   *
+   * These drive the REAL flow end to end: the consent POST, the auth-code
+   * exchange, and `handleToken`'s refresh grant. Nothing is asserted about the
+   * grants table that isn't also asserted about a token minted from it.
+   */
+  describe("cloud#211 — a re-consent that moves the vault family kills that client's live tokens", () => {
+    /** Consent, redeem the code, and hand back the issued pair. */
+    async function consentAndMint(
+      userId: string,
+      clientId: string,
+      sessionId: string,
+      opts: { mode?: string; verb?: string; include?: string[]; create?: boolean },
+    ): Promise<{ scope: string; access_token: string; refresh_token: string }> {
+      const { verifier, challenge } = await makePkce();
+      const consent = await handleAuthorizePost(
+        env.DB,
+        accountVaultsConsentReq(fields(clientId, challenge), { sessionId, create: false, ...opts }),
+        deps(),
+      );
+      const res = await mintFromCode(clientId, await codeFromConsent(consent), verifier);
+      expect(res.status).toBe(200);
+      return (await res.json()) as { scope: string; access_token: string; refresh_token: string };
+    }
+
+    async function refreshError(clientId: string, refreshToken: string): Promise<{ status: number; body: unknown }> {
+      const res = await refreshAt(clientId, refreshToken, new Date());
+      return { status: res.status, body: await res.json() };
+    }
+
+    test("THE FIX: narrowing wildcard→one vault kills the wildcard family, and the replacement mints only the narrow scope", async () => {
+      const { id: userId } = await seedUser("c211-narrow@example.com");
+      await seedVault("alpha", userId);
+      await seedVault("beta", userId);
+      const { clientId } = await seedApprovedClient();
+      const sessionId = await seedSession(userId);
+
+      const wide = await consentAndMint(userId, clientId, sessionId, { mode: "wildcard", verb: "write" });
+      expect(wide.scope).toBe(`account:${userId}:vaults:*:write`);
+      const wideFamily = await familyIdFor(wide.refresh_token);
+
+      // CONTROL, before the narrowing: this token really does rotate, and it
+      // really does re-mint the WIDE scope. Without this the kill below could
+      // be passing against a token that never worked.
+      const beforeRes = await refreshAt(clientId, wide.refresh_token, new Date());
+      expect(beforeRes.status).toBe(200);
+      const rotated = (await beforeRes.json()) as { scope: string; refresh_token: string };
+      expect(rotated.scope).toBe(`account:${userId}:vaults:*:write`);
+      expect(await liveRefreshCount(wideFamily)).toBe(1);
+
+      // The owner narrows: one vault, read only.
+      const narrow = await consentAndMint(userId, clientId, sessionId, {
+        mode: "specific",
+        verb: "read",
+        include: ["alpha"],
+      });
+      expect(narrow.scope).toBe(`account:${userId}:vaults:alpha:read`);
+
+      // The old family is DEAD — not narrowed, not rotated: dead. Asserted on
+      // the live tip the control just produced, i.e. the token a real client
+      // would actually be holding at this moment.
+      const dead = await refreshError(clientId, rotated.refresh_token);
+      expect(dead.status).toBe(400);
+      expect(dead.body).toEqual({ error: "invalid_grant", error_description: "refresh_token revoked" });
+      expect(await liveRefreshCount(wideFamily)).toBe(0);
+
+      // …and the ORIGINAL (already-rotated) token is equally dead, so a client
+      // holding a stale copy cannot walk back in either.
+      expect((await refreshError(clientId, wide.refresh_token)).status).toBe(400);
+
+      // The replacement rotates, and rotation re-mints the NARROW scope only.
+      const fresh = await refreshAt(clientId, narrow.refresh_token, new Date());
+      expect(fresh.status).toBe(200);
+      expect(((await fresh.json()) as { scope: string }).scope).toBe(`account:${userId}:vaults:alpha:read`);
+    });
+
+    test("the one-generation grace window cannot rescue the killed family", async () => {
+      // Rotation replay has a 30s grace (hub#685) that forgives a benign
+      // concurrent refresh by rotating the family's single LIVE tip. A
+      // re-consent revokes every row at once, so there IS no live tip and the
+      // grace has nothing to rotate — worth pinning, because a revocation that
+      // left one row live would land straight in the forgiving branch.
+      const { id: userId } = await seedUser("c211-grace@example.com");
+      await seedVault("alpha", userId);
+      const { clientId } = await seedApprovedClient();
+      const sessionId = await seedSession(userId);
+
+      const wide = await consentAndMint(userId, clientId, sessionId, { mode: "wildcard", verb: "write" });
+      await consentAndMint(userId, clientId, sessionId, { mode: "specific", verb: "read", include: ["alpha"] });
+
+      // Well inside REFRESH_GRACE_MS of the revocation.
+      expect(REFRESH_GRACE_MS).toBeGreaterThan(1000);
+      const replay = await refreshAt(clientId, wide.refresh_token, new Date(Date.now() + 1000));
+      expect(replay.status).toBe(400);
+      expect(((await replay.json()) as { error: string }).error).toBe("invalid_grant");
+    });
+
+    test("an UNCHANGED re-consent revokes nothing — reconnecting the same app must not log out the other device", async () => {
+      // The discriminating control for the whole feature. If the trigger were
+      // "a consent happened" rather than "the family moved", this test fails —
+      // and every routine re-connect would silently kill the user's other
+      // sessions on that client.
+      const { id: userId } = await seedUser("c211-unchanged@example.com");
+      await seedVault("alpha", userId);
+      const { clientId } = await seedApprovedClient();
+      const sessionId = await seedSession(userId);
+
+      const first = await consentAndMint(userId, clientId, sessionId, { mode: "wildcard", verb: "write" });
+      const family = await familyIdFor(first.refresh_token);
+      const second = await consentAndMint(userId, clientId, sessionId, { mode: "wildcard", verb: "write" });
+      expect(second.scope).toBe(first.scope);
+
+      expect(await liveRefreshCount(family)).toBe(1);
+      const still = await refreshAt(clientId, first.refresh_token, new Date());
+      expect(still.status).toBe(200);
+      expect(((await still.json()) as { scope: string }).scope).toBe(`account:${userId}:vaults:*:write`);
+    });
+
+    test("WIDENING revokes too — the rule is 'the family moved', not 'the family shrank'", async () => {
+      // Deliberate: deciding narrow-vs-widen means ranking authority across the
+      // legacy and composed grammars, and any pair ranked wrong is a silently
+      // retained privilege. Set inequality cannot be ranked wrong. The cost of
+      // failing this way is one re-authorization the client is already doing.
+      const { id: userId } = await seedUser("c211-widen@example.com");
+      await seedVault("alpha", userId);
+      await seedVault("beta", userId);
+      const { clientId } = await seedApprovedClient();
+      const sessionId = await seedSession(userId);
+
+      const narrow = await consentAndMint(userId, clientId, sessionId, {
+        mode: "specific",
+        verb: "read",
+        include: ["alpha"],
+      });
+      const wide = await consentAndMint(userId, clientId, sessionId, { mode: "wildcard", verb: "write" });
+      expect(wide.scope).toBe(`account:${userId}:vaults:*:write`);
+      expect((await refreshError(clientId, narrow.refresh_token)).status).toBe(400);
+      // The client is not stranded: the consent it just completed handed it a
+      // working, wider credential in the same round trip.
+      expect((await refreshAt(clientId, wide.refresh_token, new Date())).status).toBe(200);
+    });
+
+    test("a re-consent touching only MODULES leaves the vault family and its tokens alone", async () => {
+      // Modules are a disjoint family (family-replace already excludes them), so
+      // recording one does not move the vault family and must not revoke.
+      const { id: userId } = await seedUser("c211-module@example.com");
+      await seedVault("alpha", userId);
+      const { clientId } = await seedApprovedClient();
+      const sessionId = await seedSession(userId);
+
+      const pair = await consentAndMint(userId, clientId, sessionId, { mode: "wildcard", verb: "write" });
+      const { recordGrant } = await import("../src/grants.ts");
+      const result = await recordGrant(env.DB, userId, clientId, [`account:${userId}:mod:calendar:read`]);
+      expect(result.revokedTokens).toBe(0);
+      expect((await refreshAt(clientId, pair.refresh_token, new Date())).status).toBe(200);
+    });
+
+    test("expired credential rows stay untouched and are not counted as live revocations", async () => {
+      const { id: userId } = await seedUser("c211-expired@example.com");
+      await seedVault("alpha", userId);
+      const { clientId } = await seedApprovedClient();
+      const sessionId = await seedSession(userId);
+
+      const expired = await consentAndMint(userId, clientId, sessionId, { mode: "wildcard", verb: "write" });
+      const expiredFamily = await familyIdFor(expired.refresh_token);
+      await env.DB.prepare("UPDATE tokens SET expires_at = ? WHERE family_id = ?")
+        .bind("2000-01-01T00:00:00.000Z", expiredFamily)
+        .run();
+
+      const { recordGrant } = await import("../src/grants.ts");
+      const result = await recordGrant(
+        env.DB,
+        userId,
+        clientId,
+        [`account:${userId}:vaults:alpha:read`],
+        new Date("2026-01-01T00:00:00.000Z"),
+      );
+      expect(result.revokedTokens).toBe(0);
+      const row = await env.DB.prepare("SELECT revoked_at FROM tokens WHERE family_id = ?")
+        .bind(expiredFamily)
+        .first<{ revoked_at: string | null }>();
+      expect(row?.revoked_at).toBeNull();
+    });
+
+    test("the blast radius stops at (this user, this client) — every other grant survives", async () => {
+      // Two ways this could over-reach: across clients for one user, and across
+      // users for one client. Both are exercised against LIVE tokens, not row
+      // counts, because a row count cannot tell you a token still spends.
+      const { id: userId } = await seedUser("c211-blast-owner@example.com");
+      const { id: otherUserId } = await seedUser("c211-blast-other@example.com");
+      await seedVault("alpha", userId);
+      await seedVault("alpha-other", otherUserId);
+      const { clientId } = await seedApprovedClient({ clientName: "Narrowed" });
+      const { clientId: otherClientId } = await seedApprovedClient({ clientName: "Bystander" });
+      const sessionId = await seedSession(userId);
+      const otherSessionId = await seedSession(otherUserId);
+
+      const target = await consentAndMint(userId, clientId, sessionId, { mode: "wildcard", verb: "write" });
+      // Same user, DIFFERENT client — an account-vaults grant of its own.
+      const sameUserOtherClient = await consentAndMint(userId, otherClientId, sessionId, {
+        mode: "wildcard",
+        verb: "write",
+      });
+      // DIFFERENT user, SAME client.
+      const otherUserSameClient = await consentAndMint(otherUserId, clientId, otherSessionId, {
+        mode: "wildcard",
+        verb: "write",
+      });
+      // …and an ordinary non-account vault grant on a third footing, to prove
+      // the revoke is keyed on the pair and not on "tokens carrying account
+      // scopes".
+      const plainVault = await mintInitialPair(otherClientId, userId, { scope: "vault:alpha:read" });
+
+      await consentAndMint(userId, clientId, sessionId, { mode: "specific", verb: "read", include: ["alpha"] });
+
+      // The target died…
+      expect((await refreshError(clientId, target.refresh_token)).status).toBe(400);
+      // …and nothing else did.
+      expect((await refreshAt(otherClientId, sameUserOtherClient.refresh_token, new Date())).status).toBe(200);
+      expect((await refreshAt(clientId, otherUserSameClient.refresh_token, new Date())).status).toBe(200);
+      expect((await refreshAt(otherClientId, plainVault.refresh_token, new Date())).status).toBe(200);
+      // The bystanders' GRANT rows are untouched too.
+      const { findGrant } = await import("../src/grants.ts");
+      expect((await findGrant(env.DB, otherUserId, clientId))?.scopes).toEqual([`account:${otherUserId}:vaults:*:write`]);
+    });
+
+    test("the revoked ACCESS token dies with its refresh half and is published on the revocation list", async () => {
+      // Access and refresh share one row and one jti, so the outstanding WIDE
+      // access token must not live out its 15 minutes. The revocation list is
+      // how resource servers find out, and it is the surface a reviewer should
+      // check for leakage: it carries jtis and nothing else.
+      const { id: userId } = await seedUser("c211-access@example.com");
+      await seedVault("alpha", userId);
+      const { clientId } = await seedApprovedClient();
+      const sessionId = await seedSession(userId);
+
+      const wide = await consentAndMint(userId, clientId, sessionId, { mode: "wildcard", verb: "write" });
+      const wideJti = String(decodeJwtPayload(wide.access_token).jti);
+      const { listActiveRevocations } = await import("../src/tokens.ts");
+      expect(await listActiveRevocations(env.DB, new Date())).not.toContain(wideJti);
+
+      await consentAndMint(userId, clientId, sessionId, { mode: "specific", verb: "read", include: ["alpha"] });
+
+      const revocations = await listActiveRevocations(env.DB, new Date());
+      expect(revocations).toContain(wideJti);
+      // The list is jtis, full stop — no scopes, no client ids, no user ids.
+      expect(revocations.every((j) => typeof j === "string" && !j.includes(userId) && !j.includes("account:"))).toBe(true);
+      // And the token itself no longer validates — the registry check inside
+      // validateAccessToken is what the revocation list mirrors.
+      await expect(validateAccessToken(env.DB, wide.access_token, ISSUER)).rejects.toThrow();
+    });
+
+    test("the consent response reveals nothing new — a moved family and an unmoved one are byte-identical", async () => {
+      // The revocation must not become an oracle on the redirect. Two users,
+      // same shape of request; one re-consent moves the family and one does
+      // not. The bridge target must differ only in the code.
+      const { id: movedId } = await seedUser("c211-resp-moved@example.com");
+      const { id: sameId } = await seedUser("c211-resp-same@example.com");
+      await seedVault("alpha", movedId);
+      await seedVault("alpha", sameId);
+      const { clientId } = await seedApprovedClient();
+
+      async function reConsentTarget(userId: string, second: { mode: string; verb: string; include?: string[] }) {
+        const sessionId = await seedSession(userId);
+        await consentAndMint(userId, clientId, sessionId, { mode: "wildcard", verb: "write" });
+        const { challenge } = await makePkce();
+        const res = await handleAuthorizePost(
+          env.DB,
+          accountVaultsConsentReq(fields(clientId, challenge), { sessionId, create: false, ...second }),
+          deps(),
+        );
+        expect(res.status).toBe(200);
+        const url = new URL(bridgeTarget(await res.text())!);
+        url.searchParams.delete("code");
+        return { target: url.toString(), headers: [...res.headers.keys()].sort() };
+      }
+
+      const moved = await reConsentTarget(movedId, { mode: "specific", verb: "read", include: ["alpha"] });
+      const unmoved = await reConsentTarget(sameId, { mode: "wildcard", verb: "write" });
+      expect(moved.target).toBe(unmoved.target);
+      expect(moved.headers).toEqual(unmoved.headers);
+    });
   });
 });
 
