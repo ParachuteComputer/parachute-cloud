@@ -140,7 +140,17 @@ export default {
         const rootId = env.VAULT.idFromName(derived.vaultName);
         const rootStub = env.VAULT.get(rootId);
         try {
-          return withCors(await rootStub.fetch(rootForwarded));
+          const response = await rootStub.fetch(rootForwarded);
+          if (response.status === 401) {
+            // The DO correctly challenges its rewritten per-vault URL. The
+            // caller entered through the root resource, though, so preserve the
+            // root discovery contract and avoid reflecting the untrusted routing
+            // hint back as a vault-name oracle in WWW-Authenticate.
+            const headers = new Headers(response.headers);
+            headers.set("WWW-Authenticate", rootMcpWwwAuthenticate(request));
+            return withCors(new Response(response.body, { status: response.status, statusText: response.statusText, headers }));
+          }
+          return withCors(response);
         } catch (err) {
           console.error(`[router ${request.method} ${url.pathname}]`, err);
           return json({ error: "Internal server error" }, 500);
