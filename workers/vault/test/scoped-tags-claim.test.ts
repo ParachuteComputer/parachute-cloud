@@ -4,9 +4,11 @@
  * Before this change `authenticateVaultToken` hardcoded `scoped_tags: null`
  * (`src/auth.ts`), so a token that asked to see ONLY `#work` was served the
  * WHOLE vault, silently. That was safe only under "no token carries
- * `permissions`" — an assumption `ALLOWED_ISSUERS` (additive issuer set,
- * `src/auth.ts` `getGuard`) already lets an operator break by pointing a
- * hub-issued tag-scoped token at a cloud vault.
+ * `permissions`" — which no current deployment can break: `ALLOWED_ISSUERS`
+ * widens the accepted `iss` set, but `getGuard` fetches JWKS from
+ * ISSUER_ORIGIN alone, so a hub-issued token cannot verify here (see
+ * `allowed-issuers.test.ts`). The refusal is DEFENSE IN DEPTH, reachable only
+ * by a deployment that points ISSUER_ORIGIN at a hub.
  *
  * The parser is a port of the bun vault's `parseScopedTagsFromPermissions`
  * (`parachute-vault/src/auth.ts`) with the same three outcomes. The RUNTIME
@@ -19,6 +21,7 @@ import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { MalformedScopedTagsError, parseScopedTagsFromPermissions } from "../src/auth.ts";
 import { base, freshVault, mintToken, OP } from "./helpers.ts";
+import { WS_CLOSE } from "../src/live/ws-subscribe.ts";
 
 function get(vault: string, token: string, path = "/api/notes"): Promise<Response> {
   return SELF.fetch(`${base(vault)}${path}`, { headers: { Authorization: `Bearer ${token}` } });
@@ -36,6 +39,29 @@ function get(vault: string, token: string, path = "/api/notes"): Promise<Respons
  */
 const REFUSED = freshVault("scoped-refuse");
 const ACCEPTED = freshVault("scoped-ok");
+
+/**
+ * Open a live-query socket and return its first close frame. The minimal slice
+ * of `ws-subscribe.test.ts`'s client helper — this file only ever needs the
+ * close code, never a message.
+ */
+async function wsAuthClose(vault: string, token: string): Promise<{ code: number; reason: string }> {
+  const res = await SELF.fetch(`${base(vault)}/api/subscribe?tag=work`, {
+    headers: { Upgrade: "websocket" },
+  });
+  if (res.status !== 101) throw new Error(`upgrade -> ${res.status}: ${await res.text()}`);
+  const ws = res.webSocket!;
+  ws.accept();
+  const closed = new Promise<{ code: number; reason: string }>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("ws close timeout")), 15000);
+    ws.addEventListener("close", (e: any) => {
+      clearTimeout(t);
+      resolve({ code: e.code, reason: e.reason });
+    });
+  });
+  ws.send(JSON.stringify({ type: "auth", token }));
+  return closed;
+}
 
 describe("parseScopedTagsFromPermissions — bun parity, fail closed", () => {
   it("ABSENT ⇒ unscoped (null): no permissions, no key, or an explicit null", () => {
@@ -132,6 +158,22 @@ describe("cloud door — a tag-scoped token is refused, not silently widened", (
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
     });
     expect(res.status).toBe(401);
+  });
+
+  it("the refusal covers the WS door too — `authenticateVaultToken` is the third door", async () => {
+    // `vault-do.ts` authenticates a live-query socket's first `auth` message
+    // through the same function (`authenticatePendingSocket`, and again on
+    // re-auth in `reauthReadySocket`), closing 4401 on any !ok result. Without
+    // this, a scoped token refused at REST and MCP could still have opened a
+    // full-vault live subscription.
+    const v = REFUSED;
+    const token = await mintToken({
+      vault: v,
+      scopes: `vault:${v}:read`,
+      permissions: { scoped_tags: ["work"] },
+    });
+    const close = await wsAuthClose(v, token);
+    expect(close.code).toBe(WS_CLOSE.UNAUTHORIZED);
   });
 });
 

@@ -7,12 +7,14 @@
  * that branch's behavior so the ported handlers compile and behave identically
  * to an unscoped bun-vault request.
  *
- * WHY that stays safe (cloud#278): it is no longer "no token carries the
- * claim" — `ALLOWED_ISSUERS` is additive, so a hub-issued tag-scoped token can
- * be pointed at a cloud vault. It is `auth.ts` that keeps the invariant:
+ * WHY that stays safe (cloud#278): `auth.ts` keeps the invariant —
  * `authenticateVaultToken` parses `permissions.scoped_tags`
  * (`parseScopedTagsFromPermissions`) and 401s any token that carries one,
- * rather than serving it the whole vault through these passthroughs.
+ * rather than serving it the whole vault through these passthroughs. That
+ * refusal is defense in depth: `ALLOWED_ISSUERS` widens the accepted `iss` set,
+ * but `getGuard` fetches JWKS from ISSUER_ORIGIN alone, so a hub-issued token
+ * cannot verify against a cloud vault in any current deployment — only one that
+ * pointed ISSUER_ORIGIN at a hub could reach the well-formed branch.
  *
  * If per-tenant tag-scoping ever lands in cloud, this is the single seam to
  * fill in (mirror `parachute-vault/src/tag-scope.ts`) — and the work is not

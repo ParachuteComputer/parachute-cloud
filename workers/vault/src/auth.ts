@@ -513,12 +513,18 @@ export async function authenticateVaultToken(
   //     like honouring the claim while serving the WHOLE vault — the silent
   //     widening this issue exists to prevent, only now wearing a parser.
   //
-  // Not theoretical: `ALLOWED_ISSUERS` is additive (see `getGuard` above), so a
-  // hub-issued tag-scoped token can already be pointed at a cloud vault, and
-  // today it is silently upgraded to full-vault access. A loud 401 is the
-  // fail-closed answer until cloud ports `parachute-vault/src/tag-scope.ts` and
-  // threads a real `TagScopeCtx` from this result through REST + MCP + WS +
-  // export/attachments. That port is a feature in its own right, not this fix.
+  // This is DEFENSE IN DEPTH, not a live hole. `ALLOWED_ISSUERS` widens which
+  // `iss` values are accepted, but `getGuard` passes `jwksOrigin: issuer`, so
+  // keys are still fetched from ISSUER_ORIGIN alone and a hub-signed token
+  // cannot verify here (`test/allowed-issuers.test.ts` pins that a matching
+  // `iss` never rescues a token signed by a key the JWKS doesn't carry; prod's
+  // ISSUER_ORIGIN is the cloud identity worker, `wrangler.toml`). So the
+  // well-formed branch is unreachable in any current deployment — only one that
+  // pointed ISSUER_ORIGIN at a hub could reach it. A loud 401 is the fail-closed
+  // answer until cloud ports `parachute-vault/src/tag-scope.ts` and threads a
+  // real `TagScopeCtx` from this result through REST + MCP + WS +
+  // export/attachments. That port is a feature in its own right, not this fix
+  // (tracked in #278).
   let scopedTags: string[] | null;
   try {
     scopedTags = parseScopedTagsFromPermissions(claims.permissions);
