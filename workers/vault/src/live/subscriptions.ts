@@ -34,7 +34,9 @@
  * `noteWithinTagScope` — the same check the REST notes path uses. Cloud v1 is
  * unscoped (tokens carry `scoped_tags = null`), so the check is a passthrough
  * today, but it is wired identically so per-tenant tag-scoping is a one-seam
- * change. A `remove` for an out-of-scope note is suppressed (never leak a UUID
+ * change. What KEEPS it unscoped is now enforced, not assumed: `auth.ts`
+ * parses `permissions.scoped_tags` and 401s any token carrying one, because
+ * this passthrough could not honour it (cloud#278 — see `rest/tag-scope.ts`). A `remove` for an out-of-scope note is suppressed (never leak a UUID
  * a token could not have held).
  */
 import type { Note, Store } from "@openparachute/core/src/types.js";

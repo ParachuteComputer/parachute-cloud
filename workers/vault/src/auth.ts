@@ -57,7 +57,14 @@ export interface AuthResult {
    */
   permission: "full" | "read";
   scopes: string[];
-  /** null = unscoped (the only shape cloud v1 issues). */
+  /**
+   * null = unscoped, and in cloud today that is the ONLY value that ever
+   * reaches a handler: `authenticateVaultToken` parses
+   * `permissions.scoped_tags` for real (cloud#278) but REFUSES any token that
+   * carries one, because the runtime has no enforcement seam (`rest/tag-scope.ts`
+   * is a stub and nothing reads this field). Typed `string[] | null` so the
+   * refusal can be lifted without a type change once tag scope is enforced.
+   */
   scoped_tags: string[] | null;
   actor: string | null;
   via: string | null;
@@ -356,6 +363,52 @@ export function parsePrincipalPubkey(
  *  DISTINCT malformed values a misconfigured issuer emits (one). */
 const warnedBadPubkeys = new Set<string>();
 
+/** A present-but-unreadable `permissions.scoped_tags`. Caller REJECTS (401). */
+export class MalformedScopedTagsError extends Error {
+  override name = "MalformedScopedTagsError";
+}
+
+/**
+ * Read the tag-scope allowlist out of a validated JWT's `permissions` claim
+ * (cloud#278, second half). Port of the bun vault's
+ * `parseScopedTagsFromPermissions` (`parachute-vault/src/auth.ts`), with the
+ * same three outcomes and the same strict FAIL-CLOSED invariant — tag-scoping
+ * is always a RESTRICTION, so a misread must NEVER widen access:
+ *
+ *   1. Claim absent (no `permissions`, or no `scoped_tags` key), or explicitly
+ *      `null`/`undefined` → `null` = UNSCOPED = full vault. This is today's
+ *      shape for every cloud-issued token (`workers/identity/src/tokens.ts`
+ *      signs no `permissions` at all), so this is the byte-identical path.
+ *   2. A non-empty array of non-empty strings → that array. The token IS
+ *      tag-scoped.
+ *   3. Present but MALFORMED — a string, number, object, an array holding a
+ *      non-string / empty string, or the empty array `[]` → throws. We do NOT
+ *      coerce: `null` would widen a token meant to be scoped up to full vault,
+ *      and `[]` is read as "unscoped" by the enforcement helpers in
+ *      `rest/tag-scope.ts`, so it would widen too.
+ *
+ * DELIBERATELY the opposite of {@link parsePrincipalPubkey}, which fails SOFT:
+ * that claim only labels a write, this one bounds what a token may see.
+ */
+export function parseScopedTagsFromPermissions(
+  permissions: Record<string, unknown> | undefined,
+): string[] | null {
+  if (!permissions || !("scoped_tags" in permissions)) return null;
+  const raw = permissions.scoped_tags;
+  if (raw === null || raw === undefined) return null; // explicit "unscoped"
+  if (
+    Array.isArray(raw) &&
+    raw.length > 0 &&
+    raw.every((t) => typeof t === "string" && t.length > 0)
+  ) {
+    return raw as string[];
+  }
+  // Present but malformed (incl. `[]`): fail closed — never widen.
+  throw new MalformedScopedTagsError(
+    "JWT permissions.scoped_tags is present but not a non-empty array of tag names",
+  );
+}
+
 /**
  * Refine the credential-class `via` for a write that arrived on the MCP
  * channel. `mcp` wins over the generic classes, but NOT over a class that
@@ -397,6 +450,10 @@ export async function authenticateVaultToken(
       auth: {
         permission: "full",
         scopes: [SCOPE_ADMIN, SCOPE_WRITE, SCOPE_READ],
+        // Not a hardcode with a claim behind it (cloud#278): the operator
+        // bearer is an opaque server-wide secret, not a JWT — there is no
+        // `permissions` claim to read a tag scope out of, and the operator is
+        // unscoped by definition. The JWT branch below is the one that parses.
         scoped_tags: null,
         actor: "operator",
         via: "operator",
@@ -440,6 +497,50 @@ export async function authenticateVaultToken(
   const permission: "full" | "read" =
     hasScopeForVault(claims.scopes, vaultName, "write") ? "full" : "read";
 
+  // TAG SCOPE (cloud#278). Read the claim for real instead of hardcoding
+  // `null`. Both non-unscoped outcomes REJECT, because the cloud runtime has
+  // no enforcement seam to honour an allowlist with:
+  //
+  //   - MALFORMED → 401, byte-parity with the bun vault (`auth.ts`
+  //     MalformedScopedTagsError → 401 "token has a malformed tag-scope claim").
+  //   - WELL-FORMED → 401 too, and this is the cloud-specific half. On bun,
+  //     returning the array enforces it: `src/tag-scope.ts` filters every REST
+  //     handler, MCP read tool and write gate. Cloud's `rest/tag-scope.ts` is a
+  //     documented STUB whose non-null branches no caller can reach —
+  //     `AuthResult.scoped_tags` is read NOWHERE in this worker, and every
+  //     handler is dispatched with the `NO_TAG_SCOPE` literal (`vault-do.ts`
+  //     818/829/832/835/1908/1982). So passing the array through would look
+  //     like honouring the claim while serving the WHOLE vault — the silent
+  //     widening this issue exists to prevent, only now wearing a parser.
+  //
+  // Not theoretical: `ALLOWED_ISSUERS` is additive (see `getGuard` above), so a
+  // hub-issued tag-scoped token can already be pointed at a cloud vault, and
+  // today it is silently upgraded to full-vault access. A loud 401 is the
+  // fail-closed answer until cloud ports `parachute-vault/src/tag-scope.ts` and
+  // threads a real `TagScopeCtx` from this result through REST + MCP + WS +
+  // export/attachments. That port is a feature in its own right, not this fix.
+  let scopedTags: string[] | null;
+  try {
+    scopedTags = parseScopedTagsFromPermissions(claims.permissions);
+  } catch (err) {
+    if (err instanceof MalformedScopedTagsError) {
+      console.warn(`[auth] JWT rejected: ${err.message}`);
+      return { ok: false, reason: "unauthorized", message: "token has a malformed tag-scope claim" };
+    }
+    throw err;
+  }
+  if (scopedTags !== null) {
+    console.warn(
+      `[auth] JWT rejected: permissions.scoped_tags is set (${scopedTags.length} tag(s)) but the ` +
+        "cloud vault runtime cannot enforce a tag scope — refusing rather than serving the full vault",
+    );
+    return {
+      ok: false,
+      reason: "unauthorized",
+      message: "token is tag-scoped, which this vault does not support",
+    };
+  }
+
   // Write-attribution axis 2 — the NIP-98 signing pubkey, when present.
   // Fail-soft; see `parsePrincipalPubkey`.
   const principalPubkey = parsePrincipalPubkey(claims.permissions);
@@ -459,7 +560,12 @@ export async function authenticateVaultToken(
     auth: {
       permission,
       scopes: claims.scopes,
-      scoped_tags: null,
+      // Always `null` HERE by construction — the only way to reach this line is
+      // for the parse above to have returned null (unscoped). Written as the
+      // parsed variable rather than the literal so the seam is real: when cloud
+      // grows tag-scope enforcement, the refusal above is deleted and this line
+      // already carries the allowlist.
+      scoped_tags: scopedTags,
       actor: claims.sub && claims.sub.length > 0 ? claims.sub : null,
       // VIA: the NIP-98 signing pubkey when the issuer stamped one, else the
       // generic `api` credential class the request path refines. `actor` is

@@ -48,6 +48,29 @@ export async function signAccessToken(db: D1Database, opts: SignAccessTokenOpts)
   const nowMs = (opts.now?.() ?? new Date()).getTime();
   const iat = Math.floor(nowMs / 1000);
   const exp = iat + (opts.ttlSeconds ?? ACCESS_TOKEN_TTL_SECONDS);
+  // TODO(cloud#278): mint `permissions.principal_pubkey` here — the vault-side
+  // READER already exists (cloud#277: `workers/vault/src/auth.ts`
+  // `parsePrincipalPubkey` + `mcp.ts` `refineMcpVia`, so a token carrying
+  // `permissions: { principal_pubkey: "<64 lowercase hex>" }` lands
+  // `created_via` / `last_updated_via` = `nostr:<hex>`), but nothing in this
+  // worker can emit it yet: the cloud door has NO key-signed principal. Every
+  // `/account/*` and MCP principal here is a session-cookie / OAuth Bearer
+  // identity (`account-auth.ts`), and `nostr` / NIP-98 appears nowhere in
+  // `workers/identity/src`. There is no verified signature to take a pubkey
+  // FROM, and the claim may never be taken from request input.
+  //
+  // The emitter to mirror when a NIP-98 door lands: parachute-hub
+  // `src/account-mcp-backend.ts` `principalAttributionClaims` — returns the
+  // claim ONLY for `authKind === "nostr"`, with the pubkey read off the
+  // VERIFIED NIP-98 event, `null` for every password / cookie / OAuth
+  // principal, and its hop-token cache key extended with the signer so two
+  // agents on one user can't share a token. Contract: parachute-vault
+  // `docs/contracts/nostr-principal-attribution.md`.
+  //
+  // Mechanically: add `permissions?: Record<string, unknown>` to
+  // `SignAccessTokenOpts` and spread it into the claim set below (scope-guard
+  // passes `permissions` through verbatim; every other new claim is dropped).
+  // Merge, never replace — `permissions.scoped_tags` shares the object.
   const token = await new SignJWT({
     scope: opts.scopes.join(" "),
     client_id: opts.clientId,
