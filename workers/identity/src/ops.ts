@@ -132,7 +132,7 @@ export async function handleScheduled(cron: string, env: Env, sender: EmailSende
     // OAuthDeps (issuer/signing + per-environment transport), not OpsDeps.
     const rollupDeps = depsForEnv(env);
     if (deps.now) rollupDeps.now = deps.now;
-    await runUsageRollup(env, rollupDeps);
+    await runUsageRollup(env, rollupDeps, { sender });
   } else if (job === "snapshot") {
     // The nightly GFS snapshot sweep (snapshots.ts) — same mint-seam deps
     // shape as the usage rollup.

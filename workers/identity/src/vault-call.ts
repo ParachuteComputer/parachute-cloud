@@ -36,6 +36,9 @@ import { type OAuthDeps, vaultInstanceUrl } from "./oauth-shared.ts";
 import { type PlanCaps, type VaultEntitlement, entitlementPlanFor, planEntitlement } from "./plans.ts";
 import { getUserById } from "./users.ts";
 import { listVaultsForOwner } from "./vaults.ts";
+import type { Env } from "./env.ts";
+import type { EmailSender } from "./email.ts";
+import { raiseOpsAlert } from "./ops-alerts.ts";
 
 /**
  * `client_id` claim on issuer-minted tokens. Not a DCR-registered client —
@@ -315,7 +318,7 @@ export interface VaultUsageReading {
  */
 function parseResolvedCaps(raw: unknown): PlanCaps | null {
   if (raw === null) return null;
-  if (typeof raw !== "object" || raw === null) throw new Error("internal config GET carried invalid resolved caps");
+  if (typeof raw !== "object") throw new Error("internal config GET carried invalid resolved caps");
   const caps = raw as { notes_bytes?: unknown; attachment_bytes?: unknown };
   if (
     typeof caps.notes_bytes !== "number" ||
@@ -348,6 +351,7 @@ export async function readVaultUsage(
   deps: OAuthDeps,
   ownerUserId: string,
   vaultName: string,
+  alert?: { env: Env; sender?: EmailSender; now?: Date },
 ): Promise<VaultUsageReading> {
   const res = await callVaultApi(db, deps, {
     userId: ownerUserId,
@@ -403,12 +407,34 @@ export async function readVaultUsage(
       };
     } catch (err) {
       // Distinct from the rollback log the rollup emits: this vault DID answer
-      // with control-plane fields, they just weren't readable. Worth an
-      // operator's attention — it means a DO's stored caps are corrupt, which
-      // no amount of waiting self-heals.
-      console.warn(
-        `event=internal_config_caps_malformed vault=${vaultName} error=${JSON.stringify(err instanceof Error ? err.message : String(err))} caps=${JSON.stringify(body.caps).slice(0, 200)}`,
+      // with control-plane fields, they just weren't readable. A DO's stored
+      // caps are corrupt, which no amount of waiting self-heals — that is
+      // the ops-alerts.ts doctrine (no user action, retries don't drain,
+      // invisible in product), so this pages rather than remaining a
+      // silent-forever warn (cloud#267).
+      const detail = err instanceof Error ? err.message : String(err);
+      const capsPreview = JSON.stringify(body.caps).slice(0, 200);
+      console.error(
+        `event=internal_config_caps_malformed vault=${vaultName} error=${JSON.stringify(detail)} caps=${capsPreview}`,
       );
+      if (alert) {
+        await raiseOpsAlert(alert.env, alert.sender, {
+          key: `internal-config-caps-malformed:${vaultName}`,
+          subject: `malformed entitlement caps on vault ${vaultName}`,
+          text: [
+            `GET /api/internal/config returned control-plane fields whose caps`,
+            `could not be parsed. Usage was still recorded; reconciliation is`,
+            `skipped for this vault until the DO's stored caps are repaired.`,
+            ``,
+            `  vault: ${vaultName}`,
+            `  error: ${detail}`,
+            `  caps:  ${capsPreview}`,
+            ``,
+            `No amount of waiting self-heals this. Inspect the vault DO config.`,
+          ].join("\n"),
+          now: alert.now ?? new Date(),
+        });
+      }
     }
   }
 

@@ -2,6 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { SignJWT, importJWK } from "jose";
 import { TEST_PRIVATE_JWK, TEST_KID } from "./test-keys.ts";
+import { r2Key } from "../src/rest/notes.ts";
 
 /**
  * Wire-contract conformance for the Vault DO + edge router. Targets the
@@ -858,6 +859,17 @@ describe("storage — R2 round-trip + caps", () => {
     expect(get.headers.get("X-Content-Type-Options")).toBe("nosniff");
     const served = new Uint8Array(await get.arrayBuffer());
     expect([...served]).toEqual([...bytes]);
+  });
+
+  it("GET Content-Type is extension-first even when R2 httpMetadata lies (cloud#257)", async () => {
+    const v = freshVault();
+    const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const rel = "2026-01-01/clip.png";
+    await env.ATTACHMENTS.put(r2Key(v, rel), bytes, { httpMetadata: { contentType: "text/html" } });
+    const get = await op(v, `/api/storage/${rel}`);
+    expect(get.status).toBe(200);
+    expect(get.headers.get("Content-Type")).toBe("image/png");
+    expect(get.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
 
   it("disallowed active-content extension (.svg) → 400", async () => {
