@@ -38,7 +38,7 @@ import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.j
 import { buildVaultProjection, attachmentsInstructionBlock } from "@openparachute/core/src/vault-projection.js";
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
-import { hasScopeForVault, type AuthResult, type VaultVerb } from "./auth.js";
+import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
 
 // Transcribed from the SDK's types.js so negotiation matches byte-for-byte.
 const LATEST_PROTOCOL_VERSION = "2025-11-25";
@@ -457,7 +457,13 @@ function visibleTools(
   auth: AuthResult,
   attachmentTickets: { provider: AttachmentTicketProvider; urlBase: string },
 ): McpToolDef[] {
-  const writeContext = { actor: auth.actor, via: auth.via === "operator" ? "operator" : "mcp" };
+  // Write-attribution: refine the credential class to the `mcp` channel, but
+  // keep `operator` and `nostr:<pubkey>` — each names something more specific
+  // than the channel. `nostr:<pubkey>` is the ONLY axis that distinguishes two
+  // agents sharing one hub user (`created_by` is that shared user), so
+  // flattening it here would reintroduce the bug. Mirrors the bun vault's
+  // `src/mcp-tools.ts`. (cloud#277)
+  const writeContext = { actor: auth.actor, via: refineMcpVia(auth.via) };
   const tools = generateMcpTools(store, {
     writeContext,
     attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
