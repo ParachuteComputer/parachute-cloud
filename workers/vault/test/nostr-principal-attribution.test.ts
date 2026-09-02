@@ -1,5 +1,5 @@
 /**
- * Nostr principal attribution — the CLOUD door's half (cloud#PRNUM).
+ * Nostr principal attribution — the CLOUD door's half (cloud#277).
  *
  * Door parity, not a nice-to-have. `@openparachute/core` is shared verbatim
  * between the two doors (`workers/vault/package.json` →

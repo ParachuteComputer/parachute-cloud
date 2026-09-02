@@ -462,7 +462,7 @@ function visibleTools(
   // than the channel. `nostr:<pubkey>` is the ONLY axis that distinguishes two
   // agents sharing one hub user (`created_by` is that shared user), so
   // flattening it here would reintroduce the bug. Mirrors the bun vault's
-  // `src/mcp-tools.ts`. (cloud#PRNUM)
+  // `src/mcp-tools.ts`. (cloud#277)
   const writeContext = { actor: auth.actor, via: refineMcpVia(auth.via) };
   const tools = generateMcpTools(store, {
     writeContext,

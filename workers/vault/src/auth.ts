@@ -319,7 +319,7 @@ export function nostrVia(pubkey: string): string {
  * stamped ONLY on tokens minted for a NIP-98-authenticated caller. Full
  * contract: parachute-vault `docs/contracts/nostr-principal-attribution.md`.
  *
- * DOOR PARITY (cloud#PRNUM): this is a byte-for-byte port of the bun vault's
+ * DOOR PARITY (cloud#277): this is a byte-for-byte port of the bun vault's
  * `src/auth.ts`. `@openparachute/core` is shared verbatim between the two
  * doors (`package.json` `file:../../../parachute-vault/core`), so core's
  * `query-notes` manifest advertises `created_via = nostr:<hex>` to cloud
@@ -445,7 +445,7 @@ export async function authenticateVaultToken(
       // VIA: the NIP-98 signing pubkey when the issuer stamped one, else the
       // generic `api` credential class the request path refines. `actor` is
       // untouched — it stays the hub USER id, so two agents sharing one hub
-      // user keep one `created_by` and are told apart by `*_via`. (cloud#PRNUM)
+      // user keep one `created_by` and are told apart by `*_via`. (cloud#277)
       via: principalPubkey !== null ? nostrVia(principalPubkey) : "api",
       clientId: claims.clientId ?? null,
       exp,

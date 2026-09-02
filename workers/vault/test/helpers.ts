@@ -33,7 +33,7 @@ export async function mintToken(opts: {
   clientId?: string;
   /**
    * Raw `permissions` claim. The vault reads `principal_pubkey` off it for
-   * NIP-98 write attribution (cloud#PRNUM); scope-guard passes it through
+   * NIP-98 write attribution (cloud#277); scope-guard passes it through
    * verbatim.
    */
   permissions?: unknown;
