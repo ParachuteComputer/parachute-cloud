@@ -297,6 +297,73 @@ function unauthorized(message: string): { error: Response } {
  * the result onto their own error surface. Never touches the `Request` — a
  * WebSocket first-message auth has no header to read.
  */
+/** NIP-01 pubkey shape: 32 bytes, lowercase hex. */
+const NOSTR_PUBKEY_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Write-attribution `via` label for a NIP-98-signed principal.
+ *
+ * `nostr:<64-hex>` joins the open-ended `via` vocabulary (`mcp` ·
+ * `surface:<name>` · `agent:<id>` · `operator` · `api`) with the same
+ * `<class>:<id>` shape as `agent:<id>`, so `created_via` / `last_updated_via`
+ * stay plain exact-match strings.
+ */
+export function nostrVia(pubkey: string): string {
+  return `nostr:${pubkey}`;
+}
+
+/**
+ * Read the signing pubkey out of a validated hub JWT's `permissions` claim.
+ *
+ * Wire contract: `permissions: { principal_pubkey: "<64 lowercase hex>" }`,
+ * stamped ONLY on tokens minted for a NIP-98-authenticated caller. Full
+ * contract: parachute-vault `docs/contracts/nostr-principal-attribution.md`.
+ *
+ * DOOR PARITY (cloud#PRNUM): this is a byte-for-byte port of the bun vault's
+ * `src/auth.ts`. `@openparachute/core` is shared verbatim between the two
+ * doors (`package.json` `file:../../../parachute-vault/core`), so core's
+ * `query-notes` manifest advertises `created_via = nostr:<hex>` to cloud
+ * clients too. Without this, cloud would advertise a filter value it could
+ * never produce.
+ *
+ * Why it rides inside `permissions`: `@openparachute/scope-guard` returns a
+ * FIXED claim surface and drops every other claim; `permissions` is its
+ * documented verbatim passthrough.
+ *
+ * FAIL-SOFT: a missing / malformed / wrong-case / non-hex value returns null
+ * and the caller falls back to the generic credential class. Attribution is a
+ * label, not an access decision — the opposite of a `scoped_tags` misread,
+ * which must fail closed.
+ */
+export function parsePrincipalPubkey(
+  permissions: Record<string, unknown> | undefined,
+): string | null {
+  if (!permissions) return null;
+  const raw = permissions.principal_pubkey;
+  if (typeof raw !== "string") return null;
+  return NOSTR_PUBKEY_RE.test(raw) ? raw : null;
+}
+
+/**
+ * Refine the credential-class `via` for a write that arrived on the MCP
+ * channel. `mcp` wins over the generic classes, but NOT over a class that
+ * already names a principal or channel of its own:
+ *
+ *   - `operator` — the operator bearer's credential class IS its channel.
+ *   - `nostr:<pubkey>` — the NIP-98 signer. Every caller through the hub's
+ *     `/mcp` door is on the `mcp` channel, so `mcp` cannot distinguish two
+ *     agents sharing one hub user; the key can.
+ *
+ * `undefined` is accepted alongside `null`: `AuthResult.via` is declared
+ * `string | null`, but call sites that build the object without the key must
+ * degrade to `mcp` rather than throw.
+ */
+export function refineMcpVia(via: string | null | undefined): string {
+  if (via === "operator") return "operator";
+  if (typeof via === "string" && via.startsWith("nostr:")) return via;
+  return "mcp";
+}
+
 export async function authenticateVaultToken(
   token: string,
   env: Env,
@@ -354,6 +421,10 @@ export async function authenticateVaultToken(
   const permission: "full" | "read" =
     hasScopeForVault(claims.scopes, vaultName, "write") ? "full" : "read";
 
+  // Write-attribution axis 2 — the NIP-98 signing pubkey, when present.
+  // Fail-soft; see `parsePrincipalPubkey`.
+  const principalPubkey = parsePrincipalPubkey(claims.permissions);
+
   // The signature is already verified (validateHubJwt above); decoding the
   // payload for `exp` is safe. `jti` is surfaced by scope-guard's claims.
   let exp: number | null = null;
@@ -371,7 +442,11 @@ export async function authenticateVaultToken(
       scopes: claims.scopes,
       scoped_tags: null,
       actor: claims.sub && claims.sub.length > 0 ? claims.sub : null,
-      via: "api",
+      // VIA: the NIP-98 signing pubkey when the issuer stamped one, else the
+      // generic `api` credential class the request path refines. `actor` is
+      // untouched — it stays the hub USER id, so two agents sharing one hub
+      // user keep one `created_by` and are told apart by `*_via`. (cloud#PRNUM)
+      via: principalPubkey !== null ? nostrVia(principalPubkey) : "api",
       clientId: claims.clientId ?? null,
       exp,
       jti: claims.jti ?? null,
