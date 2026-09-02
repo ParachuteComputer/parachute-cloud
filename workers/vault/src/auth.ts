@@ -290,13 +290,6 @@ function unauthorized(message: string): { error: Response } {
   return { error: Response.json({ error: "Unauthorized", message }, { status: 401 }) };
 }
 
-/**
- * Authenticate a RAW token against `vaultName` (Bearer/X-API-Key/?key= value,
- * or a WS first-message auth token). Transport-agnostic: the request path
- * ({@link authenticateVaultRequest}) and the WS binding both call this and map
- * the result onto their own error surface. Never touches the `Request` — a
- * WebSocket first-message auth has no header to read.
- */
 /** NIP-01 pubkey shape: 32 bytes, lowercase hex. */
 const NOSTR_PUBKEY_RE = /^[0-9a-f]{64}$/;
 
@@ -339,10 +332,29 @@ export function parsePrincipalPubkey(
   permissions: Record<string, unknown> | undefined,
 ): string | null {
   if (!permissions) return null;
+  if (!("principal_pubkey" in permissions)) return null;
   const raw = permissions.principal_pubkey;
-  if (typeof raw !== "string") return null;
-  return NOSTR_PUBKEY_RE.test(raw) ? raw : null;
+  if (typeof raw === "string" && NOSTR_PUBKEY_RE.test(raw)) return raw;
+  // PRESENT but unreadable. Fail soft (see above) — but never SILENTLY: the
+  // symptom of a dropped claim (`created_via` back to `mcp`) is byte-identical
+  // to the symptom of the hub never having stamped it, which is the very bug
+  // this feature exists to fix. One warn per distinct bad value keeps the two
+  // distinguishable in the worker log. A pubkey is public by construction, so
+  // logging the value leaks nothing. Parity with the bun door.
+  const seen = typeof raw === "string" ? raw : `<${typeof raw}>`;
+  if (!warnedBadPubkeys.has(seen)) {
+    warnedBadPubkeys.add(seen);
+    console.warn(
+      "[attribution] hub JWT permissions.principal_pubkey present but not 64 lowercase hex — " +
+        `ignoring, falling back to the generic credential class (saw: ${JSON.stringify(seen)})`,
+    );
+  }
+  return null;
 }
+
+/** Dedupe key set for the warn above — bounded in practice by the number of
+ *  DISTINCT malformed values a misconfigured issuer emits (one). */
+const warnedBadPubkeys = new Set<string>();
 
 /**
  * Refine the credential-class `via` for a write that arrived on the MCP
@@ -364,6 +376,13 @@ export function refineMcpVia(via: string | null | undefined): string {
   return "mcp";
 }
 
+/**
+ * Authenticate a RAW token against `vaultName` (Bearer/X-API-Key/?key= value,
+ * or a WS first-message auth token). Transport-agnostic: the request path
+ * ({@link authenticateVaultRequest}) and the WS binding both call this and map
+ * the result onto their own error surface. Never touches the `Request` — a
+ * WebSocket first-message auth has no header to read.
+ */
 export async function authenticateVaultToken(
   token: string,
   env: Env,
