@@ -31,12 +31,19 @@ export async function mintToken(opts: {
   kid?: string;
   /** `client_id` claim — the internal-config seam gates on the first-party id. */
   clientId?: string;
+  /**
+   * Raw `permissions` claim. The vault reads `principal_pubkey` off it for
+   * NIP-98 write attribution (cloud#277); scope-guard passes it through
+   * verbatim.
+   */
+  permissions?: unknown;
 }): Promise<string> {
   const key = await importJWK(TEST_PRIVATE_JWK as any, "RS256");
   return new SignJWT({
     scope: opts.scopes,
     ...(opts.vaultScope ? { vault_scope: opts.vaultScope } : {}),
     ...(opts.clientId ? { client_id: opts.clientId } : {}),
+    ...(opts.permissions !== undefined ? { permissions: opts.permissions } : {}),
   })
     .setProtectedHeader({ alg: "RS256", kid: opts.kid ?? TEST_KID })
     .setIssuer(opts.iss ?? ISSUER)
