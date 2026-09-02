@@ -28,6 +28,7 @@
  * ops.ts/drip.ts so the tests drive the exact code the cron does.
  */
 import type { Env } from "./env.ts";
+import type { EmailSender } from "./email.ts";
 import type { OAuthDeps } from "./oauth-shared.ts";
 import { type VaultEntitlement, entitlementPlanFor, isPlanId, planEntitlement } from "./plans.ts";
 import { type ResolvedVaultEntitlement, pushVaultCap, readVaultUsage } from "./vault-call.ts";
@@ -232,7 +233,7 @@ export interface UsageRunSummary {
 export async function runUsageRollup(
   env: Env,
   deps: OAuthDeps,
-  opts: { runCap?: number; reconcileCap?: number; onlyVault?: string } = {},
+  opts: { runCap?: number; reconcileCap?: number; onlyVault?: string; sender?: EmailSender } = {},
 ): Promise<UsageRunSummary> {
   const runCap = opts.runCap ?? USAGE_RUN_CAP;
   const reconcileCap = opts.reconcileCap ?? RECONCILE_RUN_CAP;
@@ -266,7 +267,11 @@ export async function runUsageRollup(
   let reconcileCapped = false;
   for (const v of vaults) {
     try {
-      const usage = await readVaultUsage(env.DB, deps, v.owner_user_id, v.name);
+      const usage = await readVaultUsage(env.DB, deps, v.owner_user_id, v.name, {
+        env,
+        sender: opts.sender,
+        now,
+      });
       await env.DB.prepare(
         `INSERT INTO vault_usage (vault_name, day, db_bytes, r2_bytes, transcribe_minutes) VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(vault_name, day) DO UPDATE SET db_bytes = excluded.db_bytes, r2_bytes = excluded.r2_bytes,
