@@ -114,9 +114,16 @@ export async function callVaultApi(
     /** Optional abort signal (the fan-out arms a per-vault timeout so one hung
      *  vault can't stall the whole cross-vault read). */
     signal?: AbortSignal;
+    /**
+     * Optional `permissions` claim on the hop token (cloud#278). The account-MCP
+     * fan-out stamps `principal_pubkey` here for a NIP-98 principal; cookie /
+     * Bearer / OAuth callers omit it. Merge, never replace, if a future mint
+     * also carries `scoped_tags`.
+     */
+    permissions?: Record<string, unknown>;
   },
 ): Promise<Response> {
-  const { userId, vaultName, method, apiPath, verb, jsonBody, rawBody, rawContentType, clientId, signal } = opts;
+  const { userId, vaultName, method, apiPath, verb, jsonBody, rawBody, rawContentType, clientId, signal, permissions } = opts;
   // BRIDGE WRITE-CLAMP (hard ceiling): an account-bridge mint — `client_id`
   // "parachute-account" (ACCOUNT_TOKEN_CLIENT_ID), the tenant-facing id the
   // account-MCP fan-out uses — may NEVER carry the `admin` verb. The cross-vault
@@ -139,6 +146,7 @@ export async function callVaultApi(
     vaultScope: [vaultName],
     ttlSeconds: INTERNAL_MINT_TTL_SECONDS,
     now: deps.now,
+    ...(permissions !== undefined ? { permissions } : {}),
   });
   const fetchFn = deps.vaultFetch ?? fetch;
   const headers: Record<string, string> = { authorization: `Bearer ${signed.token}` };
