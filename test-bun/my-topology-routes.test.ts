@@ -169,7 +169,7 @@ function resourceMetadataUrl(challenge: string): URL {
 /** Ask the real router what it serves at `path` on my. */
 function serve(path: string): Response | null {
   const url = new URL(`https://${MY_HOST}${path}`);
-  return handleDiscovery(url, new Request(url), discoveryEnv);
+  return handleDiscovery(url, new Request(url.href), discoveryEnv);
 }
 
 /** The `resource` string a discovery doc advertises. */

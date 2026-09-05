@@ -314,6 +314,47 @@ async function handleNotesInner(
         return json(result);
       }
 
+      // `aggregate[...]` on a LIST query (vault#626 / cloud#134 B.4). Cloud
+      // v1's REST layer has no aggregate parser — the params used to be
+      // dropped on the floor and note rows came back, which is the exact
+      // silent shape-break vault#626 opens with: a caller asking for
+      // `[{group, value}]` gets `NoteIndex[]` and no signal at all.
+      //
+      // This is a 400, not an `unsupported_param` WARNING, on purpose. The
+      // warning convention here (`search_mode`, `sort` under search — C1.5)
+      // covers params that leave the RESULT SET unchanged: the caller's rows
+      // are still the rows it asked for, so a header is enough. `aggregate`
+      // is a mode switch — it changes the response SHAPE — so returning rows
+      // with a header would hand a rollup parser the wrong envelope. It also
+      // keeps the doors' failure modes aligned: the bun door answers the one
+      // aggregate composition IT can't serve (`search` + `aggregate`) with a
+      // 400 naming `aggregate`, not with rows.
+      //
+      // Scope of the gap: REST only. Cloud's MCP `query-notes` is
+      // core-driven (`generateMcpTools(store)`), so its `aggregate` param
+      // reaches core's `aggregateNotes` and grouped rollups already work on
+      // this door. The ungrouped filtered total (`{op: "count"}` with no
+      // `group_by`) landed in core AFTER the commit pinned in
+      // `scripts/vault-source.env`, so it arrives here — on both surfaces —
+      // when that pin is promoted.
+      const aggregateParam = [...url.searchParams.keys()].find(
+        (k) => k === "aggregate" || k.startsWith("aggregate["),
+      );
+      if (aggregateParam !== undefined) {
+        return json(
+          {
+            error:
+              "`aggregate` is not supported on cloud v1's REST door — a rollup would have to come back as `[{group, value}]`, and this door can only return note rows. Rejected rather than silently answering the wrong shape.",
+            code: "UNSUPPORTED_PARAM",
+            error_type: "unsupported_param",
+            field: "aggregate",
+            got: aggregateParam,
+            hint: "use the MCP `query-notes` tool's `aggregate` param on this vault (grouped rollups are served there), or the self-hosted door's REST `?aggregate[op]=…`",
+          },
+          400,
+        );
+      }
+
       // Semantic search (EXPERIMENTAL — semantic search MVP, C2). Ported
       // verbatim from parachute-vault/src/routes.ts (the wire contract lives
       // in this branch, so it is transcribed rather than reinvented — the

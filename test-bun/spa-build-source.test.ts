@@ -40,7 +40,7 @@ function makePinnedHubClone(prefix: string): string {
     stderr: "pipe",
   });
   expect(clone.exitCode, clone.stderr.toString()).toBe(0);
-  const checkout = Bun.spawnSync(["git", "-C", hub, "checkout", "--detach", doorContractRef], {
+  const checkout = Bun.spawnSync(["git", "-C", hub, "checkout", "--detach", doorContractRef as string], {
     stdout: "pipe",
     stderr: "pipe",
   });

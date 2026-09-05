@@ -38,6 +38,7 @@ import {
   composedAccountGrant,
 } from "@openparachute/door-contract";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
+import { type AttributionPrincipal, principalAttributionClaims } from "./tokens.ts";
 import { type OAuthDeps, vaultAdvertisedUrl } from "./oauth-shared.ts";
 import {
   PLAN_SPECS,
@@ -199,6 +200,14 @@ export interface AccountToolContext {
   /** The account owner, loaded once by the auth gate (suspended-refusal) and
    *  reused by create-vault's plan gate — never re-read per tool. */
   user: User;
+  /**
+   * How this connection authenticated (cloud#278 / hub#937). The cloud door
+   * is Bearer-only today (`authKind: "bearer"`) — there is no NIP-98 path in
+   * this worker, so hop tokens never carry `permissions.principal_pubkey`.
+   * When a NIP-98 door lands, set `authKind: "nostr"` and `pubkey` from the
+   * VERIFIED event; {@link principalAttributionClaims} is the only producer.
+   */
+  principal: AttributionPrincipal;
 }
 
 /** A single account-MCP tool: a pure definition + an executor that throws
@@ -358,6 +367,7 @@ async function queryOneVault(
   accountId: string,
   vaultName: string,
   args: Record<string, unknown>,
+  permissions?: Record<string, unknown>,
 ): Promise<VaultQueryEntry> {
   const qs = buildNotesQuery(args);
   const res = await callVaultApi(db, deps, {
@@ -368,6 +378,7 @@ async function queryOneVault(
     verb: "read",
     clientId: ACCOUNT_TOKEN_CLIENT_ID,
     signal: AbortSignal.timeout(FANOUT_TIMEOUT_MS),
+    ...(permissions !== undefined ? { permissions } : {}),
   });
   if (!res.ok) {
     let detail = `vault responded ${res.status}`;
@@ -395,9 +406,10 @@ async function fanOut(
   accountId: string,
   targets: string[],
   args: Record<string, unknown>,
+  permissions?: Record<string, unknown>,
 ): Promise<VaultQueryEntry[]> {
   const settled = await Promise.allSettled(
-    targets.map((name) => queryOneVault(db, deps, accountId, name, args)),
+    targets.map((name) => queryOneVault(db, deps, accountId, name, args, permissions)),
   );
   return settled.map((s, i) =>
     s.status === "fulfilled"
@@ -450,7 +462,15 @@ const queryNotesTool: AccountMcpTool = {
       }
       targets = [wanted];
     }
-    const results = await fanOut(ctx.db, ctx.deps, ctx.accountId, targets, args);
+    const attribution = principalAttributionClaims(ctx.principal);
+    const results = await fanOut(
+      ctx.db,
+      ctx.deps,
+      ctx.accountId,
+      targets,
+      args,
+      attribution?.permissions,
+    );
     return { vaults_queried: targets, results };
   },
 };
