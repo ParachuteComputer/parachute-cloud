@@ -40,6 +40,8 @@
  * connect-your-AI consent without a second login.
  */
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
+import { MAX_IMPORT_BYTES, MAX_IMPORT_MIB } from "./import-limit.ts";
+export { MAX_IMPORT_BYTES, MAX_IMPORT_MIB };
 import {
   checkAndBumpSignup,
   clearLoginFailures,
@@ -727,15 +729,6 @@ export async function handleExportPost(db: D1Database, req: Request, deps: OAuth
 }
 
 // --- the import door (the other half of the portability promise) -------------
-
-/**
- * The cloud import ceiling — must equal the vault worker's `MAX_IMPORT_BYTES`
- * (restore.ts). Separate Workers, no shared module; keep the two identical.
- */
-// Exported for the cross-worker parity test (test-bun/import-limit-parity):
-// this MUST equal the vault worker's MAX_IMPORT_BYTES (restore.ts).
-export const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
-const MAX_IMPORT_MIB = 50;
 
 function importTooLargeMessage(): string {
   return `That export is over the ${MAX_IMPORT_MIB} MiB import limit. For a larger vault, write hello@parachute.computer — or use the CLI import on self-host.`;

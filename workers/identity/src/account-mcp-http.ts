@@ -399,6 +399,10 @@ export async function handleAccountMcp(db: D1Database, req: Request, deps: OAuth
     accountId: auth.accountId,
     grant: auth.grant,
     user: auth.user,
+    // Cloud account-MCP is Bearer-only. A NIP-98 door would set authKind
+    // "nostr" and the verified event pubkey here; until then hop tokens
+    // carry no permissions.principal_pubkey (cloud#278).
+    principal: { authKind: "bearer" },
   };
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));

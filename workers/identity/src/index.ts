@@ -424,7 +424,7 @@ app.post("/__test/usage-run", async (c) => {
   // same cliff as the snapshot sweep in cloud#166/#218). No param → the full
   // fleet rollup, unchanged (the nightly USAGE_CRON path).
   const onlyVault = c.req.query("vault") || undefined;
-  return c.json(await runUsageRollup(c.env, deps, onlyVault ? { onlyVault } : {}));
+  return c.json(await runUsageRollup(c.env, deps, { sender: senderFor(c.env), ...(onlyVault ? { onlyVault } : {}) }));
 });
 
 // Staging/dev-only snapshot-sweep trigger — same gate + rationale (404 off

@@ -2917,7 +2917,12 @@ export class VaultDO extends DurableObject {
       const obj = await this.env.ATTACHMENTS.get(r2Key(vaultName, reqPath));
       if (!obj) return json({ error: "Not found" }, 404);
       const ext = extLower(reqPath);
-      const contentType = obj.httpMetadata?.contentType ?? MIME_TYPES[ext] ?? "application/octet-stream";
+      // cloud#257: extension-first, matching bun. Historical R2 objects
+      // stamped a lying httpMetadata.contentType (pre-#255) still serve
+      // that type if metadata wins; MIME_TYPES[ext] covers all history
+      // with no backfill. Fall through to metadata only when the
+      // extension is uncurated.
+      const contentType = MIME_TYPES[ext] ?? obj.httpMetadata?.contentType ?? "application/octet-stream";
       return new Response(obj.body, {
         headers: {
           "Content-Type": contentType,

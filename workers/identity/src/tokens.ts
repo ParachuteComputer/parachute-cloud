@@ -3,7 +3,8 @@
  * hub's `jwt-sign.ts` on D1 + jose.
  *
  * Access tokens: RS256 JWT, 15-min TTL, claims `{scope, client_id, vault_scope,
- * sub, iss, iat, exp, aud, jti}`. Refresh tokens: opaque base64url, SHA-256
+ * sub, iss, iat, exp, aud, jti}` plus optional `permissions` (cloud#278:
+ * `principal_pubkey` for a NIP-98 hop). Refresh tokens: opaque base64url, SHA-256
  * hashed into a `tokens` row keyed by the shared `jti`; rotation revokes the
  * old row + inserts a new one in the same family and links predecessor→successor
  * (`rotated_to`) for the one-generation grace window.
@@ -23,6 +24,46 @@ export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
  */
 export const REFRESH_GRACE_MS = 30_000;
 
+/**
+ * NIP-01 pubkey shape: 32 bytes, lowercase hex. Byte-identical to the vault
+ * worker's `parsePrincipalPubkey` (`workers/vault/src/auth.ts`) and the hub
+ * emitter (`src/account-mcp-backend.ts` / `src/nostr-event.ts`). A mint-side
+ * mismatch would ship a claim the vault fails-soft on, which is indistinguishable
+ * from never having stamped it.
+ */
+export const NOSTR_PUBKEY_RE = /^[0-9a-f]{64}$/;
+
+/** The account-MCP (or future NIP-98) principal the hop-token mint attributes. */
+export interface AttributionPrincipal {
+  /** `"nostr"` for a verified NIP-98 event; anything else is cookie / Bearer / OAuth. */
+  authKind: string;
+  /** Verified event pubkey. Ignored unless `authKind === "nostr"`. */
+  pubkey?: string;
+}
+
+/**
+ * The attribution claim carried on a vault hop token (cloud#278 / hub#937).
+ *
+ * Emitted ONLY for a NIP-98-authenticated principal. A password / cookie /
+ * OAuth Bearer connection has no signing key, and stamping one would fabricate
+ * attribution. A malformed pubkey is dropped rather than shipped — the vault
+ * fails soft on a bad claim and we should not make it exercise that path.
+ *
+ * Nested under `permissions` because `@openparachute/scope-guard` returns a
+ * FIXED claim surface and drops every other claim; `permissions` is its
+ * documented verbatim passthrough.
+ *
+ * Contract: parachute-vault `docs/contracts/nostr-principal-attribution.md`.
+ */
+export function principalAttributionClaims(
+  principal: AttributionPrincipal,
+): { permissions: { principal_pubkey: string } } | null {
+  if (principal.authKind !== "nostr") return null;
+  const pubkey = principal.pubkey;
+  if (typeof pubkey !== "string" || !NOSTR_PUBKEY_RE.test(pubkey)) return null;
+  return { permissions: { principal_pubkey: pubkey } };
+}
+
 export interface SignAccessTokenOpts {
   sub: string;
   scopes: string[];
@@ -33,6 +74,14 @@ export interface SignAccessTokenOpts {
   jti?: string;
   ttlSeconds?: number;
   now?: () => Date;
+  /**
+   * Optional `permissions` claim. Scope-guard passes this object through
+   * verbatim; every other new top-level claim is dropped. Merge, never
+   * replace, if a future mint also carries `scoped_tags` — the vault reads
+   * an absent `scoped_tags` as UNSCOPED, so clobbering it would widen the
+   * token. Today the only producer is {@link principalAttributionClaims}.
+   */
+  permissions?: Record<string, unknown>;
 }
 
 export interface SignedAccessToken {
@@ -52,6 +101,7 @@ export async function signAccessToken(db: D1Database, opts: SignAccessTokenOpts)
     scope: opts.scopes.join(" "),
     client_id: opts.clientId,
     vault_scope: opts.vaultScope ?? [],
+    ...(opts.permissions !== undefined ? { permissions: opts.permissions } : {}),
   })
     .setProtectedHeader({ alg: SIGNING_ALGORITHM, kid: key.kid })
     .setSubject(opts.sub)

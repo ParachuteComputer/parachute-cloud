@@ -30,7 +30,7 @@ function scriptedDeps(queue: Response[]): PropagationDeps & { calls: number; sle
   const d = {
     calls: 0,
     slept: [] as number[],
-    fetch: async () => {
+    fetch: async (_url?: string, _init?: RequestInit) => {
       const r = queue[Math.min(d.calls, queue.length - 1)]!;
       d.calls++;
       return r.clone();
@@ -79,7 +79,7 @@ describe("fetchPastPropagation — a retry may delay a red, never turn one green
     const d = scriptedDeps([html(), html(), json({ resource: "https://my.parachute.computer/account/mcp" })]);
     const r = await fetchPastPropagation("https://cloud.example/.well-known/oauth-protected-resource/account/mcp", undefined, d);
     expect(r.attempts).toBe(3);
-    expect(d.slept).toEqual([PROPAGATION_BACKOFF_MS[0], PROPAGATION_BACKOFF_MS[1]]);
+    expect(d.slept).toEqual([PROPAGATION_BACKOFF_MS[0]!, PROPAGATION_BACKOFF_MS[1]!]);
     expect(r.res.status).toBe(200);
     expect(() => JSON.parse(r.body)).not.toThrow(); // the SyntaxError that made rc.116 red
   });

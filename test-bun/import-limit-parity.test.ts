@@ -11,7 +11,7 @@
  * both modules load here without a workerd pool.
  */
 import { describe, expect, it } from "bun:test";
-import { MAX_IMPORT_BYTES as IDENTITY_MAX } from "../workers/identity/src/console.ts";
+import { MAX_IMPORT_BYTES as IDENTITY_MAX } from "../workers/identity/src/import-limit.ts";
 import { MAX_IMPORT_BYTES as VAULT_MAX } from "../workers/vault/src/restore.ts";
 
 describe("import ceiling parity (identity ↔ vault)", () => {

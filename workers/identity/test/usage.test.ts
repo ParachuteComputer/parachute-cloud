@@ -22,7 +22,7 @@ import { USAGE_CRON, handleScheduled, routeCron } from "../src/ops.ts";
 import { RECONCILE_RUN_CAP, USAGE_RUN_CAP, latestUsageForVaults, runUsageRollup } from "../src/usage.ts";
 import { validateAccessToken } from "../src/tokens.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
-import type { EmailSender, SendResult } from "../src/email.ts";
+import type { EmailSender, OpsEmail, SendResult } from "../src/email.ts";
 import { PLAN_SPECS, planEntitlement, vaultUsageLine, type VaultEntitlement } from "../src/plans.ts";
 import { CAP_PUSH_MAX_ATTEMPTS, applyPlanToVaults } from "../src/vault-call.ts";
 import { CSRF, ISSUER, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
@@ -93,7 +93,7 @@ function quietly<T>(fn: () => Promise<T>): Promise<T> {
   });
 }
 
-/** A sender that must stay silent — the usage rollup never emails anyone. */
+/** Capturing sender. The rollup is silent except cloud#267 (malformed caps). */
 function silentSender(): EmailSender & { sent: unknown[] } {
   const sent: unknown[] = [];
   return {
@@ -610,9 +610,10 @@ describe("runUsageRollup", () => {
     });
 
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const sender = silentSender();
     try {
-      const summary = await runUsageRollup(env, rollupDeps());
+      const summary = await runUsageRollup(env, rollupDeps(), { sender });
       expect(summary).toEqual({
         day: TODAY,
         vaults: 1,
@@ -629,16 +630,19 @@ describe("runUsageRollup", () => {
       // actuate a push off a DO state we cannot read. Reconciliation is
       // unavailable for this vault this run, and says so distinctly.
       expect(
-        warn.mock.calls.some((c) => String(c[0]).includes("event=internal_config_caps_malformed vault=malformed-caps-v")),
+        error.mock.calls.some((c) => String(c[0]).includes("event=internal_config_caps_malformed vault=malformed-caps-v")),
       ).toBe(true);
       expect(
         log.mock.calls.some((c) =>
           String(c[0]).includes("event=entitlement_reconcile_skipped_no_entitlement_data vault=malformed-caps-v"),
         ),
       ).toBe(true);
+      // cloud#267: the silent-forever warn now pages through raiseOpsAlert.
+      const ops = sender.sent.filter((m): m is OpsEmail => typeof m === "object" && m !== null && "subject" in m);
+      expect(ops.some((m) => m.subject.includes("malformed entitlement caps on vault malformed-caps-v"))).toBe(true);
     } finally {
       log.mockRestore();
-      warn.mockRestore();
+      error.mockRestore();
     }
   });
 

@@ -123,6 +123,15 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
       expect(isCeremonyPath("/account")).toBe(false);
       expect(SUBTREE_ONLY_PREFIXES).toEqual(["/account"]);
     });
+
+    test.each([
+      "/v/aaron/n/01JBQZ0Q2M8T9V5X7YB3KD4WEN",
+      "/v/aaron/n/Projects/2026/Roadmap",
+      "/v/aaron/n/Projects%2F2026%2FRoadmap",
+      "/v/aaron",
+    ])("vault-scoped app route %s stays SPA-owned", (path) => {
+      expect(isCeremonyPath(path)).toBe(false);
+    });
   });
 
   // (d) P0.3 parity — provably the same set as the parachute-app service-worker
