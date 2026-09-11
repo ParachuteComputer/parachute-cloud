@@ -365,6 +365,45 @@ describe("MCP — vault-info (server-layer override)", () => {
     return JSON.parse(body.result.content[0].text);
   }
 
+  // Bun twin: parachute-vault/src/vault.test.ts — "vault-info includes a compact
+  // structural map WITHOUT include_stats (front-door)"; the server override at
+  // parachute-vault/src/mcp-tools.ts:996 returns projection.map (cloud#134 C.5).
+  async function mapProjection() {
+    const v = freshVault();
+    const token = await WRITE(v);
+    for (const args of [{ path: "People/Alice", tags: ["person"] }, { tags: ["person"] }]) {
+      const res = await mcpPost(v, token, {
+        jsonrpc: "2.0", id: 31, method: "tools/call",
+        params: { name: "create-note", arguments: args },
+      });
+      const body = await res.json() as any;
+      expect(body.error).toBeUndefined();
+      expect(body.result?.isError).toBeFalsy();
+    }
+    return callVaultInfo(v, await READ(v), {});
+  }
+
+  it("P1: includes the structural map without include_stats", async () => {
+    const proj = await mapProjection();
+    expect(proj.map).toBeTruthy();
+    expect(proj.stats).toBeUndefined();
+    expect(Object.keys(proj.map)).toEqual(expect.arrayContaining([
+      "total_notes", "tags", "path_buckets", "unfiled_notes",
+    ]));
+  });
+
+  it("P2: map includes created path and tag counts alongside welcome seeds", async () => {
+    const proj = await mapProjection();
+    expect(proj.map.path_buckets).toContainEqual({ name: "People", count: 1 });
+    expect(proj.map.tags).toContainEqual({ name: "person", count: 2 });
+  });
+
+  it("P3: map total equals unfiled notes plus path-bucket counts", async () => {
+    const proj = await mapProjection();
+    const filed = proj.map.path_buckets.reduce((sum: number, bucket: { count: number }) => sum + bucket.count, 0);
+    expect(proj.map.total_notes).toBe(proj.map.unfiled_notes + filed);
+  });
+
   it("read-scoped token → a REAL projection (name + seeded tag + coordinates, no placeholder)", async () => {
     const v = freshVault();
     const proj = await callVaultInfo(v, await READ(v), {});
