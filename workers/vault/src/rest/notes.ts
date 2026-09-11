@@ -330,13 +330,6 @@ async function handleNotesInner(
       // aggregate composition IT can't serve (`search` + `aggregate`) with a
       // 400 naming `aggregate`, not with rows.
       //
-      // Scope of the gap: REST only. Cloud's MCP `query-notes` is
-      // core-driven (`generateMcpTools(store)`), so its `aggregate` param
-      // reaches core's `aggregateNotes` and grouped rollups already work on
-      // this door. The ungrouped filtered total (`{op: "count"}` with no
-      // `group_by`) landed in core AFTER the commit pinned in
-      // `scripts/vault-source.env`, so it arrives here — on both surfaces —
-      // when that pin is promoted.
       const aggregateParam = [...url.searchParams.keys()].find(
         (k) => k === "aggregate" || k.startsWith("aggregate["),
       );
@@ -344,7 +337,7 @@ async function handleNotesInner(
         return json(
           {
             error:
-              "`aggregate` is not supported on cloud v1's REST door — a rollup would have to come back as `[{group, value}]`, and this door can only return note rows. Rejected rather than silently answering the wrong shape.",
+              "`aggregate` is not supported on cloud v1's REST door because it has no aggregate parser. Rejected rather than silently answering the wrong shape.",
             code: "UNSUPPORTED_PARAM",
             error_type: "unsupported_param",
             field: "aggregate",

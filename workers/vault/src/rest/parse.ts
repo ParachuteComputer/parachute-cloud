@@ -104,8 +104,11 @@ export function parseLinkCountDirection(url: URL): "both" | "outbound" | "inboun
 }
 
 export function parseQueryList(url: URL, key: string): string[] | undefined {
-  const val = url.searchParams.get(key);
-  return val ? val.split(",") : undefined;
+  const all = url.searchParams.getAll(key);
+  if (all.length === 0) return undefined;
+  // Flatten comma-lists inside each param.
+  const flat = all.flatMap((v) => v.split(",")).filter((s) => s.length > 0);
+  return flat.length > 0 ? flat : undefined;
 }
 
 export function parseContentRangeQuery(
@@ -441,8 +444,11 @@ export function parseNotesQueryOpts(url: URL): {
     excludeTags: parseQueryList(url, "exclude_tag"),
     hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
     hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
+    hasBrokenLinks: parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+    hasAmbiguousLinks: parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
     path: parseQuery(url, "path") ?? undefined,
     pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
+    excludePathPrefix: parseQueryList(url, "exclude_path_prefix"),
     extension: parseExtensionFilter(url),
     metadata: bracket.metadata ?? metadataAlias.metadata,
     createdBy: parseQuery(url, "created_by") ?? undefined,
