@@ -1086,57 +1086,36 @@ describe("contracts-brief C1.4 — cross-door parity pins", () => {
   });
 
   /**
-   * `aggregate` on the REST door (vault#626 / cloud#134 B.4). Cloud v1's REST
-   * layer has no aggregate parser. It used to drop the params silently and
-   * answer with note rows — a rollup caller parsing `[{group, value}]` got
-   * `NoteIndex[]` and no signal. Now it 400s, naming the param.
-   *
-   * A 400 rather than an `unsupported_param` warning because `aggregate`
-   * changes the response SHAPE (unlike `search_mode`/`sort` above, which
-   * leave the result set intact and so ride the warnings channel), and
-   * because the bun door answers the one aggregate composition it can't
-   * serve — `search` + `aggregate` — with a 400 naming `aggregate` too.
-   *
-   * The MCP case is the other half of the pin: cloud's `query-notes` is
-   * core-driven, so grouped rollups already work on this door. The gap is
-   * REST-only, and these two tests are what keeps that claim honest.
+   * B2: REST and MCP serve rollup rows (vault#626 / cloud#134 B.4).
+   * Search + aggregate rejects with the bun door's invalid_query contract.
+   * Positive list and MCP controls below remain unchanged.
    */
-  describe("aggregate — REST 400s loudly, MCP still rolls up (vault#626)", () => {
-    it("?aggregate[op]=count → 400 unsupported_param naming `aggregate`, never note rows", async () => {
+  describe("aggregate — REST and MCP roll up (vault#626)", () => {
+    it("?aggregate[op]=count returns the filtered total", async () => {
       const v = freshVault();
       await createNote(v, { content: "countme one", tags: ["aggcount"] });
       await createNote(v, { content: "countme two", tags: ["aggcount"] });
       const res = await op(v, "/api/notes?tag=aggcount&aggregate%5Bop%5D=count");
-      expect(res.status).toBe(400);
-      const body = (await res.json()) as any;
-      expect(body.error_type).toBe("unsupported_param");
-      expect(body.field).toBe("aggregate");
-      expect(body.got).toBe("aggregate[op]");
-      // The defect was rows-instead-of-a-rollup: assert the body is the error
-      // envelope, not an array of notes.
-      expect(Array.isArray(body)).toBe(false);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual([{ group: null, value: 2 }]);
     });
 
-    it("the GROUPED form 400s too — the whole param family, not just the ungrouped total", async () => {
+    it("the GROUPED form returns tag rollups alongside seeded groups", async () => {
       const v = freshVault();
       await createNote(v, { content: "grouped", tags: ["agggroup"] });
-      const res = await op(
-        v,
-        "/api/notes?aggregate%5Bgroup_by%5D=tag&aggregate%5Bop%5D=count",
-      );
-      expect(res.status).toBe(400);
-      const body = (await res.json()) as any;
-      expect(body.error_type).toBe("unsupported_param");
-      expect(body.field).toBe("aggregate");
+      const res = await op(v, "/api/notes?aggregate%5Bgroup_by%5D=tag&aggregate%5Bop%5D=count");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toContainEqual({ group: "agggroup", value: 1 });
     });
 
-    it("?search=x&aggregate[op]=count → the aggregate 400, not a silent fall-through to search rows", async () => {
+    it("?search=x&aggregate[op]=count rejects the incompatible composition", async () => {
       const v = freshVault();
       await createNote(v, { content: "aggsearchable body" });
       const res = await op(v, "/api/notes?search=aggsearchable&aggregate%5Bop%5D=count");
       expect(res.status).toBe(400);
-      const body = (await res.json()) as any;
-      expect(body.error_type).toBe("unsupported_param");
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+      expect(body.error_type).toBe("invalid_query");
       expect(body.field).toBe("aggregate");
     });
 
