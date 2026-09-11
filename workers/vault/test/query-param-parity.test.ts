@@ -1,5 +1,5 @@
 /**
- * Cloud B1 query parity — contract: Specs/cloud B1, P1–P14.
+ * Cloud B1 query parity — contract: Specs/cloud B1, P1–P14; B2 updates P11.
  * Bun twins at vault 41d91be: core/src/core.test.ts query-notes broken and
  * ambiguous link filters (#555/#581): "query-notes has_broken_links=true
  * surfaces only notes with a dangling wikilink" and "query-notes
@@ -116,13 +116,11 @@ describe("B1 query parameter parity", () => {
     expect(result.isError).toBeFalsy();
     expect(JSON.parse(result.content[0].text)).toEqual([{ group: null, value: 0 }]);
   });
-  it("P11 REST aggregate retains status, error_type, and field", async () => {
+  it("P11 REST aggregate serves the total (B2)", async () => {
     const f = await fixture();
     const res = await f.get("?aggregate[op]=count");
-    expect(res.status).toBe(400);
-    const body = await res.json() as any;
-    expect(body.error_type).toBe("unsupported_param");
-    expect(body.field).toBe("aggregate");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([{ group: null, value: (await f.rows("?limit=500")).length }]);
   });
   it("P12 MCP update-note without id returns missing_required_field", async () => {
     const f = await fixture();
