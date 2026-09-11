@@ -342,6 +342,7 @@ function overrideVaultInfo(
       tags: projection.tags,
       indexed_fields: projection.indexed_fields,
       query_hints: projection.query_hints,
+      map: projection.map,
     };
     if (projection.getting_started) result.getting_started = projection.getting_started;
     if (projection.stats) result.stats = projection.stats;
