@@ -27,7 +27,7 @@ import { expandContent } from "@openparachute/core/src/expand.js";
 import { transactionAsync } from "@openparachute/core/src/txn.js";
 import { normalizePath } from "@openparachute/core/src/paths.js";
 import * as linkOps from "@openparachute/core/src/links.js";
-import { getUnresolvedLinksForNote, getUnresolvedLinksForNotes, getAmbiguousLinksForNote, getAmbiguousLinksForNotes } from "@openparachute/core/src/wikilinks.js";
+import { getUnresolvedLinksForNote, getUnresolvedLinksForNotes, getAmbiguousLinksForNote, getAmbiguousLinksForNotes, resolveOrQueueLink, resolveStructuredLinkNote, unresolvedLinkWarning, ambiguousLinkWarning, getContentWikilinkWarnings } from "@openparachute/core/src/wikilinks.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
 import { embeddingsPendingWarning, ignoredParamWarning, collectUnknownTagWarnings, computeSearchDidYouMean, searchDidYouMeanWarning, truncatedResultsWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
@@ -866,6 +866,25 @@ async function handleNotesInner(
       }
 
       const created: Note[] = [];
+      // Structured `links` are resolved in a second pass, after every note
+      // in this batch has been created (vault#555) — resolving inline (the
+      // old behavior) meant a link from item 0 to item 1's path silently
+      // dropped, since item 1 didn't exist yet at the moment item 0's links
+      // were processed. Mirrors the MCP create-note fix exactly (both
+      // layers share `resolveOrQueueLink` from core/wikilinks.ts).
+      const pendingLinks: { sourceId: string; links: { target: string; relationship: string }[] }[] = [];
+      const linkWarningsByNote = new Map<string, QueryWarning[]>();
+      const pushLinkWarning = (noteId: string, warning: QueryWarning): void => {
+        const list = linkWarningsByNote.get(noteId) ?? [];
+        list.push(warning);
+        linkWarningsByNote.set(noteId, list);
+      };
+      // Content wikilinks whose note+content pair needs an `unresolved_link`/
+      // `ambiguous_link` warning check (vault#570) — deferred to the same
+      // second pass as `pendingLinks` for the same forward-ref-within-batch
+      // reason (a content `[[wikilink]]` to a batch sibling created later
+      // resolves via the pending-wikilink backfill by the time this runs).
+      const contentWikilinkNotes: { noteId: string; content: string }[] = [];
       // `if_exists` bookkeeping (vault#555) — mirrors core/src/mcp.ts's
       // create-note tool exactly (same contract, independent REST-layer
       // reimplementation sharing the same core primitives). See that file's
@@ -939,6 +958,14 @@ async function handleNotesInner(
           });
         }
 
+        // Content-wikilink warnings (vault#570) — this branch's content
+        // update (if any) already ran `syncWikilinks` inside
+        // `store.updateNote` above; queue for the shared second-pass
+        // classification below.
+        if (updates.content !== undefined) {
+          contentWikilinkNotes.push({ noteId: result.id, content: updates.content });
+        }
+
         if (incomingTags.length > 0) {
           await store.tagNote(result.id, incomingTags);
           // Redundant with the outer batch loop's applySchemaDefaults (this
@@ -948,10 +975,7 @@ async function handleNotesInner(
         }
 
         if (item.links) {
-          for (const link of item.links as { target: string; relationship: string }[]) {
-            const target = await resolveNote(store, link.target);
-            if (target) await store.createLink(result.id, target.id, link.relationship);
-          }
+          pendingLinks.push({ sourceId: result.id, links: item.links as { target: string; relationship: string }[] });
         }
 
         return { note: (await store.getNote(result.id)) ?? result, noMutate: false };
@@ -1014,12 +1038,45 @@ async function handleNotesInner(
           if (upsertMode) existedMap.set(note.id, false);
 
           if (item.links) {
-            for (const link of item.links as { target: string; relationship: string }[]) {
-              const target = await resolveNote(store, link.target);
-              if (target) await store.createLink(note.id, target.id, link.relationship);
+            pendingLinks.push({ sourceId: note.id, links: item.links as { target: string; relationship: string }[] });
+          }
+
+          // Content-wikilink warnings (vault#570) — `store.createNote` above
+          // already ran `syncWikilinks` (gated on `content` truthy, same
+          // condition here); queue for the shared second-pass classification.
+          if (item.content) {
+            contentWikilinkNotes.push({ noteId: note.id, content: item.content });
+          }
+
+          created.push((await store.getNote(note.id)) ?? note);
+        }
+        // --- Resolve structured links (vault#555) ---
+        // Same semantics as [[wikilinks]]: ID or path/title match, tried now
+        // that every sibling note in this batch exists. A target that still
+        // doesn't resolve is queued for lazy resolution (backfills
+        // automatically when a matching note is created later) and surfaces
+        // an `unresolved_link` warning naming the target. A target that
+        // matched ≥2 notes (vault#570) is neither linked nor queued —
+        // surfaces a distinct `ambiguous_link` warning instead. Never silent.
+        for (const { sourceId, links } of pendingLinks) {
+          for (const link of links) {
+            const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+            if (outcome.status === "resolved") {
+              await store.createLink(sourceId, outcome.note_id, link.relationship);
+            } else if (outcome.status === "ambiguous") {
+              pushLinkWarning(sourceId, ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
+            } else {
+              pushLinkWarning(sourceId, unresolvedLinkWarning(link.target, link.relationship));
             }
           }
-          created.push((await store.getNote(note.id)) ?? note);
+        }
+
+        // --- Content-wikilink warnings (vault#570) ---
+        // Same forward-ref-aware timing as the structured-links pass above.
+        for (const { noteId, content } of contentWikilinkNotes) {
+          for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+            pushLinkWarning(noteId, warning);
+          }
         }
       };
       try {
@@ -1057,6 +1114,8 @@ async function handleNotesInner(
 
       const final = refreshed.map((n) => {
         let out: any = attachValidationStatus(store, db, n);
+        const warnings = linkWarningsByNote.get(n.id) ?? [];
+        if (warnings.length > 0) out = { ...out, warnings };
         const existed = existedMap.get(n.id);
         if (existed !== undefined) out = { ...out, existed };
         return out;
@@ -1253,20 +1312,41 @@ async function handleNotesInner(
           const createdNote = await store.createNote(content, createOpts);
           if (tagsArr.length > 0) await applySchemaDefaults(store, db, [createdNote.id], tagsArr);
           const linksAdd = (body.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
+          // `unresolved_link` / `ambiguous_link` warnings (vault#555, vault#570)
+          // — a target that doesn't resolve is queued for lazy resolution
+          // (backfills automatically when a matching note is created later),
+          // and a target matching ≥2 notes is neither linked nor queued.
+          // Never silently dropped.
+          const createWarnings: QueryWarning[] = [];
           if (linksAdd) {
             for (const link of linksAdd) {
-              const target = await resolveNote(store, link.target);
-              if (target) await store.createLink(createdNote.id, target.id, link.relationship, link.metadata);
+              const outcome = resolveOrQueueLink(db, createdNote.id, link.target, link.relationship);
+              if (outcome.status === "resolved") {
+                await store.createLink(createdNote.id, outcome.note_id, link.relationship, link.metadata);
+              } else if (outcome.status === "ambiguous") {
+                createWarnings.push(ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
+              } else {
+                createWarnings.push(unresolvedLinkWarning(link.target, link.relationship));
+              }
             }
+          }
+          // Content-wikilink warnings (vault#570) — `store.createNote` above
+          // already ran `syncWikilinks`; this is the single-note (non-batch)
+          // create path, so there's no batch-sibling forward-ref to wait for
+          // — compute right away against the committed content.
+          if (content) {
+            createWarnings.push(...getContentWikilinkWarnings(db, createdNote.id, content));
           }
           const finalNote = await store.getNote(createdNote.id);
           if (!finalNote) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
           const validated = attachValidationStatus(store, db, finalNote);
+          if (createWarnings.length > 0) (validated as any).warnings = createWarnings;
           const includeContentResp = body.include_content !== false;
           if (includeContentResp) return json({ ...validated, created: true });
           const lean: any = toNoteIndex(validated);
           const vs = (validated as any).validation_status;
           if (vs !== undefined) lean.validation_status = vs;
+          if (createWarnings.length > 0) lean.warnings = createWarnings;
           lean.created = true;
           return json(lean);
         }
@@ -1373,7 +1453,7 @@ async function handleNotesInner(
       const resolvedLinksToRemove: { targetId: string; relationship: string }[] = [];
       if (linksRemove) {
         for (const link of linksRemove) {
-          const target = await resolveNote(store, link.target);
+          const target = resolveStructuredLinkNote(db, link.target);
           if (!target) continue;
           resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
           if (link.relationship === "wikilink" && target.path) {
@@ -1432,6 +1512,14 @@ async function handleNotesInner(
         gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta });
       }
 
+      // Content-wikilink warnings (vault#570) gate on the SAME condition
+      // `store.updateNote`/`syncWikilinks` use to decide whether to re-sync
+      // content wikilinks at all — a tags/links-only PATCH must not
+      // spuriously re-warn about pre-existing broken links this call never
+      // touched.
+      const contentChanged = updates.content !== undefined
+        || updates.append !== undefined
+        || updates.prepend !== undefined;
       if (Object.keys(updates).length > 0) {
         updates.actor = writeCtx.actor;
         updates.via = writeCtx.via;
@@ -1450,15 +1538,42 @@ async function handleNotesInner(
         await store.untagNote(note.id, body.tags.remove);
       }
 
+      // Add links. `unresolved_link` / `ambiguous_link` warnings (vault#555,
+      // vault#570) — a target that doesn't resolve is queued for lazy
+      // resolution (backfills automatically when a matching note is created
+      // later); a target matching ≥2 notes is neither linked nor queued.
+      // Never silently dropped.
+      const linkWarnings: QueryWarning[] = [];
       if (body.links?.add) {
         for (const link of body.links.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[]) {
-          const target = await resolveNote(store, link.target);
-          if (target) await store.createLink(note.id, target.id, link.relationship, link.metadata);
+          const outcome = resolveOrQueueLink(db, note.id, link.target, link.relationship);
+          if (outcome.status === "resolved") {
+            await store.createLink(note.id, outcome.note_id, link.relationship, link.metadata);
+          } else if (outcome.status === "ambiguous") {
+            linkWarnings.push(ambiguousLinkWarning(link.target, link.relationship, outcome.candidates.length));
+          } else {
+            linkWarnings.push(unresolvedLinkWarning(link.target, link.relationship));
+          }
         }
       }
 
+      // Response shape: full Note (back-compat default) or lean NoteIndex
+      // (vault#285 friction point 2.response — opt-out for callers making
+      // frequent small edits to large notes). Mirror the MCP `update-note`
+      // `include_content` knob exactly, *and* `validation_status` attachment
+      // (vault#287) so HTTP and MCP consumers see the same schema-validation
+      // signal. Recipe matches `core/src/mcp.ts:751` — attach to the full
+      // Note first, then carry the field across the lean conversion (since
+      // `toNoteIndex` drops unknown fields).
       const updatedNote = await store.getNote(note.id);
       if (updatedNote === null) return json({ error: "Note disappeared", error_type: "not_found" }, 404);
+      // Content-wikilink warnings (vault#570) — `store.updateNote` above
+      // already ran `syncWikilinks` when `contentChanged`; this PATCH
+      // handles a single note (no batch-sibling forward-ref to wait for),
+      // so compute right away against the committed content.
+      if (contentChanged) {
+        linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content));
+      }
       const validated: any = attachValidationStatus(store, db, updatedNote);
       const linkMutated = body.links?.add !== undefined || body.links?.remove !== undefined;
       const includeLinksResp = linkMutated || parseBool(parseQuery(url, "include_links"), false);
@@ -1469,12 +1584,14 @@ async function handleNotesInner(
           tagScope.raw,
         );
       }
+      if (linkWarnings.length > 0) validated.warnings = linkWarnings;
       const includeContentResp = body.include_content !== false;
       if (includeContentResp) return json({ ...validated, created: false });
       const lean: any = toNoteIndex(validated);
       const vs = (validated as any).validation_status;
       if (vs !== undefined) lean.validation_status = vs;
       if (validated.links !== undefined) lean.links = validated.links;
+      if (linkWarnings.length > 0) lean.warnings = linkWarnings;
       lean.created = false;
       return json(lean);
     } catch (e: any) {
