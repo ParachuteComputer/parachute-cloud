@@ -68,8 +68,8 @@ describe("B7 link details and batch summary", () => {
   });
   it("P5 structured relationship survives", async () => {
     const v = freshVault("structured");
-    // Match the core twin: MCP queues unresolved structured links; REST POST
-    // currently drops them (B9). This pin tests REST surfacing, not that writer.
+    // Both doors now queue structured links (B9 / cloud#134 D.8). Keep
+    // the MCP writer here to pin the REST read surface in isolation.
     const n = await call(v, "create-note", { content: "x", links: [{ target: `Nope-${v}`, relationship: "mentions" }] });
     expect((await get(v, `id=${n.id}&include_broken_links=true`)).broken_links).toEqual([{ target: `Nope-${v}`, relationship: "mentions" }]);
   });
