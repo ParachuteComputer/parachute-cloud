@@ -351,23 +351,18 @@ function overrideVaultInfo(
 }
 
 /**
- * Map a core domain error to its JSON-RPC error shape (mirrors mcp-http.ts).
- *
- * The trailing generic branch is bun's "backstop" (its own doc comment:
- * "nothing falls through to the unstructured isError text except a TRULY
- * unknown error") — ported here because the attachment-ticket mint tools'
- * validation errors (`missing_required_field`, `invalid_query`,
- * `file_too_large`, `blocked_upload_extension`, …) are plain
- * `structuredError()` leaves (core/src/mcp.ts), not one of the four
- * dedicated domain-error classes above. Before this branch existed, EVERY
- * `structuredError()` throw on cloud MCP silently degraded to unstructured
- * `isError: true` text — losing `error_type` entirely, a real drift from
- * bun's byte-shape (caught by this PR's own conformance suite on the mint
- * tools' `missing_required_field` case). Not ticket-specific: this closes
- * the gap for every core tool's `structuredError()` leaf on this door.
+ * Map a core domain error to its JSON-RPC error shape. A port of bun's
+ * chain in parachute-vault/src/mcp-http.ts (the wire contract at the
+ * pinned core SHA), branch for branch and in the same order: the two
+ * `error_type`-keyed honest-query branches first, the four write-path
+ * classes, then QueryError/CursorError matched on `.name` (their `code`
+ * is not a fixed discriminator), the five `.code`-keyed classes, and the
+ * generic `error_type` backstop. `null` = a truly unknown error; the
+ * caller renders that as in-band `isError: true` text.
  */
 function mapDomainError(err: unknown): { code: number; data: Record<string, unknown> } | null {
   const e = err as {
+    name?: string;
     code?: string;
     note_id?: string;
     note_path?: string | null;
@@ -378,71 +373,134 @@ function mapDomainError(err: unknown): { code: number; data: Record<string, unkn
     to?: unknown;
     current?: unknown;
     violations?: unknown;
-    tag?: string;
-    cycle?: string[];
     error_type?: string;
-    hint?: string;
-    limit?: unknown;
     got?: unknown;
+    hint?: string;
+    path?: string;
+    candidates?: unknown;
     extension?: string;
+    reason?: string;
+    limit?: number;
+    tag?: string;
+    cycle?: unknown;
+    referencing_tags?: unknown;
     how_to?: string;
+    size?: number;
+    max_bytes?: number;
+    mime_type?: string;
   };
-  switch (e?.code) {
-    case "CONFLICT":
-      return {
-        code: INVALID_REQUEST,
-        data: {
-          error_type: "conflict",
-          current_updated_at: e.current_updated_at ?? null,
-          your_updated_at: e.expected_updated_at,
-          path: e.note_path ?? null,
-          note_id: e.note_id,
-        },
-      };
-    case "TRANSITION_CONFLICT":
-      return {
-        code: INVALID_REQUEST,
-        data: {
-          error_type: "transition_conflict",
-          note_id: e.note_id,
-          path: e.note_path ?? null,
-          field: e.field,
-          expected_from: e.expected_from,
-          to: e.to,
-          current: e.current ?? null,
-        },
-      };
-    case "SCHEMA_VALIDATION":
-      return { code: INVALID_PARAMS, data: { error_type: "schema_validation", violations: e.violations ?? [] } };
-    case "PRECONDITION_REQUIRED":
-      return {
-        code: INVALID_PARAMS,
-        data: { error_type: "precondition_required", note_id: e.note_id, path: e.note_path ?? null },
-      };
-    // parent_names cycle guard (vault#552) — update-tag would close a
-    // cycle. Mirrors REST's 409 parent_cycle shape.
-    case "PARENT_CYCLE":
-      return {
-        code: INVALID_REQUEST,
-        data: { error_type: "parent_cycle", tag: e.tag, cycle: e.cycle ?? [] },
-      };
-    default:
-      if (typeof e?.error_type === "string") {
-        return {
-          code: INVALID_PARAMS,
-          data: {
-            error_type: e.error_type,
-            ...(e.field !== undefined ? { field: e.field } : {}),
-            ...(e.hint !== undefined ? { hint: e.hint } : {}),
-            ...(e.limit !== undefined ? { limit: e.limit } : {}),
-            ...(e.got !== undefined ? { got: e.got } : {}),
-            ...(e.extension !== undefined ? { extension: e.extension } : {}),
-            ...(e.how_to !== undefined ? { how_to: e.how_to } : {}),
-          },
-        };
-      }
-      return null;
+  if (e?.error_type === "invalid_query") {
+    return {
+      code: INVALID_PARAMS,
+      data: {
+        error_type: "invalid_query",
+        field: e.field,
+        got: e.got,
+        hint: e.hint,
+        ...(e.how_to !== undefined ? { how_to: e.how_to } : {}),
+      },
+    };
   }
+  if (e?.error_type === "invalid_search_syntax") {
+    return {
+      code: INVALID_PARAMS,
+      data: { error_type: "invalid_search_syntax", field: e.field, got: e.got, hint: e.hint },
+    };
+  }
+  if (e?.code === "CONFLICT") {
+    return {
+      code: INVALID_REQUEST,
+      data: {
+        error_type: "conflict",
+        current_updated_at: e.current_updated_at ?? null,
+        your_updated_at: e.expected_updated_at,
+        path: e.note_path ?? null,
+        note_id: e.note_id,
+        hint: "re-read the note (query-notes) and re-apply your change against its current updated_at, or pass force: true to overwrite",
+      },
+    };
+  }
+  if (e?.code === "TRANSITION_CONFLICT") {
+    return {
+      code: INVALID_REQUEST,
+      data: {
+        error_type: "transition_conflict",
+        note_id: e.note_id,
+        path: e.note_path ?? null,
+        field: e.field,
+        expected_from: e.expected_from,
+        to: e.to,
+        current: e.current ?? null,
+        hint: "re-read the note's current value for this field and retry the transition from its actual current state",
+      },
+    };
+  }
+  if (e?.code === "SCHEMA_VALIDATION") {
+    return {
+      code: INVALID_PARAMS,
+      data: {
+        error_type: "schema_validation",
+        violations: e.violations ?? [],
+        hint: "fix every field listed in violations and retry — none of this write was applied",
+      },
+    };
+  }
+  if (e?.code === "PRECONDITION_REQUIRED") {
+    return {
+      code: INVALID_PARAMS,
+      data: {
+        error_type: "precondition_required",
+        note_id: e.note_id,
+        path: e.note_path ?? null,
+        hint: "re-read the note, pass its updated_at as if_updated_at, or pass force: true to skip the check",
+      },
+    };
+  }
+  if (e?.name === "QueryError") {
+    return {
+      code: INVALID_PARAMS,
+      data: { error_type: e.error_type ?? "invalid_query", code: e.code, field: e.field, got: e.got, hint: e.hint },
+    };
+  }
+  if (e?.name === "CursorError" && typeof e.code === "string") {
+    return { code: INVALID_PARAMS, data: { error_type: e.code } };
+  }
+  if (e?.code === "PATH_CONFLICT") {
+    return { code: INVALID_REQUEST, data: { error_type: "path_conflict", path: e.path } };
+  }
+  if (e?.code === "AMBIGUOUS_PATH") {
+    return { code: INVALID_REQUEST, data: { error_type: "ambiguous_path", path: e.path, candidates: e.candidates } };
+  }
+  if (e?.code === "INVALID_EXTENSION") {
+    return { code: INVALID_PARAMS, data: { error_type: "invalid_extension", extension: e.extension, reason: e.reason } };
+  }
+  if (e?.code === "BATCH_TOO_LARGE") {
+    return { code: INVALID_REQUEST, data: { error_type: "batch_too_large", limit: e.limit, got: e.got } };
+  }
+  if (e?.code === "TAG_FIELD_CONFLICT") {
+    return { code: INVALID_PARAMS, data: { error_type: "tag_field_conflict", tag: e.tag, violations: e.violations ?? [] } };
+  }
+  if (e?.code === "PARENT_CYCLE") {
+    return { code: INVALID_REQUEST, data: { error_type: "parent_cycle", tag: e.tag, cycle: e.cycle ?? [] } };
+  }
+  if (typeof e?.error_type === "string") {
+    return {
+      code: INVALID_PARAMS,
+      data: {
+        error_type: e.error_type,
+        field: e.field,
+        hint: e.hint,
+        ...(e.limit !== undefined ? { limit: e.limit } : {}),
+        ...(e.got !== undefined ? { got: e.got } : {}),
+        ...(e.extension !== undefined ? { extension: e.extension } : {}),
+        ...(e.how_to !== undefined ? { how_to: e.how_to } : {}),
+        ...(e.size !== undefined ? { size: e.size } : {}),
+        ...(e.max_bytes !== undefined ? { max_bytes: e.max_bytes } : {}),
+        ...(e.mime_type !== undefined ? { mime_type: e.mime_type } : {}),
+      },
+    };
+  }
+  return null;
 }
 
 /**
