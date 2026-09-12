@@ -19,11 +19,13 @@ import {
   mergeMetadata,
   MAX_BATCH_SIZE,
   validateExtension,
+  PathConflictError,
 } from "@openparachute/core/src/notes.js";
 import { applyContentRange } from "@openparachute/core/src/content-range.js";
 import { attachValidationStatus, enforceStrictWrite } from "@openparachute/core/src/mcp.js";
 import { expandContent } from "@openparachute/core/src/expand.js";
 import { transactionAsync } from "@openparachute/core/src/txn.js";
+import { normalizePath } from "@openparachute/core/src/paths.js";
 import * as linkOps from "@openparachute/core/src/links.js";
 import { getUnresolvedLinksForNote, getUnresolvedLinksForNotes, getAmbiguousLinksForNote, getAmbiguousLinksForNotes } from "@openparachute/core/src/wikilinks.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
@@ -864,21 +866,153 @@ async function handleNotesInner(
       }
 
       const created: Note[] = [];
+      // `if_exists` bookkeeping (vault#555) — mirrors core/src/mcp.ts's
+      // create-note tool exactly (same contract, independent REST-layer
+      // reimplementation sharing the same core primitives). See that file's
+      // doc comments for the full rationale.
+      const existedMap = new Map<string, boolean>();
+      const noMutateIds = new Set<string>();
+      const recordExistedBranch = (resultNote: Note, noMutate: boolean): void => {
+        existedMap.set(resultNote.id, true);
+        if (noMutate) noMutateIds.add(resultNote.id);
+        created.push(resultNote);
+      };
+      const applyExistingNote = async (
+        item: any,
+        existingNote: Note,
+        mode: "ignore" | "update" | "replace",
+      ): Promise<{ note: Note; noMutate: boolean }> => {
+        // CRITICAL scope guard (vault#555 auth-review must-fix): `existingNote`
+        // was resolved VAULT-WIDE by path (store.getNoteByPath) at BOTH call
+        // sites below (proactive + race-backstop). The batch's incoming-tag
+        // pre-validation guards only each item's OWN tags — NOT this resolved
+        // note — so without this a token scoped to `public` could READ (ignore)
+        // or OVERWRITE (update/replace) a note carrying only an out-of-scope
+        // tag `secret` just by naming its path. When the note is outside the
+        // caller's tag scope, treat it as a path conflict — the path is taken,
+        // but invisible to this caller — throwing BEFORE any read/mutation so
+        // we never expose content or write. `noteWithinTagScope` is a no-op for
+        // unscoped tokens (tagScope.raw === null → always true). The throw
+        // propagates to runBatch's PATH_CONFLICT catch → 409 path_conflict,
+        // byte-identical to a genuine conflict (leaks nothing about WHY).
+        if (!noteWithinTagScope(existingNote, tagScope.allowed, tagScope.raw)) {
+          throw new PathConflictError(existingNote.path ?? "");
+        }
+        if (mode === "ignore") {
+          return { note: existingNote, noMutate: true };
+        }
+        const updates: { content?: string; metadata?: Record<string, unknown> } = {};
+        if (mode === "update") {
+          if (item.content !== undefined) updates.content = item.content;
+          if (item.metadata !== undefined) {
+            updates.metadata = mergeMetadata(
+              existingNote.metadata as Record<string, unknown> | null | undefined,
+              item.metadata,
+            );
+          }
+        } else {
+          // "replace" — PUT semantics: content/metadata become exactly this
+          // payload (empty default when omitted), never merged.
+          updates.content = item.content ?? "";
+          updates.metadata = item.metadata ?? {};
+        }
+
+        const incomingTags: string[] = item.tags ?? [];
+        const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
+        const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata });
+
+        // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
+        // core UPDATE on the tag/link mutation too, not just `updates` — a
+        // tags-only/links-only "update" leaves `updates` empty, and skipping
+        // store.updateNote would freeze `updated_at` even though store.tagNote
+        // genuinely mutates the note (breaking cursor polling + updated_at
+        // sync). Mirrors the update-note/PATCH hasTagMutation||hasLinkMutation
+        // gate. "replace" always sets content+metadata, so it was unaffected.
+        const hasLinkMutation = item.links !== undefined;
+        let result: Note = existingNote;
+        if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
+          result = await store.updateNote(existingNote.id, {
+            ...updates,
+            actor: writeCtx.actor,
+            via: writeCtx.via,
+          });
+        }
+
+        if (incomingTags.length > 0) {
+          await store.tagNote(result.id, incomingTags);
+          // Redundant with the outer batch loop's applySchemaDefaults (this
+          // note isn't in `noMutateIds` — only "ignore" hits are), but harmless
+          // (idempotent) — kept so the update/replace branch is self-contained.
+          await applySchemaDefaults(store, db, [result.id], incomingTags);
+        }
+
+        if (item.links) {
+          for (const link of item.links as { target: string; relationship: string }[]) {
+            const target = await resolveNote(store, link.target);
+            if (target) await store.createLink(result.id, target.id, link.relationship);
+          }
+        }
+
+        return { note: (await store.getNote(result.id)) ?? result, noMutate: false };
+      };
+
       const batched = items.length > 1;
       const runBatch = async (): Promise<void> => {
         for (const item of items) {
           const extension = item.extension !== undefined ? validateExtension(item.extension) : undefined;
+          const effectiveExtension = extension ?? "md";
+          const ifExists: string = item.if_exists ?? "error";
+          const upsertMode = ifExists === "ignore" || ifExists === "update" || ifExists === "replace";
+
+          // Proactive existence check (vault#555) — only possible with a
+          // path. Handles the common, non-racing case cleanly: skips the
+          // raw-item strict gate below (it would validate the wrong shape —
+          // see `applyExistingNote`) and goes straight to the collision
+          // branch. The catch below is the backstop for a true race.
+          let existingNote: Note | null = null;
+          if (upsertMode && item.path) {
+            const normalized = normalizePath(item.path);
+            existingNote = normalized ? await store.getNoteByPath(normalized, effectiveExtension) : null;
+          }
+          if (existingNote) {
+            const { note: resultNote, noMutate } = await applyExistingNote(item, existingNote, ifExists as "ignore" | "update" | "replace");
+            recordExistedBranch(resultNote, noMutate);
+            continue;
+          }
+
           gateStrictWrite(store, writeCtx, { path: item.path, tags: item.tags, metadata: item.metadata });
-          const note = await store.createNote(item.content ?? "", {
-            id: item.id,
-            path: item.path,
-            tags: item.tags,
-            metadata: item.metadata,
-            created_at: item.createdAt ?? item.created_at,
-            ...(extension !== undefined ? { extension } : {}),
-            actor: writeCtx.actor,
-            via: writeCtx.via,
-          });
+          let note: Note;
+          try {
+            note = await store.createNote(item.content ?? "", {
+              id: item.id,
+              path: item.path,
+              tags: item.tags,
+              metadata: item.metadata,
+              created_at: item.createdAt ?? item.created_at,
+              ...(extension !== undefined ? { extension } : {}),
+              // Write-attribution (vault#298) — REST batch create.
+              actor: writeCtx.actor,
+              via: writeCtx.via,
+            });
+          } catch (err: any) {
+            // Race backstop (vault#555): a concurrent writer's INSERT
+            // committed between our proactive check and this one.
+            // Re-resolve the now-existing row and fall through to the SAME
+            // branch a proactive hit would have taken.
+            if (upsertMode && err?.code === "PATH_CONFLICT") {
+              const winner = await store.getNoteByPath(err.path, effectiveExtension);
+              if (winner) {
+                const { note: resultNote, noMutate } = await applyExistingNote(item, winner, ifExists as "ignore" | "update" | "replace");
+                recordExistedBranch(resultNote, noMutate);
+                continue;
+              }
+            }
+            throw err;
+          }
+
+          if (upsertMode) existedMap.set(note.id, false);
+
           if (item.links) {
             for (const link of item.links as { target: string; relationship: string }[]) {
               const target = await resolveNote(store, link.target);
@@ -905,6 +1039,10 @@ async function handleNotesInner(
 
       const mutatedIds = new Set<string>();
       for (const note of created) {
+        // "ignore" hits (vault#555) promise ZERO mutation, including
+        // schema-default backfill of a since-added default the existing
+        // note predates — skip them entirely.
+        if (noMutateIds.has(note.id)) continue;
         if (note.tags?.length) {
           for (const id of await applySchemaDefaults(store, db, [note.id], note.tags)) mutatedIds.add(id);
         }
@@ -917,7 +1055,12 @@ async function handleNotesInner(
               return created.map((n) => byId.get(n.id) ?? n);
             })();
 
-      const final = refreshed.map((n) => attachValidationStatus(store, db, n));
+      const final = refreshed.map((n) => {
+        let out: any = attachValidationStatus(store, db, n);
+        const existed = existedMap.get(n.id);
+        if (existed !== undefined) out = { ...out, existed };
+        return out;
+      });
       // Batch summary (vault#555) — compact shape instead of N full note
       // objects. Batch-only (a `notes` array); `summary` is ignored on a
       // single-note POST. Mirrors the MCP create-note tool exactly.
