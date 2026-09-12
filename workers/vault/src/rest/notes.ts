@@ -27,10 +27,11 @@ import { transactionAsync } from "@openparachute/core/src/txn.js";
 import * as linkOps from "@openparachute/core/src/links.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
-import { embeddingsPendingWarning, ignoredParamWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
+import { embeddingsPendingWarning, ignoredParamWarning, collectUnknownTagWarnings, computeSearchDidYouMean, searchDidYouMeanWarning, truncatedResultsWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
 import {
   json,
   jsonWithWarnings,
+  collectRemovedParamWarnings,
   cursorJson,
   parseBool,
   parseQuery,
@@ -41,6 +42,7 @@ import {
   parseExpandParams,
   parseNotesQueryOpts,
   parseExpandParam,
+  parseAggregateParam,
   parseLinkCountDirection,
   resolveNote,
   NotFoundError,
@@ -314,47 +316,6 @@ async function handleNotesInner(
         return json(result);
       }
 
-      // `aggregate[...]` on a LIST query (vault#626 / cloud#134 B.4). Cloud
-      // v1's REST layer has no aggregate parser — the params used to be
-      // dropped on the floor and note rows came back, which is the exact
-      // silent shape-break vault#626 opens with: a caller asking for
-      // `[{group, value}]` gets `NoteIndex[]` and no signal at all.
-      //
-      // This is a 400, not an `unsupported_param` WARNING, on purpose. The
-      // warning convention here (`search_mode`, `sort` under search — C1.5)
-      // covers params that leave the RESULT SET unchanged: the caller's rows
-      // are still the rows it asked for, so a header is enough. `aggregate`
-      // is a mode switch — it changes the response SHAPE — so returning rows
-      // with a header would hand a rollup parser the wrong envelope. It also
-      // keeps the doors' failure modes aligned: the bun door answers the one
-      // aggregate composition IT can't serve (`search` + `aggregate`) with a
-      // 400 naming `aggregate`, not with rows.
-      //
-      // Scope of the gap: REST only. Cloud's MCP `query-notes` is
-      // core-driven (`generateMcpTools(store)`), so its `aggregate` param
-      // reaches core's `aggregateNotes` and grouped rollups already work on
-      // this door. The ungrouped filtered total (`{op: "count"}` with no
-      // `group_by`) landed in core AFTER the commit pinned in
-      // `scripts/vault-source.env`, so it arrives here — on both surfaces —
-      // when that pin is promoted.
-      const aggregateParam = [...url.searchParams.keys()].find(
-        (k) => k === "aggregate" || k.startsWith("aggregate["),
-      );
-      if (aggregateParam !== undefined) {
-        return json(
-          {
-            error:
-              "`aggregate` is not supported on cloud v1's REST door — a rollup would have to come back as `[{group, value}]`, and this door can only return note rows. Rejected rather than silently answering the wrong shape.",
-            code: "UNSUPPORTED_PARAM",
-            error_type: "unsupported_param",
-            field: "aggregate",
-            got: aggregateParam,
-            hint: "use the MCP `query-notes` tool's `aggregate` param on this vault (grouped rollups are served there), or the self-hosted door's REST `?aggregate[op]=…`",
-          },
-          400,
-        );
-      }
-
       // Semantic search (EXPERIMENTAL — semantic search MVP, C2). Ported
       // verbatim from parachute-vault/src/routes.ts (the wire contract lives
       // in this branch, so it is transcribed rather than reinvented — the
@@ -373,6 +334,20 @@ async function handleNotesInner(
               error_type: "invalid_query",
               field: "semantic",
               hint: "drop `search` when using `semantic`, or drop `semantic`/`near_text` to use keyword search",
+            },
+            400,
+          );
+        }
+        const semanticAggregate = parseAggregateParam(url);
+        if (semanticAggregate.error) return semanticAggregate.error;
+        if (semanticAggregate.aggregate) {
+          return json(
+            {
+              error: "aggregate is incompatible with semantic search — a rollup returns groups, not ranked notes.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `semantic`/`near_text` when using `aggregate`",
             },
             400,
           );
@@ -480,6 +455,25 @@ async function handleNotesInner(
         );
       }
 
+      // vault#626 — `search=` used to silently ignore `aggregate[...]` and
+      // return note rows. MCP already rejects the combo; REST must too.
+      if (search) {
+        const searchAggregate = parseAggregateParam(url);
+        if (searchAggregate.error) return searchAggregate.error;
+        if (searchAggregate.aggregate) {
+          return json(
+            {
+              error: "aggregate is incompatible with full-text search — pick one.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `search` when using `aggregate`",
+            },
+            400,
+          );
+        }
+      }
+
       // Full-text search
       if (search) {
         const searchTags = parseQueryList(url, "tag");
@@ -536,6 +530,15 @@ async function handleNotesInner(
             );
           }
           throw e;
+        }
+        // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
+        // FTS5-vocabulary scan) and ONLY computed on the already-rare
+        // empty-result path, mirroring `unknown_tag`'s did_you_mean.
+        if (rawResults.length === 0) {
+          const suggestion = computeSearchDidYouMean(db, search);
+          if (suggestion) {
+            searchWarnings.push(searchDidYouMeanWarning(search, suggestion));
+          }
         }
         const results = filterNotesByTagScope(rawResults, tagScope.allowed, tagScope.raw);
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
@@ -601,6 +604,79 @@ async function handleNotesInner(
           400,
         );
       }
+      // Aggregation / rollup mode (top new-feature ask from a UX round).
+      // Mutually exclusive with cursor/near — a rollup returns one row per
+      // group, not a paginated/graph-scoped note list — so reject those
+      // combos loudly before touching the DB, then short-circuit: none of
+      // the normal-query output machinery below (expand, include_links,
+      // metadata filtering, ...) applies to rollup rows.
+      const aggregateParsed = parseAggregateParam(url);
+      if (aggregateParsed.error) return aggregateParsed.error;
+      if (aggregateParsed.aggregate) {
+        if (hasCursorParam) {
+          return json(
+            {
+              error: "aggregate is incompatible with cursor pagination — a rollup has no watermark to page through.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `cursor` when using `aggregate`",
+            },
+            400,
+          );
+        }
+        if (nearNoteIdEarly) {
+          return json(
+            {
+              error: "aggregate is incompatible with near (graph neighborhood).",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `near` when using `aggregate`",
+            },
+            400,
+          );
+        }
+        try {
+          const rows = await store.aggregateNotes({ ...queryOpts, aggregate: aggregateParsed.aggregate });
+          return json(rows);
+        } catch (e: any) {
+          if (e && e.name === "QueryError") {
+            return json(
+              {
+                error: e.message,
+                code: e.code ?? "INVALID_QUERY",
+                error_type: e.error_type ?? "invalid_query",
+                ...(e.field !== undefined ? { field: e.field } : {}),
+                ...(e.got !== undefined ? { got: e.got } : {}),
+                ...(e.hint !== undefined ? { hint: e.hint } : {}),
+              },
+              400,
+            );
+          }
+          throw e;
+        }
+      }
+
+      // Warnings channel (vault#550). `unknown_tag` stays structured-query
+      // only. `removed_param` warnings carry no tag information and fire
+      // regardless of scope. `search_mode` without `search` (vault#551) also
+      // carries no tag information — this IS the structured-query path
+      // precisely because `search` was absent or empty, so a `search_mode`
+      // param here is always a no-op.
+      const queryWarnings: QueryWarning[] = [
+        ...nearTextIgnored,
+        ...collectRemovedParamWarnings(url),
+        ...(parseQuery(url, "search_mode")
+          ? [
+              ignoredParamWarning(
+                "search_mode",
+                "no `search` was provided — search_mode only affects full-text search query parsing",
+              ),
+            ]
+          : []),
+        ...collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()),
+      ];
       let results: Note[];
       let nextCursor: string | null = null;
       try {
@@ -629,6 +705,18 @@ async function handleNotesInner(
           return json({ error: e.message, code: e.code ?? "cursor_invalid", error_type: e.code ?? "cursor_invalid" }, 400);
         }
         throw e;
+      }
+
+      // Truncation-honesty (vault contracts-brief V1.3): captured BEFORE
+      // near/tag-scope filtering, which can only shrink the set further —
+      // this reflects whether the underlying store query actually hit its
+      // `limit` (i.e. there may be more rows the caller never saw). Cursor
+      // mode is exempt — it already carries `next_cursor` as the honest
+      // "more may follow" signal, so a second warning would be redundant.
+      // Explicit offset is also exempt (vault#601): the caller is already
+      // paging, not hitting an accidental full default page.
+      if (!hasCursorParam && queryOpts.offset === undefined && results.length === queryOpts.limit) {
+        queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
       }
 
       const nearNoteId = parseQuery(url, "near[note_id]");
@@ -691,7 +779,7 @@ async function handleNotesInner(
             }
           }
         }
-        return json({ nodes, edges });
+        return jsonWithWarnings({ nodes, edges, ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}) }, queryWarnings);
       }
 
       if (includeLinks || includeAttachments) {
@@ -711,12 +799,12 @@ async function handleNotesInner(
           if (includeAttachments) enriched.attachments = await store.getAttachments(n.id);
           enrichedOut.push(enriched);
         }
-        if (hasCursorParam) return cursorJson(enrichedOut, nextCursor);
-        return jsonWithWarnings(enrichedOut, nearTextIgnored);
+        if (hasCursorParam) return cursorJson(enrichedOut, nextCursor, queryWarnings);
+        return jsonWithWarnings(enrichedOut, queryWarnings);
       }
 
-      if (hasCursorParam) return cursorJson(output, nextCursor);
-      return jsonWithWarnings(output, nearTextIgnored);
+      if (hasCursorParam) return cursorJson(output, nextCursor, queryWarnings);
+      return jsonWithWarnings(output, queryWarnings);
     }
 
     // POST /notes — create (single or batch)

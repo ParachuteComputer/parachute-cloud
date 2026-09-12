@@ -5,7 +5,7 @@
  * Everything here is a pure URL→object function with no runtime-specific deps,
  * so it is identical to the bun vault.
  */
-import type { Store, Note, QueryOpts } from "@openparachute/core/src/types.js";
+import type { Store, Note, QueryOpts, AggregateSpec } from "@openparachute/core/src/types.js";
 import {
   TAG_EXPAND_MODES,
   type TagExpandMode,
@@ -61,6 +61,31 @@ export function jsonWithWarnings(data: unknown, warnings: QueryWarning[], status
 }
 
 /**
+ * REST-only `removed_param` warning (vault#550) — the flat `date_field` /
+ * `date_from` / `date_to` query-string params were removed at 0.6.4
+ * (vault#288) and have been silently ignored ever since (routes.ts:633-ish
+ * comment). A request that passes any of them now gets a warning naming
+ * the ignored param and the bracket-style replacement, instead of quietly
+ * coming back unfiltered. One warning per param present (a caller passing
+ * all three gets three entries — precise, not lossy-summarized).
+ */
+export function collectRemovedParamWarnings(url: URL): QueryWarning[] {
+  const REMOVED_DATE_PARAMS = ["date_field", "date_from", "date_to"] as const;
+  const warnings: QueryWarning[] = [];
+  for (const param of REMOVED_DATE_PARAMS) {
+    if (url.searchParams.has(param)) {
+      warnings.push({
+        code: "removed_param",
+        message: `\`${param}\` was removed in 0.6.4 (vault#288) and is silently ignored — use bracket-style date filters instead: \`meta[created_at][gte]=…\` / \`meta[created_at][lt]=…\` (or \`meta[updated_at][...]\`).`,
+        param,
+      });
+    }
+  }
+  return warnings;
+}
+
+/**
+ * Warnings ride inline and in the header, matching bun.
  * Cursor-mode response. Keeps the bun body shape (`{ notes, next_cursor }` — so
  * REST clients work unchanged) AND mirrors the watermark into an `X-Next-Cursor`
  * header (design §5 discriminator list). The header is present only when the
@@ -68,10 +93,11 @@ export function jsonWithWarnings(data: unknown, warnings: QueryWarning[], status
  * bun never emits it (the body's `next_cursor` is the cross-door contract,
  * contracts-brief item 3/C1.3) — kept for existing header-reading clients.
  */
-export function cursorJson(notes: unknown[], nextCursor: string | null): Response {
+export function cursorJson(notes: unknown[], nextCursor: string | null, warnings: QueryWarning[] = []): Response {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (nextCursor !== null) headers["X-Next-Cursor"] = nextCursor;
-  return new Response(JSON.stringify({ notes, next_cursor: nextCursor }), { status: 200, headers });
+  if (warnings.length > 0) headers["X-Parachute-Warnings"] = encodeURIComponent(JSON.stringify(warnings));
+  return new Response(JSON.stringify({ notes, next_cursor: nextCursor, ...(warnings.length > 0 ? { warnings } : {}) }), { status: 200, headers });
 }
 
 export class NotFoundError extends Error {
@@ -104,8 +130,11 @@ export function parseLinkCountDirection(url: URL): "both" | "outbound" | "inboun
 }
 
 export function parseQueryList(url: URL, key: string): string[] | undefined {
-  const val = url.searchParams.get(key);
-  return val ? val.split(",") : undefined;
+  const all = url.searchParams.getAll(key);
+  if (all.length === 0) return undefined;
+  // Flatten comma-lists inside each param.
+  const flat = all.flatMap((v) => v.split(",")).filter((s) => s.length > 0);
+  return flat.length > 0 ? flat : undefined;
 }
 
 export function parseContentRangeQuery(
@@ -395,6 +424,83 @@ export function parseExpandParam(url: URL): { expand?: TagExpandMode; error?: Re
   return { expand: expandParam as TagExpandMode };
 }
 
+/**
+ * Parse the `?aggregate[group_by]=…&aggregate[op]=…&aggregate[field]=…`
+ * aggregation params (bracket-style, consistent with `meta[field][op]=`
+ * above) into an `AggregateSpec`. Absent entirely (none of the three keys
+ * present) → `{}` — no aggregate intent, the caller falls through to a
+ * normal query. `op` is required when ANY of the three is present.
+ * `group_by` is required for `sum` and optional for `count` (vault#626 —
+ * `?aggregate[op]=count` alone is the filtered total). `field` is optional
+ * at the parser level (its requiredness depends on `op`, enforced by
+ * `aggregateNotes` itself). Value validity beyond shape (indexed field,
+ * numeric type, sum-requires-field) is ALSO enforced by `aggregateNotes` —
+ * same FIELD_NOT_INDEXED / INVALID_QUERY contract every other query
+ * surface uses.
+ *
+ * Returns `{ aggregate? }` or `{ error }` (a 400 Response) on a malformed
+ * shape (missing `op`, `sum` without `group_by`, or an unrecognized `op`).
+ */
+export function parseAggregateParam(url: URL): { aggregate?: AggregateSpec; error?: Response } {
+  const groupByRaw = parseQuery(url, "aggregate[group_by]");
+  const op = parseQuery(url, "aggregate[op]");
+  const field = parseQuery(url, "aggregate[field]");
+  // Empty `aggregate[group_by]=` is omitted, not an empty grouping key.
+  const groupBy = groupByRaw === "" ? null : groupByRaw;
+  if (groupBy === null && op === null && field === null) return {};
+  if (op === null) {
+    return {
+      error: json(
+        {
+          error: `aggregate requires aggregate[op] ("count" or "sum"). group_by is optional for count (filtered total) and required for sum.`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "aggregate",
+          hint: `pass ?aggregate[op]=count or ?aggregate[group_by]=<field|tag>&aggregate[op]=<count|sum>[&aggregate[field]=<numeric field>]`,
+        },
+        400,
+      ),
+    };
+  }
+  if (op !== "count" && op !== "sum") {
+    return {
+      error: json(
+        {
+          error: `invalid aggregate[op]: "${op}" — must be "count" or "sum"`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "aggregate.op",
+          got: op,
+          hint: `pass "count" or "sum"`,
+        },
+        400,
+      ),
+    };
+  }
+  if (op === "sum" && groupBy === null) {
+    return {
+      error: json(
+        {
+          error: `aggregate[group_by] is required when aggregate[op] is "sum"`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "aggregate.group_by",
+          hint: `pass ?aggregate[group_by]=<field|tag>&aggregate[op]=sum&aggregate[field]=<numeric field>`,
+        },
+        400,
+      ),
+    };
+  }
+  return {
+    aggregate: {
+      ...(groupBy !== null ? { group_by: groupBy } : {}),
+      op,
+      field: field ?? undefined,
+    },
+  };
+}
+
+
 /** Shared structured-query parser. Ported from routes.ts:parseNotesQueryOpts. */
 export function parseNotesQueryOpts(url: URL): {
   queryOpts?: QueryOpts;
@@ -441,8 +547,11 @@ export function parseNotesQueryOpts(url: URL): {
     excludeTags: parseQueryList(url, "exclude_tag"),
     hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
     hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
+    hasBrokenLinks: parseBoolOrUndef(parseQuery(url, "has_broken_links")),
+    hasAmbiguousLinks: parseBoolOrUndef(parseQuery(url, "has_ambiguous_links")),
     path: parseQuery(url, "path") ?? undefined,
     pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
+    excludePathPrefix: parseQueryList(url, "exclude_path_prefix"),
     extension: parseExtensionFilter(url),
     metadata: bracket.metadata ?? metadataAlias.metadata,
     createdBy: parseQuery(url, "created_by") ?? undefined,
