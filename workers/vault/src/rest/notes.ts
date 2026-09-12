@@ -27,10 +27,11 @@ import { transactionAsync } from "@openparachute/core/src/txn.js";
 import * as linkOps from "@openparachute/core/src/links.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
-import { embeddingsPendingWarning, ignoredParamWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
+import { embeddingsPendingWarning, ignoredParamWarning, collectUnknownTagWarnings, computeSearchDidYouMean, searchDidYouMeanWarning, truncatedResultsWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
 import {
   json,
   jsonWithWarnings,
+  collectRemovedParamWarnings,
   cursorJson,
   parseBool,
   parseQuery,
@@ -530,6 +531,15 @@ async function handleNotesInner(
           }
           throw e;
         }
+        // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
+        // FTS5-vocabulary scan) and ONLY computed on the already-rare
+        // empty-result path, mirroring `unknown_tag`'s did_you_mean.
+        if (rawResults.length === 0) {
+          const suggestion = computeSearchDidYouMean(db, search);
+          if (suggestion) {
+            searchWarnings.push(searchDidYouMeanWarning(search, suggestion));
+          }
+        }
         const results = filterNotesByTagScope(rawResults, tagScope.allowed, tagScope.raw);
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
         const contentRange = parseContentRangeQuery(url, includeContent);
@@ -648,6 +658,25 @@ async function handleNotesInner(
         }
       }
 
+      // Warnings channel (vault#550). `unknown_tag` stays structured-query
+      // only. `removed_param` warnings carry no tag information and fire
+      // regardless of scope. `search_mode` without `search` (vault#551) also
+      // carries no tag information — this IS the structured-query path
+      // precisely because `search` was absent or empty, so a `search_mode`
+      // param here is always a no-op.
+      const queryWarnings: QueryWarning[] = [
+        ...nearTextIgnored,
+        ...collectRemovedParamWarnings(url),
+        ...(parseQuery(url, "search_mode")
+          ? [
+              ignoredParamWarning(
+                "search_mode",
+                "no `search` was provided — search_mode only affects full-text search query parsing",
+              ),
+            ]
+          : []),
+        ...collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()),
+      ];
       let results: Note[];
       let nextCursor: string | null = null;
       try {
@@ -676,6 +705,18 @@ async function handleNotesInner(
           return json({ error: e.message, code: e.code ?? "cursor_invalid", error_type: e.code ?? "cursor_invalid" }, 400);
         }
         throw e;
+      }
+
+      // Truncation-honesty (vault contracts-brief V1.3): captured BEFORE
+      // near/tag-scope filtering, which can only shrink the set further —
+      // this reflects whether the underlying store query actually hit its
+      // `limit` (i.e. there may be more rows the caller never saw). Cursor
+      // mode is exempt — it already carries `next_cursor` as the honest
+      // "more may follow" signal, so a second warning would be redundant.
+      // Explicit offset is also exempt (vault#601): the caller is already
+      // paging, not hitting an accidental full default page.
+      if (!hasCursorParam && queryOpts.offset === undefined && results.length === queryOpts.limit) {
+        queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
       }
 
       const nearNoteId = parseQuery(url, "near[note_id]");
@@ -738,7 +779,7 @@ async function handleNotesInner(
             }
           }
         }
-        return json({ nodes, edges });
+        return jsonWithWarnings({ nodes, edges, ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}) }, queryWarnings);
       }
 
       if (includeLinks || includeAttachments) {
@@ -758,12 +799,12 @@ async function handleNotesInner(
           if (includeAttachments) enriched.attachments = await store.getAttachments(n.id);
           enrichedOut.push(enriched);
         }
-        if (hasCursorParam) return cursorJson(enrichedOut, nextCursor);
-        return jsonWithWarnings(enrichedOut, nearTextIgnored);
+        if (hasCursorParam) return cursorJson(enrichedOut, nextCursor, queryWarnings);
+        return jsonWithWarnings(enrichedOut, queryWarnings);
       }
 
-      if (hasCursorParam) return cursorJson(output, nextCursor);
-      return jsonWithWarnings(output, nearTextIgnored);
+      if (hasCursorParam) return cursorJson(output, nextCursor, queryWarnings);
+      return jsonWithWarnings(output, queryWarnings);
     }
 
     // POST /notes — create (single or batch)

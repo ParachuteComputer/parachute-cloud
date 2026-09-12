@@ -61,6 +61,31 @@ export function jsonWithWarnings(data: unknown, warnings: QueryWarning[], status
 }
 
 /**
+ * REST-only `removed_param` warning (vault#550) — the flat `date_field` /
+ * `date_from` / `date_to` query-string params were removed at 0.6.4
+ * (vault#288) and have been silently ignored ever since (routes.ts:633-ish
+ * comment). A request that passes any of them now gets a warning naming
+ * the ignored param and the bracket-style replacement, instead of quietly
+ * coming back unfiltered. One warning per param present (a caller passing
+ * all three gets three entries — precise, not lossy-summarized).
+ */
+export function collectRemovedParamWarnings(url: URL): QueryWarning[] {
+  const REMOVED_DATE_PARAMS = ["date_field", "date_from", "date_to"] as const;
+  const warnings: QueryWarning[] = [];
+  for (const param of REMOVED_DATE_PARAMS) {
+    if (url.searchParams.has(param)) {
+      warnings.push({
+        code: "removed_param",
+        message: `\`${param}\` was removed in 0.6.4 (vault#288) and is silently ignored — use bracket-style date filters instead: \`meta[created_at][gte]=…\` / \`meta[created_at][lt]=…\` (or \`meta[updated_at][...]\`).`,
+        param,
+      });
+    }
+  }
+  return warnings;
+}
+
+/**
+ * Warnings ride inline and in the header, matching bun.
  * Cursor-mode response. Keeps the bun body shape (`{ notes, next_cursor }` — so
  * REST clients work unchanged) AND mirrors the watermark into an `X-Next-Cursor`
  * header (design §5 discriminator list). The header is present only when the
@@ -68,10 +93,11 @@ export function jsonWithWarnings(data: unknown, warnings: QueryWarning[], status
  * bun never emits it (the body's `next_cursor` is the cross-door contract,
  * contracts-brief item 3/C1.3) — kept for existing header-reading clients.
  */
-export function cursorJson(notes: unknown[], nextCursor: string | null): Response {
+export function cursorJson(notes: unknown[], nextCursor: string | null, warnings: QueryWarning[] = []): Response {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (nextCursor !== null) headers["X-Next-Cursor"] = nextCursor;
-  return new Response(JSON.stringify({ notes, next_cursor: nextCursor }), { status: 200, headers });
+  if (warnings.length > 0) headers["X-Parachute-Warnings"] = encodeURIComponent(JSON.stringify(warnings));
+  return new Response(JSON.stringify({ notes, next_cursor: nextCursor, ...(warnings.length > 0 ? { warnings } : {}) }), { status: 200, headers });
 }
 
 export class NotFoundError extends Error {
