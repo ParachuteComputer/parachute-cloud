@@ -1056,7 +1056,7 @@ async function handleNotesInner(
             })();
 
       const final = refreshed.map((n) => {
-        let out = attachValidationStatus(store, db, n);
+        let out: any = attachValidationStatus(store, db, n);
         const existed = existedMap.get(n.id);
         if (existed !== undefined) out = { ...out, existed };
         return out;
