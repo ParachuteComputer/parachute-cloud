@@ -325,6 +325,53 @@ export async function handleTags(
       }
     }
 
+    // Cross-tag field validation (vault#553/#554) — validate the fields THIS
+    // call is declaring (`body.fields`, not the merged `fieldsPatch`) against
+    // every other tag's schema BEFORE any write. Mirrors the MCP update-tag
+    // tool's cross-tag checks so REST and MCP report identically for this
+    // class: EVERY conflicting field in one response (not just the first),
+    // and the message states explicitly that no changes were applied —
+    // nothing is persisted before this check runs. Two case families are
+    // deliberately EXCLUDED and keep their pre-existing `IndexedFieldError`
+    // → 400 `invalid_indexed_field` path below (unchanged status/error_type):
+    // the own-field checks (unsupported type, invalid name — vault#478) AND
+    // both-indexed cross-tag type conflicts (already 400 on main via
+    // `declareField`'s cross-declarer sqlite-type check; the wire-contract
+    // floor forbids flipping that to 422). What this pre-check newly rejects
+    // — silent 200s on main — is non-indexed type conflicts and indexed-flag
+    // conflicts. See `collectCrossTagFieldViolations`'s doc comment.
+    if (body.fields && typeof body.fields === "object" && !Array.isArray(body.fields)) {
+      const incomingFields = body.fields as Record<string, tagSchemaOps.TagFieldSchema>;
+      // vault#555 fix 5 — fold the own-field `default`/`type` checks into
+      // the SAME bundled report as the cross-tag ones. Before this, a bad
+      // `default` (and, since fix 4 added the check, an unrecognized
+      // `type`) went through `store.upsertTagRecord`'s fail-fast pre-
+      // validate below INSTEAD — a single-violation 400 that silently never
+      // mentioned any OTHER bad field in the same call. `unsupported_
+      // indexed_type`/`invalid_field_name` deliberately stay OUT of this
+      // bundle — REST's established single-violation `400
+      // invalid_indexed_field` contract for those two is unchanged
+      // (vault#478; see `collectCrossTagFieldViolations`'s doc comment).
+      const fieldViolations = tagSchemaOps.collectCrossTagFieldViolations(
+        store.db,
+        putTagName,
+        incomingFields,
+      ).concat(tagSchemaOps.collectOwnFieldDefaultAndTypeViolations(incomingFields));
+      if (fieldViolations.length > 0) {
+        const violations = fieldViolations;
+        return json(
+          {
+            error: "tag_field_conflict",
+            error_type: "tag_field_conflict",
+            tag: putTagName,
+            violations,
+            message: `${violations.length} field violation(s) for tag "${putTagName}" — no changes were applied.`,
+          },
+          422,
+        );
+      }
+    }
+
     let result;
     try {
       result = await store.upsertTagRecord(putTagName, {
@@ -336,6 +383,50 @@ export async function handleTags(
     } catch (err) {
       if (err instanceof IndexedFieldError) {
         return json({ error: err.message, error_type: "invalid_indexed_field" }, 400);
+      }
+      if (err instanceof tagSchemaOps.InvalidFieldDefaultError) {
+        // vault#553 Decision B — a declared `default` doesn't conform to its
+        // own field's type/enum. Own-field error (no cross-tag data), so no
+        // scrub needed. DEFENSE-IN-DEPTH ONLY as of vault#555 fix 5 — the
+        // pre-check above (`collectOwnFieldDefaultAndTypeViolations`) now
+        // catches every `invalid_default` BEFORE reaching `store.upsertTagRecord`
+        // and reports it bundled via `tag_field_conflict` 422 instead; this
+        // branch only fires for a caller that somehow bypasses that pre-check.
+        return json(
+          { error: err.message, error_type: "invalid_field_default", field: err.field },
+          400,
+        );
+      }
+      if (err instanceof tagSchemaOps.InvalidFieldTypeError) {
+        // vault#555 fix 4 — a declared `type` isn't one of the six
+        // recognized values. Same defense-in-depth posture as
+        // InvalidFieldDefaultError above — the pre-check catches this in
+        // the normal path and reports it bundled instead.
+        return json(
+          { error: err.message, error_type: "invalid_field_type", field: err.field, type: err.type, valid_types: err.valid_types },
+          400,
+        );
+      }
+      if (err instanceof tagSchemaOps.ParentCycleError) {
+        // vault#552: parent_names would close a cycle. Nothing was
+        // persisted. `error` is a SHORT code and
+        // `message` the human sentence — the same split every sibling 409 in
+        // this file uses (target_exists, tag_in_use_by_tokens,
+        // tag_referenced_as_parent). parachute-surface's shared VaultClient
+        // 409 handler reads `body.message` (falling back to a hardcoded
+        // "Note was edited elsewhere"), so the message key is load-bearing:
+        // without it the Tags parent_names editor would show the wrong
+        // conflict text.
+        return json(
+          {
+            error: "ParentCycle",
+            error_type: "parent_cycle",
+            tag: err.tag,
+            cycle: err.cycle,
+            message: err.message,
+          },
+          409,
+        );
       }
       throw err;
     }
@@ -358,7 +449,28 @@ export async function handleTags(
         409,
       );
     }
-    return json(await store.deleteTag(tagName));
+    // `?cascade=true` / `?detach=true` (synonyms — see DeleteTagOpts):
+    // required to delete a tag another tag's parent_names still references
+    // (vault#552). Query params, not a DELETE body, so the flag is visible
+    // in access logs and works with any HTTP client without body support.
+    const cascade = parseBool(parseQuery(url, "cascade"), false);
+    const detach = parseBool(parseQuery(url, "detach"), false);
+    const result = await store.deleteTag(tagName, { cascade, detach });
+    if ("error" in result) {
+      const referencing_tags = result.referencing_tags;
+      return json(
+        {
+          error: "TagReferencedAsParent",
+          error_type: "tag_referenced_as_parent",
+          tag: tagName,
+          referencing_tags,
+          message: `Tag "${tagName}" is referenced by ${referencing_tags.length} other tag(s)' parent_names; pass ?cascade=true or ?detach=true to also remove the reference, or update the referencing tag(s) first.`,
+          hint: "pass ?cascade=true or ?detach=true, or fix the referencing tag(s)' parent_names first",
+        },
+        409,
+      );
+    }
+    return json(result);
   }
 
   return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
