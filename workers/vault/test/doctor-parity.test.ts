@@ -39,7 +39,7 @@ async function brokenFixture() {
   await createNote(v, { content: "current epic", tags: ["launch-v2"], metadata: { epic: "launch-v2" } });
   await createNote(v, { content: "stale epic reference", tags: ["launch-v2"], metadata: { epic: "launch-v1" } });
   // Guard-bypassing historical states, as contract-taxonomy.test.ts:250-263.
-  await runInDurableObject(env.VAULT.get(env.VAULT.idFromName(v)), async (inst: any) => {
+  await runInDurableObject<DurableObject, void>(env.VAULT.get(env.VAULT.idFromName(v)), async (inst: any) => {
     const db = inst.store.db;
     db.prepare("UPDATE tags SET parent_names = ? WHERE name = ?").run(JSON.stringify(["cyc-b"]), "cyc-a");
     await inst.store.createNote("bad metric", { tags: ["metric"], metadata: { n: "not-a-number" } });
