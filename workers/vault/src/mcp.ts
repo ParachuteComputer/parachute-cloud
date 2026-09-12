@@ -378,6 +378,8 @@ function mapDomainError(err: unknown): { code: number; data: Record<string, unkn
     to?: unknown;
     current?: unknown;
     violations?: unknown;
+    tag?: string;
+    cycle?: string[];
     error_type?: string;
     hint?: string;
     limit?: unknown;
@@ -416,6 +418,13 @@ function mapDomainError(err: unknown): { code: number; data: Record<string, unkn
       return {
         code: INVALID_PARAMS,
         data: { error_type: "precondition_required", note_id: e.note_id, path: e.note_path ?? null },
+      };
+    // parent_names cycle guard (vault#552) — update-tag would close a
+    // cycle. Mirrors REST's 409 parent_cycle shape.
+    case "PARENT_CYCLE":
+      return {
+        code: INVALID_REQUEST,
+        data: { error_type: "parent_cycle", tag: e.tag, cycle: e.cycle ?? [] },
       };
     default:
       if (typeof e?.error_type === "string") {
