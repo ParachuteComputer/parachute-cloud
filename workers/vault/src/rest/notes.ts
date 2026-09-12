@@ -25,6 +25,7 @@ import { attachValidationStatus, enforceStrictWrite } from "@openparachute/core/
 import { expandContent } from "@openparachute/core/src/expand.js";
 import { transactionAsync } from "@openparachute/core/src/txn.js";
 import * as linkOps from "@openparachute/core/src/links.js";
+import { getUnresolvedLinksForNote, getUnresolvedLinksForNotes, getAmbiguousLinksForNote, getAmbiguousLinksForNotes } from "@openparachute/core/src/wikilinks.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
 import { embeddingsPendingWarning, ignoredParamWarning, collectUnknownTagWarnings, computeSearchDidYouMean, searchDidYouMeanWarning, truncatedResultsWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
@@ -306,6 +307,22 @@ async function handleNotesInner(
             tagScope.allowed,
             tagScope.raw,
           );
+        }
+        if (parseBool(parseQuery(url, "include_broken_links"), false)) {
+          // No tag-scope filtering needed (unlike include_links above): a
+          // broken-link `target` never resolved to a note, so there's no
+          // neighbor identity/content to leak — just the string this note's
+          // own [[wikilink]]/structured link already named. The predicate is
+          // not a filter but an ADDITION (vault#239): it makes a reference
+          // whose only candidates are invisible read as broken here, instead
+          // of only once the last of them is deleted.
+          result.broken_links = getUnresolvedLinksForNote(db, note.id);
+        }
+        if (parseBool(parseQuery(url, "include_ambiguous_links"), false)) {
+          // Same no-tag-scope-needed reasoning as broken_links above: an
+          // ambiguous `target` never became a link, so no neighbor identity
+          // is exposed — only the string this note's own reference named.
+          result.ambiguous_links = getAmbiguousLinksForNote(db, note.id);
         }
         if (parseBool(parseQuery(url, "include_attachments"), false)) {
           result.attachments = await store.getAttachments(note.id);
@@ -743,6 +760,8 @@ async function handleNotesInner(
       const contentRange = parseContentRangeQuery(url, includeContent);
       if (contentRange.error) return contentRange.error;
       const includeLinks = parseBool(parseQuery(url, "include_links"), false);
+      const includeBrokenLinks = parseBool(parseQuery(url, "include_broken_links"), false);
+      const includeAmbiguousLinks = parseBool(parseQuery(url, "include_ambiguous_links"), false);
       const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
       const includeLinkCount = parseBool(parseQuery(url, "include_link_count"), false);
       const inclMeta = parseIncludeMetadata(url);
@@ -782,9 +801,19 @@ async function handleNotesInner(
         return jsonWithWarnings({ nodes, edges, ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}) }, queryWarnings);
       }
 
-      if (includeLinks || includeAttachments) {
+      if (includeLinks || includeBrokenLinks || includeAmbiguousLinks || includeAttachments) {
         const linksByNote = includeLinks
           ? linkOps.getLinksHydratedForNotes(db, output.map((n: any) => n.id))
+          : null;
+        // Same batched-per-page shape as links (vault#555). No tag-scope
+        // filtering needed — a broken-link `target` never resolved to a
+        // note, so there's no neighbor identity to leak.
+        const brokenLinksByNote = includeBrokenLinks
+          ? getUnresolvedLinksForNotes(db, output.map((n: any) => n.id))
+          : null;
+        // Same again for the ambiguity twin (vault#581), same non-leak logic.
+        const ambiguousLinksByNote = includeAmbiguousLinks
+          ? getAmbiguousLinksForNotes(db, output.map((n: any) => n.id))
           : null;
         const enrichedOut: any[] = [];
         for (const n of output) {
@@ -796,6 +825,8 @@ async function handleNotesInner(
               tagScope.raw,
             );
           }
+          if (brokenLinksByNote) enriched.broken_links = brokenLinksByNote.get(n.id) ?? [];
+          if (ambiguousLinksByNote) enriched.ambiguous_links = ambiguousLinksByNote.get(n.id) ?? [];
           if (includeAttachments) enriched.attachments = await store.getAttachments(n.id);
           enrichedOut.push(enriched);
         }
@@ -887,6 +918,22 @@ async function handleNotesInner(
             })();
 
       const final = refreshed.map((n) => attachValidationStatus(store, db, n));
+      // Batch summary (vault#555) — compact shape instead of N full note
+      // objects. Batch-only (a `notes` array); `summary` is ignored on a
+      // single-note POST. Mirrors the MCP create-note tool exactly.
+      if (body.notes && body.summary === true) {
+        return json(
+          {
+            created: final.filter((n: any) => n.existed !== true).length,
+            ids: final.map((n: any) => n.id),
+            // Reserved for future partial-batch-failure reporting — a batch
+            // create is all-or-nothing today, so this is always empty.
+            failed: [] as unknown[],
+          },
+          201,
+        );
+      }
+
       return json(body.notes ? final : final[0], 201);
     }
 
