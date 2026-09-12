@@ -531,15 +531,15 @@ async function handleNotesInner(
           }
           throw e;
         }
-          // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
-          // FTS5-vocabulary scan) and ONLY computed on the already-rare
-          // empty-result path, mirroring `unknown_tag`'s did_you_mean.
-          if (rawResults.length === 0) {
-            const suggestion = computeSearchDidYouMean(db, search);
-            if (suggestion) {
-              searchWarnings.push(searchDidYouMeanWarning(search, suggestion));
-            }
+        // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
+        // FTS5-vocabulary scan) and ONLY computed on the already-rare
+        // empty-result path, mirroring `unknown_tag`'s did_you_mean.
+        if (rawResults.length === 0) {
+          const suggestion = computeSearchDidYouMean(db, search);
+          if (suggestion) {
+            searchWarnings.push(searchDidYouMeanWarning(search, suggestion));
           }
+        }
         const results = filterNotesByTagScope(rawResults, tagScope.allowed, tagScope.raw);
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
         const contentRange = parseContentRangeQuery(url, includeContent);
