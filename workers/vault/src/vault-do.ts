@@ -33,6 +33,7 @@ import { NO_TAG_SCOPE } from "./rest/parse.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
 import { handleTags, handleFindPath } from "./rest/tags.js";
+import { handleDoctor } from "./rest/doctor.js";
 import { handleVault, type VaultConfigLike } from "./rest/vault.js";
 import {
   R2_METER_KEY,
@@ -833,6 +834,12 @@ export class VaultDO extends DurableObject {
     }
     if (apiPath === "/find-path") {
       return handleFindPath(request, this.store, NO_TAG_SCOPE);
+    }
+    // Doctor — GET /api/doctor (vault#552; cloud#118 item 3, B4). Read-tier:
+    // GET → read via the generic gate above, the same way /find-path is gated.
+    // Cloud has no tag-scoped readers, so the scan is always unscoped.
+    if (apiPath === "/doctor") {
+      return handleDoctor(request, this.store, NO_TAG_SCOPE);
     }
     // Seed-pack application — POST /api/packs/<name>. Admin-scoped (isPackApply
     // → verb=admin above, cloud#134 A.1 review follow-up): the applier upserts
