@@ -1,3 +1,4 @@
+import { getNoteByTitle } from "@openparachute/core/src/notes.js";
 /**
  * Pure query-param / body parsing for the REST surface — ported verbatim from
  * parachute-vault/src/routes.ts (the wire contract lives in the parser, so we
@@ -596,7 +597,26 @@ export function parseExpandParams(
   return { ctx: { db, mode, expanded: new Set(), ...(isVisible ? { isVisible } : {}) }, depth };
 }
 
-/** Resolve a note by ID or path. Ported from routes.ts:resolveNote. */
+/**
+ * Resolve a note by ID or path. Tries ID first, then case-insensitive
+ * path. A trailing `.<ext>` matching the extension pattern is parsed
+ * as `(path, extension)` to disambiguate notes sharing a path
+ * differing only by extension (vault#330 S1). When the path is
+ * ambiguous and no extension hint is supplied, `getNoteByPath` throws
+ * `AmbiguousPathError` — REST handlers catch it and return 409.
+ *
+ * Title fallback (additive): when id AND path/extension both miss
+ * cleanly (no throw), tries an H1-title match via `getNoteByTitle` — the
+ * note whose first `# ` content line equals `idOrPath`, only when
+ * exactly one note has that title. Mirrors the MCP-layer `resolveNote`
+ * in core/src/mcp.ts and `[[wikilink]]` resolution (core/src/wikilinks.ts);
+ * exact id/path always wins first. Skipped (falls through to "not found")
+ * when `store.db` isn't available — the `Store` interface documents `db`
+ * as always present on the concrete class, but a handful of tests pass a
+ * minimal duck-typed stub (e.g. `handleViewNote`'s coverage in
+ * published.test.ts) that only implements `getNote`/`getNoteByPath`; this
+ * fallback must never turn that into a crash.
+ */
 export async function resolveNote(store: Store, idOrPath: string): Promise<Note | null> {
   const byId = await store.getNote(idOrPath);
   if (byId) return byId;
@@ -605,7 +625,9 @@ export async function resolveNote(store: Store, idOrPath: string): Promise<Note 
     const explicit = await store.getNoteByPath(extMatch[1]!, extMatch[2]!);
     if (explicit) return explicit;
   }
-  return await store.getNoteByPath(idOrPath);
+  const byPath = await store.getNoteByPath(idOrPath);
+  if (byPath) return byPath;
+  return store.db ? getNoteByTitle(store.db, idOrPath) : null;
 }
 
 export async function requireNote(store: Store, idOrPath: string): Promise<Note> {
