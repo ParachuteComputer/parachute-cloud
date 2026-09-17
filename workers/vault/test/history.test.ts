@@ -22,6 +22,46 @@ async function call(v: string, token: string, name: string, args: Record<string,
 }
 
 describe("note history on DO SQLite", () => {
+  it("runs maintenance on state load and preserves history with competing compactors and a writer", async () => {
+    const v = freshVault("histrace"), n = await createNote(v, { content: "shared text ".repeat(400) + "initial" });
+    const stub = env.VAULT.get(env.VAULT.idFromName(v));
+    await runInDurableObject<DurableObject, void>(stub, async (inst: any) => {
+      const compact = inst.store.compactHistory.bind(inst.store);
+      const sweep = inst.store.sweepDeletedHistory.bind(inst.store);
+      let compactions = 0, sweeps = 0;
+      inst.store.compactHistory = (...args: any[]) => { compactions++; return compact(...args); };
+      inst.store.sweepDeletedHistory = (...args: any[]) => { sweeps++; return sweep(...args); };
+      try {
+        inst.stateLoaded = false;
+        await inst.ensureState(v);
+        await inst.ensureState(v);
+        expect(compactions).toBe(1);
+        expect(sweeps).toBe(1);
+      } finally {
+        inst.store.compactHistory = compact;
+        inst.store.sweepDeletedHistory = sweep;
+      }
+    });
+    const compactRequests = async () => {
+      for (let i = 0; i < 8; i++) {
+        const r = await op(v, "/api/history/compact", { method: "POST", ...json({ note_id: n.id }) });
+        expect(r.status, await r.clone().text()).toBe(200);
+      }
+    };
+    await Promise.all([compactRequests(), compactRequests(), (async () => {
+      for (let i = 0; i < 24; i++) await update(v, n.id, "shared text ".repeat(400) + i);
+    })()]);
+    expect((await (await op(v, `/api/notes/${n.id}`)).json() as any).content).toBe("shared text ".repeat(400) + "23");
+    await runInDurableObject<DurableObject, void>(stub, async (inst: any) => {
+      const db = inst.store.db;
+      inst.store.compactHistory({ noteId: n.id, budgetMs: 250, maxNotes: 1 });
+      expect(db.prepare("SELECT COUNT(*) AS n FROM note_blobs WHERE encoding='fossil-delta'").get().n).toBeGreaterThan(0);
+      expect(db.prepare("SELECT COUNT(*) AS n FROM note_blobs d LEFT JOIN note_blobs b ON b.hash=d.delta_of WHERE d.encoding='fossil-delta' AND (b.hash IS NULL OR b.encoding IS NOT NULL)").get().n).toBe(0);
+      expect(db.prepare("SELECT COUNT(*) AS n FROM note_versions v LEFT JOIN note_blobs b ON b.hash=v.content_hash WHERE v.content_hash IS NOT NULL AND b.hash IS NULL").get().n).toBe(0);
+      for (const row of db.prepare("SELECT hash FROM note_blobs").all()) expect(hashContent(readBlobContent(db, row.hash)!)).toBe(row.hash);
+      expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    });
+  });
   it("bounds hosted administrator compaction even when bounds are omitted or oversized", async () => {
     const v = freshVault("histbounds");
     await createNote(v, { content: "seed" });
