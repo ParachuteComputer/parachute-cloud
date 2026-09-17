@@ -48,4 +48,19 @@ promise immediate compaction of every edit on a long-lived instance.
 
 No Git archive import, mirror retirement or backfill runs in a Durable Object.
 Imported selectors support already-present rows; they are not a hosted import
-workflow. No app UI or production deployment is included in this backend change.
+workflow. No production deployment is included in this change.
+
+## Browser bundle and validation
+
+Cloud embeds the reviewed app history UI at App commit
+`e9df2cd097e9384f37925adfcc0b1431fa621c09`, not a floating npm version.
+That source still declares0.22.15-rc.2; the exact commit is the reproducibility
+boundary and includes app#212 beyond the published rc.2 package. The standalone
+app release is separate. The build validates the current @openparachute/app name
+and runs the real origin-root build plus CSP generation.
+
+The workerd probe covers one maintenance pass per ensureState load and two
+concurrent administrator compaction loops with a sequential writer. Final
+checks verify reconstructed hashes, depth-one deltas, referenced blobs and
+foreign keys. This is concurrent request admission into one Durable Object,
+not a forced internal interleaving or a multi-process SQLite test.
