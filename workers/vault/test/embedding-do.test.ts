@@ -18,7 +18,7 @@
  */
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { freshVault, op, createNote } from "./helpers.ts";
+import { freshVault, op, createNote, base, OP } from "./helpers.ts";
 import type { EmbeddingProvider, EmbedInput, EmbedResult, ProviderAvailability } from "@openparachute/core/src/embedding/provider.ts";
 import type { TranscriptionProvider, TranscribeInput, TranscribeResult } from "@openparachute/core/src/transcription/provider.ts";
 import { chunkNoteContent } from "@openparachute/core/src/embedding/chunker.ts";
@@ -130,11 +130,19 @@ describe("semantic search (C2) — embed-on-write + backfill drain", () => {
 
     expect(await vectorRowCount(v, note.id)).toBeGreaterThan(0);
 
-    const res = await op(v, "/api/notes?semantic=true&near_text=music%20remixes&include_content=true");
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as any[];
-    expect(body.map((n) => n.id)).toContain(note.id);
-    expect(body.find((n) => n.id === note.id)!.score).toBeGreaterThan(0.9);
+    // The pool can evict an idle DO between requests (see scoped-tags-claim).
+    // Persisted vectors survive; an instance-only fake provider does not.
+    // Install the fake and exercise the real DO REST handler in one callback.
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      inst.__setTestEmbeddingProvider(stubEmbedProvider((t) => (t.includes("music remixes") ? [1, 0, 0] : [0, 1, 0])));
+      const res = await inst.fetch(new Request(`${base(v)}/api/notes?semantic=true&near_text=music%20remixes&include_content=true`, {
+        headers: { Authorization: `Bearer ${OP}` },
+      }));
+      expect(res.status, await res.clone().text()).toBe(200);
+      const body = (await res.json()) as any[];
+      expect(body.map((n) => n.id)).toContain(note.id);
+      expect(body.find((n) => n.id === note.id)!.score).toBeGreaterThan(0.9);
+    });
   });
 
   it("a no-op edit (identical content) costs ZERO additional provider calls", async () => {

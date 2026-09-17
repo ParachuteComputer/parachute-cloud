@@ -32,6 +32,7 @@ import {
 import { NO_TAG_SCOPE } from "./rest/parse.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
+import { handleHistoryCompact } from "./rest/history.js";
 import { handleTags, handleFindPath } from "./rest/tags.js";
 import { handleDoctor } from "./rest/doctor.js";
 import { handleVault, type VaultConfigLike } from "./rest/vault.js";
@@ -766,7 +767,9 @@ export class VaultDO extends DurableObject {
     // collapses write and admin) is what makes the write/admin distinction
     // real on this door: a `vault:<name>:write` token keeps every genuine
     // write, and can never confer the admin tier it wasn't minted at.
-    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath)
+    const isHistoryErase = request.method === "DELETE" && /^\/notes\/[^/]+\/versions$/.test(apiPath);
+    const isHistoryCompact = request.method === "POST" && apiPath === "/history/compact";
+    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact
       ? "admin"
       : verbForMethod(request.method);
     if (requiredVerb !== "read" && !hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
@@ -828,6 +831,10 @@ export class VaultDO extends DurableObject {
 
     if (apiPath.startsWith("/notes")) {
       return handleNotes(request, this.store, apiPath.slice(6), deps, NO_TAG_SCOPE, writeCtx);
+    }
+    if (apiPath === "/history/compact") {
+      if (request.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+      return handleHistoryCompact(request, this.store);
     }
     if (apiPath.startsWith("/tags")) {
       return handleTags(request, this.store, apiPath.slice(5), NO_TAG_SCOPE);
@@ -935,6 +942,16 @@ export class VaultDO extends DurableObject {
     this.transcribeMinutes = (await this.ctx.storage.get<number>(TRANSCRIBE_MINUTES_KEY)) ?? 0;
     this.transcribeMonth = (await this.ctx.storage.get<string>(TRANSCRIBE_MONTH_KEY)) ?? "";
     this.stateLoaded = true;
+    // Once per loaded instance, using core's bounded defaults. No separate
+    // recurring alarm: idle vaults stay asleep, and transcription/embedding
+    // alarms retain their existing ownership. Failed maintenance never hides
+    // a readable vault; an admin can inspect/retry via /history/compact.
+    try {
+      this.store.sweepDeletedHistory();
+      this.store.compactHistory();
+    } catch (error) {
+      console.warn("[history-maintenance]", errText(error));
+    }
     await this.maybeArmEmbeddingBackfill();
   }
 

@@ -28,6 +28,7 @@
 import { BunSqliteStore } from "@openparachute/core/src/store.js";
 import type { HookRegistry } from "@openparachute/core/src/hooks.js";
 import type { EmbeddingProvider } from "@openparachute/core/src/embedding/provider.js";
+import type { HistoryPolicy } from "@openparachute/core/src/history.js";
 
 export class DoSqliteStore extends BunSqliteStore {
   private readonly storage: DurableObjectStorage;
@@ -35,7 +36,7 @@ export class DoSqliteStore extends BunSqliteStore {
   constructor(
     db: unknown,
     storage: DurableObjectStorage,
-    opts?: { hooks?: HookRegistry; embeddingProvider?: EmbeddingProvider; embeddingDisabledReason?: string },
+    opts?: { history?: Partial<HistoryPolicy>; hooks?: HookRegistry; embeddingProvider?: EmbeddingProvider; embeddingDisabledReason?: string },
   ) {
     // BunSqliteStore's constructor runs initSchema(db) — the boot migrations use
     // core's FREE transaction helper (shim no-ops their BEGIN); `this.transaction`
