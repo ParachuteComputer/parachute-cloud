@@ -58,7 +58,14 @@ describe("B4 doctor parity", () => {
   it("deep pages agree across REST and MCP, detect corruption, and leave stored data unchanged", async () => {
     const v = freshVault("deepdoctor");
     const token = await mintToken({ vault: v, scopes: `vault:${v}:read` });
-    for (const content of ["first history body", "second history body", "third history body"]) await createNote(v, { content });
+    for (const content of ["first history body", "second history body", "third history body"]) {
+      const note = await createNote(v, { content });
+      const updated = await op(v, `/api/notes/${note.id}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: `${content} edited`, force: true }),
+      });
+      expect(updated.status).toBe(200);
+    }
     const stub = env.VAULT.get(env.VAULT.idFromName(v));
     const before = await runInDurableObject<DurableObject, { hashes: string[]; blobs: any[]; notes: any[] }>(stub, async (inst: any) => {
       const db = inst.store.db;
