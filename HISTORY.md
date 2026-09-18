@@ -22,6 +22,23 @@ the note was never edited.
 MCP `query-notes` supports the shared `versions` selector. Restore remains
 REST-only, as on self-hosted Vault; no new MCP restore tool is advertised.
 
+## Read-only content audit
+
+`GET /api/doctor?deep=true` and MCP `doctor` with `deep: true` opt into
+materializing retained history blobs and verifying their content hashes. The
+default doctor scan remains unchanged. Both doors accept `history_after` (a
+64-character lowercase hash cursor), `history_max_blobs` (1–500, default 100),
+and `history_budget_ms` (1–1000, default 250).
+
+The `history_audit` result reports `checked`, `corrupt`, up to five example
+hashes, `complete`, and `next_after`. Continue with `next_after` until complete;
+an incomplete page is not a clean bill of health. Budgets are checked between
+blobs, not inside a materialization, and do not bound the ordinary structural
+doctor scan. Pages over a live vault are not a snapshot. Use a stable copied
+database for an exhaustive audit. Scans never repair or rewrite data, and
+operational failures are not relabeled as corruption. Deep scans require an
+unrestricted session; Cloud's existing rejection of scoped tokens is unchanged.
+
 ## Permissions and storage
 
 Reads require vault read access; restore requires write access and obeys existing
