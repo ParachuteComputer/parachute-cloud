@@ -7,7 +7,9 @@
  * which has no bun doctor method test at the pin.
  */
 import { SELF, env, runInDurableObject } from "cloudflare:test";
+import type { DurableObject } from "cloudflare:workers";
 import { declareField } from "@openparachute/core/src/indexed-fields.js";
+import { handleDoctor } from "../src/rest/doctor.ts";
 import { describe, expect, it } from "vitest";
 import { base, freshVault, mintToken, op, createNote } from "./helpers.ts";
 
@@ -53,6 +55,64 @@ async function report(v: string) {
 }
 
 describe("B4 doctor parity", () => {
+  it("deep pages agree across REST and MCP, detect corruption, and leave stored data unchanged", async () => {
+    const v = freshVault("deepdoctor");
+    const token = await mintToken({ vault: v, scopes: `vault:${v}:read` });
+    for (const content of ["first history body", "second history body", "third history body"]) {
+      const note = await createNote(v, { content });
+      const updated = await op(v, `/api/notes/${note.id}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: `${content} edited`, force: true }),
+      });
+      expect(updated.status).toBe(200);
+    }
+    const stub = env.VAULT.get(env.VAULT.idFromName(v));
+    const before = await runInDurableObject<DurableObject, { hashes: string[]; blobs: any[]; notes: any[] }>(stub, async (inst: any) => {
+      const db = inst.store.db;
+      const hashes = db.prepare("SELECT hash FROM note_blobs ORDER BY hash").all().map((r: any) => r.hash);
+      expect(hashes.length).toBeGreaterThanOrEqual(3);
+      db.prepare("UPDATE note_blobs SET content = ? WHERE hash = ?").run("tampered", hashes[0]);
+      return { hashes, blobs: db.prepare("SELECT * FROM note_blobs ORDER BY hash").all(), notes: db.prepare("SELECT * FROM notes ORDER BY id").all() };
+    });
+    expect((await report(v)).history_audit).toBeUndefined();
+    let after: string | undefined;
+    let checked = 0, corrupt = 0;
+    const cursors: string[] = [];
+    for (let i = 0; i <= before.hashes.length; i++) {
+      const query = new URLSearchParams({ deep: "true", history_max_blobs: "1", history_budget_ms: "1000" });
+      if (after) query.set("history_after", after);
+      const res = await op(v, `/api/doctor?${query}`);
+      expect(res.status).toBe(200);
+      const rest = await res.json() as any;
+      const body = await rpc(v, token, "tools/call", { name: "doctor", arguments: { deep: true, history_max_blobs: 1, history_budget_ms: 1000, ...(after ? { history_after: after } : {}) } });
+      expect(body.result.isError).toBeFalsy();
+      const mcp = JSON.parse(body.result.content[0].text);
+      expect(rest.history_audit).toEqual(mcp.history_audit);
+      const page = rest.history_audit;
+      checked += page.checked; corrupt += page.corrupt;
+      if (page.next_after) cursors.push(page.next_after);
+      if (page.complete) break;
+      expect(page.next_after).toBeTruthy();
+      expect(page.next_after).not.toBe(after);
+      expect(rest.findings.find((f: any) => f.type === "history_content_audit").severity).not.toBe("info");
+      after = page.next_after;
+    }
+    expect(checked).toBe(before.hashes.length);
+    expect(corrupt).toBe(1);
+    expect(new Set(cursors).size).toBe(cursors.length);
+    await runInDurableObject<DurableObject, void>(stub, async (inst: any) => {
+      expect(inst.store.db.prepare("SELECT * FROM note_blobs ORDER BY hash").all()).toEqual(before.blobs);
+      expect(inst.store.db.prepare("SELECT * FROM notes ORDER BY id").all()).toEqual(before.notes);
+    });
+  });
+  it.each(["deep=1", "history_after=bad", "history_max_blobs=0", "history_max_blobs=501", "history_budget_ms=1001", "history_budget_ms=NaN"])("rejects invalid audit query %s", async (query) => {
+    expect((await op(freshVault("doctorbounds"), `/api/doctor?${query}`)).status).toBe(400);
+  });
+  it("refuses scoped deep scans before calling the store", async () => {
+    const store = { doctor: () => { throw new Error("must not scan"); } };
+    const res = await handleDoctor(new Request("https://example.test/api/doctor?deep=true"), store as any, { allowed: new Set(["journal"]), raw: ["journal"] });
+    expect(res.status).toBe(403);
+  });
   it("P1 operator GET reports the integrity scan", async () => {
     const v = freshVault("doctor"); const res = await op(v, "/api/doctor"); const body = await res.json() as any;
     expect(res.status).toBe(200); expect(Array.isArray(body.findings)).toBe(true);
