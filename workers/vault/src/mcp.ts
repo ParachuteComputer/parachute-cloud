@@ -388,6 +388,8 @@ function mapDomainError(err: unknown): { code: number; data: Record<string, unkn
     size?: number;
     max_bytes?: number;
     mime_type?: string;
+    origin?: string;
+    import_ix?: number;
   };
   if (e?.error_type === "invalid_query") {
     return {
@@ -482,6 +484,13 @@ function mapDomainError(err: unknown): { code: number; data: Record<string, unkn
   }
   if (e?.code === "PARENT_CYCLE") {
     return { code: INVALID_REQUEST, data: { error_type: "parent_cycle", tag: e.tag, cycle: e.cycle ?? [] } };
+  }
+  if (e?.code === "HISTORY_UNRECOVERABLE") {
+    const imported = e.origin === "git-import" && typeof e.import_ix === "number" && Number.isSafeInteger(e.import_ix) && e.import_ix >= 0;
+    return { code: INVALID_PARAMS, data: {
+      error_type: "history_unrecoverable",
+      ...(imported ? { origin: "git-import", import_ix: e.import_ix } : { field: e.field, hint: e.hint }),
+    } };
   }
   if (typeof e?.error_type === "string") {
     return {

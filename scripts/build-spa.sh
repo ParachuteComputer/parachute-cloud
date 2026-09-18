@@ -25,8 +25,8 @@ if [[ ! -f "$APP_REPO/package.json" ]]; then
 fi
 
 ACTUAL_NAME="$(cd "$APP_REPO" && node -p "require('./package.json').name" 2>/dev/null || true)"
-if [[ "$ACTUAL_NAME" != "@openparachute/parachute-app" ]]; then
-  echo "build-spa: expected @openparachute/parachute-app at $APP_REPO, found ${ACTUAL_NAME:-<unknown>}." >&2
+if [[ "$ACTUAL_NAME" != "@openparachute/app" ]]; then
+  echo "build-spa: expected @openparachute/app at $APP_REPO, found ${ACTUAL_NAME:-<unknown>}." >&2
   exit 1
 fi
 
@@ -50,7 +50,7 @@ fi
 # The App is root-hosted by default, but keep the explicit build signal because
 # deep links and /oauth/callback require absolute /assets/... references and a
 # root React Router basename.
-echo "build-spa: building @openparachute/parachute-app v$ACTUAL_VERSION ($SPA_APP_REF) at origin root…"
+echo "build-spa: building @openparachute/app v$ACTUAL_VERSION ($SPA_APP_REF) at origin root…"
 cd "$APP_REPO"
 bun install --frozen-lockfile
 VITE_BASE_PATH="/" bun run build

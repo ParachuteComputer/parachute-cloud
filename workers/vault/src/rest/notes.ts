@@ -11,6 +11,10 @@
  *     records the row but does not enqueue a scribe job (no scribe in cloud).
  */
 import type { Store, Note, Attachment } from "@openparachute/core/src/types.js";
+import { getImportedVersion, importStorageIndex, parseHistorySelector, projectHistoryRow, ImportedHistoryUnrecoverableError } from "@openparachute/core/src/history-import.js";
+import { latestTombstone } from "@openparachute/core/src/history.js";
+import { historyBody } from "./history.js";
+import { projectHistoryProvenance } from "@openparachute/core/src/history-visibility.js";
 import {
   getNotes,
   getNoteTags,
@@ -261,6 +265,23 @@ export async function handleNotes(
   try {
     return await handleNotesInner(req, store, subpath, deps, tagScope, writeCtx);
   } catch (e: any) {
+    if (e?.code === "HISTORY_NOT_FOUND") return json({ error: e.message, error_type: "not_found" }, 404);
+    if (e?.code === "HISTORY_OVERFLOW") return json({
+      error_type: "history_overflow", note_id: e.note_id, byte_size: e.byte_size, limit: e.limit, message: e.message,
+    }, 413);
+    if (e?.code === "HISTORY_UNRECOVERABLE") return json({
+      error_type: "history_unrecoverable", note_id: e.note_id,
+      ...(e.origin === "git-import" ? { origin: e.origin, import_ix: e.import_ix } : { version_ix: e.version_ix }),
+      message: e.message,
+    }, 409);
+    if (e?.code === "PRECONDITION_REQUIRED") return json({ error_type: "precondition_required", note_id: e.note_id, message: e.message }, 428);
+    if (e?.code === "CONFLICT") return json({
+      error_type: "conflict", error: "conflict", current_updated_at: e.current_updated_at ?? null,
+      your_updated_at: e.expected_updated_at, expected_updated_at: e.expected_updated_at,
+      path: e.note_path ?? null, note_id: e.note_id, message: e.message,
+    }, 409);
+    if (e?.code === "SCHEMA_VALIDATION") return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message }, 422);
+    if (e?.code === "PATH_CONFLICT") return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message }, 409);
     const ambig = ambiguousPathResponse(e);
     if (ambig) return ambig;
     throw e;
@@ -1238,6 +1259,63 @@ async function handleNotesInner(
         try { await deps.deleteObject(result.path); } catch {}
       }
       return new Response(null, { status: 204 });
+    }
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+  }
+
+  const verMatch = sub.match(/^\/versions\/([^/]+)$/);
+  const importMatch = sub.match(/^\/imports\/([^/]+)$/);
+  if (sub === "/versions" || verMatch || importMatch || sub === "/restore") {
+    const note = await resolveNote(store, idOrPath);
+    if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
+    if (!note && (tagScope.raw !== null || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(idOrPath) ||
+      !(await store.listNoteVersions(idOrPath, { limit: 1 })).length)) {
+      return json({ error: "Not found", error_type: "not_found" }, 404);
+    }
+    const id = note?.id ?? idOrPath;
+    if (sub === "/versions") {
+      if (method === "GET") {
+        const parsedLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+        const limit = Number.isNaN(parsedLimit) ? 50 : Math.min(200, Math.max(0, parsedLimit));
+        const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0);
+        const versions = await store.listNoteVersions(id, { limit, offset });
+        return json({ versions: versions.map(row => projectHistoryProvenance(projectHistoryRow(row), tagScope.allowed !== null)), total: await store.countNoteVersions(id) });
+      }
+      if (method === "DELETE") {
+        const result = await store.eraseNoteHistory(id);
+        return json({ erased: true, id, versions_deleted: result.versionsDeleted, blobs_deleted: result.blobsDeleted });
+      }
+    } else if (importMatch && method === "GET") {
+      const index = Number(importMatch[1]);
+      if (!/^\d+$/.test(importMatch[1]!) || !Number.isSafeInteger(index) || index < 0) return json({ error: "Invalid import_ix", error_type: "invalid_request" }, 400);
+      const version = getImportedVersion(db, id, index);
+      return version ? json(projectHistoryProvenance(projectHistoryRow(version), tagScope.allowed !== null)) : json({ error: "Not found", error_type: "not_found", origin: "git-import", import_ix: index }, 404);
+    } else if (verMatch && method === "GET") {
+      const ix = Number(verMatch[1]);
+      if (!/^\d+$/.test(verMatch[1]!) || !Number.isInteger(ix) || ix < 0) return json({ error: "Invalid version_ix", error_type: "invalid_request" }, 400);
+      const version = await store.getNoteVersion(id, ix);
+      return version ? json(projectHistoryProvenance(version, tagScope.allowed !== null)) : json({ error: "Not found", error_type: "not_found" }, 404);
+    } else if (sub === "/restore" && method === "POST") {
+      const body = await historyBody(req);
+      if (body instanceof Response) return body;
+      let selector: ReturnType<typeof parseHistorySelector>;
+      try { selector = parseHistorySelector(body); }
+      catch { return json({ error: "Invalid history selector", error_type: "invalid_request" }, 400); }
+      if (!selector) return json({ error: "History selector is required", error_type: "missing_required_field" }, 400);
+      const storageIndex = "import_ix" in selector ? importStorageIndex(selector.import_ix) : selector.version_ix;
+      try {
+        const version = "import_ix" in selector ? getImportedVersion(db, id, selector.import_ix) : await store.getNoteVersion(id, storageIndex);
+        if (!version) return json({ error: "Not found", error_type: "not_found", ...("import_ix" in selector ? selector : {}) }, 404);
+        gateStrictWrite(store, writeCtx, { path: note ? note.path : latestTombstone(db, id)?.path, tags: note?.tags ?? [], metadata: version.metadata });
+        const restored = await store.restoreNoteVersion(id, storageIndex, {
+          actor: writeCtx.actor, via: writeCtx.via,
+          ...(body.if_updated_at !== undefined ? { if_updated_at: body.if_updated_at as string } : {}),
+        });
+        return json({ ...attachValidationStatus(store, db, restored), restored_from: "import_ix" in selector ? selector : selector.version_ix, recreated: !note });
+      } catch (e: any) {
+        if ("import_ix" in selector && e?.code === "HISTORY_UNRECOVERABLE" && e.origin !== "git-import") throw new ImportedHistoryUnrecoverableError(id, selector.import_ix, e.reason);
+        throw e;
+      }
     }
     return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
   }

@@ -53,13 +53,13 @@ describe("served SPA source", () => {
     const sourcePin = read("scripts/spa-source.env");
     const script = read("scripts/build-spa.sh");
 
-    expect(sourcePin).toContain('SPA_APP_VERSION="0.20.50"');
+    expect(sourcePin).toContain('SPA_APP_VERSION="0.22.15-rc.2"');
     expect(sourcePin).toMatch(/SPA_APP_REF="[0-9a-f]{40}"/);
     expect(script).toContain('source "$ROOT/scripts/spa-source.env"');
     expect(script).toContain("SPA_APP_REF");
     expect(script).toContain("git rev-parse HEAD");
     expect(script).toContain("APP_REPO");
-    expect(script).toContain("@openparachute/parachute-app");
+    expect(script).toContain("@openparachute/app");
     expect(script).toContain('VITE_BASE_PATH="/" bun run build');
     expect(script).not.toContain("@openparachute/notes-ui");
     expect(script).not.toContain("SURFACE_REPO");
