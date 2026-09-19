@@ -58,7 +58,8 @@ Schema 32 backfills per-note scheduling hints once. Subsequent candidate selecti
 uses the indexed hints, ordered by stored bytes, with a window four times the note
 limit. `remaining_candidates` is the total eligible count at selection time minus
 attempted notes, not the window size. No-op compactions are refused until another
-history write re-arms them; zero-live-byte notes are excluded. Retained deleted-note
+history write re-arms them; zero-live-byte notes are excluded from ratio-based
+selection, but remain eligible when over the byte ceiling. Retained deleted-note
 history still compacts. Shared-blob rewrites update all affected hints without
 re-arming unrelated notes. Doctor samples up to 200 largest hints and emits a
 read-only `history_compact_state_drift` warning on counter disagreement; this is not
