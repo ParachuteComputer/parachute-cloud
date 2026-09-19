@@ -22,6 +22,26 @@ async function call(v: string, token: string, name: string, args: Record<string,
 }
 
 describe("note history on DO SQLite", () => {
+  it("recovers exact legacy deleted IDs but not missing paths", async () => {
+    const v = freshVault("histlegacy");
+    await createNote(v, { content: "initialize" });
+    const ids = ["2020-01-02-03-04-05", "legacy:abc123", "shortid"];
+    await runInDurableObject<DurableObject, void>(env.VAULT.get(env.VAULT.idFromName(v)), async (inst: any) => {
+      for (const id of ids) {
+        await inst.store.createNote("original", { id, path: `legacy/${id}` });
+        await inst.store.updateNote(id, { content: "current" });
+        await inst.store.deleteNote(id);
+      }
+    });
+    for (const id of ids) {
+      expect((await op(v, `/api/notes/${id}/versions`)).status).toBe(200);
+      const restored = await op(v, `/api/notes/${id}/restore`, { method: "POST", ...json({ version_ix: 0 }) });
+      expect(restored.status).toBe(200);
+      expect(await restored.json()).toMatchObject({ id, content: "original", recreated: true });
+    }
+    expect((await op(v, "/api/notes/not-a-tombstone/versions")).status).toBe(404);
+    expect((await op(v, "/api/notes/not-a-tombstone/restore", { method: "POST", ...json({ version_ix: 0 }) })).status).toBe(404);
+  });
   it("runs maintenance on state load and preserves history with competing compactors and a writer", async () => {
     const v = freshVault("histrace"), n = await createNote(v, { content: "shared text ".repeat(400) + "initial" });
     const stub = env.VAULT.get(env.VAULT.idFromName(v));
