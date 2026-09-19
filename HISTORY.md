@@ -64,6 +64,12 @@ history still compacts. Shared-blob rewrites update all affected hints without
 re-arming unrelated notes. Doctor samples up to 200 largest hints and emits a
 read-only `history_compact_state_drift` warning on counter disagreement; this is not
 a full audit or repair. Compaction still reads authoritative history in its transaction.
+Reopening after an older schema writer automatically rebuilds hints from retained
+history, including when version-ledger timestamps tie (the lower version wins).
+A normal v32 reopen preserves refusal flags. If drift has another cause, report
+the missed-refresh bug: hosted repair arrives through a numbered core migration
+and pin update, not an operator REST call. Doctor remains read-only. The manual
+`history rebuild-state` CLI escape hatch is self-hosted only.
 This POST retains the hosted frozen/cap write gate; history erasure remains
 available when capped, but manual compaction is not a cap-bypass mechanism.
 
