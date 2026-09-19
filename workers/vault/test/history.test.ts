@@ -208,6 +208,9 @@ describe("note history on DO SQLite", () => {
       expect(db.prepare("SELECT refused FROM history_compact_state WHERE note_id=?").get(n.id).refused).toBe(1);
       initSchema(db);
       expect(db.prepare("SELECT refused FROM history_compact_state WHERE note_id=?").get(n.id).refused).toBe(1);
+      db.exec("UPDATE history_compact_state SET stored=999; UPDATE schema_version SET applied_at='2026-01-01T00:00:00.000Z'; INSERT OR REPLACE INTO schema_version VALUES(31,'2026-01-01T00:00:00.000Z')");
+      initSchema(db);
+      expect(db.prepare("SELECT stored,refused FROM history_compact_state WHERE note_id=?").get(n.id)).toEqual({ stored: 2, refused: 0 });
       await inst.store.updateNote(n.id, { content: "", force: true });
       expect(db.prepare("SELECT live,refused FROM history_compact_state WHERE note_id=?").get(n.id)).toEqual({ live: 0, refused: 0 });
       expect(inst.store.compactHistory({ budgetMs: 250, maxNotes: 50 }).notes_scanned).toBe(0);
