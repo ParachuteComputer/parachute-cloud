@@ -11,6 +11,7 @@
  *     records the row but does not enqueue a scribe job (no scribe in cloud).
  */
 import type { Store, Note, Attachment } from "@openparachute/core/src/types.js";
+import { isNoteIdShape } from "@openparachute/core/src/ulid.js";
 import { getImportedVersion, importStorageIndex, parseHistorySelector, projectHistoryRow, ImportedHistoryUnrecoverableError } from "@openparachute/core/src/history-import.js";
 import { latestTombstone } from "@openparachute/core/src/history.js";
 import { historyBody } from "./history.js";
@@ -1268,7 +1269,7 @@ async function handleNotesInner(
   if (sub === "/versions" || verMatch || importMatch || sub === "/restore") {
     const note = await resolveNote(store, idOrPath);
     if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
-    if (!note && (tagScope.raw !== null || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(idOrPath) ||
+    if (!note && (tagScope.raw !== null || !isNoteIdShape(idOrPath) ||
       !(await store.listNoteVersions(idOrPath, { limit: 1 })).length)) {
       return json({ error: "Not found", error_type: "not_found" }, 404);
     }
