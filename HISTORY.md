@@ -54,6 +54,15 @@ Hosted requests default to, and clamp at, 250ms / 50 notes per pass; unlike the
 self-hosted operator batch endpoint they cannot request an unbounded pass.
 The budget is checked between notes, not a hard deadline inside one note or the
 candidate scan. Inspect the returned summary and repeat if needed.
+Schema 32 backfills per-note scheduling hints once. Subsequent candidate selection
+uses the indexed hints, ordered by stored bytes, with a window four times the note
+limit. `remaining_candidates` is the total eligible count at selection time minus
+attempted notes, not the window size. No-op compactions are refused until another
+history write re-arms them; zero-live-byte notes are excluded. Retained deleted-note
+history still compacts. Shared-blob rewrites update all affected hints without
+re-arming unrelated notes. Doctor samples up to 200 largest hints and emits a
+read-only `history_compact_state_drift` warning on counter disagreement; this is not
+a full audit or repair. Compaction still reads authoritative history in its transaction.
 This POST retains the hosted frozen/cap write gate; history erasure remains
 available when capped, but manual compaction is not a cap-bypass mechanism.
 

@@ -195,15 +195,35 @@ describe("note history on DO SQLite", () => {
     expect((await (await op(v, `/api/notes/${n.id}`)).json() as any).content).toBe("archive");
   });
 
+  it("backfills v31 hints and persists no-op refusal until a new capture", async () => {
+    const v = freshVault("histstate"), n = await createNote(v, { content: "a" });
+    await update(v, n.id, "b"); await update(v, n.id, "c");
+    const stub = env.VAULT.get(env.VAULT.idFromName(v));
+    await runInDurableObject<DurableObject, void>(stub, async (inst: any) => {
+      const db = inst.store.db;
+      db.exec("DROP TABLE history_compact_state; UPDATE schema_version SET version=31");
+      initSchema(db);
+      expect(db.prepare("SELECT versions,stored,live,refused FROM history_compact_state WHERE note_id=?").get(n.id)).toEqual({ versions: 2, stored: 2, live: 1, refused: 0 });
+      inst.store.compactNote(n.id);
+      expect(db.prepare("SELECT refused FROM history_compact_state WHERE note_id=?").get(n.id).refused).toBe(1);
+      initSchema(db);
+      expect(db.prepare("SELECT refused FROM history_compact_state WHERE note_id=?").get(n.id).refused).toBe(1);
+      await inst.store.updateNote(n.id, { content: "", force: true });
+      expect(db.prepare("SELECT live,refused FROM history_compact_state WHERE note_id=?").get(n.id)).toEqual({ live: 0, refused: 0 });
+      expect(inst.store.compactHistory({ budgetMs: 250, maxNotes: 50 }).notes_scanned).toBe(0);
+      expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    });
+  });
+
   it("migrates a pre-history schema without losing live notes and keeps compacted blobs readable", async () => {
     const v = freshVault("histmigration"), n = await createNote(v, { content: "preserved" });
     const stub = env.VAULT.get(env.VAULT.idFromName(v));
     await runInDurableObject<DurableObject, void>(stub, async (inst: any) => {
       const db = inst.store.db;
-      db.exec("DROP TABLE history_import_refs; DROP TABLE history_import_receipts; DROP TABLE history_import_runs; DROP TABLE note_versions; DROP TABLE note_blobs; UPDATE schema_version SET version=28");
+      db.exec("DROP TABLE history_compact_state; DROP TABLE history_import_refs; DROP TABLE history_import_receipts; DROP TABLE history_import_runs; DROP TABLE note_versions; DROP TABLE note_blobs; UPDATE schema_version SET version=28");
       initSchema(db);
       // Schema versions are an append-only migration ledger, not a singleton.
-      expect(db.prepare("SELECT MAX(version) AS version FROM schema_version").get().version).toBe(31);
+      expect(db.prepare("SELECT MAX(version) AS version FROM schema_version").get().version).toBe(32);
       expect((await inst.store.getNote(n.id)).content).toBe("preserved");
       for (let i=0; i<12; i++) await inst.store.updateNote(n.id, { content: "shared prose ".repeat(500) + i, force: true });
       inst.store.compactHistory({ noteId: n.id, budgetMs: 1000, maxNotes: 1 });
