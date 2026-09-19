@@ -22,6 +22,23 @@ the note was never edited.
 MCP `query-notes` supports the shared `versions` selector. Restore remains
 REST-only, as on self-hosted Vault; no new MCP restore tool is advertised.
 
+## Read-only content audit
+
+`GET /api/doctor?deep=true` and MCP `doctor` with `deep: true` opt into
+materializing retained history blobs and verifying their content hashes. The
+default doctor scan remains unchanged. Both doors accept `history_after` (a
+64-character lowercase hash cursor), `history_max_blobs` (1–500, default 100),
+and `history_budget_ms` (1–1000, default 250).
+
+The `history_audit` result reports `checked`, `corrupt`, up to five example
+hashes, `complete`, and `next_after`. Continue with `next_after` until complete;
+an incomplete page is not a clean bill of health. Budgets are checked between
+blobs, not inside a materialization, and do not bound the ordinary structural
+doctor scan. Pages over a live vault are not a snapshot. Use a stable copied
+database for an exhaustive audit. Scans never repair or rewrite data, and
+operational failures are not relabeled as corruption. Deep scans require an
+unrestricted session; Cloud's existing rejection of scoped tokens is unchanged.
+
 ## Permissions and storage
 
 Reads require vault read access; restore requires write access and obeys existing
@@ -37,6 +54,22 @@ Hosted requests default to, and clamp at, 250ms / 50 notes per pass; unlike the
 self-hosted operator batch endpoint they cannot request an unbounded pass.
 The budget is checked between notes, not a hard deadline inside one note or the
 candidate scan. Inspect the returned summary and repeat if needed.
+Schema 32 backfills per-note scheduling hints once. Subsequent candidate selection
+uses the indexed hints, ordered by stored bytes, with a window four times the note
+limit. `remaining_candidates` is the total eligible count at selection time minus
+attempted notes, not the window size. No-op compactions are refused until another
+history write re-arms them; zero-live-byte notes are excluded from ratio-based
+selection, but remain eligible when over the byte ceiling. Retained deleted-note
+history still compacts. Shared-blob rewrites update all affected hints without
+re-arming unrelated notes. Doctor samples up to 200 largest hints and emits a
+read-only `history_compact_state_drift` warning on counter disagreement; this is not
+a full audit or repair. Compaction still reads authoritative history in its transaction.
+Reopening after an older schema writer automatically rebuilds hints from retained
+history, including when version-ledger timestamps tie (the lower version wins).
+A normal v32 reopen preserves refusal flags. If drift has another cause, report
+the missed-refresh bug: hosted repair arrives through a numbered core migration
+and pin update, not an operator REST call. Doctor remains read-only. The manual
+`history rebuild-state` CLI escape hatch is self-hosted only.
 This POST retains the hosted frozen/cap write gate; history erasure remains
 available when capped, but manual compaction is not a cap-bypass mechanism.
 
