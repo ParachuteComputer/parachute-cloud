@@ -47,7 +47,7 @@ import { handleOpsDailyGet, runDailyLine } from "./ops-daily.ts";
 import { bumpOpsCounter } from "./ops-counters.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
 import { accountDescriptor } from "./account-descriptor.ts";
-import { handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
+import { authorizeHomeRedirect, handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
 import {
   authorizationServerMetadata,
   corsPreflight,
@@ -93,6 +93,7 @@ import {
 import { handleStripeWebhookPost } from "./billing-webhook.ts";
 import { handlePromoRedeemPost } from "./promo.ts";
 import { handleAccountMcp, accountMcpProtectedResource } from "./account-mcp-http.ts";
+import { handleVaultConnectionDelete, handleVaultConnectionsList } from "./oauth-connections.ts";
 import { spaCspForHtml } from "./spa-csp.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
@@ -149,7 +150,15 @@ app.get("/.well-known/oauth-protected-resource/account/mcp", (c) => accountMcpPr
 // the uncredentialed token-family endpoints, reflected-origin (credentialed DCR)
 // on register. Cross-origin browser PKCE (the Notes PWA) needs both.
 app.options("/oauth/*", (c) => oauthPreflight(c.req.raw));
-app.get("/oauth/authorize", (c) => handleAuthorizeGet(c.env.DB, c.req.raw, depsFor(c.env)));
+// One-pass connect (T-318): on the issuer host in production, the browser is
+// sent to the home origin (my.) where the session lives — see
+// oauth-authorize.ts `authorizeHomeRedirect`.
+app.get(
+  "/oauth/authorize",
+  (c) =>
+    authorizeHomeRedirect(c.req.raw, depsFor(c.env), c.env.ENVIRONMENT === "production") ??
+    handleAuthorizeGet(c.env.DB, c.req.raw, depsFor(c.env)),
+);
 app.post("/oauth/authorize", (c) => handleAuthorizePost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/oauth/token", async (c) => withWildcardCors(await handleToken(c.env.DB, c.req.raw, depsFor(c.env))));
 app.post("/oauth/register", async (c) =>
@@ -169,7 +178,10 @@ app.post("/oauth/revoke", async (c) => withWildcardCors(await handleRevoke(c.env
  * SCOPE is the load-bearing correctness property. This is wired into ONLY the
  * GET `/login`, GET `/console` and GET `/console/security` routes below, so it is
  * PHYSICALLY unreachable
- * from any MACHINE path — `/oauth/*` (cloud. is the OAuth issuer), `/auth/verify`
+ * from any MACHINE path — `/oauth/*` (cloud. is the OAuth issuer; the one
+ * deliberate exception is the browser GET of `/oauth/authorize`, which T-318's
+ * `authorizeHomeRedirect` sends to my. — a separate, issuer-aware redirect, not
+ * this one), `/auth/verify`
  * + `/auth/code` (magic-link + code consumption; old emails point at cloud.),
  * `/unsubscribe` (RFC 8058 one-click POST won't follow a 3xx), `/billing/webhook`
  * (Stripe's dashboard pins cloud.), and `/.well-known/*` (discovery) all keep
@@ -297,6 +309,11 @@ app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, d
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/vaults/:name", (c) => handleAccountVaultDelete(c.env.DB, c.req.raw, depsFor(c.env)));
+// Connected apps (T-318): list + disconnect the OAuth clients reaching a vault.
+app.get("/account/vaults/:name/connections", (c) => handleVaultConnectionsList(c.env.DB, c.req.raw, depsFor(c.env)));
+app.delete("/account/vaults/:name/connections/:clientId", (c) =>
+  handleVaultConnectionDelete(c.env.DB, c.req.raw, depsFor(c.env)),
+);
 // ACCOUNT deletion (cloud#226 A-3) — the whole-account sibling of the vault
 // delete above, and a different shape on purpose: it severs auth immediately
 // (tombstone + session/token wipe) and pauses billing, but erases NOTHING for

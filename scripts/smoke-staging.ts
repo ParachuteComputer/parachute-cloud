@@ -1056,7 +1056,7 @@ async function main() {
         });
         const rConsent = await rResumed.text();
         assert(
-          rResumed.status === 200 && /Authorize|Approve/.test(rConsent) && rConsent.includes(rState),
+          rResumed.status === 200 && /Authorize|Approve|Allow/.test(rConsent) && rConsent.includes(rState),
           "resumed authorize renders consent for the pending request",
           `status ${rResumed.status}`,
         );
@@ -1137,7 +1137,7 @@ async function main() {
         });
         const rcConsent = await rcResumed.text();
         assert(
-          rcResumed.status === 200 && /Authorize|Approve/.test(rcConsent) && rcConsent.includes(rcState),
+          rcResumed.status === 200 && /Authorize|Approve|Allow/.test(rcConsent) && rcConsent.includes(rcState),
           "resumed-by-code authorize renders consent for the pending request",
           `status ${rcResumed.status}`,
         );

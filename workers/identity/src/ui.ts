@@ -232,11 +232,14 @@ export function renderLogin(opts: {
   showPassword?: boolean;
   /** Opens the "have a code?" disclosure with `error` shown there instead. */
   showCode?: boolean;
+  /** The connecting app's display name (untrusted DCR `client_name`), when known. */
+  clientName?: string | null;
 }): string {
-  const { params, csrfToken, error, showPassword, showCode } = opts;
+  const { params, csrfToken, error, showPassword, showCode, clientName } = opts;
+  const heading = clientName ? `Sign in to connect ${esc(clientName)}` : "Sign in to Parachute";
   return page(
     "Sign in — Parachute",
-    `<h1>Sign in to Parachute</h1>
+    `<h1>${heading}</h1>
      <div class="card">
        <form method="post" action="/auth/magic">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -297,7 +300,7 @@ export interface ConsentProps {
   issuerHost: string;
   /** The authenticated account approving this grant — the "Signed in as" line. */
   email: string;
-  /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `buildAuthorizeUrl`). */
+  /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `authorizeResumePath`). */
   notYouNext: string;
   /**
    * hub#689 port — the owner-elected read/write/admin selector, or null. Set
@@ -359,7 +362,9 @@ export interface OwnerVerbSelector {
  * landing on `/login` byte-identical to before this line existed.
  */
 function signedInAsLine(email: string, csrfToken: string, next?: string): string {
-  return `<p class="muted" data-testid="signed-in-as" style="margin:0 0 1rem">Signed in as <strong>${esc(email)}</strong> &middot; <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}">${next ? `<input type="hidden" name="next" value="${esc(next)}">` : ""}<button class="linkbtn" type="submit">Not you?</button></form></p>`;
+  // A <div>, not a <p>: the inline logout <form> would otherwise end the
+  // paragraph and drop "Not you?" onto its own line.
+  return `<div class="muted" data-testid="signed-in-as" style="margin:0 0 1rem">Signed in as <strong>${esc(email)}</strong> &middot; <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}">${next ? `<input type="hidden" name="next" value="${esc(next)}">` : ""}<button class="linkbtn" type="submit">Not you?</button></form></div>`;
 }
 
 function scopeLabel(scope: string): string {
@@ -498,7 +503,6 @@ export function renderConsent(props: ConsentProps): string {
   const scopeList = scopeDescriptions
     .map((s) => `<li><strong>${esc(s.label)}</strong><br><span class="muted">${esc(s.scope)}</span></li>`)
     .join("\n");
-  const vaultDisplay = lockedVault ? `<p class="muted">Vault: <strong>${esc(lockedVault)}</strong></p>` : "";
   const vaultField = lockedVault
     ? `<input type="hidden" name="vault_pick" value="${esc(lockedVault)}">`
     : needsVaultPick
@@ -506,15 +510,20 @@ export function renderConsent(props: ConsentProps): string {
       : "";
   const verbSelectorField = verbSelector ? renderVerbSelector(verbSelector) : "";
   const accountVaultsField = accountVaults ? renderAccountVaultsBlock(accountVaults) : "";
+  const ask = consentAsk({
+    clientName,
+    scopes: scopeDescriptions.map((s) => s.scope),
+    lockedVault,
+    needsVaultPick,
+    account: accountVaults !== null,
+  });
   return page(
-    "Authorize — Parachute",
-    `<h1>Authorize ${esc(clientName)}</h1>
-     <p class="muted" style="margin:0 0 .3rem">issued by <strong>${esc(issuerHost)}</strong></p>
+    `Connect ${clientName} — Parachute`,
+    `<h1>Connect ${esc(clientName)}</h1>
      ${signedInAsLine(email, csrfToken, notYouNext)}
      <div class="card">
-       <p class="muted"><strong>${esc(clientName)}</strong> is requesting access to:</p>
+       <p class="lead" data-testid="consent-ask">${ask}</p>
        <ul class="scopes">${scopeList}</ul>
-       ${vaultDisplay}
        <form method="post" action="/oauth/authorize">
          <input type="hidden" name="__action" value="consent">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -524,11 +533,58 @@ export function renderConsent(props: ConsentProps): string {
          ${accountVaultsField}
          <div class="row">
            <button class="deny" type="submit" name="decision" value="deny">Deny</button>
-           <button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Approve</button>
+           <button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Allow</button>
          </div>
        </form>
-     </div>`,
+       <p class="muted" style="margin:.9rem 0 0">You can disconnect it anytime from your vault's settings.</p>
+     </div>
+     <p class="muted foot">issued by <strong>${esc(issuerHost)}</strong></p>`,
   );
+}
+
+/**
+ * The plain one-line ask at the top of the consent card — names the app and
+ * the vault: "Claude wants to read and write notes in my-notes." The verb comes
+ * from the strongest vault verb requested (admin > write > read); the vault
+ * from the `vault=` hint, else the single named vault in the (resource-
+ * narrowed) scopes, else the picker below. Account-vaults requests (one
+ * connection across vaults) say so instead. `clientName` is untrusted (a
+ * self-registered DCR `client_name`) — escaped, like every name here.
+ */
+export function consentAsk(opts: {
+  clientName: string;
+  scopes: readonly string[];
+  lockedVault: string | null;
+  needsVaultPick: boolean;
+  account: boolean;
+}): string {
+  const who = `<strong>${esc(opts.clientName)}</strong>`;
+  if (opts.account) return `${who} wants to see and work with the vaults in your account.`;
+  const verbs = new Set<string>();
+  const named = new Set<string>();
+  for (const s of opts.scopes) {
+    const parts = s.split(":");
+    if (parts[0] !== "vault") continue;
+    if (parts.length === 2 && parts[1]) verbs.add(parts[1]);
+    if (parts.length === 3 && parts[1] && parts[2]) {
+      named.add(parts[1]);
+      verbs.add(parts[2]);
+    }
+  }
+  if (verbs.size === 0) return `${who} wants access to your Parachute account.`;
+  const what = verbs.has("admin")
+    ? "read, write and manage notes in"
+    : verbs.has("write")
+      ? "read and write notes in"
+      : "read notes in";
+  const single = named.size === 1 ? [...named][0]! : null;
+  const vault = opts.lockedVault ?? single;
+  const where = vault
+    ? `<strong>${esc(vault)}</strong>`
+    : opts.needsVaultPick
+      ? "the vault you choose below"
+      : "your vaults";
+  return `${who} wants to ${what} ${where}.`;
 }
 
 export function renderError(opts: { title: string; message: string }): string {
@@ -1078,19 +1134,21 @@ function connectAiContent(v: ConsoleVaultCard): string {
     <div class="connect-block">
       <h4>Claude</h4>
       <ol class="steps">
-        <li>Open <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> and go to <strong>Settings → Connectors</strong></li>
-        <li>Choose <strong>Add custom connector</strong></li>
-        <li>Paste the URL above and connect</li>
+        <li>Open <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> and go to <strong>Customize → Connectors</strong></li>
+        <li>Click <strong>+ Add</strong>, then <strong>Add custom connector</strong></li>
+        <li>Paste the URL above, click <strong>Continue</strong>, and allow access when Parachute asks</li>
       </ol>
+      <p class="muted" style="margin:.2rem 0 0">On Claude&#39;s free plan you can add one custom connector.</p>
     </div>
     <div class="connect-block">
       <h4>ChatGPT</h4>
       <ol class="steps">
-        <li>Open ChatGPT and go to <strong>Settings → Connectors</strong> (available on paid plans)</li>
-        <li>In your connector settings, add a custom connector / MCP server</li>
+        <li>Open ChatGPT&#39;s <strong>Settings</strong> and find <strong>Apps &amp; Connectors</strong> (custom connectors need a paid plan, and may need Developer mode turned on)</li>
+        <li>Create a custom connector / MCP server</li>
         <li>Paste the URL above and connect</li>
       </ol>
     </div>
+    <p class="muted" style="margin:.65rem 0 0">Disconnect anytime from your vault&#39;s settings in the app.</p>
     <p class="muted" style="margin:.65rem 0 0"><strong>Other AIs:</strong> that same URL works in any MCP-compatible client — paste it wherever your AI asks for an MCP server.</p>
     <p class="muted" style="margin:.45rem 0 0">Command line: <code>${esc(v.connectCmd)}</code></p>
     <p class="muted" style="margin:.45rem 0 0">Need more detail? See the <a href="https://parachute.computer/guides/connect-your-ai/" target="_blank" rel="noopener">Connect your AI guide</a>.</p>`;

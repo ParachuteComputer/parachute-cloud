@@ -17,7 +17,9 @@
  *   3. MUST-NEVER-REDIRECT — the single most important correctness property:
  *      EVERY machine path on cloud. keeps serving (never a 3xx to my.), because
  *      the redirect is wired into ONLY the GET /login + /console routes and is
- *      physically unreachable from /oauth/*, /auth/verify, /auth/code,
+ *      physically unreachable from /oauth/* (except the browser GET of
+ *      /oauth/authorize, which T-318 sends to my. on purpose — see
+ *      one-pass-connect.test.ts), /auth/verify, /auth/code,
  *      /unsubscribe, /billing/webhook, /.well-known/*.
  *   4. ONLY cloud. redirects — my. (a co-equal serving Custom Domain) SERVES the
  *      same pages; it never front-door-redirects.
@@ -149,8 +151,27 @@ describe("MUST-NEVER-REDIRECT — every machine path on cloud. keeps serving (pr
     expect(notFrontDoorRedirected(res)).toBe(true);
   });
 
-  test("GET cloud./oauth/authorize → served (never 3xx to my.)", async () => {
+  // T-318 one-pass connect: the browser GET of /oauth/authorize is the ONE
+  // deliberate /oauth/* exception — it goes to my. (302, query intact) so
+  // sign-in + consent run where the session lives. The issuer, discovery,
+  // token, register and revoke endpoints all stay on cloud. Pinned in full in
+  // one-pass-connect.test.ts; a POST (a form rendered on cloud. before the
+  // deploy) is still served in place.
+  test("GET cloud./oauth/authorize → 302 to my. (one-pass connect, T-318) — the only /oauth/* exception", async () => {
     const res = await get(`${CLOUD}/oauth/authorize?client_id=unknown&redirect_uri=https%3A%2F%2Fx.example%2Fcb&response_type=code`, prodEnv);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(`${MY}/oauth/authorize?client_id=unknown&redirect_uri=https%3A%2F%2Fx.example%2Fcb&response_type=code`);
+  });
+
+  test("POST cloud./oauth/authorize → served (never 3xx to my.)", async () => {
+    const res = await worker.fetch(
+      new Request(`${CLOUD}/oauth/authorize`, {
+        method: "POST",
+        body: new URLSearchParams({ __action: "consent" }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: CLOUD },
+      }),
+      prodEnv,
+    );
     expect(notFrontDoorRedirected(res)).toBe(true);
   });
 
