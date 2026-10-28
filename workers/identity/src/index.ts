@@ -42,6 +42,8 @@ import {
   handleAdminVaultsGet,
 } from "./admin.ts";
 import { handleAdminGrowthGet } from "./admin-growth.ts";
+import { handleAdminDeleteGet, handleAdminDeletePost } from "./admin-delete.ts";
+import { handleTestAccountDeleteReport, handleTestAccountDeleteSweep } from "./account-delete-hooks.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
 import { accountDescriptor } from "./account-descriptor.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
@@ -361,6 +363,11 @@ app.get("/admin/users", (c) => handleAdminUsersGet(c.env.DB, c.req.raw, depsFor(
 app.get("/admin/vaults", (c) => handleAdminVaultsGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/admin/users/plan", (c) => handleAdminSetPlanPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/admin/users/suspend", (c) => handleAdminSuspendPost(c.env.DB, c.req.raw, depsFor(c.env)));
+// The operator path for an emailed deletion request (T-318, admin-delete.ts):
+// a retype-the-email confirm step, then the SAME request path as self-service
+// (24h undo window + the holder's notice email), audit-logged with the operator.
+app.get("/admin/users/delete", (c) => handleAdminDeleteGet(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/admin/users/delete", (c) => handleAdminDeletePost(c.env, c.req.raw, depsFor(c.env), senderFor(c.env)));
 
 // --- billing (Wave 4d — Stripe) ---
 // All three routes config-gate FIRST (billing-config.ts): without the Stripe
@@ -439,6 +446,21 @@ app.post("/__test/snapshot-run", async (c) => {
   // param → the full fleet sweep, unchanged.
   const onlyVault = c.req.query("vault") || undefined;
   return c.json(await runSnapshotSweep(c.env, deps, onlyVault ? { onlyVault } : {}));
+});
+
+// Staging/dev-only deletion-proof hooks (T-318, account-delete-hooks.ts) —
+// same allowlist gate as the triggers above (404 off staging|development|test,
+// pinned by smoke-prod), and additionally limited to @example.com accounts.
+// `sweep` fast-forwards ONE already-requested deletion past its window and runs
+// the real sweep for it; `report` counts every D1 row that can still name it.
+app.post("/__test/account-delete/sweep", (c) => {
+  const deps = depsFor(c.env);
+  if (!deps.exposeDevLinks) return c.notFound();
+  return handleTestAccountDeleteSweep(c.env, c.req.raw, deps, senderFor(c.env));
+});
+app.post("/__test/account-delete/report", (c) => {
+  if (!depsFor(c.env).exposeDevLinks) return c.notFound();
+  return handleTestAccountDeleteReport(c.env, c.req.raw);
 });
 
 /**

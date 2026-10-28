@@ -503,6 +503,7 @@ export async function pushVaultCap(
   userId: string,
   vaultName: string,
   entitlement: VaultEntitlement,
+  opts: { reopen?: boolean } = {},
 ): Promise<CapPushResult> {
   const capBytes = entitlement.caps.notes_bytes + entitlement.caps.attachment_bytes;
   let lastStatus: number | undefined;
@@ -530,6 +531,9 @@ export async function pushVaultCap(
           caps: entitlement.caps,
           transcription: entitlement.transcription,
           frozen: entitlement.frozen,
+          // T-318: undo (and the operator comp lever) re-open a vault the
+          // delete request locked, in the SAME PUT as the entitlement.
+          ...(opts.reopen ? { closed: false } : {}),
         },
       });
       if (res.ok) return { vault: vaultName, capBytes, ok: true, status: res.status, attempts: attempt };
@@ -587,6 +591,7 @@ export async function applyPlanToVaults(
   db: D1Database,
   deps: OAuthDeps,
   userId: string,
+  opts: { reopen?: boolean } = {},
 ): Promise<CapPushResult[]> {
   const user = await getUserById(db, userId);
   if (!user) return [];
@@ -606,7 +611,59 @@ export async function applyPlanToVaults(
   const vaults = await listVaultsForOwner(db, userId);
   const results: CapPushResult[] = [];
   for (const v of vaults) {
-    results.push(await pushVaultCap(db, deps, userId, v.name, entitlement));
+    results.push(await pushVaultCap(db, deps, userId, v.name, entitlement, opts));
+  }
+  return results;
+}
+
+export interface VaultClosePushResult {
+  vault: string;
+  ok: boolean;
+  status?: number;
+}
+
+/**
+ * Lock (`closed: true`) or unlock every vault the account owns (T-318). The
+ * vault DO refuses every tenant request with 401 `account_closed` while
+ * locked — the lever that makes the stateless 15-minute vault tokens stop
+ * working the moment a delete is REQUESTED instead of when they expire.
+ *
+ * Deliberately NOT routed through {@link applyPlanToVaults}: that seam refuses
+ * a tombstoned owner by design (never wake a deleted account's DO for a
+ * plan change), and locking is exactly the call a tombstoned owner needs.
+ * Best-effort per vault, one retry on a retryable status; failures are
+ * returned (and logged) rather than thrown, because the delete HAS happened
+ * and the tokens it failed to lock still die at expiry.
+ */
+export async function pushVaultsClosed(
+  db: D1Database,
+  deps: OAuthDeps,
+  userId: string,
+  closed: boolean,
+): Promise<VaultClosePushResult[]> {
+  const results: VaultClosePushResult[] = [];
+  for (const v of await listVaultsForOwner(db, userId)) {
+    let last: VaultClosePushResult = { vault: v.name, ok: false };
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const res = await callVaultApi(db, deps, {
+          userId,
+          vaultName: v.name,
+          method: "PUT",
+          apiPath: "/api/internal/config",
+          verb: "admin",
+          jsonBody: { closed },
+        });
+        last = { vault: v.name, ok: res.ok, status: res.status };
+        if (res.ok || !isRetryableStatus(res.status)) break;
+      } catch {
+        last = { vault: v.name, ok: false };
+      }
+    }
+    if (!last.ok) {
+      console.warn(`event=vault_close_push_failed vault=${v.name} closed=${closed} status=${last.status ?? "transport"}`);
+    }
+    results.push(last);
   }
   return results;
 }

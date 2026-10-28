@@ -163,6 +163,8 @@ export interface AdminUserRow {
   pendingPlan: string | null;
   vaultCount: number;
   checklistDone: number;
+  /** Account deletion requested (T-318) — the 24h undo window is running. */
+  deletedAt?: string | null;
 }
 
 export interface AdminUsersProps {
@@ -221,6 +223,7 @@ export function renderAdminUsers(props: AdminUsersProps): string {
           ? `<span class="badge badge-warn" data-testid="payment-failed-badge">payment failed &times;${u.paymentFailedCount} since ${esc(u.paymentFailedAt.slice(0, 10))}</span>`
           : "",
         u.pendingPlan ? `<span class="badge">downgrade scheduled &rarr; ${esc(u.pendingPlan)}</span>` : "",
+        u.deletedAt ? `<span class="badge badge-warn" data-testid="deletion-badge">deletion requested ${esc(u.deletedAt.slice(0, 10))}</span>` : "",
       ]
         .filter(Boolean)
         .join(" ");
@@ -230,7 +233,7 @@ export function renderAdminUsers(props: AdminUsersProps): string {
         <td>${esc(u.createdAt.slice(0, 10))}</td>
         <td style="text-align:right">${u.vaultCount}</td>
         <td style="text-align:right">${u.checklistDone}/${CHECKLIST_ITEMS.length}</td>
-        <td>${planForm} ${suspendForm}</td>
+        <td>${planForm} ${suspendForm}${u.deletedAt ? "" : ` <a class="rowbtn" style="text-decoration:none" href="/admin/users/delete?user_id=${encodeURIComponent(u.id)}">Delete&hellip;</a>`}</td>
       </tr>`;
     })
     .join("\n");
@@ -301,5 +304,48 @@ export function renderAdminVaults(props: AdminVaultsProps): string {
        </table></div>
        ${pager("/admin/vaults", current, totalPages)}
      </div>`,
+  );
+}
+
+// --- delete an account on an emailed request (T-318) -------------------------
+
+export interface AdminDeleteConfirmProps {
+  user: { id: string; email: string; vaultCount: number; deletedAt: string | null; role: string };
+  csrfToken: string;
+  error?: string;
+}
+
+/**
+ * The confirm step of the operator delete: the operator retypes the account's
+ * email (the same guard the account holder gets). The action runs the SAME
+ * request path as self-service — 24-hour undo window, notice email to the
+ * account holder — and writes an audit row naming the operator.
+ */
+export function renderAdminDeleteConfirm(props: AdminDeleteConfirmProps): string {
+  const { user, csrfToken, error } = props;
+  const body = user.deletedAt
+    ? `<p>This account already asked to be deleted on ${esc(user.deletedAt.slice(0, 16).replace("T", " "))} UTC. Nothing more to do: it is erased 24 hours after that.</p>`
+    : `<p>Delete the account <strong>${esc(user.email)}</strong> and its ${user.vaultCount} vault${user.vaultCount === 1 ? "" : "s"}.</p>
+       <ul class="muted">
+         <li>The account closes now: signed out everywhere, its vault tokens stop working.</li>
+         <li>The account holder gets the deletion email with a 24-hour undo link.</li>
+         <li>After 24 hours, its vaults, notes, files, snapshots and exports are erased.</li>
+         <li>This action is logged with your operator id.</li>
+       </ul>
+       ${user.role === "operator" ? `<div class="warn">This is an operator account.</div>` : ""}
+       <form method="post" action="/admin/users/delete">
+         <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+         <input type="hidden" name="user_id" value="${esc(user.id)}">
+         <label for="confirm_email">Type the account email to confirm</label>
+         <input type="text" id="confirm_email" name="confirm_email" autocomplete="off" required>
+         <button class="primary" type="submit">Delete this account</button>
+       </form>`;
+  return page(
+    "Admin · Delete account — Parachute",
+    `${ADMIN_STYLE}
+     ${adminHeader("Delete account", "users")}
+     ${banner(undefined, error)}
+     <div class="card" data-testid="admin-delete-confirm">${body}</div>
+     <div class="foot"><a href="/admin/users">&larr; Back to users</a></div>`,
   );
 }

@@ -8,7 +8,7 @@
  * `checkAccountDescriptor`); the self-host hub serves its own twin (advertising
  * `/account/setup`, hub#748) in a follow-up.
  */
-import type { AccountPlanSummary, ParachuteAccountDescriptor } from "@openparachute/door-contract";
+import type { AccountCapabilities, AccountPlanSummary, ParachuteAccountDescriptor } from "@openparachute/door-contract";
 import { type OAuthDeps, frontDoorOrigin, jsonResponse, vaultAdvertisedUrl } from "./oauth-shared.ts";
 import { PAID_TIERS, PLAN_SPECS, TIER_PRICE_MONTHLY_USD, type TierIntervalAvailability, tierIntervals } from "./plans.ts";
 
@@ -66,6 +66,18 @@ function planLadder(): AccountPlanSummaryWithIntervals[] {
   }));
 }
 
+/** The shared capability keys plus cloud's additive `account_delete`. */
+export interface CloudAccountCapabilities extends AccountCapabilities {
+  account_delete: boolean;
+}
+
+const CLOUD_CAPABILITIES: CloudAccountCapabilities = {
+  vault_create: true,
+  vault_rename: false,
+  vault_delete: true,
+  account_delete: true,
+};
+
 export function accountDescriptor(deps: OAuthDeps): Response {
   const iss = deps.issuer;
   const body: ParachuteAccountDescriptor = {
@@ -87,15 +99,16 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // identity-side D1 sweep), so the door now advertises the capability it
     // actually has. A client that reads this flag is what turns the endpoint
     // into a user-facing affordance; leaving it false would ship the route dark.
-    // NOT advertised here, deliberately: the WHOLE-ACCOUNT door (cloud#226
-    // A-3, `/account/delete` + `/account/undo-delete`) has no flag, because
-    // `AccountCapabilities` is the SHARED door contract — it lives upstream in
-    // parachute-hub's `packages/door-contract` and is CI-pinned to a reviewed
-    // commit, so a new key belongs to an upstream PR + a pin bump, not to a
-    // cloud-side wiring branch. Until that lands, a client learns the door
-    // exists from the contract's route list, not from a capability bit. The
-    // route works either way; what it lacks is the advertisement.
-    capabilities: { vault_create: true, vault_rename: false, vault_delete: true },
+    // `account_delete` (T-318): the WHOLE-ACCOUNT door (cloud#226 A-3,
+    // `POST /account/delete` + `/account/undo-delete`) is advertised as an
+    // ADDITIVE cloud extension of the shared `AccountCapabilities` (the same
+    // pattern as `AccountPlanSummaryWithIntervals` below): a door-contract
+    // consumer that only knows the shared keys sees exactly what it expects,
+    // and the app turns this bit into its Delete-account section. Folding the
+    // key into the shared contract upstream (parachute-hub door-contract) is a
+    // follow-up; the self-host hub simply never sends it, so its app shows no
+    // such section.
+    capabilities: CLOUD_CAPABILITIES,
     // The account-level MCP endpoint (Wave A PR3) — one connection across the
     // account's vaults (list-vaults / create-vault / query-notes). Advertised at
     // the FRONT DOOR origin (`my.` in prod, self-referential in staging), where

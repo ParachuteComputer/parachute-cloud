@@ -588,7 +588,9 @@ describe("C3 — DELETE /account/vaults/<name>", () => {
         vault_rows_deleted: 1,
         vault_usage_rows_deleted: 2,
         vault_snapshot_rows_deleted: 2,
-        tokens_revoked: 1,
+        // The 3-part `vault:doomed:*` token AND (T-318) the owner's composed
+        // `account:<id>:vaults:doomed:read` token.
+        tokens_revoked: 2,
         grants_rewritten: 1,
         grants_dropped: 1,
       },
@@ -616,23 +618,17 @@ describe("C3 — DELETE /account/vaults/<name>", () => {
       .bind("delete-other-vault-token")
       .first<{ revoked_at: string | null }>();
     expect(unrelated?.revoked_at).toBeNull();
-    // The sweep's blast radius stops at the 3-part vault grammar: a composed
-    // ACCOUNT scope naming the same vault survives. Goes red if the LIKE
-    // pattern is ever loosened (e.g. to `%<name>%` or `%vault%<name>%`).
-    // The exact-segment check is the authority, not the LIKE prefilter: the
-    // composed account scope never reaches it, and the two rows that DO reach
-    // it (`xvault:<name>:read`, `vault:<name>:superuser` — both carry the
-    // literal `vault:<name>:` substring) must be discarded by the JS match.
+    // T-318: the owner's composed ACCOUNT scope naming this vault is now
+    // swept too (it would otherwise cover a later same-name vault without a
+    // fresh consent). The exact-segment check is still the authority: the two
+    // rows that reach it through the LIKE prefilter (`xvault:<name>:read`,
+    // `vault:<name>:superuser`) must be discarded by the JS match.
     const survivors = await env.DB.prepare(
       "SELECT jti FROM tokens WHERE revoked_at IS NULL AND jti IN (?, ?, ?) ORDER BY jti",
     )
       .bind("delete-composed-account-token", "delete-prefix-suffixed", "delete-bogus-verb")
       .all<{ jti: string }>();
-    expect((survivors.results ?? []).map((r) => r.jti)).toEqual([
-      "delete-bogus-verb",
-      "delete-composed-account-token",
-      "delete-prefix-suffixed",
-    ]);
+    expect((survivors.results ?? []).map((r) => r.jti)).toEqual(["delete-bogus-verb", "delete-prefix-suffixed"]);
 
     // Grants: REWRITTEN, not dropped, when the row spans other vaults — the hub
     // twin's over-revocation guard. Dropping `grant-spanning` would silently
@@ -677,6 +673,33 @@ describe("C3 — DELETE /account/vaults/<name>", () => {
       .bind("underscore-neighbor")
       .first<{ revoked_at: string | null }>();
     expect(neighbor?.revoked_at).toBeNull();
+  });
+
+  test("T-318: composed account grants naming the vault are rewritten; the wildcard and other accounts survive", async () => {
+    const { userId, token } = await seedOwnerWithPlan("del-composed@example.com");
+    const other = await seedOwnerWithPlan("del-composed-other@example.com");
+    await seedVault("journal", userId);
+    const at = new Date().toISOString();
+    const grant = (uid: string, client: string, scopes: string) =>
+      env.DB.prepare("INSERT INTO grants (user_id, client_id, scopes, granted_at) VALUES (?, ?, ?, ?)").bind(uid, client, scopes, at);
+    await env.DB.batch([
+      // Per-vault composed + legacy narrowed forms for THIS vault, beside a
+      // sibling vault and the all-vaults wildcard.
+      grant(userId, "c-mixed", `account:${userId}:vaults:journal:write account:${userId}:vaults:work:read account:${userId}:vaults:*:read`),
+      grant(userId, "c-only", `account:${userId}:vaults:journal`),
+      // Another account's scope that happens to name the same vault string.
+      grant(other.userId, "c-foreign", `account:${other.userId}:vaults:journal:read`),
+    ]);
+
+    const res = await handleAccountVaultDelete(
+      db(),
+      accountReq("DELETE", "/account/vaults/journal", { token, body: { confirm: "journal" } }),
+      accountDeps(),
+    );
+    expect(res.status).toBe(200);
+    expect(await grantScopes(userId, "c-mixed")).toBe(`account:${userId}:vaults:work:read account:${userId}:vaults:*:read`);
+    expect(await grantScopes(userId, "c-only")).toBeNull();
+    expect(await grantScopes(other.userId, "c-foreign")).toBe(`account:${other.userId}:vaults:journal:read`);
   });
 
   test("after the delete, the vault is gone from every read path — list, mint, and re-delete", async () => {

@@ -38,6 +38,7 @@ import type { Env } from "./env.ts";
 import type { EmailSender } from "./email.ts";
 import { runAccountDeleteSweep } from "./account-delete.ts";
 import { markAlerted, shouldAlert } from "./ops-alerts.ts";
+import { purgeStaleAuthArtifacts } from "./magic-links.ts";
 import { runBillingSweep } from "./billing-lifecycle.ts";
 import { runDrip } from "./drip.ts";
 import { depsForEnv } from "./oauth-shared.ts";
@@ -126,6 +127,15 @@ export async function handleScheduled(cron: string, env: Env, sender: EmailSende
       await runAccountDeleteSweep(env, purgeDeps, deps.now?.() ?? new Date(), { sender });
     } catch (err) {
       console.error(`event=account_delete_sweep_failed error=${err instanceof Error ? err.message : String(err)}`);
+    }
+    // Retention purge of spent sign-in artifacts (T-318, magic-links.ts):
+    // links + pending 2FA logins + auth codes past their life by a week.
+    // Own try — it must never starve, or be starved by, the jobs above.
+    try {
+      const r = await purgeStaleAuthArtifacts(env.DB, deps.now?.() ?? new Date());
+      console.log(`event=auth_retention_purge magic_links=${r.magicLinks} pending_logins=${r.pendingLogins} auth_codes=${r.authCodes}`);
+    } catch (err) {
+      console.error(`event=auth_retention_purge_failed error=${err instanceof Error ? err.message : String(err)}`);
     }
   } else if (job === "usage") {
     // The rollup's vault reads go through the mint seam, so it takes the full
