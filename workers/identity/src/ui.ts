@@ -297,7 +297,7 @@ export interface ConsentProps {
   issuerHost: string;
   /** The authenticated account approving this grant — the "Signed in as" line. */
   email: string;
-  /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `buildAuthorizeUrl`). */
+  /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `authorizeResumePath`). */
   notYouNext: string;
   /**
    * hub#689 port — the owner-elected read/write/admin selector, or null. Set
@@ -568,6 +568,7 @@ export function consentAsk(opts: {
       verbs.add(parts[2]);
     }
   }
+  if (verbs.size === 0) return `${who} wants access to your Parachute account.`;
   const what = verbs.has("admin")
     ? "read, write and manage notes in"
     : verbs.has("write")

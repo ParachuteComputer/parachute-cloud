@@ -55,7 +55,7 @@ import {
 import { generateTotpSecret, otpauthUrl, verifyTotp } from "./totp.ts";
 import { qrSvg } from "./qr.ts";
 import { EMAIL_RE, PASSWORD_MIN, normalizeEmail } from "./validation.ts";
-import { authorizeParamsFromForm, buildAuthorizeUrl } from "./oauth-authorize.ts";
+import { authorizeParamsFromForm, authorizeResumePath } from "./oauth-authorize.ts";
 import {
   type AuthorizeParams,
   renderConsoleLogin,
@@ -182,14 +182,14 @@ export async function handleMagicRequestPost(
   //
   // Otherwise honor a caller-supplied `next` (the SPA passes its in-app landing
   // path, e.g. `/welcome`, in the body). Precedence: the OAuth authorize-resume
-  // URL (issuer-anchored) → a caller-supplied relative path (`safeNext`-guarded,
+  // path (origin-relative — resumes where the person signs in, T-318) → a caller-supplied relative path (`safeNext`-guarded,
   // same-origin only, no open redirect) → for the SPA/JSON caller, the app root
   // `/` (its BootGate dispatches new-vs-returning — NEVER the server console) →
   // for the server-rendered forms, null (verify keeps its own `/console` default).
   const authorizeParams = authorizeParamsFromForm(form);
   const requestedNext = String(form.get("next") ?? "").trim();
   const next = authorizeParams
-    ? buildAuthorizeUrl(deps.issuer, authorizeParams)
+    ? authorizeResumePath(authorizeParams)
     : requestedNext
       ? safeNext(requestedNext, deps)
       : wantsJson
@@ -235,8 +235,8 @@ export async function handleMagicRequestPost(
     // computer gets a link back to app., landing the session on the origin they
     // started on (P1.3 same-origin ceremonies). The gate above already proved
     // the Origin is a bound member; ceremonyOrigin falls back to the issuer for
-    // any opaque/foreign origin. The stored `next` resume target is unchanged —
-    // its authorize URL stays issuer-anchored (the OAuth ceremony origin).
+    // any opaque/foreign origin. The stored `next` authorize resume is
+    // origin-relative, so it resumes on this same origin (T-318).
     const link = `${ceremonyOrigin(req, deps)}/auth/verify?token=${encodeURIComponent(rawToken)}`;
     // G5: choose the email variant at send time — no `existing` row = a
     // brand-new account this link will create. Only the address owner reads the

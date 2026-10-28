@@ -581,8 +581,11 @@ describe("magic link resumes a pending authorize request", () => {
 
     const verify = await handleMagicVerifyGet(env.DB, verifyReq(tokenFromLink(link)), deps(() => now));
     expect(verify.status).toBe(302);
-    const loc = new URL(verify.headers.get("location")!);
-    expect(loc.origin).toBe(new URL(ISSUER).origin);
+    // Origin-RELATIVE (T-318): it resumes on whichever origin the person signed
+    // in on — where the session cookie now lives — and a form POST ending here
+    // never 302s cross-origin (form-action 'self').
+    expect(verify.headers.get("location")!.startsWith("/oauth/authorize?")).toBe(true);
+    const loc = new URL(verify.headers.get("location")!, ISSUER);
     expect(loc.pathname).toBe("/oauth/authorize");
     // EVERY param of the pending request round-trips exactly.
     expect(loc.searchParams.get("client_id")).toBe(clientId);
@@ -871,8 +874,11 @@ describe("sign-in code — verify by CODE instead of the link", () => {
     // link's own resume.
     const verify = await handleCodeVerifyPost(env.DB, codeVerifyReq("code-resume@example.com", code), deps(() => now));
     expect(verify.status).toBe(302);
-    const loc = new URL(verify.headers.get("location")!);
-    expect(loc.origin).toBe(new URL(ISSUER).origin);
+    // Origin-RELATIVE (T-318): it resumes on whichever origin the person signed
+    // in on — where the session cookie now lives — and a form POST ending here
+    // never 302s cross-origin (form-action 'self').
+    expect(verify.headers.get("location")!.startsWith("/oauth/authorize?")).toBe(true);
+    const loc = new URL(verify.headers.get("location")!, ISSUER);
     expect(loc.pathname).toBe("/oauth/authorize");
     expect(loc.searchParams.get("client_id")).toBe(clientId);
     expect(loc.searchParams.get("state")).toBe("st-code-resume-1");

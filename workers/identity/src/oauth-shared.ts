@@ -291,7 +291,7 @@ export function ceremonyOrigin(req: Request, deps: OAuthDeps): string {
  *      (cloud.) through Phase 4 — the browser's authorize request itself always
  *      lands on cloud., so on that leg the `resource` is the ONLY carrier of
  *      "which door the user pasted". It also survives every login round-trip
- *      (hiddenParams / buildAuthorizeUrl both preserve `resource`), so the
+ *      (hiddenParams / authorizeResumePath both preserve `resource`), so the
  *      consent shows the right face whether the user arrived signed-in or via
  *      magic-link/password/code, then
  *   3. the issuer host (the pre-existing behavior).

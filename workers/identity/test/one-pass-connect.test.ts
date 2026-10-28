@@ -230,6 +230,16 @@ describe("one-pass connect — authorize on the issuer host goes to the home ori
   });
 });
 
+/**
+ * Chrome enforces `form-action 'self'` against a form POST's FINAL redirect
+ * target, so a form on my. that answers with a 302 to cloud. is silently
+ * blocked. Every same-page form response in the flow must stay on my.
+ */
+function expectStaysOnMy(res: Response): void {
+  expect(res.status).toBe(302);
+  expect(new URL(res.headers.get("location")!, MY).origin).toBe(MY);
+}
+
 describe("one-pass connect — the full flow across cloud. and my.", () => {
   test("signed in on my.: DCR → authorize at cloud. → consent on my. → code → token at cloud. — no second sign-in", async () => {
     const email = `one-pass-in-${crypto.randomUUID()}@example.com`;
@@ -325,16 +335,9 @@ describe("one-pass connect — the full flow across cloud. and my.", () => {
     const user = await getUserByEmail(env.DB, email);
     await seedVault(vault, user!.id);
 
-    // Follow the resume: it may pass through the issuer URL, which hands the
-    // browser straight back to my. — where the session now is.
-    let next = new URL(verify.headers.get("location")!, MY);
-    let hops = 0;
-    let res = await browse(jar, next.toString());
-    while (res.status === 302 && hops++ < 3) {
-      next = new URL(res.headers.get("location")!, next);
-      res = await browse(jar, next.toString());
-    }
-    expect(next.origin).toBe(MY);
+    // The resume is origin-relative: it stays on my., where the session is.
+    expect(verify.headers.get("location")!.startsWith("/oauth/authorize?")).toBe(true);
+    const res = await browse(jar, new URL(verify.headers.get("location")!, MY).toString());
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain(`wants to read and write notes in <strong>${vault}</strong>`);
@@ -345,5 +348,66 @@ describe("one-pass connect — the full flow across cloud. and my.", () => {
 
     // ONE email for the whole connect.
     expect(await magicLinkCount(email)).toBe(1);
+  });
+
+  test("signed out, typing the 6-digit code on my.: the code POST resumes on my. (no cross-origin form redirect)", async () => {
+    const email = `one-pass-code-${crypto.randomUUID()}@example.com`;
+    const jar = new Jar();
+    const clientId = await registerClaude();
+    const { challenge } = await makePkce();
+    const vault = `op-${crypto.randomUUID().slice(0, 8)}`;
+    const atCloud = await browse(jar, `${CLOUD}/oauth/authorize?${authorizeQuery(clientId, challenge, vault)}`);
+    const loginHtml = await (await browse(jar, atCloud.headers.get("location")!)).text();
+    const fields = ["client_id", "redirect_uri", "response_type", "scope", "code_challenge", "code_challenge_method", "state", "resource", "__csrf"];
+    const send = new URLSearchParams();
+    for (const name of fields) send.set(name, hidden(loginHtml, name));
+    send.set("email", email);
+    const sent = await browse(
+      jar,
+      `${MY}/auth/magic`,
+      { method: "POST", body: send, headers: { "content-type": "application/x-www-form-urlencoded", origin: MY } },
+      env, // dev echo header only
+    );
+    const code = sent.headers.get("x-parachute-dev-magic-code")!;
+    expect(code).toMatch(/^\d{6}$/);
+
+    const enter = new URLSearchParams();
+    for (const name of fields) enter.set(name, hidden(loginHtml, name));
+    enter.set("email", email);
+    enter.set("code", code);
+    const verified = await browse(jar, `${MY}/auth/code`, {
+      method: "POST",
+      body: enter,
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: MY },
+    });
+    expectStaysOnMy(verified);
+    expect(jar.get(MY, SESSION_COOKIE)).toBeTruthy();
+    const user = await getUserByEmail(env.DB, email);
+    await seedVault(vault, user!.id);
+    const consent = await browse(jar, new URL(verified.headers.get("location")!, MY).toString());
+    expect(await consent.text()).toContain(`wants to read and write notes in <strong>${vault}</strong>`);
+  });
+
+  test("'Not you?' on the my. consent page signs out and lands back on my. sign-in for the same request", async () => {
+    const email = `one-pass-notyou-${crypto.randomUUID()}@example.com`;
+    const jar = new Jar();
+    await signInOnMy(jar, email);
+    const user = await getUserByEmail(env.DB, email);
+    const vault = `op-${crypto.randomUUID().slice(0, 8)}`;
+    await seedVault(vault, user!.id);
+    const clientId = await registerClaude();
+    const { challenge } = await makePkce();
+    const atCloud = await browse(jar, `${CLOUD}/oauth/authorize?${authorizeQuery(clientId, challenge, vault)}`);
+    const html = await (await browse(jar, atCloud.headers.get("location")!)).text();
+    const out = await browse(jar, `${MY}/logout`, {
+      method: "POST",
+      body: new URLSearchParams({ __csrf: hidden(html, "__csrf"), next: hidden(html, "next") }),
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: MY },
+    });
+    expectStaysOnMy(out);
+    expect(jar.get(MY, SESSION_COOKIE)).toBeUndefined();
+    const again = await browse(jar, new URL(out.headers.get("location")!, MY).toString());
+    expect(again.status).toBe(200);
+    expect(await again.text()).toContain("Sign in to connect Claude");
   });
 });

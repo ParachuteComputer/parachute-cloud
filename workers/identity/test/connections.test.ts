@@ -227,6 +227,38 @@ describe("DELETE /account/vaults/<name>/connections/<client_id> — Disconnect",
     expect(grant?.scopes).toBe(`vault:${other}:read`);
   });
 
+  test("a vault whose name starts with the disconnected one's is untouched (literal scope match, not a prefix)", async () => {
+    const { userId, vault, sessionId } = await setup("pre");
+    const longer = `${vault}x`;
+    await seedVault(longer, userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const a = await connect(clientId, sessionId, `vault:${vault}:read`);
+    const b = await connect(clientId, sessionId, `vault:${longer}:read`);
+    const res = await api("DELETE", `/account/vaults/${vault}/connections/${clientId}`, await accountBearer(userId, "admin"));
+    expect(((await res.json()) as { revoked_tokens: number }).revoked_tokens).toBe(1);
+    expect((await refresh(clientId, a.refresh_token)).status).toBe(400);
+    expect((await refresh(clientId, b.refresh_token)).status).toBe(200);
+  });
+
+  test("an account-wide connection: disconnecting from one vault removes it everywhere", async () => {
+    const { userId, vault, other } = await setup("aw");
+    const { clientId } = await seedApprovedClient({ clientName: "Agent" });
+    await env.DB.prepare("INSERT INTO grants (user_id, client_id, scopes, granted_at) VALUES (?, ?, ?, ?)")
+      .bind(userId, clientId, composedWildcardVaultsScope(userId, "write"), new Date().toISOString())
+      .run();
+    const res = await api("DELETE", `/account/vaults/${vault}/connections/${clientId}`, await accountBearer(userId, "admin"));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { covers: string }).covers).toBe("account");
+    const list = await api("GET", `/account/vaults/${other}/connections`, await accountBearer(userId, "read"));
+    expect(((await list.json()) as { connections: unknown[] }).connections).toEqual([]);
+  });
+
+  test("a malformed %-escape in the path is a 404, not a 500", async () => {
+    const { userId, vault } = await setup("esc");
+    const res = await api("DELETE", `/account/vaults/${vault}/connections/%E0%A4%A`, await accountBearer(userId, "admin"));
+    expect(res.status).toBe(404);
+  });
+
   test("an unknown client, or one not connected to this vault → 404; another owner's vault → 403", async () => {
     const { userId, vault, other, sessionId } = await setup("nf");
     const { clientId } = await seedApprovedClient();

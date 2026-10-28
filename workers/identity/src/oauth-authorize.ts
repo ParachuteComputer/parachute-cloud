@@ -273,7 +273,7 @@ async function authorizeCore(
         accountVaults: { ownedVaults },
         issuerHost: consentIssuedByHost(req, params.resource, deps),
         email: consentUser?.email ?? "",
-        notYouNext: buildAuthorizeUrl(deps.issuer, params),
+        notYouNext: authorizeResumePath(params),
       }),
       200,
       extra,
@@ -338,7 +338,7 @@ async function authorizeCore(
       // logout lands back here (no session → the login page, params intact)
       // and the connector request resumes without any new machinery.
       email: consentUser?.email ?? "",
-      notYouNext: buildAuthorizeUrl(deps.issuer, params),
+      notYouNext: authorizeResumePath(params),
     }),
     200,
     extra,
@@ -482,11 +482,13 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   const email = String(form.get("email") ?? "");
   const password = String(form.get("password") ?? "");
   const now = deps.now?.() ?? new Date();
+  // Keep naming the connecting app on an error re-render.
+  const clientName = (await getClient(db, params.clientId))?.clientName ?? null;
   // Same brute-force fence as the console /login (this is the other public
   // login-submit path). Check lockout BEFORE the expensive password verify.
   const key = loginKey(clientIp(req), email);
   if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
-    return renderLoginPage(req, params, "Too many attempts. Please wait a few minutes and try again.");
+    return renderLoginPage(req, params, "Too many attempts. Please wait a few minutes and try again.", clientName);
   }
   const user = email ? await getUserByEmail(db, email) : null;
   // SUSPENDED or DELETED accounts get the same wrong-password message here
@@ -494,7 +496,7 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   // never an oracle.
   if (!user || !(await verifyPassword(user, password)) || user.suspendedAt || user.deletedAt) {
     await recordLoginFailure(deps.rateLimiter, key, now);
-    return renderLoginPage(req, params, "Incorrect email or password.");
+    return renderLoginPage(req, params, "Incorrect email or password.", clientName);
   }
   await clearLoginFailures(deps.rateLimiter, key);
   // Transparent KDF upgrade: a verified-correct password stored under the
@@ -505,7 +507,7 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   // Stash a pending login whose `next` resumes THIS authorize request (with the
   // session the /login/2fa handler mints), and send the user to the code prompt.
   if (await isTotpEnrolled(db, user.id)) {
-    const token = await createPendingLogin(db, user.id, buildAuthorizeUrl(deps.issuer, params), now);
+    const token = await createPendingLogin(db, user.id, authorizeResumePath(params), now);
     return redirectResponse("/login/2fa", { "set-cookie": buildPendingLoginCookie(token) });
   }
 
@@ -521,23 +523,34 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
 }
 
 /**
- * Reconstruct the GET /oauth/authorize URL from parsed params — the resume
- * handle for flows that leave this page and come back with a session: the
- * post-2FA `next` (pending_logins), and the magic-link `next` (magic_links,
- * migration 0017 — auth-handlers.ts stores it server-side at send time).
+ * Reconstruct the pending GET /oauth/authorize request from parsed params, as
+ * an ORIGIN-RELATIVE path (`/oauth/authorize?…`) — the resume handle for flows
+ * that leave this page and come back with a session: the post-2FA `next`
+ * (pending_logins), the magic-link / sign-in-code `next` (magic_links,
+ * migration 0017 — auth-handlers.ts stores it server-side at send time), and
+ * the consent page's "Not you?" logout `next`.
+ *
+ * Relative on purpose (T-318 one-pass connect): the authorize pages now render
+ * on the home origin (my.) while the issuer is cloud. A resume target pinned
+ * to the issuer would (a) land on a host where the just-minted session cookie
+ * doesn't exist, and (b) turn every form POST that ends in it (/auth/code,
+ * /login/2fa, /logout) into a cross-origin 302, which Chrome's
+ * `form-action 'self'` silently blocks. Relative resumes on whichever origin
+ * the person signed in on — the one where their session now lives.
+ * `safeNext` accepts a relative path, so no new trust is introduced.
  */
-export function buildAuthorizeUrl(issuer: string, params: AuthorizeParams): string {
-  const u = new URL(`${issuer}/oauth/authorize`);
-  u.searchParams.set("client_id", params.clientId);
-  u.searchParams.set("redirect_uri", params.redirectUri);
-  u.searchParams.set("response_type", params.responseType);
-  u.searchParams.set("scope", params.scope);
-  u.searchParams.set("code_challenge", params.codeChallenge);
-  u.searchParams.set("code_challenge_method", params.codeChallengeMethod);
-  if (params.state !== null) u.searchParams.set("state", params.state);
-  if (params.resource !== null) u.searchParams.set("resource", params.resource);
-  if (params.vault !== null) u.searchParams.set("vault", params.vault);
-  return u.toString();
+export function authorizeResumePath(params: AuthorizeParams): string {
+  const q = new URLSearchParams();
+  q.set("client_id", params.clientId);
+  q.set("redirect_uri", params.redirectUri);
+  q.set("response_type", params.responseType);
+  q.set("scope", params.scope);
+  q.set("code_challenge", params.codeChallenge);
+  q.set("code_challenge_method", params.codeChallengeMethod);
+  if (params.state !== null) q.set("state", params.state);
+  if (params.resource !== null) q.set("resource", params.resource);
+  if (params.vault !== null) q.set("vault", params.vault);
+  return `/oauth/authorize?${q.toString()}`;
 }
 
 async function handleConsentSubmit(db: D1Database, req: Request, form: FormData, deps: OAuthDeps): Promise<Response> {

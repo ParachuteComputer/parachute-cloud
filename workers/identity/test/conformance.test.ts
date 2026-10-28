@@ -1076,8 +1076,10 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
 
     // The "Not you?" next is THIS exact pending request, reconstructed —
     // proven by round-tripping every param a resumed authorize would need.
-    const next = new URL(extractNotYouNext(html));
-    expect(next.origin + next.pathname).toBe(`${ISSUER}/oauth/authorize`);
+    // Origin-relative (T-318): the logout lands back on the same origin.
+    expect(extractNotYouNext(html).startsWith("/oauth/authorize?")).toBe(true);
+    const next = new URL(extractNotYouNext(html), ISSUER);
+    expect(next.pathname).toBe("/oauth/authorize");
     expect(next.searchParams.get("client_id")).toBe(clientId);
     expect(next.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
     expect(next.searchParams.get("scope")).toBe("vault:default:read");
@@ -1151,7 +1153,7 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     // re-enters /oauth/authorize with every original param intact — the
     // SAME session-less login render a first-time visitor would see, ready
     // for the right person to sign in and resume the connector request.
-    const resumed = await handleAuthorizeGet(env.DB, new Request(next), deps());
+    const resumed = await handleAuthorizeGet(env.DB, new Request(new URL(next, ISSUER)), deps());
     expect(resumed.status).toBe(200);
     const resumedHtml = await resumed.text();
     expect(resumedHtml).toContain("Sign in to");

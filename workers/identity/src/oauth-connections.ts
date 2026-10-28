@@ -130,14 +130,6 @@ interface GrantJoinRow {
   client_name: string | null;
 }
 
-interface TokenRow {
-  jti: string;
-  scopes: string;
-  created_at: string;
-  revoked_at: string | null;
-  expires_at: string;
-}
-
 function splitScopes(s: string): string[] {
   return s.split(" ").filter((x) => x.length > 0);
 }
@@ -150,18 +142,50 @@ function restError(status: number, error: string, message: string): Response {
 function pathParts(req: Request): { vault: string; clientId: string | null } | null {
   const m = /^\/account\/vaults\/([^/]+)\/connections(?:\/([^/]+))?\/?$/.exec(new URL(req.url).pathname);
   if (!m) return null;
-  return {
-    vault: decodeURIComponent(m[1]!).toLowerCase(),
-    clientId: m[2] !== undefined ? decodeURIComponent(m[2]) : null,
-  };
+  try {
+    return {
+      vault: decodeURIComponent(m[1]!).toLowerCase(),
+      clientId: m[2] !== undefined ? decodeURIComponent(m[2]) : null,
+    };
+  } catch {
+    return null; // a malformed %-escape is a 404, not a 500
+  }
 }
 
-async function tokenRowsFor(db: D1Database, userId: string, clientId: string): Promise<TokenRow[]> {
+/** The newest token row per client for this user that reaches `vault` — one query. */
+async function lastUsedByClient(db: D1Database, userId: string, vault: string): Promise<Map<string, string>> {
   const res = await db
-    .prepare("SELECT jti, scopes, created_at, revoked_at, expires_at FROM tokens WHERE user_id = ? AND client_id = ?")
-    .bind(userId, clientId)
-    .all<TokenRow>();
-  return res.results ?? [];
+    .prepare("SELECT client_id, scopes, created_at FROM tokens WHERE user_id = ?")
+    .bind(userId)
+    .all<{ client_id: string; scopes: string; created_at: string }>();
+  const out = new Map<string, string>();
+  for (const t of res.results ?? []) {
+    if (!vaultReach(splitScopes(t.scopes), vault, userId)) continue;
+    const prev = out.get(t.client_id);
+    if (prev === undefined || t.created_at > prev) out.set(t.client_id, t.created_at);
+  }
+  return out;
+}
+
+/**
+ * The SQL predicate "this row's space-separated `scopes` reach `vault`" — the
+ * same rule as {@link vaultReach}, as literal token matches (`instr`, no LIKE
+ * wildcards, so `_` / `%` in names can't over-match). Run INSIDE the batch so
+ * a token minted between a read and the write can't slip past (no
+ * read-then-revoke-by-id window).
+ */
+function reachesVaultSql(vault: string, userId: string): { clause: string; binds: string[] } {
+  const needles = [
+    ` vault:${vault}:`, // vault:<name>:<verb>
+    ` account:${userId}:vaults:${vault}:`, // composed per-vault
+    ` account:${userId}:vaults:${vault} `, // legacy per-vault
+    ` account:${userId}:vaults:*:`, // composed wildcard
+    ` account:${userId}:vaults `, // legacy blanket
+  ];
+  return {
+    clause: `(${needles.map(() => "instr(' ' || scopes || ' ', ?) > 0").join(" OR ")})`,
+    binds: needles,
+  };
 }
 
 /** The connections that reach `vault` for `userId`, newest first. */
@@ -175,21 +199,17 @@ export async function listVaultConnections(db: D1Database, userId: string, vault
     )
     .bind(userId)
     .all<GrantJoinRow>();
+  const lastUsed = await lastUsedByClient(db, userId, vault);
   const out: VaultConnection[] = [];
   for (const row of res.results ?? []) {
     if (FIRST_PARTY_CLIENTS.has(row.client_id)) continue;
     const reach = vaultReach(splitScopes(row.scopes), vault, userId);
     if (!reach) continue;
-    let lastUsed: string | null = null;
-    for (const t of await tokenRowsFor(db, userId, row.client_id)) {
-      if (!vaultReach(splitScopes(t.scopes), vault, userId)) continue;
-      if (lastUsed === null || t.created_at > lastUsed) lastUsed = t.created_at;
-    }
     out.push({
       client_id: row.client_id,
       client_name: row.client_name,
       connected_at: row.granted_at,
-      last_used_at: lastUsed,
+      last_used_at: lastUsed.get(row.client_id) ?? null,
       access: reach.access,
       covers: reach.covers,
       scopes: reach.scopes,
@@ -236,34 +256,36 @@ export async function disconnectVaultClient(
           .bind(remaining.join(" "), userId, clientId),
   );
 
-  // 2. Live tokens that reach this vault (all of them, for an account-wide
-  //    connection). Revoking the row kills the refresh token AND lists the
-  //    access token's jti in the revocation document.
-  const live = (await tokenRowsFor(db, userId, clientId)).filter(
-    (t) => t.revoked_at === null && t.expires_at > nowIso,
+  // 2. Live tokens that reach this vault (every live token of this client
+  //    for this user, when the connection is account-wide). Revoking the row
+  //    kills the refresh token AND lists the access token's jti in the
+  //    revocation document. A predicate, not a list of jtis read earlier, so a
+  //    token minted a moment before the click is caught too.
+  const reachSql = reachesVaultSql(vault, userId);
+  const tokenFilter = reach.covers === "account" ? "" : ` AND ${reachSql.clause}`;
+  const tokenBinds = reach.covers === "account" ? [] : reachSql.binds;
+  const revokeIdx = stmts.length;
+  stmts.push(
+    db
+      .prepare(
+        `UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL AND expires_at > ?${tokenFilter}`,
+      )
+      .bind(nowIso, userId, clientId, nowIso, ...tokenBinds),
   );
-  const doomed = live.filter((t) => reach.covers === "account" || vaultReach(splitScopes(t.scopes), vault, userId) !== null);
-  for (const t of doomed) {
-    stmts.push(
-      db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL").bind(nowIso, t.jti),
-    );
-  }
 
-  // 3. Unredeemed auth codes that reach this vault.
-  const codes = await db
-    .prepare("SELECT code, scopes FROM auth_codes WHERE user_id = ? AND client_id = ? AND used_at IS NULL")
-    .bind(userId, clientId)
-    .all<{ code: string; scopes: string }>();
-  for (const c of codes.results ?? []) {
-    if (reach.covers === "account" || vaultReach(splitScopes(c.scopes), vault, userId) !== null) {
-      stmts.push(db.prepare("DELETE FROM auth_codes WHERE code = ?").bind(c.code));
-    }
-  }
+  // 3. Unredeemed auth codes that reach this vault — a code minted just
+  //    before the click can't be spent after it.
+  stmts.push(
+    db
+      .prepare(`DELETE FROM auth_codes WHERE user_id = ? AND client_id = ? AND used_at IS NULL${tokenFilter}`)
+      .bind(userId, clientId, ...tokenBinds),
+  );
 
-  await db.batch(stmts);
+  const results = await db.batch(stmts);
+  const revokedTokens = results[revokeIdx]?.meta.changes ?? 0;
   // Ids and a count only — no scopes, no token material.
-  console.log(`event=connection_disconnected user=${userId} client=${clientId} revoked_tokens=${doomed.length}`);
-  return { revokedTokens: doomed.length, covers: reach.covers };
+  console.log(`event=connection_disconnected user=${userId} client=${clientId} revoked_tokens=${revokedTokens}`);
+  return { revokedTokens, covers: reach.covers };
 }
 
 /** GET /account/vaults/<name>/connections */
