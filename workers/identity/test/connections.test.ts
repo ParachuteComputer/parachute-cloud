@@ -210,6 +210,48 @@ describe("DELETE /account/vaults/<name>/connections/<client_id> — Disconnect",
     expect(await again.text()).toContain('data-testid="consent-ask"');
   });
 
+  test("a refresh already in flight when Disconnect commits does not leave a live token (Codex T-318)", async () => {
+    const { userId, vault, sessionId } = await setup("race");
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const pair = await connect(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`);
+    const admin = await accountBearer(userId, "admin");
+    // A DB whose first batch() (the refresh rotation) lets the Disconnect commit
+    // first: the refresh has already read its token as live, then loses the race.
+    let raced = false;
+    const racingDb = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "batch") {
+          return async (stmts: D1PreparedStatement[]) => {
+            if (!raced) {
+              raced = true;
+              const dc = await api("DELETE", `/account/vaults/${vault}/connections/${clientId}`, admin);
+              expect(dc.status).toBe(200);
+            }
+            return target.batch(stmts);
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    const r = await worker.fetch(
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: pair.refresh_token, client_id: clientId }),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      { ...env, DB: racingDb },
+    );
+    expect(raced).toBe(true);
+    expect(r.status).toBe(400);
+    const live = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM tokens WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL",
+    )
+      .bind(userId, clientId)
+      .first<{ n: number }>();
+    expect(live?.n).toBe(0);
+  });
+
   test("disconnecting from one vault leaves the same app's access to another vault working", async () => {
     const { userId, vault, other, sessionId } = await setup("two");
     const { clientId } = await seedApprovedClient({ clientName: "Claude" });

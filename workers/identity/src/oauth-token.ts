@@ -420,9 +420,15 @@ async function rotateAndRespond(
     familyId: row.familyId,
     now: deps.now,
   });
+  let results: D1Result[];
   try {
-    await db.batch([
-      db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").bind(now.toISOString(), row.jti),
+    results = await db.batch([
+      // Conditional: only a STILL-LIVE predecessor rotates. The row was read
+      // live before this batch, but a disconnect (oauth-connections.ts) or a
+      // concurrent rotation may have revoked it since.
+      db
+        .prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL")
+        .bind(now.toISOString(), row.jti),
       prepared.stmt,
       db.prepare("UPDATE tokens SET rotated_to = ? WHERE jti = ?").bind(access.jti, row.jti),
     ]);
@@ -430,6 +436,13 @@ async function rotateAndRespond(
     // Concurrent rotation collided on the jti PK (or any INSERT-time error).
     // Clean invalid_grant per RFC 6749 §5.2 — the batch rolled back.
     return jsonResponse({ error: "invalid_grant", error_description: "refresh_token rotation conflict" }, 400);
+  }
+  if ((results[0]?.meta.changes ?? 0) !== 1) {
+    // The predecessor was revoked between our read and our write (Codex T-318
+    // review: an in-flight refresh must not outlive a Disconnect). Kill the
+    // replacement we just inserted and refuse, so no live token survives.
+    await db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").bind(now.toISOString(), access.jti).run();
+    return jsonResponse({ error: "invalid_grant", error_description: "refresh_token revoked" }, 400);
   }
   const vault = singleVaultName(row.scopes);
   return jsonResponse({
