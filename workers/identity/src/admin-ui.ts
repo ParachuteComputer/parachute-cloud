@@ -128,7 +128,12 @@ export function renderAdminOverview(props: AdminOverviewProps): string {
        ${
          dailyLines.length === 0
            ? `<p class="muted">No daily lines yet — the first one is written after the next 03:30 UTC run.</p>`
-           : `<pre style="white-space:pre-wrap;font-size:.8rem;line-height:1.5;margin:0">${dailyLines.map((d) => `<span data-testid="admin-daily-line">${esc(d.line)}</span>`).join("\n")}</pre>`
+           : `<div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.5">${dailyLines
+               .map(
+                 (d) =>
+                   `<div data-testid="admin-daily-line" style="padding-left:2ch;text-indent:-2ch;margin:0 0 .45rem">${esc(d.line)}</div>`,
+               )
+               .join("")}</div>`
        }
      </div>
      <div class="statgrid">
