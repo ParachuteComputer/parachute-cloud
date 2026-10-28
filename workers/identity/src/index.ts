@@ -42,6 +42,9 @@ import {
   handleAdminVaultsGet,
 } from "./admin.ts";
 import { handleAdminGrowthGet } from "./admin-growth.ts";
+import { handleAdminDailyJsonGet } from "./admin.ts";
+import { handleOpsDailyGet, runDailyLine } from "./ops-daily.ts";
+import { bumpOpsCounter } from "./ops-counters.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
 import { accountDescriptor } from "./account-descriptor.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
@@ -357,6 +360,8 @@ app.get("/admin", (c) => handleAdminOverviewGet(c.env.DB, c.req.raw, depsFor(c.e
 // (admin-growth.ts's privacy rule). `/admin` in CEREMONY_PREFIXES already
 // covers it, so no route-manifest change is needed.
 app.get("/admin/growth", (c) => handleAdminGrowthGet(c.env.DB, c.req.raw, depsFor(c.env)));
+// The daily ops lines as JSON for the signed-in operator (ops-daily.ts).
+app.get("/admin/daily.json", (c) => handleAdminDailyJsonGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/admin/users", (c) => handleAdminUsersGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/admin/vaults", (c) => handleAdminVaultsGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/admin/users/plan", (c) => handleAdminSetPlanPost(c.env.DB, c.req.raw, depsFor(c.env)));
@@ -440,6 +445,23 @@ app.post("/__test/snapshot-run", async (c) => {
   const onlyVault = c.req.query("vault") || undefined;
   return c.json(await runSnapshotSweep(c.env, deps, onlyVault ? { onlyVault } : {}));
 });
+
+// Staging/dev-only: compute + store + send the daily ops line NOW (ops-daily.ts)
+// instead of waiting for the 03:30 UTC tick — same gate + rationale (404 off
+// the allowlist, pinned by smoke-prod). Optional ?day=YYYY-MM-DD; default the
+// UTC day before now. Staging has no email binding: the "send" is the devlog
+// line, and the result is visible on /admin and /admin/daily.json.
+app.post("/__test/ops-daily-run", async (c) => {
+  if (!depsFor(c.env).exposeDevLinks) return c.notFound();
+  const day = c.req.query("day");
+  if (day !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(day)) return c.json({ error: "day must be YYYY-MM-DD" }, 400);
+  const r = await runDailyLine(c.env, senderFor(c.env), day ? { day } : {});
+  return c.json({ day: r.day, line: r.line, stats: r.stats, notified: r.notified });
+});
+
+// The daily ops lines for an operator AGENT (Uni) without a browser: bearer
+// OPS_READ_TOKEN (a secret). Unset secret → the router's plain 404.
+app.get("/ops/daily", async (c) => (await handleOpsDailyGet(c.env, c.req.raw)) ?? c.notFound());
 
 /**
  * The /vault defensive backstop (route-manifest.ts DEFENSIVE_PREFIXES),
@@ -573,8 +595,28 @@ app.get("/", (c) => {
  * Same sender selection as the magic-link flow: real binding in production,
  * dev-log on staging (deterministic, lands in Workers Logs).
  */
+/**
+ * The fetch entrypoint: Hono, plus the 5xx counter for the daily line and the
+ * health cron's error-rate alert. Costs nothing on the happy path (a status
+ * compare); on a 5xx it bumps one D1 counter AFTER the response, via
+ * waitUntil, so it never delays or breaks the response itself
+ * (bumpOpsCounter never throws). Without an ExecutionContext (direct calls in
+ * tests) the bump is awaited inline instead of left floating.
+ */
+// `env` stays as loosely typed as Hono's own `app.fetch` (tests hand it partial envs).
+async function fetchWithOpsCounters(req: Request, env?: Env | {}, ctx?: ExecutionContext): Promise<Response> {
+  const res = await app.fetch(req, env, ctx);
+  const db = (env as Partial<Env> | undefined)?.DB;
+  if (res.status >= 500 && db) {
+    const bump = bumpOpsCounter(db, "http_5xx", new Date());
+    if (ctx?.waitUntil) ctx.waitUntil(bump);
+    else await bump;
+  }
+  return res;
+}
+
 export default {
-  fetch: app.fetch,
+  fetch: fetchWithOpsCounters,
   async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     await handleScheduled(controller.cron, env, senderFor(env));
   },

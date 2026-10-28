@@ -66,7 +66,8 @@ export const CEREMONY_PREFIXES = [
   "/billing", // Stripe checkout / portal / webhook / mock-checkout
   "/unsubscribe", // onboarding-drip one-click unsubscribe (GET/POST)
   "/health", // liveness JSON — must return JSON, never the SPA shell
-  "/__test", // staging-only test triggers (drip/usage/snapshot); 404 in production, but server-owned
+  "/__test", // staging-only test triggers (drip/usage/snapshot/ops-daily); 404 in production, but server-owned
+  "/ops", // operator-agent JSON reads (/ops/daily, bearer OPS_READ_TOKEN); 404 when the secret is unset
 ] as const;
 
 /**
