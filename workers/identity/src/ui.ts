@@ -1106,19 +1106,21 @@ function connectAiContent(v: ConsoleVaultCard): string {
     <div class="connect-block">
       <h4>Claude</h4>
       <ol class="steps">
-        <li>Open <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> and go to <strong>Settings → Connectors</strong></li>
-        <li>Choose <strong>Add custom connector</strong></li>
-        <li>Paste the URL above and connect</li>
+        <li>Open <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> and go to <strong>Customize → Connectors</strong></li>
+        <li>Click <strong>+ Add</strong>, then <strong>Add custom connector</strong></li>
+        <li>Paste the URL above, click <strong>Continue</strong>, and allow access when Parachute asks</li>
       </ol>
+      <p class="muted" style="margin:.2rem 0 0">On Claude&#39;s free plan you can add one custom connector.</p>
     </div>
     <div class="connect-block">
       <h4>ChatGPT</h4>
       <ol class="steps">
-        <li>Open ChatGPT and go to <strong>Settings → Connectors</strong> (available on paid plans)</li>
-        <li>In your connector settings, add a custom connector / MCP server</li>
+        <li>Open ChatGPT&#39;s <strong>Settings</strong> and find <strong>Apps &amp; Connectors</strong> (custom connectors need a paid plan, and may need Developer mode turned on)</li>
+        <li>Create a custom connector / MCP server</li>
         <li>Paste the URL above and connect</li>
       </ol>
     </div>
+    <p class="muted" style="margin:.65rem 0 0">Disconnect anytime from your vault&#39;s settings in the app.</p>
     <p class="muted" style="margin:.65rem 0 0"><strong>Other AIs:</strong> that same URL works in any MCP-compatible client — paste it wherever your AI asks for an MCP server.</p>
     <p class="muted" style="margin:.45rem 0 0">Command line: <code>${esc(v.connectCmd)}</code></p>
     <p class="muted" style="margin:.45rem 0 0">Need more detail? See the <a href="https://parachute.computer/guides/connect-your-ai/" target="_blank" rel="noopener">Connect your AI guide</a>.</p>`;
