@@ -931,7 +931,7 @@ export class VaultDO extends DurableObject {
     if (!stored) {
       await this.ctx.storage.put("config", this.config);
       // First-ever materialization of this vault → seed the default packs
-      // (welcome: the five-guide welcome ring + the capture/guide/pinned tags;
+      // (welcome: the five-guide welcome ring + the guide tag — not capture;
       // getting-started: the AI-facing guide). This is
       // the create-time seam: the console's createVault is only a D1 ownership
       // claim ("the DO comes into existence on first access"), so the vault-as-
