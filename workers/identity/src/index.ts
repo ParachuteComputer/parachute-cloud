@@ -90,6 +90,7 @@ import {
 import { handleStripeWebhookPost } from "./billing-webhook.ts";
 import { handlePromoRedeemPost } from "./promo.ts";
 import { handleAccountMcp, accountMcpProtectedResource } from "./account-mcp-http.ts";
+import { handleVaultConnectionDelete, handleVaultConnectionsList } from "./oauth-connections.ts";
 import { spaCspForHtml } from "./spa-csp.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
@@ -305,6 +306,11 @@ app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, d
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/vaults/:name", (c) => handleAccountVaultDelete(c.env.DB, c.req.raw, depsFor(c.env)));
+// Connected apps (T-318): list + disconnect the OAuth clients reaching a vault.
+app.get("/account/vaults/:name/connections", (c) => handleVaultConnectionsList(c.env.DB, c.req.raw, depsFor(c.env)));
+app.delete("/account/vaults/:name/connections/:clientId", (c) =>
+  handleVaultConnectionDelete(c.env.DB, c.req.raw, depsFor(c.env)),
+);
 // ACCOUNT deletion (cloud#226 A-3) — the whole-account sibling of the vault
 // delete above, and a different shape on purpose: it severs auth immediately
 // (tombstone + session/token wipe) and pauses billing, but erases NOTHING for

@@ -8,7 +8,7 @@
  * `checkAccountDescriptor`); the self-host hub serves its own twin (advertising
  * `/account/setup`, hub#748) in a follow-up.
  */
-import type { AccountPlanSummary, ParachuteAccountDescriptor } from "@openparachute/door-contract";
+import type { AccountCapabilities, AccountPlanSummary, ParachuteAccountDescriptor } from "@openparachute/door-contract";
 import { type OAuthDeps, frontDoorOrigin, jsonResponse, vaultAdvertisedUrl } from "./oauth-shared.ts";
 import { PAID_TIERS, PLAN_SPECS, TIER_PRICE_MONTHLY_USD, type TierIntervalAvailability, tierIntervals } from "./plans.ts";
 
@@ -66,8 +66,27 @@ function planLadder(): AccountPlanSummaryWithIntervals[] {
   }));
 }
 
+/**
+ * The cloud's capabilities: the shared door-contract set plus `connections`
+ * (T-318) — `GET /account/vaults/<name>/connections` lists the apps connected
+ * to a vault and `DELETE …/connections/<client_id>` disconnects one
+ * (oauth-connections.ts). Additive, like `AccountPlanSummaryWithIntervals`: a
+ * reader that only knows `AccountCapabilities` sees exactly its fields. The
+ * key belongs upstream in door-contract eventually; until then the app reads
+ * it as an optional extra.
+ */
+export interface CloudAccountCapabilities extends AccountCapabilities {
+  connections: boolean;
+}
+
 export function accountDescriptor(deps: OAuthDeps): Response {
   const iss = deps.issuer;
+  const capabilities: CloudAccountCapabilities = {
+    vault_create: true,
+    vault_rename: false,
+    vault_delete: true,
+    connections: true,
+  };
   const body: ParachuteAccountDescriptor = {
     issuer: iss,
     door: "cloud",
@@ -95,7 +114,7 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // cloud-side wiring branch. Until that lands, a client learns the door
     // exists from the contract's route list, not from a capability bit. The
     // route works either way; what it lacks is the advertisement.
-    capabilities: { vault_create: true, vault_rename: false, vault_delete: true },
+    capabilities,
     // The account-level MCP endpoint (Wave A PR3) — one connection across the
     // account's vaults (list-vaults / create-vault / query-notes). Advertised at
     // the FRONT DOOR origin (`my.` in prod, self-referential in staging), where

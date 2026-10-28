@@ -226,6 +226,11 @@ export async function handleAccountVaultsList(db: D1Database, req: Request, deps
       // predating the migration's backfill (shouldn't happen once applied).
       vault_id: v.vaultId,
       url: vaultAdvertisedUrl(v.name, deps),
+      // The ONE address to paste into an AI (T-318): the advertised origin's
+      // MCP endpoint — my.parachute.computer/vault/<name>/mcp in production.
+      // The app's Connect AI shows this instead of deriving from the token's
+      // services URL (u.…, the machine origin, which keeps working forever).
+      mcp_url: `${vaultAdvertisedUrl(v.name, deps)}/mcp`,
       created_at: v.createdAt,
       // dbBytes → notes graph, r2Bytes → attachment binaries (the two-meter
       // split the plan caps push mirrors). Null until the first rollup lands.
