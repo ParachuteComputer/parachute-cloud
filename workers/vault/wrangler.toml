@@ -184,6 +184,11 @@ ENVIRONMENT = "production"
 # config. Only the literal "false" disables it; flip + redeploy this worker
 # ONLY (the pinned vault-worker-only ladder) to turn it off in an incident.
 EMBEDDINGS_ENABLED = "true"
+# The money switch (T-318) — the SAME var as the identity worker's. Anything
+# but "paid" (including unset) is the open beta: this worker then never
+# refuses a write as `plan_required`, whatever `frozen` flag a vault's stored
+# config still carries (src/caps.ts writesFrozen). Flip both workers together.
+BILLING_MODE = "open_beta"
 
 # A single incoming request's CPU budget resets per message; a large import that
 # arrives as one request may exceed the 30s default. Raise the ceiling.
@@ -240,6 +245,8 @@ CAP_BYTES = "1073741824"
 ENVIRONMENT = "staging"
 # Semantic search off switch (C2, EXPERIMENTAL) — see the top-level [vars] note.
 EMBEDDINGS_ENABLED = "true"
+# Money switch — restated per env; see the top-level [vars] note.
+BILLING_MODE = "open_beta"
 
 # Workers Logs for staging too (explicit per-env restatement; see the top-level
 # [observability] note).

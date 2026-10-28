@@ -54,6 +54,13 @@ export interface Env {
   /** Default per-tenant storage cap in bytes (string in wrangler vars). */
   CAP_BYTES?: string;
 
+  /**
+   * The money switch (T-318), shared with the identity worker: only the literal
+   * "paid" enforces the `frozen` floor; unset / anything else is the open beta,
+   * where no vault refuses a write as `plan_required` (caps.ts writesFrozen).
+   */
+  BILLING_MODE?: string;
+
   /** Deploy environment. TEST_JWKS is honored only when this is "test". */
   ENVIRONMENT?: string;
 

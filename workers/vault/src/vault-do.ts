@@ -41,6 +41,7 @@ import {
   attachmentsNotIncludedResponse,
   capExceededResponse,
   planRequiredResponse,
+  writesFrozen,
   resolveCap,
   usedBytes,
 } from "./caps.js";
@@ -1066,8 +1067,15 @@ export class VaultDO extends DurableObject {
     return this.config?.caps ?? null;
   }
 
-  /** Whether writes are frozen (the expired floor). */
+  /** Whether writes are frozen (the expired floor) — ENFORCED only in paid
+   *  mode (caps.ts writesFrozen); the open beta never freezes. */
   private isFrozen(): boolean {
+    return writesFrozen(this.config?.frozen === true, this.env.BILLING_MODE);
+  }
+
+  /** The STORED flag, mode-independent — what the internal config seam reports
+   *  so the identity reconciler can see (and clear) a stale `frozen: true`. */
+  private storedFrozen(): boolean {
     return this.config?.frozen === true;
   }
 
@@ -1136,8 +1144,9 @@ export class VaultDO extends DurableObject {
         cap_bytes: this.config!.cap_bytes ?? null,
         /** The two-meter budgets (null when the vault is legacy/un-pushed). */
         caps: caps ?? null,
-        /** The expired floor — writes return 402 plan_required. */
-        frozen: this.isFrozen(),
+        /** The STORED expired-floor flag (enforced only in paid mode — see
+         *  isFrozen). Reported raw so the reconciler converges it. */
+        frozen: this.storedFrozen(),
         /** The effective SUMMED cap (two-meter sum → legacy → env → 1 GiB). */
         resolved_cap_bytes: this.capBytes(),
         used_bytes: usedBytes(dbBytes, this.r2Bytes),
