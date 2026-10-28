@@ -314,6 +314,19 @@ async function handleTokenAuthorizationCode(
     scopes: redeemed.scopes,
     now: deps.now,
   });
+  // Fence against Disconnect (Codex T-318, P1): a Disconnect that commits
+  // between the code's redemption and the token insert deletes the code
+  // (redeemed or not) but finds no token to revoke yet. If the code is gone
+  // now, revoke what we just inserted and refuse. A Disconnect after this
+  // check finds the token live and revokes it itself.
+  const stillGranted = await db.prepare("SELECT 1 AS ok FROM auth_codes WHERE code = ?").bind(code).first();
+  if (!stillGranted) {
+    await db
+      .prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?")
+      .bind((deps.now?.() ?? new Date()).toISOString(), access.jti)
+      .run();
+    return jsonResponse({ error: "invalid_grant", error_description: "authorization was revoked" }, 400);
+  }
   const vault = singleVaultName(redeemed.scopes);
   return jsonResponse({
     access_token: access.token,
