@@ -111,11 +111,34 @@ export interface Env {
   /** FROM address for outbound email. Its domain must be onboarded to Email Sending. */
   EMAIL_FROM?: string;
   /**
-   * Where the scheduled health-check alerts + the weekly ops digest go
-   * (ops.ts). On staging the devlog sender writes these to the worker log
-   * instead of sending. Unset → ops emails are skipped (logged).
+   * Where operator alerts, the weekly ops digest and the daily ops line go
+   * (ops.ts, ops-alerts.ts, ops-daily.ts). Accepts a LIST — comma, semicolon or
+   * space separated — and every address gets every message (one email each;
+   * `operatorRecipients` in ops-alerts.ts). On staging the devlog sender writes
+   * these to the worker log instead of sending. Unset → ops emails are skipped
+   * (logged).
    */
   OPERATOR_ALERT_EMAIL?: string;
+  /**
+   * SECRET (`wrangler secret put OPS_ALERT_WEBHOOK_URL`), optional: a second,
+   * non-email operator channel. Alerts and the daily line are POSTed here as
+   * JSON `{ text, severity, key, at }` (5 s timeout, never throws into the
+   * caller; alert dedupe stays hourly per key across all channels). Works with
+   * ntfy.sh topic URLs, Slack-compatible incoming webhooks, and Buzz/other
+   * incoming webhooks. Unset → email only.
+   */
+  OPS_ALERT_WEBHOOK_URL?: string;
+  /**
+   * SECRET (`wrangler secret put OPS_READ_TOKEN`), optional: the bearer that
+   * lets an operator agent read `GET /ops/daily` (the daily lines as JSON)
+   * without a browser session. Unset → `/ops/daily` answers 404.
+   */
+  OPS_READ_TOKEN?: string;
+  /**
+   * 5xx responses in one 10-minute window at or above which the health cron
+   * raises an `errors:5xx` alert. Optional var; default 25 (ops.ts).
+   */
+  OPS_5XX_ALERT_THRESHOLD?: string;
   /**
    * The Cloudflare `send_email` binding, when declared in wrangler.toml AND the
    * sending domain is onboarded. Absent → the magic-link flow uses the dev-log
