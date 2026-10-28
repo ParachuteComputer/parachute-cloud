@@ -88,8 +88,8 @@ describe("voice entitlement (cloud#56) — folded into the ladder", () => {
   });
 
   it("the plan line reads each tier's own label", () => {
-    expect(planLine("plus")).toContain("Plus");
-    expect(planLine("standard")).toContain("Standard");
-    expect(planLine("entry")).toContain("Entry");
+    expect(planLine("plus", "paid")).toContain("Plus");
+    expect(planLine("standard", "paid")).toContain("Standard");
+    expect(planLine("entry", "paid")).toContain("Entry");
   });
 });

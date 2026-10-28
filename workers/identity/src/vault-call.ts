@@ -32,7 +32,7 @@
  */
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { signAccessToken } from "./tokens.ts";
-import { type OAuthDeps, vaultInstanceUrl } from "./oauth-shared.ts";
+import { type OAuthDeps, billingModeOf, vaultInstanceUrl } from "./oauth-shared.ts";
 import { type PlanCaps, type VaultEntitlement, entitlementPlanFor, planEntitlement } from "./plans.ts";
 import { getUserById } from "./users.ts";
 import { listVaultsForOwner } from "./vaults.ts";
@@ -602,7 +602,7 @@ export async function applyPlanToVaults(
   // entitlement, and frozen — a plan change flips them together. A TRIAL
   // mirrors the CHOSEN tier when pending_plan names one (plans.ts
   // entitlementPlanFor — "try any plan free for three months").
-  const entitlement = planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan));
+  const entitlement = planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps)));
   const vaults = await listVaultsForOwner(db, userId);
   const results: CapPushResult[] = [];
   for (const v of vaults) {

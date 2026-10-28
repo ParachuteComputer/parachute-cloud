@@ -130,6 +130,13 @@ export interface Env {
    */
   STRIPE_SECRET_KEY?: string;
   /**
+   * The money switch (T-318): "open_beta" (the default when unset, and for any
+   * unknown value) or "paid". Read ONLY through billing-config.ts
+   * `billingMode`. open_beta keeps every Stripe path dormant even when the
+   * secrets above exist, and makes the expired/frozen floor unreachable.
+   */
+  BILLING_MODE?: string;
+  /**
    * Stripe webhook endpoint signing secret (whsec_…) — `wrangler secret put
    * STRIPE_WEBHOOK_SECRET`. From the webhook endpoint created in the Stripe
    * dashboard pointing at POST /billing/webhook.

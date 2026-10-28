@@ -83,6 +83,7 @@ import {
   jsonResponse,
   redirectResponse,
   resolveBoundOrigins,
+  billingModeOf,
 } from "./oauth-shared.ts";
 
 function csrfExtra(setCookie?: string): Record<string, string> {
@@ -289,7 +290,12 @@ function magicError(req: Request, message: string, email: string): Response {
  * chokepoint; the caller decides how that surfaces (the link's dead-link page
  * vs the code's neutral failure message), but neither ever mints.
  */
-async function resolveVerifiedUser(db: D1Database, consumed: ConsumedMagicLink, now: Date): Promise<string | null> {
+async function resolveVerifiedUser(
+  db: D1Database,
+  consumed: ConsumedMagicLink,
+  now: Date,
+  deps: OAuthDeps,
+): Promise<string | null> {
   let userId = consumed.userId;
   const existing = userId ? await getUserById(db, userId) : await getUserByEmail(db, consumed.email);
   if (existing) {
@@ -298,7 +304,7 @@ async function resolveVerifiedUser(db: D1Database, consumed: ConsumedMagicLink, 
     await markEmailVerified(db, userId);
     return userId;
   }
-  return (await createUser(db, consumed.email, "", now, { emailVerified: true })).id;
+  return (await createUser(db, consumed.email, "", now, { emailVerified: true, billingMode: billingModeOf(deps) })).id;
 }
 
 export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
@@ -308,7 +314,7 @@ export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: O
   if (!consumed) return magicLinkDead(req, deps);
   // A SUSPENDED account gets the same dead-link page as an expired token —
   // covers links minted before the suspension landed, with no oracle.
-  const userId = await resolveVerifiedUser(db, consumed, now);
+  const userId = await resolveVerifiedUser(db, consumed, now, deps);
   if (!userId) return magicLinkDead(req, deps);
   // Follow the stored resume target (the authorize URL for sends from the
   // OAuth login page — single-use + expiry came free with the token consume
@@ -361,7 +367,7 @@ export async function handleCodeVerifyPost(db: D1Database, req: Request, deps: O
     await recordLoginFailure(deps.rateLimiter, key, now);
     return codeError(req, authorizeParams, neutralMsg, email);
   }
-  const userId = await resolveVerifiedUser(db, consumed, now);
+  const userId = await resolveVerifiedUser(db, consumed, now, deps);
   if (!userId) {
     // SUSPENDED — same neutral failure as a wrong/expired code, never a mint.
     await recordLoginFailure(deps.rateLimiter, key, now);

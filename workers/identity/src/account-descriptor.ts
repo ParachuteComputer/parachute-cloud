@@ -9,8 +9,17 @@
  * `/account/setup`, hub#748) in a follow-up.
  */
 import type { AccountPlanSummary, ParachuteAccountDescriptor } from "@openparachute/door-contract";
-import { type OAuthDeps, frontDoorOrigin, jsonResponse, vaultAdvertisedUrl } from "./oauth-shared.ts";
-import { PAID_TIERS, PLAN_SPECS, TIER_PRICE_MONTHLY_USD, type TierIntervalAvailability, tierIntervals } from "./plans.ts";
+import { type OAuthDeps, billingModeOf, frontDoorOrigin, jsonResponse, vaultAdvertisedUrl } from "./oauth-shared.ts";
+import {
+  type BillingMode,
+  OPEN_BETA_LONG,
+  OPEN_BETA_SHORT,
+  PAID_TIERS,
+  PLAN_SPECS,
+  TIER_PRICE_MONTHLY_USD,
+  type TierIntervalAvailability,
+  tierIntervals,
+} from "./plans.ts";
 
 /**
  * The reserved first-party client id a native app uses against the cloud door.
@@ -66,9 +75,26 @@ function planLadder(): AccountPlanSummaryWithIntervals[] {
   }));
 }
 
+/**
+ * The cloud-only money fields (T-318), additive over the shared door contract
+ * (`checkAccountDescriptor` ignores unknown keys; a hub serves none of them):
+ *   - `billing_mode` — the money switch, so the front door can tell the open
+ *     beta from a priced door without guessing from `plans`;
+ *   - `money_line` / `money_story` — the short + long money story, so the copy
+ *     travels with the door instead of being hardcoded in the app.
+ * In open beta `plans` is EMPTY: there is nothing to buy, and an app that
+ * derives "Plans from $X" from the ladder must find no prices to quote.
+ */
+interface CloudMoneyFields {
+  billing_mode: BillingMode;
+  money_line?: string;
+  money_story?: string;
+}
+
 export function accountDescriptor(deps: OAuthDeps): Response {
   const iss = deps.issuer;
-  const body: ParachuteAccountDescriptor = {
+  const mode = billingModeOf(deps);
+  const body: ParachuteAccountDescriptor & CloudMoneyFields = {
     issuer: iss,
     door: "cloud",
     account_endpoint: `${iss}/account`,
@@ -103,7 +129,9 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // 4). Its RFC 9728 PRM sits at `<frontDoor>/.well-known/oauth-protected-
     // resource/account/mcp`.
     account_mcp_endpoint: `${frontDoorOrigin(deps)}/account/mcp`,
-    plans: planLadder(),
+    plans: mode === "paid" ? planLadder() : [],
+    billing_mode: mode,
+    ...(mode === "open_beta" ? { money_line: OPEN_BETA_SHORT, money_story: OPEN_BETA_LONG } : {}),
     // A `{name}`-placeholder template the app substitutes to preview a vault's
     // address pre-creation. Derived from the SAME vaultAdvertisedUrl the real
     // console/account URLs come from (the PUBLIC origin — `my.` in prod, path

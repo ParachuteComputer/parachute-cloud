@@ -48,6 +48,50 @@
 
 export type PlanId = "entry" | "standard" | "plus" | "power" | "trial" | "expired";
 
+/**
+ * THE MONEY SWITCH's two states (billing-config.ts `billingMode` is the one
+ * reader of BILLING_MODE). Lives here, not there, so this module stays pure and
+ * import-cycle-free for ui.ts.
+ *
+ * OPEN BETA AND THE PLAN IDS (T-318): the open beta deliberately REUSES the
+ * `trial` id — a clockless trial (pending_plan + plan_downgrade_at NULL) with
+ * the trial spec's Plus-level limits, labelled "Open beta" everywhere a person
+ * reads it. Not a new `beta` id, because every pre-T-318 build coerces an
+ * unknown plan id to `expired` (coercePlanId) and the 03:30 reconciler would
+ * then push `frozen: true` to every beta vault on a rollback; a clockless
+ * `trial` row is something every older build already treats as "entitled,
+ * never swept". `expired` rows still exist in D1 until the lift runs, and in
+ * open beta {@link livePlan} reads them as `trial`, so the freeze is
+ * unreachable whether or not the data was lifted.
+ */
+export type BillingMode = "open_beta" | "paid";
+
+/** The money story, short form (Aaron 10-29; the T-318 shared contract). */
+export const OPEN_BETA_SHORT = "Free during the open beta.";
+/** The money story, long form — every page, the terms, the refusals. */
+export const OPEN_BETA_LONG =
+  "Parachute is in open beta, and it's free for now. Before any paid plan, we'll tell you well ahead, and everyone already here gets notice and a fair path.";
+/** The plan label a beta account shows wherever a plan name appears. */
+export const OPEN_BETA_LABEL = "Open beta";
+
+/**
+ * The plan whose spec a user LIVES on right now, given the money switch. In
+ * open beta the expired floor does not exist: an `expired` row (frozen before
+ * the switch, or not yet lifted) reads as `trial` — beta limits, writes on.
+ * In paid mode this is the identity. Every vault-count / restore / retention /
+ * entitlement read goes through this (directly or via entitlementPlanFor).
+ */
+export function livePlan(plan: PlanId, mode: BillingMode): PlanId {
+  return mode === "open_beta" && plan === "expired" ? "trial" : plan;
+}
+
+/** The human plan name for a stored plan under the money switch. */
+export function planLabel(plan: PlanId, mode: BillingMode): string {
+  const live = livePlan(plan, mode);
+  if (mode === "open_beta" && live === "trial") return OPEN_BETA_LABEL;
+  return PLAN_SPECS[live].label;
+}
+
 /** The four purchasable tiers, cheapest→dearest (UI + checkout iterate this). */
 export type PaidTier = "entry" | "standard" | "plus" | "power";
 export const PAID_TIERS: readonly PaidTier[] = ["entry", "standard", "plus", "power"] as const;
@@ -369,6 +413,17 @@ export function canStartCheckout(plan: PlanId): boolean {
   return plan === "trial" || plan === "expired";
 }
 
+/**
+ * An EXISTING paying subscriber: a paid tier AND a recorded Stripe
+ * subscription (the admin-growth definition — the plan half matters because a
+ * churned row keeps its stale subscription id on the floor). In open beta these
+ * are the only accounts that keep a billing door (the Stripe portal), so nobody
+ * is ever stuck paying for something they can't see or cancel.
+ */
+export function isExistingSubscriber(plan: PlanId, stripeSubscriptionId: string | null): boolean {
+  return isPaidTier(plan) && stripeSubscriptionId !== null;
+}
+
 /** The two-meter storage caps a plan pushes into a vault DO. */
 export interface PlanCaps {
   notes_bytes: number;
@@ -395,9 +450,18 @@ export interface VaultEntitlement {
  * Every non-trial plan is its own spec. Callers: applyPlanToVaults
  * (vault-call.ts) + the console's vault-creation cap pushes.
  */
-export function entitlementPlanFor(plan: PlanId, pendingPlan: PlanId | null): PlanId {
-  if (plan === "trial" && pendingPlan !== null && isPaidTier(pendingPlan)) return pendingPlan;
-  return plan;
+export function entitlementPlanFor(plan: PlanId, pendingPlan: PlanId | null, mode: BillingMode): PlanId {
+  const live = livePlan(plan, mode);
+  if (mode === "open_beta") {
+    // Open beta: everyone on the beta gets the beta (trial = Plus-level)
+    // limits — an Entry/Standard pick made during the old trial must not leave
+    // someone notes-only with no picker to change it. The one exception keeps
+    // a person from shrinking: whoever was trying Power keeps Power.
+    if (live === "trial" && plan === "trial" && pendingPlan === "power") return "power";
+    return live;
+  }
+  if (live === "trial" && pendingPlan !== null && isPaidTier(pendingPlan)) return pendingPlan;
+  return live;
 }
 
 /** The entitlement pushed to every vault DO for a plan (vault-call.ts). */
@@ -460,7 +524,8 @@ export function formatUsageBytes(n: number): string {
 
 /** The console plan line — entitlement-descriptive. trial/expired read
  *  distinctly; paid tiers read "<Label> plan — N vaults, NOTES + ATTACH". */
-export function planLine(plan: PlanId): string {
+export function planLine(plan: PlanId, mode: BillingMode): string {
+  plan = livePlan(plan, mode);
   const spec = PLAN_SPECS[plan];
   if (plan === "expired") {
     return "Trial ended — your notes are safe to read and export; pick a plan to write again";
@@ -471,7 +536,7 @@ export function planLine(plan: PlanId): string {
   // "across your vaults" — storage is a POOLED total shared across every vault
   // the plan includes, not a per-vault budget.
   const body = `${vaults}, ${formatPlanBytes(spec.notes_bytes)} notes${attach} across your vaults`;
-  if (plan === "trial") return `Free trial — ${body}`;
+  if (plan === "trial") return mode === "open_beta" ? `${OPEN_BETA_LABEL} — ${body}. ${OPEN_BETA_SHORT}` : `Free trial — ${body}`;
   return `${spec.label} plan — ${body}`;
 }
 
@@ -559,8 +624,12 @@ export function trialBannerLine(tierLabel: string, isDefault: boolean, daysLeft:
  * The friendly refusal when a restore would need a vault slot the plan doesn't
  * have (restore always creates a NEW vault — it never overwrites).
  */
-export function restoreAtCapMessage(plan: PlanId): string {
+export function restoreAtCapMessage(plan: PlanId, mode: BillingMode): string {
+  plan = livePlan(plan, mode);
   const spec = PLAN_SPECS[plan];
+  if (mode === "open_beta" && plan === "trial") {
+    return `Restoring creates a new vault, and your account is at its ${spec.vault_count}-vault limit for the open beta. Free up a slot first, or write hello@parachute.computer.`;
+  }
   return `Restoring creates a new vault, and your ${spec.label} plan is at its ${spec.vault_count}-vault limit. Free up a slot first, or write hello@parachute.computer.`;
 }
 
@@ -569,8 +638,13 @@ export function restoreAtCapMessage(plan: PlanId): string {
  * (grandfathered) see the same message: they keep everything they have — the
  * cap only refuses NEW creation until they're under it.
  */
-export function vaultCapMessage(plan: PlanId): string {
+export function vaultCapMessage(plan: PlanId, mode: BillingMode): string {
+  plan = livePlan(plan, mode);
   const spec = PLAN_SPECS[plan];
+  if (mode === "open_beta" && plan === "trial") {
+    const n = `${spec.vault_count} vault${spec.vault_count === 1 ? "" : "s"}`;
+    return `During the open beta your account includes ${n} — that's the current ceiling. Need more? Write hello@parachute.computer.`;
+  }
   if (plan === "expired") {
     return "Your trial has ended — pick a plan to create vaults again. Your existing notes stay readable and exportable anytime.";
   }

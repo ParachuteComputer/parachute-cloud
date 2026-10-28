@@ -12,6 +12,7 @@ import { namedVaultsInScopes } from "../src/vaults.ts";
 import { SESSION_COOKIE, createSession } from "../src/sessions.ts";
 import { handleToken } from "../src/oauth-token.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
+import { billingMode } from "../src/billing-config.ts";
 
 export const ISSUER = env.ISSUER;
 /**
@@ -43,6 +44,9 @@ export function deps(now?: () => Date): OAuthDeps {
     boundOrigins: () => [ISSUER],
     now,
     rateLimiter: env.RATE_LIMITER,
+    // The money switch, from the project's BILLING_MODE binding (vitest.config.ts)
+    // — so hand-built deps agree with depsForEnv in the same project.
+    billingMode: billingMode(env),
   };
 }
 
@@ -126,7 +130,8 @@ export function registerReq(body: unknown, headers: Record<string, string> = {})
 }
 
 export async function seedUser(email = "owner@example.com", password = "correct horse"): Promise<{ id: string }> {
-  const user = await createUser(env.DB, email, password);
+  // Signs up under the project's money switch, exactly like the real signup paths.
+  const user = await createUser(env.DB, email, password, new Date(), { billingMode: billingMode(env) });
   return { id: user.id };
 }
 

@@ -11,7 +11,7 @@
  * login password is stored differs, and that never crosses the wire to a client.
  */
 import { bytesToBase64url, randomUUID, timingSafeEqualString } from "./crypto.ts";
-import { type PlanId, TRIAL_DURATION_DAYS, coercePlanId } from "./plans.ts";
+import { type BillingMode, type PlanId, TRIAL_DURATION_DAYS, coercePlanId } from "./plans.ts";
 
 const encoder = new TextEncoder();
 // KDF POSTURE (#28, settled 2026-07-02 — the honest version):
@@ -271,7 +271,7 @@ export async function createUser(
   email: string,
   password: string,
   now: Date = new Date(),
-  opts: { emailVerified?: boolean } = {},
+  opts: { emailVerified?: boolean; billingMode?: BillingMode } = {},
 ): Promise<User> {
   const id = randomUUID();
   // NEVER hash an empty password — an empty hash means "no password", which
@@ -280,16 +280,22 @@ export async function createUser(
   const passwordHash = password.length > 0 ? await hashPassword(password) : "";
   const emailVerified = opts.emailVerified ?? false;
   const createdAt = now.toISOString();
-  const planDowngradeAt = new Date(now.getTime() + TRIAL_DURATION_DAYS * 86_400_000).toISOString();
+  // OPEN BETA (T-318; unset billingMode = open_beta, like BILLING_MODE): the
+  // account lands on a CLOCKLESS trial — the beta — with no pending floor and
+  // no downgrade date, so the hourly sweep never selects it. Paid mode keeps
+  // the original trial state machine below.
+  const paid = opts.billingMode === "paid";
+  const pendingPlan: PlanId | null = paid ? "expired" : null;
+  const planDowngradeAt = paid ? new Date(now.getTime() + TRIAL_DURATION_DAYS * 86_400_000).toISOString() : null;
   // `role` is deliberately NOT in the INSERT (migration DEFAULT 'user'); `plan`
   // + the trial pair ARE written explicitly so the state machine is set the
   // same way regardless of the migration DEFAULT.
   await db
     .prepare(
       `INSERT INTO users (id, email, password_hash, created_at, email_verified, plan, pending_plan, plan_downgrade_at)
-       VALUES (?, ?, ?, ?, ?, 'trial', 'expired', ?)`,
+       VALUES (?, ?, ?, ?, ?, 'trial', ?, ?)`,
     )
-    .bind(id, email, passwordHash, createdAt, emailVerified ? 1 : 0, planDowngradeAt)
+    .bind(id, email, passwordHash, createdAt, emailVerified ? 1 : 0, pendingPlan, planDowngradeAt)
     .run();
   return {
     id,
@@ -307,7 +313,7 @@ export async function createUser(
     deletePurgeAttempts: 0,
     stripeCustomerId: null,
     stripeSubscriptionId: null,
-    pendingPlan: "expired",
+    pendingPlan,
     planDowngradeAt,
     lastInvoicePaidAt: null,
     paymentFailedAt: null,

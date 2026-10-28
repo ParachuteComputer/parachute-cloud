@@ -279,6 +279,16 @@ ENVIRONMENT = "production"
 EMAIL_FROM = "noreply@parachute.computer"
 # Where the scheduled health-check alerts + weekly ops digest go (src/ops.ts).
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
+# --- money switch (T-318, Aaron 10-29: "Parachute open beta") -----------------
+# BILLING_MODE = "open_beta" | "paid" (src/billing-config.ts billingMode). UNSET
+# means open_beta, and so does any unknown value (the safe direction: nobody is
+# charged and no vault freezes on a typo). In open_beta: no trial clock on new
+# sign-ups, the hourly sweep never floors anyone to `expired`, no vault is
+# frozen, checkout/portal/promo answer 409 billing_paused, and every page tells
+# the one money story. All Stripe code + the Price ids below stay in place,
+# dormant; the webhook keeps reconciling any existing subscription. Flip to
+# "paid" (here AND in [env.staging.vars]) only with Aaron's go-ahead.
+BILLING_MODE = "open_beta"
 # --- Stripe billing (Wave 4d; full 4-tier × interval matrix) -------------------
 # Billing activates only when the two secrets + the four per-tier ANCHOR Prices
 # (standard/plus/power monthly + entry quarterly) exist (src/billing-config.ts);
@@ -447,6 +457,9 @@ EMAIL_FROM = "noreply@parachute.computer"
 # Same operator address as production — but staging has no send_email binding,
 # so ops alerts/digests land in the worker log (devlog sender), never an inbox.
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
+# Money switch — restated per env (named envs don't inherit [vars]); see the
+# production [vars] note. Staging walks the open beta too.
+BILLING_MODE = "open_beta"
 # Stripe billing (staging = TEST-mode catalog, account "Open Parachute PBC
 # sandbox"). The secrets are already set (`wrangler secret put STRIPE_SECRET_KEY
 # -e staging` + `STRIPE_WEBHOOK_SECRET -e staging`; the webhook endpoint points

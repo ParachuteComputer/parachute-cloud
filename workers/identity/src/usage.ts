@@ -29,7 +29,7 @@
  */
 import type { Env } from "./env.ts";
 import type { EmailSender } from "./email.ts";
-import type { OAuthDeps } from "./oauth-shared.ts";
+import { type OAuthDeps, billingModeOf } from "./oauth-shared.ts";
 import { type VaultEntitlement, entitlementPlanFor, isPlanId, planEntitlement } from "./plans.ts";
 import { type ResolvedVaultEntitlement, pushVaultCap, readVaultUsage } from "./vault-call.ts";
 import { getUserById } from "./users.ts";
@@ -154,7 +154,7 @@ async function reconcileVaultEntitlement(
     return NO_PUSH;
   }
 
-  const snapshotExpected = planEntitlement(entitlementPlanFor(v.plan, v.pending_plan));
+  const snapshotExpected = planEntitlement(entitlementPlanFor(v.plan, v.pending_plan, billingModeOf(deps)));
   if (resolvedEntitlementMatches(entitlement, snapshotExpected)) return NO_PUSH;
 
   // Mismatch per the snapshot — re-read the owner FRESH before pushing
@@ -166,7 +166,7 @@ async function reconcileVaultEntitlement(
     console.log(`event=entitlement_reconcile_skipped_owner_missing vault=${v.name}`);
     return NO_PUSH;
   }
-  const freshExpected = planEntitlement(entitlementPlanFor(freshUser.plan, freshUser.pendingPlan));
+  const freshExpected = planEntitlement(entitlementPlanFor(freshUser.plan, freshUser.pendingPlan, billingModeOf(deps)));
   if (resolvedEntitlementMatches(entitlement, freshExpected)) {
     // The owner's plan changed since the snapshot and the DO ALREADY
     // reflects the new truth (e.g. a concurrent checkout's own push landed

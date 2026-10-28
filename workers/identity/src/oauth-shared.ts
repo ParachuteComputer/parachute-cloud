@@ -10,7 +10,7 @@
  */
 import { isRequestableAccountScope } from "@openparachute/door-contract";
 import { VAULT_VERBS } from "./audience.ts";
-import { billingConfig, mockBillingEnabled } from "./billing-config.ts";
+import { type BillingMode, billingConfig, billingMode, mockBillingEnabled } from "./billing-config.ts";
 import { randomBase64url } from "./crypto.ts";
 import type { Env } from "./env.ts";
 import { isDevExposureEnv } from "./env-gates.ts";
@@ -89,6 +89,17 @@ export interface OAuthDeps {
    * reads this. ALWAYS false off the allowlist — the mock 404s there.
    */
   mockBillingEnabled?: boolean;
+  /**
+   * The money switch (billing-config.ts `billingMode`). Optional so hand-built
+   * deps (tests, scripts) read as the default — read it through
+   * {@link billingModeOf}, never `deps.billingMode` directly.
+   */
+  billingMode?: BillingMode;
+}
+
+/** The deps' money switch — unset is open_beta, like BILLING_MODE itself. */
+export function billingModeOf(deps: { billingMode?: BillingMode }): BillingMode {
+  return deps.billingMode === "paid" ? "paid" : "open_beta";
 }
 
 /**
@@ -220,7 +231,11 @@ export function depsForEnv(env: Env): OAuthDeps {
     boundOrigins: () => parseBoundOrigins(issuer, env.BOUND_ORIGINS),
     exposeDevLinks: isDevExposureEnv(env.ENVIRONMENT),
     rateLimiter: env.RATE_LIMITER,
-    billingConfigured: billingConfig(env) !== null,
+    billingMode: billingMode(env),
+    // Open beta keeps Stripe dormant even with the keys present: the console +
+    // /account/summary read this, so "configured" means "configured AND on".
+    // (The webhook reads billingConfig directly — it keeps reconciling.)
+    billingConfigured: billingMode(env) === "paid" && billingConfig(env) !== null,
     mockBillingEnabled: mockBillingEnabled(env),
     // Service binding when bound (staging — workers.dev origins aren't valid
     // subrequest targets); else the handlers fall back to global fetch.

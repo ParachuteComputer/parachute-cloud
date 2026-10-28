@@ -39,10 +39,11 @@ import {
 } from "@openparachute/door-contract";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { type AttributionPrincipal, principalAttributionClaims } from "./tokens.ts";
-import { type OAuthDeps, vaultAdvertisedUrl } from "./oauth-shared.ts";
+import { type OAuthDeps, billingModeOf, vaultAdvertisedUrl } from "./oauth-shared.ts";
 import {
   PLAN_SPECS,
   entitlementPlanFor,
+  livePlan,
   planEntitlement,
   vaultCapMessage,
 } from "./plans.ts";
@@ -280,9 +281,9 @@ const createVaultTool: AccountMcpTool = {
     // Plan vault-count gate — IDENTICAL to handleAccountVaultCreate / the
     // console's handleCreateVaultPost: `>=` grandfathers users already over a
     // cap (an expired plan has vault_count=0 → refused here).
-    const spec = PLAN_SPECS[user.plan];
+    const spec = PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))];
     if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-      throw new AccountToolError("vault_limit_reached", vaultCapMessage(user.plan));
+      throw new AccountToolError("vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps)));
     }
 
     const rawName = typeof args.name === "string" ? args.name : "";
@@ -308,7 +309,7 @@ const createVaultTool: AccountMcpTool = {
     // a hiccup leaves the DO on the more-generous env default; applyPlanToVaults /
     // the backfill reconcile). Uses the first-party `parachute-console` mint
     // (callVaultApi's default) — the internal config seam, NOT the tenant path.
-    await pushVaultCap(db, deps, user.id, created.name, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan)));
+    await pushVaultCap(db, deps, user.id, created.name, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps))));
 
     // NO vault_token in the result — a token in model context is a credential
     // leak. The app mints one out-of-band via POST /account/vaults/<name>/token.

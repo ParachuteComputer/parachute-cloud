@@ -7,6 +7,9 @@
 // Plan copy renders from plans.ts (the single source of truth for
 // entitlements + display strings) — the console can never drift from it.
 import {
+  type BillingMode,
+  OPEN_BETA_LONG,
+  OPEN_BETA_SHORT,
   PAID_TIERS,
   PLAN_SPECS,
   TIER_PRICE_LABEL,
@@ -637,14 +640,22 @@ function codeForm(csrfToken: string, email: string | undefined, error: string | 
 }
 
 /** Signup — create a cloud account. Magic-link default; password in the disclosure. */
-export function renderSignup(opts: { csrfToken: string; error?: string; email?: string; showPassword?: boolean }): string {
+export function renderSignup(opts: {
+  csrfToken: string;
+  error?: string;
+  email?: string;
+  showPassword?: boolean;
+  billingMode?: BillingMode;
+}): string {
   const { csrfToken, error, email, showPassword } = opts;
+  const pricing =
+    opts.billingMode === "paid" ? `From $1/mo · ${TRIAL_LENGTH_COPY} free · no card to start` : OPEN_BETA_SHORT;
   return page(
     "Create your account — Parachute",
     `<h1>Create your account</h1>
      <div class="lead" data-testid="signup-context">
        <p style="margin:.2rem 0 .5rem">A private vault your AI can read and write — your notes, and everything you want it to remember, in one place you own.</p>
-       <p class="pricepill" data-testid="signup-pricing">From $1/mo · ${TRIAL_LENGTH_COPY} free · no card to start</p>
+       <p class="pricepill" data-testid="signup-pricing">${esc(pricing)}</p>
      </div>
      <div class="card">
        ${magicForm(csrfToken, email, "Email me a sign-in link", showPassword ? undefined : error)}
@@ -711,7 +722,7 @@ export function renderConsoleLogin(opts: {
          </form>
        </details>
      </div>
-     <div class="foot" data-testid="login-signup-door">New to Parachute? <a href="/signup"><strong>Create your free account</strong></a></div>`,
+     <div class="foot" data-testid="login-signup-door">New to Parachute? <a href="/signup"><strong>Create your account</strong></a></div>`,
   );
 }
 
@@ -1011,6 +1022,20 @@ export interface ConsoleProps {
   mockBillingEnabled?: boolean;
   /** The user has a Stripe customer (false for comped accounts). */
   hasBillingAccount?: boolean;
+  /**
+   * The money switch (billing-config.ts). Unset = open_beta. In open beta the
+   * plan line reads the beta, the plan cards / tier picker / promo box are
+   * replaced by the one money story, and no trial clock or Upgrade renders.
+   * console.ts also passes `plan` through livePlan, so `expired` never reaches
+   * this view in open beta.
+   */
+  billingMode?: BillingMode;
+  /**
+   * Open beta only: an EXISTING paying subscriber (paid tier + live Stripe
+   * subscription) keeps a "Manage billing" door so they can see or cancel what
+   * they pay — the beta must never trap someone in a charge.
+   */
+  subscriberPortal?: boolean;
   /**
    * Whether the account may START a checkout / redeem a promo (plans.ts
    * canStartCheckout: a trial or expired account with no live subscription).
@@ -1551,7 +1576,10 @@ export function renderConsole(props: ConsoleProps): string {
     hasBillingAccount,
     canCheckout,
     trial,
+    subscriberPortal,
   } = props;
+  const mode: BillingMode = props.billingMode === "paid" ? "paid" : "open_beta";
+  const openBeta = mode === "open_beta";
   // Plan display. The across-vaults usage total (latest rollup rows) rides the
   // plan line. The plan-line TEXT depends on state: a trial user gets the
   // "you're trying <Tier> — N days left" banner (trial.tierLabel from
@@ -1569,7 +1597,7 @@ export function renderConsole(props: ConsoleProps): string {
       ? ` <span data-testid="usage-total">&middot; Using ${esc(formatUsageBytes(totalUsedBytes))}</span>`
       : "";
   const manageBillingHtml =
-    isPaidTier(plan) && billingConfigured && hasBillingAccount
+    isPaidTier(plan) && hasBillingAccount && (openBeta ? subscriberPortal === true : billingConfigured)
       ? ` <form class="inline" method="post" action="/billing/portal" data-testid="manage-billing">
            <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
            <span style="opacity:.75">&middot;</span> <button class="linkbtn" type="submit">Manage billing</button>
@@ -1586,14 +1614,19 @@ export function renderConsole(props: ConsoleProps): string {
   // The plan-line lead text: the trial banner (with a "Change plan" jump to the
   // cards) when trialing, else the plan's spec line.
   const planLead =
-    plan === "trial" && trial
+    !openBeta && plan === "trial" && trial
       ? `<span data-testid="trial-banner">${esc(trialBannerLine(trial.tierLabel, trial.isDefault, trial.daysLeft))}</span> <a href="#plans" data-testid="change-plan">Change plan</a>`
-      : esc(planLine(plan));
+      : esc(planLine(plan, mode));
   const planHtml = `${planLead}${planUntilHtml}${usageHtml}${manageBillingHtml}`;
   // The always-visible plan cards — for checkout-eligible (trial/expired) users
   // only; a paid tier / live-sub account uses Manage billing and never sees it.
-  const plansSectionHtml =
-    canCheckout === true
+  // OPEN BETA: no plan grid, no picker, no Subscribe — the one money story.
+  const plansSectionHtml = openBeta
+    ? `<section id="plans" data-testid="open-beta" style="margin:0 0 1.1rem">
+       <h2 style="margin:0 0 .4rem;font-size:1rem">Plan</h2>
+       <p class="muted" data-testid="open-beta-story" style="margin:0">${esc(OPEN_BETA_LONG)}</p>
+     </section>`
+    : canCheckout === true
       ? renderPlanCards({
           csrfToken,
           plan,
@@ -1607,7 +1640,7 @@ export function renderConsole(props: ConsoleProps): string {
   // A quiet disclosure under the plan line: present for launch codes, invisible
   // noise otherwise. Inline styles undo the details/input defaults.
   const promoHtml =
-    canCheckout
+    canCheckout && !openBeta
       ? `<details data-testid="promo-code" style="margin:-.9rem 0 1.2rem;border-top:0;padding-top:0;font-size:.88rem">
        <summary class="muted" style="font-weight:500">Have a code?</summary>
        <form method="post" action="/console/promo" style="display:flex;gap:.5rem;align-items:center;margin-top:.45rem;max-width:22rem">
@@ -1649,7 +1682,7 @@ export function renderConsole(props: ConsoleProps): string {
   const createCard = atVaultCap
     ? `<div class="card" data-testid="vault-cap">
        <h2>Create a vault</h2>
-       <p class="muted" style="margin:.35rem 0 0">${esc(vaultCapMessage(plan))}</p>
+       <p class="muted" style="margin:.35rem 0 0">${esc(vaultCapMessage(plan, mode))}</p>
        ${error ? `<div class="err">${esc(error)}</div>` : ""}
      </div>`
     : `<div class="card">

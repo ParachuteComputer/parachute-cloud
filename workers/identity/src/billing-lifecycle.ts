@@ -60,8 +60,8 @@
  * action is operator-driven. `invoice.paid` clears the flags.
  */
 import type Stripe from "stripe";
-import type { OAuthDeps } from "./oauth-shared.ts";
-import { PAID_TIERS, type PaidTier, type PlanId, coercePlanId, isPaidTier } from "./plans.ts";
+import { type OAuthDeps, billingModeOf } from "./oauth-shared.ts";
+import { PAID_TIERS, type PaidTier, type PlanId, coercePlanId, isPaidTier, livePlan } from "./plans.ts";
 import { getUserById, getUserByStripeCustomerId, getUserByStripeSubscriptionId, setUserPlan } from "./users.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 import { BILLING_INTERVALS, type BillingConfig } from "./billing-config.ts";
@@ -541,6 +541,7 @@ export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date
   // the write's `plan_downgrade_at <= ?` guard means exactly "still due as of
   // the moment we selected it" (the sweep-vs-conversion race guard below).
   const nowIso = now.toISOString();
+  const mode = billingModeOf(deps);
   const res = await db
     .prepare(
       `SELECT id, plan, pending_plan FROM users
@@ -564,7 +565,19 @@ export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date
       // a paid pending tier here would be a FREE upgrade at trial's end — floor it.
       // Folded into the `plan` bound into the CONDITIONAL write below, never a
       // separate read-then-write.
-      const plan: PlanId = coercePlanId(row.plan) === "trial" && isPaidTier(pending) ? "expired" : pending;
+      const floored: PlanId = coercePlanId(row.plan) === "trial" && isPaidTier(pending) ? "expired" : pending;
+      // OPEN BETA (T-318): the expired floor does not exist. A due row whose
+      // target is the floor (an old trial clock, a promo comp running out, a
+      // cancelled subscription past its paid-through date) lands on the beta
+      // (`trial`, clockless) instead — and a trialist who was trying Power
+      // keeps Power (entitlementPlanFor), so nobody shrinks. Converting the
+      // row (rather than skipping it) also keeps it from re-selecting every
+      // hour and starving real downgrades of the LIMIT.
+      const plan: PlanId = livePlan(floored, mode);
+      const keepPending: PlanId | null =
+        mode === "open_beta" && plan === "trial" && coercePlanId(row.plan) === "trial" && pending === "power"
+          ? "power"
+          : null;
       // RACE GUARD (cloud#84 review): the SELECT→write window can overlap a
       // `checkout.session.completed` that converted this user — the webhook's
       // CAS flips the plan to the bought tier AND clears the pending pair
@@ -577,10 +590,10 @@ export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date
       // conversion that won the race leaves this UPDATE matching 0 rows.
       const write = await db
         .prepare(
-          `UPDATE users SET plan = ?, pending_plan = NULL, plan_downgrade_at = NULL
+          `UPDATE users SET plan = ?, pending_plan = ?, plan_downgrade_at = NULL
              WHERE id = ? AND pending_plan IS NOT NULL AND plan_downgrade_at <= ?`,
         )
-        .bind(plan, row.id, nowIso)
+        .bind(plan, keepPending, row.id, nowIso)
         .run();
       if ((write.meta.changes ?? 0) === 0) {
         // The row moved under us (a conversion, or any write that cleared the

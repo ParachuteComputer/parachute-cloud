@@ -30,6 +30,8 @@ import {
   cheapestInterval,
   coercePlanId,
   entitlementPlanFor,
+  livePlan,
+  planLabel,
   formatPlanBytes,
   formatUsageBytes,
   isEntitled,
@@ -162,17 +164,17 @@ describe("PLAN_SPECS — the ratified ladder", () => {
   });
 
   test("display copy derives from the specs", () => {
-    expect(planLine("entry")).toBe("Entry plan — 1 vault, 100 MB notes (notes only) across your vaults");
-    expect(planLine("standard")).toBe(
+    expect(planLine("entry", "paid")).toBe("Entry plan — 1 vault, 100 MB notes (notes only) across your vaults");
+    expect(planLine("standard", "paid")).toBe(
       "Standard plan — 3 vaults, 250 MB notes + 2 GiB attachments across your vaults",
     );
-    expect(planLine("trial")).toBe("Free trial — 5 vaults, 500 MB notes + 8 GiB attachments across your vaults");
-    expect(planLine("expired")).toBe(
+    expect(planLine("trial", "paid")).toBe("Free trial — 5 vaults, 500 MB notes + 8 GiB attachments across your vaults");
+    expect(planLine("expired", "paid")).toBe(
       "Trial ended — your notes are safe to read and export; pick a plan to write again",
     );
     expect(upgradeTeaser()).toContain("from $1/mo");
-    expect(vaultCapMessage("entry")).toContain("Entry plan includes 1 vault");
-    expect(vaultCapMessage("expired")).toContain("trial has ended");
+    expect(vaultCapMessage("entry", "paid")).toContain("Entry plan includes 1 vault");
+    expect(vaultCapMessage("expired", "paid")).toContain("trial has ended");
   });
 
   test("tierIntervalPricing — the honest per-interval breakdown, entry omits monthly (#98)", () => {
@@ -218,16 +220,37 @@ describe("PLAN_SPECS — the ratified ladder", () => {
   test("entitlementPlanFor — the trial mirrors the CHOSEN tier (pending_plan), else its plus-mirroring self", () => {
     // "Try any plan free for 30 days": an Entry trialist experiences Entry,
     // a Power trialist Power.
-    expect(entitlementPlanFor("trial", "entry")).toBe("entry");
-    expect(entitlementPlanFor("trial", "power")).toBe("power");
+    expect(entitlementPlanFor("trial", "entry", "paid")).toBe("entry");
+    expect(entitlementPlanFor("trial", "power", "paid")).toBe("power");
     // No chosen tier (signup stamps pending_plan='expired' — the day-30 floor,
     // not a choice) → the trial spec (mirrors plus).
-    expect(entitlementPlanFor("trial", "expired")).toBe("trial");
-    expect(entitlementPlanFor("trial", null)).toBe("trial");
+    expect(entitlementPlanFor("trial", "expired", "paid")).toBe("trial");
+    expect(entitlementPlanFor("trial", null, "paid")).toBe("trial");
     // Non-trial plans are their own spec — pending never leaks entitlements
     // (a paid user with a scheduled cancel keeps their paid spec until the sweep).
-    expect(entitlementPlanFor("standard", "expired")).toBe("standard");
-    expect(entitlementPlanFor("expired", "power")).toBe("expired");
+    expect(entitlementPlanFor("standard", "expired", "paid")).toBe("standard");
+    expect(entitlementPlanFor("expired", "power", "paid")).toBe("expired");
+  });
+
+  test("open beta (T-318) — the expired floor is unreachable and nobody shrinks", () => {
+    // A row frozen before the switch (or never lifted) lives on the beta.
+    expect(livePlan("expired", "open_beta")).toBe("trial");
+    expect(livePlan("expired", "paid")).toBe("expired");
+    expect(entitlementPlanFor("expired", null, "open_beta")).toBe("trial");
+    expect(planEntitlement(entitlementPlanFor("expired", null, "open_beta")).frozen).toBe(false);
+    expect(planEntitlement(entitlementPlanFor("expired", null, "paid")).frozen).toBe(true);
+    // An old-trial tier pick doesn't leave anyone notes-only in the beta...
+    expect(entitlementPlanFor("trial", "entry", "open_beta")).toBe("trial");
+    expect(entitlementPlanFor("trial", "expired", "open_beta")).toBe("trial");
+    // ...and whoever was trying Power keeps Power.
+    expect(entitlementPlanFor("trial", "power", "open_beta")).toBe("power");
+    // Paid tiers (comps, subscribers) are untouched by the switch.
+    expect(entitlementPlanFor("standard", "expired", "open_beta")).toBe("standard");
+    // The copy a beta account reads.
+    expect(planLabel("trial", "open_beta")).toBe("Open beta");
+    expect(planLabel("expired", "open_beta")).toBe("Open beta");
+    expect(planLine("expired", "open_beta")).toContain("Free during the open beta.");
+    expect(vaultCapMessage("expired", "open_beta")).toContain("5 vaults");
   });
 
   test("the entitlement/checkout split — isEntitled, canStartCheckout, isPaidTier", () => {
@@ -519,7 +542,7 @@ describe("vault-count enforcement + entitlement push", () => {
     );
     expect(refused.status).toBe(200);
     const html = await refused.text();
-    expect(html).toContain(vaultCapMessage("plus").replace(/'/g, "&#39;").slice(0, 40));
+    expect(html).toContain(vaultCapMessage("plus", "paid").replace(/'/g, "&#39;").slice(0, 40));
     expect(await vaultRowCount(userId)).toBe(5);
   });
 

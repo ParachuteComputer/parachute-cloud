@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { defineWorkersConfig, readD1Migrations } from "@cloudflare/vitest-pool-workers/config";
+import { defineWorkersProject, readD1Migrations } from "@cloudflare/vitest-pool-workers/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 /**
  * P1.1 added `[assets] directory = "./dist-assets"` to wrangler.toml, and
@@ -33,25 +34,47 @@ ensureAssetsDir();
  * `test/apply-migrations.ts` applies them once per worker (outside isolated
  * storage) so every test sees the schema but its own row writes roll back.
  */
-export default defineWorkersConfig(async () => {
+/**
+ * TWO PROJECTS, one `bun x vitest run` (T-318 money switch). BILLING_MODE is a
+ * worker env var, so it is pinned per project rather than per test:
+ *   - `identity`           — the whole corpus under BILLING_MODE="paid": the
+ *                            trial clock, the expired floor, Stripe checkout,
+ *                            promo and mock billing all stay exercised exactly
+ *                            as before (the dormant paid path must not rot).
+ *   - `identity-open-beta` — test/open-beta/**, under "open_beta" (the deployed
+ *                            default in wrangler.toml).
+ * test/helpers.ts `deps()` reads the same binding, so hand-built deps agree.
+ */
+export default defineConfig(async () => {
   const migrations = await readD1Migrations(path.join(__dirname, "migrations"));
-  return {
-    test: {
-      setupFiles: ["./test/apply-migrations.ts"],
-      poolOptions: {
-        workers: {
-          wrangler: { configPath: "./wrangler.toml" },
-          miniflare: {
-            // Surfaced to `test/apply-migrations.ts` via `env.TEST_MIGRATIONS`.
-            // ENVIRONMENT is PINNED here (overrides the wrangler.toml [vars],
-            // which say "production" since the top level became the production
-            // deploy): the suite depends on the x-parachute-dev-magic-link echo
-            // being ON by default, with the production-drops-it case exercised
-            // via an explicit env override in auth.test.ts.
-            bindings: { TEST_MIGRATIONS: migrations, ENVIRONMENT: "test" },
+  const project = (name: string, billingMode: "paid" | "open_beta", files: { include?: string[]; exclude?: string[] }) =>
+    defineWorkersProject({
+      test: {
+        name,
+        ...files,
+        setupFiles: ["./test/apply-migrations.ts"],
+        poolOptions: {
+          workers: {
+            wrangler: { configPath: "./wrangler.toml" },
+            miniflare: {
+              // Surfaced to `test/apply-migrations.ts` via `env.TEST_MIGRATIONS`.
+              // ENVIRONMENT is PINNED here (overrides the wrangler.toml [vars],
+              // which say "production" since the top level became the production
+              // deploy): the suite depends on the x-parachute-dev-magic-link echo
+              // being ON by default, with the production-drops-it case exercised
+              // via an explicit env override in auth.test.ts.
+              bindings: { TEST_MIGRATIONS: migrations, ENVIRONMENT: "test", BILLING_MODE: billingMode },
+            },
           },
         },
       },
+    });
+  return {
+    test: {
+      projects: [
+        project("identity", "paid", { exclude: [...configDefaults.exclude, "test/open-beta/**"] }),
+        project("identity-open-beta", "open_beta", { include: ["test/open-beta/**/*.test.ts"] }),
+      ],
     },
   };
 });

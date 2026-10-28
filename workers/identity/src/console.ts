@@ -74,12 +74,15 @@ import {
   PLAN_SPECS,
   canStartCheckout,
   entitlementPlanFor,
+  livePlan,
   isPaidTier,
   isPlanId,
   planEntitlement,
   restoreAtCapMessage,
   trialTierChosenMessage,
   vaultCapMessage,
+  OPEN_BETA_LONG,
+  isExistingSubscriber,
 } from "./plans.ts";
 import {
   applyPlanToVaults,
@@ -121,6 +124,7 @@ import {
   redirectResponse,
   resolveBoundOrigins,
   vaultAdvertisedUrl,
+  billingModeOf,
 } from "./oauth-shared.ts";
 
 function csrfExtra(setCookie?: string): Record<string, string> {
@@ -165,31 +169,31 @@ export function handleSignupGet(req: Request, deps: OAuthDeps): Response {
 export async function handleSignupPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const form = await req.formData();
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
-    return signupError(req, "Your session expired. Please try again.", "");
+    return signupError(req, "Your session expired. Please try again.", "", deps);
   }
   const email = String(form.get("email") ?? "").trim();
   const password = String(form.get("password") ?? "");
-  if (!EMAIL_RE.test(email)) return signupError(req, "Enter a valid email address.", email);
-  if (password.length < PASSWORD_MIN) return signupError(req, `Password must be at least ${PASSWORD_MIN} characters.`, email);
+  if (!EMAIL_RE.test(email)) return signupError(req, "Enter a valid email address.", email, deps);
+  if (password.length < PASSWORD_MIN) return signupError(req, `Password must be at least ${PASSWORD_MIN} characters.`, email, deps);
 
   // DO-backed abuse fence, fail-open (see rate-limit.ts for the documented limits).
   const throttle = await checkAndBumpSignup(deps.rateLimiter, clientIp(req), deps.now?.() ?? new Date());
   if (!throttle.allowed) {
-    return signupError(req, "Too many signups from this network. Try again later.", email);
+    return signupError(req, "Too many signups from this network. Try again later.", email, deps);
   }
 
   if (await getUserByEmail(db, email)) {
-    return signupError(req, "An account with that email already exists.", email);
+    return signupError(req, "An account with that email already exists.", email, deps);
   }
-  const user = await createUser(db, email, password, deps.now?.() ?? new Date());
+  const user = await createUser(db, email, password, deps.now?.() ?? new Date(), { billingMode: billingModeOf(deps) });
   // A brand-new user has no 2FA, so this mints a session directly; funnel through
   // the shared fork anyway for one primary-auth path.
   return finishPrimaryAuth(db, deps, user.id, "/console");
 }
 
-function signupError(req: Request, message: string, email: string): Response {
+function signupError(req: Request, message: string, email: string, deps: OAuthDeps): Response {
   const csrf = ensureCsrfToken(req);
-  return htmlResponse(renderSignup({ csrfToken: csrf.token, error: message, email }), 200, csrfExtra(csrf.setCookie));
+  return htmlResponse(renderSignup({ csrfToken: csrf.token, error: message, email, billingMode: billingModeOf(deps) }), 200, csrfExtra(csrf.setCookie));
 }
 
 // --- login / logout --------------------------------------------------------
@@ -316,7 +320,7 @@ async function renderConsoleFor(
   // History (Wave 4e): restore points from the D1 snapshot mirror — paid
   // plans see the list + restore doors; free plans see the teaser (their
   // rolling weekly is OUR disaster-recovery artifact, never surfaced).
-  if (PLAN_SPECS[user.plan].restore) {
+  if (PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))].restore) {
     const snapshots = await listSnapshotsForVaults(db, vaults.map((v) => v.name));
     for (const card of cards) {
       const rows = snapshots.get(card.name) ?? [];
@@ -360,7 +364,7 @@ async function renderConsoleFor(
     currentTier: "entry" | "standard" | "plus" | "power";
   } | null = null;
   if (user.plan === "trial") {
-    const effective = entitlementPlanFor(user.plan, user.pendingPlan);
+    const effective = entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps));
     const isDefault = !isPaidTier(effective);
     const currentTier = isPaidTier(effective) ? effective : "plus";
     const nowMs = (deps.now?.() ?? new Date()).getTime();
@@ -382,7 +386,12 @@ async function renderConsoleFor(
       // Dismissed → the quiet "Show setup guide" footer link brings it back.
       showChecklistRestore: checklistHidden,
       firstRun: opts.firstRun,
-      plan: user.plan,
+      // Open beta: an `expired` row renders as the beta (livePlan) — the floor
+      // copy, the zero-vault wall and the reactivate line are unreachable.
+      plan: livePlan(user.plan, billingModeOf(deps)),
+      billingMode: billingModeOf(deps),
+      // Open beta: only an existing PAYING subscriber keeps a billing door.
+      subscriberPortal: isExistingSubscriber(user.plan, user.stripeSubscriptionId),
       // Honest paid-until surface: a scheduled downgrade to the expired floor
       // (the trial clock, a promo comp's expiry, or a real subscription's
       // scheduled cancel) shows its date on the plan line — never a silent cliff.
@@ -404,7 +413,7 @@ async function renderConsoleFor(
       // At (or over — grandfathered) the plan's vault count: the create form
       // gives way to the friendly at-cap note. The POST handler is the real
       // gate; this just keeps the UI honest.
-      atVaultCap: cards.length >= PLAN_SPECS[user.plan].vault_count,
+      atVaultCap: cards.length >= PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))].vault_count,
       // Operators get the quiet Admin header link (the surface itself 404s
       // for everyone else — admin.ts).
       isOperator: user.role === "operator",
@@ -425,6 +434,8 @@ const BILLING_ERRORS: Record<string, string> = {
   already: "You're already on a paid plan — use Manage billing to make changes.",
   "no-billing": "This account has no billing profile to manage. Write hello@parachute.computer if something looks off.",
   stripe: "Couldn't reach the payment provider just now. Please try again in a moment.",
+  // Open beta (BILLING_MODE unset/open_beta): every billing door answers this.
+  paused: OPEN_BETA_LONG,
 };
 
 /**
@@ -437,6 +448,7 @@ const PROMO_ERRORS: Record<string, string> = {
   exhausted: "That code has been fully redeemed — every spot is taken. Write hello@parachute.computer if you think that's wrong.",
   "already-used": "This account has already redeemed a code — codes are one per account.",
   "already-paid": "You're already on a paid plan, so there's nothing for a code to add.",
+  paused: OPEN_BETA_LONG,
 };
 
 /**
@@ -450,6 +462,7 @@ const PLAN_ERRORS: Record<string, string> = {
   invalid: "That plan isn't one we recognize. Please try again.",
   reactivate: "Your trial has ended — add a payment method to pick a plan again. Your notes stay readable and exportable anytime.",
   already: "You're already on a paid plan — use Manage billing to change tiers.",
+  paused: OPEN_BETA_LONG,
 };
 
 export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
@@ -550,6 +563,8 @@ export async function handleConsoleGet(db: D1Database, req: Request, deps: OAuth
 export async function handleChoosePlanPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
+  // Open beta: there is no tier to pick — everyone gets the beta limits.
+  if (billingModeOf(deps) !== "paid") return redirectResponse("/console?plan_err=paused");
   const form = await req.formData();
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
     return redirectResponse("/console?plan_err=session");
@@ -629,9 +644,9 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   // with no vaults has vault_count=0, so 0 >= 0 always refuses here with the
   // at-cap message even though they've never made a vault. Give them a distinct
   // "pick a plan to create your first vault" path instead of the cap wall.
-  const spec = PLAN_SPECS[user.plan];
+  const spec = PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))];
   if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-    return fail(vaultCapMessage(user.plan));
+    return fail(vaultCapMessage(user.plan, billingModeOf(deps)));
   }
   try {
     const vault = await createVault(db, rawName, user.id, deps.now?.() ?? new Date());
@@ -641,7 +656,7 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
     // Best-effort by the same contract as the first note: a hiccup leaves the
     // DO on the (more generous) env default, never fails creation;
     // applyPlanToVaults / the backfill reconcile.
-    await pushVaultCap(db, deps, user.id, vault.name, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan)));
+    await pushVaultCap(db, deps, user.id, vault.name, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps))));
     // Land the user straight in their notes, not back on the console (the
     // 2026-07-08 onboarding decision). No-JS: 303 so the form POST resolves to a
     // GET on the cross-origin Notes deep-link. Fetch path: hand the URL back as
@@ -878,9 +893,9 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
     // A NEW vault — the plan vault-count gate, verbatim from the create door.
     // `>=` grandfathers accounts already over a cap; expired (vault_count 0) is
     // refused here exactly as create refuses it.
-    const spec = PLAN_SPECS[user.plan];
+    const spec = PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))];
     if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-      return consoleError(db, req, deps, user, vaultCapMessage(user.plan));
+      return consoleError(db, req, deps, user, vaultCapMessage(user.plan, billingModeOf(deps)));
     }
     try {
       // `importPending: true` stamps `import_pending_at` atomically in the
@@ -903,7 +918,7 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
       throw err;
     }
     // Push the plan's caps + voice entitlement (best-effort, as any creation).
-    await pushVaultCap(db, deps, user.id, vaultName, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan)));
+    await pushVaultCap(db, deps, user.id, vaultName, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps))));
   }
 
   // Forward the tar. On ANY forward/replay failure we KEEP the ownership row —
@@ -991,7 +1006,7 @@ function routerNotFound(): Response {
 export async function handleRestorePost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
-  const spec = PLAN_SPECS[user.plan];
+  const spec = PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))];
   if (!spec.restore) return routerNotFound();
 
   const form = await req.formData();
@@ -1019,7 +1034,7 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
     // Restore creates a NEW vault — it counts against the plan's vault limit
     // exactly like any other creation (same `>=` grandfathering rule).
     if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-      return consoleError(db, req, deps, user, restoreAtCapMessage(user.plan));
+      return consoleError(db, req, deps, user, restoreAtCapMessage(user.plan, billingModeOf(deps)));
     }
     try {
       await createVault(db, targetName, user.id, now);
@@ -1032,7 +1047,7 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
     // Same best-effort entitlement push as any vault creation (a miss leaves the
     // vault on its prior caps; applyPlanToVaults reconciles). Trial mirrors the
     // chosen tier (entitlementPlanFor), same as the create path.
-    await pushVaultCap(db, deps, user.id, targetName, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan)));
+    await pushVaultCap(db, deps, user.id, targetName, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps))));
   }
 
   try {

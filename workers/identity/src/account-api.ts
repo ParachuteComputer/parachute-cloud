@@ -49,11 +49,15 @@ import {
   buildServicesCatalog,
   jsonResponse,
   vaultAdvertisedUrl,
+  billingModeOf,
 } from "./oauth-shared.ts";
 import {
   PLAN_SPECS,
   TIER_PRICE_MONTHLY_USD,
   entitlementPlanFor,
+  livePlan,
+  OPEN_BETA_LONG,
+  planLabel,
   isPaidTier,
   planEntitlement,
   planTotalBytes,
@@ -252,7 +256,11 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
 
   // The tier whose LIMITS apply — a trial mirrors its chosen tier (or Plus),
   // exactly as the vault-cap push resolves it (entitlementPlanFor).
-  const effective = entitlementPlanFor(user.plan, user.pendingPlan);
+  const mode = billingModeOf(deps);
+  const effective = entitlementPlanFor(user.plan, user.pendingPlan, mode);
+  // The plan the account LIVES on (open beta reads a not-yet-lifted `expired`
+  // row as the beta — never "frozen" on the wire either).
+  const live = livePlan(user.plan, mode);
   const spec = PLAN_SPECS[effective];
 
   // vaults_used + account-wide storage_used — one batched usage query (the list
@@ -279,8 +287,8 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
     storage_limit_bytes?: number;
     trial_days_left?: number;
   } = {
-    tier: user.plan,
-    label: user.plan === "trial" ? "Free trial" : PLAN_SPECS[user.plan].label,
+    tier: live,
+    label: mode === "open_beta" ? planLabel(live, mode) : live === "trial" ? "Free trial" : PLAN_SPECS[live].label,
     vault_limit: spec.vault_count,
     vaults_used: vaults.length,
     storage_used_bytes: storageUsed,
@@ -293,7 +301,8 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
   if (isPaidTier(user.plan)) {
     plan.price_monthly_usd = TIER_PRICE_MONTHLY_USD[user.plan];
   }
-  if (user.plan === "trial" && user.planDowngradeAt) {
+  // No countdown in open beta, even for a row the lift hasn't cleared yet.
+  if (mode === "paid" && user.plan === "trial" && user.planDowngradeAt) {
     const msLeft = new Date(user.planDowngradeAt).getTime() - now.getTime();
     plan.trial_days_left = Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
   }
@@ -322,7 +331,15 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
       // shows the section so the no-relogin flow is exercisable there;
       // production with neither hides it, matching the console's own
       // teaser-only state.
-      billing_enabled: deps.billingConfigured === true || deps.mockBillingEnabled === true,
+      // OPEN BETA (T-318): always false, whatever Stripe keys exist —
+      // depsForEnv folds the mode into billingConfigured, and the mock is off
+      // outside paid mode; the explicit `mode` check is the belt.
+      billing_enabled: mode === "paid" && (deps.billingConfigured === true || deps.mockBillingEnabled === true),
+      // The money switch itself — "open_beta" | "paid". The app renders the
+      // open-beta story (no plan grid, no Upgrade, no countdown) when this is
+      // "open_beta"; `money_story` is the one sentence to show.
+      billing_mode: mode,
+      ...(mode === "open_beta" ? { money_story: OPEN_BETA_LONG } : {}),
       // Whether this account has a Stripe customer to MANAGE — lets the app
       // decide the billing CTA up front: show "Manage billing" (→ POST
       // /account/billing/portal) only when true; otherwise "Upgrade" (→ POST
@@ -447,9 +464,9 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   // `>=` grandfathers users already over a cap (they keep every vault they own;
   // only NEW creation is refused). An expired plan has vault_count=0, so it is
   // refused here with the same at-cap message the console gives.
-  const spec = PLAN_SPECS[user.plan];
+  const spec = PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))];
   if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-    return restError(403, "vault_limit_reached", vaultCapMessage(user.plan));
+    return restError(403, "vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps)));
   }
 
   const body = await readJsonBody(req);
@@ -479,7 +496,7 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   // Push the plan's storage cap + voice entitlement into the new vault's DO —
   // best-effort by the same contract as the console (a hiccup leaves the DO on
   // the more-generous env default; applyPlanToVaults / the backfill reconcile).
-  await pushVaultCap(db, deps, user.id, name, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan)));
+  await pushVaultCap(db, deps, user.id, name, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps))));
 
   const scopes = [`vault:${name}:read`, `vault:${name}:write`];
   const minted = await mintVaultToken(db, deps, user.id, name, scopes);
