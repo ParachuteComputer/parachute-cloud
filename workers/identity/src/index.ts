@@ -37,12 +37,12 @@ import {
 import {
   handleAdminOverviewGet,
   handleAdminSetPlanPost,
+  handleAdminDailyJsonGet,
   handleAdminSuspendPost,
   handleAdminUsersGet,
   handleAdminVaultsGet,
 } from "./admin.ts";
 import { handleAdminGrowthGet } from "./admin-growth.ts";
-import { handleAdminDailyJsonGet } from "./admin.ts";
 import { handleOpsDailyGet, runDailyLine } from "./ops-daily.ts";
 import { bumpOpsCounter } from "./ops-counters.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
@@ -588,13 +588,25 @@ app.get("/", (c) => {
 });
 
 /**
- * Default export: the Hono fetch handler + the ops cron ([triggers] in
- * wrangler.toml). `controller.cron` is the matched pattern — ops.routeCron maps
- * it to the health check (every 10 min), the weekly digest (Mon 14:00 UTC),
- * the hourly drip tick, or the daily usage rollup (03:30 UTC).
- * Same sender selection as the magic-link flow: real binding in production,
- * dev-log on staging (deterministic, lands in Workers Logs).
+ * Whether a 5xx counts toward the error-rate signal. Everything ≥ 500 does,
+ * EXCEPT the by-design `route_missing` 503 backstops for /vault and /mcp on a
+ * host where no vault zone route is meant to exist (cloud., app., workers.dev):
+ * MCP/vault scanners hit those all day and would page the operator for
+ * nothing. On the canonical vault host (VAULT_PUBLIC_ORIGIN, my. in
+ * production) the same 503 means the zone route broke — that one counts.
  */
+export function countsAs5xx(req: Request, status: number, env: Partial<Env>): boolean {
+  if (status < 500) return false;
+  const url = new URL(req.url);
+  const backstop = /^\/(vault|mcp)(\/|$)/.test(url.pathname);
+  if (!backstop) return true;
+  try {
+    return env.VAULT_PUBLIC_ORIGIN ? new URL(env.VAULT_PUBLIC_ORIGIN).host === url.host : false;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The fetch entrypoint: Hono, plus the 5xx counter for the daily line and the
  * health cron's error-rate alert. Costs nothing on the happy path (a status
@@ -602,12 +614,14 @@ app.get("/", (c) => {
  * waitUntil, so it never delays or breaks the response itself
  * (bumpOpsCounter never throws). Without an ExecutionContext (direct calls in
  * tests) the bump is awaited inline instead of left floating.
+ *
+ * `env` stays as loosely typed as Hono's own `app.fetch` (tests hand it partial envs).
  */
-// `env` stays as loosely typed as Hono's own `app.fetch` (tests hand it partial envs).
 async function fetchWithOpsCounters(req: Request, env?: Env | {}, ctx?: ExecutionContext): Promise<Response> {
   const res = await app.fetch(req, env, ctx);
-  const db = (env as Partial<Env> | undefined)?.DB;
-  if (res.status >= 500 && db) {
+  const e = (env ?? {}) as Partial<Env>;
+  const db = e.DB;
+  if (db && countsAs5xx(req, res.status, e)) {
     const bump = bumpOpsCounter(db, "http_5xx", new Date());
     if (ctx?.waitUntil) ctx.waitUntil(bump);
     else await bump;
@@ -615,6 +629,14 @@ async function fetchWithOpsCounters(req: Request, env?: Env | {}, ctx?: Executio
   return res;
 }
 
+/**
+ * Default export: the fetch handler above + the ops cron ([triggers] in
+ * wrangler.toml). `controller.cron` is the matched pattern — ops.routeCron maps
+ * it to the health check (every 10 min), the weekly digest (Mon 14:00 UTC),
+ * the hourly drip tick, or the daily usage rollup + daily ops line (03:30 UTC).
+ * Same sender selection as the magic-link flow: real binding in production,
+ * dev-log on staging (deterministic, lands in Workers Logs).
+ */
 export default {
   fetch: fetchWithOpsCounters,
   async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {

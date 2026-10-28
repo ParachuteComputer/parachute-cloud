@@ -15,7 +15,7 @@ import { opsBucket, sumOpsCounter } from "../src/ops-counters.ts";
 import { collectDailyStats, renderDailyLine, runDailyLine } from "../src/ops-daily.ts";
 import { createSession } from "../src/sessions.ts";
 import { createUser } from "../src/users.ts";
-import { CSRF, ISSUER, seedSession, seedUser } from "./helpers.ts";
+import { CANONICAL_ORIGIN, CSRF, ISSUER, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 const RECIPIENTS = "ops-a@example.com, ops-b@example.com";
 const WEBHOOK = "https://hooks.example.com/ops-test";
@@ -81,7 +81,8 @@ const RUN_AT = new Date("2026-10-28T03:30:00Z");
 
 /** A realistic day: 4 live users (+3 that day), 1 pending deletion, 4 vaults, counters. */
 async function seedDay(): Promise<void> {
-  await createUser(env.DB, "old@example.com", "", new Date("2026-10-01T10:00:00Z"));
+  const old = await createUser(env.DB, "old@example.com", "", new Date("2026-10-01T10:00:00Z"));
+  for (const v of ["v-big", "v-small", "v-quiet", "v-legacy"]) await seedVault(v, old.id);
   for (const h of ["01", "12", "23"]) await createUser(env.DB, `new-${h}@example.com`, "", new Date(`${DAY}T${h}:00:00Z`));
   await createUser(env.DB, "tomorrow@example.com", "", new Date("2026-10-28T01:00:00Z")); // after the day: not counted
   const leaving = await createUser(env.DB, "leaving@example.com", "", new Date("2026-10-01T10:00:00Z"));
@@ -161,6 +162,23 @@ describe("daily ops line", () => {
     await seedUsage("v-a", "2026-10-26", 2_500_000, 0, 1, 3);
     const stats = await collectDailyStats(env.DB, DAY, "production");
     expect(renderDailyLine(stats)).toContain("storage 2.5 MB (as of 2026-10-26)");
+  });
+
+  test("a partial rollup says so: rows for fewer vaults than exist", async () => {
+    const { id } = await seedUser("partial@example.com");
+    for (const v of ["p-1", "p-2", "p-3"]) await seedVault(v, id);
+    await seedUsage("p-1", "2026-10-28", 1_000_000, 0, 0, 1);
+    await seedUsage("p-2", "2026-10-28", 1_000_000, 0, 0, 0);
+    const stats = await collectDailyStats(env.DB, DAY, "production");
+    expect(renderDailyLine(stats)).toContain("storage 2.0 MB (2/3 vaults)");
+  });
+
+  test("the last day of a month reads voice from that month, not the freshly reset next one", async () => {
+    await seedUsage("m-1", "2026-10-31", 0, 0, 400, 0); // Oct month-to-date at 03:30 on the 31st
+    await seedUsage("m-1", "2026-11-01", 0, 0, 2, 0); // the meter has reset to November
+    const stats = await collectDailyStats(env.DB, "2026-10-31", "production");
+    expect(renderDailyLine(stats)).toContain("voice 400 min this month");
+    expect(renderDailyLine(await collectDailyStats(env.DB, "2026-11-01", "production"))).toContain("voice 2 min this month");
   });
 
   test("the usage cron writes the line for the day that just ended (the cron router dispatches the daily job)", async () => {
@@ -262,11 +280,16 @@ describe("operator alerts — not only one inbox", () => {
 
 describe("5xx counter and error-rate alert", () => {
   test("a 5xx response through the real worker export is counted (after the response, via waitUntil); a 2xx is not", async () => {
+    expect(new URL(CANONICAL_ORIGIN).host).not.toBe(new URL(ISSUER).host); // my. vs the issuer host
     const ctx = createExecutionContext();
-    const bad = await worker.fetch(new Request(`${ISSUER}/vault/anything`), env, ctx); // 503 route_missing by design
+    // On the canonical vault host a /vault 503 means the zone route broke: counted.
+    const bad = await worker.fetch(new Request(`${CANONICAL_ORIGIN}/vault/anything`), env, ctx);
     expect(bad.status).toBe(503);
     const ok = await worker.fetch(new Request(`${ISSUER}/health`), env, ctx);
     expect(ok.status).toBe(200);
+    // On any other host the same backstop is scanner noise: not counted.
+    const noise = await worker.fetch(new Request(`${ISSUER}/mcp`), env, ctx);
+    expect(noise.status).toBe(503);
     await waitOnExecutionContext(ctx);
     const rows = await env.DB.prepare("SELECT name, count FROM ops_counters").all();
     expect(rows.results).toEqual([{ name: "http_5xx", count: 1 }]);

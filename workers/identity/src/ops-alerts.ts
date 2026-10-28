@@ -101,12 +101,17 @@ export const OPS_WEBHOOK_TIMEOUT_MS = 5_000;
  * webhook is configured, otherwise whether it answered 2xx. NEVER THROWS, and
  * never logs the URL (it usually embeds a token).
  */
+/** The configured webhook URL (trimmed), or null. */
+export function opsWebhookUrl(env: Pick<Env, "OPS_ALERT_WEBHOOK_URL">): string | null {
+  return env.OPS_ALERT_WEBHOOK_URL?.trim() || null;
+}
+
 export async function postOpsWebhook(
   env: Pick<Env, "OPS_ALERT_WEBHOOK_URL">,
   payload: OpsWebhookPayload,
   fetchFn: typeof fetch = fetch,
 ): Promise<boolean | null> {
-  const url = env.OPS_ALERT_WEBHOOK_URL?.trim();
+  const url = opsWebhookUrl(env);
   if (!url) return null;
   try {
     const res = await fetchFn(url, {
@@ -180,8 +185,10 @@ export async function notifyOperators(
         console.error(`event=ops_email_send_failed key=${msg.key} error=${JSON.stringify(String(err))}`);
       }
     }
-  } else if (recipients.length === 0) {
-    console.error(`event=ops_email_skipped key=${msg.key} reason=no_operator_alert_email`);
+  } else {
+    console.error(
+      `event=ops_email_skipped key=${msg.key} reason=${recipients.length === 0 ? "no_operator_alert_email" : "no_sender"}`,
+    );
   }
   const webhook = msg.webhook
     ? await postOpsWebhook(
@@ -221,8 +228,8 @@ export async function raiseOpsAlert(
 ): Promise<boolean> {
   console.error(`event=ops_alert key=${opts.key} detail=${JSON.stringify(opts.subject)}`);
   try {
-    if (!sender && !env.OPS_ALERT_WEBHOOK_URL) return false;
-    if (operatorRecipients(env).length === 0 && !env.OPS_ALERT_WEBHOOK_URL) {
+    if (!sender && !opsWebhookUrl(env)) return false;
+    if (operatorRecipients(env).length === 0 && !opsWebhookUrl(env)) {
       console.error("event=ops_alert_skipped reason=no_operator_channel");
       return false;
     }

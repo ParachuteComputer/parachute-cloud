@@ -15,16 +15,23 @@
  *
  * WHERE EACH NUMBER COMES FROM (only data that is really recorded):
  *   - users (+new)          — `users`: live accounts created before the day's
- *                             end (pending deletions excluded); +N = created
- *                             during the day.
+ *                             end; +N = those created during the day. Both
+ *                             exclude accounts pending deletion (they show
+ *                             under "deletions pending").
  *   - active vaults, notes  — the usage rollup row written at 03:30 on the
  *     changed                 FOLLOWING day: each vault DO reports
  *                             `notes_changed_24h` (notes whose last write fell
  *                             in the 24 h before the read). "active" = vaults
  *                             with at least one. `n/a` when no vault reported it.
  *   - storage               — the same rollup rows: Σ db_bytes + r2_bytes.
- *   - voice                 — the same rows: Σ transcribe_minutes, which the
- *                             DO meters per UTC MONTH (hence "this month").
+ *                             "(as of D)" when that rollup is older than the
+ *                             one that should close the day; "(N/M vaults)"
+ *                             when it read fewer vaults than exist.
+ *   - voice                 — Σ transcribe_minutes, which the DO meters per
+ *                             UTC MONTH (hence "this month"), from the newest
+ *                             rollup inside the day's own month — on the last
+ *                             day of a month that is the rollup at 03:30 that
+ *                             morning, because the next one has already reset.
  *   - sign-ins              — `ops_counters.sign_in` (sessions started).
  *   - deletions pending     — accounts inside their 24 h undo window right now.
  *   - alerts                — `ops_counters.alert` (alerts actually delivered).
@@ -63,6 +70,9 @@ export interface DailyStats {
   voiceMinutesThisMonth: number | null;
   /** The rollup day the vault figures come from (normally day + 1). */
   usageDay: string | null;
+  /** Vaults with a row in that rollup, and vaults of live accounts now. */
+  usageVaults: number;
+  vaultsTotal: number;
   signIns: number;
   deletionsPending: number;
   alerts: number;
@@ -89,7 +99,7 @@ export async function collectDailyStats(db: D1Database, day: string, environment
 
   const [users, usersNew, deletionsPending, signIns, alerts, errors5xx, healthOk, healthFail] = await Promise.all([
     count("SELECT COUNT(*) AS n FROM users WHERE deleted_at IS NULL AND created_at < ?", end),
-    count("SELECT COUNT(*) AS n FROM users WHERE created_at >= ? AND created_at < ?", day, end),
+    count("SELECT COUNT(*) AS n FROM users WHERE deleted_at IS NULL AND created_at >= ? AND created_at < ?", day, end),
     count("SELECT COUNT(*) AS n FROM users WHERE deleted_at IS NOT NULL"),
     sumOpsCounter(db, "sign_in", day, end),
     sumOpsCounter(db, "alert", day, end),
@@ -109,24 +119,41 @@ export async function collectDailyStats(db: D1Database, day: string, environment
   let voiceMinutesThisMonth: number | null = null;
   let notesChanged: number | null = null;
   let activeVaults: number | null = null;
+  let usageVaults = 0;
+  const vaultsTotal = await count(
+    "SELECT COUNT(*) AS n FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE u.deleted_at IS NULL",
+  );
   if (usageDay) {
     const agg = await db
       .prepare(
-        `SELECT COALESCE(SUM(db_bytes + r2_bytes), 0) AS bytes,
-                COALESCE(SUM(transcribe_minutes), 0) AS minutes,
+        `SELECT COUNT(*) AS rows_n,
+                COALESCE(SUM(db_bytes + r2_bytes), 0) AS bytes,
                 COUNT(notes_changed_24h) AS reported,
                 COALESCE(SUM(notes_changed_24h), 0) AS notes,
                 COALESCE(SUM(CASE WHEN notes_changed_24h > 0 THEN 1 ELSE 0 END), 0) AS active
          FROM vault_usage WHERE day = ?`,
       )
       .bind(usageDay)
-      .first<{ bytes: number; minutes: number; reported: number; notes: number; active: number }>();
+      .first<{ rows_n: number; bytes: number; reported: number; notes: number; active: number }>();
+    usageVaults = agg?.rows_n ?? 0;
     storageBytes = agg?.bytes ?? 0;
-    voiceMinutesThisMonth = Math.round(agg?.minutes ?? 0);
     if ((agg?.reported ?? 0) > 0) {
       notesChanged = agg!.notes;
       activeVaults = agg!.active;
     }
+  }
+  // Voice is a per-MONTH meter that resets lazily at the month boundary, so
+  // read it from the newest rollup still inside the day's own month.
+  const voiceDayRow = await db
+    .prepare("SELECT MAX(day) AS d FROM vault_usage WHERE day <= ? AND substr(day, 1, 7) = ?")
+    .bind(end, day.slice(0, 7))
+    .first<{ d: string | null }>();
+  if (voiceDayRow?.d) {
+    const v = await db
+      .prepare("SELECT COALESCE(SUM(transcribe_minutes), 0) AS m FROM vault_usage WHERE day = ?")
+      .bind(voiceDayRow.d)
+      .first<{ m: number }>();
+    voiceMinutesThisMonth = Math.round(v?.m ?? 0);
   }
 
   return {
@@ -139,6 +166,8 @@ export async function collectDailyStats(db: D1Database, day: string, environment
     storageBytes,
     voiceMinutesThisMonth,
     usageDay,
+    usageVaults,
+    vaultsTotal,
     signIns,
     deletionsPending,
     alerts,
@@ -164,10 +193,11 @@ export function formatBytes(n: number): string {
 export function renderDailyLine(s: DailyStats): string {
   const na = (v: number | null) => (v === null ? "n/a" : String(v));
   const head = s.environment === "production" ? `parachute-cloud ${s.day}` : `parachute-cloud ${s.environment} ${s.day}`;
+  const notes: string[] = [];
+  if (s.usageDay && s.usageDay !== nextDay(s.day)) notes.push(`as of ${s.usageDay}`);
+  if (s.storageBytes !== null && s.usageVaults < s.vaultsTotal) notes.push(`${s.usageVaults}/${s.vaultsTotal} vaults`);
   const storage =
-    s.storageBytes === null
-      ? "n/a"
-      : `${formatBytes(s.storageBytes)}${s.usageDay && s.usageDay !== nextDay(s.day) ? ` (as of ${s.usageDay})` : ""}`;
+    s.storageBytes === null ? "n/a" : `${formatBytes(s.storageBytes)}${notes.length ? ` (${notes.join(", ")})` : ""}`;
   return [
     head,
     `users ${s.users} (+${s.usersNew})`,

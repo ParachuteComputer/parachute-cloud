@@ -42,7 +42,7 @@
 import type { Env } from "./env.ts";
 import type { EmailSender } from "./email.ts";
 import { runAccountDeleteSweep } from "./account-delete.ts";
-import { markAlerted, notifyOperators, operatorRecipients, raiseOpsAlert, shouldAlert } from "./ops-alerts.ts";
+import { markAlerted, notifyOperators, operatorRecipients, opsWebhookUrl, raiseOpsAlert, shouldAlert } from "./ops-alerts.ts";
 import { OPS_BUCKET_MS, bumpOpsCounter, opsBucket, sumOpsCounter } from "./ops-counters.ts";
 import { runDailyLine } from "./ops-daily.ts";
 import { runBillingSweep } from "./billing-lifecycle.ts";
@@ -252,7 +252,7 @@ export async function runHealthCheck(
   }
   if (alertable.length === 0) return { failures, alerted: [], errors5xx };
 
-  if (operatorRecipients(env).length === 0 && !env.OPS_ALERT_WEBHOOK_URL) {
+  if (operatorRecipients(env).length === 0 && !opsWebhookUrl(env)) {
     console.error("event=ops_alert_skipped reason=no_operator_channel");
     return { failures, alerted: [], errors5xx };
   }
