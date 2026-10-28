@@ -1,0 +1,61 @@
+# External uptime check — production /health from OUTSIDE Cloudflare.
+#
+# Why: the identity worker's own 10-minute health cron (workers/identity
+# src/ops.ts) runs inside that worker, so if the worker (or Cloudflare) is
+# down, the cron that would alert is down too. This workflow GETs the public
+# health endpoints every 15 minutes and keeps ONE GitHub issue labelled
+# `uptime` open while anything fails (commenting each failing run), closing it
+# when everything is green again. GitHub notifies watchers of the repo on the
+# issue, which is a channel independent of Cloudflare email.
+#
+# Read-only GETs, no secrets. GITHUB_TOKEN only needs issues: write.
+# NOTE: scheduled workflows run only from the DEFAULT branch, so this starts
+# after the release reaches main; GitHub may also delay scheduled runs by a few
+# minutes and disables them after 60 days without repository activity.
+name: Uptime
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: GET production /health (3 tries each)
+        id: check
+        run: |
+          set +e
+          bash scripts/uptime-check.sh > "$RUNNER_TEMP/uptime-report.md"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/uptime-report.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -eq 0 ]; then echo "state=up" >> "$GITHUB_OUTPUT"; else echo "state=down" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Open, update or close the uptime issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE: ${{ steps.check.outputs.state }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash scripts/uptime-issue.sh "$STATE" "$RUNNER_TEMP/uptime-report.md" "$RUN_URL"
+
+      - name: Mark the run failed while production is down
+        if: steps.check.outputs.state == 'down'
+        run: |
+          echo "::error::Production health check failed — see the open 'uptime' issue."
+          exit 1
