@@ -229,11 +229,14 @@ export function renderLogin(opts: {
   showPassword?: boolean;
   /** Opens the "have a code?" disclosure with `error` shown there instead. */
   showCode?: boolean;
+  /** The connecting app's display name (untrusted DCR `client_name`), when known. */
+  clientName?: string | null;
 }): string {
-  const { params, csrfToken, error, showPassword, showCode } = opts;
+  const { params, csrfToken, error, showPassword, showCode, clientName } = opts;
+  const heading = clientName ? `Sign in to connect ${esc(clientName)}` : "Sign in to Parachute";
   return page(
     "Sign in — Parachute",
-    `<h1>Sign in to Parachute</h1>
+    `<h1>${heading}</h1>
      <div class="card">
        <form method="post" action="/auth/magic">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -495,7 +498,6 @@ export function renderConsent(props: ConsentProps): string {
   const scopeList = scopeDescriptions
     .map((s) => `<li><strong>${esc(s.label)}</strong><br><span class="muted">${esc(s.scope)}</span></li>`)
     .join("\n");
-  const vaultDisplay = lockedVault ? `<p class="muted">Vault: <strong>${esc(lockedVault)}</strong></p>` : "";
   const vaultField = lockedVault
     ? `<input type="hidden" name="vault_pick" value="${esc(lockedVault)}">`
     : needsVaultPick
@@ -503,15 +505,20 @@ export function renderConsent(props: ConsentProps): string {
       : "";
   const verbSelectorField = verbSelector ? renderVerbSelector(verbSelector) : "";
   const accountVaultsField = accountVaults ? renderAccountVaultsBlock(accountVaults) : "";
+  const ask = consentAsk({
+    clientName,
+    scopes: scopeDescriptions.map((s) => s.scope),
+    lockedVault,
+    needsVaultPick,
+    account: accountVaults !== null,
+  });
   return page(
-    "Authorize — Parachute",
-    `<h1>Authorize ${esc(clientName)}</h1>
-     <p class="muted" style="margin:0 0 .3rem">issued by <strong>${esc(issuerHost)}</strong></p>
+    `Connect ${clientName} — Parachute`,
+    `<h1>Connect ${esc(clientName)}</h1>
      ${signedInAsLine(email, csrfToken, notYouNext)}
      <div class="card">
-       <p class="muted"><strong>${esc(clientName)}</strong> is requesting access to:</p>
+       <p class="lead" data-testid="consent-ask">${ask}</p>
        <ul class="scopes">${scopeList}</ul>
-       ${vaultDisplay}
        <form method="post" action="/oauth/authorize">
          <input type="hidden" name="__action" value="consent">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -521,11 +528,57 @@ export function renderConsent(props: ConsentProps): string {
          ${accountVaultsField}
          <div class="row">
            <button class="deny" type="submit" name="decision" value="deny">Deny</button>
-           <button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Approve</button>
+           <button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Allow</button>
          </div>
        </form>
-     </div>`,
+       <p class="muted" style="margin:.9rem 0 0">You can disconnect it anytime from your vault's settings.</p>
+     </div>
+     <p class="muted foot">issued by <strong>${esc(issuerHost)}</strong></p>`,
   );
+}
+
+/**
+ * The plain one-line ask at the top of the consent card — names the app and
+ * the vault: "Claude wants to read and write notes in my-notes." The verb comes
+ * from the strongest vault verb requested (admin > write > read); the vault
+ * from the `vault=` hint, else the single named vault in the (resource-
+ * narrowed) scopes, else the picker below. Account-vaults requests (one
+ * connection across vaults) say so instead. `clientName` is untrusted (a
+ * self-registered DCR `client_name`) — escaped, like every name here.
+ */
+export function consentAsk(opts: {
+  clientName: string;
+  scopes: readonly string[];
+  lockedVault: string | null;
+  needsVaultPick: boolean;
+  account: boolean;
+}): string {
+  const who = `<strong>${esc(opts.clientName)}</strong>`;
+  if (opts.account) return `${who} wants to see and work with the vaults in your account.`;
+  const verbs = new Set<string>();
+  const named = new Set<string>();
+  for (const s of opts.scopes) {
+    const parts = s.split(":");
+    if (parts[0] !== "vault") continue;
+    if (parts.length === 2 && parts[1]) verbs.add(parts[1]);
+    if (parts.length === 3 && parts[1] && parts[2]) {
+      named.add(parts[1]);
+      verbs.add(parts[2]);
+    }
+  }
+  const what = verbs.has("admin")
+    ? "read, write and manage notes in"
+    : verbs.has("write")
+      ? "read and write notes in"
+      : "read notes in";
+  const single = named.size === 1 ? [...named][0]! : null;
+  const vault = opts.lockedVault ?? single;
+  const where = vault
+    ? `<strong>${esc(vault)}</strong>`
+    : opts.needsVaultPick
+      ? "the vault you choose below"
+      : "your vaults";
+  return `${who} wants to ${what} ${where}.`;
 }
 
 export function renderError(opts: { title: string; message: string }): string {

@@ -966,7 +966,7 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     );
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("Authorize");
+    expect(html).toContain('data-testid="consent-ask"');
     expect(res.headers.get("set-cookie")).toContain("parachute_id_session=");
   });
 
@@ -1154,7 +1154,7 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     const resumed = await handleAuthorizeGet(env.DB, new Request(next), deps());
     expect(resumed.status).toBe(200);
     const resumedHtml = await resumed.text();
-    expect(resumedHtml).toContain("Sign in to Parachute");
+    expect(resumedHtml).toContain("Sign in to");
     expect(resumedHtml).not.toContain("Signed in as");
     expect(resumedHtml).toContain(`value="${clientId}"`);
     expect(resumedHtml).toContain(`value="${challenge}"`);

@@ -230,7 +230,7 @@ async function authorizeCore(
 
   // Pending client: single-consent — a session auto-approves it, else login.
   if (client.status !== "approved") {
-    if (!session) return renderLoginPage(req, params);
+    if (!session) return renderLoginPage(req, params, undefined, client.clientName);
     await approveClient(db, client.clientId);
   }
 
@@ -246,7 +246,7 @@ async function authorizeCore(
     );
   }
 
-  if (!session) return renderLoginPage(req, params);
+  if (!session) return renderLoginPage(req, params, undefined, client.clientName);
 
   // Account-vaults (Wave A) — a wholly separate consent surface from the vault
   // picker. Refuse a mixed/foreign-id request, then ALWAYS render consent (never
@@ -345,13 +345,65 @@ async function authorizeCore(
   );
 }
 
-function renderLoginPage(req: Request, params: AuthorizeParams, error?: string): Response {
+function renderLoginPage(req: Request, params: AuthorizeParams, error?: string, clientName?: string | null): Response {
   const csrf = ensureCsrfToken(req);
   const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
   // Errors on this page today only come from the password submit path, so an
   // error render opens the password disclosure (magic-send errors re-render via
   // auth-handlers.ts with showPassword: false).
-  return htmlResponse(renderLogin({ params, csrfToken: csrf.token, error, showPassword: Boolean(error) }), 200, extra);
+  return htmlResponse(renderLogin({ params, csrfToken: csrf.token, error, showPassword: Boolean(error), clientName }), 200, extra);
+}
+
+/**
+ * The origin where a person's sign-in session lives, when that is NOT the
+ * issuer origin — `APP_ORIGIN` (my.parachute.computer in production), but only
+ * when it is a DIFFERENT origin from the issuer AND a bound origin of this same
+ * worker (so the consent POST from there passes the same-origin gate, and we
+ * never send anyone to a host this worker doesn't serve — e.g. the legacy
+ * Notes PWA default when APP_ORIGIN is unset). Null when the issuer IS the
+ * home origin (staging: single-origin), so the authorize flow runs in place.
+ */
+export function authorizeHomeOrigin(deps: OAuthDeps): string | null {
+  const home = deps.appOrigin.replace(/\/$/, "");
+  if (home === deps.issuer) return null;
+  return resolveBoundOrigins(deps).includes(home) ? home : null;
+}
+
+/**
+ * ONE-PASS CONNECT (T-318). The OAuth issuer is `cloud.parachute.computer`
+ * (every registered connector, the AS metadata, `iss`, JWKS — fixed forever),
+ * but people sign in on `my.parachute.computer`. Both are Custom Domains of
+ * THIS worker, yet the session cookie is host-only, so an authorize request
+ * rendered on cloud. saw no session and asked for a SECOND email sign-in in the
+ * middle of connecting Claude.
+ *
+ * So a browser GET of `/oauth/authorize` on the ISSUER host is sent (302, path +
+ * query byte-identical) to the same path on the home origin, where the session
+ * lives. Sign-in (only if truly signed out) and consent then run there; the
+ * consent POST is same-origin on my. (a bound origin); the auth code lands in
+ * the shared D1; the client's redirect carries the same `code` + `state`; and
+ * the token exchange stays at `cloud./oauth/token`. Nothing a client can
+ * observe about the issuer changes — only where the human pages render.
+ *
+ * Scope: GET only. A POST to cloud./oauth/authorize (a login/consent form that
+ * was rendered on cloud. before this deploy) is still served in place — a 302
+ * would turn it into a GET and drop the body. Requests on any other host (my.,
+ * app., workers.dev) are served in place.
+ *
+ * `enabled` is the caller's production gate (index.ts): the cloud./my. split
+ * exists only in production, while the handler-integration suite drives the
+ * authorize pages on the ISSUER host under the committed production [vars]
+ * with ENVIRONMENT="test" — the same gate `cloudFrontDoorRedirect` uses.
+ * Staging is single-origin (APP_ORIGIN == ISSUER), so it is a no-op there
+ * regardless.
+ */
+export function authorizeHomeRedirect(req: Request, deps: OAuthDeps, enabled: boolean): Response | null {
+  if (!enabled) return null;
+  const home = authorizeHomeOrigin(deps);
+  if (!home) return null;
+  const url = new URL(req.url);
+  if (url.origin !== deps.issuer) return null;
+  return redirectResponse(`${home}${url.pathname}${url.search}`, { "cache-control": "no-store" });
 }
 
 export async function handleAuthorizeGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {

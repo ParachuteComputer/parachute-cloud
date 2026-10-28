@@ -44,7 +44,7 @@ import {
 import { handleAdminGrowthGet } from "./admin-growth.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
 import { accountDescriptor } from "./account-descriptor.ts";
-import { handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
+import { authorizeHomeRedirect, handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
 import {
   authorizationServerMetadata,
   corsPreflight,
@@ -146,7 +146,15 @@ app.get("/.well-known/oauth-protected-resource/account/mcp", (c) => accountMcpPr
 // the uncredentialed token-family endpoints, reflected-origin (credentialed DCR)
 // on register. Cross-origin browser PKCE (the Notes PWA) needs both.
 app.options("/oauth/*", (c) => oauthPreflight(c.req.raw));
-app.get("/oauth/authorize", (c) => handleAuthorizeGet(c.env.DB, c.req.raw, depsFor(c.env)));
+// One-pass connect (T-318): on the issuer host in production, the browser is
+// sent to the home origin (my.) where the session lives — see
+// oauth-authorize.ts `authorizeHomeRedirect`.
+app.get(
+  "/oauth/authorize",
+  (c) =>
+    authorizeHomeRedirect(c.req.raw, depsFor(c.env), c.env.ENVIRONMENT === "production") ??
+    handleAuthorizeGet(c.env.DB, c.req.raw, depsFor(c.env)),
+);
 app.post("/oauth/authorize", (c) => handleAuthorizePost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/oauth/token", async (c) => withWildcardCors(await handleToken(c.env.DB, c.req.raw, depsFor(c.env))));
 app.post("/oauth/register", async (c) =>
@@ -166,7 +174,10 @@ app.post("/oauth/revoke", async (c) => withWildcardCors(await handleRevoke(c.env
  * SCOPE is the load-bearing correctness property. This is wired into ONLY the
  * GET `/login`, GET `/console` and GET `/console/security` routes below, so it is
  * PHYSICALLY unreachable
- * from any MACHINE path — `/oauth/*` (cloud. is the OAuth issuer), `/auth/verify`
+ * from any MACHINE path — `/oauth/*` (cloud. is the OAuth issuer; the one
+ * deliberate exception is the browser GET of `/oauth/authorize`, which T-318's
+ * `authorizeHomeRedirect` sends to my. — a separate, issuer-aware redirect, not
+ * this one), `/auth/verify`
  * + `/auth/code` (magic-link + code consumption; old emails point at cloud.),
  * `/unsubscribe` (RFC 8058 one-click POST won't follow a 3xx), `/billing/webhook`
  * (Stripe's dashboard pins cloud.), and `/.well-known/*` (discovery) all keep

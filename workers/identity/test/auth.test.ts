@@ -609,7 +609,7 @@ describe("magic link resumes a pending authorize request", () => {
     );
     expect(resumed.status).toBe(200);
     const html = await resumed.text();
-    expect(html).toContain("Authorize Claude");
+    expect(html).toContain("Connect Claude");
     expect(html).toContain('name="state" value="st-resume-1"');
     expect(html).toContain('<select id="vault_pick" name="vault_pick"');
     expect(html).toContain('<option value="resume-vault"');
@@ -887,7 +887,7 @@ describe("sign-in code — verify by CODE instead of the link", () => {
     );
     expect(resumed.status).toBe(200);
     const html = await resumed.text();
-    expect(html).toContain("Authorize Claude");
+    expect(html).toContain("Connect Claude");
     expect(html).toContain('name="state" value="st-code-resume-1"');
   });
 
