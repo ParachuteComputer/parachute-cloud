@@ -134,13 +134,10 @@ describe("discovery endpoints", () => {
     // flag is the ONLY thing a client reads to decide whether to offer delete;
     // an unadvertised working route ships dark.
     expect((md.capabilities as Record<string, unknown>).vault_delete).toBe(true);
-    // Its whole-account sibling (A-3) has NO flag yet, and that absence is
-    // pinned rather than left ambiguous: `AccountCapabilities` is the shared,
-    // CI-pinned door contract from parachute-hub, so adding a key is an
-    // upstream PR. This assertion is what will fail — loudly, and in the right
-    // place — the day someone widens the contract and forgets to light the
-    // cloud door up.
-    expect((md.capabilities as Record<string, unknown>).account_delete).toBeUndefined();
+    // T-318: the whole-account sibling (A-3) is advertised as an ADDITIVE
+    // cloud key on top of the shared contract (checkAccountDescriptor above
+    // still passes); the app gates its Delete-account section on it.
+    expect((md.capabilities as Record<string, unknown>).account_delete).toBe(true);
     expect(Array.isArray(md.plans) && (md.plans as unknown[]).length).toBe(4);
     // PR-2: the {name}-placeholder vault-URL template, derived from vaultInstanceUrl.
     expect(md.vault_url_template).toContain("{name}");

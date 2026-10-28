@@ -110,6 +110,8 @@ export interface PurgeReport {
   tables: Record<string, { rows: number; columns: Record<string, number> }>;
   checked_tables: string[];
   remaining_rows_total: number;
+  /** Rows (any table) that still contain the account's email address. */
+  email_rows_total: number;
   /** account_audit rows for this account — kept BY DESIGN (hashed target). */
   audit: Array<{ at: string; actor: string; action: string; note: Record<string, unknown> | null }>;
   stripe: { customer_before: boolean | null; customer_deleted: boolean | null };
@@ -186,10 +188,17 @@ export async function buildPurgeReport(
     });
     // One pass: an inner SELECT computes a 0/1 match per column per row, the
     // outer sums them per column and for "any column" (no repeated predicate).
-    const inner = conds.map((c, j) => `(CASE WHEN ${c} THEN 1 ELSE 0 END) AS m${j}`).join(", ");
+    // `e` flags rows carrying the EMAIL anywhere, reported apart so "no
+    // email-bearing rows remain" is its own checkable number.
+    const emailCond = columns.map((col) => `instr(lower(CAST(${ident(col)} AS TEXT)), ${lit(email)}) > 0`).join(" OR ");
+    const inner = [
+      ...conds.map((c, j) => `(CASE WHEN ${c} THEN 1 ELSE 0 END) AS m${j}`),
+      `(CASE WHEN ${emailCond} THEN 1 ELSE 0 END) AS e`,
+    ].join(", ");
     const outer = [
       ...columns.map((_, j) => `COALESCE(SUM(m${j}), 0) AS c${j}`),
       `COALESCE(SUM(CASE WHEN ${columns.map((_, j) => `m${j} = 1`).join(" OR ")} THEN 1 ELSE 0 END), 0) AS any_row`,
+      `COALESCE(SUM(e), 0) AS email_rows`,
     ].join(", ");
     statements.push(db.prepare(`SELECT ${outer} FROM (SELECT ${inner} FROM ${ident(table)})`));
     shapes.push({ table, columns });
@@ -198,6 +207,7 @@ export async function buildPurgeReport(
 
   const out: PurgeReport["tables"] = {};
   let total = 0;
+  let emailRows = 0;
   shapes.forEach(({ table, columns }, i) => {
     const row = ((counted[i]?.results ?? [])[0] ?? {}) as Record<string, number>;
     const perColumn: Record<string, number> = {};
@@ -208,6 +218,7 @@ export async function buildPurgeReport(
     const rows = Number(row.any_row ?? 0);
     out[table] = { rows, columns: perColumn };
     total += rows;
+    emailRows += Number(row.email_rows ?? 0);
   });
 
   const audit = userId ? await auditRowsFor(db, userId) : [];
@@ -225,6 +236,7 @@ export async function buildPurgeReport(
     tables: out,
     checked_tables: tables,
     remaining_rows_total: total,
+    email_rows_total: emailRows,
     audit,
     stripe: {
       customer_before: purged ? purged.note?.stripe_customer_before === true : userRow ? userRow.stripe_customer_id !== null : null,

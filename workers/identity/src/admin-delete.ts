@@ -19,7 +19,7 @@ import { ensureCsrfToken } from "./csrf.ts";
 import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
 import { type OAuthDeps, htmlResponse, redirectResponse } from "./oauth-shared.ts";
-import { getUserById } from "./users.ts";
+import { getUserByEmail, getUserById } from "./users.ts";
 import { countVaultsForOwner } from "./vaults.ts";
 
 async function confirmPage(
@@ -48,11 +48,18 @@ async function confirmPage(
   );
 }
 
-/** GET /admin/users/delete?user_id= — the retype-the-email confirm step. */
+/**
+ * GET /admin/users/delete?user_id= (from the users table) or ?email= (the
+ * operator CLI, which starts from the address in the request email) — the
+ * retype-the-email confirm step.
+ */
 export async function handleAdminDeleteGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const operator = await operatorFor(db, req, deps);
   if (!operator) return notFound();
-  const userId = new URL(req.url).searchParams.get("user_id") ?? "";
+  const params = new URL(req.url).searchParams;
+  let userId = params.get("user_id") ?? "";
+  const email = params.get("email");
+  if (!userId && email) userId = (await getUserByEmail(db, email.trim()))?.id ?? "";
   return (await confirmPage(db, req, userId)) ?? redirectResponse("/admin/users?err=not-found");
 }
 

@@ -231,7 +231,7 @@ export async function deleteVaultD1Rows(
   const namesThisVault = (scope: string): boolean =>
     vaultScopeName(scope) === vaultName || composedScopeNamesVault(scope, ownerUserId, vaultName);
 
-  const [tokenCandidates, grantCandidates, composedTokens, composedGrants] = await Promise.all([
+  const [tokenCandidates, grantCandidates, composedTokens, composedGrants, clientCandidates] = await Promise.all([
     db
       .prepare("SELECT jti, scopes FROM tokens WHERE revoked_at IS NULL AND scopes LIKE ? ESCAPE '\\'")
       .bind(pattern)
@@ -248,6 +248,16 @@ export async function deleteVaultD1Rows(
       .prepare("SELECT user_id, client_id, scopes FROM grants WHERE user_id = ? AND instr(scopes, ?) > 0")
       .bind(ownerUserId, composedNeedle)
       .all<{ user_id: string; client_id: string; scopes: string }>(),
+    // DCR client registrations echo the scopes a connector asked for at
+    // registration — `vault:<name>:read …` — so the deleted vault's NAME sat in
+    // `clients.scopes` after everything else was gone (found by the T-318
+    // end-to-end purge report). The column is informational (echoed in the
+    // DCR response, never enforced), so dropping the dead name's scopes from
+    // it changes no authorization.
+    db
+      .prepare("SELECT client_id, scopes FROM clients WHERE scopes LIKE ? ESCAPE '\\'")
+      .bind(pattern)
+      .all<{ client_id: string; scopes: string }>(),
   ]);
 
   const jtis = [
@@ -298,6 +308,13 @@ export async function deleteVaultD1Rows(
       );
       grantsRewritten++;
     }
+  }
+
+  for (const row of clientCandidates.results ?? []) {
+    const scopes = splitScopes(row.scopes);
+    const kept = scopes.filter((s) => vaultScopeName(s) !== vaultName);
+    if (kept.length === scopes.length) continue;
+    statements.push(db.prepare("UPDATE clients SET scopes = ? WHERE client_id = ?").bind(kept.join(" "), row.client_id));
   }
 
   const mirrorsAt = statements.length;

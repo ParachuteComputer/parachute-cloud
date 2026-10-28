@@ -201,8 +201,8 @@ type VaultConfigState = {
   /**
    * The OWNER'S ACCOUNT IS CLOSED (account deletion requested — T-318).
    * Pushed `true` by the identity worker the moment a delete is requested and
-   * `false` on undo (every entitlement push also re-asserts `false`, since
-   * every caller of that seam acts on a live account). While set, every
+   * `false` on undo (or by an operator plan set, the repair lever). A push
+   * WITHOUT the key leaves it as it is. While set, every
    * TENANT request is refused 401 `account_closed` — including stateless
    * vault tokens minted before the request, which carry no registry row the
    * revocation list could name. Only the platform's own `/api/internal/*`
@@ -671,6 +671,9 @@ export class VaultDO extends DurableObject {
     // (its own first-party/operator gate still applies) so the purge sweep
     // can destroy and an undo can re-open.
     if (this.config?.closed === true && !rest.startsWith("/api/internal/")) {
+      // Discard an unread body (MCP/REST POSTs) so the runtime doesn't log a
+      // "read after response" error for a refusal that never needed it.
+      await request.body?.cancel().catch(() => {});
       return json(
         { error: "Unauthorized", error_type: "account_closed", message: "This account has been closed." },
         401,
