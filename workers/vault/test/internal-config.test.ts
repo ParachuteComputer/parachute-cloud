@@ -142,6 +142,24 @@ describe("internal config — authorization matrix", () => {
     expect(body.used_bytes).toBe(body.db_bytes + body.r2_bytes);
   });
 
+  it("GET reports notes_changed_24h — a count of notes written in the last day (the identity daily ops line)", async () => {
+    const v = freshVault("ic");
+    await createNote(v, { content: "first" });
+    const read = async () => {
+      const res = await SELF.fetch(`${base(v)}/api/internal/config`, {
+        headers: { authorization: `Bearer ${await firstPartyToken(v)}` },
+      });
+      expect(res.status).toBe(200);
+      return ((await res.json()) as any).notes_changed_24h as number;
+    };
+    const before = await read();
+    expect(typeof before).toBe("number");
+    expect(before).toBeGreaterThanOrEqual(1);
+    await createNote(v, { content: "second" });
+    await createNote(v, { content: "third" });
+    expect(await read()).toBe(before + 2);
+  });
+
   it("GET reports the RESOLVED ENTITLEMENT — caps/frozen/transcription_enabled/transcribe_minutes_limit (cloud#186 reconciler contract)", async () => {
     // CROSS-WORKER PIN. The identity worker's daily reconciler
     // (workers/identity/src/usage.ts) decides whether a vault's entitlement is

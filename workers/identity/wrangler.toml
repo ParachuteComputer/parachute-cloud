@@ -71,8 +71,11 @@ head_sampling_rate = 1
 
 # Ops cron (src/ops.ts, routed by the matched pattern in controller.cron):
 #   */10 * * * *  → health check: identity D1 self-check + vault /health via
-#                   VAULT_ORIGIN; failures email OPERATOR_ALERT_EMAIL with a
-#                   1-hour per-check dedupe (ops_alerts, D1).
+#                   VAULT_ORIGIN; failures alert every OPERATOR_ALERT_EMAIL
+#                   recipient (+ the optional OPS_ALERT_WEBHOOK_URL secret) with
+#                   a 1-hour per-check dedupe (ops_alerts, D1). Each run's
+#                   outcome is counted (ops_counters) and the same tick alerts
+#                   on a 5xx burst (OPS_5XX_ALERT_THRESHOLD per 10 min, default 25).
 #   0 14 * * 1    → weekly ops digest (Mon 14:00 UTC ≈ Monday morning MT):
 #                   counts-only from D1 (users/vaults/magic-link events).
 #   15 * * * *    → hourly onboarding-drip tick (src/drip.ts): day-0 welcome,
@@ -82,6 +85,10 @@ head_sampling_rate = 1
 #                   each vault DO's live db/R2 split through the internal
 #                   config seam, upsert one D1 `vault_usage` row per vault per
 #                   UTC day (skip+log+continue per vault; USAGE_RUN_CAP bound).
+#                   THEN the daily ops line for the UTC day just ended
+#                   (src/ops-daily.ts): stored in D1 ops_daily, logged as
+#                   event=ops_daily, sent to the operator recipients + webhook,
+#                   shown on /admin, JSON at /admin/daily.json + /ops/daily.
 #   0 4 * * *     → nightly GFS snapshot sweep (src/snapshots.ts): each vault
 #                   DO snapshots itself under the owner's plan retention (paid
 #                   14 daily/8 weekly/12 monthly; free 1 rolling weekly — the
@@ -193,6 +200,7 @@ run_worker_first = [
   "/unsubscribe", "/unsubscribe/*",
   "/health", "/health/*",
   "/__test", "/__test/*",
+  "/ops", "/ops/*",
   "/account/*",
   "/vault", "/vault/*",
   "/mcp", "/mcp/*",
@@ -277,7 +285,14 @@ ENVIRONMENT = "production"
 # FROM address for magic-link email. Its domain must be onboarded to Cloudflare
 # Email Sending before real sends succeed (see the send_email binding note below).
 EMAIL_FROM = "noreply@parachute.computer"
-# Where the scheduled health-check alerts + weekly ops digest go (src/ops.ts).
+# Where the health-check alerts, the weekly ops digest and the daily ops line go
+# (src/ops.ts, src/ops-daily.ts). A LIST is accepted (comma-separated); every
+# address gets every message. Optional secrets, set with `wrangler secret put`:
+#   OPS_ALERT_WEBHOOK_URL — a second, non-email channel for alerts + the daily
+#                           line: POST JSON {text, severity, key, at} (ntfy.sh
+#                           topic URL, Slack-compatible or Buzz incoming webhook).
+#   OPS_READ_TOKEN        — bearer for GET /ops/daily (operator agent reads the
+#                           daily lines without a browser). Unset → 404.
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
 # --- money switch (T-318, Aaron 10-29: "Parachute open beta") -----------------
 # BILLING_MODE = "open_beta" | "paid" (src/billing-config.ts billingMode). UNSET
@@ -418,6 +433,7 @@ run_worker_first = [
   "/unsubscribe", "/unsubscribe/*",
   "/health", "/health/*",
   "/__test", "/__test/*",
+  "/ops", "/ops/*",
   "/account/*",
   "/vault", "/vault/*",
   "/mcp", "/mcp/*",

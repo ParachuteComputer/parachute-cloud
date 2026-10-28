@@ -49,7 +49,7 @@ async function seedOperator(email = "operator@example.com"): Promise<{ id: strin
   return { id, cookie: cookieFor(await seedSession(id)) };
 }
 
-const ADMIN_GETS = ["/admin", "/admin/users", "/admin/vaults"];
+const ADMIN_GETS = ["/admin", "/admin/users", "/admin/vaults", "/admin/daily.json"];
 const ADMIN_POSTS = ["/admin/users/plan", "/admin/users/suspend"];
 
 // --- the role gate -----------------------------------------------------------

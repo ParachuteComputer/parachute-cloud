@@ -314,6 +314,16 @@ async function main() {
     assert(usage.status === 404, "PRODUCTION: /__test/usage-run does not exist (404)", `status ${usage.status}`);
     const snap = await fetch(`${IDENTITY}/__test/snapshot-run`, { method: "POST" });
     assert(snap.status === 404, "PRODUCTION: /__test/snapshot-run does not exist (404)", `status ${snap.status}`);
+    const daily = await fetch(`${IDENTITY}/__test/ops-daily-run`, { method: "POST" });
+    assert(daily.status === 404, "PRODUCTION: /__test/ops-daily-run does not exist (404)", `status ${daily.status}`);
+    // The operator-agent read never answers without its bearer: 404 while
+    // OPS_READ_TOKEN is unset, 401 once it is set. Either is a pass; 200 is not.
+    const opsDaily = await fetch(`${IDENTITY}/ops/daily`);
+    assert(
+      opsDaily.status === 404 || opsDaily.status === 401,
+      "PRODUCTION: /ops/daily without a bearer is refused (404 unset / 401 set)",
+      `status ${opsDaily.status}`,
+    );
     // THE MOCK-BILLING SECURITY PIN: the interim mock-checkout endpoint is
     // hard-gated to non-production (billing-config.ts mockBillingEnabled). In
     // prod it 404s exactly like the __test/* hooks — a free self-upgrade is

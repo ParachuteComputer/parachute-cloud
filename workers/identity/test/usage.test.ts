@@ -129,14 +129,15 @@ describe("usage cron routing", () => {
     expect(routeCron("30 3 * * 1")).toBe("health"); // near-miss degrades safely
   });
 
-  test("handleScheduled dispatches the usage cron to the rollup — no email, no health probe", async () => {
+  test("handleScheduled dispatches the usage cron to the rollup, then the daily ops line — nothing else", async () => {
     // Zero vaults → the rollup makes no vault call; a misroute to the health
     // check would consume a fetch interceptor (none registered → throw inside
-    // the check → alert email), and digest/drip would email. Silence proves
-    // the route.
+    // the check → alert email), and digest/drip would email. The ONLY mail is
+    // the daily ops line (ops-daily.ts), chained on this tick.
     const sender = silentSender();
     await quietly(() => handleScheduled(USAGE_CRON, env, sender));
-    expect(sender.sent).toHaveLength(0);
+    expect(sender.sent).toHaveLength(1);
+    expect((sender.sent[0] as { subject: string }).subject).toMatch(/^\[parachute-cloud test\] daily — \d{4}-\d{2}-\d{2}$/);
     expect(await usageRows()).toEqual([]);
   });
 });
@@ -197,6 +198,26 @@ describe("runUsageRollup", () => {
     const map = await latestUsageForVaults(env.DB, ["voice-a", "voice-legacy"]);
     expect(map.get("voice-a")?.transcribeMinutes).toBe(12.5);
     expect(map.get("voice-legacy")?.transcribeMinutes).toBe(0);
+  });
+
+  test("records the DO's notes_changed_24h (the daily ops line); an older vault worker stays NULL, never 0", async () => {
+    const { id: owner } = await seedUser("notes-roll@example.com");
+    await seedVault("notes-a", owner);
+    await seedVault("notes-legacy", owner);
+    interceptConfigGet("notes-a", { ...splitBody(100, 0), notes_changed_24h: 7 });
+    interceptConfigGet("notes-legacy", splitBody(10, 0)); // no notes_changed_24h
+
+    const now = new Date();
+    const summary = await quietly(() => runUsageRollup(env, rollupDeps(() => now)));
+    expect(summary.recorded).toBe(2);
+    const rows = await env.DB
+      .prepare("SELECT vault_name, notes_changed_24h AS n FROM vault_usage WHERE day = ? ORDER BY vault_name")
+      .bind(now.toISOString().slice(0, 10))
+      .all();
+    expect(rows.results).toEqual([
+      { vault_name: "notes-a", n: 7 },
+      { vault_name: "notes-legacy", n: null },
+    ]);
   });
 
   test("END-TO-END (cloud#186): an upgrade whose push EXHAUSTS its retries leaves the customer under-entitled — the next daily rollup repairs it, and the one after is a no-op", async () => {

@@ -69,10 +69,12 @@ export interface AdminOverviewProps {
   latestAlerts: Array<{ key: string; lastAlertAt: string }>;
   /** Promo codes with redemption counts (promo.ts listPromoCodes) — read-only. */
   promoCodes: import("./promo.ts").PromoCodeRow[];
+  /** The daily ops lines (ops-daily.ts), newest first — rendered at the top. */
+  dailyLines?: Array<{ day: string; line: string }>;
 }
 
 export function renderAdminOverview(props: AdminOverviewProps): string {
-  const { stats, dripEvents7d, signupsByDay, latestAlerts, promoCodes } = props;
+  const { stats, dripEvents7d, signupsByDay, latestAlerts, promoCodes, dailyLines = [] } = props;
   const stat = (k: string, v: number | string, sub = "") =>
     `<div class="stat"><div class="k">${esc(k)}</div><div class="v">${esc(String(v))}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ""}</div>`;
 
@@ -120,6 +122,20 @@ export function renderAdminOverview(props: AdminOverviewProps): string {
     "Admin — Parachute",
     `${ADMIN_STYLE}
      ${adminHeader("Fleet overview", "overview")}
+     <div class="card" data-testid="admin-daily">
+       <h2>Daily line — last 14 days</h2>
+       <p class="muted" style="margin:.1rem 0 .3rem">One line per UTC day, written after the 03:30 UTC usage rollup. Counts only. JSON: <a href="/admin/daily.json">/admin/daily.json</a>.</p>
+       ${
+         dailyLines.length === 0
+           ? `<p class="muted">No daily lines yet — the first one is written after the next 03:30 UTC run.</p>`
+           : `<div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.5">${dailyLines
+               .map(
+                 (d) =>
+                   `<div data-testid="admin-daily-line" style="padding-left:2ch;text-indent:-2ch;margin:0 0 .45rem">${esc(d.line)}</div>`,
+               )
+               .join("")}</div>`
+       }
+     </div>
      <div class="statgrid">
        ${stat("Users", stats.usersTotal, `+${stats.usersNew7d} in 7d`)}
        ${stat("Vaults", stats.vaultsTotal, `+${stats.vaultsNew7d} in 7d`)}

@@ -31,6 +31,7 @@ import { applyPlanToVaults } from "./vault-call.ts";
 import { collectDigestStats } from "./ops.ts";
 import { latestUsageForVaults } from "./usage.ts";
 import { listPromoCodes } from "./promo.ts";
+import { DAILY_DEFAULT_DAYS, dailyJsonResponse, listDailyLines } from "./ops-daily.ts";
 import {
   type AdminUserRow,
   type AdminVaultRow,
@@ -138,7 +139,19 @@ export async function handleAdminOverviewGet(db: D1Database, req: Request, deps:
   // themselves are tuned via D1 statements (migration 0016's header).
   const promoCodes = await listPromoCodes(db);
 
-  return htmlResponse(renderAdminOverview({ stats, dripEvents7d, signupsByDay, latestAlerts, promoCodes }));
+  // The daily ops lines (ops-daily.ts) — the last 14, newest first, at the top.
+  const dailyLines = (await listDailyLines(db, DAILY_DEFAULT_DAYS)).map((d) => ({ day: d.day, line: d.line }));
+
+  return htmlResponse(renderAdminOverview({ stats, dripEvents7d, signupsByDay, latestAlerts, promoCodes, dailyLines }));
+}
+
+// --- GET /admin/daily.json — the daily ops lines, machine-readable ------------
+
+/** Same operator boundary as every /admin page; `?days=` 1..90, default 14. */
+export async function handleAdminDailyJsonGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const operator = await operatorFor(db, req, deps);
+  if (!operator) return notFound();
+  return dailyJsonResponse(db, req);
 }
 
 // --- GET /admin/users --------------------------------------------------------

@@ -4,6 +4,7 @@
  * human's session with the issuer, not a client's access grant.
  */
 import { randomBase64url } from "./crypto.ts";
+import { bumpOpsCounter } from "./ops-counters.ts";
 
 export const SESSION_COOKIE = "parachute_id_session";
 /**
@@ -45,6 +46,8 @@ export async function createSession(db: D1Database, userId: string, now: Date = 
     .prepare("INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)")
     .bind(id, userId, createdAt, expiresAt)
     .run();
+  // The daily ops line's "sign-ins" (counts only; never throws).
+  await bumpOpsCounter(db, "sign_in", now);
   return { id, userId, createdAt, expiresAt };
 }
 

@@ -1166,6 +1166,13 @@ export class VaultDO extends DurableObject {
         transcription_enabled: ent?.enabled ?? false,
         transcribe_minutes_limit: ent?.minutes_limit ?? 0,
         transcribe_minutes: this.usedMinutesThisMonth(),
+        /**
+         * Notes whose last write fell in the 24 hours before this read — the
+         * identity worker's daily ops line ("active vaults", "notes changed").
+         * A count only, never ids or content. One indexed range count
+         * (idx_notes_updated_ms). null if the count fails.
+         */
+        notes_changed_24h: this.notesChangedSince(Date.now() - 24 * 60 * 60 * 1000),
       };
     };
 
@@ -2107,6 +2114,16 @@ export class VaultDO extends DurableObject {
   // -------------------------------------------------------------------------
   // Voice transcription (cloud#56) — Workers AI provider + DO-alarm pipeline
   // -------------------------------------------------------------------------
+
+  /** COUNT of notes with updated_at_ms >= sinceMs (null on error — e.g. a pre-v26 schema). */
+  private notesChangedSince(sinceMs: number): number | null {
+    try {
+      const row = this.raw().exec("SELECT COUNT(*) AS n FROM notes WHERE updated_at_ms >= ?", sinceMs).one();
+      return Number(row.n);
+    } catch {
+      return null;
+    }
+  }
 
   /** Minutes used in the CURRENT UTC month (a stale month tag reads as 0 — the
    *  lazy monthly reset; the stored value is only zeroed on the next accrual). */
