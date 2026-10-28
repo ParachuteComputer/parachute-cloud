@@ -162,6 +162,13 @@ async function main() {
   console.log(`\nSmoke: identity=${IDENTITY}\n       vault=${VAULT} (name="${VAULT_NAME}")  marker=${MARKER}\n`);
   const { email, password } = readDevSecrets();
 
+  // The money switch (T-318). The door descriptor says which mode this deploy
+  // runs; an older deploy with no `billing_mode` is the paid-shaped one.
+  const OPEN_BETA =
+    ((await (await fetch(`${IDENTITY}/.well-known/parachute-account`)).json()) as { billing_mode?: string })
+      .billing_mode === "open_beta";
+  console.log(`  billing mode: ${OPEN_BETA ? "open_beta" : "paid"}\n`);
+
   // 0. Liveness — the endpoints the ops cron + external monitors watch.
   {
     const ih = await fetch(`${IDENTITY}/health`);
@@ -588,6 +595,20 @@ async function main() {
     // path (POST /console/plan, no Stripe). The Stripe "Add a card" affordance is
     // additive on top when billing is available (mock buttons on staging today,
     // real Upgrade once keys land).
+    if (OPEN_BETA) {
+      // OPEN BETA: one money story, no clock, no grid, no Upgrade, no code box.
+      assert(
+        conHtml.includes('data-testid="open-beta-story"') &&
+          conHtml.includes("Free during the open beta.") &&
+          !conHtml.includes('data-testid="trial-banner"') &&
+          !conHtml.includes("days left") &&
+          !conHtml.includes('data-testid="plan-card-') &&
+          !conHtml.includes("$1/mo") &&
+          !conHtml.includes('data-testid="promo-code"'),
+        "OPEN BETA: console shows the money story — no countdown, plan grid, prices or promo box",
+        "",
+      );
+    } else {
     assert(
       conHtml.includes('data-testid="trial-banner"') && conHtml.includes("days left"),
       "console shows the trial banner (mirrored tier + days left)",
@@ -604,6 +625,7 @@ async function main() {
       "console shows all four plan cards + prices + the free 'Choose this plan' path (no Stripe needed)",
       "",
     );
+    }
 
     // Trial vault-count: the trial includes 5 vaults, so a 2nd create SUCCEEDS
     // (the full paid experience during the trial).
@@ -1531,7 +1553,18 @@ async function main() {
   {
     const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
     const mockMode = conHtml.includes('action="/billing/mock-checkout"');
-    if (mockMode) {
+    if (OPEN_BETA) {
+      // OPEN BETA: Stripe is dormant even with keys — checkout 409s, the mock
+      // 404s, the webhook stays wired for existing subscriptions.
+      const probe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
+      const pj = (await probe.json()) as { error?: string };
+      assert(probe.status === 409 && pj.error === "billing_paused", "billing OPEN BETA: checkout → 409 billing_paused", `status ${probe.status}`);
+      const mock = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
+      assert(mock.status === 404, "billing OPEN BETA: the mock endpoint 404s", `status ${mock.status}`);
+      const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
+      assert(webhook.status === 400 || webhook.status === 503, "billing OPEN BETA: webhook still answers (unsigned → 400)", `status ${webhook.status}`);
+      assert(!conHtml.includes('data-testid="upgrade-billing"'), "billing OPEN BETA: no Upgrade buttons on the console");
+    } else if (mockMode) {
       // The real checkout route stays config-gated (503) even in mock mode; the
       // mock is a SEPARATE endpoint.
       const realProbe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
@@ -1578,7 +1611,9 @@ async function main() {
   //      landing's caps FLIP to Power (1 GiB notes + 50 GiB attach = 51 GiB), and
   //      the trial clock is unchanged. Then change to standard and assert the
   //      caps flip again — proving the free tier-change re-pushes entitlements.
-  try {
+  //      OPEN BETA: there is no tier to pick — skipped (the picker refuses
+  //      with plan_err=paused, pinned in test/open-beta).
+  if (!OPEN_BETA) try {
     const tEmail = `tier-${Date.now()}@smoke.test`;
     const tPass = b64url(crypto.getRandomValues(new Uint8Array(18)));
     const tVault = `tierbox-${Date.now()}`;

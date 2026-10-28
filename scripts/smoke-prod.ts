@@ -333,14 +333,27 @@ async function main() {
     assert(admin.status === 404, "PRODUCTION: unauthenticated /admin → 404 (surface hidden)", `status ${admin.status}`);
   }
 
-  // 3d. Billing (Wave 4d) — state-adaptive, all state-free probes. NOT
+  // 3d. Billing (Wave 4d) — state-adaptive, all state-free probes. OPEN BETA
+  //     (T-318, the default): checkout answers 409 billing_paused. NOT
   //     CONFIGURED (until the Stripe keys land): /billing/* answers the clean
   //     503. CONFIGURED: anonymous checkout redirects to /login and an
   //     unsigned webhook is refused 400. Either state is a pass; the detail
   //     names which one this deploy is in.
   {
     const probe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
-    if (probe.status === 503) {
+    if (probe.status === 409) {
+      // OPEN BETA (T-318, BILLING_MODE unset/open_beta): checkout is paused
+      // even with Stripe keys present; the webhook stays live so any existing
+      // subscription still reconciles (an unsigned one is refused 400).
+      const body = (await probe.json()) as { error?: string };
+      assert(body.error === "billing_paused", "billing: OPEN BETA — checkout answers 409 billing_paused", String(body.error));
+      const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
+      assert(
+        webhook.status === 400 || webhook.status === 503,
+        "billing: OPEN BETA — the webhook stays wired (unsigned → 400; 503 only if keys are absent)",
+        `status ${webhook.status}`,
+      );
+    } else if (probe.status === 503) {
       const body = (await probe.json()) as { error?: string };
       assert(body.error === "billing_not_configured", "billing: NOT CONFIGURED — checkout answers the clean 503", String(body.error));
       const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
