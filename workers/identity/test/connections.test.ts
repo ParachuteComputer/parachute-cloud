@@ -252,6 +252,78 @@ describe("DELETE /account/vaults/<name>/connections/<client_id> — Disconnect",
     expect(live?.n).toBe(0);
   });
 
+  test("a code exchange in flight when Disconnect commits does not leave a live token (Codex T-318 P1)", async () => {
+    const { userId, vault, sessionId } = await setup("codex-p1");
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const scope = `vault:${vault}:read vault:${vault}:write`;
+    await connect(clientId, sessionId, scope);
+    const admin = await accountBearer(userId, "admin");
+    // A second authorization: get a fresh code through the real consent POST.
+    const { verifier, challenge } = await makePkce();
+    const fields = {
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "s2",
+    };
+    const consent = await worker.fetch(consentReq(fields, { sessionId }), env);
+    const code = new URL(bridgeTarget(await consent.text())!).searchParams.get("code")!;
+    // The Disconnect commits right after the code is stamped used, before the
+    // token row is inserted.
+    let raced = false;
+    const racingDb = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            const stmt = target.prepare(sql);
+            if (raced || !sql.startsWith("UPDATE auth_codes SET used_at")) return stmt;
+            return {
+              bind: (...args: unknown[]) => {
+                const bound = stmt.bind(...args);
+                return {
+                  run: async () => {
+                    const r = await bound.run();
+                    raced = true;
+                    const dc = await api("DELETE", `/account/vaults/${vault}/connections/${clientId}`, admin);
+                    expect(dc.status).toBe(200);
+                    return r;
+                  },
+                };
+              },
+            };
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    const tok = await worker.fetch(
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: verifier,
+          redirect_uri: REDIRECT_URI,
+          client_id: clientId,
+        }),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      { ...env, DB: racingDb },
+    );
+    expect(raced).toBe(true);
+    expect(tok.status).toBe(400);
+    const live = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM tokens WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL",
+    )
+      .bind(userId, clientId)
+      .first<{ n: number }>();
+    expect(live?.n).toBe(0);
+  });
+
   test("disconnecting from one vault leaves the same app's access to another vault working", async () => {
     const { userId, vault, other, sessionId } = await setup("two");
     const { clientId } = await seedApprovedClient({ clientName: "Claude" });

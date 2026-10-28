@@ -31,7 +31,7 @@
  *      — which the vault worker's scope-guard re-reads at most every 60 s
  *      (REVOCATION_CACHE_TTL_MS) and fails closed on. A disconnected app is
  *      refused at the vault within about a minute, not after its token runs out;
- *   3. any unredeemed auth code for this client + user that reaches this vault
+ *   3. any auth code (redeemed or not) for this client + user that reaches this vault
  *      is deleted, so a code minted just before the click can't be spent after.
  */
 import { parseComposedAccountScope } from "@openparachute/door-contract";
@@ -273,11 +273,13 @@ export async function disconnectVaultClient(
       .bind(nowIso, userId, clientId, nowIso, ...tokenBinds),
   );
 
-  // 3. Unredeemed auth codes that reach this vault — a code minted just
-  //    before the click can't be spent after it.
+  // 3. Auth codes that reach this vault, redeemed or not — a code minted just
+  //    before the click can't be spent after it, and an exchange in flight
+  //    (code stamped, token not yet inserted) sees its code gone and revokes
+  //    its own token (oauth-token.ts fence).
   stmts.push(
     db
-      .prepare(`DELETE FROM auth_codes WHERE user_id = ? AND client_id = ? AND used_at IS NULL${tokenFilter}`)
+      .prepare(`DELETE FROM auth_codes WHERE user_id = ? AND client_id = ?${tokenFilter}`)
       .bind(userId, clientId, ...tokenBinds),
   );
 
