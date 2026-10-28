@@ -198,6 +198,19 @@ type VaultConfigState = {
   frozen?: boolean;
   /** Voice entitlement (plan-pushed via PUT /api/internal/config). */
   transcription?: TranscriptionEntitlement;
+  /**
+   * The OWNER'S ACCOUNT IS CLOSED (account deletion requested — T-318).
+   * Pushed `true` by the identity worker the moment a delete is requested and
+   * `false` on undo (every entitlement push also re-asserts `false`, since
+   * every caller of that seam acts on a live account). While set, every
+   * TENANT request is refused 401 `account_closed` — including stateless
+   * vault tokens minted before the request, which carry no registry row the
+   * revocation list could name. Only the platform's own `/api/internal/*`
+   * calls (first-party mint / operator bearer) still pass, so the sweep can
+   * destroy and undo can re-open. Data is untouched: this is a lock, not an
+   * erase.
+   */
+  closed?: boolean;
 };
 
 /** DO-storage keys for the monthly voice-minutes meter (the r2_bytes pattern):
@@ -590,6 +603,23 @@ export class VaultDO extends DurableObject {
       if (destroyForbidden) return destroyForbidden;
       return this.handleDestroy(request, vaultName);
     }
+    // STAGING/DEV-ONLY purge probe (T-318 delete proof) — GET
+    // /vault/<name>/__test/purge-check. Dispatched BEFORE ensureState for the
+    // same reason destroy is: probing a destroyed vault must not be the thing
+    // that re-persists a default config into it. Reports counts only (never
+    // content): rows per SQLite table, DO key-value keys, the alarm, and the
+    // R2 objects under `vault-<name>/`. 404 everywhere off the dev allowlist
+    // (production included — pinned by smoke-prod). No auth: same posture as
+    // the other staging hooks; it exposes numbers, not notes.
+    if (rest === "/__test/purge-check") {
+      const envName = this.env.ENVIRONMENT;
+      if (envName !== "staging" && envName !== "development" && envName !== "test") {
+        return json({ error: "Not found" }, 404);
+      }
+      if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+      return json(await this.purgeCheck(vaultName));
+    }
+
     // Every OTHER route on an already-destroyed warm instance: 410, no
     // writes, no ensureState (the same resurrection concern as above).
     if (this.destroyed) {
@@ -631,6 +661,20 @@ export class VaultDO extends DurableObject {
       if (this.env.ENVIRONMENT !== "staging") return json({ error: "Not found" }, 404);
       if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
       return this.handleEmbedRun();
+    }
+
+    // ACCOUNT CLOSED (T-318): the owner asked to delete their account. Every
+    // tenant door — tickets, MCP, the landing, REST, SSE, the WS upgrade —
+    // answers 401 from here on, whatever credential it carries. This is the
+    // lever that makes a stateless 15-minute vault token stop working at
+    // REQUEST time rather than at expiry. `/api/internal/*` stays reachable
+    // (its own first-party/operator gate still applies) so the purge sweep
+    // can destroy and an undo can re-open.
+    if (this.config?.closed === true && !rest.startsWith("/api/internal/")) {
+      return json(
+        { error: "Unauthorized", error_type: "account_closed", message: "This account has been closed." },
+        401,
+      );
     }
 
     // Attachment ticket spend (attachment-tickets design, Wave 1 DO mirror) —
@@ -1138,6 +1182,8 @@ export class VaultDO extends DurableObject {
         caps: caps ?? null,
         /** The expired floor — writes return 402 plan_required. */
         frozen: this.isFrozen(),
+        /** The owner's account is closed (delete requested) — tenants get 401. */
+        closed: this.config!.closed === true,
         /** The effective SUMMED cap (two-meter sum → legacy → env → 1 GiB). */
         resolved_cap_bytes: this.capBytes(),
         used_bytes: usedBytes(dbBytes, this.r2Bytes),
@@ -1163,13 +1209,14 @@ export class VaultDO extends DurableObject {
     if (request.method === "GET") return json(shape());
     if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
 
-    let body: { cap_bytes?: unknown; caps?: unknown; frozen?: unknown; transcription?: unknown };
+    let body: { cap_bytes?: unknown; caps?: unknown; frozen?: unknown; transcription?: unknown; closed?: unknown };
     try {
       body = (await request.json()) as {
         cap_bytes?: unknown;
         caps?: unknown;
         frozen?: unknown;
         transcription?: unknown;
+        closed?: unknown;
       };
     } catch {
       return json({ error: "Invalid JSON body" }, 400);
@@ -1182,8 +1229,12 @@ export class VaultDO extends DurableObject {
     const hasCaps = body.caps !== undefined;
     const hasFrozen = body.frozen !== undefined;
     const hasTranscription = body.transcription !== undefined;
-    if (!hasCap && !hasCaps && !hasFrozen && !hasTranscription) {
-      return json({ error: "provide caps, cap_bytes, frozen, and/or transcription" }, 400);
+    const hasClosed = body.closed !== undefined;
+    if (!hasCap && !hasCaps && !hasFrozen && !hasTranscription && !hasClosed) {
+      return json({ error: "provide caps, cap_bytes, frozen, transcription, and/or closed" }, 400);
+    }
+    if (hasClosed && typeof body.closed !== "boolean") {
+      return json({ error: "closed must be a boolean" }, 400);
     }
 
     if (hasCaps) {
@@ -1211,7 +1262,21 @@ export class VaultDO extends DurableObject {
       this.config!.transcription = ent.value;
     }
 
+    const closing = hasClosed && body.closed === true && this.config!.closed !== true;
+    if (hasClosed) {
+      if (body.closed === true) this.config!.closed = true;
+      else delete this.config!.closed;
+    }
+
     await this.ctx.storage.put("config", this.config);
+    if (closing) {
+      // Live streams authed BEFORE the close must end now too, not at their
+      // next wake: close every WS (4401, the binding's unauthorized code) and
+      // end every SSE stream. The manager re-attaches its hooks lazily on the
+      // next register, so a later re-open needs nothing special.
+      for (const ws of this.ctx.getWebSockets()) this.closeWs(ws, 4401, "account closed");
+      this.subManager.shutdown();
+    }
     return json(shape());
   }
 
@@ -1616,6 +1681,64 @@ export class VaultDO extends DurableObject {
 
     console.log(`[destroy ${vaultName}] r2_objects_deleted=${deleted}`);
     return json({ destroyed: true, r2_objects_deleted: deleted });
+  }
+
+  /**
+   * Counts for the staging purge probe (`/__test/purge-check`). Row counts per
+   * SQLite table (core's schema is re-created empty on any cold wake, so a
+   * destroyed vault and a never-created one both show the schema with zero
+   * user rows — compare against a never-created name, not against "no
+   * tables"), the DO key-value keys, the alarm, and the R2 objects under the
+   * vault's prefix. Numbers only, never content.
+   */
+  private async purgeCheck(vaultName: string): Promise<{
+    vault: string;
+    destroyed_flag: boolean;
+    sql_tables: Record<string, number>;
+    sql_rows_total: number;
+    kv_keys: string[];
+    alarm: number | null;
+    r2_prefix: string;
+    r2_objects: number;
+  }> {
+    const tables = this.raw()
+      .exec<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY name",
+      )
+      .toArray();
+    const sqlTables: Record<string, number> = {};
+    let total = 0;
+    for (const { name } of tables) {
+      // FTS shadow tables etc. can refuse a plain COUNT on some builds; a
+      // table we can't count is reported as -1 rather than hidden.
+      try {
+        const row = this.raw().exec<{ n: number }>(`SELECT COUNT(*) AS n FROM "${name.replace(/"/g, '""')}"`).one();
+        sqlTables[name] = row.n;
+        total += row.n;
+      } catch {
+        sqlTables[name] = -1;
+      }
+    }
+    const kvKeys = [...(await this.ctx.storage.list({ limit: 1000 })).keys()];
+    const alarm = await this.ctx.storage.getAlarm();
+    const prefix = `vault-${vaultName}/`;
+    let r2Objects = 0;
+    let cursor: string | undefined;
+    do {
+      const page = await this.env.ATTACHMENTS.list({ prefix, ...(cursor ? { cursor } : {}) });
+      r2Objects += page.objects.length;
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    return {
+      vault: vaultName,
+      destroyed_flag: this.destroyed,
+      sql_tables: sqlTables,
+      sql_rows_total: total,
+      kv_keys: kvKeys,
+      alarm,
+      r2_prefix: prefix,
+      r2_objects: r2Objects,
+    };
   }
 
   private importTooLargeResponse(): Response {
