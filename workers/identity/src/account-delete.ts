@@ -58,8 +58,12 @@ import { deleteSessionsForUser } from "./sessions.ts";
 import { raiseOpsAlert } from "./ops-alerts.ts";
 import { makeStripe } from "./stripe-client.ts";
 import { type User, getUserById } from "./users.ts";
-import { applyPlanToVaults, callVaultDestroy, readDestroyOutcome } from "./vault-call.ts";
+import { applyPlanToVaults, callVaultDestroy, pushVaultsClosed, readDestroyOutcome } from "./vault-call.ts";
 import { deleteVaultD1Rows, listVaultsForOwner } from "./vaults.ts";
+import { type AuditActor, auditStatement, recordAudit } from "./account-audit.ts";
+import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
+import { frontDoorOrigin, htmlResponse, isSameOriginRequest, resolveBoundOrigins } from "./oauth-shared.ts";
+import { renderUndoConfirm, renderUndoDone, renderUndoProblem } from "./account-delete-ui.ts";
 
 /** The ratified undo window: 24 hours from the delete REQUEST (`deleted_at`). */
 export const DELETE_UNDO_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -154,8 +158,7 @@ export async function handleAccountDelete(
   const user = auth.user;
 
   const body = await readJsonBody(req);
-  const confirm = typeof body.confirm === "string" ? body.confirm.trim().toLowerCase() : null;
-  if (confirm === null || confirm !== user.email.trim().toLowerCase()) {
+  if (!confirmMatchesEmail(body.confirm, user.email)) {
     return deleteError(
       400,
       "confirm_mismatch",
@@ -163,11 +166,68 @@ export async function handleAccountDelete(
     );
   }
 
+  const outcome = await requestAccountDeletion(env, deps, user, { sender, overrides, actor: "self" });
+  if (!outcome.ok) return deleteError(outcome.status, outcome.error, outcome.message);
+  return jsonResponse(
+    {
+      deleted: true,
+      deleted_at: outcome.deletedAt,
+      undo_expires_at: outcome.undoExpiresAt,
+      undo_token: outcome.undoToken,
+      undo_url: outcome.undoUrl,
+      notice_sent: outcome.noticeSent,
+    },
+    200,
+    { "cache-control": "no-store" },
+  );
+}
+
+/** The retype guard, shared by the API and the operator action: trimmed,
+ *  case-insensitive equality with the account email. */
+export function confirmMatchesEmail(confirm: unknown, email: string): boolean {
+  return typeof confirm === "string" && confirm.trim().toLowerCase() === email.trim().toLowerCase();
+}
+
+export type DeletionRequestOutcome =
+  | {
+      ok: true;
+      deletedAt: string;
+      undoExpiresAt: string;
+      undoToken: string;
+      undoUrl: string;
+      noticeSent: boolean;
+      vaultsLocked: number;
+      vaultsLockFailed: number;
+    }
+  | { ok: false; status: number; error: string; message: string };
+
+/**
+ * The delete REQUEST, after the caller is authenticated and the retype guard
+ * has passed — the ONE path both the account holder (`handleAccountDelete`)
+ * and the operator action for an emailed request (admin.ts) drive, so an
+ * operator-filed deletion gets exactly the same hold, tombstone, severance,
+ * vault lock, 24-hour undo window and notice email as a self-service one.
+ * `actor` only changes the audit row and the log line.
+ */
+export async function requestAccountDeletion(
+  env: Env,
+  deps: OAuthDeps,
+  user: User,
+  opts: { sender?: EmailSender; overrides?: BillingOverrides; actor: AuditActor },
+): Promise<DeletionRequestOutcome> {
+  const { sender, overrides, actor } = opts;
+  const fail = (status: number, error: string, message: string): DeletionRequestOutcome => ({
+    ok: false,
+    status,
+    error,
+    message,
+  });
+
   // 1. The reversible hold, before anything durable.
   const stripe = stripeFor(env, overrides);
   if (user.stripeSubscriptionId !== null) {
     if (!stripe) {
-      return deleteError(
+      return fail(
         503,
         "billing_not_configured",
         "This account has a subscription but billing is not configured here, so the hold that stops new charges cannot be placed. Deletion was not started.",
@@ -179,7 +239,7 @@ export async function handleAccountDelete(
       console.error(
         `event=account_delete_hold_failed user=${user.id} error=${err instanceof Error ? err.message : String(err)}`,
       );
-      return deleteError(
+      return fail(
         502,
         "billing_hold_failed",
         "Billing could not be paused, so deletion was not started. Nothing changed; retry the request.",
@@ -244,7 +304,7 @@ export async function handleAccountDelete(
         });
       }
     }
-    return deleteError(
+    return fail(
       500,
       "delete_request_failed",
       "The deletion could not be recorded. Nothing was deleted; retry the request.",
@@ -254,7 +314,7 @@ export async function handleAccountDelete(
     // requireAccount already refuses a tombstoned account, so reaching here
     // means a concurrent request won the race — report it rather than minting
     // a second undo token that would silently orphan the first.
-    return deleteError(409, "already_deleting", "This account is already scheduled for deletion.");
+    return fail(409, "already_deleting", "This account is already scheduled for deletion.");
   }
 
   // 3. Sever the credentials that exist right now (belt — see the doc above).
@@ -267,6 +327,26 @@ export async function handleAccountDelete(
   } catch (err) {
     console.error(
       `event=account_delete_severance_incomplete user=${user.id} error=${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // 3b. Lock every owned vault (T-318). The tombstone already stops every
+  //     identity-side credential, but the vault tokens this worker hands out
+  //     are STATELESS (15-minute JWTs with no registry row), so neither the
+  //     tombstone nor the token revocation above reaches them — before this,
+  //     a deleted account's vault stayed readable and writable until those
+  //     tokens expired. The DO refuses every tenant request while locked;
+  //     undo unlocks it. Best-effort for the same reason step 3 is.
+  let vaultsLocked = 0;
+  let vaultsLockFailed = 0;
+  try {
+    for (const r of await pushVaultsClosed(env.DB, deps, user.id, true)) {
+      if (r.ok) vaultsLocked++;
+      else vaultsLockFailed++;
+    }
+  } catch (err) {
+    console.error(
+      `event=account_delete_vault_lock_failed user=${user.id} error=${err instanceof Error ? err.message : String(err)}`,
     );
   }
 
@@ -313,39 +393,94 @@ export async function handleAccountDelete(
     }
   }
 
-  console.log(`event=account_delete_requested user=${user.id} purge_at=${purgeAt.toISOString()} notice_sent=${noticeSent}`);
-  return jsonResponse(
-    {
-      deleted: true,
-      deleted_at: nowIso,
-      undo_expires_at: purgeAt.toISOString(),
-      undo_token: undoToken,
-      undo_url: undoUrl,
-      notice_sent: noticeSent,
-    },
-    200,
-    { "cache-control": "no-store" },
+  await recordAudit(env.DB, {
+    actor,
+    action: "delete_requested",
+    userId: user.id,
+    note: { notice_sent: noticeSent, vaults_locked: vaultsLocked, vaults_lock_failed: vaultsLockFailed },
+    now,
+  });
+  console.log(
+    `event=account_delete_requested user=${user.id} actor=${actor} purge_at=${purgeAt.toISOString()} notice_sent=${noticeSent} vaults_locked=${vaultsLocked} vaults_lock_failed=${vaultsLockFailed}`,
   );
+  return {
+    ok: true,
+    deletedAt: nowIso,
+    undoExpiresAt: purgeAt.toISOString(),
+    undoToken,
+    undoUrl,
+    noticeSent,
+    vaultsLocked,
+    vaultsLockFailed,
+  };
 }
 
 // --- A-3b: /account/undo-delete — the way back, inside the window ------------
 
-/** The one neutral answer for every unusable token — see the module note. */
-function invalidUndoToken(): Response {
-  return deleteError(400, "invalid_undo_token", "That restore link is not valid.");
-}
+/** Why an undo token cannot be used, in the module's no-oracle vocabulary. */
+type UndoRefusal = { ok: false; status: number; error: string; message: string };
+
+const UNDO_INVALID: UndoRefusal = {
+  ok: false,
+  status: 400,
+  error: "invalid_undo_token",
+  message: "That restore link is not valid.",
+};
+const UNDO_EXPIRED: UndoRefusal = {
+  ok: false,
+  status: 410,
+  error: "undo_window_expired",
+  message: "The 24-hour window to restore this account has passed and its data has been deleted.",
+};
 
 /**
- * Restore an account inside its undo window. Authenticated by the mailed token
- * ALONE — no session, no bearer — because A-1 refuses both for a tombstoned
- * account, so any other credential would make undo structurally impossible.
- *
- * Answers both GET (`?token=` — the link in the notice email, so a click
- * restores) and POST (`{ "token": ... }` — API clients). A GET that mutates is
- * a deliberate exception, on the same footing as the magic-link consume: the
- * token is single-use and unguessable, and the mutation is the RESTORING
- * direction, so a stray prefetch can only ever un-delete something the account
- * holder asked to be able to un-delete.
+ * Resolve a raw undo token to the account it can restore, or the refusal.
+ * READ-ONLY — the shared first half of the preview (GET) and the restore
+ * (POST), so the page a person sees and the action they take agree on
+ * validity by construction.
+ */
+async function resolveUndoToken(
+  env: Env,
+  deps: OAuthDeps,
+  raw: string | null,
+): Promise<{ ok: true; user: User; expiresAt: string } | UndoRefusal> {
+  if (!raw) return UNDO_INVALID;
+  const hash = await sha256Hex(raw);
+  const row = await env.DB
+    .prepare("SELECT id FROM users WHERE delete_undo_hash = ?")
+    .bind(hash)
+    .first<{ id: string }>();
+  if (!row) return UNDO_INVALID;
+  const user = await getUserById(env.DB, row.id);
+  if (!user || user.deletedAt === null) return UNDO_INVALID;
+
+  const now = deps.now?.() ?? new Date();
+  const requestedAtMs = Date.parse(user.deletedAt);
+  // An unparseable timestamp is corruption, not an open window — refuse to
+  // treat it as restorable rather than guessing which side of the line it's on.
+  if (!Number.isFinite(requestedAtMs) || now.getTime() - requestedAtMs >= DELETE_UNDO_WINDOW_MS) {
+    return UNDO_EXPIRED;
+  }
+
+  // cloud#248: the clock said the window is open; the SWEEP may already have
+  // said otherwise. Its claim is authoritative over both our clock and its own
+  // — once it is set, irreversible teardown has begun and there is nothing
+  // left to restore. 410, not the neutral 400: reaching it requires having
+  // held the real, unspent token for an account whose window has in fact
+  // closed, so it tells that holder nothing they did not already have (the
+  // module's stated no-oracle exception).
+  if (user.deletePurgeClaimedAt !== null) {
+    console.log(`event=account_undo_lost_to_purge user=${user.id} claimed_at=${user.deletePurgeClaimedAt}`);
+    return UNDO_EXPIRED;
+  }
+  return { ok: true, user, expiresAt: new Date(requestedAtMs + DELETE_UNDO_WINDOW_MS).toISOString() };
+}
+
+type RestoreOutcome = { ok: true; billingResumed: boolean; billingNote: "already_canceled" | null } | UndoRefusal;
+
+/**
+ * Restore an account inside its undo window — the mutation, reached ONLY by a
+ * POST (T-318: a GET never mutates, because mail link scanners prefetch).
  *
  * The tombstone-clear CAS is the atomic winner BEFORE billing resumes. That
  * ordering is load-bearing: if Stripe ran first, the sweep could claim during
@@ -353,102 +488,47 @@ function invalidUndoToken(): Response {
  * Stripe failure compensates by restoring the original tombstone + undo token,
  * so the account remains honestly deleted and the same link can retry.
  * After the tombstone clears, current plan entitlement is pushed to owned
- * vaults (cloud#234): Stripe webhooks during the window recorded D1 but
- * skipped the DO wake, so restore — not the webhook — is what applies caps.
- * A hard Stripe failure leaves the tombstone in place and the window still
- * open — retryable, and the account stays honestly deleted meanwhile rather
- * than half-restored.
+ * vaults (cloud#234), and that same push re-opens the vault lock the delete
+ * request set (`applyPlanToVaults(..., { reopen: true })` adds `closed: false`).
  *
  * The one case that cannot be undone is reported, not hidden: if the billing
  * period boundary passed during the window, Stripe already canceled for real
  * and there is no un-cancel ({@link resumeBilling}'s `already_canceled`). The
- * account still restores — the user's data is theirs regardless — but the
- * response says billing did not come back, so a caller can say so plainly
- * instead of leaving them to discover it on a failed feature.
+ * account still restores, and the result says billing did not come back.
  *
  * Sessions are NOT restored (they were deleted, not tombstoned): a restored
  * user signs in again. That is the safe direction and it costs one magic link.
  */
-export async function handleAccountDeleteUndo(
+async function restoreAccount(
   env: Env,
-  req: Request,
   deps: OAuthDeps,
+  raw: string | null,
   overrides?: BillingOverrides,
-): Promise<Response> {
-  let raw: string | null = null;
-  if (req.method === "GET") {
-    raw = new URL(req.url).searchParams.get("token");
-  } else {
-    const body = await readJsonBody(req);
-    raw = typeof body.token === "string" ? body.token : null;
-  }
-  if (!raw) return invalidUndoToken();
-
-  const hash = await sha256Hex(raw);
-  const row = await env.DB
-    .prepare("SELECT id FROM users WHERE delete_undo_hash = ?")
-    .bind(hash)
-    .first<{ id: string }>();
-  if (!row) return invalidUndoToken();
-  const user = await getUserById(env.DB, row.id);
-  if (!user || user.deletedAt === null) return invalidUndoToken();
-
-  const now = deps.now?.() ?? new Date();
-  const requestedAtMs = Date.parse(user.deletedAt);
-  // An unparseable timestamp is corruption, not an open window — refuse to
-  // treat it as restorable rather than guessing which side of the line it's on.
-  if (!Number.isFinite(requestedAtMs) || now.getTime() - requestedAtMs >= DELETE_UNDO_WINDOW_MS) {
-    return deleteError(
-      410,
-      "undo_window_expired",
-      "The 24-hour window to restore this account has passed and its data has been deleted.",
-    );
-  }
-
-  // cloud#248: the clock said the window is open; the SWEEP may already have
-  // said otherwise. Its claim is authoritative over both our clock and its own
-  // — once it is set, irreversible teardown has begun and there is nothing
-  // left to restore. Checked HERE, before Stripe, so a losing undo does not
-  // un-cancel a subscription for an account that is being torn down; the CAS
-  // below is still the authority, this is only the fast path. `user` was read
-  // one statement ago, so this costs no extra query.
-  //
-  // 410, not the neutral 400, and it is the SAME 410 the clock check above
-  // returns. Reaching it requires having held the real, unspent token for an
-  // account whose window has in fact closed, so it tells that holder nothing
-  // they did not already have — and it is the one thing they need to hear.
-  // "Not valid" would send someone whose data is being deleted off to re-click
-  // a link that can never work again. That is the module's stated no-oracle
-  // exception, exercised for exactly the case it was written for.
-  if (user.deletePurgeClaimedAt !== null) {
-    console.log(`event=account_undo_lost_to_purge user=${user.id} claimed_at=${user.deletePurgeClaimedAt}`);
-    return deleteError(
-      410,
-      "undo_window_expired",
-      "The 24-hour window to restore this account has passed and its data has been deleted.",
-    );
-  }
+): Promise<RestoreOutcome> {
+  const resolved = await resolveUndoToken(env, deps, raw);
+  if (!resolved.ok) return resolved;
+  const user = resolved.user;
 
   const stripe = stripeFor(env, overrides);
   if (user.stripeSubscriptionId !== null && !stripe) {
-    return deleteError(
-      503,
-      "billing_not_configured",
-      "Billing is not configured here, so this account's subscription cannot be resumed. The account was not restored; retry later.",
-    );
+    return {
+      ok: false,
+      status: 503,
+      error: "billing_not_configured",
+      message:
+        "Billing is not configured here, so this account's subscription cannot be resumed. The account was not restored; retry later.",
+    };
   }
 
   // THE ATOMIC WINNER. Clear the tombstone before any external side effect so
   // a sweep selected just before this line loses its exact-tombstone claim.
-  // The inverse ordering (Stripe first, CAS second) lets the sweep claim during
-  // the network await and purge an account whose subscription was just resumed.
   const res = await env.DB
     .prepare(
       "UPDATE users SET deleted_at = NULL, delete_undo_hash = NULL, delete_notice_sent_at = NULL WHERE id = ? AND deleted_at = ? AND delete_undo_hash = ? AND delete_purge_claimed_at IS NULL",
     )
     .bind(user.id, user.deletedAt, user.deleteUndoHash)
     .run();
-  if ((res.meta.changes ?? 0) === 0) return invalidUndoToken();
+  if ((res.meta.changes ?? 0) === 0) return UNDO_INVALID;
 
   let billingResumed = true;
   let billingNote: "already_canceled" | null = null;
@@ -471,45 +551,186 @@ export async function handleAccountDeleteUndo(
         .run();
       if ((rollback.meta.changes ?? 0) === 0) {
         console.error(`event=account_undo_rollback_failed user=${user.id}`);
-        return deleteError(
-          500,
-          "undo_rollback_failed",
-          "Billing could not be resumed and the account restore could not be rolled back safely. Support has been notified.",
-        );
+        return {
+          ok: false,
+          status: 500,
+          error: "undo_rollback_failed",
+          message:
+            "Billing could not be resumed and the account restore could not be rolled back safely. Support has been notified.",
+        };
       }
       console.error(
         `event=account_undo_billing_failed user=${user.id} error=${err instanceof Error ? err.message : String(err)}`,
       );
-      return deleteError(
-        502,
-        "billing_resume_failed",
-        "Billing could not be resumed, so the account was not restored. Nothing changed; retry the request.",
-      );
+      return {
+        ok: false,
+        status: 502,
+        error: "billing_resume_failed",
+        message: "Billing could not be resumed, so the account was not restored. Nothing changed; retry the request.",
+      };
     }
   }
 
-  // cloud#234: Stripe webhooks during the window recorded D1 (plan /
-  // subscription ids) but skipped the vault-DO cap push so they would not
-  // wake a tombstoned owner. Re-apply now that the tombstone is gone. Best
-  // effort — a missed push self-heals via the entitlement reconciler; failing
-  // undo over a cap hiccup would strand a restored account behind a 5xx.
-  const capResults = await applyPlanToVaults(env.DB, deps, user.id);
+  // cloud#234 + T-318: re-apply plan entitlement now that the tombstone is
+  // gone — and with it `closed: false`, which unlocks the vaults the delete
+  // request locked. Best effort; a vault whose push failed gets one more,
+  // lock-only attempt, and after that an operator plan set in /admin/users
+  // (which also re-opens) fixes it. Failing undo over it would strand a
+  // restored account behind a 5xx.
+  const capResults = await applyPlanToVaults(env.DB, deps, user.id, { reopen: true });
   const capFailed = capResults.filter((r) => !r.ok);
   if (capFailed.length > 0) {
     console.warn(
       `event=account_undo_plan_push_partial user=${user.id} failed=${capFailed.map((f) => f.vault).join(",")}`,
     );
+    await pushVaultsClosed(env.DB, deps, user.id, false).catch(() => []);
   }
 
+  await recordAudit(env.DB, {
+    actor: "self",
+    action: "delete_undone",
+    userId: user.id,
+    note: { billing_resumed: billingResumed, vaults: capResults.length },
+    now: deps.now?.() ?? new Date(),
+  });
   console.log(`event=account_delete_undone user=${user.id} billing_resumed=${billingResumed} vaults=${capResults.length}`);
-  return jsonResponse(
-    {
-      restored: true,
-      billing_resumed: billingResumed,
-      ...(billingNote ? { billing_note: billingNote } : {}),
-    },
-    200,
-    { "cache-control": "no-store" },
+  return { ok: true, billingResumed, billingNote };
+}
+
+/** Does this request want the JSON API rather than a page? */
+function wantsJson(req: Request): boolean {
+  const ct = (req.headers.get("content-type") ?? "").toLowerCase();
+  if (req.method === "POST") return ct.includes("application/json");
+  const accept = (req.headers.get("accept") ?? "").toLowerCase();
+  return accept.includes("application/json") && !accept.includes("text/html");
+}
+
+const NO_STORE = { "cache-control": "no-store" };
+
+/**
+ * `/account/undo-delete` — the way back, inside the window. Authenticated by
+ * the mailed token ALONE — no session, no bearer — because A-1 refuses both
+ * for a tombstoned account, so any other credential would make undo
+ * structurally impossible.
+ *
+ * T-318 split it by verb, because mail link scanners PREFETCH:
+ *
+ *   - GET `?token=` (the link in the notice email) NEVER mutates. A browser
+ *     gets a calm page saying what will come back, with a "Restore my
+ *     account" button that POSTs the token; an API caller (`Accept:
+ *     application/json`) gets `{ restorable, undo_expires_at }`.
+ *   - POST with a JSON body `{ "token" }` is the API restore (the app),
+ *     answering the JSON shape it always has.
+ *   - POST from the page's form restores and renders the result page. It
+ *     carries the console's write boundary: the double-submit CSRF cookie the
+ *     GET set, plus a same-origin check against BOUND_ORIGINS.
+ *
+ * Every refusal keeps the module's no-oracle rule (one neutral 400 for every
+ * unusable token; the 410 only for a token that was real and is too late).
+ */
+export async function handleAccountDeleteUndo(
+  env: Env,
+  req: Request,
+  deps: OAuthDeps,
+  overrides?: BillingOverrides,
+): Promise<Response> {
+  const signInUrl = `${frontDoorOrigin(deps)}/`;
+  const json = wantsJson(req);
+
+  if (req.method === "GET") {
+    const raw = new URL(req.url).searchParams.get("token");
+    const resolved = await resolveUndoToken(env, deps, raw);
+    if (json) {
+      if (!resolved.ok) return deleteError(resolved.status, resolved.error, resolved.message);
+      return jsonResponse({ restorable: true, undo_expires_at: resolved.expiresAt }, 200, NO_STORE);
+    }
+    if (!resolved.ok) return undoProblemPage(resolved, signInUrl);
+    const vaults = await listVaultsForOwner(env.DB, resolved.user.id);
+    const csrf = ensureCsrfToken(req);
+    return htmlResponse(
+      renderUndoConfirm({
+        email: resolved.user.email,
+        vaultNames: vaults.map((v) => v.name),
+        deletedAt: resolved.user.deletedAt!,
+        expiresAt: resolved.expiresAt,
+        token: raw!,
+        csrfToken: csrf.token,
+        hasSubscription: resolved.user.stripeSubscriptionId !== null,
+      }),
+      200,
+      { ...NO_STORE, ...(csrf.setCookie ? { "set-cookie": csrf.setCookie } : {}) },
+    );
+  }
+
+  if (json) {
+    const body = await readJsonBody(req);
+    const outcome = await restoreAccount(env, deps, typeof body.token === "string" ? body.token : null, overrides);
+    if (!outcome.ok) return deleteError(outcome.status, outcome.error, outcome.message);
+    return jsonResponse(
+      {
+        restored: true,
+        billing_resumed: outcome.billingResumed,
+        ...(outcome.billingNote ? { billing_note: outcome.billingNote } : {}),
+      },
+      200,
+      NO_STORE,
+    );
+  }
+
+  // The page's form POST.
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch {
+    return undoProblemPage(UNDO_INVALID, signInUrl);
+  }
+  if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+    return htmlResponse(
+      renderUndoProblem({
+        title: "Please open the link again",
+        message:
+          "This page expired before the button was pressed, so nothing changed. Open the restore link from the email again and press the button once more.",
+        signInUrl,
+      }),
+      403,
+      NO_STORE,
+    );
+  }
+  const token = form.get("token");
+  const outcome = await restoreAccount(env, deps, typeof token === "string" ? token : null, overrides);
+  if (!outcome.ok) return undoProblemPage(outcome, signInUrl);
+  return htmlResponse(renderUndoDone({ signInUrl, billingResumed: outcome.billingResumed }), 200, NO_STORE);
+}
+
+function undoProblemPage(refusal: UndoRefusal, signInUrl: string): Response {
+  if (refusal.error === "invalid_undo_token") {
+    return htmlResponse(
+      renderUndoProblem({
+        title: "This restore link doesn't work",
+        message:
+          "It may have been used already, or copied only in part. If you already restored your account, just sign in.",
+        signInUrl,
+      }),
+      400,
+      NO_STORE,
+    );
+  }
+  if (refusal.error === "undo_window_expired") {
+    return htmlResponse(
+      renderUndoProblem({
+        title: "The restore window has closed",
+        message:
+          "The 24 hours to restore this account have passed, and its vaults and everything in them have been erased. You're welcome to start a new account any time.",
+        signInUrl,
+      }),
+      410,
+      NO_STORE,
+    );
+  }
+  return htmlResponse(
+    renderUndoProblem({ title: "Your account wasn't restored yet", message: refusal.message, signInUrl }),
+    refusal.status,
+    NO_STORE,
   );
 }
 
@@ -673,21 +894,38 @@ export interface AccountDeleteSweepSummary {
  * them here too would let a vault whose DO destroy FAILED lose its ownership
  * row anyway, which is precisely how orphaned, still-billed storage is made.
  */
-async function purgeAccountRows(db: D1Database, userId: string): Promise<void> {
+async function purgeAccountRows(
+  db: D1Database,
+  user: Pick<User, "id" | "email">,
+  audit: D1PreparedStatement,
+): Promise<void> {
+  const userId = user.id;
+  const email = user.email.trim().toLowerCase();
   await db.batch([
     db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM tokens WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM grants WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM auth_codes WHERE user_id = ?").bind(userId),
-    db.prepare("DELETE FROM magic_links WHERE user_id = ?").bind(userId),
+    // T-318: by EMAIL too. A sign-up link is minted before the account exists,
+    // so it is stored with `user_id NULL` (auth-handlers.ts, magic-links.ts)
+    // and a `user_id`-only delete left the address behind forever.
+    db.prepare("DELETE FROM magic_links WHERE user_id = ? OR email = ?").bind(userId, email),
     db.prepare("DELETE FROM pending_logins WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM drip_sends WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM user_checklist WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM promo_redemptions WHERE user_id = ?").bind(userId),
+    // T-318: operator alert dedupe rows whose key names this account
+    // (`billing-hold-stuck:<id>`, `account-purge:<id>` — this module's own
+    // keys). Matched on the exact `:<id>` SUFFIX with substr, not LIKE: D1
+    // caps LIKE pattern length, and a UUID-bearing pattern exceeds it.
+    db.prepare("DELETE FROM ops_alerts WHERE substr(key, -?) = ?").bind(userId.length + 1, `:${userId}`),
     db
       .prepare("DELETE FROM owners WHERE kind = 'user' AND owner_id = (SELECT owner_id FROM users WHERE id = ?)")
       .bind(userId),
     db.prepare("DELETE FROM users WHERE id = ?").bind(userId),
+    // The record that this happened, in the same atomic batch as the erasure
+    // it describes (account-audit.ts — hashed target, counts only).
+    audit,
   ]);
 }
 
@@ -739,19 +977,23 @@ export async function runAccountDeleteSweep(
   env: Env,
   deps: OAuthDeps,
   now: Date = new Date(),
-  overrides?: BillingOverrides & { sender?: EmailSender },
+  overrides?: BillingOverrides & { sender?: EmailSender; onlyUserId?: string },
 ): Promise<AccountDeleteSweepSummary> {
   const cutoff = new Date(now.getTime() - DELETE_UNDO_WINDOW_MS).toISOString();
+  // `onlyUserId` scopes the pass to one account — the staging proof hook
+  // (`/__test/account-delete/sweep`) uses it so a test run never purges
+  // anyone else's expired account early. The cron never sets it.
+  const only = overrides?.onlyUserId;
   const res = await env.DB
     .prepare(
       // `deleted_at` rides along because the claim below CASes on its exact
       // value (cloud#248) — the tombstone this pass decided was expired must
       // be the same one it destroys against.
       `SELECT id, deleted_at FROM users
-       WHERE deleted_at IS NOT NULL AND deleted_at <= ?
+       WHERE deleted_at IS NOT NULL AND deleted_at <= ?${only !== undefined ? " AND id = ?" : ""}
        ORDER BY deleted_at ASC LIMIT ?`,
     )
-    .bind(cutoff, ACCOUNT_DELETE_SWEEP_CAP)
+    .bind(...(only !== undefined ? [cutoff, only] : [cutoff]), ACCOUNT_DELETE_SWEEP_CAP)
     .all<{ id: string; deleted_at: string }>();
   const due = res.results ?? [];
   const summary: AccountDeleteSweepSummary = { due: due.length, purged: 0, deferred: 0, skipped: 0, failed: 0 };
@@ -775,7 +1017,11 @@ export async function runAccountDeleteSweep(
         continue;
       }
 
-      // 1. Billing.
+      // 1. Billing. What Stripe held is recorded on the audit row at purge
+      //    (T-318) — after this account's row is gone, that row is the only
+      //    place that can say whether a Stripe customer existed and went.
+      const hadStripeCustomer = user.stripeCustomerId !== null;
+      const hadStripeSubscription = user.stripeSubscriptionId !== null;
       if (hasBillingArtifacts(user)) {
         const stripe = stripeFor(env, overrides);
         if (!stripe) {
@@ -801,6 +1047,8 @@ export async function runAccountDeleteSweep(
       // still billed, no longer attributable, and beyond the reach of any
       // retry, because nothing left in the system would know to try.
       let storageConverged = true;
+      let vaultsDestroyed = 0;
+      let r2ObjectsDeleted = 0;
       for (const vault of await listVaultsForOwner(env.DB, userId)) {
         let outcome: Awaited<ReturnType<typeof readDestroyOutcome>>;
         try {
@@ -816,6 +1064,8 @@ export async function runAccountDeleteSweep(
           continue;
         }
         await deleteVaultD1Rows(env.DB, userId, vault.name, now);
+        vaultsDestroyed++;
+        r2ObjectsDeleted += outcome.r2ObjectsDeleted;
       }
       if (!storageConverged) {
         await deferAccount(env, overrides?.sender, user, now, "vault_storage");
@@ -823,10 +1073,28 @@ export async function runAccountDeleteSweep(
         continue;
       }
 
-      // 3. The account.
-      await purgeAccountRows(env.DB, userId);
+      // 3. The account. Vault counts here are THIS pass's; a deferred earlier
+      //    pass may already have destroyed some (their D1 rows went with them).
+      const audit = await auditStatement(env.DB, {
+        actor: "sweep",
+        action: "purged",
+        userId,
+        note: {
+          stripe_customer_before: hadStripeCustomer,
+          stripe_subscription_before: hadStripeSubscription,
+          // Reaching this line means teardownBilling converged (or there was
+          // nothing to tear down): the customer was deleted in Stripe.
+          stripe_customer_deleted: hadStripeCustomer,
+          vaults_destroyed: vaultsDestroyed,
+          r2_objects_deleted: r2ObjectsDeleted,
+        },
+        now,
+      });
+      await purgeAccountRows(env.DB, user, audit);
       summary.purged++;
-      console.log(`event=account_purged user=${userId}`);
+      console.log(
+        `event=account_purged user=${userId} vaults_destroyed=${vaultsDestroyed} r2_objects_deleted=${r2ObjectsDeleted} stripe_customer_deleted=${hadStripeCustomer}`,
+      );
     } catch (err) {
       console.error(
         `event=account_purge_failed user=${userId} error=${err instanceof Error ? err.message : String(err)}`,

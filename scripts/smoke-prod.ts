@@ -324,6 +324,16 @@ async function main() {
       "PRODUCTION: /ops/daily without a bearer is refused (404 unset / 401 set)",
       `status ${opsDaily.status}`,
     );
+    // T-318 deletion-proof hooks: a scoped purge fast-forward and a footprint
+    // report — both must not exist in production.
+    for (const hook of ["/__test/account-delete/sweep", "/__test/account-delete/report"]) {
+      const r = await fetch(`${IDENTITY}${hook}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email: "smoke-prod-probe@example.com" }),
+      });
+      assert(r.status === 404, `PRODUCTION: ${hook} does not exist (404)`, `status ${r.status}`);
+    }
     // THE MOCK-BILLING SECURITY PIN: the interim mock-checkout endpoint is
     // hard-gated to non-production (billing-config.ts mockBillingEnabled). In
     // prod it 404s exactly like the __test/* hooks — a free self-upgrade is
@@ -413,6 +423,8 @@ async function main() {
     // hook must NOT exist in production.
     const embedRun = await fetch(`${VAULT}/vault/${VAULT_NAME}/__test/embed-run`, { method: "POST" });
     assert(embedRun.status === 404, "PRODUCTION: /vault/<name>/__test/embed-run does not exist (404)", `status ${embedRun.status}`);
+    const purgeCheck = await fetch(`${VAULT}/vault/${VAULT_NAME}/__test/purge-check`);
+    assert(purgeCheck.status === 404, "PRODUCTION: /vault/<name>/__test/purge-check does not exist (404)", `status ${purgeCheck.status}`);
 
     // Attachment tickets (cloud#177's DO mirror): a bogus/unknown ticket id
     // answers the SAME uniform 404 as a spent/expired/wrong-vault/wrong-kind

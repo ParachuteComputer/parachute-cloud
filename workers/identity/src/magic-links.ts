@@ -166,3 +166,42 @@ export async function verifyMagicCode(
     .run();
   return null;
 }
+
+/**
+ * How long a spent or expired sign-in artifact is kept before the hourly
+ * retention purge removes it (T-318). A magic link is live for 10 minutes and
+ * a pending 2FA login for 5, so a week is ample for any "why didn't my link
+ * work" support question, and short enough that an address someone typed into
+ * the sign-in box — but never turned into an account — does not sit in D1
+ * indefinitely.
+ */
+export const AUTH_ARTIFACT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface AuthRetentionSummary {
+  magicLinks: number;
+  pendingLogins: number;
+  authCodes: number;
+}
+
+/**
+ * Delete sign-in artifacts whose useful life ended more than a week ago:
+ * magic links (which carry the EMAIL — including sign-up links minted before
+ * any account existed, `user_id NULL`), pending 2FA logins, and OAuth
+ * authorization codes. Keyed on `expires_at`, which every row has and which is
+ * always past for a consumed row too (consumption happens inside the TTL), so
+ * one predicate covers used and unused alike. Idempotent; rides the hourly
+ * tick (ops.ts).
+ */
+export async function purgeStaleAuthArtifacts(db: D1Database, now: Date = new Date()): Promise<AuthRetentionSummary> {
+  const cutoff = new Date(now.getTime() - AUTH_ARTIFACT_RETENTION_MS).toISOString();
+  const [ml, pl, ac] = await db.batch([
+    db.prepare("DELETE FROM magic_links WHERE expires_at < ?").bind(cutoff),
+    db.prepare("DELETE FROM pending_logins WHERE expires_at < ?").bind(cutoff),
+    db.prepare("DELETE FROM auth_codes WHERE expires_at < ?").bind(cutoff),
+  ]);
+  return {
+    magicLinks: ml?.meta.changes ?? 0,
+    pendingLogins: pl?.meta.changes ?? 0,
+    authCodes: ac?.meta.changes ?? 0,
+  };
+}

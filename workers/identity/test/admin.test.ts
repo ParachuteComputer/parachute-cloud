@@ -50,7 +50,7 @@ async function seedOperator(email = "operator@example.com"): Promise<{ id: strin
 }
 
 const ADMIN_GETS = ["/admin", "/admin/users", "/admin/vaults", "/admin/daily.json"];
-const ADMIN_POSTS = ["/admin/users/plan", "/admin/users/suspend"];
+const ADMIN_POSTS = ["/admin/users/plan", "/admin/users/suspend", "/admin/users/delete"];
 
 // --- the role gate -----------------------------------------------------------
 
@@ -270,8 +270,10 @@ describe("POST /admin/users/plan — the comp lever", () => {
     expect(res.headers.get("location")).toBe("/admin/users?notice=plan-updated");
     expect((await getUserById(env.DB, id))!.plan).toBe("standard");
     // The pushed body is the NEW plan's full two-meter entitlement — the comp
-    // takes effect now (standard carries voice: 60 min).
-    expect(JSON.parse(body!)).toEqual(planEntitlement("standard"));
+    // takes effect now (standard carries voice: 60 min) — plus (T-318) the
+    // re-assertion that the account is open, which every entitlement push
+    // carries because every caller of that seam acts on a live account.
+    expect(JSON.parse(body!)).toEqual({ ...planEntitlement("standard"), closed: false });
   });
 
   test("the comp CLEARS the trial clock (pending_plan + plan_downgrade_at) — the expiry revert can't re-enter", async () => {

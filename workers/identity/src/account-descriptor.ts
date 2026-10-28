@@ -102,6 +102,8 @@ interface CloudMoneyFields {
  */
 export interface CloudAccountCapabilities extends AccountCapabilities {
   connections: boolean;
+  /** The whole-account door (`POST /account/delete` + `/account/undo-delete`). */
+  account_delete: boolean;
 }
 
 export function accountDescriptor(deps: OAuthDeps): Response {
@@ -111,6 +113,7 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     vault_create: true,
     vault_rename: false,
     vault_delete: true,
+    account_delete: true,
     connections: true,
   };
   const body: ParachuteAccountDescriptor & CloudMoneyFields = {
@@ -132,14 +135,15 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // identity-side D1 sweep), so the door now advertises the capability it
     // actually has. A client that reads this flag is what turns the endpoint
     // into a user-facing affordance; leaving it false would ship the route dark.
-    // NOT advertised here, deliberately: the WHOLE-ACCOUNT door (cloud#226
-    // A-3, `/account/delete` + `/account/undo-delete`) has no flag, because
-    // `AccountCapabilities` is the SHARED door contract — it lives upstream in
-    // parachute-hub's `packages/door-contract` and is CI-pinned to a reviewed
-    // commit, so a new key belongs to an upstream PR + a pin bump, not to a
-    // cloud-side wiring branch. Until that lands, a client learns the door
-    // exists from the contract's route list, not from a capability bit. The
-    // route works either way; what it lacks is the advertisement.
+    // `account_delete` (T-318): the WHOLE-ACCOUNT door (cloud#226 A-3,
+    // `POST /account/delete` + `/account/undo-delete`) is advertised as an
+    // ADDITIVE cloud extension of the shared `AccountCapabilities` (the same
+    // pattern as `AccountPlanSummaryWithIntervals` below): a door-contract
+    // consumer that only knows the shared keys sees exactly what it expects,
+    // and the app turns this bit into its Delete-account section. Folding the
+    // key into the shared contract upstream (parachute-hub door-contract) is a
+    // follow-up; the self-host hub simply never sends it, so its app shows no
+    // such section.
     capabilities,
     // The account-level MCP endpoint (Wave A PR3) — one connection across the
     // account's vaults (list-vaults / create-vault / query-notes). Advertised at

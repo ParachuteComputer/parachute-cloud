@@ -14,6 +14,7 @@
  */
 import { randomUUID } from "./crypto.ts";
 import { VAULT_VERBS } from "./audience.ts";
+import { parseComposedAccountScope } from "@openparachute/door-contract";
 
 /**
  * Vault-name slug: lowercase alnum + hyphen, 2–63 chars, must start alnum.
@@ -196,15 +197,24 @@ function splitScopes(scopes: string): string[] {
  * intentionally irreversible but itself idempotent. The two candidate SELECTs
  * run before it and write nothing.
  *
- * REMAINING RESIDUE, stated rather than implied away: the cascade sweeps the
- * three-part `vault:<name>:<verb>` grammar the twin defines, and NOT cloud's
- * own composed ACCOUNT scopes (`account:<id>:vaults:<name>:<verb>`), which have
- * no hub counterpart. Those are inert against a deleted vault — the account-MCP
- * fan-out resolves vaults through `listVaultsForOwner` at call time, so a dead
- * name reaches nothing — but they would still cover a same-name vault created
- * later without a fresh consent. Sweeping them safely means reasoning about
- * `recordGrant`'s family-replace narrowing semantics (grants.ts), which is a
- * consent-model change and wants its own review, not a wiring slice (cloud#226).
+ * COMPOSED ACCOUNT SCOPES (T-318). Cloud also has its own per-vault account
+ * scopes with no hub counterpart: `account:<owner>:vaults:<name>` (legacy
+ * consent-narrowed) and `account:<owner>:vaults:<name>:<verb>` (composed).
+ * They are inert against a deleted vault, but before this they would have
+ * covered a SAME-NAME vault the owner created later, with no fresh consent.
+ * They are now swept exactly like the three-part form: a token naming one is
+ * revoked, a grant naming one is rewritten without it (dropped if emptied).
+ * Only the OWNER's composed scopes for THIS name match — the wildcard
+ * `account:<owner>:vaults:*:<verb>` is a grant over "every vault I own" and
+ * deliberately survives, and so does `vault-create`. Why a rewrite is safe
+ * against `recordGrant`'s family-replace: the rewrite only ever REMOVES
+ * scopes, so the next consent for this client compares against a strictly
+ * narrower family, re-prompts for the dead name, and revokes on the move —
+ * the safe direction on every path.
+ *
+ * Operator alert dedupe rows keyed `…:<name>` (vault-call.ts
+ * `internal-config-caps-malformed:<name>`) go too: the vault they describe no
+ * longer exists, and the name may be someone else's tomorrow.
  */
 export async function deleteVaultD1Rows(
   db: D1Database,
@@ -214,8 +224,14 @@ export async function deleteVaultD1Rows(
 ): Promise<VaultDeleteD1Summary> {
   const vaultName = name.toLowerCase();
   const pattern = vaultScopeLikePattern(vaultName);
+  // `instr`, not LIKE, for the composed family: D1 caps LIKE pattern length
+  // and `account:<uuid>:vaults:<name>` is longer than that cap. Still only a
+  // superset prefilter — the JS check below is the decision.
+  const composedNeedle = `account:${ownerUserId}:vaults:${vaultName}`;
+  const namesThisVault = (scope: string): boolean =>
+    vaultScopeName(scope) === vaultName || composedScopeNamesVault(scope, ownerUserId, vaultName);
 
-  const [tokenCandidates, grantCandidates] = await Promise.all([
+  const [tokenCandidates, grantCandidates, composedTokens, composedGrants, clientCandidates] = await Promise.all([
     db
       .prepare("SELECT jti, scopes FROM tokens WHERE revoked_at IS NULL AND scopes LIKE ? ESCAPE '\\'")
       .bind(pattern)
@@ -224,11 +240,37 @@ export async function deleteVaultD1Rows(
       .prepare("SELECT user_id, client_id, scopes FROM grants WHERE scopes LIKE ? ESCAPE '\\'")
       .bind(pattern)
       .all<{ user_id: string; client_id: string; scopes: string }>(),
+    db
+      .prepare("SELECT jti, scopes FROM tokens WHERE revoked_at IS NULL AND user_id = ? AND instr(scopes, ?) > 0")
+      .bind(ownerUserId, composedNeedle)
+      .all<{ jti: string; scopes: string }>(),
+    db
+      .prepare("SELECT user_id, client_id, scopes FROM grants WHERE user_id = ? AND instr(scopes, ?) > 0")
+      .bind(ownerUserId, composedNeedle)
+      .all<{ user_id: string; client_id: string; scopes: string }>(),
+    // DCR client registrations echo the scopes a connector asked for at
+    // registration — `vault:<name>:read …` — so the deleted vault's NAME sat in
+    // `clients.scopes` after everything else was gone (found by the T-318
+    // end-to-end purge report). The column is informational (echoed in the
+    // DCR response, never enforced), so dropping the dead name's scopes from
+    // it changes no authorization.
+    db
+      .prepare("SELECT client_id, scopes FROM clients WHERE scopes LIKE ? ESCAPE '\\'")
+      .bind(pattern)
+      .all<{ client_id: string; scopes: string }>(),
   ]);
 
-  const jtis = (tokenCandidates.results ?? [])
-    .filter((r) => splitScopes(r.scopes).some((s) => vaultScopeName(s) === vaultName))
-    .map((r) => r.jti);
+  const jtis = [
+    ...new Set(
+      [...(tokenCandidates.results ?? []), ...(composedTokens.results ?? [])]
+        .filter((r) => splitScopes(r.scopes).some(namesThisVault))
+        .map((r) => r.jti),
+    ),
+  ];
+  const grantRows = new Map<string, { user_id: string; client_id: string; scopes: string }>();
+  for (const r of [...(grantCandidates.results ?? []), ...(composedGrants.results ?? [])]) {
+    grantRows.set(`${r.user_id}\u0000${r.client_id}`, r);
+  }
 
   const statements: D1PreparedStatement[] = [];
 
@@ -249,9 +291,9 @@ export async function deleteVaultD1Rows(
 
   let grantsRewritten = 0;
   let grantsDropped = 0;
-  for (const row of grantCandidates.results ?? []) {
+  for (const row of grantRows.values()) {
     const scopes = splitScopes(row.scopes);
-    const kept = scopes.filter((s) => vaultScopeName(s) !== vaultName);
+    const kept = scopes.filter((s) => !namesThisVault(s));
     if (kept.length === scopes.length) continue; // LIKE over-fetch — not a real match.
     if (kept.length === 0) {
       statements.push(
@@ -268,11 +310,19 @@ export async function deleteVaultD1Rows(
     }
   }
 
+  for (const row of clientCandidates.results ?? []) {
+    const scopes = splitScopes(row.scopes);
+    const kept = scopes.filter((s) => vaultScopeName(s) !== vaultName);
+    if (kept.length === scopes.length) continue;
+    statements.push(db.prepare("UPDATE clients SET scopes = ? WHERE client_id = ?").bind(kept.join(" "), row.client_id));
+  }
+
   const mirrorsAt = statements.length;
   statements.push(
     db.prepare("DELETE FROM vault_usage WHERE vault_name = ?").bind(vaultName),
     db.prepare("DELETE FROM vault_snapshots WHERE vault_name = ?").bind(vaultName),
     db.prepare("DELETE FROM vaults WHERE name = ? AND owner_user_id = ?").bind(vaultName, ownerUserId),
+    db.prepare("DELETE FROM ops_alerts WHERE substr(key, -?) = ?").bind(vaultName.length + 1, `:${vaultName}`),
   );
 
   const results = await db.batch(statements);
@@ -346,6 +396,18 @@ export async function clearImportPending(db: D1Database, name: string, ownerUser
     .prepare("UPDATE vaults SET import_pending_at = NULL WHERE name = ? AND owner_user_id = ?")
     .bind(name.toLowerCase(), ownerUserId)
     .run();
+}
+
+/**
+ * Whether a composed ACCOUNT scope names exactly this owner's vault: the
+ * legacy `account:<owner>:vaults:<name>` or the composed
+ * `account:<owner>:vaults:<name>:<verb>`. The wildcard and every other
+ * account's scopes never match (T-318).
+ */
+export function composedScopeNamesVault(scope: string, ownerUserId: string, vaultName: string): boolean {
+  const parsed = parseComposedAccountScope(scope);
+  if (!parsed || parsed.id !== ownerUserId) return false;
+  return (parsed.kind === "legacy-vault" || parsed.kind === "vault") && parsed.vault.toLowerCase() === vaultName;
 }
 
 /**

@@ -1,5 +1,5 @@
 /**
- * PII-free ops counters in 10-minute buckets (migration 0029, `ops_counters`).
+ * PII-free ops counters in 10-minute buckets (migration 0027, `ops_counters`).
  *
  * Deliberately dependency-free (no Env, no sender) so any module — the session
  * store, the fetch wrapper, the health check — can count without an import
