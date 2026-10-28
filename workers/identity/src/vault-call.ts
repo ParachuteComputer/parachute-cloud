@@ -299,6 +299,9 @@ export interface VaultUsageReading {
   /** Voice minutes used this UTC month (cloud#56). 0 when the DO reports none
    *  (a pre-voice vault worker, or no transcriptions yet). */
   transcribeMinutes: number;
+  /** Notes written in the 24 h before the read (the daily ops line). null when
+   *  the DO doesn't report it (an older vault worker) — never guessed as 0. */
+  notesChanged24h: number | null;
   /**
    * The DO's resolved entitlement, or null when the response didn't carry
    * the control-plane fields AT ALL — a vault-worker ROLLBACK to a
@@ -377,6 +380,7 @@ export async function readVaultUsage(
     transcription_enabled?: unknown;
     transcribe_minutes_limit?: unknown;
     transcribe_minutes?: unknown;
+    notes_changed_24h?: unknown;
   };
   if (typeof body.db_bytes !== "number" || typeof body.r2_bytes !== "number") {
     throw new Error("internal config GET carried no usage split (db_bytes/r2_bytes)");
@@ -450,6 +454,10 @@ export async function readVaultUsage(
     dbBytes: body.db_bytes,
     r2Bytes: body.r2_bytes,
     transcribeMinutes,
+    notesChanged24h:
+      typeof body.notes_changed_24h === "number" && Number.isFinite(body.notes_changed_24h)
+        ? body.notes_changed_24h
+        : null,
     entitlement,
   };
 }

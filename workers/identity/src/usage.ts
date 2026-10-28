@@ -273,11 +273,11 @@ export async function runUsageRollup(
         now,
       });
       await env.DB.prepare(
-        `INSERT INTO vault_usage (vault_name, day, db_bytes, r2_bytes, transcribe_minutes) VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO vault_usage (vault_name, day, db_bytes, r2_bytes, transcribe_minutes, notes_changed_24h) VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(vault_name, day) DO UPDATE SET db_bytes = excluded.db_bytes, r2_bytes = excluded.r2_bytes,
-           transcribe_minutes = excluded.transcribe_minutes`,
+           transcribe_minutes = excluded.transcribe_minutes, notes_changed_24h = excluded.notes_changed_24h`,
       )
-        .bind(v.name, day, usage.dbBytes, usage.r2Bytes, usage.transcribeMinutes)
+        .bind(v.name, day, usage.dbBytes, usage.r2Bytes, usage.transcribeMinutes, usage.notesChanged24h)
         .run();
       recorded++;
 
