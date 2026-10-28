@@ -15,6 +15,7 @@
  *     "usage appears within a day" when none, the plan line's total,
  *   - the staging-only /__test/usage-run trigger (404 in production).
  */
+import { entitlementPlanFor } from "../src/plans.ts";
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import worker from "../src/index.ts";
@@ -327,6 +328,40 @@ describe("runUsageRollup", () => {
       expect(reads).toBe(2);
       expect(pushes).toBe(1);
       expect(log.mock.calls.filter((c) => String(c[0]).includes("event=entitlement_reconciled")).length).toBe(1);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("T-318: a vault still locked for a LIVE owner (failed unlock on undo) is reopened once, then left alone", async () => {
+    const { id: owner } = await seedUser("stuck-lock@example.com");
+    await seedVault("stuck-lock-v", owner);
+    const row = await env.DB.prepare("SELECT plan, pending_plan FROM users WHERE id = ?")
+      .bind(owner)
+      .first<{ plan: string; pending_plan: string | null }>();
+    const expected = planEntitlement(entitlementPlanFor(row!.plan as never, row!.pending_plan as never, "open_beta"));
+    let closed = true;
+    const pushedBodies: Record<string, unknown>[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const runDeps: OAuthDeps = {
+      ...deps(() => NOW),
+      vaultFetch: async (_input, init) => {
+        if (init?.method === "GET") return Response.json({ ...splitBody(10, 0, expected), closed });
+        if (init?.method === "PUT") {
+          const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+          pushedBodies.push(body);
+          if (body.closed === false) closed = false;
+          return Response.json({ ok: true });
+        }
+        return new Response("method not allowed", { status: 405 });
+      },
+    };
+    try {
+      await runUsageRollup(env, runDeps, { onlyVault: "stuck-lock-v" });
+      expect(pushedBodies).toHaveLength(1);
+      expect(pushedBodies[0]!.closed).toBe(false);
+      await runUsageRollup(env, runDeps, { onlyVault: "stuck-lock-v" });
+      expect(pushedBodies).toHaveLength(1);
     } finally {
       log.mockRestore();
     }

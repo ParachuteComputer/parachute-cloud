@@ -290,6 +290,9 @@ export interface ResolvedVaultEntitlement {
   transcriptionEnabled: boolean;
   /** The currently resolved monthly voice budget. */
   transcribeMinutesLimit: number;
+  /** The account-closed lock (T-318 delete request). Optional: an older vault
+   *  worker doesn't report it. */
+  closed?: boolean;
 }
 
 /** The usage split GET /api/internal/config reports (the rollup's read). */
@@ -381,6 +384,7 @@ export async function readVaultUsage(
     transcribe_minutes_limit?: unknown;
     transcribe_minutes?: unknown;
     notes_changed_24h?: unknown;
+    closed?: unknown;
   };
   if (typeof body.db_bytes !== "number" || typeof body.r2_bytes !== "number") {
     throw new Error("internal config GET carried no usage split (db_bytes/r2_bytes)");
@@ -416,6 +420,7 @@ export async function readVaultUsage(
         frozen: body.frozen as boolean,
         transcriptionEnabled: body.transcription_enabled as boolean,
         transcribeMinutesLimit: body.transcribe_minutes_limit as number,
+        closed: body.closed === true,
       };
     } catch (err) {
       // Distinct from the rollback log the rollup emits: this vault DID answer

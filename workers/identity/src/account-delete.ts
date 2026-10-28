@@ -574,8 +574,9 @@ async function restoreAccount(
   // cloud#234 + T-318: re-apply plan entitlement now that the tombstone is
   // gone — and with it `closed: false`, which unlocks the vaults the delete
   // request locked. Best effort; a vault whose push failed gets one more,
-  // lock-only attempt, and after that an operator plan set in /admin/users
-  // (which also re-opens) fixes it. Failing undo over it would strand a
+  // lock-only attempt; after that the 03:30 entitlement reconciler reopens any
+  // vault still locked for a live owner (usage.ts), or an operator plan set in
+  // /admin/users does it at once. Failing undo over it would strand a
   // restored account behind a 5xx.
   const capResults = await applyPlanToVaults(env.DB, deps, user.id, { reopen: true });
   const capFailed = capResults.filter((r) => !r.ok);
