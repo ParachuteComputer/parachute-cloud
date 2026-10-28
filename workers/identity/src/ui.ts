@@ -359,7 +359,9 @@ export interface OwnerVerbSelector {
  * landing on `/login` byte-identical to before this line existed.
  */
 function signedInAsLine(email: string, csrfToken: string, next?: string): string {
-  return `<p class="muted" data-testid="signed-in-as" style="margin:0 0 1rem">Signed in as <strong>${esc(email)}</strong> &middot; <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}">${next ? `<input type="hidden" name="next" value="${esc(next)}">` : ""}<button class="linkbtn" type="submit">Not you?</button></form></p>`;
+  // A <div>, not a <p>: the inline logout <form> would otherwise end the
+  // paragraph and drop "Not you?" onto its own line.
+  return `<div class="muted" data-testid="signed-in-as" style="margin:0 0 1rem">Signed in as <strong>${esc(email)}</strong> &middot; <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}">${next ? `<input type="hidden" name="next" value="${esc(next)}">` : ""}<button class="linkbtn" type="submit">Not you?</button></form></div>`;
 }
 
 function scopeLabel(scope: string): string {
