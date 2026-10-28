@@ -48,6 +48,7 @@ import { isUnverifiable, resolveMinAssertions, STAGING_MIN_ASSERTIONS, summarize
 // core resolves from the sibling parachute-vault checkout, copied into the vault
 // worker's node_modules by `bun install` (the same explicit path test-bun uses).
 import { GETTING_STARTED_PACK, welcomePack } from "../workers/vault/node_modules/@openparachute/core/src/seed-packs.js";
+import { DEFAULT_SEED_OMITTED_TAGS } from "../workers/vault/src/welcome.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.openparachute.workers.dev").replace(/\/$/, "");
@@ -663,8 +664,8 @@ async function main() {
       // The fresh vault materialized with the DEFAULT SEED PACKS (core's
       // welcome + getting-started): exactly 6 notes (the five-guide welcome
       // ring + Getting Started, the guides-ring rewrite vault#544) + core's
-      // declared seed tags (capture + guide + pinned), before this user writes
-      // anything. Asserted dynamically against the import so core-side
+      // declared seed tags minus DEFAULT_SEED_OMITTED_TAGS (so: guide, not
+      // capture — T-318), before this user writes anything. Asserted dynamically against the import so core-side
       // vocabulary changes can't strand a stale literal pin here again.
       const expectedSeedPaths = welcomePack().notes.map((n) => n.path).concat(GETTING_STARTED_PACK.notes.map((n) => n.path));
       const seededRes = await fetch(`${VAULT}/vault/${newVault}/api/notes`, { headers: OWN_AUTH });
@@ -679,11 +680,14 @@ async function main() {
       );
       const tagRes = await fetch(`${VAULT}/vault/${newVault}/api/tags`, { headers: OWN_AUTH });
       const tagRows = (await tagRes.json()) as Array<{ name: string }>;
-      const expectedTagNames = welcomePack().tags.map((t) => t.name).sort();
+      const expectedTagNames = welcomePack()
+        .tags.map((t) => t.name)
+        .filter((n) => !DEFAULT_SEED_OMITTED_TAGS.has(n))
+        .sort();
       assert(
         tagRes.status === 200 &&
           tagRows.map((r) => r.name).sort().join(",") === expectedTagNames.join(","),
-        `fresh vault seeds exactly core's declared tag set (${expectedTagNames.join(", ")})`,
+        `fresh vault seeds core's declared tag set minus capture (${expectedTagNames.join(", ")})`,
         tagRows.map((r) => r.name).join(", "),
       );
 

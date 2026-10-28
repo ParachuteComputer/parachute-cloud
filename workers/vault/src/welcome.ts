@@ -5,11 +5,12 @@
  *
  *  1. The `welcome` pack — the five-guide welcome ring (Welcome to your vault,
  *     Capture anything, Tags and the graph, Connect your AI, Yours to keep;
- *     the guides-ring rewrite, vault#544) + the `capture` / `guide`
- *     tags. `capture` is the sacred raw-input tag Notes' schema audit requires
- *     (ONE tag since vault#528; entry method lives in note metadata.source);
- *     `guide` is the skill-file tag (no schema — guides are for you and your AI
- *     alike, plain markdown). The five guides are ordinary notes tagged `#guide`,
+ *     the guides-ring rewrite, vault#544) + the `guide` tag (the skill-file
+ *     tag; no schema — guides are for you and your AI alike, plain markdown).
+ *     Core's pack also declares `capture`; the cloud default seed drops it
+ *     (T-318, DESIGN-0.9 §8b/§8c): `#capture` is opt-in in the Notes app now,
+ *     and the app declares the tag lazily the first time it actually adds it.
+ *     See DEFAULT_SEED_OMITTED_TAGS below. The five guides are ordinary notes tagged `#guide`,
  *     forming a small linked web (Welcome → all four; the rest chain,
  *     Connect-your-AI also links [[Getting Started]]).
  *     The Connect-your-AI note names the console origin (ISSUER_ORIGIN). This
@@ -37,14 +38,16 @@
 import type { Store } from "@openparachute/core/src/types.js";
 import {
   GETTING_STARTED_PACK,
+  type SeedPack,
   applySeedPack,
   welcomePack,
 } from "@openparachute/core/src/seed-packs.js";
 
 // Re-exported so the conformance tests assert against the SAME constants the
 // seed writes (single import site; content lives in core). The guides-ring set
-// (vault#544): the five welcome paths + Getting Started, plus the seeded tag
-// declarations (capture via NOTES_REQUIRED_TAGS + the GUIDE_TAG).
+// (vault#544): the five welcome paths + Getting Started, plus core's tag
+// declarations (NOTES_REQUIRED_TAGS = capture, NOT default-seeded on cloud;
+// GUIDE_TAG, seeded).
 export {
   CAPTURE_ANYTHING_PATH,
   CONNECT_AI_PATH,
@@ -59,12 +62,29 @@ export {
 /** Storage key for the per-DO "welcome seed already ran" marker. */
 export const WELCOME_SEEDED_KEY = "welcome_seeded";
 
+/**
+ * Tags core's default packs declare that a fresh CLOUD vault does not get.
+ * `capture` used to be declared because the Notes app required it; the app no
+ * longer tags new notes `#capture` unless the owner opts in, and declares the
+ * tag itself on first use. Only the create-time default seed is filtered — an
+ * explicit `POST /api/packs/welcome` still applies core's full pack (the
+ * caller asked for exactly that pack). Existing vaults are never re-seeded
+ * (the `welcome_seeded` marker + stored-config guard in vault-do.ts), so
+ * their `capture` tag and notes are untouched.
+ */
+export const DEFAULT_SEED_OMITTED_TAGS: ReadonlySet<string> = new Set(["capture"]);
+
+/** The default pack minus the tags a fresh cloud vault should not carry. */
+function forDefaultSeed(pack: SeedPack): SeedPack {
+  return { ...pack, tags: pack.tags.filter((t) => !DEFAULT_SEED_OMITTED_TAGS.has(t.name)) };
+}
+
 export interface WelcomeSeedResult {
   /** Note paths written this run (across both default packs). */
   seededNotes: string[];
   /** Note paths skipped because a note already lives there (idempotency). */
   skippedNotes: string[];
-  /** Tag names upserted (upserts are idempotent; always core's full declared set). */
+  /** Tag names upserted (idempotent; core's declared set minus DEFAULT_SEED_OMITTED_TAGS). */
   tags: string[];
 }
 
@@ -81,7 +101,7 @@ export interface WelcomeSeedResult {
 export async function seedWelcome(store: Store, opts: { consoleOrigin: string }): Promise<WelcomeSeedResult> {
   const result: WelcomeSeedResult = { seededNotes: [], skippedNotes: [], tags: [] };
   for (const pack of [welcomePack({ consoleOrigin: opts.consoleOrigin }), GETTING_STARTED_PACK]) {
-    const applied = await applySeedPack(store, pack);
+    const applied = await applySeedPack(store, forDefaultSeed(pack));
     result.seededNotes.push(...applied.seededNotes);
     result.skippedNotes.push(...applied.skippedNotes);
     result.tags.push(...applied.tags);

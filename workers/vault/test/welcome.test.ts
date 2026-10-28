@@ -14,20 +14,18 @@ import { GETTING_STARTED_PACK, welcomePack } from "@openparachute/core/src/seed-
 
 /**
  * Default-seed conformance: a brand-new vault materializes with the two
- * default core packs — the five-guide welcome ring + core's declared seed tags
- * (the `welcome` pack: capture/guide, asserted dynamically so this suite
- * tracks core@main) and the AI-facing Getting Started guide (the
- * `getting-started` pack) — and NOTHING else. The seed must be invisible to
+ * default core packs — the five-guide welcome ring + the `guide` tag (core's
+ * welcome pack minus `capture`, see DEFAULT_SEED_OMITTED_TAGS) and the
+ * AI-facing Getting Started guide (the `getting-started` pack) — and NOTHING else. The seed must be invisible to
  * everything that already exists: idempotent on re-entry, absent for
  * pre-existing vaults, ordinary/deletable notes, exported like any other note.
  *
  * The guides ring (vault#544): six seeded notes, all `#guide` skill files.
  * Guides are for you and your AI alike, plain markdown, so the `#guide` tag
  * carries no per-guide audience schema (written_for dropped 2026-07-06; the
- * vestigial #pinned seed dropped 2026-07-07). The `capture` tag assertion still
- * mirrors notes-ui's audit equality exactly (schema-audit.ts diffs
- * `description` + `parent_names` verbatim against NOTES_REQUIRED_SCHEMA), so
- * green there means the PWA banner clears for the right reason. The parity
+ * vestigial #pinned seed dropped 2026-07-07). `capture` is NOT default-seeded
+ * on cloud any more (T-318): the Notes app declares it lazily, only when the
+ * owner opts in to tagging new notes as an inbox. The parity
  * block pins that the seeded bytes are exactly core's pack content — this repo
  * no longer carries its own copy.
  */
@@ -57,7 +55,7 @@ async function listTagsWithSchema(v: string): Promise<any[]> {
 }
 
 describe("default seed — a new vault's first materialization", () => {
-  it("contains exactly the 6 seeded guides and exactly core's declared seed tags", async () => {
+  it("contains exactly the 6 seeded guides and only the guide tag (no capture)", async () => {
     const v = freshVault("w");
     const notes = await listNotes(v);
     expect(notes).toHaveLength(6);
@@ -85,21 +83,21 @@ describe("default seed — a new vault's first materialization", () => {
     }
     expect(gettingStarted.tags).toContain("guide");
 
-    // Exactly core's declared seed-tag set — dynamic (the welcome pack's tags:
-    // capture + guide), so the assertion follows core@main rather than pinning
-    // a count that a core seed-schema change would silently strand.
+    // Exactly ONE seeded tag: `guide`. Core's welcome pack also declares
+    // `capture` (NOTES_REQUIRED_TAGS); the cloud default seed drops it
+    // (T-318 / DESIGN-0.9 §8b: `#capture` is opt-in in the Notes app, which
+    // declares it lazily on first use). Assert the core side still declares
+    // it, so this test notices if core changes underneath the filter.
     const declaredTags = welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string }).tags;
+    expect(declaredTags.map((d) => d.name)).toEqual(
+      expect.arrayContaining(NOTES_REQUIRED_TAGS.map((d) => d.name)),
+    );
     const tags = await listTagsWithSchema(v);
-    expect(tags.map((t) => t.name).sort()).toEqual(declaredTags.map((d) => d.name).sort());
-
-    // capture: notes-ui's schema-audit compares description + parent_names.
-    for (const decl of NOTES_REQUIRED_TAGS) {
-      const row = tags.find((t) => t.name === decl.name);
-      expect(row, `tag ${decl.name} exists`).toBeTruthy();
-      expect(row.description ?? "").toBe(decl.description);
-      expect(row.parent_names ?? []).toEqual(decl.parent_names ?? []);
-      // capture is an identity row only — no notes carry it yet.
-      expect(row.count).toBe(0);
+    expect(tags.map((t) => t.name).sort()).toEqual(["guide"]);
+    expect(tags.find((t) => t.name === "capture"), "no capture tag on a fresh vault").toBeUndefined();
+    // And no seeded note carries it either.
+    for (const note of notes) {
+      expect(note.tags, `${note.path} not tagged #capture`).not.toContain("capture");
     }
 
     // guide is the skill-file tag — it PERSISTED through the DO store (the
@@ -177,9 +175,9 @@ describe("default seed — a new vault's first materialization", () => {
     expect(again.skippedNotes.sort()).toEqual([...ALL_PATHS].sort());
 
     expect(await listNotes(v)).toHaveLength(6);
-    // capture + guide — the welcome pack's full declared tag set.
-    const declaredTags = welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string }).tags;
-    expect(await listTagsWithSchema(v)).toHaveLength(declaredTags.length);
+    // The re-run converges on the same filtered set: guide only, no capture.
+    expect(again.tags).not.toContain("capture");
+    expect((await listTagsWithSchema(v)).map((t) => t.name)).toEqual(["guide"]);
   });
 
   it("seeded notes are ordinary notes — deletable, and never re-seeded after delete", async () => {
