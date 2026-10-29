@@ -243,9 +243,15 @@ async function main() {
     const su = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
     assert(su.status === 302 && su.headers.get("location") === `${MY}/`, "cloud./signup → 302 my./ (handler front door, unchanged)", `status ${su.status} → ${su.headers.get("location")}`);
 
+    // ONE-PASS CONNECT (T-318, oauth-authorize.ts authorizeHomeRedirect): a browser GET of cloud./oauth/authorize
+    // is handed to my. with path + query byte-identical, so the consent page sees the my. session. A POST is still
+    // served in place (not probed here: it would need a form body).
+    const authzQ = "/oauth/authorize?client_id=unknown&redirect_uri=https%3A%2F%2Fx.example%2Fcb&response_type=code";
+    const authz = await fetch(`${IDENTITY}${authzQ}`, { redirect: "manual" });
+    assert(authz.status === 302 && authz.headers.get("location") === `${MY}${authzQ}`, "cloud. GET /oauth/authorize → 302 my. (path+query preserved)", `status ${authz.status} → ${authz.headers.get("location")}`);
+
     // MUST-NEVER-REDIRECT: machine paths on cloud. keep serving (never 3xx→my.).
     const machinePaths = [
-      "/oauth/authorize?client_id=unknown&redirect_uri=https%3A%2F%2Fx.example%2Fcb&response_type=code",
       `/auth/verify?token=bogus-${Date.now()}`,
       `/unsubscribe?t=bogus-${Date.now()}`,
       "/.well-known/oauth-authorization-server",
