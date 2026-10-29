@@ -238,7 +238,7 @@ function cloudFrontDoorRedirect(env: Env, req: Request): Response | null {
 
 // --- console (accounts + vaults) ---
 app.get("/signup", (c) => handleSignupGet(c.req.raw, depsFor(c.env)));
-app.post("/signup", (c) => handleSignupPost(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/signup", (c) => handleSignupPost(c.env.DB, c.req.raw, depsFor(c.env), senderFor(c.env)));
 app.get("/login", (c) => cloudFrontDoorRedirect(c.env, c.req.raw) ?? handleLoginGet(c.req.raw));
 app.post("/login", (c) => handleLoginPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/logout", (c) => handleLogoutPost(c.env.DB, c.req.raw, depsFor(c.env)));

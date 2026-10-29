@@ -16,7 +16,13 @@
  */
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import type { EmailSender } from "./email.ts";
-import { type ConsumedMagicLink, consumeMagicLink, createMagicLink, verifyMagicCode } from "./magic-links.ts";
+import {
+  type ConsumedMagicLink,
+  type PendingSignup,
+  consumeMagicLink,
+  createMagicLink,
+  verifyMagicCode,
+} from "./magic-links.ts";
 import { bumpMagicLinkEvent } from "./ops.ts";
 import {
   buildPendingLoginCookie,
@@ -35,13 +41,13 @@ import {
   recordLoginFailure,
 } from "./rate-limit.ts";
 import { buildSessionCookie, createSession } from "./sessions.ts";
+import { clearSignupBindingCookie, requestHoldsBinding } from "./signup-binding.ts";
 import { sessionUser } from "./session-user.ts";
 import {
   createUser,
   getUserByEmail,
   getUserById,
   hasPassword,
-  markEmailVerified,
   setPassword,
   type User,
 } from "./users.ts";
@@ -161,6 +167,64 @@ async function readMagicForm(req: Request): Promise<FormData> {
   return req.formData();
 }
 
+/**
+ * Mint a magic link (+ code) for `email` and send it — the one send path the
+ * magic-link request AND the password sign-up (console.ts) share. Returns the
+ * dev echo headers (empty outside dev/test/staging). `existing` is the account
+ * the address already has, if any; `pending` (a password sign-up's password +
+ * browser binding) is stored ONLY for a new address, so a sign-up against an
+ * existing account is exactly a sign-in link and never touches its password.
+ * The caller has already fenced the request and refused suspended/deleted
+ * accounts.
+ */
+export async function sendSignInLink(
+  db: D1Database,
+  req: Request,
+  deps: OAuthDeps,
+  sender: EmailSender,
+  args: { email: string; existing: User | null; next: string | null; now: Date; pending?: PendingSignup | null },
+): Promise<Record<string, string>> {
+  const { email, existing, next, now } = args;
+  const pending = existing ? null : (args.pending ?? null);
+  const { rawToken, code } = await createMagicLink(db, email, existing?.id ?? null, now, next, pending);
+  // Build the emailed link from the origin the request came in on (app. or
+  // cloud.), NOT the fixed issuer — so a user who asked from app.parachute.
+  // computer gets a link back to app., landing the session on the origin they
+  // started on (P1.3 same-origin ceremonies). The gate above already proved
+  // the Origin is a bound member; ceremonyOrigin falls back to the issuer for
+  // any opaque/foreign origin. The stored `next` authorize resume is
+  // origin-relative, so it resumes on this same origin (T-318).
+  const link = `${ceremonyOrigin(req, deps)}/auth/verify?token=${encodeURIComponent(rawToken)}`;
+  // G5: choose the email variant at send time — no `existing` row = a
+  // brand-new account this link will create. Only the address owner reads the
+  // email, so this new-vs-returning distinction leaks nothing (the on-page
+  // copy stays neutral).
+  const sent = await sender.sendMagicLink(email, link, code, !existing);
+  if (!sent.ok) {
+    // A real-binding failure (bad address, quota, CF transient) must leave a
+    // log trail — otherwise it's a silent 200 and an inbox that never rings.
+    // Structured + PII-safe: the email's DOMAIN only, never the full address.
+    // The response below stays the same neutral 200 (no enumeration change).
+    const domain = email.split("@")[1] ?? "unknown";
+    console.error(
+      `event=magic_link_send_failed sender=${sender.kind} domain=${domain} error=${JSON.stringify(sent.error)}`,
+    );
+  }
+  // PII-free per-day counter for the weekly ops digest (never throws).
+  await bumpMagicLinkEvent(db, sent.ok ? "sent" : "failed", now);
+  const extra: Record<string, string> = {};
+  // DEV ONLY: echo the link + code so the flow is testable without real
+  // email. Gated hard on isDevExposureEnv (deps.exposeDevLinks).
+  // The code rides a SIBLING header (not the existing link header) — callers
+  // that only expect a URL there (smoke-staging's existing steps) are
+  // unaffected; a new step reads x-parachute-dev-magic-code.
+  if (deps.exposeDevLinks) {
+    extra["x-parachute-dev-magic-link"] = link;
+    extra["x-parachute-dev-magic-code"] = code;
+  }
+  return extra;
+}
+
 export async function handleMagicRequestPost(
   db: D1Database,
   req: Request,
@@ -230,42 +294,7 @@ export async function handleMagicRequestPost(
       const csrfToken = ensureCsrfToken(req).token;
       return wantsJson ? jsonResponse({ ok: true }, 200) : htmlResponse(renderMagicSent({ email, csrfToken }), 200);
     }
-    const { rawToken, code } = await createMagicLink(db, email, existing?.id ?? null, now, next);
-    // Build the emailed link from the origin the request came in on (app. or
-    // cloud.), NOT the fixed issuer — so a user who asked from app.parachute.
-    // computer gets a link back to app., landing the session on the origin they
-    // started on (P1.3 same-origin ceremonies). The gate above already proved
-    // the Origin is a bound member; ceremonyOrigin falls back to the issuer for
-    // any opaque/foreign origin. The stored `next` authorize resume is
-    // origin-relative, so it resumes on this same origin (T-318).
-    const link = `${ceremonyOrigin(req, deps)}/auth/verify?token=${encodeURIComponent(rawToken)}`;
-    // G5: choose the email variant at send time — no `existing` row = a
-    // brand-new account this link will create. Only the address owner reads the
-    // email, so this new-vs-returning distinction leaks nothing (the on-page
-    // copy stays neutral).
-    const sent = await sender.sendMagicLink(email, link, code, !existing);
-    if (!sent.ok) {
-      // A real-binding failure (bad address, quota, CF transient) must leave a
-      // log trail — otherwise it's a silent 200 and an inbox that never rings.
-      // Structured + PII-safe: the email's DOMAIN only, never the full address.
-      // The response below stays the same neutral 200 (no enumeration change).
-      const domain = email.split("@")[1] ?? "unknown";
-      console.error(
-        `event=magic_link_send_failed sender=${sender.kind} domain=${domain} error=${JSON.stringify(sent.error)}`,
-      );
-    }
-    // PII-free per-day counter for the weekly ops digest (never throws).
-    await bumpMagicLinkEvent(db, sent.ok ? "sent" : "failed", now);
-    const extra: Record<string, string> = {};
-    // DEV ONLY: echo the link + code so the flow is testable without real
-    // email. Gated hard on isDevExposureEnv (deps.exposeDevLinks).
-    // The code rides a SIBLING header (not the existing link header) — callers
-    // that only expect a URL there (smoke-staging's existing steps) are
-    // unaffected; a new step reads x-parachute-dev-magic-code.
-    if (deps.exposeDevLinks) {
-      extra["x-parachute-dev-magic-link"] = link;
-      extra["x-parachute-dev-magic-code"] = code;
-    }
+    const extra = await sendSignInLink(db, req, deps, sender, { email, existing, next, now });
     const csrfToken = ensureCsrfToken(req).token;
     return wantsJson
       ? jsonResponse({ ok: true }, 200, extra)
@@ -289,22 +318,80 @@ function magicError(req: Request, message: string, email: string): Response {
  * Returns null for a SUSPENDED or DELETED account — the never-mint
  * chokepoint; the caller decides how that surfaces (the link's dead-link page
  * vs the code's neutral failure message), but neither ever mints.
+ *
+ * Password sign-up (T-318 night): a NEW account takes the pending password
+ * from the link row only when `req` holds the requesting browser's binding
+ * cookie (signup-binding.ts); otherwise it is created passwordless. An
+ * EXISTING account never takes a pending password (sendSignInLink doesn't
+ * even store one for it). `bound` tells the caller to clear the cookie.
  */
 async function resolveVerifiedUser(
   db: D1Database,
   consumed: ConsumedMagicLink,
   now: Date,
   deps: OAuthDeps,
-): Promise<string | null> {
-  let userId = consumed.userId;
-  const existing = userId ? await getUserById(db, userId) : await getUserByEmail(db, consumed.email);
+  req: Request,
+): Promise<{ userId: string; bound: boolean } | null> {
+  const existing = consumed.userId ? await getUserById(db, consumed.userId) : await getUserByEmail(db, consumed.email);
   if (existing) {
     if (existing.suspendedAt || existing.deletedAt) return null;
-    userId = existing.id;
-    await markEmailVerified(db, userId);
-    return userId;
+    if (!existing.emailVerified) await claimUnverifiedAccount(db, existing.id, now);
+    return { userId: existing.id, bound: false };
   }
-  return (await createUser(db, consumed.email, "", now, { emailVerified: true, billingMode: billingModeOf(deps) })).id;
+  const bound = consumed.pending !== null && (await requestHoldsBinding(req, consumed.pending.bindingHash));
+  const user = await createUser(db, consumed.email, "", now, {
+    emailVerified: true,
+    billingMode: billingModeOf(deps),
+    ...(bound && consumed.pending ? { passwordHash: consumed.pending.passwordHash } : {}),
+  });
+  return { userId: user.id, bound };
+}
+
+/**
+ * The address on an UNVERIFIED account has just been proven by link or code.
+ * Such a row can only come from the old password sign-up, which created
+ * accounts for any address without proof — so whoever set its password (and
+ * anything that password led to) may not be the address owner. The owner now
+ * takes the account over and everything set before the proof is dropped: the
+ * password, 2FA (a planted second factor would lock the owner out), every
+ * session and half-finished 2FA login, every OAuth token, and standing consent.
+ * The vaults and their contents stay with the account.
+ *
+ * Conditional on `email_verified = 0` so it runs once, even under a race of
+ * two verifies. A genuine owner who signed up that way pays once: sign in
+ * again elsewhere, reconnect AI apps, set the password again on
+ * /console/security. A verified account never comes here.
+ */
+async function claimUnverifiedAccount(db: D1Database, userId: string, now: Date): Promise<void> {
+  const claimed = await db
+    .prepare(
+      `UPDATE users SET email_verified = 1, password_hash = '',
+         totp_secret = NULL, totp_backup_codes = NULL, totp_enrolled_at = NULL, totp_last_step = NULL
+       WHERE id = ? AND email_verified = 0`,
+    )
+    .bind(userId)
+    .run();
+  if (claimed.meta.changes === 0) return;
+  const nowIso = now.toISOString();
+  await db.batch([
+    db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId),
+    db.prepare("DELETE FROM pending_logins WHERE user_id = ?").bind(userId),
+    db.prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(nowIso, userId),
+    db.prepare("DELETE FROM grants WHERE user_id = ?").bind(userId),
+  ]);
+  console.log(`event=unverified_account_claimed user=${userId}`);
+}
+
+/** finishPrimaryAuth, plus clearing a spent sign-up binding cookie. */
+async function finishVerifiedAuth(
+  db: D1Database,
+  deps: OAuthDeps,
+  resolved: { userId: string; bound: boolean },
+  next: string,
+): Promise<Response> {
+  const res = await finishPrimaryAuth(db, deps, resolved.userId, next);
+  if (resolved.bound) res.headers.append("set-cookie", clearSignupBindingCookie());
+  return res;
 }
 
 export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
@@ -314,14 +401,14 @@ export async function handleMagicVerifyGet(db: D1Database, req: Request, deps: O
   if (!consumed) return magicLinkDead(req, deps);
   // A SUSPENDED account gets the same dead-link page as an expired token —
   // covers links minted before the suspension landed, with no oracle.
-  const userId = await resolveVerifiedUser(db, consumed, now, deps);
-  if (!userId) return magicLinkDead(req, deps);
+  const resolved = await resolveVerifiedUser(db, consumed, now, deps, req);
+  if (!resolved) return magicLinkDead(req, deps);
   // Follow the stored resume target (the authorize URL for sends from the
   // OAuth login page — single-use + expiry came free with the token consume
   // above), re-validated against the issuer origin; null → /console. A
   // 2FA-enrolled account keeps the same destination through the code prompt
   // (finishPrimaryAuth threads it into pending_logins.next).
-  return finishPrimaryAuth(db, deps, userId, safeNext(consumed.next ?? "/console", deps));
+  return finishVerifiedAuth(db, deps, resolved, safeNext(consumed.next ?? "/console", deps));
 }
 
 // --- sign-in code (the magic link's short-form spelling, auth redesign §2) --
@@ -367,14 +454,14 @@ export async function handleCodeVerifyPost(db: D1Database, req: Request, deps: O
     await recordLoginFailure(deps.rateLimiter, key, now);
     return codeError(req, authorizeParams, neutralMsg, email);
   }
-  const userId = await resolveVerifiedUser(db, consumed, now, deps);
-  if (!userId) {
+  const resolved = await resolveVerifiedUser(db, consumed, now, deps, req);
+  if (!resolved) {
     // SUSPENDED — same neutral failure as a wrong/expired code, never a mint.
     await recordLoginFailure(deps.rateLimiter, key, now);
     return codeError(req, authorizeParams, neutralMsg, email);
   }
   await clearLoginFailures(deps.rateLimiter, key);
-  return finishPrimaryAuth(db, deps, userId, safeNext(consumed.next ?? "/console", deps));
+  return finishVerifiedAuth(db, deps, resolved, safeNext(consumed.next ?? "/console", deps));
 }
 
 /** Re-render whichever ceremony page the code was submitted from, with the

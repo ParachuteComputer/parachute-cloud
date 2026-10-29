@@ -16,7 +16,6 @@ import {
   parseBoundOrigins,
   resolveBoundOrigins,
 } from "../src/oauth-shared.ts";
-import { getUserByEmail } from "../src/users.ts";
 import { CSRF, ISSUER } from "./helpers.ts";
 
 const APP = "https://app.parachute.computer";
@@ -190,10 +189,17 @@ describe("ceremonyOrigin — request-origin-aware, issuer fallback", () => {
 /**
  * End-to-end through the real router: /signup runs the exact
  * `verifyCsrfToken(req, form) && isSameOriginRequest(req, resolveBoundOrigins(deps))`
- * gate every cookie-authed POST uses. The signal is user creation — a refused
- * request never reaches createUser. Distinct IPs keep the signup rate-limiter
- * (20/h/IP) out of the way; distinct emails avoid the already-exists branch.
+ * gate every cookie-authed POST uses. The signal is a minted sign-in link (since
+ * T-318 night POST /signup creates no account; it emails a link) — a refused
+ * request never reaches the send. Distinct IPs keep the signup rate-limiter
+ * (20/h/IP) out of the way.
  */
+/** Did the POST get through to the send (a magic_links row for the address)? */
+async function linkMinted(email: string): Promise<boolean> {
+  const r = await env.DB.prepare("SELECT COUNT(*) AS n FROM magic_links WHERE email = ?").bind(email).first<{ n: number }>();
+  return (r?.n ?? 0) > 0;
+}
+
 describe("the real router gate (/signup) honors BOUND_ORIGINS", () => {
   const appEnv = { ...env, BOUND_ORIGINS: APP } as never;
   // The committed env now SETS BOUND_ORIGINS (the P1.3 fix), so to exercise the
@@ -222,31 +228,31 @@ describe("the real router gate (/signup) honors BOUND_ORIGINS", () => {
   test("UNSET (regression pin): with BOUND_ORIGINS absent, an app.-origin POST is refused — only ISSUER passes", async () => {
     const email = "p05-unset-app@example.com";
     await app.fetch(signupReq(APP, { email, ip: "10.50.0.1" }), unsetEnv);
-    expect(await getUserByEmail(env.DB, email)).toBeNull();
+    expect(await linkMinted(email)).toBe(false);
   });
 
   test("SET {cloud., app.}: an app.-origin POST passes the same-origin gate (account surface lives)", async () => {
     const email = "p05-set-app@example.com";
     await app.fetch(signupReq(APP, { email, ip: "10.50.0.2" }), appEnv);
-    expect(await getUserByEmail(env.DB, email)).not.toBeNull();
+    expect(await linkMinted(email)).toBe(true);
   });
 
   test("SET {cloud., app.}: the ISSUER origin STILL passes (nothing accepted today breaks)", async () => {
     const email = "p05-set-issuer@example.com";
     await app.fetch(signupReq(ISSUER, { email, ip: "10.50.0.3" }), appEnv);
-    expect(await getUserByEmail(env.DB, email)).not.toBeNull();
+    expect(await linkMinted(email)).toBe(true);
   });
 
   test("SET {cloud., app.}: a FOREIGN origin is STILL refused (the security property)", async () => {
     const email = "p05-set-evil@example.com";
     await app.fetch(signupReq(EVIL, { email, ip: "10.50.0.4" }), appEnv);
-    expect(await getUserByEmail(env.DB, email)).toBeNull();
+    expect(await linkMinted(email)).toBe(false);
   });
 
   test("SET {cloud., app.}: a valid app. origin + BAD CSRF is STILL refused (CSRF independent)", async () => {
     const email = "p05-set-badcsrf@example.com";
     await app.fetch(signupReq(APP, { email, ip: "10.50.0.5", csrf: "wrong-token" }), appEnv);
-    expect(await getUserByEmail(env.DB, email)).toBeNull();
+    expect(await linkMinted(email)).toBe(false);
   });
 
   // The COMMITTED prod config (Phase A1): `env` here is the real wrangler.toml
@@ -254,19 +260,19 @@ describe("the real router gate (/signup) honors BOUND_ORIGINS", () => {
   test("the COMMITTED {cloud., app., my.}: a my.-origin POST passes the same-origin gate (the one-origin door)", async () => {
     const email = "a1-set-my@example.com";
     await app.fetch(signupReq(MY, { email, ip: "10.50.0.6" }), env);
-    expect(await getUserByEmail(env.DB, email)).not.toBeNull();
+    expect(await linkMinted(email)).toBe(true);
   });
 
   test("the COMMITTED {cloud., app., my.}: a FOREIGN origin is STILL refused even with my. bound", async () => {
     const email = "a1-set-evil@example.com";
     await app.fetch(signupReq(EVIL, { email, ip: "10.50.0.7" }), env);
-    expect(await getUserByEmail(env.DB, email)).toBeNull();
+    expect(await linkMinted(email)).toBe(false);
   });
 
   test("the COMMITTED {cloud., app., my.}: a my. origin + BAD CSRF is STILL refused (CSRF independent of the origin widening)", async () => {
     const email = "a1-set-my-badcsrf@example.com";
     await app.fetch(signupReq(MY, { email, ip: "10.50.0.8", csrf: "wrong-token" }), env);
-    expect(await getUserByEmail(env.DB, email)).toBeNull();
+    expect(await linkMinted(email)).toBe(false);
   });
 });
 
@@ -307,6 +313,6 @@ describe("VAULT_ORIGIN stays OUT of the CSRF/same-origin accept-set (the conflat
       }),
       env,
     );
-    expect(await getUserByEmail(env.DB, email)).toBeNull();
+    expect(await linkMinted(email)).toBe(false);
   });
 });

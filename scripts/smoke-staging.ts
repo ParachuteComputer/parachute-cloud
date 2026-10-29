@@ -139,6 +139,33 @@ function form(o: Record<string, string>): string {
   return new URLSearchParams(o).toString();
 }
 const FORM = { "content-type": "application/x-www-form-urlencoded" };
+
+/**
+ * Password sign-up, the way a person does it since T-318 night: POST /signup
+ * only emails a link (staging echoes it in x-parachute-dev-magic-link and sends
+ * nothing); opening it in the same "browser" (the parachute_id_signup cookie)
+ * creates the account with the chosen password and a session.
+ */
+async function passwordSignup(email: string, password: string): Promise<{ csrf: string | null; session: string | null; detail: string }> {
+  const suGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
+  const csrf = cookieVal(suGet.headers.getSetCookie(), "parachute_id_csrf");
+  const suRes = await fetch(`${IDENTITY}/signup`, {
+    method: "POST",
+    headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${csrf}` },
+    redirect: "manual",
+    body: form({ __csrf: csrf!, email, password }),
+  });
+  const early = cookieVal(suRes.headers.getSetCookie(), "parachute_id_session");
+  if (early) return { csrf, session: null, detail: "POST /signup minted a session before the address was proven" };
+  const binding = cookieVal(suRes.headers.getSetCookie(), "parachute_id_signup");
+  const link = suRes.headers.get("x-parachute-dev-magic-link");
+  if (suRes.status !== 200 || !binding || !link) {
+    return { csrf, session: null, detail: `signup status ${suRes.status}, binding ${!!binding}, link ${!!link}` };
+  }
+  const verify = await fetch(link, { redirect: "manual", headers: { cookie: `parachute_id_signup=${binding}` } });
+  const session = cookieVal(verify.headers.getSetCookie(), "parachute_id_session");
+  return { csrf, session, detail: `verify status ${verify.status}` };
+}
 /**
  * Extract the cross-origin redirect target from a rendered same-origin
  * bridge page (workers/identity/src/ui.ts renderRedirectBridge — the
@@ -555,17 +582,11 @@ async function main() {
     const newPassword = b64url(crypto.getRandomValues(new Uint8Array(18)));
     const newVault = `box-${Date.now()}`;
 
-    // Signup (GET for CSRF, then POST).
-    const suGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
-    const suCsrf = cookieVal(suGet.headers.getSetCookie(), "parachute_id_csrf");
-    const suRes = await fetch(`${IDENTITY}/signup`, {
-      method: "POST",
-      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${suCsrf}` },
-      redirect: "manual",
-      body: form({ __csrf: suCsrf!, email: newEmail, password: newPassword }),
-    });
-    const newSession = cookieVal(suRes.headers.getSetCookie(), "parachute_id_session");
-    assert(suRes.status === 302 && suRes.headers.get("location") === "/console" && !!newSession, "signup → session + /console", `status ${suRes.status}`);
+    // Password sign-up: the emailed link (echoed on staging) creates the account.
+    const su = await passwordSignup(newEmail, newPassword);
+    const suCsrf = su.csrf;
+    const newSession = su.session;
+    assert(!!newSession, "password signup → link → session", su.detail);
 
     // Create a vault (GET /console for CSRF, then POST).
     const conGet = await fetch(`${IDENTITY}/console`, { headers: { cookie: `parachute_id_session=${newSession}` }, redirect: "manual" });
@@ -1220,18 +1241,12 @@ async function main() {
     const vaultName = `arrive-${Date.now()}`;
     const firstNote = `Remember: I am rebuilding my garden (${MARKER})`;
 
-    // Signup → session.
-    const suGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
-    const csrf = cookieVal(suGet.headers.getSetCookie(), "parachute_id_csrf");
-    const suRes = await fetch(`${IDENTITY}/signup`, {
-      method: "POST",
-      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${csrf}` },
-      redirect: "manual",
-      body: form({ __csrf: csrf!, email, password }),
-    });
-    const session = cookieVal(suRes.headers.getSetCookie(), "parachute_id_session");
+    // Signup → emailed link → session.
+    const su = await passwordSignup(email, password);
+    const csrf = su.csrf;
+    const session = su.session;
     const cookie = `parachute_id_session=${session}; parachute_id_csrf=${csrf}`;
-    assert(suRes.status === 302 && !!session, "arrival: signup → session", `status ${suRes.status}`);
+    assert(!!session, "arrival: signup → link → session", su.detail);
     arrivalCookie = cookie;
     arrivalVault = vaultName;
     arrivalEmail = email;
@@ -1621,16 +1636,10 @@ async function main() {
     const tEmail = `tier-${Date.now()}@smoke.test`;
     const tPass = b64url(crypto.getRandomValues(new Uint8Array(18)));
     const tVault = `tierbox-${Date.now()}`;
-    const tSuGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
-    const tCsrf = cookieVal(tSuGet.headers.getSetCookie(), "parachute_id_csrf");
-    const tSu = await fetch(`${IDENTITY}/signup`, {
-      method: "POST",
-      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${tCsrf}` },
-      redirect: "manual",
-      body: form({ __csrf: tCsrf!, email: tEmail, password: tPass }),
-    });
-    const tSession = cookieVal(tSu.headers.getSetCookie(), "parachute_id_session");
-    assert(tSu.status === 302 && !!tSession, "tier-change: fresh signup → session", `status ${tSu.status}`);
+    const tSu = await passwordSignup(tEmail, tPass);
+    const tCsrf = tSu.csrf;
+    const tSession = tSu.session;
+    assert(!!tSession, "tier-change: fresh signup → link → session", tSu.detail);
     const tCookie = `parachute_id_session=${tSession}; parachute_id_csrf=${tCsrf}`;
 
     const tCv = await fetch(`${IDENTITY}/console/vaults`, {
