@@ -32,7 +32,7 @@ export function renderUndoConfirm(p: UndoConfirmProps): string {
   const vaultLine =
     n === 0
       ? `<p>This account has no vaults.</p>`
-      : `<p>${n === 1 ? "Your vault comes" : `Your ${n} vaults come`} back exactly as they were, with every note, file and snapshot in ${n === 1 ? "it" : "them"}:</p>
+      : `<p>${n === 1 ? "Your vault comes" : `Your ${n} vaults come`} back exactly as ${n === 1 ? "it was" : "they were"}, with every note, file and snapshot in ${n === 1 ? "it" : "them"}:</p>
          <ul class="scopes">${p.vaultNames.map((v) => `<li>${esc(v)}</li>`).join("")}</ul>`;
   return page(
     "Restore your account — Parachute",
