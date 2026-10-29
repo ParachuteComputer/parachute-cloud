@@ -41,6 +41,7 @@ import {
 } from "./admin-ui.ts";
 import {
   type OAuthDeps,
+  billingModeOf,
   htmlResponse,
   isSameOriginRequest,
   redirectResponse,
@@ -230,6 +231,7 @@ export async function handleAdminUsersGet(db: D1Database, req: Request, deps: OA
       totalPages,
       totalUsers,
       csrfToken: csrf.token,
+      billingMode: billingModeOf(deps),
       notice: NOTICES[params.get("notice") ?? ""],
       error: ERRORS[params.get("err") ?? ""],
     }),
