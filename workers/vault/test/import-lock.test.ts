@@ -138,6 +138,11 @@ describe("import lock (T-318)", () => {
     // A stranger learns nothing: no token, no 503.
     const anon = await SELF.fetch(`${base(v)}/api/notes?limit=1`);
     expect(anon.status).toBe(401);
+    // Routes that carry no bearer get the retryable 503 itself, not a 401 that
+    // reads as a dead session: the WebSocket upgrade and a ticket spend.
+    const ws = await SELF.fetch(`${base(v)}/api/subscribe`, { headers: { Upgrade: "websocket" } });
+    expect(ws.status).toBe(503);
+    expect((await SELF.fetch(`${base(v)}/tickets/no-such-ticket`)).status).toBe(503);
 
     hold.release();
     const res = await importing;

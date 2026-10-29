@@ -874,6 +874,7 @@ async function importFailureResponse(
  * worker's own 413 — three fences, one friendly message.
  */
 export async function handleImportPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const startedMs = Date.now();
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
 
@@ -1002,7 +1003,14 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
   } else {
     logImportForwardFailed(user.id, vaultName, res ? `status=${res.status}` : forwardError);
     const definite = res !== null && res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
-    const landed = definite ? null : await confirmImportLanded(db, deps, user.id, vaultName, importId);
+    // Refused because ANOTHER attempt is replaying into this vault (a double
+    // submit, a second tab): that attempt's outcome is the vault's outcome.
+    const busy = res?.status === 503
+      ? ((await res.clone().json().catch(() => ({}))) as { error_type?: unknown }).error_type === "import_in_progress"
+      : false;
+    const landed = definite
+      ? null
+      : await confirmImportLanded(db, deps, user.id, vaultName, busy ? null : importId, startedMs + IMPORT_CONFIRM_BUDGET_MS);
     if (!landed) return importFailureResponse(db, req, deps, user, importFailedMessage(vaultName));
     console.log(`event=import_confirmed_after_error vault=${vaultName} notes=${landed.notes}`);
     notes = landed.notes;
@@ -1027,26 +1035,33 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
 /** The vault's import-status answer, as far as the console reads it. */
 type ImportStatusBody = { state?: unknown; import_id?: unknown; notes?: unknown; skipped_attachments?: unknown };
 
-/** How often, and how many times, the console asks whether an import landed. */
+/** How often the console asks whether an import landed, and until when: the
+ *  whole upload request must answer before Cloudflare's ~100 s proxy timeout. */
 const IMPORT_CONFIRM_INTERVAL_MS = 2_000;
-const IMPORT_CONFIRM_POLLS = 45;
+const IMPORT_CONFIRM_BUDGET_MS = 85_000;
 
 /**
  * After an import request errored, ask the vault whether import attempt
  * `importId` landed anyway (T-318). Polls while the vault reports it still
- * running (or answers 503 `import_in_progress`), up to ~90 s. Returns the
- * counts when the vault recorded THIS attempt as done; null for anything else
- * (failed, interrupted, another attempt, unreachable). Never throws.
+ * running (or answers 503 `import_in_progress`), until `deadlineMs` (the
+ * upload request's own budget). Returns the counts when the vault recorded
+ * THIS attempt as done (`importId` null: any attempt, for a request refused
+ * because another one was replaying); null for anything else (failed,
+ * interrupted, another attempt, unreachable, out of time). Never throws.
  */
 async function confirmImportLanded(
   db: D1Database,
   deps: OAuthDeps,
   userId: string,
   vaultName: string,
-  importId: string,
+  importId: string | null,
+  deadlineMs: number,
 ): Promise<{ notes: number; skipped: number } | null> {
-  for (let i = 0; i < IMPORT_CONFIRM_POLLS; i++) {
-    if (i > 0) await new Promise((resolve) => setTimeout(resolve, IMPORT_CONFIRM_INTERVAL_MS));
+  for (let i = 0; ; i++) {
+    if (i > 0) {
+      if (Date.now() + IMPORT_CONFIRM_INTERVAL_MS > deadlineMs) return null;
+      await new Promise((resolve) => setTimeout(resolve, IMPORT_CONFIRM_INTERVAL_MS));
+    }
     let rec: ImportStatusBody | null = null;
     try {
       const res = await callVaultImportStatus(db, deps, userId, vaultName);
@@ -1057,7 +1072,7 @@ async function confirmImportLanded(
       return null; // the vault can't be reached at all: report the failure
     }
     if (rec?.state === "running") continue;
-    if (rec?.state === "done" && rec.import_id === importId) {
+    if (rec?.state === "done" && (importId === null || rec.import_id === importId)) {
       return {
         notes: typeof rec.notes === "number" ? rec.notes : 0,
         skipped: typeof rec.skipped_attachments === "number" ? rec.skipped_attachments : 0,
@@ -1065,7 +1080,6 @@ async function confirmImportLanded(
     }
     return null;
   }
-  return null;
 }
 
 // --- snapshot restore (Wave 4e — paid plans only) -----------------------------

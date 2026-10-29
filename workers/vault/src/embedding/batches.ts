@@ -18,7 +18,9 @@
  *   2. calls are planned by total characters as well as count
  *      ({@link planEmbedBatches});
  *   3. a call the model still rejects as too long is split in half, down to
- *      one text, and a single text is halved again ({@link embedSplitting}).
+ *      one text, and a single text is halved again ({@link embedSplitting});
+ *      a short text it still rejects is stored as a fixed fallback, so no
+ *      chunk can make the drain retry forever.
  *
  * Characters stand in for tokens: one token per character is the worst case
  * this assumes, so a planned call never exceeds the window. Typical text runs
@@ -79,11 +81,19 @@ function isInputRejected(e: unknown): boolean {
   return err.code === "input_rejected" && err.retriable === false;
 }
 
+/** What a chunk the model refuses outright is embedded as, so it stops coming back (see embedSplitting). */
+export const EMBED_FALLBACK_TEXT = "[a passage the embedding model could not read]";
+
 /**
  * Embed `texts`, splitting a call the model rejects as too long: halves for
  * several texts, a halved text for one. Returns one vector per text, in
- * order. Any other error, or a rejection of a text already at
- * {@link EMBED_MIN_CHARS}, propagates (the caller leaves those chunks stale).
+ * order; a half that succeeded is kept even when its sibling is split
+ * further. A single text the model still rejects at {@link EMBED_MIN_CHARS}
+ * (so not about length: an odd character, a policy refusal) is embedded as
+ * {@link EMBED_FALLBACK_TEXT} instead. Its stored hash is still the chunk's,
+ * so it reads as fresh and no longer wedges the drain on every wake; it is
+ * findable by nothing in particular. Other errors (transient, network)
+ * propagate, and the caller leaves the chunks stale for the next wake.
  */
 export async function embedSplitting(provider: EmbeddingProvider, texts: string[]): Promise<Float32Array[]> {
   try {
@@ -97,7 +107,11 @@ export async function embedSplitting(provider: EmbeddingProvider, texts: string[
       return [...left, ...right];
     }
     const only = texts[0]!;
-    if (only.length <= EMBED_MIN_CHARS) throw e;
+    if (only === EMBED_FALLBACK_TEXT) throw e;
+    if (only.length <= EMBED_MIN_CHARS) {
+      console.warn(`[embeddings] a ${only.length}-char text was rejected as-is; storing the fallback vector`);
+      return embedSplitting(provider, [EMBED_FALLBACK_TEXT]);
+    }
     return embedSplitting(provider, [capEmbedText(only, Math.max(EMBED_MIN_CHARS, Math.floor(only.length / 2)))]);
   }
 }

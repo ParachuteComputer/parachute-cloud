@@ -639,7 +639,48 @@ export class VaultDO extends DurableObject {
   // -------------------------------------------------------------------------
 
   async fetch(request: Request): Promise<Response> {
+    // The import lock (T-318) answers here, BEFORE the request is counted as
+    // in flight: a refused request must not hold up the import's drain.
+    if (this.importRun) {
+      const refused = await this.answerDuringImport(request);
+      if (refused) return refused;
+    }
     return this.counted(() => this.handleFetch(request));
+  }
+
+  /**
+   * While an import or restore replays (T-318; see `importRun`): the
+   * import-status probe is answered from memory and DO storage, without
+   * touching the half-imported store; every other request gets 503
+   * `import_in_progress`. Routes that carry no bearer (the WebSocket upgrade,
+   * whose auth is its first message; ticket spends) get the 503 as is; the
+   * rest authenticate first, so a stranger still sees 401. Returns null when
+   * the import ended meanwhile (the request then runs normally).
+   */
+  private async answerDuringImport(request: Request): Promise<Response | null> {
+    const url = new URL(request.url);
+    const m = /^\/vault\/([^/]+)(\/.*)?$/.exec(url.pathname);
+    if (!m) return null;
+    const vaultName = decodeURIComponent(m[1]!);
+    const rest = m[2] ?? "";
+    if (rest === "/api/internal/import-status") {
+      const auth = await authenticateVaultRequest(request, this.env, vaultName);
+      if ("error" in auth) return auth.error;
+      const forbidden = this.internalForbidden(auth, vaultName);
+      if (forbidden) return forbidden;
+      return this.handleImportStatus(request);
+    }
+    const bearerless = rest.startsWith("/tickets/") || (rest === "/api/subscribe" && isWebSocketUpgrade(request));
+    if (!bearerless) {
+      const auth = await authenticateVaultRequest(request, this.env, vaultName);
+      if ("error" in auth) {
+        await request.body?.cancel().catch(() => {});
+        return auth.error;
+      }
+    }
+    if (!this.importRun) return null;
+    await request.body?.cancel().catch(() => {});
+    return importInProgressResponse();
   }
 
   /**
@@ -684,18 +725,6 @@ export class VaultDO extends DurableObject {
     if (!m) return json({ error: "Not found" }, 404);
     const vaultName = decodeURIComponent(m[1]!);
     const rest = m[2] ?? "";
-
-    // The import lock (T-318) — see `importRun`. Checked before everything,
-    // destroy included: a destroy mid-replay would be followed by the
-    // replay's next chunk of writes. Only the import-status probe passes (the
-    // console asks it whether the import landed). The caller authenticates
-    // first, so the 503 tells nothing to a stranger.
-    if (this.importRun && rest !== "/api/internal/import-status") {
-      const busyAuth = await authenticateVaultRequest(request, this.env, vaultName);
-      await request.body?.cancel().catch(() => {});
-      if ("error" in busyAuth) return busyAuth.error;
-      return importInProgressResponse();
-    }
 
     // Vault destroy (cloud#226 PR-1) — dispatched BEFORE ensureState and
     // everything else, deliberately. `handleDestroy` touches only R2 + DO
@@ -2759,6 +2788,13 @@ export class VaultDO extends DurableObject {
         }
       }
 
+      // An import took the lock while transcription ran (T-318): do nothing
+      // more against the half-imported vault; look again after it.
+      if (this.importRun) {
+        await this.ctx.storage.setAlarm(Date.now() + IMPORT_ALARM_HOLD_MS);
+        return;
+      }
+
       // Embedding drain (C2) — runs every wake, independent of whether a
       // transcription was due. See drainEmbeddingsOnce's doc for the outcome
       // shape; `more`/`failed` decide the re-arm below, `empty`/(`partial` with
@@ -2943,7 +2979,9 @@ export class VaultDO extends DurableObject {
     const provider = this.store.embeddingProvider;
     if (!provider) return { kind: "disabled" };
     const generation = this.importGeneration;
+    if (this.alarmMustYield(generation)) return { kind: "failed", more: true };
     const avail = await provider.available();
+    if (this.alarmMustYield(generation)) return { kind: "failed", more: true };
     if (!avail.ok) return { kind: "unavailable" };
 
     const db = this.store.db;

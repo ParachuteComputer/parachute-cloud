@@ -1,4 +1,6 @@
 import { SELF, env } from "cloudflare:test";
+import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
+import { mintToken as mintClientToken } from "./helpers.ts";
 import { describe, it, expect } from "vitest";
 import { SignJWT, importJWK } from "jose";
 import { TEST_PRIVATE_JWK, TEST_KID } from "./test-keys.ts";
@@ -621,6 +623,18 @@ describe("auth matrix", () => {
     const token = await mintToken({ vault: v, scopes: "vault:read vault:write" });
     const res = await SELF.fetch(`${base(v)}/api/notes`, { headers: { Authorization: `Bearer ${token}` } });
     expect(res.status).toBe(401);
+  });
+
+  it("GET /api/internal/import-status (T-318): no token 401, tenant admin 403, first-party 200", async () => {
+    const v = freshVault();
+    const url = `${base(v)}/api/internal/import-status`;
+    expect((await SELF.fetch(url)).status).toBe(401);
+    const tenant = await mintClientToken({ vault: v, scopes: `vault:${v}:admin`, vaultScope: [v] });
+    expect((await SELF.fetch(url, { headers: { Authorization: `Bearer ${tenant}` } })).status).toBe(403);
+    const firstParty = await mintClientToken({ vault: v, scopes: `vault:${v}:admin`, vaultScope: [v], clientId: FIRST_PARTY_CLIENT_ID });
+    const ok = await SELF.fetch(url, { headers: { Authorization: `Bearer ${firstParty}` } });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ state: "none" });
   });
 
   it("vault_scope pin mismatch → 403 vault_scope_mismatch", async () => {
