@@ -324,6 +324,17 @@ describe("restore — tar plumbing (unit)", () => {
     const broken = tar.slice();
     broken.set(enc.encode("9"), 512); // first record's "<len>" → wrong length
     expect(() => parseTar(broken)).toThrow(UnreadableTarError);
+    // A huge PAX body with no length separator is refused cleanly too (no RangeError → 500).
+    const blob = new Uint8Array(512 * 3 + 300_000 + 1024);
+    blob.set(tar.subarray(0, 512)); // the 'x' header block, size field rewritten below
+    const size = (300_000).toString(8).padStart(11, "0") + "\0";
+    blob.set(enc.encode(size), 124);
+    let sum = 0;
+    blob.fill(0x20, 148, 156);
+    for (let i = 0; i < 512; i++) sum += blob[i]!;
+    blob.set(enc.encode(sum.toString(8).padStart(6, "0") + "\0 "), 148);
+    blob.fill(0x31, 512, 512 + 300_000); // "1111…": digits, never a space
+    expect(() => parseTar(blob)).toThrow(UnreadableTarError);
     // PAX global headers stay refused.
     const global = tar.slice();
     global[156] = 0x67;

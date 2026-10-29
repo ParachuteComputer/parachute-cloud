@@ -214,8 +214,9 @@ export async function runSnapshotSweep(
       key: "snapshot:failed",
       subject: `${failed} of ${vaults.length} vault backups failed (${day})`,
       text: [
-        `The nightly snapshot sweep on ${day} could not back up ${failed} of ${vaults.length} vaults.`,
-        "Those vaults have no new restore point until the cause is fixed; nothing retries before tomorrow's run.",
+        `A snapshot run on ${day} (${scoped ? "re-run of named vaults" : "the nightly sweep"}) could not back up ${failed} of ${vaults.length} vaults.`,
+        "Those vaults have no new restore point until the cause is fixed. The nightly sweep tries again at 04:00 UTC;",
+        "POST /ops/snapshot-run (bearer OPS_RUN_TOKEN) re-runs every stale vault after a fix.",
         "",
         "Workers Logs (parachute-identity): event=snapshot_failed names each vault and the error;",
         "the vault worker (parachute-vault-do) logs the matching 500 for POST /api/internal/snapshot.",
