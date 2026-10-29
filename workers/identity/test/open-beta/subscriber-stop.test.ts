@@ -314,6 +314,34 @@ describe("stopping a paying subscriber lands them on the open beta", () => {
       STRIPE_ENV,
     );
     expect(created.status).toBe(201);
+
+    // Restoring a snapshot into a new vault counts against the same ten (Codex P2).
+    const snapKey = "vault-stop-power-1/snapshots/2026-10-28.tar";
+    await env.DB.prepare(
+      "INSERT INTO vault_snapshots (vault_name, key, taken_at, bytes, ranks) VALUES (?, ?, ?, 1, '[\"daily\"]')",
+    )
+      .bind("stop-power-1", snapKey, new Date().toISOString())
+      .run();
+    const session = await seedSession(id);
+    const restore = await app.fetch(
+      new Request(`${CANONICAL_ORIGIN}/console/vaults/restore`, {
+        method: "POST",
+        body: new URLSearchParams({ __csrf: CSRF, vault: "stop-power-1", key: snapKey }),
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: CANONICAL_ORIGIN,
+          cookie: `parachute_id_csrf=${CSRF}; parachute_id_session=${session}`,
+        },
+      }),
+      STRIPE_ENV,
+    );
+    // Past the cap gate: the restored vault's row exists (the DO restore call
+    // itself has no mock here and fails afterwards, which is fine).
+    expect(await restore.text()).not.toContain("vault limit");
+    const restored = await env.DB.prepare("SELECT COUNT(*) AS n FROM vaults WHERE owner_user_id = ? AND name LIKE 'stop-power-1-%'")
+      .bind(id)
+      .first<{ n: number }>();
+    expect(restored?.n).toBe(1);
   });
 
   test("cancel at period end: paid plan and writes stay until Stripe ends it, then the open beta", async () => {

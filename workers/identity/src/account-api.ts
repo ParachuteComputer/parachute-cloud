@@ -472,7 +472,7 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   // refused here with the same at-cap message the console gives.
   const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
   if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-    return restError(403, "vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps)));
+    return restError(403, "vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
   }
 
   const body = await readJsonBody(req);

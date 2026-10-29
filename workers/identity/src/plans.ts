@@ -646,9 +646,10 @@ export function trialBannerLine(tierLabel: string, isDefault: boolean, daysLeft:
  * The friendly refusal when a restore would need a vault slot the plan doesn't
  * have (restore always creates a NEW vault — it never overwrites).
  */
-export function restoreAtCapMessage(plan: PlanId, mode: BillingMode): string {
+export function restoreAtCapMessage(plan: PlanId, mode: BillingMode, pendingPlan: PlanId | null = null): string {
+  const limit = PLAN_SPECS[vaultLimitPlan(plan, pendingPlan, mode)].vault_count;
   plan = livePlan(plan, mode);
-  const spec = PLAN_SPECS[plan];
+  const spec = { ...PLAN_SPECS[plan], vault_count: limit };
   if (mode === "open_beta" && plan === "trial") {
     return `Restoring creates a new vault, and your account is at its ${spec.vault_count}-vault limit for the open beta. Free up a slot first, or write hello@parachute.computer.`;
   }
@@ -660,9 +661,10 @@ export function restoreAtCapMessage(plan: PlanId, mode: BillingMode): string {
  * (grandfathered) see the same message: they keep everything they have — the
  * cap only refuses NEW creation until they're under it.
  */
-export function vaultCapMessage(plan: PlanId, mode: BillingMode): string {
+export function vaultCapMessage(plan: PlanId, mode: BillingMode, pendingPlan: PlanId | null = null): string {
+  const limit = PLAN_SPECS[vaultLimitPlan(plan, pendingPlan, mode)].vault_count;
   plan = livePlan(plan, mode);
-  const spec = PLAN_SPECS[plan];
+  const spec = { ...PLAN_SPECS[plan], vault_count: limit };
   if (mode === "open_beta" && plan === "trial") {
     const n = `${spec.vault_count} vault${spec.vault_count === 1 ? "" : "s"}`;
     return `During the open beta your account includes ${n} — that's the current ceiling. Need more? Write hello@parachute.computer.`;

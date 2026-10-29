@@ -415,6 +415,7 @@ async function renderConsoleFor(
       // gives way to the friendly at-cap note. The POST handler is the real
       // gate; this just keeps the UI honest.
       atVaultCap: cards.length >= PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))].vault_count,
+      pendingPlan: user.pendingPlan,
       // Operators get the quiet Admin header link (the surface itself 404s
       // for everyone else — admin.ts).
       isOperator: user.role === "operator",
@@ -647,7 +648,7 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   // "pick a plan to create your first vault" path instead of the cap wall.
   const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
   if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-    return fail(vaultCapMessage(user.plan, billingModeOf(deps)));
+    return fail(vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
   }
   try {
     const vault = await createVault(db, rawName, user.id, deps.now?.() ?? new Date());
@@ -896,7 +897,7 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
     // refused here exactly as create refuses it.
     const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
     if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-      return consoleError(db, req, deps, user, vaultCapMessage(user.plan, billingModeOf(deps)));
+      return consoleError(db, req, deps, user, vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
     }
     try {
       // `importPending: true` stamps `import_pending_at` atomically in the
@@ -1009,6 +1010,9 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
   if (!user) return redirectResponse("/login");
   const spec = PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))];
   if (!spec.restore) return routerNotFound();
+  // The new vault a restore makes counts against the same limit as any other
+  // creation (a former Power subscriber keeps ten in open beta).
+  const vaultLimit = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))].vault_count;
 
   const form = await req.formData();
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
@@ -1034,8 +1038,8 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
   if (!existing) {
     // Restore creates a NEW vault — it counts against the plan's vault limit
     // exactly like any other creation (same `>=` grandfathering rule).
-    if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-      return consoleError(db, req, deps, user, restoreAtCapMessage(user.plan, billingModeOf(deps)));
+    if ((await countVaultsForOwner(db, user.id)) >= vaultLimit) {
+      return consoleError(db, req, deps, user, restoreAtCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
     }
     try {
       await createVault(db, targetName, user.id, now);
