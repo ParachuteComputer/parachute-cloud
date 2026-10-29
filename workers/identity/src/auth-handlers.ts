@@ -358,31 +358,39 @@ async function resolveVerifiedUser(
  * authorization code, and standing consent.
  * The vaults and their contents stay with the account.
  *
- * Conditional on `email_verified = 0` so it runs once, even under a race of
- * two verifies. A genuine owner who signed up that way pays once: sign in
- * again elsewhere, reconnect AI apps, set the password again on
+ * Conditional on `email_verified = 0` and done in one transaction, so it runs
+ * once and whole, even under a race of two verifies or a failed write. A
+ * genuine owner who signed up that way pays once: sign in again elsewhere,
+ * reconnect AI apps, set the password again on
  * /console/security. A verified account never comes here.
  */
 async function claimUnverifiedAccount(db: D1Database, userId: string, now: Date): Promise<void> {
-  const claimed = await db
-    .prepare(
-      `UPDATE users SET email_verified = 1, password_hash = '',
-         totp_secret = NULL, totp_backup_codes = NULL, totp_enrolled_at = NULL, totp_last_step = NULL
-       WHERE id = ? AND email_verified = 0`,
-    )
-    .bind(userId)
-    .run();
-  if (claimed.meta.changes === 0) return;
+  // One D1 batch = one transaction: the cleanup and the flip to verified land
+  // together or not at all (Codex P1). If the flip landed alone, a later proof
+  // would skip the cleanup and the old holder's credentials would live on.
+  // Each cleanup statement is guarded on the row still being unverified, and
+  // the flip runs last, so a verified account is never touched.
+  const unverified = "EXISTS (SELECT 1 FROM users WHERE id = ? AND email_verified = 0)";
   const nowIso = now.toISOString();
-  await db.batch([
-    db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId),
-    db.prepare("DELETE FROM pending_logins WHERE user_id = ?").bind(userId),
-    db.prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(nowIso, userId),
-    db.prepare("DELETE FROM grants WHERE user_id = ?").bind(userId),
+  const results = await db.batch([
+    db.prepare(`DELETE FROM sessions WHERE user_id = ? AND ${unverified}`).bind(userId, userId),
+    db.prepare(`DELETE FROM pending_logins WHERE user_id = ? AND ${unverified}`).bind(userId, userId),
+    db
+      .prepare(`UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL AND ${unverified}`)
+      .bind(nowIso, userId, userId),
+    db.prepare(`DELETE FROM grants WHERE user_id = ? AND ${unverified}`).bind(userId, userId),
     // An unredeemed authorization code would otherwise still trade for fresh
     // tokens after the claim (redemption checks the code, not the grant).
-    db.prepare("DELETE FROM auth_codes WHERE user_id = ?").bind(userId),
+    db.prepare(`DELETE FROM auth_codes WHERE user_id = ? AND ${unverified}`).bind(userId, userId),
+    db
+      .prepare(
+        `UPDATE users SET email_verified = 1, password_hash = '',
+           totp_secret = NULL, totp_backup_codes = NULL, totp_enrolled_at = NULL, totp_last_step = NULL
+         WHERE id = ? AND email_verified = 0`,
+      )
+      .bind(userId),
   ]);
+  if ((results[results.length - 1]?.meta.changes ?? 0) === 0) return;
   console.log(`event=unverified_account_claimed user=${userId}`);
 }
 

@@ -296,6 +296,41 @@ describe("accounts made by the old unverified sign-up", () => {
     await expect(redeemAuthCode(env.DB, pendingCode)).rejects.toBeInstanceOf(AuthCodeNotFoundError);
   }, 30_000);
 
+  test("a claim whose cleanup fails changes nothing, so the next proof still drops the old credentials (Codex P1)", async () => {
+    const email = "planted-retry@example.com";
+    const { user, session } = await legacyAccount(email);
+    // The first verify hits a D1 failure in the claim's write batch.
+    let failNext = true;
+    const flakyDb = new Proxy(env.DB, {
+      get(target, prop, receiver) {
+        if (prop === "batch") {
+          return async (stmts: D1PreparedStatement[]) => {
+            if (failNext) {
+              failNext = false;
+              throw new Error("D1 batch failed (injected)");
+            }
+            return target.batch(stmts);
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    const first = await magicSend(email);
+    await app
+      .fetch(new Request(first.headers.get("x-parachute-dev-magic-link")!), { ...env, DB: flakyDb })
+      .catch(() => undefined);
+    expect(failNext).toBe(false);
+    // Nothing half-done: still unverified, so the next proof runs the claim in full.
+    expect((await getUserById(env.DB, user.id))!.emailVerified).toBe(false);
+    const second = await magicSend(email);
+    const verify = await openLink(second.headers.get("x-parachute-dev-magic-link")!);
+    expect(cookieVal(verify, "parachute_id_session")).toBeTruthy();
+    const old = await env.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE id = ?").bind(session).first<{ n: number }>();
+    expect(old?.n).toBe(0);
+    expect((await getUserById(env.DB, user.id))!.passwordHash).toBe("");
+  }, 30_000);
+
   test("a verified password account is untouched by a magic-link sign-in", async () => {
     const email = "verified-pw@example.com";
     const user = await createUser(env.DB, email, "keepme123", new Date(), { emailVerified: true });
