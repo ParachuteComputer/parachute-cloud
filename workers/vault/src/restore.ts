@@ -158,8 +158,9 @@ function parsePaxRecords(data: Uint8Array): Map<string, string> {
   const out = new Map<string, string>();
   let off = 0;
   while (off < data.length) {
+    // The length is a handful of digits; never scan (or spread) further.
     let sp = off;
-    while (sp < data.length && data[sp] !== 0x20) sp++;
+    while (sp < data.length && sp - off < 20 && data[sp] !== 0x20) sp++;
     const digits = String.fromCharCode(...data.subarray(off, sp));
     const len = /^\d+$/.test(digits) ? Number(digits) : NaN;
     if (!Number.isSafeInteger(len) || len <= sp - off + 1 || off + len > data.length || data[off + len - 1] !== 0x0a) {

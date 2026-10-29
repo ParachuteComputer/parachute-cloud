@@ -1364,7 +1364,11 @@ export class VaultDO extends DurableObject {
    */
   private handleSnapshot(request: Request, vaultName: string): Promise<Response> {
     const run = this.snapshotQueue.then(() => this.takeSnapshot(request, vaultName));
-    this.snapshotQueue = run.catch(() => undefined);
+    // The tail settles to undefined either way: it never holds the Response.
+    this.snapshotQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
     return run;
   }
 
