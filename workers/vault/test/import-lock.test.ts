@@ -269,14 +269,23 @@ describe("import lock (T-318)", () => {
       let outcome: unknown;
       let vectors = -1;
       await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
-        inst.__setTestEmbeddingProvider(parked);
-        const draining = inst.drainEmbeddingsOnce();
-        await inEmbed;
-        const done = importHappens(inst); // an import took the lock while the model ran
-        releaseEmbed();
-        outcome = await draining;
-        done();
-        vectors = (inst.store.db.prepare("SELECT COUNT(*) AS n FROM note_vectors WHERE note_id = ?").get(note.id) as { n: number }).n;
+        // Keep the pool's own alarm delivery out of this test's wake: a wake that
+        // STARTS after the import may write, rightly, and would blur the count.
+        for (let i = 0; i < 400 && inst.alarmRunning; i++) await new Promise((r) => setTimeout(r, 25));
+        inst.alarmRunning = true;
+        await inst.ctx.storage.deleteAlarm();
+        try {
+          inst.__setTestEmbeddingProvider(parked);
+          const draining = inst.drainEmbeddingsOnce();
+          await inEmbed;
+          const done = importHappens(inst); // an import took the lock while the model ran
+          releaseEmbed();
+          outcome = await draining;
+          done();
+          vectors = (inst.store.db.prepare("SELECT COUNT(*) AS n FROM note_vectors WHERE note_id = ?").get(note.id) as { n: number }).n;
+        } finally {
+          inst.alarmRunning = false;
+        }
       });
       expect(outcome).toEqual({ kind: "failed", more: true });
       expect(vectors).toBe(0);
