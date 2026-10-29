@@ -12,6 +12,7 @@ import { namedVaultsInScopes } from "../src/vaults.ts";
 import { SESSION_COOKIE, createSession } from "../src/sessions.ts";
 import { handleToken } from "../src/oauth-token.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
+import { billingMode } from "../src/billing-config.ts";
 
 export const ISSUER = env.ISSUER;
 /**
@@ -43,6 +44,9 @@ export function deps(now?: () => Date): OAuthDeps {
     boundOrigins: () => [ISSUER],
     now,
     rateLimiter: env.RATE_LIMITER,
+    // The money switch, from the project's BILLING_MODE binding (vitest.config.ts)
+    // — so hand-built deps agree with depsForEnv in the same project.
+    billingMode: billingMode(env),
   };
 }
 
@@ -126,8 +130,49 @@ export function registerReq(body: unknown, headers: Record<string, string> = {})
 }
 
 export async function seedUser(email = "owner@example.com", password = "correct horse"): Promise<{ id: string }> {
-  const user = await createUser(env.DB, email, password);
+  // Signs up under the project's money switch, exactly like the real signup
+  // paths. VERIFIED, like every account the real sign-up paths make since
+  // T-318 night (both create the row only once the address is proven). An
+  // unverified password row is the legacy pre-fix shape; signup-verify.test.ts
+  // builds that one explicitly.
+  const user = await createUser(env.DB, email, password, new Date(), { billingMode: billingMode(env), emailVerified: true });
   return { id: user.id };
+}
+
+/**
+ * The whole password sign-up as a browser does it: POST /signup (which only
+ * emails a link now), then open that link in the SAME browser (the
+ * `parachute_id_signup` binding cookie rides along, so the chosen password is
+ * kept). The link comes from the dev echo header the test env turns on.
+ * Returns the verify response: 302 → /console with the session cookie.
+ */
+export async function passwordSignup(
+  fetcher: { fetch(req: Request, env: never): Response | Promise<Response> },
+  email: string,
+  password: string,
+  opts: { env?: unknown; ip?: string } = {},
+): Promise<Response> {
+  const e = (opts.env ?? env) as never;
+  const res = await fetcher.fetch(
+    new Request(`${ISSUER}/signup`, {
+      method: "POST",
+      body: new URLSearchParams({ __csrf: CSRF, email, password }),
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: ISSUER,
+        cookie: `parachute_id_csrf=${CSRF}`,
+        ...(opts.ip ? { "cf-connecting-ip": opts.ip } : {}),
+      },
+    }),
+    e,
+  );
+  const link = res.headers.get("x-parachute-dev-magic-link");
+  if (!link) throw new Error(`passwordSignup: no link for ${email} (status ${res.status})`);
+  const binding = (res.headers as unknown as { getSetCookie(): string[] })
+    .getSetCookie()
+    .map((c) => /^parachute_id_signup=([^;]*)/.exec(c)?.[1])
+    .find(Boolean);
+  return fetcher.fetch(new Request(link, { headers: { cookie: `parachute_id_signup=${binding}` } }), e);
 }
 
 /**

@@ -132,3 +132,7 @@ jobs:
       - name: Live smoke (full, staging-only — creates throwaway debris)
         if: steps.gate.outputs.ready == 'true'
         run: bun scripts/smoke-staging.ts
+
+      - name: Deletion proof (T-318 — every store purged; blocking)
+        if: steps.gate.outputs.ready == 'true'
+        run: bun scripts/smoke-delete-staging.ts

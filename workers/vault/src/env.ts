@@ -39,6 +39,12 @@ export interface Env {
   /** Identity Worker origin — token `iss` pin + JWKS/revocation fetch base. */
   ISSUER_ORIGIN: string;
   /**
+   * Where a person finds their connection URL: the app front door
+   * (`https://my.parachute.computer` in production). Named in the seeded
+   * Connect-your-AI guide. Unset → ISSUER_ORIGIN (the old behaviour).
+   */
+  CONSOLE_PUBLIC_ORIGIN?: string;
+  /**
    * ADDITIVE set of extra `iss` values to accept beyond ISSUER_ORIGIN
    * (comma-separated origins; trailing slashes/blanks tolerated). Unset/empty →
    * the single-ISSUER_ORIGIN exact match this worker has always enforced.
@@ -53,6 +59,13 @@ export interface Env {
   VAULT_BASE_DOMAIN: string;
   /** Default per-tenant storage cap in bytes (string in wrangler vars). */
   CAP_BYTES?: string;
+
+  /**
+   * The money switch (T-318), shared with the identity worker: only the literal
+   * "paid" enforces the `frozen` floor; unset / anything else is the open beta,
+   * where no vault refuses a write as `plan_required` (caps.ts writesFrozen).
+   */
+  BILLING_MODE?: string;
 
   /** Deploy environment. TEST_JWKS is honored only when this is "test". */
   ENVIRONMENT?: string;

@@ -29,9 +29,11 @@
  *     function itself refuses a tombstone — belt). Undo re-applies after
  *     the tombstone clears (account-delete.ts). That is DROP of the DO
  *     push, not DEFER of the event, and not DROP of the D1 write.
- *   - `handleSubscriptionDeleted` stays ungated: it never talks to a DO
- *     (it only schedules `pending_plan='expired'`). Gating it would leave
- *     stale plan state on a row about to be purged.
+ *   - `handleSubscriptionDeleted` stays ungated in paid mode: it never
+ *     talks to a DO (it only schedules `pending_plan='expired'`). Gating it
+ *     would leave stale plan state on a row about to be purged. In open beta
+ *     it lands the row on the beta and pushes caps, so it skips the push for
+ *     a tombstone like the others.
  *
  * Resolution by Stripe id (old contract, unchanged):
  *   - invoice.paid / invoice.payment_failed → look up by `customer` id.
@@ -60,9 +62,9 @@
  * action is operator-driven. `invoice.paid` clears the flags.
  */
 import type Stripe from "stripe";
-import type { OAuthDeps } from "./oauth-shared.ts";
-import { PAID_TIERS, type PaidTier, type PlanId, coercePlanId, isPaidTier } from "./plans.ts";
-import { getUserById, getUserByStripeCustomerId, getUserByStripeSubscriptionId, setUserPlan } from "./users.ts";
+import { type OAuthDeps, billingModeOf } from "./oauth-shared.ts";
+import { PAID_TIERS, type PaidTier, type PlanId, coercePlanId, isPaidTier, livePlan, openBetaLandingPending } from "./plans.ts";
+import { type User, getUserById, getUserByStripeCustomerId, getUserByStripeSubscriptionId } from "./users.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 import { BILLING_INTERVALS, type BillingConfig } from "./billing-config.ts";
 
@@ -402,12 +404,14 @@ function periodEndOf(subscription: Stripe.Subscription): number | null {
  */
 export async function handleSubscriptionDeleted(
   db: D1Database,
+  deps: OAuthDeps,
   event: Stripe.Event,
   now: Date,
 ): Promise<LifecycleResult> {
   const subscription = event.data.object as Stripe.Subscription;
   const user = await getUserByStripeSubscriptionId(db, subscription.id);
   if (!user) return { ok: true, userId: null, action: "subscription_deleted_unknown_user" };
+  if (billingModeOf(deps) === "open_beta") return landSubscriberOnOpenBeta(db, deps, user);
   if (user.plan === "expired" && !user.pendingPlan) {
     return { ok: true, userId: user.id, action: "subscription_deleted_idempotent" };
   }
@@ -425,6 +429,54 @@ export async function handleSubscriptionDeleted(
   console.log(`event=billing_downgrade_scheduled user=${user.id} at=${downgradeAt}`);
 
   return { ok: true, userId: user.id, action: "subscription_deleted_downgrade_scheduled" };
+}
+
+/**
+ * OPEN BETA (T-318 night, Aaron 10-28: "stop charging existing paying
+ * subscribers"): a subscription that ends during the beta lands its owner on
+ * the beta NOW — plan='trial' with no clock, the Power marker kept for a Power
+ * subscriber ({@link openBetaLandingPending}) — and pushes that entitlement to
+ * their vaults. Why not the paid-mode "keep the paid plan until the period end
+ * + 3 days, then the sweep" schedule: in the beta there is no floor to protect
+ * a paid-through period FROM (the beta is the same or more for every tier),
+ * and the schedule left a prepaid annual subscriber showing their old plan,
+ * an "until <date>" and a billing door for months after the operator stopped
+ * the subscription — the opposite of the email they were sent. The Stripe ids
+ * stay on the row (refund and receipt lookups); with a non-paid plan they no
+ * longer count as a subscriber (plans.ts isExistingSubscriber), so the portal
+ * door closes.
+ *
+ * Idempotent: a row already off a paid tier is left alone (a replay, or a
+ * churned row whose stale subscription id Stripe fans out again). A
+ * tombstoned owner gets the D1 write but no DO push (cloud#234).
+ */
+async function landSubscriberOnOpenBeta(db: D1Database, deps: OAuthDeps, user: User): Promise<LifecycleResult> {
+  if (!isPaidTier(user.plan)) {
+    return { ok: true, userId: user.id, action: "subscription_deleted_idempotent" };
+  }
+  const pending = openBetaLandingPending(user.plan, user.pendingPlan);
+  // Conditional on the row still being this paid subscriber, so a concurrent
+  // write that already moved it (another delivery, an operator comp) wins.
+  const write = await db
+    .prepare(
+      `UPDATE users SET plan = 'trial', pending_plan = ?, plan_downgrade_at = NULL
+         WHERE id = ? AND plan = ? AND stripe_subscription_id IS ?`,
+    )
+    .bind(pending, user.id, user.plan, user.stripeSubscriptionId)
+    .run();
+  if ((write.meta.changes ?? 0) === 0) {
+    return { ok: true, userId: user.id, action: "subscription_deleted_idempotent" };
+  }
+  if (user.deletedAt !== null) {
+    console.log(`event=billing_cap_push_skipped_tombstone user=${user.id} plan=trial`);
+    return { ok: true, userId: user.id, action: "subscription_deleted_open_beta_recorded_tombstoned" };
+  }
+  const results = await applyPlanToVaults(db, deps, user.id);
+  const failed = results.filter((r) => !r.ok).length;
+  console.log(
+    `event=billing_subscriber_landed_open_beta user=${user.id} from=${user.plan} keep=${pending ?? "-"} vaults=${results.length} failed_pushes=${failed}`,
+  );
+  return { ok: true, userId: user.id, action: "subscription_deleted_open_beta" };
 }
 
 /** Map a Stripe Price id to the tier it buys (env-configured, never
@@ -468,6 +520,15 @@ export async function handleSubscriptionUpdated(
   const subscription = event.data.object as Stripe.Subscription;
   const user = await getUserByStripeSubscriptionId(db, subscription.id);
   if (!user) return { ok: true, userId: null, action: "subscription_updated_unknown_user" };
+  // OPEN BETA: checkout is paused, so no subscription can START during the
+  // beta. A row off the paid tiers that still carries a subscription id was
+  // landed on the beta by that subscription's deletion
+  // (landSubscriberOnOpenBeta). Any update for it is a late or retried
+  // delivery from before the cancel (Stripe doesn't order events) and must not
+  // put the paid plan back (Codex P2).
+  if (billingModeOf(deps) === "open_beta" && !isPaidTier(user.plan)) {
+    return { ok: true, userId: user.id, action: "subscription_updated_after_beta_landing" };
+  }
 
   const priceId = subscription.items?.data?.[0]?.price?.id;
   if (!priceId) return { ok: true, userId: user.id, action: "subscription_updated_no_price" };
@@ -480,12 +541,23 @@ export async function handleSubscriptionUpdated(
   const newPlan = planForPrice(priceId, config) ?? (isPaidTier(metaTier) ? metaTier : null);
   if (!newPlan) return { ok: true, userId: user.id, action: "subscription_updated_unknown_price" };
 
+  // Every write below is conditional on the row still being what was read
+  // (plan + pending_plan): a subscription.deleted that lands meanwhile (open
+  // beta: plan 'trial', the Power marker kept) must win, never be overwritten
+  // by an update that read the row while it was still paid (Codex P2).
+  const unchanged = "id = ? AND plan = ? AND pending_plan IS ?";
+  const whereArgs = [user.id, user.plan, user.pendingPlan] as const;
+  const raced: LifecycleResult = { ok: true, userId: user.id, action: "subscription_updated_raced" };
+
   if (newPlan !== user.plan) {
-    await setUserPlan(db, user.id, newPlan);
-    await db.prepare("UPDATE users SET pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?").bind(user.id).run();
+    const write = await db
+      .prepare(`UPDATE users SET plan = ?, pending_plan = NULL, plan_downgrade_at = NULL WHERE ${unchanged}`)
+      .bind(newPlan, ...whereArgs)
+      .run();
+    if ((write.meta.changes ?? 0) === 0) return raced;
     // cloud#234: D1 records the plan change; the DO push waits for undo if
-    // the owner is tombstoned. `handleSubscriptionDeleted` is intentionally
-    // NOT gated this way — it never calls applyPlanToVaults.
+    // the owner is tombstoned. (`handleSubscriptionDeleted` only pushes in
+    // open beta, and gates the same way there.)
     if (user.deletedAt !== null) {
       console.log(`event=billing_cap_push_skipped_tombstone user=${user.id} plan=${newPlan}`);
       return { ok: true, userId: user.id, action: "subscription_updated_plan_recorded_tombstoned" };
@@ -497,14 +569,19 @@ export async function handleSubscriptionUpdated(
 
   if (subscription.cancel_at_period_end === true) {
     if (user.pendingPlan !== "expired") {
-      await db.prepare("UPDATE users SET pending_plan = 'expired' WHERE id = ?").bind(user.id).run();
+      const write = await db.prepare(`UPDATE users SET pending_plan = 'expired' WHERE ${unchanged}`).bind(...whereArgs).run();
+      if ((write.meta.changes ?? 0) === 0) return raced;
       console.log(`event=billing_cancel_scheduled user=${user.id}`);
     }
     return { ok: true, userId: user.id, action: "subscription_updated_cancel_scheduled" };
   }
 
   if (user.pendingPlan) {
-    await db.prepare("UPDATE users SET pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?").bind(user.id).run();
+    const write = await db
+      .prepare(`UPDATE users SET pending_plan = NULL, plan_downgrade_at = NULL WHERE ${unchanged}`)
+      .bind(...whereArgs)
+      .run();
+    if ((write.meta.changes ?? 0) === 0) return raced;
     return { ok: true, userId: user.id, action: "subscription_updated_pending_cleared" };
   }
   return { ok: true, userId: user.id, action: "subscription_updated_no_change" };
@@ -541,6 +618,7 @@ export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date
   // the write's `plan_downgrade_at <= ?` guard means exactly "still due as of
   // the moment we selected it" (the sweep-vs-conversion race guard below).
   const nowIso = now.toISOString();
+  const mode = billingModeOf(deps);
   const res = await db
     .prepare(
       `SELECT id, plan, pending_plan FROM users
@@ -564,7 +642,19 @@ export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date
       // a paid pending tier here would be a FREE upgrade at trial's end — floor it.
       // Folded into the `plan` bound into the CONDITIONAL write below, never a
       // separate read-then-write.
-      const plan: PlanId = coercePlanId(row.plan) === "trial" && isPaidTier(pending) ? "expired" : pending;
+      const floored: PlanId = coercePlanId(row.plan) === "trial" && isPaidTier(pending) ? "expired" : pending;
+      // OPEN BETA (T-318): the expired floor does not exist. A due row whose
+      // target is the floor (an old trial clock, a promo comp running out, a
+      // cancelled subscription past its paid-through date) lands on the beta
+      // (`trial`, clockless) instead — and a trialist who was trying Power
+      // keeps Power (entitlementPlanFor), so nobody shrinks. Converting the
+      // row (rather than skipping it) also keeps it from re-selecting every
+      // hour and starving real downgrades of the LIMIT.
+      const plan: PlanId = livePlan(floored, mode);
+      // …and a Power subscriber whose cancel was scheduled before the beta
+      // (paid mode's period-end + grace) keeps Power the same way.
+      const keepPending: PlanId | null =
+        mode === "open_beta" && plan === "trial" ? openBetaLandingPending(coercePlanId(row.plan), pending) : null;
       // RACE GUARD (cloud#84 review): the SELECT→write window can overlap a
       // `checkout.session.completed` that converted this user — the webhook's
       // CAS flips the plan to the bought tier AND clears the pending pair
@@ -577,10 +667,10 @@ export async function runBillingSweep(db: D1Database, deps: OAuthDeps, now: Date
       // conversion that won the race leaves this UPDATE matching 0 rows.
       const write = await db
         .prepare(
-          `UPDATE users SET plan = ?, pending_plan = NULL, plan_downgrade_at = NULL
+          `UPDATE users SET plan = ?, pending_plan = ?, plan_downgrade_at = NULL
              WHERE id = ? AND pending_plan IS NOT NULL AND plan_downgrade_at <= ?`,
         )
-        .bind(plan, row.id, nowIso)
+        .bind(plan, keepPending, row.id, nowIso)
         .run();
       if ((write.meta.changes ?? 0) === 0) {
         // The row moved under us (a conversion, or any write that cleared the

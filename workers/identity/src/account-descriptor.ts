@@ -8,9 +8,18 @@
  * `checkAccountDescriptor`); the self-host hub serves its own twin (advertising
  * `/account/setup`, hub#748) in a follow-up.
  */
-import type { AccountPlanSummary, ParachuteAccountDescriptor } from "@openparachute/door-contract";
-import { type OAuthDeps, frontDoorOrigin, jsonResponse, vaultAdvertisedUrl } from "./oauth-shared.ts";
-import { PAID_TIERS, PLAN_SPECS, TIER_PRICE_MONTHLY_USD, type TierIntervalAvailability, tierIntervals } from "./plans.ts";
+import type { AccountCapabilities, AccountPlanSummary, ParachuteAccountDescriptor } from "@openparachute/door-contract";
+import { type OAuthDeps, billingModeOf, frontDoorOrigin, jsonResponse, vaultAdvertisedUrl } from "./oauth-shared.ts";
+import {
+  type BillingMode,
+  OPEN_BETA_LONG,
+  OPEN_BETA_SHORT,
+  PAID_TIERS,
+  PLAN_SPECS,
+  TIER_PRICE_MONTHLY_USD,
+  type TierIntervalAvailability,
+  tierIntervals,
+} from "./plans.ts";
 
 /**
  * The reserved first-party client id a native app uses against the cloud door.
@@ -66,9 +75,48 @@ function planLadder(): AccountPlanSummaryWithIntervals[] {
   }));
 }
 
+/**
+ * The cloud-only money fields (T-318), additive over the shared door contract
+ * (`checkAccountDescriptor` ignores unknown keys; a hub serves none of them):
+ *   - `billing_mode` — the money switch, so the front door can tell the open
+ *     beta from a priced door without guessing from `plans`;
+ *   - `money_line` / `money_story` — the short + long money story, so the copy
+ *     travels with the door instead of being hardcoded in the app.
+ * In open beta `plans` is EMPTY: there is nothing to buy, and an app that
+ * derives "Plans from $X" from the ladder must find no prices to quote.
+ */
+interface CloudMoneyFields {
+  billing_mode: BillingMode;
+  money_line?: string;
+  money_story?: string;
+}
+
+/**
+ * The cloud's capabilities: the shared door-contract set plus `connections`
+ * (T-318) — `GET /account/vaults/<name>/connections` lists the apps connected
+ * to a vault and `DELETE …/connections/<client_id>` disconnects one
+ * (oauth-connections.ts). Additive, like `AccountPlanSummaryWithIntervals`: a
+ * reader that only knows `AccountCapabilities` sees exactly its fields. The
+ * key belongs upstream in door-contract eventually; until then the app reads
+ * it as an optional extra.
+ */
+export interface CloudAccountCapabilities extends AccountCapabilities {
+  connections: boolean;
+  /** The whole-account door (`POST /account/delete` + `/account/undo-delete`). */
+  account_delete: boolean;
+}
+
 export function accountDescriptor(deps: OAuthDeps): Response {
   const iss = deps.issuer;
-  const body: ParachuteAccountDescriptor = {
+  const mode = billingModeOf(deps);
+  const capabilities: CloudAccountCapabilities = {
+    vault_create: true,
+    vault_rename: false,
+    vault_delete: true,
+    account_delete: true,
+    connections: true,
+  };
+  const body: ParachuteAccountDescriptor & CloudMoneyFields = {
     issuer: iss,
     door: "cloud",
     account_endpoint: `${iss}/account`,
@@ -87,15 +135,16 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // identity-side D1 sweep), so the door now advertises the capability it
     // actually has. A client that reads this flag is what turns the endpoint
     // into a user-facing affordance; leaving it false would ship the route dark.
-    // NOT advertised here, deliberately: the WHOLE-ACCOUNT door (cloud#226
-    // A-3, `/account/delete` + `/account/undo-delete`) has no flag, because
-    // `AccountCapabilities` is the SHARED door contract — it lives upstream in
-    // parachute-hub's `packages/door-contract` and is CI-pinned to a reviewed
-    // commit, so a new key belongs to an upstream PR + a pin bump, not to a
-    // cloud-side wiring branch. Until that lands, a client learns the door
-    // exists from the contract's route list, not from a capability bit. The
-    // route works either way; what it lacks is the advertisement.
-    capabilities: { vault_create: true, vault_rename: false, vault_delete: true },
+    // `account_delete` (T-318): the WHOLE-ACCOUNT door (cloud#226 A-3,
+    // `POST /account/delete` + `/account/undo-delete`) is advertised as an
+    // ADDITIVE cloud extension of the shared `AccountCapabilities` (the same
+    // pattern as `AccountPlanSummaryWithIntervals` below): a door-contract
+    // consumer that only knows the shared keys sees exactly what it expects,
+    // and the app turns this bit into its Delete-account section. Folding the
+    // key into the shared contract upstream (parachute-hub door-contract) is a
+    // follow-up; the self-host hub simply never sends it, so its app shows no
+    // such section.
+    capabilities,
     // The account-level MCP endpoint (Wave A PR3) — one connection across the
     // account's vaults (list-vaults / create-vault / query-notes). Advertised at
     // the FRONT DOOR origin (`my.` in prod, self-referential in staging), where
@@ -103,7 +152,9 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // 4). Its RFC 9728 PRM sits at `<frontDoor>/.well-known/oauth-protected-
     // resource/account/mcp`.
     account_mcp_endpoint: `${frontDoorOrigin(deps)}/account/mcp`,
-    plans: planLadder(),
+    plans: mode === "paid" ? planLadder() : [],
+    billing_mode: mode,
+    ...(mode === "open_beta" ? { money_line: OPEN_BETA_SHORT, money_story: OPEN_BETA_LONG } : {}),
     // A `{name}`-placeholder template the app substitutes to preview a vault's
     // address pre-creation. Derived from the SAME vaultAdvertisedUrl the real
     // console/account URLs come from (the PUBLIC origin — `my.` in prod, path

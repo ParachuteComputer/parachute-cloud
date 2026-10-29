@@ -18,7 +18,11 @@
  *
  * FROZEN (the expired floor): an independent `frozen: true` flag the DO checks
  * BEFORE any cap math on writes → 402 `plan_required` (reads + export + DELETE
- * untouched — "your notes are safe").
+ * untouched — "your notes are safe"). ENFORCED ONLY IN PAID MODE: in the open
+ * beta (BILLING_MODE unset / not "paid") a stored `frozen: true` is inert —
+ * see {@link writesFrozen}. The stored flag itself is kept and reported as-is
+ * on the internal config seam, so the identity worker's reconciler still sees
+ * it and re-pushes `frozen: false`.
  *
  * The R2 meter is a DO-storage counter maintained by the storage upload/delete
  * paths (R2 has no cheap per-prefix size query), so the check stays O(1).
@@ -59,7 +63,8 @@ export function attachmentsNotIncludedResponse(): Response {
     {
       error_type: "attachments_not_included",
       error: "attachments_not_included",
-      message: "This plan doesn't include file attachments. Upgrade to a plan with an attachment budget to upload files.",
+      message:
+        "This account's plan doesn't include file attachments, so the upload was refused. Your notes are unaffected. Write hello@parachute.computer if you need attachments.",
     },
     { status: 403 },
   );
@@ -70,12 +75,23 @@ export function attachmentsNotIncludedResponse(): Response {
  * or the subscription lapsed). Writes are refused; reads + export are untouched.
  * The trust flex: your notes are safe, pick a plan or export anytime.
  */
+/**
+ * Whether a vault's stored `frozen` flag actually blocks writes right now. The
+ * vault side of the T-318 open beta: the freeze is unreachable unless
+ * BILLING_MODE is exactly "paid", so lifting the beta does not depend on every
+ * vault's config having been re-pushed first.
+ */
+export function writesFrozen(storedFrozen: boolean, billingMode: string | undefined): boolean {
+  return storedFrozen && billingMode?.trim().toLowerCase() === "paid";
+}
+
 export function planRequiredResponse(): Response {
   return Response.json(
     {
       error_type: "plan_required",
       error: "plan_required",
-      message: "Your trial has ended — this vault is read-only. Your notes are safe to read and export anytime; pick a plan to write again.",
+      message:
+        "This vault is read-only because the account has no active plan. Your notes are safe to read and export anytime; choose a plan in your account to write again.",
     },
     { status: 402 },
   );

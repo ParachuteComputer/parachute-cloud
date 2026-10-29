@@ -119,8 +119,9 @@ function deleteReq(token: string | null, confirm?: unknown, method: "DELETE" | "
   });
 }
 
-function undoGetReq(token: string): Request {
-  return new Request(`${ISSUER}/account/undo-delete?token=${encodeURIComponent(token)}`);
+/** The emailed link as a browser opens it — T-318: this NEVER mutates. */
+function undoGetReq(token: string, accept = "text/html"): Request {
+  return new Request(`${ISSUER}/account/undo-delete?token=${encodeURIComponent(token)}`, { headers: { accept } });
 }
 
 function undoPostReq(body: unknown): Request {
@@ -515,7 +516,7 @@ describe("A-4 — inside the 24-hour window nothing is destroyed", () => {
 // --- 3. undo -----------------------------------------------------------------
 
 describe("A-3 — undo inside the window restores the account", () => {
-  test("the emailed GET link restores the account and releases the billing hold", async () => {
+  test("the restore (POST) brings the account back and releases the billing hold", async () => {
     const acct = await seedAccount("undo-link@example.com", { vaults: ["restored"], stripe: true });
     const { stripe, calls } = makeStripeStub();
     const del = await handleAccountDelete(
@@ -529,7 +530,7 @@ describe("A-3 — undo inside the window restores the account", () => {
 
     const res = await handleAccountDeleteUndo(
       env,
-      undoGetReq(undo_token),
+      undoPostReq({ token: undo_token }),
       accountDeps(clock(plus(60 * 60 * 1000))),
       billing(stripe),
     );
@@ -581,7 +582,7 @@ describe("A-3 — undo inside the window restores the account", () => {
 
     const res = await handleAccountDeleteUndo(
       env,
-      undoGetReq(undo_token),
+      undoPostReq({ token: undo_token }),
       accountDeps(clock(plus(60 * 60 * 1000)), vaultFetch),
       billing(stripe),
     );
@@ -679,8 +680,8 @@ describe("A-3 — undo inside the window restores the account", () => {
     const del = await handleAccountDelete(env, deleteReq(acct.token, acct.email), accountDeps(clock(T0)));
     const { undo_token } = (await del.json()) as { undo_token: string };
 
-    expect((await handleAccountDeleteUndo(env, undoGetReq(undo_token), accountDeps(clock(plus(1000))))).status).toBe(200);
-    const second = await handleAccountDeleteUndo(env, undoGetReq(undo_token), accountDeps(clock(plus(2000))));
+    expect((await handleAccountDeleteUndo(env, undoPostReq({ token: undo_token }), accountDeps(clock(plus(1000))))).status).toBe(200);
+    const second = await handleAccountDeleteUndo(env, undoPostReq({ token: undo_token }), accountDeps(clock(plus(2000))));
     expect(second.status).toBe(400);
     expect(((await second.json()) as { error: string }).error).toBe("invalid_undo_token");
   });
@@ -695,7 +696,7 @@ describe("A-3 — undo inside the window restores the account", () => {
       undoPostReq({ token: "" }),
       undoPostReq({ token: "not-a-real-token" }),
       undoPostReq({ token: acct.userId }),
-      undoGetReq("nope"),
+      undoPostReq({ token: "nope" }),
     ]) {
       const res = await handleAccountDeleteUndo(env, req, accountDeps(clock(T0)));
       expect(res.status).toBe(400);
@@ -711,7 +712,7 @@ describe("A-3 — undo inside the window restores the account", () => {
 
     const res = await handleAccountDeleteUndo(
       env,
-      undoGetReq(undo_token),
+      undoPostReq({ token: undo_token }),
       accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS))),
     );
     expect(res.status).toBe(410);
@@ -727,7 +728,7 @@ describe("A-3 — undo inside the window restores the account", () => {
     const { undo_token } = (await del.json()) as { undo_token: string };
     const res = await handleAccountDeleteUndo(
       env,
-      undoGetReq(undo_token),
+      undoPostReq({ token: undo_token }),
       accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS - 1))),
     );
     expect(res.status).toBe(200);
@@ -817,7 +818,7 @@ describe("A-4 — past the window the sweep really deletes", () => {
     // row that no longer exists.
     const undo = await handleAccountDeleteUndo(
       env,
-      undoGetReq(undo_token),
+      undoPostReq({ token: undo_token }),
       accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS + 1000))),
     );
     expect(undo.status).toBe(400);
@@ -1177,7 +1178,7 @@ describe("cloud#248 — the sweep and undo agree on ONE atomic point", () => {
     const { stripe } = stripeWithTeardownHook(async () => {
       const res = await handleAccountDeleteUndo(
         env,
-        undoGetReq(undoToken),
+        undoPostReq({ token: undoToken }),
         accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS - 1000)), undoVault),
         billing(makeStripeStub().stripe),
       );
@@ -1235,7 +1236,7 @@ describe("cloud#248 — the sweep and undo agree on ONE atomic point", () => {
     const { stripe } = stripeWithTeardownHook(async () => {
       const res = await handleAccountDeleteUndo(
         env,
-        undoGetReq(claimedToken),
+        undoPostReq({ token: claimedToken }),
         accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS - 1000))),
       );
       expect(res.status).toBe(410);
@@ -1251,7 +1252,7 @@ describe("cloud#248 — the sweep and undo agree on ONE atomic point", () => {
 
     const late = await handleAccountDeleteUndo(
       env,
-      undoGetReq(expiredToken),
+      undoPostReq({ token: expiredToken }),
       accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS * 3))),
     );
     expect(late.status).toBe(410);
@@ -1271,7 +1272,7 @@ describe("cloud#248 — the sweep and undo agree on ONE atomic point", () => {
     const { stripe } = stripeWithTeardownHook(async () => {
       const res = await handleAccountDeleteUndo(
         env,
-        undoGetReq(secondToken),
+        undoPostReq({ token: secondToken }),
         accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS))),
         billing(makeStripeStub().stripe),
       );
@@ -1329,7 +1330,7 @@ describe("cloud#248 — the sweep and undo agree on ONE atomic point", () => {
 
     const restored = await handleAccountDeleteUndo(
       env,
-      undoGetReq(token),
+      undoPostReq({ token: token }),
       accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS - 1000))),
       billing(resumeStripe),
     );
@@ -1353,7 +1354,7 @@ describe("cloud#248 — the sweep and undo agree on ONE atomic point", () => {
     const { stripe } = stripeWithTeardownHook(async () => {
       const undone = await handleAccountDeleteUndo(
         env,
-        undoGetReq(secondToken),
+        undoPostReq({ token: secondToken }),
         accountDeps(clock(plus(DELETE_UNDO_WINDOW_MS))),
         billing(makeStripeStub().stripe),
       );
@@ -1441,7 +1442,7 @@ describe("cloud#248 — the sweep and undo agree on ONE atomic point", () => {
     const { vaultFetch, calls } = recordingVaultFetch();
     const res = await handleAccountDeleteUndo(
       env,
-      undoGetReq(token),
+      undoPostReq({ token: token }),
       accountDeps(clock(plus(1000)), vaultFetch),
       billing(stripe),
     );

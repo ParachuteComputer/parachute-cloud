@@ -44,7 +44,7 @@
  */
 import { verifyCsrfToken } from "./csrf.ts";
 import { sessionUser } from "./session-user.ts";
-import { type OAuthDeps, isSameOriginRequest, redirectResponse, resolveBoundOrigins } from "./oauth-shared.ts";
+import { type OAuthDeps, billingModeOf, isSameOriginRequest, redirectResponse, resolveBoundOrigins } from "./oauth-shared.ts";
 import { type PlanId, canStartCheckout } from "./plans.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 
@@ -85,6 +85,9 @@ async function releaseSlot(db: D1Database, code: string): Promise<void> {
 export async function handlePromoRedeemPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
+  // Open beta: nothing to redeem a code onto (everyone already has the beta).
+  // Refuse BEFORE touching promo_codes so no slot is ever claimed.
+  if (billingModeOf(deps) !== "paid") return redirectResponse("/console?promo_err=paused");
   const form = await req.formData();
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
     return redirectResponse("/console?promo_err=session");

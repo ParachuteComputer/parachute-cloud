@@ -31,6 +31,7 @@ import { applyPlanToVaults } from "./vault-call.ts";
 import { collectDigestStats } from "./ops.ts";
 import { latestUsageForVaults } from "./usage.ts";
 import { listPromoCodes } from "./promo.ts";
+import { DAILY_DEFAULT_DAYS, dailyJsonResponse, listDailyLines } from "./ops-daily.ts";
 import {
   type AdminUserRow,
   type AdminVaultRow,
@@ -40,6 +41,7 @@ import {
 } from "./admin-ui.ts";
 import {
   type OAuthDeps,
+  billingModeOf,
   htmlResponse,
   isSameOriginRequest,
   redirectResponse,
@@ -90,12 +92,16 @@ const NOTICES: Record<string, string> = {
   "plan-partial": "Plan updated, but one or more vault cap pushes failed — they self-heal via the daily reconcilers, or re-run scripts/backfill-plans.ts.",
   suspended: "Account suspended — sessions invalidated; sign-in now answers neutrally. Vault data untouched; tokens expire naturally.",
   unsuspended: "Account un-suspended — sign-in works again.",
+  "delete-requested": "Deletion requested — the account is closed now, the holder was emailed an undo link, and it is erased after 24 hours. Logged.",
 };
 const ERRORS: Record<string, string> = {
   csrf: "Your session expired. Please try again.",
   "not-found": "No such user.",
   invalid: "Invalid request.",
   "self-suspend": "You can't suspend your own account (that would lock out this console).",
+  "self-delete": "You can't delete your own account from here (that would lock out this console).",
+  "already-deleting": "That account has already asked to be deleted.",
+  "delete-failed": "The deletion could not be started. Nothing changed; check the logs and retry.",
 };
 
 // --- GET /admin — the fleet overview ----------------------------------------
@@ -138,7 +144,19 @@ export async function handleAdminOverviewGet(db: D1Database, req: Request, deps:
   // themselves are tuned via D1 statements (migration 0016's header).
   const promoCodes = await listPromoCodes(db);
 
-  return htmlResponse(renderAdminOverview({ stats, dripEvents7d, signupsByDay, latestAlerts, promoCodes }));
+  // The daily ops lines (ops-daily.ts) — the last 14, newest first, at the top.
+  const dailyLines = (await listDailyLines(db, DAILY_DEFAULT_DAYS)).map((d) => ({ day: d.day, line: d.line }));
+
+  return htmlResponse(renderAdminOverview({ stats, dripEvents7d, signupsByDay, latestAlerts, promoCodes, dailyLines }));
+}
+
+// --- GET /admin/daily.json — the daily ops lines, machine-readable ------------
+
+/** Same operator boundary as every /admin page; `?days=` 1..90, default 14. */
+export async function handleAdminDailyJsonGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const operator = await operatorFor(db, req, deps);
+  if (!operator) return notFound();
+  return dailyJsonResponse(db, req);
 }
 
 // --- GET /admin/users --------------------------------------------------------
@@ -156,6 +174,7 @@ interface UserPageRow {
   pending_plan: string | null;
   vault_count: number;
   checklist_done: number;
+  deleted_at: string | null;
 }
 
 export async function handleAdminUsersGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
@@ -174,7 +193,7 @@ export async function handleAdminUsersGet(db: D1Database, req: Request, deps: OA
   const res = await db
     .prepare(
       `SELECT u.id, u.email, u.plan, u.role, u.created_at, u.suspended_at, u.drip_unsubscribed,
-         u.payment_failed_at, u.payment_failed_count, u.pending_plan,
+         u.payment_failed_at, u.payment_failed_count, u.pending_plan, u.deleted_at,
          (SELECT COUNT(*) FROM vaults v WHERE v.owner_user_id = u.id) AS vault_count,
          (SELECT COUNT(*) FROM user_checklist c WHERE c.user_id = u.id AND c.item <> 'hidden') AS checklist_done
        FROM users u
@@ -200,6 +219,7 @@ export async function handleAdminUsersGet(db: D1Database, req: Request, deps: OA
     pendingPlan: r.pending_plan,
     vaultCount: r.vault_count,
     checklistDone: r.checklist_done,
+    deletedAt: r.deleted_at,
   }));
 
   const params = new URL(req.url).searchParams;
@@ -211,6 +231,7 @@ export async function handleAdminUsersGet(db: D1Database, req: Request, deps: OA
       totalPages,
       totalUsers,
       csrfToken: csrf.token,
+      billingMode: billingModeOf(deps),
       notice: NOTICES[params.get("notice") ?? ""],
       error: ERRORS[params.get("err") ?? ""],
     }),
@@ -271,7 +292,7 @@ export async function handleAdminVaultsGet(db: D1Database, req: Request, deps: O
 // --- POST actions ------------------------------------------------------------
 
 /** Shared POST prologue: operator + CSRF + same-origin, and the target user. */
-async function actionContext(
+export async function actionContext(
   db: D1Database,
   req: Request,
   deps: OAuthDeps,
@@ -317,7 +338,9 @@ export async function handleAdminSetPlanPost(db: D1Database, req: Request, deps:
   // Push the new entitlement into the vault DOs NOW — a comp must take effect
   // while the person is looking. Best-effort per vault (vault-call.ts); a miss
   // is reported and reconciled by the backfill script / next plan change.
-  const results = await applyPlanToVaults(db, deps, target.id);
+  // `reopen` (T-318): an operator plan set also clears a delete-request vault
+  // lock that a failed undo push left behind — the documented repair lever.
+  const results = await applyPlanToVaults(db, deps, target.id, { reopen: true });
   const failed = results.filter((r) => !r.ok);
   if (failed.length > 0) {
     console.warn(`event=admin_plan_cap_partial user=${target.id} plan=${plan} failed=${failed.map((f) => f.vault).join(",")}`);

@@ -37,14 +37,19 @@ import {
 import {
   handleAdminOverviewGet,
   handleAdminSetPlanPost,
+  handleAdminDailyJsonGet,
   handleAdminSuspendPost,
   handleAdminUsersGet,
   handleAdminVaultsGet,
 } from "./admin.ts";
 import { handleAdminGrowthGet } from "./admin-growth.ts";
+import { handleOpsDailyGet, runDailyLine } from "./ops-daily.ts";
+import { bumpOpsCounter } from "./ops-counters.ts";
+import { handleAdminDeleteGet, handleAdminDeletePost } from "./admin-delete.ts";
+import { handleTestAccountDeleteReport, handleTestAccountDeleteSweep } from "./account-delete-hooks.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
 import { accountDescriptor } from "./account-descriptor.ts";
-import { handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
+import { authorizeHomeRedirect, handleAuthorizeGet, handleAuthorizePost } from "./oauth-authorize.ts";
 import {
   authorizationServerMetadata,
   corsPreflight,
@@ -90,6 +95,7 @@ import {
 import { handleStripeWebhookPost } from "./billing-webhook.ts";
 import { handlePromoRedeemPost } from "./promo.ts";
 import { handleAccountMcp, accountMcpProtectedResource } from "./account-mcp-http.ts";
+import { handleVaultConnectionDelete, handleVaultConnectionsList } from "./oauth-connections.ts";
 import { spaCspForHtml } from "./spa-csp.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
@@ -146,7 +152,15 @@ app.get("/.well-known/oauth-protected-resource/account/mcp", (c) => accountMcpPr
 // the uncredentialed token-family endpoints, reflected-origin (credentialed DCR)
 // on register. Cross-origin browser PKCE (the Notes PWA) needs both.
 app.options("/oauth/*", (c) => oauthPreflight(c.req.raw));
-app.get("/oauth/authorize", (c) => handleAuthorizeGet(c.env.DB, c.req.raw, depsFor(c.env)));
+// One-pass connect (T-318): on the issuer host in production, the browser is
+// sent to the home origin (my.) where the session lives — see
+// oauth-authorize.ts `authorizeHomeRedirect`.
+app.get(
+  "/oauth/authorize",
+  (c) =>
+    authorizeHomeRedirect(c.req.raw, depsFor(c.env), c.env.ENVIRONMENT === "production") ??
+    handleAuthorizeGet(c.env.DB, c.req.raw, depsFor(c.env)),
+);
 app.post("/oauth/authorize", (c) => handleAuthorizePost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/oauth/token", async (c) => withWildcardCors(await handleToken(c.env.DB, c.req.raw, depsFor(c.env))));
 app.post("/oauth/register", async (c) =>
@@ -166,7 +180,10 @@ app.post("/oauth/revoke", async (c) => withWildcardCors(await handleRevoke(c.env
  * SCOPE is the load-bearing correctness property. This is wired into ONLY the
  * GET `/login`, GET `/console` and GET `/console/security` routes below, so it is
  * PHYSICALLY unreachable
- * from any MACHINE path — `/oauth/*` (cloud. is the OAuth issuer), `/auth/verify`
+ * from any MACHINE path — `/oauth/*` (cloud. is the OAuth issuer; the one
+ * deliberate exception is the browser GET of `/oauth/authorize`, which T-318's
+ * `authorizeHomeRedirect` sends to my. — a separate, issuer-aware redirect, not
+ * this one), `/auth/verify`
  * + `/auth/code` (magic-link + code consumption; old emails point at cloud.),
  * `/unsubscribe` (RFC 8058 one-click POST won't follow a 3xx), `/billing/webhook`
  * (Stripe's dashboard pins cloud.), and `/.well-known/*` (discovery) all keep
@@ -221,7 +238,7 @@ function cloudFrontDoorRedirect(env: Env, req: Request): Response | null {
 
 // --- console (accounts + vaults) ---
 app.get("/signup", (c) => handleSignupGet(c.req.raw, depsFor(c.env)));
-app.post("/signup", (c) => handleSignupPost(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/signup", (c) => handleSignupPost(c.env.DB, c.req.raw, depsFor(c.env), senderFor(c.env)));
 app.get("/login", (c) => cloudFrontDoorRedirect(c.env, c.req.raw) ?? handleLoginGet(c.req.raw));
 app.post("/login", (c) => handleLoginPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/logout", (c) => handleLogoutPost(c.env.DB, c.req.raw, depsFor(c.env)));
@@ -294,6 +311,11 @@ app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, d
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/vaults/:name", (c) => handleAccountVaultDelete(c.env.DB, c.req.raw, depsFor(c.env)));
+// Connected apps (T-318): list + disconnect the OAuth clients reaching a vault.
+app.get("/account/vaults/:name/connections", (c) => handleVaultConnectionsList(c.env.DB, c.req.raw, depsFor(c.env)));
+app.delete("/account/vaults/:name/connections/:clientId", (c) =>
+  handleVaultConnectionDelete(c.env.DB, c.req.raw, depsFor(c.env)),
+);
 // ACCOUNT deletion (cloud#226 A-3) — the whole-account sibling of the vault
 // delete above, and a different shape on purpose: it severs auth immediately
 // (tombstone + session/token wipe) and pauses billing, but erases NOTHING for
@@ -357,10 +379,17 @@ app.get("/admin", (c) => handleAdminOverviewGet(c.env.DB, c.req.raw, depsFor(c.e
 // (admin-growth.ts's privacy rule). `/admin` in CEREMONY_PREFIXES already
 // covers it, so no route-manifest change is needed.
 app.get("/admin/growth", (c) => handleAdminGrowthGet(c.env.DB, c.req.raw, depsFor(c.env)));
+// The daily ops lines as JSON for the signed-in operator (ops-daily.ts).
+app.get("/admin/daily.json", (c) => handleAdminDailyJsonGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/admin/users", (c) => handleAdminUsersGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/admin/vaults", (c) => handleAdminVaultsGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/admin/users/plan", (c) => handleAdminSetPlanPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/admin/users/suspend", (c) => handleAdminSuspendPost(c.env.DB, c.req.raw, depsFor(c.env)));
+// The operator path for an emailed deletion request (T-318, admin-delete.ts):
+// a retype-the-email confirm step, then the SAME request path as self-service
+// (24h undo window + the holder's notice email), audit-logged with the operator.
+app.get("/admin/users/delete", (c) => handleAdminDeleteGet(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/admin/users/delete", (c) => handleAdminDeletePost(c.env, c.req.raw, depsFor(c.env), senderFor(c.env)));
 
 // --- billing (Wave 4d — Stripe) ---
 // All three routes config-gate FIRST (billing-config.ts): without the Stripe
@@ -439,6 +468,38 @@ app.post("/__test/snapshot-run", async (c) => {
   // param → the full fleet sweep, unchanged.
   const onlyVault = c.req.query("vault") || undefined;
   return c.json(await runSnapshotSweep(c.env, deps, onlyVault ? { onlyVault } : {}));
+});
+
+// Staging/dev-only: compute + store + send the daily ops line NOW (ops-daily.ts)
+// instead of waiting for the 03:30 UTC tick — same gate + rationale (404 off
+// the allowlist, pinned by smoke-prod). Optional ?day=YYYY-MM-DD; default the
+// UTC day before now. Staging has no email binding: the "send" is the devlog
+// line, and the result is visible on /admin and /admin/daily.json.
+app.post("/__test/ops-daily-run", async (c) => {
+  if (!depsFor(c.env).exposeDevLinks) return c.notFound();
+  const day = c.req.query("day");
+  if (day !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(day)) return c.json({ error: "day must be YYYY-MM-DD" }, 400);
+  const r = await runDailyLine(c.env, senderFor(c.env), day ? { day } : {});
+  return c.json({ day: r.day, line: r.line, stats: r.stats, notified: r.notified });
+});
+
+// The daily ops lines for an operator AGENT (Uni) without a browser: bearer
+// OPS_READ_TOKEN (a secret). Unset secret → the router's plain 404.
+app.get("/ops/daily", async (c) => (await handleOpsDailyGet(c.env, c.req.raw)) ?? c.notFound());
+
+// Staging/dev-only deletion-proof hooks (T-318, account-delete-hooks.ts) —
+// same allowlist gate as the triggers above (404 off staging|development|test,
+// pinned by smoke-prod), and additionally limited to @example.com accounts.
+// `sweep` fast-forwards ONE already-requested deletion past its window and runs
+// the real sweep for it; `report` counts every D1 row that can still name it.
+app.post("/__test/account-delete/sweep", (c) => {
+  const deps = depsFor(c.env);
+  if (!deps.exposeDevLinks) return c.notFound();
+  return handleTestAccountDeleteSweep(c.env, c.req.raw, deps, senderFor(c.env));
+});
+app.post("/__test/account-delete/report", (c) => {
+  if (!depsFor(c.env).exposeDevLinks) return c.notFound();
+  return handleTestAccountDeleteReport(c.env, c.req.raw);
 });
 
 /**
@@ -566,15 +627,57 @@ app.get("/", (c) => {
 });
 
 /**
- * Default export: the Hono fetch handler + the ops cron ([triggers] in
+ * Whether a 5xx counts toward the error-rate signal. Everything ≥ 500 does,
+ * EXCEPT the by-design `route_missing` 503 backstops for /vault and /mcp on a
+ * host where no vault zone route is meant to exist (cloud., app., workers.dev):
+ * MCP/vault scanners hit those all day and would page the operator for
+ * nothing. On the canonical vault host (VAULT_PUBLIC_ORIGIN, my. in
+ * production) the same 503 means the zone route broke — that one counts.
+ */
+export function countsAs5xx(req: Request, status: number, env: Partial<Env>): boolean {
+  if (status < 500) return false;
+  const url = new URL(req.url);
+  const backstop = /^\/(vault|mcp)(\/|$)/.test(url.pathname);
+  if (!backstop) return true;
+  try {
+    return env.VAULT_PUBLIC_ORIGIN ? new URL(env.VAULT_PUBLIC_ORIGIN).host === url.host : false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The fetch entrypoint: Hono, plus the 5xx counter for the daily line and the
+ * health cron's error-rate alert. Costs nothing on the happy path (a status
+ * compare); on a 5xx it bumps one D1 counter AFTER the response, via
+ * waitUntil, so it never delays or breaks the response itself
+ * (bumpOpsCounter never throws). Without an ExecutionContext (direct calls in
+ * tests) the bump is awaited inline instead of left floating.
+ *
+ * `env` stays as loosely typed as Hono's own `app.fetch` (tests hand it partial envs).
+ */
+async function fetchWithOpsCounters(req: Request, env?: Env | {}, ctx?: ExecutionContext): Promise<Response> {
+  const res = await app.fetch(req, env, ctx);
+  const e = (env ?? {}) as Partial<Env>;
+  const db = e.DB;
+  if (db && countsAs5xx(req, res.status, e)) {
+    const bump = bumpOpsCounter(db, "http_5xx", new Date());
+    if (ctx?.waitUntil) ctx.waitUntil(bump);
+    else await bump;
+  }
+  return res;
+}
+
+/**
+ * Default export: the fetch handler above + the ops cron ([triggers] in
  * wrangler.toml). `controller.cron` is the matched pattern — ops.routeCron maps
  * it to the health check (every 10 min), the weekly digest (Mon 14:00 UTC),
- * the hourly drip tick, or the daily usage rollup (03:30 UTC).
+ * the hourly drip tick, or the daily usage rollup + daily ops line (03:30 UTC).
  * Same sender selection as the magic-link flow: real binding in production,
  * dev-log on staging (deterministic, lands in Workers Logs).
  */
 export default {
-  fetch: app.fetch,
+  fetch: fetchWithOpsCounters,
   async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     await handleScheduled(controller.cron, env, senderFor(env));
   },

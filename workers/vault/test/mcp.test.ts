@@ -413,12 +413,13 @@ describe("MCP — vault-info (server-layer override)", () => {
     // vault-info actually orients the connected AI (on cloud the MCP server
     // instruction is essentially just this description).
     expect(proj.description).toBe(DEFAULT_VAULT_DESCRIPTION);
-    // The default welcome pack seeds the sacred `capture` tag plus the
-    // guides-ring tags (`guide` — schema-carrying — and `pinned`). `toContain`
-    // keeps the assertion robust to a growing seed set (the #86 robustness shape).
+    // The default seed declares the guides-ring tag `guide`. `capture` is NOT
+    // default-seeded on cloud (T-318: the Notes app declares it lazily, only
+    // when the owner opts in). `toContain` keeps the assertion robust to a
+    // growing seed set (the #86 robustness shape).
     const tagNames = (proj.tags as any[]).map((t) => t.name);
-    expect(tagNames).toContain("capture");
     expect(tagNames).toContain("guide");
+    expect(tagNames).not.toContain("capture");
     expect(Array.isArray(proj.indexed_fields)).toBe(true);
     expect((proj.query_hints as string[]).length).toBeGreaterThan(0);
     // Cloud always knows its public origin → absolute coordinates.

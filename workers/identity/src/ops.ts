@@ -10,8 +10,11 @@
  *     (a self-HTTP-fetch would be near-tautological — this worker is obviously
  *     running if the cron fired — and Workers can't fetch their own routes);
  *     vault liveness = GET <VAULT_ORIGIN>/health, the router-level endpoint that
- *     never wakes a DO. Failures alert OPERATOR_ALERT_EMAIL with a 1-hour
- *     per-check dedupe persisted in D1 (`ops_alerts`).
+ *     never wakes a DO. Failures alert every OPERATOR_ALERT_EMAIL recipient
+ *     (+ the optional OPS_ALERT_WEBHOOK_URL) with a 1-hour per-check dedupe
+ *     persisted in D1 (`ops_alerts`). Each run's outcome is counted
+ *     (`ops_counters` health_ok/health_fail) for the daily line, and the same
+ *     tick checks the 5xx rate of the 10 minutes just closed.
  *   - Mondays 14:00 UTC (DIGEST_CRON): a counts-only digest from D1 — users,
  *     vaults, magic links sent/failed over 7 days. No PII, ever: counts only.
  *   - hourly at :15 (DRIP_CRON): the onboarding email drip — routed here,
@@ -25,7 +28,9 @@
  *   - daily 03:30 UTC (USAGE_CRON): the per-vault storage-usage rollup plus
  *     plan-entitlement reconciler — routed here, implemented in usage.ts
  *     (one internal-config GET and one D1 `vault_usage` row per vault per UTC
- *     day; stale entitlements reuse the cap-push seam).
+ *     day; stale entitlements reuse the cap-push seam) — THEN the daily ops
+ *     line for the UTC day that just ended (ops-daily.ts), chained on the same
+ *     tick so it reads the fresh rollup; separately guarded.
  *   - nightly 04:00 UTC (SNAPSHOT_CRON): the GFS snapshot sweep — routed
  *     here, implemented in snapshots.ts (per-plan retention, D1 manifest
  *     mirror, failure isolation per vault).
@@ -37,7 +42,10 @@
 import type { Env } from "./env.ts";
 import type { EmailSender } from "./email.ts";
 import { runAccountDeleteSweep } from "./account-delete.ts";
-import { markAlerted, shouldAlert } from "./ops-alerts.ts";
+import { markAlerted, notifyOperators, operatorRecipients, opsWebhookUrl, raiseOpsAlert, shouldAlert } from "./ops-alerts.ts";
+import { OPS_BUCKET_MS, bumpOpsCounter, opsBucket, sumOpsCounter } from "./ops-counters.ts";
+import { runDailyLine } from "./ops-daily.ts";
+import { purgeStaleAuthArtifacts } from "./magic-links.ts";
 import { runBillingSweep } from "./billing-lifecycle.ts";
 import { runDrip } from "./drip.ts";
 import { depsForEnv } from "./oauth-shared.ts";
@@ -63,8 +71,14 @@ const HEALTH_FETCH_TIMEOUT_MS = 10_000;
 
 export interface OpsDeps {
   now?: () => Date;
+  /** The vault /health probe's fetch. */
   fetchFn?: typeof fetch;
+  /** The operator webhook's fetch (ops-alerts.ts postOpsWebhook); default global fetch. */
+  webhookFetchFn?: typeof fetch;
 }
+
+/** 5xx responses per 10-minute window that raise an `errors:5xx` alert (OPS_5XX_ALERT_THRESHOLD overrides). */
+export const DEFAULT_5XX_ALERT_THRESHOLD = 25;
 
 /**
  * Which job a firing cron maps to. Cloudflare passes the matched pattern as
@@ -127,12 +141,38 @@ export async function handleScheduled(cron: string, env: Env, sender: EmailSende
     } catch (err) {
       console.error(`event=account_delete_sweep_failed error=${err instanceof Error ? err.message : String(err)}`);
     }
+    // Retention purge of spent sign-in artifacts (T-318, magic-links.ts):
+    // links + pending 2FA logins + auth codes past their life by a week.
+    // Own try — it must never starve, or be starved by, the jobs above.
+    try {
+      const r = await purgeStaleAuthArtifacts(env.DB, deps.now?.() ?? new Date());
+      console.log(`event=auth_retention_purge magic_links=${r.magicLinks} pending_logins=${r.pendingLogins} auth_codes=${r.authCodes}`);
+    } catch (err) {
+      console.error(`event=auth_retention_purge_failed error=${err instanceof Error ? err.message : String(err)}`);
+    }
   } else if (job === "usage") {
     // The rollup's vault reads go through the mint seam, so it takes the full
     // OAuthDeps (issuer/signing + per-environment transport), not OpsDeps.
     const rollupDeps = depsForEnv(env);
     if (deps.now) rollupDeps.now = deps.now;
-    await runUsageRollup(env, rollupDeps, { sender });
+    // The daily ops line rides this tick, AFTER the rollup so its vault
+    // figures are fresh. Its own try: a rollup failure must not cost the line
+    // (the line is how the operator notices the rollup failing), and a line
+    // failure must not mask the rollup's. The rollup error is rethrown last so
+    // the cron invocation still reports failed.
+    let rollupError: unknown = null;
+    try {
+      await runUsageRollup(env, rollupDeps, { sender });
+    } catch (err) {
+      rollupError = err;
+      console.error(`event=usage_rollup_failed error=${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      await runDailyLine(env, sender, { now: deps.now?.() ?? new Date(), fetchFn: deps.webhookFetchFn });
+    } catch (err) {
+      console.error(`event=ops_daily_failed error=${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (rollupError) throw rollupError;
   } else if (job === "snapshot") {
     // The nightly GFS snapshot sweep (snapshots.ts) — same mint-seam deps
     // shape as the usage rollup.
@@ -192,7 +232,7 @@ export async function runHealthCheck(
   env: Env,
   sender: EmailSender,
   deps: OpsDeps = {},
-): Promise<{ failures: HealthFailure[]; alerted: HealthFailure[] }> {
+): Promise<{ failures: HealthFailure[]; alerted: HealthFailure[]; errors5xx: number }> {
   const now = deps.now?.() ?? new Date();
   const fetchFn = deps.fetchFn ?? fetch;
 
@@ -203,7 +243,12 @@ export async function runHealthCheck(
       : Promise.resolve<HealthFailure>({ check: "vault-health", detail: "VAULT_ORIGIN unset — cannot check" }),
   ]);
   const failures = results.filter((r): r is HealthFailure => r !== null);
-  if (failures.length === 0) return { failures: [], alerted: [] };
+  // Record every run's outcome — the daily line's "health ok N/144". A run
+  // that never happened (worker/cron down) records nothing, which also shows.
+  await bumpOpsCounter(env.DB, failures.length === 0 ? "health_ok" : "health_fail", now);
+  // The error-rate signal rides the same tick, independent of the checks.
+  const errors5xx = await checkErrorRate(env, sender, now, deps);
+  if (failures.length === 0) return { failures: [], alerted: [], errors5xx };
 
   // Structured log for EVERY failure, independent of email (Workers Logs is the
   // always-on trail; email is the wake-someone-up channel).
@@ -215,12 +260,11 @@ export async function runHealthCheck(
   for (const f of failures) {
     if (await shouldAlert(env.DB, `health:${f.check}`, now)) alertable.push(f);
   }
-  if (alertable.length === 0) return { failures, alerted: [] };
+  if (alertable.length === 0) return { failures, alerted: [], errors5xx };
 
-  const to = env.OPERATOR_ALERT_EMAIL;
-  if (!to) {
-    console.error("event=ops_alert_skipped reason=no_operator_alert_email");
-    return { failures, alerted: [] };
+  if (operatorRecipients(env).length === 0 && !opsWebhookUrl(env)) {
+    console.error("event=ops_alert_skipped reason=no_operator_channel");
+    return { failures, alerted: [], errors5xx };
   }
 
   const envName = env.ENVIRONMENT ?? "unknown";
@@ -234,14 +278,61 @@ export async function runHealthCheck(
     `Logs: Cloudflare dashboard → Workers Logs (parachute-identity), or \`wrangler tail parachute-identity\`.`,
   ].join("\n");
 
-  const sent = await sender.sendOps({ to, subject, text });
-  if (sent.ok) {
+  // Every recipient + the webhook; dedupe is per check across all channels.
+  const sent = await notifyOperators(env, sender, {
+    subject,
+    text,
+    key: alertable.map((f) => `health:${f.check}`).join(","),
+    severity: "critical",
+    now,
+    webhook: true,
+    fetchFn: deps.webhookFetchFn,
+  });
+  if (sent.delivered) {
     for (const f of alertable) await markAlerted(env.DB, `health:${f.check}`, now);
-    console.error(`event=ops_alert_sent checks=${alertable.map((f) => f.check).join(",")}`);
-    return { failures, alerted: alertable };
+    await bumpOpsCounter(env.DB, "alert", now);
+    console.error(
+      `event=ops_alert_sent checks=${alertable.map((f) => f.check).join(",")} emailed=${sent.emailed} webhook=${sent.webhook}`,
+    );
+    return { failures, alerted: alertable, errors5xx };
   }
-  console.error(`event=ops_alert_send_failed sender=${sender.kind} error=${JSON.stringify(sent.error)}`);
-  return { failures, alerted: [] };
+  console.error(`event=ops_alert_send_failed sender=${sender.kind} email_failed=${sent.emailFailed} webhook=${sent.webhook}`);
+  return { failures, alerted: [], errors5xx };
+}
+
+/**
+ * The error-rate signal: identity 5xx responses in the 10-minute bucket that
+ * just closed (counted by the fetch wrapper in index.ts). At or over the
+ * threshold → one deduped `errors:5xx` alert. Returns the count. Never throws.
+ */
+export async function checkErrorRate(env: Env, sender: EmailSender, now: Date, deps: OpsDeps = {}): Promise<number> {
+  try {
+    const parsed = Number.parseInt(env.OPS_5XX_ALERT_THRESHOLD ?? "", 10);
+    const threshold = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_5XX_ALERT_THRESHOLD;
+    const from = opsBucket(new Date(now.getTime() - OPS_BUCKET_MS));
+    const to = opsBucket(now);
+    const n = await sumOpsCounter(env.DB, "http_5xx", from, to);
+    if (n >= threshold) {
+      console.error(`event=error_rate_high count=${n} threshold=${threshold} window=${from}`);
+      await raiseOpsAlert(env, sender, {
+        key: "errors:5xx",
+        subject: `${n} server errors (5xx) in 10 minutes`,
+        text: [
+          `The identity worker answered ${n} requests with a 5xx status in the 10 minutes from ${from} UTC`,
+          `(alert threshold ${threshold}; set OPS_5XX_ALERT_THRESHOLD to change it).`,
+          "",
+          "Look in Workers Logs (parachute-identity) for responses with status >= 500 in that window.",
+        ].join("\n"),
+        now,
+        severity: "warning",
+        fetchFn: deps.webhookFetchFn,
+      });
+    }
+    return n;
+  } catch (err) {
+    console.error(`event=error_rate_check_failed error=${JSON.stringify(String(err))}`);
+    return 0;
+  }
 }
 
 // --- magic-link send counters (PII-free) --------------------------------------
@@ -316,14 +407,22 @@ export function renderDigest(stats: DigestStats, envName: string, now: Date): { 
 export async function sendWeeklyDigest(env: Env, sender: EmailSender, deps: OpsDeps = {}): Promise<DigestStats> {
   const now = deps.now?.() ?? new Date();
   const stats = await collectDigestStats(env.DB, now);
-  const to = env.OPERATOR_ALERT_EMAIL;
-  if (!to) {
+  if (operatorRecipients(env).length === 0) {
     console.error("event=ops_digest_skipped reason=no_operator_alert_email");
     return stats;
   }
   const { subject, text } = renderDigest(stats, env.ENVIRONMENT ?? "unknown", now);
-  const sent = await sender.sendOps({ to, subject, text });
-  if (sent.ok) console.log(`event=ops_digest_sent users=${stats.usersTotal} vaults=${stats.vaultsTotal}`);
-  else console.error(`event=ops_digest_send_failed sender=${sender.kind} error=${JSON.stringify(sent.error)}`);
+  // Email only (every recipient) — the webhook carries alerts + the daily line.
+  const sent = await notifyOperators(env, sender, {
+    subject,
+    text,
+    key: "digest",
+    severity: "info",
+    now,
+    webhook: false,
+  });
+  if (sent.delivered) {
+    console.log(`event=ops_digest_sent users=${stats.usersTotal} vaults=${stats.vaultsTotal} emailed=${sent.emailed}`);
+  } else console.error(`event=ops_digest_send_failed sender=${sender.kind} email_failed=${sent.emailFailed}`);
   return stats;
 }

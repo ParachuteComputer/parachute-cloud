@@ -21,7 +21,9 @@
  */
 import type { Env } from "./env.ts";
 import { isDevExposureEnv } from "./env-gates.ts";
-import type { PaidTier } from "./plans.ts";
+import { type BillingMode, OPEN_BETA_LONG, type PaidTier } from "./plans.ts";
+
+export type { BillingMode } from "./plans.ts";
 
 /** The billing cycles a Checkout can buy — form field `interval`. */
 export type BillingInterval = "monthly" | "quarterly" | "yearly";
@@ -41,6 +43,35 @@ export interface BillingConfig {
    * them); everything else is best-available. Read through {@link priceFor}.
    */
   prices: PriceMatrix;
+}
+
+/**
+ * THE MONEY SWITCH (T-318, Aaron 10-29: "Parachute open beta"). The ONE reader
+ * of `BILLING_MODE`. Only the literal "paid" (trimmed, case-insensitive) turns
+ * billing on; unset, empty, or anything else is "open_beta" — the safe
+ * direction, because a typo must never start charging people or freezing
+ * vaults. In open_beta:
+ *   - new sign-ups get no trial clock (users.ts createUser);
+ *   - the expired floor is unreachable: entitlements never carry `frozen`
+ *     (plans.ts livePlan) and the hourly sweep lands due rows on the beta plan
+ *     instead of `expired` (billing-lifecycle.ts runBillingSweep);
+ *   - checkout / portal / promo / the tier picker answer `billing_paused`, and
+ *     `/account/summary` reports `billing_enabled: false`, EVEN WHEN the Stripe
+ *     secrets + Prices exist (billingConfig stays a pure "are the keys here?"
+ *     probe so the webhook keeps reconciling any existing subscription).
+ */
+export function billingMode(env: { BILLING_MODE?: string }): BillingMode {
+  return env.BILLING_MODE?.trim().toLowerCase() === "paid" ? "paid" : "open_beta";
+}
+
+/** The clean refusal every billing door answers while the open beta is on. 409
+ *  (the request is fine; the product state says no), with the long money story
+ *  as the human message. */
+export function billingPausedResponse(): Response {
+  return new Response(JSON.stringify({ error: "billing_paused", message: OPEN_BETA_LONG }), {
+    status: 409,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
 }
 
 /** Trim-to-undefined: an empty [vars] value means "not set". */
@@ -119,6 +150,9 @@ export function priceFor(config: BillingConfig, tier: PaidTier, interval: Billin
  */
 export function mockBillingEnabled(env: Env): boolean {
   if (!isDevExposureEnv(env.ENVIRONMENT)) return false; // belt — fail closed
+  // Open beta: no checkout of any kind, mock included (a mock upgrade would
+  // flip a plan nobody can buy).
+  if (billingMode(env) !== "paid") return false;
   if (env.MOCK_BILLING === "1") return true; // explicit opt-in (allowlist only)
   return billingConfig(env) === null; // auto: mock stands in for absent Stripe
 }

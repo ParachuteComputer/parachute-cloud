@@ -32,7 +32,7 @@
  */
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { signAccessToken } from "./tokens.ts";
-import { type OAuthDeps, vaultInstanceUrl } from "./oauth-shared.ts";
+import { type OAuthDeps, billingModeOf, vaultInstanceUrl } from "./oauth-shared.ts";
 import { type PlanCaps, type VaultEntitlement, entitlementPlanFor, planEntitlement } from "./plans.ts";
 import { getUserById } from "./users.ts";
 import { listVaultsForOwner } from "./vaults.ts";
@@ -290,6 +290,9 @@ export interface ResolvedVaultEntitlement {
   transcriptionEnabled: boolean;
   /** The currently resolved monthly voice budget. */
   transcribeMinutesLimit: number;
+  /** The account-closed lock (T-318 delete request). Optional: an older vault
+   *  worker doesn't report it. */
+  closed?: boolean;
 }
 
 /** The usage split GET /api/internal/config reports (the rollup's read). */
@@ -299,6 +302,9 @@ export interface VaultUsageReading {
   /** Voice minutes used this UTC month (cloud#56). 0 when the DO reports none
    *  (a pre-voice vault worker, or no transcriptions yet). */
   transcribeMinutes: number;
+  /** Notes written in the 24 h before the read (the daily ops line). null when
+   *  the DO doesn't report it (an older vault worker) — never guessed as 0. */
+  notesChanged24h: number | null;
   /**
    * The DO's resolved entitlement, or null when the response didn't carry
    * the control-plane fields AT ALL — a vault-worker ROLLBACK to a
@@ -377,6 +383,8 @@ export async function readVaultUsage(
     transcription_enabled?: unknown;
     transcribe_minutes_limit?: unknown;
     transcribe_minutes?: unknown;
+    notes_changed_24h?: unknown;
+    closed?: unknown;
   };
   if (typeof body.db_bytes !== "number" || typeof body.r2_bytes !== "number") {
     throw new Error("internal config GET carried no usage split (db_bytes/r2_bytes)");
@@ -412,6 +420,7 @@ export async function readVaultUsage(
         frozen: body.frozen as boolean,
         transcriptionEnabled: body.transcription_enabled as boolean,
         transcribeMinutesLimit: body.transcribe_minutes_limit as number,
+        closed: body.closed === true,
       };
     } catch (err) {
       // Distinct from the rollback log the rollup emits: this vault DID answer
@@ -450,6 +459,10 @@ export async function readVaultUsage(
     dbBytes: body.db_bytes,
     r2Bytes: body.r2_bytes,
     transcribeMinutes,
+    notesChanged24h:
+      typeof body.notes_changed_24h === "number" && Number.isFinite(body.notes_changed_24h)
+        ? body.notes_changed_24h
+        : null,
     entitlement,
   };
 }
@@ -503,6 +516,7 @@ export async function pushVaultCap(
   userId: string,
   vaultName: string,
   entitlement: VaultEntitlement,
+  opts: { reopen?: boolean } = {},
 ): Promise<CapPushResult> {
   const capBytes = entitlement.caps.notes_bytes + entitlement.caps.attachment_bytes;
   let lastStatus: number | undefined;
@@ -530,6 +544,9 @@ export async function pushVaultCap(
           caps: entitlement.caps,
           transcription: entitlement.transcription,
           frozen: entitlement.frozen,
+          // T-318: undo (and the operator comp lever) re-open a vault the
+          // delete request locked, in the SAME PUT as the entitlement.
+          ...(opts.reopen ? { closed: false } : {}),
         },
       });
       if (res.ok) return { vault: vaultName, capBytes, ok: true, status: res.status, attempts: attempt };
@@ -587,6 +604,7 @@ export async function applyPlanToVaults(
   db: D1Database,
   deps: OAuthDeps,
   userId: string,
+  opts: { reopen?: boolean } = {},
 ): Promise<CapPushResult[]> {
   const user = await getUserById(db, userId);
   if (!user) return [];
@@ -602,11 +620,63 @@ export async function applyPlanToVaults(
   // entitlement, and frozen — a plan change flips them together. A TRIAL
   // mirrors the CHOSEN tier when pending_plan names one (plans.ts
   // entitlementPlanFor — "try any plan free for three months").
-  const entitlement = planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan));
+  const entitlement = planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps)));
   const vaults = await listVaultsForOwner(db, userId);
   const results: CapPushResult[] = [];
   for (const v of vaults) {
-    results.push(await pushVaultCap(db, deps, userId, v.name, entitlement));
+    results.push(await pushVaultCap(db, deps, userId, v.name, entitlement, opts));
+  }
+  return results;
+}
+
+export interface VaultClosePushResult {
+  vault: string;
+  ok: boolean;
+  status?: number;
+}
+
+/**
+ * Lock (`closed: true`) or unlock every vault the account owns (T-318). The
+ * vault DO refuses every tenant request with 401 `account_closed` while
+ * locked — the lever that makes the stateless 15-minute vault tokens stop
+ * working the moment a delete is REQUESTED instead of when they expire.
+ *
+ * Deliberately NOT routed through {@link applyPlanToVaults}: that seam refuses
+ * a tombstoned owner by design (never wake a deleted account's DO for a
+ * plan change), and locking is exactly the call a tombstoned owner needs.
+ * Best-effort per vault, one retry on a retryable status; failures are
+ * returned (and logged) rather than thrown, because the delete HAS happened
+ * and the tokens it failed to lock still die at expiry.
+ */
+export async function pushVaultsClosed(
+  db: D1Database,
+  deps: OAuthDeps,
+  userId: string,
+  closed: boolean,
+): Promise<VaultClosePushResult[]> {
+  const results: VaultClosePushResult[] = [];
+  for (const v of await listVaultsForOwner(db, userId)) {
+    let last: VaultClosePushResult = { vault: v.name, ok: false };
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const res = await callVaultApi(db, deps, {
+          userId,
+          vaultName: v.name,
+          method: "PUT",
+          apiPath: "/api/internal/config",
+          verb: "admin",
+          jsonBody: { closed },
+        });
+        last = { vault: v.name, ok: res.ok, status: res.status };
+        if (res.ok || !isRetryableStatus(res.status)) break;
+      } catch {
+        last = { vault: v.name, ok: false };
+      }
+    }
+    if (!last.ok) {
+      console.warn(`event=vault_close_push_failed vault=${v.name} closed=${closed} status=${last.status ?? "transport"}`);
+    }
+    results.push(last);
   }
   return results;
 }
