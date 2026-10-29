@@ -56,6 +56,7 @@ import {
   TIER_PRICE_MONTHLY_USD,
   entitlementPlanFor,
   livePlan,
+  vaultLimitPlan,
   OPEN_BETA_LONG,
   planLabel,
   isPaidTier,
@@ -469,7 +470,7 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   // `>=` grandfathers users already over a cap (they keep every vault they own;
   // only NEW creation is refused). An expired plan has vault_count=0, so it is
   // refused here with the same at-cap message the console gives.
-  const spec = PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))];
+  const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
   if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
     return restError(403, "vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps)));
   }

@@ -75,6 +75,7 @@ import {
   canStartCheckout,
   entitlementPlanFor,
   livePlan,
+  vaultLimitPlan,
   isPaidTier,
   isPlanId,
   planEntitlement,
@@ -413,7 +414,7 @@ async function renderConsoleFor(
       // At (or over — grandfathered) the plan's vault count: the create form
       // gives way to the friendly at-cap note. The POST handler is the real
       // gate; this just keeps the UI honest.
-      atVaultCap: cards.length >= PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))].vault_count,
+      atVaultCap: cards.length >= PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))].vault_count,
       // Operators get the quiet Admin header link (the surface itself 404s
       // for everyone else — admin.ts).
       isOperator: user.role === "operator",
@@ -644,7 +645,7 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   // with no vaults has vault_count=0, so 0 >= 0 always refuses here with the
   // at-cap message even though they've never made a vault. Give them a distinct
   // "pick a plan to create your first vault" path instead of the cap wall.
-  const spec = PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))];
+  const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
   if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
     return fail(vaultCapMessage(user.plan, billingModeOf(deps)));
   }
@@ -893,7 +894,7 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
     // A NEW vault — the plan vault-count gate, verbatim from the create door.
     // `>=` grandfathers accounts already over a cap; expired (vault_count 0) is
     // refused here exactly as create refuses it.
-    const spec = PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))];
+    const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
     if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
       return consoleError(db, req, deps, user, vaultCapMessage(user.plan, billingModeOf(deps)));
     }
