@@ -1354,15 +1354,24 @@ export class VaultDO extends DurableObject {
    * D1 in one hop. Snapshots never touch the r2_bytes cap meter (no
    * meterAdd/meterSub — quota honesty, pinned by the conformance suite).
    *
-   * CONCURRENCY NOTE: the manifest read-modify-write below is NOT mutexed —
-   * DO event interleaving across awaits means two concurrent snapshot POSTs
-   * to the same vault could race it. Acceptable by topology: the only callers
-   * are the single nightly cron and the staging test trigger, and a same-
-   * millisecond collision degrades to a key overwrite + manifest replace
-   * (handled below). Add blockConcurrencyWhile before ever giving this verb
-   * a second concurrent caller.
+   * CONCURRENCY: runs are SERIALIZED per vault ({@link snapshotQueue}). The
+   * manifest read-modify-write + list-based prune spans many awaits (R2 I/O
+   * does not hold the DO's input gate), and two interleaved runs each pruned
+   * the other's new tarball and published a manifest naming a deleted one.
+   * The nightly sweep and POST /ops/snapshot-run (T-318) can overlap, so the
+   * queue is load-bearing. A queue, not blockConcurrencyWhile: the vault keeps
+   * serving reads and writes while a snapshot exports.
    */
-  private async handleSnapshot(request: Request, vaultName: string): Promise<Response> {
+  private handleSnapshot(request: Request, vaultName: string): Promise<Response> {
+    const run = this.snapshotQueue.then(() => this.takeSnapshot(request, vaultName));
+    this.snapshotQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** The tail of this instance's snapshot queue (see handleSnapshot). */
+  private snapshotQueue: Promise<unknown> = Promise.resolve();
+
+  private async takeSnapshot(request: Request, vaultName: string): Promise<Response> {
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
     let body: { retention?: unknown };
     try {

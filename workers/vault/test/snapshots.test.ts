@@ -311,6 +311,21 @@ describe("POST /api/internal/snapshot — tarball + manifest", () => {
     expect(((await list.json()) as { snapshots: SnapshotEntry[] }).snapshots).toEqual([body.entry]);
   });
 
+  it("two overlapping snapshot calls are serialized: both land, every manifest key has its tarball", async () => {
+    // The nightly sweep and POST /ops/snapshot-run can overlap (T-318). An
+    // unserialized pair read the same manifest and each pruned the other's tar.
+    const v = freshVault("sn");
+    await createNote(v, { content: "overlap", path: "notes/overlap" });
+    const res = await Promise.all(Array.from({ length: 5 }, () => snapshotReq(v, OP, PAID)));
+    expect(res.map((r) => r.status)).toEqual([200, 200, 200, 200, 200]);
+    const keys = new Set(await Promise.all(res.map(async (r) => ((await r.json()) as SnapshotResponse).entry!.key)));
+    const stored = await loadManifest(env.ATTACHMENTS, v);
+    const tars = await listTarKeys(v);
+    // Every call's snapshot survives (PAID keeps 14 dailies), in R2 and in the manifest.
+    expect(stored.snapshots.map((x) => x.key).sort()).toEqual([...keys].sort());
+    expect([...tars].sort()).toEqual([...keys].sort());
+  });
+
   it("reports how many entries needed a PAX path record (count only, no names) — T-318", async () => {
     const v = freshVault("sn");
     await createNote(v, { content: "short", path: "notes/short" });
