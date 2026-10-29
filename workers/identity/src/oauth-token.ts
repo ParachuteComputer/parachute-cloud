@@ -443,7 +443,11 @@ async function rotateAndRespond(
         .prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL")
         .bind(now.toISOString(), row.jti),
       prepared.stmt,
-      db.prepare("UPDATE tokens SET rotated_to = ? WHERE jti = ?").bind(access.jti, row.jti),
+      // Only the winning rotation links its successor: a loser (predecessor
+      // already revoked) must not overwrite the winner's rotated_to.
+      db
+        .prepare("UPDATE tokens SET rotated_to = ? WHERE jti = ? AND rotated_to IS NULL")
+        .bind(access.jti, row.jti),
     ]);
   } catch (err) {
     // Concurrent rotation collided on the jti PK (or any INSERT-time error).

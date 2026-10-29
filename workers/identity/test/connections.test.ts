@@ -324,6 +324,81 @@ describe("DELETE /account/vaults/<name>/connections/<client_id> — Disconnect",
     expect(live?.n).toBe(0);
   });
 
+  test("two Disconnects racing on one grant never resurrect a removed vault (Codex T-318 pass 4)", async () => {
+    const { userId, vault, other, sessionId } = await setup("dc-race");
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    await connect(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`);
+    await connect(clientId, sessionId, `vault:${other}:read`);
+    const admin = await accountBearer(userId, "admin");
+    // Disconnect(vault) has read the grant; Disconnect(other) commits before it writes.
+    let raced = false;
+    const racingDb = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "batch") {
+          return async (stmts: D1PreparedStatement[]) => {
+            if (!raced) {
+              raced = true;
+              const dc = await api("DELETE", `/account/vaults/${other}/connections/${clientId}`, admin);
+              expect(dc.status).toBe(200);
+            }
+            return target.batch(stmts);
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    const res = await worker.fetch(
+      new Request(`${ISSUER}/account/vaults/${vault}/connections/${clientId}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${admin}` },
+      }),
+      { ...env, DB: racingDb },
+    );
+    expect(raced).toBe(true);
+    expect(res.status).toBe(200);
+    const grant = await env.DB.prepare("SELECT scopes FROM grants WHERE user_id = ? AND client_id = ?")
+      .bind(userId, clientId)
+      .first<{ scopes: string }>();
+    expect(grant).toBeNull();
+  });
+
+  test("a refresh that loses a rotation race keeps the winner's successor link (Codex T-318 pass 4)", async () => {
+    const { vault, sessionId } = await setup("rot-race");
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const pair = await connect(clientId, sessionId, `vault:${vault}:read`);
+    let winner: Response | null = null;
+    const racingDb = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "batch") {
+          return async (stmts: D1PreparedStatement[]) => {
+            if (!winner) winner = await refresh(clientId, pair.refresh_token);
+            return target.batch(stmts);
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    const loser = await worker.fetch(
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: pair.refresh_token, client_id: clientId }),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      { ...env, DB: racingDb },
+    );
+    expect(loser.status).toBe(400);
+    expect(winner!.status).toBe(200);
+    const won = (await winner!.json()) as Pair;
+    const predJti = decodeJwtPayload(pair.access_token).jti as string;
+    const wonJti = decodeJwtPayload(won.access_token).jti as string;
+    const link = await env.DB.prepare("SELECT rotated_to FROM tokens WHERE jti = ?").bind(predJti).first<{ rotated_to: string }>();
+    expect(link?.rotated_to).toBe(wonJti);
+    // The winner's session keeps working.
+    expect((await refresh(clientId, won.refresh_token)).status).toBe(200);
+  });
+
   test("disconnecting from one vault leaves the same app's access to another vault working", async () => {
     const { userId, vault, other, sessionId } = await setup("two");
     const { clientId } = await seedApprovedClient({ clientName: "Claude" });

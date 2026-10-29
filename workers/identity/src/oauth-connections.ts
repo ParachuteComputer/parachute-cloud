@@ -229,6 +229,7 @@ export async function disconnectVaultClient(
   vault: string,
   clientId: string,
   now: Date,
+  attempt = 0,
 ): Promise<{ revokedTokens: number; covers: ConnectionCoverage } | null> {
   if (FIRST_PARTY_CLIENTS.has(clientId)) return null;
   const grant = await db
@@ -250,10 +251,12 @@ export async function disconnectVaultClient(
   const remaining = reach.covers === "account" ? [] : grantScopes.filter((s) => !reaching.has(s));
   stmts.push(
     remaining.length === 0
-      ? db.prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?").bind(userId, clientId)
+      ? db
+          .prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ? AND scopes = ?")
+          .bind(userId, clientId, grant.scopes)
       : db
-          .prepare("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ?")
-          .bind(remaining.join(" "), userId, clientId),
+          .prepare("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ? AND scopes = ?")
+          .bind(remaining.join(" "), userId, clientId, grant.scopes),
   );
 
   // 2. Live tokens that reach this vault (every live token of this client
@@ -284,6 +287,14 @@ export async function disconnectVaultClient(
   );
 
   const results = await db.batch(stmts);
+  if ((results[0]?.meta.changes ?? 0) === 0 && attempt < 3) {
+    // The grant changed under us (Codex T-318: a concurrent Disconnect of
+    // another vault, or a fresh consent) — the guarded rewrite applied nothing,
+    // so a stale read can't resurrect removed scopes. Redo from a fresh read;
+    // the token revoke and code delete above are idempotent.
+    const again = await disconnectVaultClient(db, userId, vault, clientId, now, attempt + 1);
+    return again ?? { revokedTokens: results[revokeIdx]?.meta.changes ?? 0, covers: reach.covers };
+  }
   const revokedTokens = results[revokeIdx]?.meta.changes ?? 0;
   // Ids and a count only — no scopes, no token material.
   console.log(`event=connection_disconnected user=${userId} client=${clientId} revoked_tokens=${revokedTokens}`);
