@@ -44,8 +44,8 @@ import {
 
 const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 
-function htmlError(title: string, message: string, status: number): Response {
-  return htmlResponse(renderError({ title, message }), status);
+function htmlError(title: string, message: string, status: number, action?: { href: string; label: string }): Response {
+  return htmlResponse(renderError({ title, message, ...(action ? { action } : {}) }), status);
 }
 
 /**
@@ -562,7 +562,14 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   }
   const sessionId = parseSessionCookie(req.headers.get("cookie"));
   const session = sessionId ? await findActiveSession(db, sessionId, deps.now?.() ?? new Date()) : null;
-  if (!session) return htmlError("Session expired", "Please sign in again.", 401);
+  if (!session) {
+    return htmlError(
+      "Signed out",
+      "You were signed out before allowing the connection. Sign in, then go back to your AI app and connect again.",
+      401,
+      { href: "/login", label: "Sign in" },
+    );
+  }
   const client = await getClient(db, params.clientId);
   if (!client) return htmlError("Unknown application", "The client is not registered.", 400);
   try {
@@ -662,7 +669,12 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   if (unnamedVaultVerbs(scopes).length > 0) {
     const picked = String(form.get("vault_pick") ?? "") || (params.vault ?? "");
     if (!picked || !VAULT_NAME_RE.test(picked)) {
-      return htmlError("Vault required", "Choose a vault to authorize.", 400);
+      return htmlError(
+        "Make a vault first",
+        "A connection needs a vault to read and write. Make one, then go back to your AI app and connect again.",
+        400,
+        { href: "/console", label: "Make your first vault" },
+      );
     }
     // hub#689 port — owner-elected verb widening. `verb_select` is an UNTRUSTED
     // hint from the consent radio; re-level the unnamed read/write verb(s) to the

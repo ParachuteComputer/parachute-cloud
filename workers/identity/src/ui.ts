@@ -392,9 +392,9 @@ export function describeScopes(scopes: string[]): Array<{ scope: string; label: 
  * consent CSP is untouched. The submit path re-validates ownership server-side,
  * so this list is UX, not the security boundary.
  */
-function renderVaultPicker(ownedVaults: string[]): string {
+function renderVaultPicker(ownedVaults: string[], clientName: string): string {
   if (ownedVaults.length === 0) {
-    return `<p class="muted" data-testid="no-vaults" style="margin:.85rem 0 0">You don't have a vault yet — <a href="/console">create one</a>, then reconnect to authorize it.</p>`;
+    return `<p data-testid="no-vaults" style="margin:.85rem 0 0">You don't have a vault yet. <a href="/console">Make your first vault</a>, then go back to ${esc(clientName)} and connect again.</p>`;
   }
   const options = ownedVaults
     .map((name, i) => `<option value="${esc(name)}"${i === 0 ? " selected" : ""}>${esc(name)}</option>`)
@@ -506,8 +506,10 @@ export function renderConsent(props: ConsentProps): string {
   const vaultField = lockedVault
     ? `<input type="hidden" name="vault_pick" value="${esc(lockedVault)}">`
     : needsVaultPick
-      ? renderVaultPicker(ownedVaults)
+      ? renderVaultPicker(ownedVaults, clientName)
       : "";
+  // Nothing to pick: an Allow here could only fail ("Vault required").
+  const nothingToPick = !lockedVault && needsVaultPick && ownedVaults.length === 0;
   const verbSelectorField = verbSelector ? renderVerbSelector(verbSelector) : "";
   const accountVaultsField = accountVaults ? renderAccountVaultsBlock(accountVaults) : "";
   const ask = consentAsk({
@@ -533,7 +535,7 @@ export function renderConsent(props: ConsentProps): string {
          ${accountVaultsField}
          <div class="row">
            <button class="deny" type="submit" name="decision" value="deny">Deny</button>
-           <button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Allow</button>
+           ${nothingToPick ? "" : `<button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Allow</button>`}
          </div>
        </form>
        <p class="muted" style="margin:.9rem 0 0">You can disconnect it anytime from your vault's settings.</p>
@@ -587,10 +589,15 @@ export function consentAsk(opts: {
   return `${who} wants to ${what} ${where}.`;
 }
 
-export function renderError(opts: { title: string; message: string }): string {
+export function renderError(opts: { title: string; message: string; action?: { href: string; label: string } }): string {
+  // A page that stops someone says what to do next and links to it (T-318
+  // night: "Link expired" and "Vault required" were dead ends).
+  const action = opts.action
+    ? `<a class="primary" style="display:block;text-align:center;text-decoration:none;padding:.62rem 1rem;margin-top:.9rem" href="${esc(opts.action.href)}">${esc(opts.action.label)}</a>`
+    : "";
   return page(
     opts.title,
-    `<h1>${esc(opts.title)}</h1><div class="card"><p>${esc(opts.message)}</p></div>`,
+    `<h1>${esc(opts.title)}</h1><div class="card"><p>${esc(opts.message)}</p>${action}</div>`,
   );
 }
 

@@ -421,7 +421,8 @@ function magicLinkDead(req: Request, deps: OAuthDeps): Response {
   return htmlResponse(
     renderError({
       title: "Link expired",
-      message: "This sign-in link is invalid, already used, or expired. Request a new one from the sign-in page.",
+      message: "This sign-in link was already used or has expired. Links work once, for 10 minutes.",
+      action: { href: "/login", label: "Get a new sign-in link" },
     }),
     400,
   );

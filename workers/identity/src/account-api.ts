@@ -303,7 +303,8 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
   };
   // A current monthly price only for a paid tier (trial/expired aren't charged).
   // Read the numeric source directly — no regex-strip of the display label.
-  if (isPaidTier(user.plan)) {
+  // In open beta only a live subscription pays: a comped tier shows no price.
+  if (isPaidTier(user.plan) && (mode === "paid" || user.stripeSubscriptionId !== null)) {
     plan.price_monthly_usd = TIER_PRICE_MONTHLY_USD[user.plan];
   }
   // No countdown in open beta, even for a row the lift hasn't cleared yet.

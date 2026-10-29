@@ -58,6 +58,7 @@ export function renderUndoDone(p: { signInUrl: string; billingResumed: boolean }
     `<h1>Your account is back</h1>
      <div class="card" data-testid="undo-done">
        <p>Sign in again to continue. Your vaults and everything in them are just as you left them.</p>
+       <p class="muted">Connected AI apps (Claude, ChatGPT and others) lost access when the account closed. Connect them again from Connect your AI.</p>
        ${p.billingResumed ? "" : `<p class="muted">Your subscription had already ended during the 24 hours, so it was not restarted.</p>`}
        <a class="primary" style="display:block;text-align:center;text-decoration:none;padding:.62rem 1rem" href="${esc(p.signInUrl)}">Sign in</a>
      </div>`,
