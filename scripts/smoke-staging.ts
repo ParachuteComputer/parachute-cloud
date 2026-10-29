@@ -45,7 +45,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { totpCodeAt } from "../workers/identity/src/totp.ts";
 import { isUnverifiable, resolveMinAssertions, STAGING_MIN_ASSERTIONS, summarize } from "./smoke-report.ts";
-// core resolves from the sibling parachute-vault checkout, copied into the vault
+// core resolves from the sibling parachute-core checkout, copied into the vault
 // worker's node_modules by `bun install` (the same explicit path test-bun uses).
 import { GETTING_STARTED_PACK, welcomePack } from "../workers/vault/node_modules/@openparachute/core/src/seed-packs.js";
 import { DEFAULT_SEED_OMITTED_TAGS } from "../workers/vault/src/welcome.ts";

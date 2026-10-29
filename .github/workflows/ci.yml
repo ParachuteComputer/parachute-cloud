@@ -2,11 +2,11 @@
 # @cloudflare/vitest-pool-workers) and the dormant control plane (root bun test).
 #
 # Load-bearing setup notes (all three jobs):
-#   - workers/vault depends on @openparachute/core via
-#     `file:../../../parachute-vault/core` — a SIBLING checkout of the public
-#     parachute-vault repo, OUTSIDE this repo. Bun copies it into node_modules
-#     at install time, so each job materializes the exact commit pinned in
-#     scripts/vault-source.env next to this checkout BEFORE `bun install`. The
+#   - workers/vault depends on @openparachute/core (the engine) via
+#     `file:../../../parachute-core/packages/vault/core` — a SIBLING checkout of
+#     the public parachute-core repo, OUTSIDE this repo. Bun copies it into
+#     node_modules at install time, so each job materializes the exact commit
+#     pinned in scripts/core-source.env next to this checkout BEFORE `bun install`. The
 #     root install covers the whole workspace (workers/*), which is why even
 #     the identity/control-plane jobs need the sibling present.
 #   - workers/identity depends on @openparachute/door-contract via
@@ -18,8 +18,8 @@
 #     exact App commit from scripts/spa-source.env as a sibling checkout.
 #   - bun.lock is COMMITTED (cloud#44, 2026-07-09) — registry deps install
 #     pinned from the lockfile (the vitest-3.2.7 drift broke main), so the
-#     download cache is keyed on bun.lock. The Vault file dependency is pinned
-#     in scripts/vault-source.env (cloud#45, cloud#59); the Hub file dependency
+#     download cache is keyed on bun.lock. The engine file dependency is pinned
+#     in scripts/core-source.env (cloud#45, cloud#59); the Hub file dependency
 #     is pinned separately.
 #   - Root `bun run typecheck` IS run now (control-plane job): cloud#23 (stripe
 #     caret drift) is closed — `stripe` is pinned EXACT ("22.1.0") and the
@@ -49,7 +49,7 @@ jobs:
         with:
           bun-version: 1.4 # floor: Bun 1.4
 
-      - name: Materialize pinned vault-core dependency
+      - name: Materialize pinned parachute-core engine dependency
         run: bash scripts/materialize-vault-core.sh
 
       - name: Materialize pinned Hub door-contract dependency
@@ -85,7 +85,7 @@ jobs:
         with:
           bun-version: 1.4 # floor: Bun 1.4
 
-      - name: Materialize pinned vault-core dependency
+      - name: Materialize pinned parachute-core engine dependency
         run: bash scripts/materialize-vault-core.sh
 
       - name: Materialize pinned Hub door-contract dependency
@@ -131,7 +131,7 @@ jobs:
         with:
           bun-version: 1.4 # floor: Bun 1.4
 
-      - name: Materialize pinned vault-core dependency
+      - name: Materialize pinned parachute-core engine dependency
         # Needed even here — the root workspace install resolves workers/vault's
         # file dep regardless of which package's tests run.
         run: bash scripts/materialize-vault-core.sh

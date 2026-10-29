@@ -18,7 +18,8 @@ bun run typecheck           # clean (needs "bun" in tsconfig types for bun:sqlit
 The DO is driven directly over RPC from the tests; the `fetch` handler is a
 placeholder so `wrangler` has a valid `main`.
 
-Core is consumed via `file:../../../parachute-vault/core`. The measurements below
+Core is consumed via `file:../../../parachute-core/packages/vault/core` (it lived at
+`parachute-vault/core` when these were measured). The measurements below
 were taken against parachute-vault **`main` @ `4c60f10`** (vault 0.6.4). Core has
 zero npm deps and never constructs a database — `BunSqliteStore` takes an
 injected handle, so the `DatabaseShim` over `ctx.storage.sql` is the only seam.

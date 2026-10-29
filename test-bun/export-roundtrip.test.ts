@@ -11,7 +11,7 @@
  * as the narrow `StreamableObject`/`AttachmentIndex` seams, faked here over an
  * in-memory map, chunked to exercise the streaming pump).
  *
- * @openparachute/core resolves from the SIBLING parachute-vault checkout
+ * @openparachute/core resolves from the SIBLING parachute-core checkout
  * (file: dep, copied into node_modules at install — same as the workers).
  */
 import { describe, expect, it } from "bun:test";
