@@ -293,6 +293,12 @@ describe("POST /ops/snapshot-run", () => {
     expect((await mirrorRows()).filter((r) => r.vault_name === "opsrun-stale").map((r) => r.key)).toEqual([fresh.key]);
   });
 
+  test("a scoped set over 100 names binds only 100 (D1's limit) and reports capped", async () => {
+    const names = Array.from({ length: 150 }, (_, i) => `gone-${i}`); // none exist: no vault calls
+    const summary = await quietly(() => runSnapshotSweep(env, sweepDeps(), { onlyVaults: names }));
+    expect(summary).toMatchObject({ vaults: 0, failed: 0, capped: true });
+  });
+
   test("nothing stale → no vault call, run null", async () => {
     const res = await quietly(() => call({ ...env, OPS_RUN_TOKEN: TOKEN }, `Bearer ${TOKEN}`));
     expect(await res!.json()).toEqual({ stale_before: 0, run: null, stale_after: 0, vaults: 0 });

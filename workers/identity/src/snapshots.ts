@@ -141,11 +141,11 @@ export async function runSnapshotSweep(
         ? { results: [] }
         : await env.DB.prepare(
             `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name IN (${set
-              .slice(0, runCap + 1)
+              .slice(0, runCap)
               .map(() => "?")
               .join(", ")}) AND u.deleted_at IS NULL ORDER BY v.name`,
           )
-            .bind(...set.slice(0, runCap + 1))
+            .bind(...set.slice(0, runCap))
             .all<{ name: string; owner_user_id: string; plan: string }>()
       : await env.DB.prepare(
         `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE u.deleted_at IS NULL ORDER BY v.name LIMIT ?`,
@@ -153,7 +153,9 @@ export async function runSnapshotSweep(
         .bind(runCap + 1)
         .all<{ name: string; owner_user_id: string; plan: string }>();
   const rows = res.results ?? [];
-  const capped = rows.length > runCap || set.length > runCap + 1;
+  // A scoped set binds at most runCap names (D1 refuses over 100 bound
+  // parameters), so it is capped when the SET was longer, not the rows.
+  const capped = rows.length > runCap || set.length > runCap;
   const vaults = capped ? rows.slice(0, runCap) : rows;
   if (capped) console.error(`event=snapshot_sweep_capped cap=${runCap} — paginate before raising (see SNAPSHOT_RUN_CAP note)`);
 
