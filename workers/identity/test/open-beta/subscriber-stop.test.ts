@@ -187,6 +187,31 @@ describe("stopping a paying subscriber lands them on the open beta", () => {
   });
   afterEach(() => fetchMock.assertNoPendingInterceptors());
 
+  test("a late subscription.updated that arrives after the deletion can't put the paid plan back (Codex P2)", async () => {
+    const id = await seedSubscriber("stop-late@example.com", "standard", "sub_stop_late");
+    await seedVault("stop-late-box", id);
+    const pushes: Pushed[] = [];
+    capturePush("stop-late-box", pushes);
+    const periodEnd = Math.floor((Date.now() + 20 * DAY) / 1000);
+    await webhook(
+      "customer.subscription.deleted",
+      subscription({ id: "sub_stop_late", price: PRICE.standardMonthly, periodEndSec: periodEnd, status: "canceled" }),
+    );
+    expect((await getUserById(env.DB, id))!.plan).toBe("trial");
+    expect(pushes).toHaveLength(1);
+
+    // Stripe retries an update it made before the cancel (still "active", the old price).
+    const late = await webhook(
+      "customer.subscription.updated",
+      subscription({ id: "sub_stop_late", price: PRICE.standardMonthly, periodEndSec: periodEnd }),
+    );
+    expect(late.status).toBe(200);
+    const after = (await getUserById(env.DB, id))!;
+    expect(after.plan).toBe("trial");
+    expect(after.pendingPlan).toBeNull();
+    expect(pushes).toHaveLength(1); // no second, smaller push
+  });
+
   test("cancel immediately, mid-period (Standard monthly): open beta NOW, writes on, no cliff date, no billing door", async () => {
     const id = await seedSubscriber("stop-standard@example.com", "standard", "sub_stop_std");
     await seedVault("stop-standard-box", id);

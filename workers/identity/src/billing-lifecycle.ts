@@ -520,6 +520,15 @@ export async function handleSubscriptionUpdated(
   const subscription = event.data.object as Stripe.Subscription;
   const user = await getUserByStripeSubscriptionId(db, subscription.id);
   if (!user) return { ok: true, userId: null, action: "subscription_updated_unknown_user" };
+  // OPEN BETA: checkout is paused, so no subscription can START during the
+  // beta. A row off the paid tiers that still carries a subscription id was
+  // landed on the beta by that subscription's deletion
+  // (landSubscriberOnOpenBeta). Any update for it is a late or retried
+  // delivery from before the cancel (Stripe doesn't order events) and must not
+  // put the paid plan back (Codex P2).
+  if (billingModeOf(deps) === "open_beta" && !isPaidTier(user.plan)) {
+    return { ok: true, userId: user.id, action: "subscription_updated_after_beta_landing" };
+  }
 
   const priceId = subscription.items?.data?.[0]?.price?.id;
   if (!priceId) return { ok: true, userId: user.id, action: "subscription_updated_no_price" };
