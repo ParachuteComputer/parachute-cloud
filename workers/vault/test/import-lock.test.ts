@@ -228,48 +228,60 @@ describe("import lock (T-318)", () => {
     expect(alarmSeenMidReplay.every((running) => !running)).toBe(true);
   }, 120_000);
 
-  it("an embedding wake still parked in the model when an import begins writes nothing when it resumes", async () => {
-    const v = freshVault("iyield");
-    expect((await op(v, "")).status).toBe(200);
-    const note = (await (
-      await op(v, "/api/notes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: "a note to embed", path: "yield/one" }),
-      })
-    ).json()) as { id: string };
-    let entered!: () => void;
-    const inEmbed = new Promise<void>((r) => (entered = r));
-    let releaseEmbed!: () => void;
-    const embedGate = new Promise<void>((r) => (releaseEmbed = r));
-    const parked: EmbeddingProvider = {
-      name: "test-parked",
-      model: "test-parked-model",
-      dims: 3,
-      async available() {
-        return { ok: true as const };
-      },
-      async embed(input: EmbedInput): Promise<EmbedResult> {
-        entered();
-        await embedGate;
-        return { vectors: input.texts.map(() => new Float32Array([1, 0, 0])), model: "test-parked-model", dims: 3 };
-      },
-    };
-    let outcome: unknown;
-    let vectors = -1;
-    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
-      inst.__setTestEmbeddingProvider(parked);
-      const draining = inst.drainEmbeddingsOnce();
-      await inEmbed;
-      inst.importRun = "import"; // an import took the lock while the model ran
-      releaseEmbed();
-      outcome = await draining;
-      inst.importRun = null;
-      vectors = (inst.store.db.prepare("SELECT COUNT(*) AS n FROM note_vectors WHERE note_id = ?").get(note.id) as { n: number }).n;
+  for (const [when, importHappens] of [
+    ["while the import still runs", (inst: any) => {
+      inst.importGeneration++;
+      inst.importRun = "import";
+      return () => (inst.importRun = null);
+    }],
+    ["after the import has finished", (inst: any) => {
+      inst.importGeneration++;
+      return () => {};
+    }],
+  ] as const) {
+    it(`an embedding wake parked in the model across an import writes nothing when it resumes ${when}`, async () => {
+      const v = freshVault("iyield");
+      expect((await op(v, "")).status).toBe(200);
+      const note = (await (
+        await op(v, "/api/notes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: "a note to embed", path: "yield/one" }),
+        })
+      ).json()) as { id: string };
+      let entered!: () => void;
+      const inEmbed = new Promise<void>((r) => (entered = r));
+      let releaseEmbed!: () => void;
+      const embedGate = new Promise<void>((r) => (releaseEmbed = r));
+      const parked: EmbeddingProvider = {
+        name: "test-parked",
+        model: "test-parked-model",
+        dims: 3,
+        async available() {
+          return { ok: true as const };
+        },
+        async embed(input: EmbedInput): Promise<EmbedResult> {
+          entered();
+          await embedGate;
+          return { vectors: input.texts.map(() => new Float32Array([1, 0, 0])), model: "test-parked-model", dims: 3 };
+        },
+      };
+      let outcome: unknown;
+      let vectors = -1;
+      await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+        inst.__setTestEmbeddingProvider(parked);
+        const draining = inst.drainEmbeddingsOnce();
+        await inEmbed;
+        const done = importHappens(inst); // an import took the lock while the model ran
+        releaseEmbed();
+        outcome = await draining;
+        done();
+        vectors = (inst.store.db.prepare("SELECT COUNT(*) AS n FROM note_vectors WHERE note_id = ?").get(note.id) as { n: number }).n;
+      });
+      expect(outcome).toEqual({ kind: "failed", more: true });
+      expect(vectors).toBe(0);
     });
-    expect(outcome).toEqual({ kind: "failed", more: true });
-    expect(vectors).toBe(0);
-  });
+  }
 
   it("a snapshot restore takes the same lock and lands in chunks", async () => {
     const src = freshVault("rsrc");

@@ -661,13 +661,19 @@ export class VaultDO extends DurableObject {
   private inflight = 0;
 
   /**
-   * True when an import started while this alarm wake was parked in a model
-   * call (T-318). The wake then writes nothing more: its results came from
-   * the vault as it was before the import. The work stays pending and the
-   * held alarm picks it up after the import.
+   * Bumped each time an import or restore takes the lock (T-318). Background
+   * work that awaits a model captures it first; see {@link alarmMustYield}.
    */
-  private alarmMustYield(): boolean {
-    return this.importRun !== null;
+  private importGeneration = 0;
+
+  /**
+   * True when an import is running, or has run, since background work
+   * captured `generation` (T-318): its model results came from the vault as it
+   * was before the import, so it writes nothing more. The work stays pending
+   * and the alarm picks it up again after the import.
+   */
+  private alarmMustYield(generation: number): boolean {
+    return this.importRun !== null || this.importGeneration !== generation;
   }
 
   private async handleFetch(request: Request): Promise<Response> {
@@ -1690,6 +1696,7 @@ export class VaultDO extends DurableObject {
   ): Promise<Response> {
     if (this.importRun) return importInProgressResponse();
     this.importRun = kind;
+    this.importGeneration++;
     this.importStartedAt = new Date().toISOString();
     this.importId = importId;
     try {
@@ -2935,6 +2942,7 @@ export class VaultDO extends DurableObject {
   > {
     const provider = this.store.embeddingProvider;
     if (!provider) return { kind: "disabled" };
+    const generation = this.importGeneration;
     const avail = await provider.available();
     if (!avail.ok) return { kind: "unavailable" };
 
@@ -2973,12 +2981,12 @@ export class VaultDO extends DurableObject {
     let anyFailure = false;
     for (const indexes of planEmbedBatches(toEmbed.map((t) => t.chunk.text), EMBED_MAX_TEXTS_PER_CALL)) {
       const slice = indexes.map((i) => toEmbed[i]!);
-      if (this.alarmMustYield()) return { kind: "failed", more: true };
+      if (this.alarmMustYield(generation)) return { kind: "failed", more: true };
       try {
         // The vector may stand for a capped text; the hash below is the whole
         // chunk's, so the chunk reads as fresh and is not re-sent.
         const vectors = await embedSplitting(provider, slice.map((t) => capEmbedText(t.chunk.text)));
-        if (this.alarmMustYield()) return { kind: "failed", more: true };
+        if (this.alarmMustYield(generation)) return { kind: "failed", more: true };
         for (let j = 0; j < slice.length; j++) {
           const vector = vectors[j];
           if (!vector) continue; // defensive: provider returned fewer vectors than requested
@@ -3007,6 +3015,7 @@ export class VaultDO extends DurableObject {
    * {@link TRANSCRIBE_MAX_ATTEMPTS}, then write the "unavailable" marker.
    */
   private async transcribeOne(vaultName: string, attachment: Attachment): Promise<void> {
+    const generation = this.importGeneration;
     const fresh = (await this.store.getAttachment(attachment.id)) ?? attachment;
     const meta: Record<string, unknown> = { ...(fresh.metadata ?? {}) };
     if (meta.transcribe_status !== "pending") return;
@@ -3073,7 +3082,7 @@ export class VaultDO extends DurableObject {
       audioSeconds = result.audioSeconds;
     } catch (err) {
       // An import began while whisper ran: write nothing (T-318, alarmMustYield).
-      if (this.alarmMustYield()) return;
+      if (this.alarmMustYield(generation)) return;
       const errMsg = err instanceof Error ? err.message : String(err);
       const apiErr = err instanceof TranscriptionError ? err : null;
       const nonRetriable = apiErr !== null && !apiErr.retriable;
@@ -3130,7 +3139,7 @@ export class VaultDO extends DurableObject {
     }
     // An import began while the models ran: write nothing; the attachment
     // stays pending and is transcribed after the import (T-318).
-    if (this.alarmMustYield()) return;
+    if (this.alarmMustYield(generation)) return;
 
     // --- Success. Surgically patch the note (legacy voice-memo stub path): the
     // body shows the cleaned view; the RAW transcript is stamped into the note's
