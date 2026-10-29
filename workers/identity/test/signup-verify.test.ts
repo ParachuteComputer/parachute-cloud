@@ -163,6 +163,20 @@ describe("password sign-up: the emailed link finishes it", () => {
     expect((await passwordLogin(email, "longenough1")).status).toBe(302);
   });
 
+  test("signing up twice in one browser keeps the first email's link working with the password (Codex P2)", async () => {
+    const email = "twice@example.com";
+    const first = await signupPost(email, "longenough1");
+    const firstLink = first.headers.get("x-parachute-dev-magic-link")!;
+    let jar = cookieVal(first, BINDING)!;
+    // A retry before opening the email: the browser sends what it holds.
+    const again = await app.fetch(formPost("/signup", { __csrf: CSRF, email, password: "longenough1" }, `${BINDING}=${jar}`), env);
+    jar = cookieVal(again, BINDING) ?? jar;
+    // Then the person opens the FIRST email.
+    const verify = await openLink(firstLink, `${BINDING}=${jar}`);
+    expect(cookieVal(verify, "parachute_id_session")).toBeTruthy();
+    expect((await passwordLogin(email, "longenough1")).status).toBe(302);
+  });
+
   test("opened in another browser, the link still creates the account, but without the password", async () => {
     const email = "otherdevice@example.com";
     const res = await signupPost(email, "longenough1");

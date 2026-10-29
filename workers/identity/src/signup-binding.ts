@@ -16,9 +16,16 @@ import { MAGIC_LINK_TTL_MS } from "./magic-links.ts";
 
 export const SIGNUP_BINDING_COOKIE = "parachute_id_signup";
 
-/** A fresh nonce for the cookie, and the hash that goes on the link row. */
-export async function newSignupBinding(): Promise<{ nonce: string; hash: string }> {
-  const nonce = randomBase64url(32);
+/**
+ * The nonce for this sign-up, and the hash that goes on the link row. A
+ * browser that already holds one (a retry before opening the first email)
+ * keeps it, so every link it asked for stays bound to it (Codex P2): a fresh
+ * nonce would orphan the earlier links, which would then silently create a
+ * passwordless account. Only a well-formed value is reused.
+ */
+export async function signupBindingFor(req: Request): Promise<{ nonce: string; hash: string }> {
+  const held = parseSignupBindingCookie(req.headers.get("cookie"));
+  const nonce = held && /^[A-Za-z0-9_-]{32,128}$/.test(held) ? held : randomBase64url(32);
   return { nonce, hash: await sha256Hex(nonce) };
 }
 

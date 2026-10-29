@@ -61,7 +61,7 @@ import {
 import { sessionUser } from "./session-user.ts";
 import { finishPrimaryAuth, safeNext, sendSignInLink } from "./auth-handlers.ts";
 import type { EmailSender } from "./email.ts";
-import { buildSignupBindingCookie, newSignupBinding } from "./signup-binding.ts";
+import { buildSignupBindingCookie, signupBindingFor } from "./signup-binding.ts";
 import { EMAIL_RE, PASSWORD_MIN, normalizeEmail } from "./validation.ts";
 import { getUserByEmail, hashPassword, needsRehash, setPassword, verifyPassword, type User } from "./users.ts";
 import {
@@ -204,7 +204,7 @@ export async function handleSignupPost(db: D1Database, req: Request, deps: OAuth
   }
 
   const passwordHash = await hashPassword(password);
-  const binding = await newSignupBinding();
+  const binding = await signupBindingFor(req);
   const headers: Record<string, string> = { "set-cookie": buildSignupBindingCookie(binding.nonce) };
   // The same per-(ip,email) send fence as /auth/magic: over it, the same page
   // and nothing sent, so /signup can't bomb an inbox either.
