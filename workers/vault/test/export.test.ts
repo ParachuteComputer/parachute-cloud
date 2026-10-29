@@ -12,6 +12,7 @@ import {
   type StreamableObject,
   type TarEntrySpec,
 } from "../src/export.ts";
+import { parseTarBinary } from "../src/restore.ts";
 
 /**
  * Portable-markdown export conformance (design §3.3). The no-lock-in promise:
@@ -109,6 +110,28 @@ describe("export — tarball shape", () => {
     expect(noteEntry).toBeTruthy();
     expect(noteEntry!.text.startsWith("---\n")).toBe(true);
     expect(noteEntry!.text).toContain("first note #project");
+  });
+});
+
+describe("export — paths ustar can't hold (T-318 snapfix)", () => {
+  it("a note title over 100 bytes exports (PAX path record), with an exact Content-Length", async () => {
+    const v = freshVault();
+    const long = `Journal/${"é".repeat(60)}`; // 120-byte leaf: no ustar split exists
+    await createNote(v, { content: "long title note", path: long });
+    const note = await createNote(v, { content: "with audio", path: "t".repeat(110) });
+    await uploadAndAttach(v, note.id, new Uint8Array([1, 2, 3]), "clip.wav", "audio/wav");
+
+    const res = await op(v, `/api/export?exported_at=${FIXED}`);
+    expect(res.status).toBe(200);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    // tarSize must count the PAX blocks, or the fixed-length stream breaks.
+    expect(Number(res.headers.get("Content-Length"))).toBe(bytes.length);
+    // Read with the production decoder (restore.ts), which applies PAX records.
+    const dec = new TextDecoder();
+    const byName = new Map(parseTarBinary(bytes).map((e) => [e.name, dec.decode(e.bytes)]));
+    expect(byName.get(`${long}.md`)).toContain("long title note");
+    expect(byName.get(`${"t".repeat(110)}.md`)).toContain("with audio");
+    expect([...byName.keys()].some((n) => n.startsWith(ATT_SIDECAR))).toBe(true);
   });
 });
 

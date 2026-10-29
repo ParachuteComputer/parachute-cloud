@@ -5,7 +5,7 @@
  *
  *   parachute-cloud 2026-10-27 · users 42 (+3) · active vaults 17 · notes changed 210 ·
  *   storage 1.2 GB · voice 34 min this month · sign-ins 25 · deletions pending 1 ·
- *   alerts 0 · 5xx 0 · health ok 144/144
+ *   stale backups 0 · alerts 0 · 5xx 0 · health ok 144/144
  *
  * Runs once a day, chained after the 03:30 UTC usage rollup (ops.ts, the
  * USAGE_CRON branch — no new cron pattern), for the UTC day that just ended.
@@ -34,6 +34,12 @@
  *                             morning, because the next one has already reset.
  *   - sign-ins              — `ops_counters.sign_in` (sessions started).
  *   - deletions pending     — accounts inside their 24 h undo window right now.
+ *   - stale backups         — vaults of live accounts whose newest snapshot
+ *                             (`vault_snapshots`, or the vault's creation if
+ *                             none) is older than its plan's cadence allows,
+ *                             as of the run (snapshots.ts countStaleSnapshots).
+ *                             Should be 0; T-318 found one vault failing
+ *                             nightly for two months with nothing showing it.
  *   - alerts                — `ops_counters.alert` (alerts actually delivered).
  *   - 5xx                   — `ops_counters.http_5xx` (identity responses ≥ 500).
  *   - health ok N/144       — `ops_counters.health_ok`: 10-minute health runs
@@ -43,11 +49,13 @@
  *
  * NO PERSONAL DATA: counts only — no email, no vault name, no IP.
  */
+import { type BillingMode, billingMode } from "./billing-config.ts";
 import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
 import { type NotifyResult, notifyOperators } from "./ops-alerts.ts";
 import { pruneOpsCounters, sumOpsCounter } from "./ops-counters.ts";
 import { sha256Hex, timingSafeEqualString } from "./crypto.ts";
+import { countStaleSnapshots } from "./snapshots.ts";
 
 /** 24 h / 10 min — the health runs a full day should contain. */
 export const HEALTH_RUNS_PER_DAY = 144;
@@ -75,6 +83,8 @@ export interface DailyStats {
   vaultsTotal: number;
   signIns: number;
   deletionsPending: number;
+  /** Vaults whose newest backup is overdue at the time of the run. */
+  staleSnapshots: number;
   alerts: number;
   errors5xx: number;
   healthOk: number;
@@ -90,7 +100,12 @@ function nextDay(day: string): string {
   return new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
 }
 
-export async function collectDailyStats(db: D1Database, day: string, environment: string): Promise<DailyStats> {
+export async function collectDailyStats(
+  db: D1Database,
+  day: string,
+  environment: string,
+  opts: { now?: Date; billingMode?: BillingMode } = {},
+): Promise<DailyStats> {
   const end = nextDay(day);
   const count = async (sql: string, ...binds: string[]): Promise<number> => {
     const row = await db.prepare(sql).bind(...binds).first<{ n: number }>();
@@ -156,6 +171,8 @@ export async function collectDailyStats(db: D1Database, day: string, environment
     voiceMinutesThisMonth = Math.round(v?.m ?? 0);
   }
 
+  const { stale: staleSnapshots } = await countStaleSnapshots(db, opts.now ?? new Date(), opts.billingMode ?? "open_beta");
+
   return {
     day,
     environment,
@@ -170,6 +187,7 @@ export async function collectDailyStats(db: D1Database, day: string, environment
     vaultsTotal,
     signIns,
     deletionsPending,
+    staleSnapshots,
     alerts,
     errors5xx,
     healthOk,
@@ -207,6 +225,7 @@ export function renderDailyLine(s: DailyStats): string {
     `voice ${s.voiceMinutesThisMonth === null ? "n/a" : `${s.voiceMinutesThisMonth} min`} this month`,
     `sign-ins ${s.signIns}`,
     `deletions pending ${s.deletionsPending}`,
+    `stale backups ${s.staleSnapshots}`,
     `alerts ${s.alerts}`,
     `5xx ${s.errors5xx}`,
     `health ok ${s.healthOk}/${HEALTH_RUNS_PER_DAY}`,
@@ -232,7 +251,7 @@ export async function runDailyLine(
   const now = opts.now ?? new Date();
   const day = opts.day ?? previousUtcDay(now);
   const environment = env.ENVIRONMENT ?? "unknown";
-  const stats = await collectDailyStats(env.DB, day, environment);
+  const stats = await collectDailyStats(env.DB, day, environment, { now, billingMode: billingMode(env) });
   const line = renderDailyLine(stats);
 
   await env.DB.prepare(

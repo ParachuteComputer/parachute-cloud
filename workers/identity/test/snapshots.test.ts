@@ -24,6 +24,7 @@ import app from "../src/index.ts";
 import { SNAPSHOT_CRON, handleScheduled, routeCron } from "../src/ops.ts";
 import {
   SNAPSHOT_RUN_CAP,
+  countStaleSnapshots,
   listSnapshotsForVaults,
   restoredVaultName,
   runSnapshotSweep,
@@ -207,6 +208,39 @@ describe("snapshot cron routing", () => {
   });
 });
 
+// --- stale backups (the daily ops line's count) ------------------------------------
+
+describe("countStaleSnapshots", () => {
+  test("flags a missed night (daily policy), a missed week (weekly floor) and a vault never backed up", async () => {
+    const at = (iso: string) => wireEntry("x", iso).taken_at;
+    const now = new Date("2026-10-30T03:30:00Z"); // the daily line's run
+    const { id: live } = await seedUser("stale-live@example.com");
+    const { id: floor } = await seedUser("stale-floor@example.com");
+    const { id: gone } = await seedUser("stale-gone@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(live).run();
+    await env.DB.prepare("UPDATE users SET plan = 'expired' WHERE id = ?").bind(floor).run();
+    await env.DB.prepare("UPDATE users SET deleted_at = '2026-10-01T00:00:00Z' WHERE id = ?").bind(gone).run();
+    const vault = async (name: string, owner: string, createdAt: string, newest?: string) => {
+      await seedVault(name, owner);
+      await env.DB.prepare("UPDATE vaults SET created_at = ? WHERE name = ?").bind(createdAt, name).run();
+      if (newest) await seedMirrorRow(name, wireEntry(name, at(newest)));
+    };
+    await vault("st-fresh", live, "2026-07-16T23:04:16Z", "2026-10-29T04:01:00Z"); // last night: ok
+    await seedMirrorRow("st-fresh", wireEntry("st-fresh", "2026-08-29T04:01:11.210Z")); // the NEWEST row counts
+    await vault("st-missed", live, "2026-07-16T23:04:16Z", "2026-10-28T04:01:00Z"); // one night missed: stale
+    await vault("st-never", live, "2026-10-27T12:00:00Z"); // created days ago, no snapshot: stale
+    await vault("st-new", live, "2026-10-30T01:00:00Z"); // created tonight: not yet due
+    await vault("st-weekly", floor, "2026-07-01T00:00:00Z", "2026-10-26T04:00:00Z"); // this week's weekly: ok
+    await vault("st-weekly-old", floor, "2026-07-01T00:00:00Z", "2026-10-19T04:00:00Z"); // 10+ days: stale
+    await vault("st-tombstoned", gone, "2026-07-01T00:00:00Z"); // owner deleted: not swept, not counted
+
+    expect(await countStaleSnapshots(env.DB, now, "paid")).toEqual({ stale: 3, vaults: 6 });
+    // Open beta lifts the expired floor to the trial's nightly policy, so the
+    // weekly vault that had its weekly 3.5 days ago is now overdue too.
+    expect(await countStaleSnapshots(env.DB, now, "open_beta")).toEqual({ stale: 4, vaults: 6 });
+  });
+});
+
 // --- runSnapshotSweep --------------------------------------------------------------
 
 describe("runSnapshotSweep", () => {
@@ -301,6 +335,31 @@ describe("runSnapshotSweep", () => {
       ["sweep-bad", stale.key], // untouched by the failure
       ["sweep-good", goodManifest[0]!.key],
     ]);
+  });
+
+  test("a failed vault backup pages the operator once per run — counts only, no vault name", async () => {
+    const { id: owner } = await seedUser("sweep-alert@example.com");
+    await seedVault("sweep-alert-bad", owner);
+    await seedVault("sweep-alert-good", owner);
+    interceptSnapshotPost("sweep-alert-bad", { skipped: false, manifest: [] }, { status: 500 });
+    interceptSnapshotPost("sweep-alert-good", { skipped: false, manifest: [wireEntry("sweep-alert-good", "2026-07-03T04:00:00.000Z")] });
+    const sender = silentSender();
+    const opsEnv = { ...env, OPERATOR_ALERT_EMAIL: "ops@example.com", OPS_ALERT_WEBHOOK_URL: undefined };
+    const summary = await quietly(() => runSnapshotSweep(opsEnv, sweepDeps(), { sender }));
+    expect(summary.failed).toBe(1);
+    const mails = sender.sent as Array<{ to: string; subject: string; text: string }>;
+    expect(mails).toHaveLength(1);
+    expect(mails[0]!.to).toBe("ops@example.com");
+    expect(mails[0]!.subject).toBe(`[parachute-cloud test] 1 of 2 vault backups failed (${TODAY})`);
+    expect(mails[0]!.text).toContain("event=snapshot_failed");
+    expect(`${mails[0]!.subject}\n${mails[0]!.text}`).not.toMatch(/sweep-alert|example\.com/);
+
+    // A clean night sends nothing.
+    interceptSnapshotPost("sweep-alert-bad", { skipped: false, manifest: [] });
+    interceptSnapshotPost("sweep-alert-good", { skipped: false, manifest: [] });
+    const clean = silentSender();
+    await quietly(() => runSnapshotSweep(opsEnv, sweepDeps(), { sender: clean }));
+    expect(clean.sent).toHaveLength(0);
   });
 
   test("a 200 body without the run shape counts as a failure (stale vault worker)", async () => {
