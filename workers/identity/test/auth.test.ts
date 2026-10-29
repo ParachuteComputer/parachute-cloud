@@ -213,7 +213,7 @@ describe("magic link — send + verify", () => {
     expect(first.status).toBe(302);
     const second = await handleMagicVerifyGet(env.DB, verifyReq(token), deps(() => now));
     expect(second.status).toBe(400);
-    expect(await second.text()).toContain("invalid, already used, or expired");
+    expect(await second.text()).toContain("already used or has expired");
   });
 
   test("expiry: a link older than its TTL fails, no session", async () => {

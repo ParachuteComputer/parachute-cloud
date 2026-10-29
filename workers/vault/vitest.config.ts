@@ -64,6 +64,7 @@ function project(name: string, billingMode: "paid" | "open_beta", files: { inclu
             bindings: {
               ENVIRONMENT: "test",
               ISSUER_ORIGIN: "https://id.test.example",
+              CONSOLE_PUBLIC_ORIGIN: "https://my.test.example",
               VAULT_BASE_DOMAIN: "u.parachute.computer",
               CAP_BYTES: "2000000",
               VAULT_AUTH_TOKEN: "test-operator-token",

@@ -9,7 +9,17 @@
  */
 import { esc, page } from "./ui.ts";
 import { CHECKLIST_ITEMS } from "./checklist.ts";
-import { PLAN_SPECS, type PlanId, formatPlanBytes, formatUsageBytes, isCompPlan } from "./plans.ts";
+import {
+  type BillingMode,
+  OPEN_BETA_LABEL,
+  PLAN_SPECS,
+  type PlanId,
+  coercePlanId,
+  formatPlanBytes,
+  formatUsageBytes,
+  isCompPlan,
+  planLabel,
+} from "./plans.ts";
 import type { DigestStats } from "./ops.ts";
 
 /**
@@ -50,6 +60,18 @@ export function adminHeader(title: string, active: "overview" | "growth" | "user
       ${link("/admin/users", "Users", "users")}
       ${link("/admin/vaults", "Vaults", "vaults")}
     </div>`;
+}
+
+/**
+ * The plan name an operator reads, under the money switch. Same as
+ * {@link planLabel} (a stored `trial` reads "Open beta" in open beta, paid
+ * tiers keep their names), except that an `expired` row in open beta also says
+ * what is stored: it LIVES as the beta, but the lift has not reached it yet,
+ * and the operator should be able to see that.
+ */
+export function adminPlanLabel(plan: PlanId, mode: BillingMode): string {
+  if (mode === "open_beta" && plan === "expired") return `${OPEN_BETA_LABEL} (stored as expired)`;
+  return planLabel(plan, mode);
 }
 
 function banner(notice?: string, error?: string): string {
@@ -189,6 +211,8 @@ export interface AdminUsersProps {
   totalPages: number;
   totalUsers: number;
   csrfToken: string;
+  /** The money switch: plan names read "Open beta" for clockless trial rows. */
+  billingMode: BillingMode;
   notice?: string;
   error?: string;
 }
@@ -200,8 +224,21 @@ function pager(path: string, current: number, totalPages: number): string {
   return `<div style="display:flex;justify-content:space-between;margin-top:.8rem;font-size:.9rem">${prev}<span class="muted" data-testid="admin-page">Page ${current} of ${totalPages}</span>${next}</div>`;
 }
 
+/**
+ * The scheduled-downgrade badge. Paid mode: as stored. Open beta: a `trial`
+ * row's pending_plan is the old trial clock, which the sweep lands on the beta
+ * (not a downgrade), so it is not shown; a paid row's booked downgrade names
+ * the plan it will live on.
+ */
+function pendingBadge(u: AdminUserRow, mode: BillingMode): string {
+  if (!u.pendingPlan) return "";
+  if (mode === "paid") return `<span class="badge">downgrade scheduled &rarr; ${esc(u.pendingPlan)}</span>`;
+  if (u.plan === "trial") return "";
+  return `<span class="badge">downgrade scheduled &rarr; ${esc(planLabel(coercePlanId(u.pendingPlan), mode))}</span>`;
+}
+
 export function renderAdminUsers(props: AdminUsersProps): string {
-  const { users, page: current, totalPages, totalUsers, csrfToken, notice, error } = props;
+  const { users, page: current, totalPages, totalUsers, csrfToken, billingMode, notice, error } = props;
   const rows = users
     .map((u) => {
       // Comp lever — a button per OTHER comp-able plan (paid tiers + expired),
@@ -209,7 +246,8 @@ export function renderAdminUsers(props: AdminUsersProps): string {
       // `trial` is excluded (isCompPlan): the handler clears the trial clock, so
       // a comped trial would never convert or expire. setUserPlan +
       // applyPlanToVaults pushes the two-meter caps + voice + frozen into the
-      // owner's vault DOs immediately.
+      // owner's vault DOs immediately. In open beta the `expired` button is
+      // labelled "Open beta": that row lives as the beta (plans.ts livePlan).
       const planForm = (Object.keys(PLAN_SPECS) as PlanId[])
         .filter((p) => p !== u.plan && isCompPlan(p))
         .map(
@@ -218,7 +256,7 @@ export function renderAdminUsers(props: AdminUsersProps): string {
           <input type="hidden" name="user_id" value="${esc(u.id)}">
           <input type="hidden" name="plan" value="${esc(p)}">
           <input type="hidden" name="page" value="${current}">
-          <button class="rowbtn" type="submit">&rarr; ${esc(PLAN_SPECS[p].label)}</button>
+          <button class="rowbtn" type="submit">&rarr; ${esc(planLabel(p, billingMode))}</button>
         </form>`,
         )
         .join(" ");
@@ -238,14 +276,14 @@ export function renderAdminUsers(props: AdminUsersProps): string {
         u.paymentFailedAt
           ? `<span class="badge badge-warn" data-testid="payment-failed-badge">payment failed &times;${u.paymentFailedCount} since ${esc(u.paymentFailedAt.slice(0, 10))}</span>`
           : "",
-        u.pendingPlan ? `<span class="badge">downgrade scheduled &rarr; ${esc(u.pendingPlan)}</span>` : "",
+        pendingBadge(u, billingMode),
         u.deletedAt ? `<span class="badge badge-warn" data-testid="deletion-badge">deletion requested ${esc(u.deletedAt.slice(0, 10))}</span>` : "",
       ]
         .filter(Boolean)
         .join(" ");
       return `<tr data-testid="admin-user-row">
         <td>${esc(u.email)}${flags ? `<br>${flags}` : ""}</td>
-        <td>${esc(PLAN_SPECS[u.plan].label)}</td>
+        <td>${esc(adminPlanLabel(u.plan, billingMode))}</td>
         <td>${esc(u.createdAt.slice(0, 10))}</td>
         <td style="text-align:right">${u.vaultCount}</td>
         <td style="text-align:right">${u.checklistDone}/${CHECKLIST_ITEMS.length}</td>

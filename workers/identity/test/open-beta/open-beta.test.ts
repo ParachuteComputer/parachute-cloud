@@ -29,7 +29,7 @@ import { OPEN_BETA_LONG, OPEN_BETA_SHORT } from "../../src/plans.ts";
 import { signAccessToken } from "../../src/tokens.ts";
 import { applyPlanToVaults } from "../../src/vault-call.ts";
 import { getUserByEmail, getUserById } from "../../src/users.ts";
-import { CANONICAL_ORIGIN, CSRF, ISSUER, deps, seedSession, seedUser, seedVault } from "../helpers.ts";
+import { CANONICAL_ORIGIN, CSRF, ISSUER, deps, passwordSignup, seedSession, seedUser, seedVault } from "../helpers.ts";
 
 /** env + a full Stripe config: the point is that open beta ignores it. */
 const STRIPE_ENV = {
@@ -92,10 +92,7 @@ function recordingDeps(now?: () => Date) {
 
 describe("(a) a new sign-up in open beta has no clock and is never frozen", () => {
   test("real POST /signup → clockless trial; the sweep 200 days later changes nothing", async () => {
-    const res = await app.fetch(
-      post("/signup", { __csrf: CSRF, email: "beta-signup@example.com", password: "longenough1" }, `parachute_id_csrf=${CSRF}`),
-      env,
-    );
+    const res = await passwordSignup(app, "beta-signup@example.com", "longenough1");
     expect(res.status).toBe(302);
     const user = await getUserByEmail(env.DB, "beta-signup@example.com");
     expect(user!.plan).toBe("trial");

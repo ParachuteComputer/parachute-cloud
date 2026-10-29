@@ -63,7 +63,7 @@ import { deleteVaultD1Rows, listVaultsForOwner } from "./vaults.ts";
 import { type AuditActor, auditStatement, recordAudit } from "./account-audit.ts";
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { frontDoorOrigin, htmlResponse, isSameOriginRequest, resolveBoundOrigins } from "./oauth-shared.ts";
-import { renderUndoConfirm, renderUndoDone, renderUndoProblem } from "./account-delete-ui.ts";
+import { humanUtc, renderUndoConfirm, renderUndoDone, renderUndoProblem } from "./account-delete-ui.ts";
 
 /** The ratified undo window: 24 hours from the delete REQUEST (`deleted_at`). */
 export const DELETE_UNDO_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -369,15 +369,15 @@ export async function requestAccountDeletion(
         `Your account is now closed and you have been signed out everywhere.`,
         `Nothing has been erased yet.`,
         ``,
-        `You have until ${purgeAt.toISOString()} (24 hours) to change your mind.`,
+        `You have until ${humanUtc(purgeAt.toISOString())} (24 hours) to change your mind.`,
         `After that, your vaults and their contents are permanently deleted and`,
         `cannot be recovered.`,
         ``,
         `To restore your account, open this link before then:`,
         `${undoUrl}`,
         ``,
-        `If you did not request this, restore your account now and change your`,
-        `password.`,
+        `If you did not request this, restore your account now, and check who`,
+        `else can read this email inbox.`,
       ].join("\n"),
     });
     if (result.ok) {
@@ -709,7 +709,7 @@ function undoProblemPage(refusal: UndoRefusal, signInUrl: string): Response {
       renderUndoProblem({
         title: "This restore link doesn't work",
         message:
-          "It may have been used already, or copied only in part. If you already restored your account, just sign in.",
+          "It may have been used already, or copied only in part. If you already restored your account, just sign in. If more than 24 hours have passed since the deletion request, the account and its vaults have been erased.",
         signInUrl,
       }),
       400,

@@ -392,9 +392,9 @@ export function describeScopes(scopes: string[]): Array<{ scope: string; label: 
  * consent CSP is untouched. The submit path re-validates ownership server-side,
  * so this list is UX, not the security boundary.
  */
-function renderVaultPicker(ownedVaults: string[]): string {
+function renderVaultPicker(ownedVaults: string[], clientName: string): string {
   if (ownedVaults.length === 0) {
-    return `<p class="muted" data-testid="no-vaults" style="margin:.85rem 0 0">You don't have a vault yet — <a href="/console">create one</a>, then reconnect to authorize it.</p>`;
+    return `<p data-testid="no-vaults" style="margin:.85rem 0 0">You don't have a vault yet. <a href="/console">Make your first vault</a>, then go back to ${esc(clientName)} and connect again.</p>`;
   }
   const options = ownedVaults
     .map((name, i) => `<option value="${esc(name)}"${i === 0 ? " selected" : ""}>${esc(name)}</option>`)
@@ -506,8 +506,10 @@ export function renderConsent(props: ConsentProps): string {
   const vaultField = lockedVault
     ? `<input type="hidden" name="vault_pick" value="${esc(lockedVault)}">`
     : needsVaultPick
-      ? renderVaultPicker(ownedVaults)
+      ? renderVaultPicker(ownedVaults, clientName)
       : "";
+  // Nothing to pick: an Allow here could only fail ("Vault required").
+  const nothingToPick = !lockedVault && needsVaultPick && ownedVaults.length === 0;
   const verbSelectorField = verbSelector ? renderVerbSelector(verbSelector) : "";
   const accountVaultsField = accountVaults ? renderAccountVaultsBlock(accountVaults) : "";
   const ask = consentAsk({
@@ -533,7 +535,7 @@ export function renderConsent(props: ConsentProps): string {
          ${accountVaultsField}
          <div class="row">
            <button class="deny" type="submit" name="decision" value="deny">Deny</button>
-           <button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Allow</button>
+           ${nothingToPick ? "" : `<button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Allow</button>`}
          </div>
        </form>
        <p class="muted" style="margin:.9rem 0 0">You can disconnect it anytime from your vault's settings.</p>
@@ -587,10 +589,15 @@ export function consentAsk(opts: {
   return `${who} wants to ${what} ${where}.`;
 }
 
-export function renderError(opts: { title: string; message: string }): string {
+export function renderError(opts: { title: string; message: string; action?: { href: string; label: string } }): string {
+  // A page that stops someone says what to do next and links to it (T-318
+  // night: "Link expired" and "Vault required" were dead ends).
+  const action = opts.action
+    ? `<a class="primary" style="display:block;text-align:center;text-decoration:none;padding:.62rem 1rem;margin-top:.9rem" href="${esc(opts.action.href)}">${esc(opts.action.label)}</a>`
+    : "";
   return page(
     opts.title,
-    `<h1>${esc(opts.title)}</h1><div class="card"><p>${esc(opts.message)}</p></div>`,
+    `<h1>${esc(opts.title)}</h1><div class="card"><p>${esc(opts.message)}</p>${action}</div>`,
   );
 }
 
@@ -724,7 +731,7 @@ export function renderSignup(opts: {
            <input id="pw-email" name="email" type="email" autocomplete="username" value="${esc(email ?? "")}" required>
            <label for="password">Password</label>
            <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
-           <p class="muted" style="margin:.35rem 0 0">At least 8 characters.</p>
+           <p class="muted" style="margin:.35rem 0 0">At least 8 characters. We'll email you a link to confirm the address first.</p>
            ${showPassword && error ? `<div class="err">${esc(error)}</div>` : ""}
            <button class="secondary" type="submit">Create account with a password</button>
          </form>
@@ -773,7 +780,7 @@ export function renderConsoleLogin(opts: {
            <input id="su-email" name="email" type="email" autocomplete="username" required>
            <label for="su-password">Password</label>
            <input id="su-password" name="password" type="password" autocomplete="new-password" minlength="8" required>
-           <p class="muted" style="margin:.35rem 0 0">At least 8 characters.</p>
+           <p class="muted" style="margin:.35rem 0 0">At least 8 characters. We'll email you a link to confirm the address first.</p>
            <button class="secondary" type="submit">Create account with a password</button>
          </form>
        </details>
@@ -782,14 +789,23 @@ export function renderConsoleLogin(opts: {
   );
 }
 
-/** "Check your email" — the neutral response to a magic-link request (no enumeration). */
-export function renderMagicSent(opts: { email: string; csrfToken: string }): string {
+/**
+ * "Check your email" — the neutral response to a magic-link request (no
+ * enumeration). `signup` is the password sign-up's variant (POST /signup): the
+ * same page whether or not the address already has an account, so its copy
+ * covers both and never says which.
+ */
+export function renderMagicSent(opts: { email: string; csrfToken: string; signup?: boolean }): string {
+  const lead = opts.signup
+    ? `<p>We sent a link to <strong>${esc(opts.email)}</strong>. Open it to confirm the address is yours. Your account is created only then. If the address already has an account, the link signs you in and nothing about it changes.</p>
+       <p class="muted" data-testid="signup-same-browser">Open the link in this browser to keep the password you chose. Opened anywhere else, it still signs you in, and you can set a password later under Security. The link works once and expires in 10 minutes.</p>`
+    : `<p>If <strong>${esc(opts.email)}</strong> has (or can have) a Parachute account, a sign-in link is on its way.</p>
+       <p class="muted">The link works once and expires in 10 minutes. You can close this tab — open the link from your email to continue.</p>`;
   return page(
     "Check your email — Parachute",
     `<h1>Check your email</h1>
      <div class="card">
-       <p>If <strong>${esc(opts.email)}</strong> has (or can have) a Parachute account, a sign-in link is on its way.</p>
-       <p class="muted">The link works once and expires in 10 minutes. You can close this tab — open the link from your email to continue.</p>
+       ${lead}
        <details open>
          <summary>Have the code instead?</summary>
          <p class="muted" style="margin:.35rem 0 .5rem">Click the link in the email — or type the 6-digit code from it here.</p>
@@ -1060,6 +1076,8 @@ export interface ConsoleProps {
   totalUsedBytes?: number | null;
   /** At/over the plan's vault count → the create form yields to the at-cap note. */
   atVaultCap: boolean;
+  /** The stored pending plan, so the at-cap note names the real limit (a former Power subscriber keeps ten). */
+  pendingPlan?: PlanId | null;
   /** Operator account → the quiet "Admin" header link (/admin). */
   isOperator?: boolean;
   /**
@@ -1740,7 +1758,7 @@ export function renderConsole(props: ConsoleProps): string {
   const createCard = atVaultCap
     ? `<div class="card" data-testid="vault-cap">
        <h2>Create a vault</h2>
-       <p class="muted" style="margin:.35rem 0 0">${esc(vaultCapMessage(plan, mode))}</p>
+       <p class="muted" style="margin:.35rem 0 0">${esc(vaultCapMessage(plan, mode, props.pendingPlan ?? null))}</p>
        ${error ? `<div class="err">${esc(error)}</div>` : ""}
      </div>`
     : `<div class="card">
