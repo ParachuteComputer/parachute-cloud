@@ -294,6 +294,11 @@ export interface ImportStateRecord {
   error_type?: string;
 }
 
+/** How long an import waits for in-flight requests to finish before its replay. */
+const IMPORT_DRAIN_MAX_MS = 60_000;
+/** How long it waits for a running alarm; past that the alarm yields to it (see alarmMustYield). */
+const IMPORT_ALARM_WAIT_MS = 10_000;
+
 /** How long a held alarm waits before it looks again while an import runs. */
 const IMPORT_ALARM_HOLD_MS = 30_000;
 
@@ -634,6 +639,38 @@ export class VaultDO extends DurableObject {
   // -------------------------------------------------------------------------
 
   async fetch(request: Request): Promise<Response> {
+    return this.counted(() => this.handleFetch(request));
+  }
+
+  /**
+   * Count an event handler as in flight while it runs (T-318). The import
+   * lock refuses NEW requests; an import also waits for these, and for a
+   * running alarm, before its replay starts (see {@link underImportLock}), so
+   * nothing that began before the lock resumes mid-replay.
+   */
+  private async counted<T>(fn: () => Promise<T>): Promise<T> {
+    this.inflight++;
+    try {
+      return await fn();
+    } finally {
+      this.inflight--;
+    }
+  }
+
+  /** Event handlers (fetch, WebSocket) currently running in this instance. */
+  private inflight = 0;
+
+  /**
+   * True when an import started while this alarm wake was parked in a model
+   * call (T-318). The wake then writes nothing more: its results came from
+   * the vault as it was before the import. The work stays pending and the
+   * held alarm picks it up after the import.
+   */
+  private alarmMustYield(): boolean {
+    return this.importRun !== null;
+  }
+
+  private async handleFetch(request: Request): Promise<Response> {
     if (this.bootError) return json({ error: "Internal server error", detail: this.bootError }, 500);
 
     const url = new URL(request.url);
@@ -1656,6 +1693,23 @@ export class VaultDO extends DurableObject {
     this.importStartedAt = new Date().toISOString();
     this.importId = importId;
     try {
+      // Drain: the lock now refuses new requests, but one that began before it
+      // could resume during a checkpoint and see a half-imported vault. Wait
+      // for them (this request is the one left). A running alarm gets a short
+      // wait too; one still parked in model inference after that (whisper can
+      // take minutes) drops its results when it resumes (alarmMustYield).
+      const started = Date.now();
+      for (;;) {
+        const waited = Date.now() - started;
+        const requestsBusy = this.inflight > 1;
+        const alarmBusy = this.alarmRunning && waited < IMPORT_ALARM_WAIT_MS;
+        if (!requestsBusy && !alarmBusy) break;
+        if (waited > IMPORT_DRAIN_MAX_MS) {
+          return json({ error: "This vault is busy. Try again in a minute.", error_type: "vault_busy" }, 503);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      if (this.destroyed) return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
       await this.putImportState({ kind, state: "running" });
       const res = await replay();
       if (!res.ok) await this.putImportState({ kind, state: "failed", error_type: `status_${res.status}` });
@@ -2172,6 +2226,10 @@ export class VaultDO extends DurableObject {
   /** First-message auth (`{"type":"auth","token"}`) and re-auth on token
    *  refresh; the literal `ping` keepalive never reaches here (autoResponse). */
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    return this.counted(() => this.onWebSocketMessage(ws, message));
+  }
+
+  private async onWebSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (this.bootError) {
       this.closeWs(ws, WS_CLOSE.PROTOCOL, "vault unavailable");
       return;
@@ -2220,6 +2278,14 @@ export class VaultDO extends DurableObject {
   }
 
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
+    return this.counted(() => this.onWebSocketGone(ws));
+  }
+
+  async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
+    return this.counted(() => this.onWebSocketGone(ws));
+  }
+
+  private async onWebSocketGone(ws: WebSocket): Promise<void> {
     if (this.bootError) return;
     if (this.destroyed) return;
     await this.ensureStateForWake();
@@ -2227,13 +2293,7 @@ export class VaultDO extends DurableObject {
     this.cleanupSocket(ws);
   }
 
-  async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
-    if (this.bootError) return;
-    if (this.destroyed) return;
-    await this.ensureStateForWake();
-    await this.ensureSubscriptionsRehydrated();
-    this.cleanupSocket(ws);
-  }
+
 
   /**
    * Authenticate a pending socket's first message. On success: build the matcher
@@ -2913,10 +2973,12 @@ export class VaultDO extends DurableObject {
     let anyFailure = false;
     for (const indexes of planEmbedBatches(toEmbed.map((t) => t.chunk.text), EMBED_MAX_TEXTS_PER_CALL)) {
       const slice = indexes.map((i) => toEmbed[i]!);
+      if (this.alarmMustYield()) return { kind: "failed", more: true };
       try {
         // The vector may stand for a capped text; the hash below is the whole
         // chunk's, so the chunk reads as fresh and is not re-sent.
         const vectors = await embedSplitting(provider, slice.map((t) => capEmbedText(t.chunk.text)));
+        if (this.alarmMustYield()) return { kind: "failed", more: true };
         for (let j = 0; j < slice.length; j++) {
           const vector = vectors[j];
           if (!vector) continue; // defensive: provider returned fewer vectors than requested
@@ -3010,6 +3072,8 @@ export class VaultDO extends DurableObject {
       text = result.text;
       audioSeconds = result.audioSeconds;
     } catch (err) {
+      // An import began while whisper ran: write nothing (T-318, alarmMustYield).
+      if (this.alarmMustYield()) return;
       const errMsg = err instanceof Error ? err.message : String(err);
       const apiErr = err instanceof TranscriptionError ? err : null;
       const nonRetriable = apiErr !== null && !apiErr.retriable;
@@ -3064,6 +3128,9 @@ export class VaultDO extends DurableObject {
       display = text;
       cleaned = false;
     }
+    // An import began while the models ran: write nothing; the attachment
+    // stays pending and is transcribed after the import (T-318).
+    if (this.alarmMustYield()) return;
 
     // --- Success. Surgically patch the note (legacy voice-memo stub path): the
     // body shows the cleaned view; the RAW transcript is stamped into the note's

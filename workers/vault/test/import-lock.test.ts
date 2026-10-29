@@ -187,6 +187,90 @@ describe("import lock (T-318)", () => {
     expect(provider.calls).toBeGreaterThan(callsBefore);
   }, 120_000);
 
+  it("an alarm already mid-inference when the import starts finishes before the replay begins", async () => {
+    const v = freshVault("idrain");
+    expect((await op(v, "")).status).toBe(200);
+    // An embedding provider that blocks inside embed() until released.
+    let entered!: () => void;
+    const inEmbed = new Promise<void>((r) => (entered = r));
+    let releaseEmbed!: () => void;
+    const embedGate = new Promise<void>((r) => (releaseEmbed = r));
+    const blocking: EmbeddingProvider = {
+      name: "test-blocking",
+      model: "test-embed-model",
+      dims: 3,
+      async available() {
+        return { ok: true as const };
+      },
+      async embed(input: EmbedInput): Promise<EmbedResult> {
+        entered();
+        await embedGate;
+        return { vectors: input.texts.map(() => new Float32Array([1, 0, 0])), model: "test-embed-model", dims: 3 };
+      },
+    };
+    // Every checkpoint records whether an alarm was still running at that moment.
+    const alarmSeenMidReplay: boolean[] = [];
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      inst.__setTestEmbeddingProvider(blocking);
+      inst.__setTestImportCheckpoint(async () => {
+        alarmSeenMidReplay.push(inst.alarmRunning === true);
+      });
+      void inst.alarm(); // left running, parked in embed()
+    });
+    await inEmbed;
+
+    const importing = startImport(v, bigExportTar(NOTES), "attempt-d");
+    // Let the import reach its drain wait, then let the alarm finish.
+    setTimeout(() => releaseEmbed(), 3_000);
+    const res = await importing;
+    expect(res.status).toBe(200);
+    expect(alarmSeenMidReplay.length).toBeGreaterThan(0);
+    expect(alarmSeenMidReplay.every((running) => !running)).toBe(true);
+  }, 120_000);
+
+  it("an embedding wake still parked in the model when an import begins writes nothing when it resumes", async () => {
+    const v = freshVault("iyield");
+    expect((await op(v, "")).status).toBe(200);
+    const note = (await (
+      await op(v, "/api/notes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "a note to embed", path: "yield/one" }),
+      })
+    ).json()) as { id: string };
+    let entered!: () => void;
+    const inEmbed = new Promise<void>((r) => (entered = r));
+    let releaseEmbed!: () => void;
+    const embedGate = new Promise<void>((r) => (releaseEmbed = r));
+    const parked: EmbeddingProvider = {
+      name: "test-parked",
+      model: "test-parked-model",
+      dims: 3,
+      async available() {
+        return { ok: true as const };
+      },
+      async embed(input: EmbedInput): Promise<EmbedResult> {
+        entered();
+        await embedGate;
+        return { vectors: input.texts.map(() => new Float32Array([1, 0, 0])), model: "test-parked-model", dims: 3 };
+      },
+    };
+    let outcome: unknown;
+    let vectors = -1;
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      inst.__setTestEmbeddingProvider(parked);
+      const draining = inst.drainEmbeddingsOnce();
+      await inEmbed;
+      inst.importRun = "import"; // an import took the lock while the model ran
+      releaseEmbed();
+      outcome = await draining;
+      inst.importRun = null;
+      vectors = (inst.store.db.prepare("SELECT COUNT(*) AS n FROM note_vectors WHERE note_id = ?").get(note.id) as { n: number }).n;
+    });
+    expect(outcome).toEqual({ kind: "failed", more: true });
+    expect(vectors).toBe(0);
+  });
+
   it("a snapshot restore takes the same lock and lands in chunks", async () => {
     const src = freshVault("rsrc");
     const key = `${snapshotPrefix(src)}2026-10-29T00-00-00-000Z.tar`;
