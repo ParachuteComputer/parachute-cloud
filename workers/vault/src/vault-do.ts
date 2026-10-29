@@ -94,7 +94,7 @@ import {
   restoreFromTar,
 } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
-import { WELCOME_SEEDED_KEY, seedWelcome, type WelcomeSeedResult } from "./welcome.js";
+import { WELCOME_SEEDED_KEY, seedWelcome, withCloudGuideText, type WelcomeSeedResult } from "./welcome.js";
 import {
   SEED_PACK_NAMES,
   applySeedPack,
@@ -1091,7 +1091,10 @@ export class VaultDO extends DurableObject {
     if (!pack) {
       return json({ error: `Unknown pack '${packName}'`, available: [...SEED_PACK_NAMES] }, 404);
     }
-    const result = await applySeedPack(this.store, pack);
+    // The cloud's guide-text corrections apply here too (welcome.ts
+    // CLOUD_GUIDE_EDITS), so a re-applied guide never teaches what the app no
+    // longer does. Tags stay core's full declared set.
+    const result = await applySeedPack(this.store, withCloudGuideText(pack));
     return json({
       pack: result.pack,
       applied: result.seededNotes,

@@ -9,6 +9,8 @@ import {
   TAGS_GRAPH_PATH,
   WELCOME_PATH,
   YOURS_TO_KEEP_PATH,
+  CLOUD_GUIDE_EDITS,
+  withCloudGuideText,
 } from "../src/welcome.ts";
 import { GETTING_STARTED_PACK, welcomePack } from "@openparachute/core/src/seed-packs.js";
 
@@ -112,12 +114,12 @@ describe("default seed — a new vault's first materialization", () => {
     expect(tags.find((t) => t.name === "pinned")).toBeUndefined();
   });
 
-  it("seeded content is byte-equal to core's packs (no cloud-side fork)", async () => {
+  it("seeded content is byte-equal to core's packs plus the listed cloud corrections", async () => {
     const v = freshVault("w");
     const notes = await listNotes(v);
     const expected = [
-      ...welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string }).notes,
-      ...GETTING_STARTED_PACK.notes,
+      ...withCloudGuideText(welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string })).notes,
+      ...withCloudGuideText(GETTING_STARTED_PACK).notes,
     ];
     expect(expected).toHaveLength(6);
     for (const { path, content } of expected) {
@@ -232,5 +234,75 @@ describe("default seed — a new vault's first materialization", () => {
     expect((await res.json()) as any[]).toHaveLength(0);
     const tags = await op(v, "/api/tags");
     expect((await tags.json()) as any[]).toHaveLength(0);
+  });
+});
+
+/**
+ * T-318: the Notes app no longer tags what you write `#capture` unless you turn
+ * on "Tag new notes as an inbox" (Settings → Tag roles). Core's guide text at
+ * the pinned commit still says it does ("Tags and the graph", "Getting
+ * Started"), so the cloud seed corrects those sentences. A fresh vault's guides
+ * must make no claim that notes are auto-tagged, and must still teach how to
+ * opt in.
+ */
+describe("the seeded guides tell the truth about #capture", () => {
+  // Phrases that claim the app tags everything (core's pinned wording).
+  const AUTO_TAG_CLAIMS = [
+    /puts it on whatever you write/i,
+    /`capture` tag the Notes surface uses/i,
+    /starts with just two/i,
+  ];
+
+  function expectNoAutoTagClaim(notes: Array<{ path: string; content: string }>) {
+    for (const note of notes) {
+      for (const claim of AUTO_TAG_CLAIMS) {
+        expect(note.content, `${note.path} must not claim ${claim}`).not.toMatch(claim);
+      }
+    }
+  }
+
+  it("a fresh vault's guides never say notes are auto-tagged, and teach the opt-in", async () => {
+    const v = freshVault("w");
+    const notes = await listNotes(v);
+    expect(notes).toHaveLength(6);
+    expectNoAutoTagClaim(notes);
+
+    const tagsNote = notes.find((n) => n.path === TAGS_GRAPH_PATH)!;
+    expect(tagsNote.content).toContain('"Tag new notes as an inbox"');
+    expect(tagsNote.content).toContain("It's off unless you turn it on.");
+    // The tag the guides do carry is still named.
+    expect(tagsNote.content).toContain("#guide");
+
+    const gs = notes.find((n) => n.path === GETTING_STARTED_PATH)!;
+    expect(gs.content).toContain("only if the person turns on its inbox option");
+  });
+
+  it("an explicit POST /api/packs/welcome re-seeds the corrected text too", async () => {
+    const v = freshVault("w");
+    const before = (await listNotes(v)).find((n) => n.path === TAGS_GRAPH_PATH)!;
+    expect((await op(v, `/api/notes/${before.id}`, { method: "DELETE" })).status).toBe(200);
+    const gs = (await listNotes(v)).find((n) => n.path === GETTING_STARTED_PATH)!;
+    expect((await op(v, `/api/notes/${gs.id}`, { method: "DELETE" })).status).toBe(200);
+
+    for (const pack of ["welcome", "getting-started"]) {
+      const res = await op(v, `/api/packs/${pack}`, { method: "POST" });
+      expect(res.status, pack).toBe(200);
+    }
+    const notes = await listNotes(v);
+    expect(notes.map((n) => n.path)).toEqual(expect.arrayContaining([TAGS_GRAPH_PATH, GETTING_STARTED_PATH]));
+    expectNoAutoTagClaim(notes);
+    expect(notes.find((n) => n.path === TAGS_GRAPH_PATH)!.content).toContain('"Tag new notes as an inbox"');
+  });
+
+  it("every cloud correction still matches core's text (a core bump that fixes it upstream trips this)", () => {
+    const core = [...welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string }).notes, ...GETTING_STARTED_PACK.notes];
+    expect(CLOUD_GUIDE_EDITS.length).toBeGreaterThan(0);
+    for (const edit of CLOUD_GUIDE_EDITS) {
+      const note = core.find((n) => n.path === edit.path);
+      expect(note, edit.path).toBeTruthy();
+      // If this fails after a vault-source.env bump, core changed the sentence:
+      // check its new wording and drop or update this edit.
+      expect(note!.content, `${edit.path}: core text the edit replaces`).toContain(edit.from);
+    }
   });
 });
