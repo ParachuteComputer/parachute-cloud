@@ -61,6 +61,9 @@ import { callVaultApi } from "./vault-call.ts";
  */
 export const SNAPSHOT_RUN_CAP = 500;
 
+/** Most vaults one `onlyVaults` run takes — D1's bound-parameter limit per statement. */
+export const ONLY_VAULTS_MAX = 100;
+
 /** GFS ranks, mirrored from workers/vault/src/snapshots.ts (wire shape). */
 export type SnapshotRank = "daily" | "weekly" | "monthly";
 
@@ -87,6 +90,12 @@ export interface SnapshotSweepSummary {
   /** True when enumeration stopped at the cap with vaults still unswept. */
   capped: boolean;
   /**
+   * Entries across this run's snapshots whose path needed a PAX record (a note
+   * title over 100 bytes — the T-318 failure). Count only; 0 from an older
+   * vault worker that doesn't report it.
+   */
+  longPaths: number;
+  /**
    * Orphan `vault_snapshots` rows deleted this run (mirror rows whose vault no
    * longer exists). Always 0 on an `onlyVault` run and on a prune that itself
    * failed — see {@link pruneOrphanSnapshotRows}.
@@ -103,13 +112,19 @@ export interface SnapshotSweepSummary {
  * passes it so the live smoke's restore round-trip (smoke-staging.ts §17) stays
  * O(1) rather than O(fleet) — a fleet-wide sweep outgrew the smoke's client
  * timeout as staging debris accumulated (cloud#166).
+ *
+ * `opts.onlyVaults` scopes it to a named SET (at most 100 — one D1 statement's
+ * bind limit — and the run cap): POST /ops/snapshot-run re-runs the vaults
+ * whose backups are stale (ops-daily.ts).
  */
 export async function runSnapshotSweep(
   env: Env,
   deps: OAuthDeps,
-  opts: { runCap?: number; onlyVault?: string; sender?: EmailSender; fetchFn?: typeof fetch } = {},
+  opts: { runCap?: number; onlyVault?: string; onlyVaults?: string[]; sender?: EmailSender; fetchFn?: typeof fetch } = {},
 ): Promise<SnapshotSweepSummary> {
-  const runCap = opts.runCap ?? SNAPSHOT_RUN_CAP;
+  const runCap = Math.min(opts.runCap ?? SNAPSHOT_RUN_CAP, opts.onlyVaults ? ONLY_VAULTS_MAX : Infinity);
+  const scoped = opts.onlyVault !== undefined || opts.onlyVaults !== undefined;
+  const set = opts.onlyVaults ? [...new Set(opts.onlyVaults)] : [];
   const now = deps.now?.() ?? new Date();
   const day = now.toISOString().slice(0, 10);
 
@@ -121,19 +136,31 @@ export async function runSnapshotSweep(
       )
         .bind(opts.onlyVault)
         .all<{ name: string; owner_user_id: string; plan: string }>()
-    : await env.DB.prepare(
+    : opts.onlyVaults
+      ? set.length === 0
+        ? { results: [] }
+        : await env.DB.prepare(
+            `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name IN (${set
+              .slice(0, runCap + 1)
+              .map(() => "?")
+              .join(", ")}) AND u.deleted_at IS NULL ORDER BY v.name`,
+          )
+            .bind(...set.slice(0, runCap + 1))
+            .all<{ name: string; owner_user_id: string; plan: string }>()
+      : await env.DB.prepare(
         `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE u.deleted_at IS NULL ORDER BY v.name LIMIT ?`,
       )
         .bind(runCap + 1)
         .all<{ name: string; owner_user_id: string; plan: string }>();
   const rows = res.results ?? [];
-  const capped = rows.length > runCap;
+  const capped = rows.length > runCap || set.length > runCap + 1;
   const vaults = capped ? rows.slice(0, runCap) : rows;
   if (capped) console.error(`event=snapshot_sweep_capped cap=${runCap} — paginate before raising (see SNAPSHOT_RUN_CAP note)`);
 
   let taken = 0;
   let skipped = 0;
   let failed = 0;
+  let longPaths = 0;
   for (const v of vaults) {
     try {
       const retention: SnapshotRetention = PLAN_SPECS[livePlan(coercePlanId(v.plan), billingModeOf(deps))].snapshot_retention;
@@ -146,11 +173,12 @@ export async function runSnapshotSweep(
         jsonBody: { retention },
       });
       if (!resp.ok) throw new Error(`internal snapshot POST → HTTP ${resp.status}`);
-      const body = (await resp.json()) as { skipped?: unknown; manifest?: unknown };
+      const body = (await resp.json()) as { skipped?: unknown; manifest?: unknown; long_paths?: unknown };
       if (typeof body.skipped !== "boolean" || !Array.isArray(body.manifest)) {
         throw new Error("internal snapshot POST carried no run shape (skipped/manifest)");
       }
       body.skipped ? skipped++ : taken++;
+      if (typeof body.long_paths === "number" && Number.isSafeInteger(body.long_paths)) longPaths += body.long_paths;
       // The D1 mirror is a render cache — a mirror-only failure is NOT a
       // snapshot failure (the tarball + R2 manifest landed; the console shows
       // last night's rows until tomorrow's sweep refreshes them). Logged under
@@ -172,11 +200,11 @@ export async function runSnapshotSweep(
   }
 
   // The orphan backstop (cloud#227) — fleet-wide runs only.
-  const orphansPruned = opts.onlyVault ? 0 : await pruneOrphanSnapshotRows(env.DB);
+  const orphansPruned = scoped ? 0 : await pruneOrphanSnapshotRows(env.DB);
 
-  const summary: SnapshotSweepSummary = { day, vaults: vaults.length, taken, skipped, failed, capped, orphansPruned };
+  const summary: SnapshotSweepSummary = { day, vaults: vaults.length, taken, skipped, failed, capped, longPaths, orphansPruned };
   console.log(
-    `event=snapshot_sweep day=${day} vaults=${summary.vaults} taken=${taken} skipped=${skipped} failed=${failed} capped=${capped} orphans_pruned=${orphansPruned}`,
+    `event=snapshot_sweep day=${day} vaults=${summary.vaults} taken=${taken} skipped=${skipped} failed=${failed} capped=${capped} long_paths=${longPaths} orphans_pruned=${orphansPruned}`,
   );
   if (failed > 0) {
     // Counts only: vault names stay in Workers Logs. raiseOpsAlert never throws.
@@ -257,23 +285,34 @@ export async function countStaleSnapshots(
   now: Date,
   mode: BillingMode,
 ): Promise<{ stale: number; vaults: number }> {
+  const { names, vaults } = await staleSnapshotVaults(db, now, mode);
+  return { stale: names.length, vaults };
+}
+
+/** The stale vaults themselves (names, sorted) — for the re-run endpoint; the
+ *  daily line only ever sees the count. */
+export async function staleSnapshotVaults(
+  db: D1Database,
+  now: Date,
+  mode: BillingMode,
+): Promise<{ names: string[]; vaults: number }> {
   const res = await db
     .prepare(
-      `SELECT v.created_at, u.plan, MAX(s.taken_at) AS newest
+      `SELECT v.name, v.created_at, u.plan, MAX(s.taken_at) AS newest
        FROM vaults v JOIN users u ON u.id = v.owner_user_id
        LEFT JOIN vault_snapshots s ON s.vault_name = v.name
-       WHERE u.deleted_at IS NULL GROUP BY v.name`,
+       WHERE u.deleted_at IS NULL GROUP BY v.name ORDER BY v.name`,
     )
-    .all<{ created_at: string; plan: string; newest: string | null }>();
+    .all<{ name: string; created_at: string; plan: string; newest: string | null }>();
   const rows = res.results ?? [];
-  let stale = 0;
+  const names: string[] = [];
   for (const r of rows) {
     const policy = PLAN_SPECS[livePlan(coercePlanId(r.plan), mode)].snapshot_retention;
     const maxAge = policy.daily > 0 ? STALE_DAILY_MS : STALE_WEEKLY_MS;
     const since = Date.parse(r.newest ?? r.created_at);
-    if (!Number.isFinite(since) || now.getTime() - since > maxAge) stale++;
+    if (!Number.isFinite(since) || now.getTime() - since > maxAge) names.push(r.name);
   }
-  return { stale, vaults: rows.length };
+  return { names, vaults: rows.length };
 }
 
 /** Replace a vault's D1 mirror rows with the post-run manifest (one batch —

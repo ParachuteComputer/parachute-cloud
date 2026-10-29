@@ -72,6 +72,7 @@ import {
   pruneExportTarballs,
   streamTar,
   tarSize,
+  needsPaxPath,
   toTar,
 } from "./export.js";
 import {
@@ -1394,6 +1395,10 @@ export class VaultDO extends DurableObject {
     await this.env.ATTACHMENTS.put(key, tar);
 
     const entry: SnapshotEntry = { key, taken_at: now.toISOString(), bytes: tar.byteLength, notes: stats.notes, ranks };
+    // How many entries needed a PAX path record (count only, never names):
+    // before T-318 any one of them failed the snapshot.
+    const longPaths = entries.filter((e) => needsPaxPath(e.name)).length;
+    if (longPaths > 0) console.log(`[snapshot ${vaultName}] long_paths=${longPaths}`);
     // Same-millisecond double snapshot overwrites one R2 key — keep the
     // manifest consistent with that (replace, never duplicate, the entry).
     manifest.snapshots = manifest.snapshots.filter((s) => s.key !== key);
@@ -1407,7 +1412,7 @@ export class VaultDO extends DurableObject {
     await saveManifest(this.env.ATTACHMENTS, manifest);
 
     if (pruned.length > 0) console.log(`[snapshot-prune ${vaultName}] deleted ${pruned.length} stale snapshot(s)`);
-    return json({ skipped: false, entry, pruned, manifest: manifest.snapshots });
+    return json({ skipped: false, entry, pruned, long_paths: longPaths, manifest: manifest.snapshots });
   }
 
   /** GET /api/internal/snapshots — the manifest (restore points), for the

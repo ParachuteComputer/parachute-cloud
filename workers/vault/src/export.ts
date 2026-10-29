@@ -259,6 +259,12 @@ function splitName(path: string): { name: string; prefix: string } | null {
   return null;
 }
 
+/** Whether `path` needs a PAX path record (no ustar name/prefix split fits).
+ *  Before T-318's fix these were the paths that failed the whole archive. */
+export function needsPaxPath(path: string): boolean {
+  return splitName(path) === null;
+}
+
 function tarHeader(name: string, prefix: string, size: number, typeflag = 0x30): Uint8Array {
   const header = new Uint8Array(BLOCK);
 

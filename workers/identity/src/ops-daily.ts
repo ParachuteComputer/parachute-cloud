@@ -55,7 +55,8 @@ import type { Env } from "./env.ts";
 import { type NotifyResult, notifyOperators } from "./ops-alerts.ts";
 import { pruneOpsCounters, sumOpsCounter } from "./ops-counters.ts";
 import { sha256Hex, timingSafeEqualString } from "./crypto.ts";
-import { countStaleSnapshots } from "./snapshots.ts";
+import { billingModeOf, type OAuthDeps } from "./oauth-shared.ts";
+import { countStaleSnapshots, runSnapshotSweep, type SnapshotSweepSummary, staleSnapshotVaults } from "./snapshots.ts";
 
 /** 24 h / 10 min — the health runs a full day should contain. */
 export const HEALTH_RUNS_PER_DAY = 144;
@@ -327,17 +328,56 @@ export async function dailyJsonResponse(db: D1Database, req: Request): Promise<R
  * SHA-256 digests, constant-time, so neither length nor prefix leaks.
  */
 export async function handleOpsDailyGet(env: Env, req: Request): Promise<Response | null> {
-  const secret = env.OPS_READ_TOKEN?.trim();
+  const refused = await opsBearerRefusal(env.OPS_READ_TOKEN, req);
+  if (refused !== undefined) return refused;
+  return dailyJsonResponse(env.DB, req);
+}
+
+/** The shared bearer gate of the /ops endpoints: null = the secret is unset
+ *  (the router 404s), a 401 Response = wrong/missing bearer, undefined = ok.
+ *  SHA-256 digests compared in constant time, so neither length nor prefix
+ *  leaks. */
+async function opsBearerRefusal(secretRaw: string | undefined, req: Request): Promise<Response | null | undefined> {
+  const secret = secretRaw?.trim();
   if (!secret) return null;
   const auth = req.headers.get("authorization") ?? "";
   const m = /^Bearer\s+(.+)$/i.exec(auth);
   const presented = m?.[1]?.trim() ?? "";
   const ok = presented !== "" && timingSafeEqualString(await sha256Hex(presented), await sha256Hex(secret));
-  if (!ok) {
-    return Response.json(
-      { error: "unauthorized" },
-      { status: 401, headers: { "www-authenticate": "Bearer", "cache-control": "no-store" } },
-    );
-  }
-  return dailyJsonResponse(env.DB, req);
+  if (ok) return undefined;
+  return Response.json(
+    { error: "unauthorized" },
+    { status: 401, headers: { "www-authenticate": "Bearer", "cache-control": "no-store" } },
+  );
+}
+
+/**
+ * POST /ops/snapshot-run — take a backup NOW of every vault whose backup is
+ * stale (the daily line's "stale backups" set), for an operator agent after a
+ * fix, instead of waiting for the 04:00 sweep. Bearer `OPS_RUN_TOKEN` (its own
+ * secret: this one writes, /ops/daily only reads); unset → null (404).
+ *
+ * Takes no vault name and returns none — counts only: stale before, the run's
+ * summary, stale after. It can only do what the nightly sweep does, to the
+ * vaults the sweep already failed; the GFS ranks + retention bound the work.
+ */
+export async function handleOpsSnapshotRunPost(
+  env: Env,
+  req: Request,
+  deps: OAuthDeps,
+  sender: EmailSender | undefined,
+): Promise<Response | null> {
+  const refused = await opsBearerRefusal(env.OPS_RUN_TOKEN, req);
+  if (refused !== undefined) return refused;
+  if (req.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
+  const mode = billingModeOf(deps);
+  const before = await staleSnapshotVaults(env.DB, deps.now?.() ?? new Date(), mode);
+  let run: SnapshotSweepSummary | null = null;
+  if (before.names.length > 0) run = await runSnapshotSweep(env, deps, { onlyVaults: before.names, sender });
+  const after = await countStaleSnapshots(env.DB, deps.now?.() ?? new Date(), mode);
+  console.log(`event=ops_snapshot_run stale_before=${before.names.length} stale_after=${after.stale}`);
+  return Response.json(
+    { stale_before: before.names.length, run, stale_after: after.stale, vaults: after.vaults },
+    { headers: { "cache-control": "no-store" } },
+  );
 }

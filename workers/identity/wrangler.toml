@@ -293,6 +293,8 @@ EMAIL_FROM = "noreply@parachute.computer"
 #                           topic URL, Slack-compatible or Buzz incoming webhook).
 #   OPS_READ_TOKEN        — bearer for GET /ops/daily (operator agent reads the
 #                           daily lines without a browser). Unset → 404.
+#   OPS_RUN_TOKEN         — bearer for POST /ops/snapshot-run (re-run the stale
+#                           vaults' backups now). Unset → 404.
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
 # --- money switch (T-318, Aaron 10-29: "Parachute open beta") -----------------
 # BILLING_MODE = "open_beta" | "paid" (src/billing-config.ts billingMode). UNSET

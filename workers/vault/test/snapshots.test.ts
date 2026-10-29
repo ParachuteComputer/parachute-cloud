@@ -237,6 +237,7 @@ interface SnapshotResponse {
   reason?: string;
   entry?: SnapshotEntry;
   pruned?: string[];
+  long_paths?: number;
   manifest: SnapshotEntry[];
 }
 
@@ -308,6 +309,20 @@ describe("POST /api/internal/snapshot — tarball + manifest", () => {
       headers: { authorization: `Bearer ${await firstPartyToken(v)}` },
     });
     expect(((await list.json()) as { snapshots: SnapshotEntry[] }).snapshots).toEqual([body.entry]);
+  });
+
+  it("reports how many entries needed a PAX path record (count only, no names) — T-318", async () => {
+    const v = freshVault("sn");
+    await createNote(v, { content: "short", path: "notes/short" });
+    const plain = (await (await snapshotReq(v, OP, PAID)).json()) as SnapshotResponse;
+    expect(plain.long_paths).toBe(0);
+    await createNote(v, { content: "long", path: `A long title ${"that keeps going ".repeat(6)}` });
+    await sleep(3);
+    const res = await snapshotReq(v, OP, PAID);
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect((JSON.parse(text) as SnapshotResponse).long_paths).toBe(1);
+    expect(text).not.toContain("that keeps going");
   });
 
   it("free policy: the first snapshot of the week is taken; a same-week re-run is SKIPPED (no export work)", async () => {
