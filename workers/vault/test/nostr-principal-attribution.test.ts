@@ -3,7 +3,7 @@
  *
  * Door parity, not a nice-to-have. `@openparachute/core` is shared verbatim
  * between the two doors (`workers/vault/package.json` →
- * `file:../../../parachute-vault/core`), so core's `query-notes` manifest
+ * `file:../../../parachute-core/packages/vault/core`), so core's `query-notes` manifest
  * advertises `created_via` / `last_updated_via` = `nostr:<64-hex>` to CLOUD
  * clients as well as bun ones. Before this change, cloud hardcoded
  * `via: "api"` in `src/auth.ts` and flattened to `"mcp"` in `src/mcp.ts`, so
