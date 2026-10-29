@@ -1256,6 +1256,22 @@ describe("console — the import door (POST /console/vaults/import)", () => {
     }
   });
 
+  test("a double submit: the attempt refused as import_in_progress reports the other attempt's success", async () => {
+    const { id: userId } = await seedUser("import-double@example.com");
+    const sessionId = await seedSession(userId);
+    const s = confirmDeps({
+      importResponse: () =>
+        new Response(JSON.stringify({ error_type: "import_in_progress" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        }),
+      status: () => ({ state: "done", kind: "import", import_id: "the-first-tab", notes: 12, skipped_attachments: 0 }),
+    });
+    const res = await handleImportPost(env.DB, importReq("double-box", TAR, sessionCookie(sessionId)), s.boundDeps);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?imported=double-box&notes=12&skipped=0");
+  });
+
   test("a definite refusal (400 unreadable) is not re-checked", async () => {
     const { id: userId } = await seedUser("import-definite@example.com");
     const sessionId = await seedSession(userId);

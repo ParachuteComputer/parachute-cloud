@@ -31,7 +31,7 @@ import { createNote, freshVault, op } from "./helpers.ts";
 
 const MODEL = "test-window-model";
 
-function windowedProvider(opts: { windowChars: number; perTextChars: number }): EmbeddingProvider & {
+function windowedProvider(opts: { windowChars: number; perTextChars: number; refuse?: string }): EmbeddingProvider & {
   calls: number;
   rejected: number;
 } {
@@ -48,7 +48,8 @@ function windowedProvider(opts: { windowChars: number; perTextChars: number }): 
       p.calls++;
       const total = input.texts.reduce((n, t) => n + t.length, 0);
       const longest = Math.max(...input.texts.map((t) => t.length));
-      if (total > opts.windowChars || longest > opts.perTextChars) {
+      const refused = opts.refuse !== undefined && input.texts.some((t) => t.includes(opts.refuse!));
+      if (total > opts.windowChars || longest > opts.perTextChars || refused) {
         p.rejected++;
         // The exact wording Workers AI used on staging, through the provider's own mapping.
         throw new EmbeddingError(
@@ -133,6 +134,20 @@ describe("embedding batches (T-318): oversized input is capped and split, not re
     }
     expect(await vectorCount(v, blobNote.id)).toBe(1);
     // Nothing is re-sent once embedded: the capped blob reads as fresh.
+    const calls = provider.calls;
+    expect(await drain(v, provider)).toBe(0);
+    expect(provider.calls).toBe(calls);
+  }, 120_000);
+
+  it("a text the model refuses for another reason gets the fallback vector and stops coming back", async () => {
+    const v = freshVault("erefuse");
+    expect((await op(v, "")).status).toBe(200);
+    const good = await createNote(v, { content: longNote(300, 6), path: "refuse/good" });
+    const bad = await createNote(v, { content: "short note with a ZZ-REFUSED-ZZ marker", path: "refuse/bad" });
+    const provider = windowedProvider({ windowChars: 60_000, perTextChars: 10_000, refuse: "ZZ-REFUSED-ZZ" });
+    expect(await drain(v, provider)).toBe(0);
+    expect(await vectorCount(v, bad.id)).toBe(1);
+    expect(await vectorCount(v, good.id)).toBe(chunkNoteContent(longNote(300, 6)).filter((c) => c.text.trim()).length);
     const calls = provider.calls;
     expect(await drain(v, provider)).toBe(0);
     expect(provider.calls).toBe(calls);
