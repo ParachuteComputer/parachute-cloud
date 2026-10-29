@@ -39,6 +39,7 @@
 import {
   SIDECAR_DIR,
   importVault,
+  type ImportEngineOptions,
   isExcludedPath,
   type ImportSource,
   type ImportStats,
@@ -294,13 +295,24 @@ function hasVaultMeta(names: Iterable<string>): boolean {
  * binaries — see the module note. The caller (the internal restore endpoint)
  * only ever runs this against a freshly created restore-target vault.
  */
-export async function restoreFromTar(store: Store, tarBytes: Uint8Array): Promise<ImportStats> {
+export async function restoreFromTar(store: Store, tarBytes: Uint8Array, opts: ReplayOptions = {}): Promise<ImportStats> {
   const files = parseTar(tarBytes);
   if (!hasVaultMeta(files.map((f) => f.name))) {
     throw new Error(`not a portable-md snapshot: missing ${SIDECAR_DIR}/vault.yaml in the tarball`);
   }
-  return importVault(store, new TarImportSource(files), { blowAway: true });
+  return importVault(store, new TarImportSource(files), { blowAway: true, ...opts });
 }
+
+/**
+ * What the DO may pass to a replay. `checkpoint` (T-318) is awaited every few
+ * hundred notes so the writes commit in chunks rather than as one implicit
+ * storage transaction, which Cloudflare resets past ~30 s (a 2,698-note vault
+ * needed ~33 s). The caller must hold the vault's import lock while it runs:
+ * other events are delivered during each await. A failure part-way leaves the
+ * chunks already written; the import door keeps the name import-pending, and
+ * a retry blow-away-replays it.
+ */
+export type ReplayOptions = Pick<ImportEngineOptions, "checkpoint">;
 
 /** The outcome of an import-door replay: the engine stats + the attachment
  *  binaries the DO still needs to write to R2 (collected past the synchronous
@@ -317,13 +329,13 @@ export interface ImportResult {
  * for the DO to stream into R2 + meter (the sync `restoreAttachment` seam can't
  * await R2). Throws when the body isn't a readable portable-md export.
  */
-export async function importFromTar(store: Store, tarBytes: Uint8Array): Promise<ImportResult> {
+export async function importFromTar(store: Store, tarBytes: Uint8Array, opts: ReplayOptions = {}): Promise<ImportResult> {
   const files = parseTarBinary(tarBytes);
   if (!hasVaultMeta(files.map((f) => f.name))) {
     throw new Error(`not a portable-md export: missing ${SIDECAR_DIR}/vault.yaml in the tarball`);
   }
   const source = new TarImportSource(files, { collectAttachments: true });
-  const stats = await importVault(store, source, { blowAway: true });
+  const stats = await importVault(store, source, { blowAway: true, ...opts });
   return { stats, pending: source.pendingAttachments };
 }
 

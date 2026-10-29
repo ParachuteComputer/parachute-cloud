@@ -1170,6 +1170,108 @@ describe("console — the import door (POST /console/vaults/import)", () => {
     expect((await getVault(env.DB, "unreachable-box"))?.ownerUserId).toBe(userId);
   });
 
+  // T-318: the vault can be reset after the replay committed and before it
+  // answered (Adam's 2,705 notes landed while the console said "failed"). On
+  // an error that isn't a definite refusal, the console asks the vault how
+  // THIS attempt went.
+  function confirmDeps(script: {
+    importResponse: () => Response | Promise<Response>;
+    status: (importId: string, call: number) => unknown | Promise<unknown>;
+  }) {
+    let importId = "";
+    let statusCalls = 0;
+    const boundDeps = {
+      ...deps(),
+      vaultFetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/api/internal/import")) {
+          importId = new Headers(init?.headers).get("x-parachute-import-id") ?? "";
+          return script.importResponse();
+        }
+        if (url.endsWith("/api/internal/import-status")) {
+          statusCalls++;
+          const body = await script.status(importId, statusCalls);
+          if (body instanceof Response) return body;
+          return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      },
+    };
+    return { boundDeps, importId: () => importId, statusCalls: () => statusCalls };
+  }
+
+  test("an import that errored but landed (vault reset after the replay) reports success and clears import-pending", async () => {
+    const { id: userId } = await seedUser("import-landed@example.com");
+    const sessionId = await seedSession(userId);
+    const s = confirmDeps({
+      importResponse: () => {
+        throw new Error("Durable Object reset because its code was updated or it exceeded its memory limit");
+      },
+      status: (id) => ({ state: "done", kind: "import", import_id: id, notes: 2705, skipped_attachments: 0 }),
+    });
+    const res = await handleImportPost(env.DB, importReq("landed-box", TAR, sessionCookie(sessionId)), s.boundDeps);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?imported=landed-box&notes=2705&skipped=0");
+    expect(s.importId()).toMatch(/^[0-9a-f-]{36}$/);
+    expect((await getVault(env.DB, "landed-box"))?.importPendingAt).toBeNull();
+  });
+
+  test("a 503 import_in_progress waits for the replay, then reports success", async () => {
+    const { id: userId } = await seedUser("import-wait@example.com");
+    const sessionId = await seedSession(userId);
+    const s = confirmDeps({
+      importResponse: () =>
+        new Response(JSON.stringify({ error_type: "import_in_progress" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        }),
+      status: (id, call) =>
+        call === 1
+          ? { state: "running", kind: "import", import_id: id }
+          : { state: "done", kind: "import", import_id: id, notes: 7, skipped_attachments: 1 },
+    });
+    const res = await handleImportPost(env.DB, importReq("wait-box", TAR, sessionCookie(sessionId)), s.boundDeps);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/console?imported=wait-box&notes=7&skipped=1");
+    expect(s.statusCalls()).toBe(2);
+  });
+
+  test("an errored import is NOT confirmed by another attempt's record, or by a failed/interrupted one", async () => {
+    const { id: userId } = await seedUser("import-other@example.com");
+    const sessionId = await seedSession(userId);
+    for (const [name, record] of [
+      ["other-attempt", { state: "done", kind: "import", import_id: "some-older-attempt", notes: 9 }],
+      ["interrupted-box", { state: "interrupted", kind: "import" }],
+      ["failed-box", { state: "failed", kind: "import" }],
+    ] as const) {
+      const s = confirmDeps({
+        importResponse: () => new Response("upstream error", { status: 500 }),
+        status: (id) => ("import_id" in record ? record : { ...record, import_id: id }),
+      });
+      const res = await handleImportPost(env.DB, importReq(name, TAR, sessionCookie(sessionId)), s.boundDeps);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("is reserved for you");
+      expect((await getVault(env.DB, name))?.importPendingAt).not.toBeNull();
+      expect(s.statusCalls()).toBe(1);
+    }
+  });
+
+  test("a definite refusal (400 unreadable) is not re-checked", async () => {
+    const { id: userId } = await seedUser("import-definite@example.com");
+    const sessionId = await seedSession(userId);
+    const s = confirmDeps({
+      importResponse: () =>
+        new Response(JSON.stringify({ error_type: "import_unreadable" }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+      status: (id) => ({ state: "done", kind: "import", import_id: id, notes: 1 }),
+    });
+    const res = await handleImportPost(env.DB, importReq("definite-box", TAR, sessionCookie(sessionId)), s.boundDeps);
+    expect(res.status).toBe(200);
+    expect(s.statusCalls()).toBe(0);
+  });
+
   test("the vault worker's 413 surfaces the too-large message and KEEPS the row", async () => {
     const { id: userId } = await seedUser("import-413@example.com");
     const sessionId = await seedSession(userId);

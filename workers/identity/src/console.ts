@@ -93,6 +93,7 @@ import {
   applyPlanToVaults,
   callVaultApi,
   callVaultImport,
+  callVaultImportStatus,
   FIRST_PARTY_CLIENT_ID,
   PACK_APPLY_CLIENT_ID,
   pushVaultCap,
@@ -789,15 +790,15 @@ function importTooLargeMessage(): string {
 
 /**
  * The friendly copy for a failed import forward/replay. We NEVER free the vault
- * name on failure, so the message reassures the caller: nothing was kept from
- * the upload, and the name is theirs — a retry reuses it (and the DO's blow-away
- * import converges). Vault names are validated slugs (`[a-z0-9-]`), so the name
+ * name on failure, so the message reassures the caller: the name is theirs,
+ * and a retry reuses it. Part of the upload may have landed (the DO commits a
+ * big import in chunks, T-318); the retry's blow-away replaces it. Vault names are validated slugs (`[a-z0-9-]`), so the name
  * needs no HTML escaping here.
  */
 function importFailedMessage(vaultName: string): string {
   return (
-    `Import failed — nothing was kept from the upload. The vault name "${vaultName}" ` +
-    `is reserved for you; retrying the import will reuse it.`
+    `Import failed. The vault name "${vaultName}" is reserved for you; ` +
+    `retrying the import will reuse it and replace anything that landed.`
   );
 }
 
@@ -966,33 +967,47 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
   // a retry re-imports into the SAME vault and converges. Log loudly, and guard
   // the failure render so a logging/DB hiccup can't escalate a handled import
   // failure into an unhandled 500 (this worker has no Hono onError).
-  let res: Response;
+  //
+  // An error here is not proof the import failed (T-318): the vault can be
+  // reset after the replay committed and before it answered (2,705 notes
+  // landed while the console said "failed"). So for anything but a definite
+  // refusal (413, or a 4xx about the tar itself), ask the vault how THIS
+  // attempt went (`importId`) before calling it a failure.
+  const importId = crypto.randomUUID();
+  let res: Response | null = null;
+  let forwardError = "";
   try {
-    res = await callVaultImport(db, deps, user.id, vaultName, buf);
+    res = await callVaultImport(db, deps, user.id, vaultName, buf, importId);
   } catch (err) {
-    logImportForwardFailed(user.id, vaultName, err instanceof Error ? err.message : String(err));
-    return importFailureResponse(db, req, deps, user, importFailedMessage(vaultName));
+    forwardError = err instanceof Error ? err.message : String(err);
   }
-  if (!res.ok) {
-    if (res.status === 413) {
-      logImportForwardFailed(user.id, vaultName, "status=413");
-      return importFailureResponse(db, req, deps, user, importTooLargeMessage());
-    }
-    logImportForwardFailed(user.id, vaultName, `status=${res.status}`);
-    return importFailureResponse(db, req, deps, user, importFailedMessage(vaultName));
+  if (res?.status === 413) {
+    logImportForwardFailed(user.id, vaultName, "status=413");
+    return importFailureResponse(db, req, deps, user, importTooLargeMessage());
   }
-
-  const summary = (await res.json().catch(() => ({}))) as {
-    notes?: unknown;
-    stats?: { notes_created?: unknown; skipped_attachments?: unknown };
-  };
-  const notes =
-    typeof summary.notes === "number"
-      ? summary.notes
-      : typeof summary.stats?.notes_created === "number"
-        ? summary.stats.notes_created
-        : 0;
-  const skipped = typeof summary.stats?.skipped_attachments === "number" ? summary.stats.skipped_attachments : 0;
+  let notes = 0;
+  let skipped = 0;
+  if (res?.ok) {
+    const summary = (await res.json().catch(() => ({}))) as {
+      notes?: unknown;
+      stats?: { notes_created?: unknown; skipped_attachments?: unknown };
+    };
+    notes =
+      typeof summary.notes === "number"
+        ? summary.notes
+        : typeof summary.stats?.notes_created === "number"
+          ? summary.stats.notes_created
+          : 0;
+    skipped = typeof summary.stats?.skipped_attachments === "number" ? summary.stats.skipped_attachments : 0;
+  } else {
+    logImportForwardFailed(user.id, vaultName, res ? `status=${res.status}` : forwardError);
+    const definite = res !== null && res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
+    const landed = definite ? null : await confirmImportLanded(db, deps, user.id, vaultName, importId);
+    if (!landed) return importFailureResponse(db, req, deps, user, importFailedMessage(vaultName));
+    console.log(`event=import_confirmed_after_error vault=${vaultName} notes=${landed.notes}`);
+    notes = landed.notes;
+    skipped = landed.skipped;
+  }
   // Import succeeded — the vault now holds real content, so CLOSE the retry-
   // reuse gate (a later import naming this vault must get "already taken",
   // never a blow-away). Guarded: a D1 hiccup here must not turn a successful
@@ -1007,6 +1022,50 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
   return redirectResponse(
     `/console?imported=${encodeURIComponent(vaultName)}&notes=${notes}&skipped=${skipped}`,
   );
+}
+
+/** The vault's import-status answer, as far as the console reads it. */
+type ImportStatusBody = { state?: unknown; import_id?: unknown; notes?: unknown; skipped_attachments?: unknown };
+
+/** How often, and how many times, the console asks whether an import landed. */
+const IMPORT_CONFIRM_INTERVAL_MS = 2_000;
+const IMPORT_CONFIRM_POLLS = 45;
+
+/**
+ * After an import request errored, ask the vault whether import attempt
+ * `importId` landed anyway (T-318). Polls while the vault reports it still
+ * running (or answers 503 `import_in_progress`), up to ~90 s. Returns the
+ * counts when the vault recorded THIS attempt as done; null for anything else
+ * (failed, interrupted, another attempt, unreachable). Never throws.
+ */
+async function confirmImportLanded(
+  db: D1Database,
+  deps: OAuthDeps,
+  userId: string,
+  vaultName: string,
+  importId: string,
+): Promise<{ notes: number; skipped: number } | null> {
+  for (let i = 0; i < IMPORT_CONFIRM_POLLS; i++) {
+    if (i > 0) await new Promise((resolve) => setTimeout(resolve, IMPORT_CONFIRM_INTERVAL_MS));
+    let rec: ImportStatusBody | null = null;
+    try {
+      const res = await callVaultImportStatus(db, deps, userId, vaultName);
+      if (res.status === 503) continue; // the vault is mid-replay, or waking
+      if (!res.ok) return null;
+      rec = (await res.json()) as ImportStatusBody;
+    } catch {
+      return null; // the vault can't be reached at all: report the failure
+    }
+    if (rec?.state === "running") continue;
+    if (rec?.state === "done" && rec.import_id === importId) {
+      return {
+        notes: typeof rec.notes === "number" ? rec.notes : 0,
+        skipped: typeof rec.skipped_attachments === "number" ? rec.skipped_attachments : 0,
+      };
+    }
+    return null;
+  }
+  return null;
 }
 
 // --- snapshot restore (Wave 4e — paid plans only) -----------------------------

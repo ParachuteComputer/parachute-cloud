@@ -86,10 +86,10 @@ jobs:
         with:
           bun-version: 1.4 # floor: Bun 1.4
 
-      - name: Materialize pinned vault-core dependency
-        # workers/vault builds against file:../../../parachute-vault/core — a
+      - name: Materialize pinned parachute-core engine dependency
+        # workers/vault builds against file:../../../parachute-core/packages/vault/core — a
         # sibling checkout outside this repo. Deploys materialize the exact
-        # commit pinned in scripts/vault-source.env (the deploy script's own
+        # commit pinned in scripts/core-source.env (the deploy script's own
         # `bun install` refreshes the copied dep from this checkout).
         if: steps.gate.outputs.ready == 'true'
         run: bash scripts/materialize-vault-core.sh

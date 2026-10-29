@@ -102,6 +102,8 @@ export async function callVaultApi(
      *  Mutually exclusive with jsonBody; `rawContentType` sets its header. */
     rawBody?: BodyInit;
     rawContentType?: string;
+    /** Extra request headers (the import door's attempt id). */
+    extraHeaders?: Record<string, string>;
     /**
      * `client_id` stamped on the minted token. Defaults to
      * {@link FIRST_PARTY_CLIENT_ID} ("parachute-console") so every EXISTING
@@ -123,7 +125,7 @@ export async function callVaultApi(
     permissions?: Record<string, unknown>;
   },
 ): Promise<Response> {
-  const { userId, vaultName, method, apiPath, verb, jsonBody, rawBody, rawContentType, clientId, signal, permissions } = opts;
+  const { userId, vaultName, method, apiPath, verb, jsonBody, rawBody, rawContentType, clientId, signal, permissions, extraHeaders } = opts;
   // BRIDGE WRITE-CLAMP (hard ceiling): an account-bridge mint — `client_id`
   // "parachute-account" (ACCOUNT_TOKEN_CLIENT_ID), the tenant-facing id the
   // account-MCP fan-out uses — may NEVER carry the `admin` verb. The cross-vault
@@ -149,7 +151,7 @@ export async function callVaultApi(
     ...(permissions !== undefined ? { permissions } : {}),
   });
   const fetchFn = deps.vaultFetch ?? fetch;
-  const headers: Record<string, string> = { authorization: `Bearer ${signed.token}` };
+  const headers: Record<string, string> = { ...(extraHeaders ?? {}), authorization: `Bearer ${signed.token}` };
   let body: BodyInit | undefined;
   if (jsonBody !== undefined) {
     headers["content-type"] = "application/json";
@@ -181,6 +183,7 @@ export async function callVaultImport(
   userId: string,
   vaultName: string,
   tarBytes: ArrayBuffer | Uint8Array,
+  importId?: string,
 ): Promise<Response> {
   return callVaultApi(db, deps, {
     userId,
@@ -190,6 +193,32 @@ export async function callVaultImport(
     verb: "admin",
     rawBody: tarBytes,
     rawContentType: "application/x-tar",
+    ...(importId ? { extraHeaders: { [IMPORT_ID_HEADER]: importId } } : {}),
+  });
+}
+
+/** The import door's per-attempt id (T-318): the vault records it with the
+ *  import's state, so a status check can tell THIS attempt from an older one. */
+export const IMPORT_ID_HEADER = "x-parachute-import-id";
+
+/**
+ * Ask the vault how its last import went (`GET /api/internal/import-status`,
+ * T-318): `{ state: "running" | "done" | "failed" | "interrupted" | "none",
+ * import_id?, notes?, skipped_attachments? }`. Counts only. The console uses
+ * it when the import request itself came back as an error.
+ */
+export async function callVaultImportStatus(
+  db: D1Database,
+  deps: OAuthDeps,
+  userId: string,
+  vaultName: string,
+): Promise<Response> {
+  return callVaultApi(db, deps, {
+    userId,
+    vaultName,
+    method: "GET",
+    apiPath: "/api/internal/import-status",
+    verb: "admin",
   });
 }
 

@@ -72,6 +72,8 @@ export const WS_CLOSE = {
   FORBIDDEN: 4403,
   /** Accepted socket never authed within {@link WS_AUTH_DEADLINE_MS}. */
   AUTH_TIMEOUT: 4408,
+  /** The vault is busy (an import is replaying into it); reconnect later. */
+  UNAVAILABLE: 4503,
 } as const;
 
 /**

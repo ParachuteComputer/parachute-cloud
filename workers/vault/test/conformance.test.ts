@@ -1192,7 +1192,7 @@ describe("contracts-brief C1.4 — cross-door parity pins", () => {
  * able to tell the hosted door from the self-hosted one by the shape of an
  * answer. Ground truth for every case below is
  * parachute-vault/src/routes.ts + core/src/notes.ts at the pinned vault-core
- * ref (scripts/vault-source.env).
+ * ref (scripts/core-source.env).
  */
 describe("parity residue — cloud#112 / #113 / #115 / #157", () => {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

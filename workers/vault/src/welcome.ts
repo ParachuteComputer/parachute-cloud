@@ -120,7 +120,7 @@ export async function seedWelcome(store: Store, opts: { consoleOrigin: string })
  * does unless the owner turns on "Tag new notes as an inbox" (Settings → Tag
  * roles). Each edit swaps one exact passage of core's text for the true one
  * and leaves the rest of the note byte-equal to core. welcome.test.ts checks
- * every `from` still appears in core, so a vault-source.env bump that fixes the
+ * every `from` still appears in core, so a core-source.env bump that fixes the
  * text upstream fails loudly here instead of silently keeping a stale edit.
  * The new wording holds whether or not the vault declares `capture` (the
  * default seed omits it; an explicit welcome-pack apply declares it).

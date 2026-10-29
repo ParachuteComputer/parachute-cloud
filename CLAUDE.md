@@ -27,7 +27,7 @@ bun scripts/smoke-prod.ts           # READ-ONLY live checks vs production
 
 ## Load-bearing gotchas
 
-- **Stale `file:` core dep** — `workers/vault` depends on `@openparachute/core` via `file:../../../parachute-vault/core`; bun COPIES it at install. After any vault-core change, `bun install` or you test/deploy stale core (the deploy scripts do it; test runs don't).
+- **Stale `file:` core dep** — `workers/vault` depends on `@openparachute/core` via `file:../../../parachute-core/packages/vault/core`; bun COPIES it at install. After any engine change, `bun install` or you test/deploy stale core (the deploy scripts do it; test runs don't).
 - **DO SQLite rejects `BEGIN/COMMIT`** — core's `transaction()` duck-types the shim's `transactionSync`.
 - **workerd ≠ vitest-workerd** — e.g. runtime caps PBKDF2 at 100k iterations, the test pool doesn't enforce it (green tests, every live login 500'd). ALWAYS live-smoke after deploy.
 - **`wrangler deploy` success ≠ globally propagated** — an edge PoP can serve the old version minutes later. `/health`'s `version` field is per-PoP ground truth; `deploy-staging.sh` polls it against a pre-deploy baseline before smoking.
@@ -46,11 +46,11 @@ bun scripts/smoke-prod.ts           # READ-ONLY live checks vs production
 
 ## Critical rule: shared core + shared wire contract, forked runtime
 
-The engine is `@openparachute/core` (in parachute-vault) — never reimplement schema/query/MCP-tool semantics here; PR core changes upstream. The WIRE contract (REST shapes, OAuth flows, MCP discovery, portable-md bytes) must match the bun vault byte-shaped. The RUNTIME (router/DO/R2/D1) diverges by design. Extend the conformance suites with every endpoint you add.
+The engine is `@openparachute/core` (parachute-core `packages/vault/core`; it moved there from parachute-vault `core/` with its history) — never reimplement schema/query/MCP-tool semantics here; PR core changes upstream. The WIRE contract (REST shapes, OAuth flows, MCP discovery, portable-md bytes) must match the bun vault byte-shaped. The RUNTIME (router/DO/R2/D1) diverges by design. Extend the conformance suites with every endpoint you add.
 
 ## Governance / CI
 
-Same as the workspace: PR-only, reviewer-gated, no self-merge; every code-touching PR bumps rc.N (private package — the discipline is for history legibility). `.github/workflows/ci.yml` and both deploy paths materialize the exact parachute-vault commit pinned in `scripts/vault-source.env` as a sibling (the `file:` core dep needs it) — promote vault-core by bumping the pin. `deploy-staging.yml` auto-runs on pushes to main; `deploy-prod.yml` is manual-dispatch only, gated on Aaron's `production` environment approval. The deploy secret-gate skips GREEN when secrets are unset — verify a NEW deployment actually landed before claiming deployed.
+Same as the workspace: PR-only, reviewer-gated, no self-merge; every code-touching PR bumps rc.N (private package — the discipline is for history legibility). `.github/workflows/ci.yml` and both deploy paths materialize the exact parachute-core commit pinned in `scripts/core-source.env` as a sibling `../parachute-core` (the `file:` core dep needs it) — promote the engine by bumping the pin. `deploy-staging.yml` auto-runs on pushes to main; `deploy-prod.yml` is manual-dispatch only, gated on Aaron's `production` environment approval. The deploy secret-gate skips GREEN when secrets are unset — verify a NEW deployment actually landed before claiming deployed.
 
 ## License
 

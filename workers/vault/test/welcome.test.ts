@@ -303,7 +303,7 @@ describe("the seeded guides tell the truth about #capture", () => {
     for (const edit of CLOUD_GUIDE_EDITS) {
       const note = core.find((n) => n.path === edit.path);
       expect(note, edit.path).toBeTruthy();
-      // If this fails after a vault-source.env bump, core changed the sentence:
+      // If this fails after a core-source.env bump, core changed the sentence:
       // check its new wording and drop or update this edit.
       expect(note!.content, `${edit.path}: core text the edit replaces`).toContain(edit.from);
     }

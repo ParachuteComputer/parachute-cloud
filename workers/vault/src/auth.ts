@@ -321,7 +321,7 @@ export function nostrVia(pubkey: string): string {
  *
  * DOOR PARITY (cloud#277): this is a byte-for-byte port of the bun vault's
  * `src/auth.ts`. `@openparachute/core` is shared verbatim between the two
- * doors (`package.json` `file:../../../parachute-vault/core`), so core's
+ * doors (`package.json` `file:../../../parachute-core/packages/vault/core`), so core's
  * `query-notes` manifest advertises `created_via = nostr:<hex>` to cloud
  * clients too. Without this, cloud would advertise a filter value it could
  * never produce.

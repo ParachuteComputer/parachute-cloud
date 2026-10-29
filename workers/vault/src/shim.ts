@@ -37,7 +37,7 @@ export interface RunResult {
 export interface InterceptRecord {
   kind: "transaction" | "pragma";
   stmt: string;
-  /** First `parachute-vault/core` frame in the call stack, if resolvable. */
+  /** First engine (`@openparachute/core`) frame in the call stack, if resolvable. */
   caller?: string;
 }
 
@@ -77,7 +77,7 @@ function coreCaller(): string | undefined {
   const stack = new Error().stack;
   if (!stack) return undefined;
   for (const line of stack.split("\n")) {
-    if (line.includes("parachute-vault/core") || line.includes("@openparachute/core")) {
+    if (line.includes("parachute-vault/core") || line.includes("packages/vault/core") || line.includes("@openparachute/core")) {
       return line.trim().replace(/^at\s+/, "");
     }
   }
