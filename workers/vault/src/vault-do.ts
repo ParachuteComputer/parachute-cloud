@@ -129,6 +129,7 @@ import {
 import { normalize } from "@openparachute/core/src/embedding/vector-codec.js";
 import { WorkersAiEmbeddingProvider } from "./embedding/workers-ai.js";
 import { embeddingsExplicitlyDisabled } from "./embedding/select.js";
+import { capEmbedText, embedSplitting, planEmbedBatches } from "./embedding/batches.js";
 import {
   DoAttachmentTicketProvider,
   handleTicketSpend,
@@ -273,6 +274,39 @@ const EMBED_NOTES_PER_WAKE = 25;
 const EMBED_MAX_TEXTS_PER_CALL = 90;
 
 /**
+ * DO-storage record of the last import or snapshot restore into this vault
+ * (T-318). Written "running" before the replay starts and "done"/"failed"
+ * when it ends, so the console can ask whether an import landed when the
+ * import request itself came back as an error (see GET
+ * /api/internal/import-status). A record still "running" with no replay in
+ * this instance means the object was reset part-way: "interrupted".
+ */
+const IMPORT_STATE_KEY = "import_state";
+export interface ImportStateRecord {
+  state: "running" | "done" | "failed";
+  kind: "import" | "restore";
+  /** The console's attempt id (`x-parachute-import-id`), so it can tell its own attempt from an older one. */
+  import_id?: string;
+  started_at: string;
+  finished_at?: string;
+  notes?: number;
+  skipped_attachments?: number;
+  error_type?: string;
+}
+
+/** How long a held alarm waits before it looks again while an import runs. */
+const IMPORT_ALARM_HOLD_MS = 30_000;
+
+/**
+ * The import checkpoint (T-318): a short timer, awaited every few hundred
+ * notes, so the DO commits the replay's writes in chunks instead of one
+ * implicit storage transaction (which the platform resets past ~30 s). Other
+ * events can be delivered during each wait, which is why the import lock
+ * ({@link VaultDO.importRun}) exists.
+ */
+const importCheckpoint = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 1));
+
+/**
  * Lazily resolves to the DO's live embedding provider on every property/
  * method access, rather than baking a concrete provider instance into
  * `DoSqliteStore`'s constructor-injected (and `readonly` on core's `Store`)
@@ -368,6 +402,16 @@ export async function purgePrefix(bucket: R2Bucket, prefix: string): Promise<num
   return deleted;
 }
 
+/** 503 while the import lock is held (T-318). The console re-checks via import-status. */
+function importInProgressResponse(): Response {
+  const res = json(
+    { error: "This vault is being imported. Try again in a moment.", error_type: "import_in_progress" },
+    503,
+  );
+  res.headers.set("retry-after", "5");
+  return res;
+}
+
 export class VaultDO extends DurableObject {
   private shim: DatabaseShim;
   private store!: DoSqliteStore;
@@ -396,6 +440,19 @@ export class VaultDO extends DurableObject {
    * under vitest-pool-workers' concurrency model (see `alarm()`'s doc).
    */
   private alarmRunning = false;
+
+  /**
+   * The import lock (T-318): set while an import or snapshot restore replays
+   * into this vault. The replay yields every few hundred notes so its writes
+   * commit in chunks ({@link importCheckpoint}), and each yield lets other
+   * events in. While it is set, every request except the import-status probe
+   * gets 503 `import_in_progress`, `alarm()` holds the embedding and
+   * transcription work, and WebSocket messages close the socket. Nothing can
+   * read a half-imported vault, write into it, wipe it again or destroy it
+   * mid-replay. In memory only: a reset clears it, and the vault's import
+   * state record then reads "interrupted".
+   */
+  private importRun: ImportStateRecord["kind"] | null = null;
   protected env: Env;
 
   // In-memory caches of DO-storage state (a warm DO keeps these across
@@ -584,6 +641,18 @@ export class VaultDO extends DurableObject {
     if (!m) return json({ error: "Not found" }, 404);
     const vaultName = decodeURIComponent(m[1]!);
     const rest = m[2] ?? "";
+
+    // The import lock (T-318) — see `importRun`. Checked before everything,
+    // destroy included: a destroy mid-replay would be followed by the
+    // replay's next chunk of writes. Only the import-status probe passes (the
+    // console asks it whether the import landed). The caller authenticates
+    // first, so the 503 tells nothing to a stranger.
+    if (this.importRun && rest !== "/api/internal/import-status") {
+      const busyAuth = await authenticateVaultRequest(request, this.env, vaultName);
+      await request.body?.cancel().catch(() => {});
+      if ("error" in busyAuth) return busyAuth.error;
+      return importInProgressResponse();
+    }
 
     // Vault destroy (cloud#226 PR-1) — dispatched BEFORE ensureState and
     // everything else, deliberately. `handleDestroy` touches only R2 + DO
@@ -850,6 +919,7 @@ export class VaultDO extends DurableObject {
       if (apiPath === "/internal/snapshots") return this.handleListSnapshots(request, vaultName);
       if (apiPath === "/internal/restore") return this.handleRestore(request, vaultName);
       if (apiPath === "/internal/import") return this.handleImport(request, vaultName);
+      if (apiPath === "/internal/import-status") return this.handleImportStatus(request);
       return json({ error: "Not found" }, 404);
     }
 
@@ -1483,7 +1553,14 @@ export class VaultDO extends DurableObject {
     if (!obj) return json({ error: "Snapshot not found", error_type: "snapshot_not_found" }, 404);
     const tarBytes = new Uint8Array(await obj.arrayBuffer());
 
-    const stats = await restoreFromTar(this.store, tarBytes);
+    return this.underImportLock("restore", () => this.replayRestore(vaultName, source, key, tarBytes));
+  }
+
+  /** The restore replay proper, under the import lock (see {@link underImportLock}). */
+  private async replayRestore(vaultName: string, source: string, key: string, tarBytes: Uint8Array): Promise<Response> {
+    // Chunked like the import door (T-318): a big snapshot hit the same ~30 s
+    // storage-transaction reset.
+    const stats = await restoreFromTar(this.store, tarBytes, { checkpoint: this.replayCheckpoint });
     // Like import: the blow-away wiped the fresh target's welcome seed +
     // DEFAULT_VAULT_DESCRIPTION, and this vault now carries a snapshot's worth of
     // real content — so the connected AI should LEARN it, not re-seed. Flip the
@@ -1494,6 +1571,7 @@ export class VaultDO extends DurableObject {
       `[restore ${vaultName}] from=${key} notes_created=${stats.notes_created} notes_wiped=${stats.notes_wiped} ` +
         `schemas=${stats.schemas_restored} links=${stats.links_restored} attachments_referenced=${stats.attachments_restored}`,
     );
+    await this.putImportState({ kind: "restore", state: "done", notes: stats.notes_created });
     return json({
       restored: true,
       source_vault: source,
@@ -1553,9 +1631,95 @@ export class VaultDO extends DurableObject {
     }
     if (tarBytes.byteLength === 0) return json({ error: "Empty import body", error_type: "import_empty" }, 400);
 
+    // The console's attempt id: opaque, bounded, recorded with the state.
+    const importId = (request.headers.get("x-parachute-import-id") ?? "").slice(0, 100) || undefined;
+    return this.underImportLock("import", () => this.replayImport(vaultName, tarBytes), importId);
+  }
+
+  /**
+   * Run one import or restore replay under the import lock (T-318; see
+   * `importRun`), recording its progress in {@link IMPORT_STATE_KEY}. A second
+   * replay while one runs gets 503 `import_in_progress` (the fetch gate
+   * refuses most; this catches two that passed it before either took the
+   * lock). The lock covers the whole request — the R2 writes of attachment
+   * binaries and the config write too — and is released however it ends.
+   * `replay` records "done" itself; a 4xx it returns or anything it throws
+   * records "failed".
+   */
+  private async underImportLock(
+    kind: ImportStateRecord["kind"],
+    replay: () => Promise<Response>,
+    importId?: string,
+  ): Promise<Response> {
+    if (this.importRun) return importInProgressResponse();
+    this.importRun = kind;
+    this.importStartedAt = new Date().toISOString();
+    this.importId = importId;
+    try {
+      await this.putImportState({ kind, state: "running" });
+      const res = await replay();
+      if (!res.ok) await this.putImportState({ kind, state: "failed", error_type: `status_${res.status}` });
+      return res;
+    } catch (err) {
+      await this.putImportState({ kind, state: "failed", error_type: "exception" }).catch(() => {});
+      throw err;
+    } finally {
+      this.importRun = null;
+    }
+  }
+
+  /** TEST-ONLY: see {@link __setTestImportCheckpoint}. Undefined on every deployed path. */
+  private testImportCheckpoint?: () => Promise<void>;
+
+  /** The checkpoint a replay awaits: the real yield, then the test hook if one is set. */
+  private replayCheckpoint = async (): Promise<void> => {
+    await importCheckpoint();
+    if (this.testImportCheckpoint) await this.testImportCheckpoint();
+  };
+
+  /** Start time and console attempt id of the current (or last) replay in this instance. */
+  private importStartedAt = "";
+  private importId: string | undefined;
+
+  private async putImportState(rec: Omit<ImportStateRecord, "started_at" | "finished_at">): Promise<void> {
+    const full: ImportStateRecord = {
+      ...rec,
+      ...(this.importId ? { import_id: this.importId } : {}),
+      started_at: this.importStartedAt,
+      ...(rec.state === "running" ? {} : { finished_at: new Date().toISOString() }),
+    };
+    await this.ctx.storage.put(IMPORT_STATE_KEY, full);
+  }
+
+  /**
+   * GET /api/internal/import-status — did the last import or restore land?
+   * The console asks when its import request came back as an error (the
+   * object can be reset after the replay committed, before it answered).
+   * `running` while the lock is held; `interrupted` for a record left
+   * "running" by an instance that no longer exists; `none` before any
+   * import. Counts only.
+   */
+  private async handleImportStatus(request: Request): Promise<Response> {
+    if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+    const rec = (await this.ctx.storage.get<ImportStateRecord>(IMPORT_STATE_KEY)) ?? null;
+    if (this.importRun) {
+      return json({
+        state: "running",
+        kind: this.importRun,
+        ...(this.importId ? { import_id: this.importId } : {}),
+        started_at: this.importStartedAt,
+      });
+    }
+    if (!rec) return json({ state: "none" });
+    if (rec.state === "running") return json({ ...rec, state: "interrupted" });
+    return json(rec);
+  }
+
+  /** The import replay proper, under the import lock (see {@link underImportLock}). */
+  private async replayImport(vaultName: string, tarBytes: Uint8Array): Promise<Response> {
     let result;
     try {
-      result = await importFromTar(this.store, tarBytes);
+      result = await importFromTar(this.store, tarBytes, { checkpoint: this.replayCheckpoint });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[import ${vaultName}] rejected: ${msg}`);
@@ -1613,6 +1777,12 @@ export class VaultDO extends DurableObject {
         `schemas=${stats.schemas_restored} links=${stats.links_restored} attachment_rows=${stats.attachments_restored} ` +
         `attachments_written=${attachmentsWritten} attachment_bytes=${attachmentBytes} skipped_attachments=${skippedAttachments}`,
     );
+    await this.putImportState({
+      kind: "import",
+      state: "done",
+      notes: stats.notes_created,
+      skipped_attachments: skippedAttachments,
+    });
     return json({
       imported: true,
       /** Convenience top-level count for the identity worker's redirect. */
@@ -2010,6 +2180,11 @@ export class VaultDO extends DurableObject {
     // warm fast-path never re-arming: see the field doc on `destroyed` for
     // why this can't be left to fall out of other code incidentally.
     if (this.destroyed) return;
+    if (this.importRun) {
+      // Import lock (T-318): the client reconnects once the import is done.
+      this.closeWs(ws, WS_CLOSE.UNAVAILABLE, "vault importing, reconnect later");
+      return;
+    }
     const vaultName = await this.ensureStateForWake();
     if (!vaultName) {
       this.closeWs(ws, WS_CLOSE.PROTOCOL, "vault not initialized");
@@ -2462,6 +2637,13 @@ export class VaultDO extends DurableObject {
     // both read `transcribe_status: "pending"` before either wrote back,
     // double-metering the same audio.
     if (this.alarmRunning) return;
+    // Import lock (T-318): the embedding drain used to run in the import's
+    // yields, over a half-imported vault, and pushed the object past its
+    // memory limit. Look again later; the import's own note hooks re-arm too.
+    if (this.importRun) {
+      await this.ctx.storage.setAlarm(Date.now() + IMPORT_ALARM_HOLD_MS);
+      return;
+    }
     this.alarmRunning = true;
     try {
       // The alarm has no request → recover the vault name from persisted config.
@@ -2723,14 +2905,18 @@ export class VaultDO extends DurableObject {
       return { kind: "partial", more };
     }
 
-    // Sub-batch the FLATTENED chunk list at EMBED_MAX_TEXTS_PER_CALL — this
-    // is what makes an oversized single provider.embed() call structurally
-    // impossible regardless of how many chunks this wake's notes produced.
+    // Sub-batch the FLATTENED chunk list at EMBED_MAX_TEXTS_PER_CALL texts AND
+    // a total-size budget, each text capped, and split a call the model still
+    // rejects as too long (embedding/batches.ts, T-318). Count alone let 90
+    // long chunks pass bge-m3's 60,000-token window; the same call then
+    // failed on every wake, forever.
     let anyFailure = false;
-    for (let i = 0; i < toEmbed.length; i += EMBED_MAX_TEXTS_PER_CALL) {
-      const slice = toEmbed.slice(i, i + EMBED_MAX_TEXTS_PER_CALL);
+    for (const indexes of planEmbedBatches(toEmbed.map((t) => t.chunk.text), EMBED_MAX_TEXTS_PER_CALL)) {
+      const slice = indexes.map((i) => toEmbed[i]!);
       try {
-        const { vectors } = await provider.embed({ texts: slice.map((t) => t.chunk.text) });
+        // The vector may stand for a capped text; the hash below is the whole
+        // chunk's, so the chunk reads as fresh and is not re-sent.
+        const vectors = await embedSplitting(provider, slice.map((t) => capEmbedText(t.chunk.text)));
         for (let j = 0; j < slice.length; j++) {
           const vector = vectors[j];
           if (!vector) continue; // defensive: provider returned fewer vectors than requested
@@ -3059,6 +3245,15 @@ export class VaultDO extends DurableObject {
    */
   __setTestEmbeddingProvider(provider: EmbeddingProvider): void {
     this.testEmbeddingProvider = provider;
+  }
+
+  /**
+   * TEST RPC (T-318): awaited after each real import checkpoint, so a test
+   * can hold an import open mid-replay and probe the lock. Set via
+   * `runInDurableObject` in the vitest suite; never called on a deployed path.
+   */
+  __setTestImportCheckpoint(hook: (() => Promise<void>) | undefined): void {
+    this.testImportCheckpoint = hook;
   }
 
   /** TEST RPC: force the embedding backfill-complete flag back to unknown/
