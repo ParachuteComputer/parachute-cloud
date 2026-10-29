@@ -45,6 +45,7 @@ import {
   deps,
   makePkce,
   mintInitialPair,
+  passwordSignup,
   refreshAt,
   seedApprovedClient,
   seedSession,
@@ -80,11 +81,22 @@ function post(path: string, fields: Record<string, string>, cookie: string): Req
   });
 }
 
-async function signup(email: string, password: string): Promise<Response> {
+/** The bare POST /signup — since T-318 night it only emails a link. */
+async function signupPost(email: string, password: string): Promise<Response> {
   return app.fetch(
     post("/signup", { __csrf: CSRF, email, password }, `parachute_id_csrf=${CSRF}`),
     env,
   );
+}
+
+/** The whole password sign-up: POST /signup, then the emailed link in the same browser. */
+async function signup(email: string, password: string): Promise<Response> {
+  return passwordSignup(app, email, password);
+}
+
+async function magicLinkCount(email: string): Promise<number> {
+  const r = await env.DB.prepare("SELECT COUNT(*) AS n FROM magic_links WHERE email = ?").bind(email).first<{ n: number }>();
+  return r?.n ?? 0;
 }
 
 // --- ownership: token-endpoint gate ---------------------------------------
@@ -401,15 +413,24 @@ describe("console — signup", () => {
     expect(getSetCookies(res).some((c) => c.startsWith("parachute_id_csrf="))).toBe(true);
   });
 
-  test("headless/dev creation still works: GET /signup for the CSRF cookie, then POST /signup", async () => {
+  test("headless/dev creation still works: GET /signup for the CSRF cookie, POST /signup, then the emailed link", async () => {
     const csrfRes = await app.fetch(new Request(`${ISSUER}/signup`), env);
     const csrf = setCookieVal(csrfRes, "parachute_id_csrf")!;
     const res = await app.fetch(
       post("/signup", { __csrf: csrf, email: "headless@example.com", password: "longenough1" }, `parachute_id_csrf=${csrf}`),
       env,
     );
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/console");
+    // No account yet: only the link + code went out.
+    expect(res.status).toBe(200);
+    expect(await getUserByEmail(env.DB, "headless@example.com")).toBeNull();
+    const verify = await app.fetch(
+      new Request(res.headers.get("x-parachute-dev-magic-link")!, {
+        headers: { cookie: `parachute_id_signup=${setCookieVal(res, "parachute_id_signup")}` },
+      }),
+      env,
+    );
+    expect(verify.status).toBe(302);
+    expect(verify.headers.get("location")).toBe("/console");
     expect(await getUserByEmail(env.DB, "headless@example.com")).not.toBeNull();
   });
 
@@ -438,31 +459,36 @@ describe("console — signup", () => {
   });
 
   test("signup rejects a bad email, a short password, and a duplicate", async () => {
-    const badEmail = await signup("not-an-email", "longenough1");
+    const badEmail = await signupPost("not-an-email", "longenough1");
     expect(badEmail.status).toBe(200);
     expect(await badEmail.text()).toContain("valid email");
 
-    const shortPw = await signup("shorty@example.com", "abc");
+    const shortPw = await signupPost("shorty@example.com", "abc");
     expect(shortPw.status).toBe(200);
     expect(await shortPw.text()).toContain("at least 8");
     expect(await getUserByEmail(env.DB, "shorty@example.com")).toBeNull();
 
+    // A taken address gets the same neutral page as a new one (T-318 night:
+    // "already exists" told anyone which addresses have accounts).
     await signup("dupe@example.com", "longenough1");
-    const dupe = await signup("dupe@example.com", "longenough1");
+    const dupe = await signupPost("dupe@example.com", "longenough1");
     expect(dupe.status).toBe(200);
-    expect(await dupe.text()).toContain("already exists");
+    const dupeHtml = await dupe.text();
+    expect(dupeHtml).toContain("Check your email");
+    expect(dupeHtml).not.toContain("already exists");
   });
 
   // A-1 (migration 0023): the tombstoned row still resolves by email (nothing
   // filters getUserByEmail), so the ordinary collision path already degrades
   // neutrally — no route change needed. Pins that: no 500, no second row.
-  test("signup against a DELETED account's email degrades to the same collision message — never a 500, never a second row", async () => {
+  test("signup against a DELETED account's email gets the neutral page — never a 500, never a second row, no link", async () => {
     const { id } = await seedUser("del-signup@example.com", "longenough1");
     await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(new Date().toISOString(), id).run();
 
-    const res = await signup("del-signup@example.com", "anotherpassword1");
+    const res = await signupPost("del-signup@example.com", "anotherpassword1");
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain("already exists");
+    expect(await res.text()).toContain("Check your email");
+    expect(await magicLinkCount("del-signup@example.com")).toBe(0);
     const rows = await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE email = ?")
       .bind("del-signup@example.com")
       .first<{ n: number }>();
@@ -480,6 +506,7 @@ describe("console — signup", () => {
     );
     expect(res.status).toBe(200);
     expect(await getUserByEmail(env.DB, "nocsrf@example.com")).toBeNull();
+    expect(await magicLinkCount("nocsrf@example.com")).toBe(0);
   });
 
   test("signup from a foreign Origin is refused (same-origin gate)", async () => {
@@ -493,6 +520,7 @@ describe("console — signup", () => {
     );
     expect(res.status).toBe(200);
     expect(await getUserByEmail(env.DB, "foreign@example.com")).toBeNull();
+    expect(await magicLinkCount("foreign@example.com")).toBe(0);
   });
 });
 

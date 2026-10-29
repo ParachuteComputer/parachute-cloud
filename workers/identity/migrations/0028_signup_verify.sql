@@ -1,0 +1,29 @@
+-- 0028: password sign-up proves the address first (T-318 night, audit §5).
+--
+-- Before this, POST /signup created the users row and a session at once, for
+-- any address. Now it only mints an ordinary magic link (+ code) for the
+-- address; the account is created when that link or code is used, exactly
+-- like a magic-link sign-up. The password the person chose rides the link
+-- row until then:
+--   pending_password_hash — the PBKDF2 verifier of the chosen password (same
+--                           format as users.password_hash; never the raw
+--                           password). NULLed as soon as the row is consumed,
+--                           and the hourly purge drops the row after a week.
+--   signup_binding_hash   — sha256 of a random nonce held in the requesting
+--                           browser's `parachute_id_signup` cookie. The
+--                           password is applied ONLY when the link or code is
+--                           used with that cookie present, so a stranger who
+--                           signs up with someone else's address can never
+--                           leave the real owner holding a password the
+--                           stranger knows.
+-- Both are NULL on every existing row and on every plain magic link, which
+-- keeps the old behaviour (passwordless account on first verify).
+--
+-- No users backfill. `users.email_verified` (0004) already says whether an
+-- address was proven. Accounts made by the old password sign-up stay
+-- email_verified = 0, which is true: nobody proved the address. They keep
+-- signing in with their password. The first time someone proves the address
+-- by link or code, credentials set before the proof (password, 2FA, sessions,
+-- tokens, standing consent) are dropped (auth-handlers.ts claimUnverifiedAccount).
+ALTER TABLE magic_links ADD COLUMN pending_password_hash TEXT;
+ALTER TABLE magic_links ADD COLUMN signup_binding_hash TEXT;

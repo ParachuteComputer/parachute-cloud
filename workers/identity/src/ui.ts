@@ -724,7 +724,7 @@ export function renderSignup(opts: {
            <input id="pw-email" name="email" type="email" autocomplete="username" value="${esc(email ?? "")}" required>
            <label for="password">Password</label>
            <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
-           <p class="muted" style="margin:.35rem 0 0">At least 8 characters.</p>
+           <p class="muted" style="margin:.35rem 0 0">At least 8 characters. We'll email you a link to confirm the address first.</p>
            ${showPassword && error ? `<div class="err">${esc(error)}</div>` : ""}
            <button class="secondary" type="submit">Create account with a password</button>
          </form>
@@ -773,7 +773,7 @@ export function renderConsoleLogin(opts: {
            <input id="su-email" name="email" type="email" autocomplete="username" required>
            <label for="su-password">Password</label>
            <input id="su-password" name="password" type="password" autocomplete="new-password" minlength="8" required>
-           <p class="muted" style="margin:.35rem 0 0">At least 8 characters.</p>
+           <p class="muted" style="margin:.35rem 0 0">At least 8 characters. We'll email you a link to confirm the address first.</p>
            <button class="secondary" type="submit">Create account with a password</button>
          </form>
        </details>
@@ -782,14 +782,23 @@ export function renderConsoleLogin(opts: {
   );
 }
 
-/** "Check your email" — the neutral response to a magic-link request (no enumeration). */
-export function renderMagicSent(opts: { email: string; csrfToken: string }): string {
+/**
+ * "Check your email" — the neutral response to a magic-link request (no
+ * enumeration). `signup` is the password sign-up's variant (POST /signup): the
+ * same page whether or not the address already has an account, so its copy
+ * covers both and never says which.
+ */
+export function renderMagicSent(opts: { email: string; csrfToken: string; signup?: boolean }): string {
+  const lead = opts.signup
+    ? `<p>We sent a link to <strong>${esc(opts.email)}</strong>. Open it to confirm the address is yours. Your account is created only then. If the address already has an account, the link signs you in and nothing about it changes.</p>
+       <p class="muted" data-testid="signup-same-browser">Open the link in this browser to keep the password you chose. Opened anywhere else, it still signs you in, and you can set a password later under Security. The link works once and expires in 10 minutes.</p>`
+    : `<p>If <strong>${esc(opts.email)}</strong> has (or can have) a Parachute account, a sign-in link is on its way.</p>
+       <p class="muted">The link works once and expires in 10 minutes. You can close this tab — open the link from your email to continue.</p>`;
   return page(
     "Check your email — Parachute",
     `<h1>Check your email</h1>
      <div class="card">
-       <p>If <strong>${esc(opts.email)}</strong> has (or can have) a Parachute account, a sign-in link is on its way.</p>
-       <p class="muted">The link works once and expires in 10 minutes. You can close this tab — open the link from your email to continue.</p>
+       ${lead}
        <details open>
          <summary>Have the code instead?</summary>
          <p class="muted" style="margin:.35rem 0 .5rem">Click the link in the email — or type the 6-digit code from it here.</p>

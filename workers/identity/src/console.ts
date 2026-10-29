@@ -5,9 +5,10 @@
  * Routes (all pure `(db, req, deps)` like the OAuth handlers):
  *   GET  /signup             302 to the `my.`/`app.` front door (auth
  *                            redesign §1 — no longer a destination); still
- *                            mints the CSRF cookie so headless/dev creation
- *                            (a bare POST /signup) keeps working unadvertised
- *   POST /signup             create user + session → /console
+ *                            mints the CSRF cookie for POST /signup
+ *   POST /signup             password sign-up: email the magic link + code;
+ *                            the account is created when it is used (T-318
+ *                            night — never before the address is proven)
  *   GET  /login              console sign-in form
  *   POST /login              verify + session → /console
  *   POST /logout             clear session → /login, or an optional
@@ -43,6 +44,7 @@ import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { MAX_IMPORT_BYTES, MAX_IMPORT_MIB } from "./import-limit.ts";
 export { MAX_IMPORT_BYTES, MAX_IMPORT_MIB };
 import {
+  checkAndBumpMagic,
   checkAndBumpSignup,
   clearLoginFailures,
   clientIp,
@@ -57,9 +59,11 @@ import {
   parseSessionCookie,
 } from "./sessions.ts";
 import { sessionUser } from "./session-user.ts";
-import { finishPrimaryAuth, safeNext } from "./auth-handlers.ts";
-import { EMAIL_RE, PASSWORD_MIN } from "./validation.ts";
-import { createUser, getUserByEmail, needsRehash, setPassword, verifyPassword, type User } from "./users.ts";
+import { finishPrimaryAuth, safeNext, sendSignInLink } from "./auth-handlers.ts";
+import type { EmailSender } from "./email.ts";
+import { buildSignupBindingCookie, signupBindingFor } from "./signup-binding.ts";
+import { EMAIL_RE, PASSWORD_MIN, normalizeEmail } from "./validation.ts";
+import { getUserByEmail, hashPassword, needsRehash, setPassword, verifyPassword, type User } from "./users.ts";
 import {
   VaultNameInvalidError,
   VaultNameTakenError,
@@ -111,6 +115,7 @@ import {
   type FirstRunValues,
   renderConsole,
   renderConsoleLogin,
+  renderMagicSent,
   renderRedirectBridge,
   renderSignup,
 } from "./ui.ts";
@@ -153,42 +158,73 @@ function appDeepLinkRedirect(url: string, deps: OAuthDeps, status = 302): Respon
  * Auth redesign §1 ("one advertised door"): `/signup` is no longer a
  * destination — visiting it 302s to the `my.`/`app.` front door, where
  * arrival is the SPA's one email-field Landing screen. The CSRF cookie is
- * STILL minted here (unchanged from the old render path): headless/dev
- * password-first creation stays reachable, unadvertised, via a bare
- * `POST /signup` using the cookie this GET sets — `handleSignupPost` itself
- * is untouched, so smoke-staging's "GET for CSRF, then POST" callers keep
- * working with zero script changes. The human-facing password-creation form
- * moved to `/login`'s "Use a password instead" disclosure (ui.ts
- * `renderConsoleLogin`), which still posts to this same unchanged endpoint.
+ * STILL minted here: the password-first sign-up form (`/login`'s "Use a
+ * password instead" disclosure, ui.ts `renderConsoleLogin`) and headless
+ * callers (smoke-staging) post to `POST /signup` with it.
  */
 export function handleSignupGet(req: Request, deps: OAuthDeps): Response {
   const csrf = ensureCsrfToken(req);
   return redirectResponse(`${frontDoorOrigin(deps)}/`, csrfExtra(csrf.setCookie));
 }
 
-export async function handleSignupPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+/**
+ * Password sign-up. It does NOT create an account (T-318 night, audit §5:
+ * this used to create the row + a session for any address, unproven). It
+ * sends the ordinary magic link + code for the address, through the same
+ * send path as `/auth/magic`, and answers with the same neutral "check your
+ * email" page whatever the address's state:
+ *   - new address: the link row carries the chosen password's verifier and
+ *     the hash of a nonce in this browser's `parachute_id_signup` cookie. The
+ *     account is created on verify, verified, with that password only if the
+ *     link or code is used in this same browser (signup-binding.ts) — so a
+ *     stranger's sign-up can't hand the real owner a password the stranger
+ *     knows.
+ *   - existing account: a plain sign-in link; its password is never touched.
+ *     The old "An account with that email already exists." is gone: it told
+ *     anyone whether an address had an account, which /auth/magic never does.
+ *   - suspended / deleted: nothing minted or sent (as /auth/magic).
+ * The response shape (status, headers, cookies, timing-relevant work: the
+ * password is hashed in every case) is the same for all three.
+ */
+export async function handleSignupPost(db: D1Database, req: Request, deps: OAuthDeps, sender: EmailSender): Promise<Response> {
   const form = await req.formData();
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
     return signupError(req, "Your session expired. Please try again.", "", deps);
   }
-  const email = String(form.get("email") ?? "").trim();
+  const email = normalizeEmail(String(form.get("email") ?? ""));
   const password = String(form.get("password") ?? "");
   if (!EMAIL_RE.test(email)) return signupError(req, "Enter a valid email address.", email, deps);
   if (password.length < PASSWORD_MIN) return signupError(req, `Password must be at least ${PASSWORD_MIN} characters.`, email, deps);
 
+  const now = deps.now?.() ?? new Date();
   // DO-backed abuse fence, fail-open (see rate-limit.ts for the documented limits).
-  const throttle = await checkAndBumpSignup(deps.rateLimiter, clientIp(req), deps.now?.() ?? new Date());
+  const throttle = await checkAndBumpSignup(deps.rateLimiter, clientIp(req), now);
   if (!throttle.allowed) {
     return signupError(req, "Too many signups from this network. Try again later.", email, deps);
   }
 
-  if (await getUserByEmail(db, email)) {
-    return signupError(req, "An account with that email already exists.", email, deps);
+  const passwordHash = await hashPassword(password);
+  const binding = await signupBindingFor(req);
+  const headers: Record<string, string> = { "set-cookie": buildSignupBindingCookie(binding.nonce) };
+  // The same per-(ip,email) send fence as /auth/magic: over it, the same page
+  // and nothing sent, so /signup can't bomb an inbox either.
+  if ((await checkAndBumpMagic(deps.rateLimiter, clientIp(req), email, now)).allowed) {
+    const existing = await getUserByEmail(db, email);
+    if (!existing?.suspendedAt && !existing?.deletedAt) {
+      Object.assign(
+        headers,
+        await sendSignInLink(db, req, deps, sender, {
+          email,
+          existing,
+          next: null,
+          now,
+          pending: { passwordHash, bindingHash: binding.hash },
+        }),
+      );
+    }
   }
-  const user = await createUser(db, email, password, deps.now?.() ?? new Date(), { billingMode: billingModeOf(deps) });
-  // A brand-new user has no 2FA, so this mints a session directly; funnel through
-  // the shared fork anyway for one primary-auth path.
-  return finishPrimaryAuth(db, deps, user.id, "/console");
+  const csrfToken = ensureCsrfToken(req).token;
+  return htmlResponse(renderMagicSent({ email, csrfToken, signup: true }), 200, headers);
 }
 
 function signupError(req: Request, message: string, email: string, deps: OAuthDeps): Response {

@@ -56,6 +56,7 @@ import {
   decodeJwtPayload,
   deps,
   mintInitialPair,
+  passwordSignup,
   seedApprovedClient,
   seedSession,
   seedUser,
@@ -280,10 +281,7 @@ describe("plan defaults — signup starts the three-months-free trial", () => {
   });
 
   test("a fresh signup lands on plan 'trial' with pending_plan='expired' + a ~90d clock (NOT 30)", async () => {
-    const res = await app.fetch(
-      post("/signup", { __csrf: CSRF, email: "trialstart@example.com", password: "longenough1" }, `parachute_id_csrf=${CSRF}`),
-      env,
-    );
+    const res = await passwordSignup(app, "trialstart@example.com", "longenough1");
     expect(res.status).toBe(302);
     const row = await env.DB.prepare("SELECT plan, pending_plan, plan_downgrade_at FROM users WHERE email = ?")
       .bind("trialstart@example.com")
