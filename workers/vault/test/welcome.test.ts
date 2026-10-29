@@ -67,8 +67,11 @@ describe("default seed — a new vault's first materialization", () => {
     expect(welcome.content).toContain("This vault is yours.");
     expect(welcome.content).toContain(`[[${CAPTURE_ANYTHING_PATH}]]`);
     const connect = notes.find((n) => n.path === CONNECT_AI_PATH)!;
-    // The console origin is the deploy's ISSUER_ORIGIN (test env: TEST config).
-    expect(connect.content).toContain(env.ISSUER_ORIGIN);
+    // The note sends a person to the front door they use (my. in production),
+    // CONSOLE_PUBLIC_ORIGIN, not the OAuth issuer host (T-318 night audit:
+    // newcomers were sent to cloud.parachute.computer).
+    expect(connect.content).toContain(env.CONSOLE_PUBLIC_ORIGIN);
+    expect(connect.content).not.toContain(env.ISSUER_ORIGIN);
     // Connect-your-AI points the human at the AI-facing Getting Started guide.
     expect(connect.content).toContain(`[[${GETTING_STARTED_PATH}]]`);
     const gettingStarted = notes.find((n) => n.path === GETTING_STARTED_PATH)!;
@@ -90,7 +93,7 @@ describe("default seed — a new vault's first materialization", () => {
     // (T-318 / DESIGN-0.9 §8b: `#capture` is opt-in in the Notes app, which
     // declares it lazily on first use). Assert the core side still declares
     // it, so this test notices if core changes underneath the filter.
-    const declaredTags = welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string }).tags;
+    const declaredTags = welcomePack({ consoleOrigin: env.CONSOLE_PUBLIC_ORIGIN as string }).tags;
     expect(declaredTags.map((d) => d.name)).toEqual(
       expect.arrayContaining(NOTES_REQUIRED_TAGS.map((d) => d.name)),
     );
@@ -118,7 +121,7 @@ describe("default seed — a new vault's first materialization", () => {
     const v = freshVault("w");
     const notes = await listNotes(v);
     const expected = [
-      ...withCloudGuideText(welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string })).notes,
+      ...withCloudGuideText(welcomePack({ consoleOrigin: env.CONSOLE_PUBLIC_ORIGIN as string })).notes,
       ...withCloudGuideText(GETTING_STARTED_PACK).notes,
     ];
     expect(expected).toHaveLength(6);
@@ -295,7 +298,7 @@ describe("the seeded guides tell the truth about #capture", () => {
   });
 
   it("every cloud correction still matches core's text (a core bump that fixes it upstream trips this)", () => {
-    const core = [...welcomePack({ consoleOrigin: env.ISSUER_ORIGIN as string }).notes, ...GETTING_STARTED_PACK.notes];
+    const core = [...welcomePack({ consoleOrigin: env.CONSOLE_PUBLIC_ORIGIN as string }).notes, ...GETTING_STARTED_PACK.notes];
     expect(CLOUD_GUIDE_EDITS.length).toBeGreaterThan(0);
     for (const edit of CLOUD_GUIDE_EDITS) {
       const note = core.find((n) => n.path === edit.path);
