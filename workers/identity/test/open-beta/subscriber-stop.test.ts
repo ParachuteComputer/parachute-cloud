@@ -212,6 +212,71 @@ describe("stopping a paying subscriber lands them on the open beta", () => {
     expect(pushes).toHaveLength(1); // no second, smaller push
   });
 
+  test("an update that read the row as paid can't overwrite a deletion that landed meanwhile (Codex P2)", async () => {
+    const id = await seedSubscriber("stop-race@example.com", "power", "sub_stop_race");
+    // A DB whose first write to the users row is preceded by the deletion's
+    // landing, as if subscription.deleted ran between the update's read and write.
+    let fired = false;
+    const land = () =>
+      env.DB.prepare("UPDATE users SET plan = 'trial', pending_plan = 'power', plan_downgrade_at = NULL WHERE id = ?").bind(id).run();
+    const racingDb = new Proxy(env.DB, {
+      get(target, prop, receiver) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            const st = target.prepare(sql);
+            if (fired || !/^\s*UPDATE users SET/.test(sql)) return st;
+            return new Proxy(st, {
+              get(t, p2) {
+                if (p2 !== "bind") return Reflect.get(t, p2).bind(t);
+                return (...args: unknown[]) => {
+                  const bound = t.bind(...args);
+                  return new Proxy(bound, {
+                    get(b, p3) {
+                      const v = Reflect.get(b, p3);
+                      if (p3 !== "run" || fired) return typeof v === "function" ? v.bind(b) : v;
+                      return async () => {
+                        fired = true;
+                        await land();
+                        return b.run();
+                      };
+                    },
+                  });
+                };
+              },
+            });
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    const periodEnd = Math.floor((Date.now() + 30 * DAY) / 1000);
+    const payload = JSON.stringify({
+      id: `evt_stop_race_${Date.now()}`,
+      object: "event",
+      type: "customer.subscription.updated",
+      api_version: "2026-04-22.dahlia",
+      created: Math.floor(Date.now() / 1000),
+      livemode: false,
+      pending_webhooks: 0,
+      request: { id: null, idempotency_key: null },
+      data: { object: subscription({ id: "sub_stop_race", price: PRICE.powerYearly, periodEndSec: periodEnd, cancelAtPeriodEnd: true }) },
+    });
+    const res = await app.fetch(
+      new Request(`${ISSUER}/billing/webhook`, {
+        method: "POST",
+        body: payload,
+        headers: { "stripe-signature": await sign(payload), "content-type": "application/json" },
+      }),
+      { ...STRIPE_ENV, DB: racingDb },
+    );
+    expect(res.status).toBe(200);
+    expect(fired).toBe(true);
+    const after = (await getUserById(env.DB, id))!;
+    expect(after.plan).toBe("trial");
+    expect(after.pendingPlan).toBe("power"); // the Power marker survives
+  });
+
   test("cancel immediately, mid-period (Standard monthly): open beta NOW, writes on, no cliff date, no billing door", async () => {
     const id = await seedSubscriber("stop-standard@example.com", "standard", "sub_stop_std");
     await seedVault("stop-standard-box", id);

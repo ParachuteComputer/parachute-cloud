@@ -64,7 +64,7 @@
 import type Stripe from "stripe";
 import { type OAuthDeps, billingModeOf } from "./oauth-shared.ts";
 import { PAID_TIERS, type PaidTier, type PlanId, coercePlanId, isPaidTier, livePlan, openBetaLandingPending } from "./plans.ts";
-import { type User, getUserById, getUserByStripeCustomerId, getUserByStripeSubscriptionId, setUserPlan } from "./users.ts";
+import { type User, getUserById, getUserByStripeCustomerId, getUserByStripeSubscriptionId } from "./users.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 import { BILLING_INTERVALS, type BillingConfig } from "./billing-config.ts";
 
@@ -541,9 +541,20 @@ export async function handleSubscriptionUpdated(
   const newPlan = planForPrice(priceId, config) ?? (isPaidTier(metaTier) ? metaTier : null);
   if (!newPlan) return { ok: true, userId: user.id, action: "subscription_updated_unknown_price" };
 
+  // Every write below is conditional on the row still being what was read
+  // (plan + pending_plan): a subscription.deleted that lands meanwhile (open
+  // beta: plan 'trial', the Power marker kept) must win, never be overwritten
+  // by an update that read the row while it was still paid (Codex P2).
+  const unchanged = "id = ? AND plan = ? AND pending_plan IS ?";
+  const whereArgs = [user.id, user.plan, user.pendingPlan] as const;
+  const raced: LifecycleResult = { ok: true, userId: user.id, action: "subscription_updated_raced" };
+
   if (newPlan !== user.plan) {
-    await setUserPlan(db, user.id, newPlan);
-    await db.prepare("UPDATE users SET pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?").bind(user.id).run();
+    const write = await db
+      .prepare(`UPDATE users SET plan = ?, pending_plan = NULL, plan_downgrade_at = NULL WHERE ${unchanged}`)
+      .bind(newPlan, ...whereArgs)
+      .run();
+    if ((write.meta.changes ?? 0) === 0) return raced;
     // cloud#234: D1 records the plan change; the DO push waits for undo if
     // the owner is tombstoned. (`handleSubscriptionDeleted` only pushes in
     // open beta, and gates the same way there.)
@@ -558,14 +569,19 @@ export async function handleSubscriptionUpdated(
 
   if (subscription.cancel_at_period_end === true) {
     if (user.pendingPlan !== "expired") {
-      await db.prepare("UPDATE users SET pending_plan = 'expired' WHERE id = ?").bind(user.id).run();
+      const write = await db.prepare(`UPDATE users SET pending_plan = 'expired' WHERE ${unchanged}`).bind(...whereArgs).run();
+      if ((write.meta.changes ?? 0) === 0) return raced;
       console.log(`event=billing_cancel_scheduled user=${user.id}`);
     }
     return { ok: true, userId: user.id, action: "subscription_updated_cancel_scheduled" };
   }
 
   if (user.pendingPlan) {
-    await db.prepare("UPDATE users SET pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?").bind(user.id).run();
+    const write = await db
+      .prepare(`UPDATE users SET pending_plan = NULL, plan_downgrade_at = NULL WHERE ${unchanged}`)
+      .bind(...whereArgs)
+      .run();
+    if ((write.meta.changes ?? 0) === 0) return raced;
     return { ok: true, userId: user.id, action: "subscription_updated_pending_cleared" };
   }
   return { ok: true, userId: user.id, action: "subscription_updated_no_change" };
