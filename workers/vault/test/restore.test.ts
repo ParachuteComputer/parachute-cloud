@@ -17,7 +17,7 @@ import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { IMPORTED_VAULT_DESCRIPTION } from "@openparachute/core/src/seed-packs.js";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
-import { parseTar, TarImportSource } from "../src/restore.ts";
+import { parseTar, TarImportSource, UnreadableTarError } from "../src/restore.ts";
 import type { SnapshotEntry } from "../src/snapshots.ts";
 import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
 
@@ -153,6 +153,43 @@ describe("restore — end to end (snapshot → new vault → equality)", () => {
     expect(srcAgain.status).toBe(200);
   });
 
+  it("notes whose paths don't fit a ustar header snapshot and restore intact (T-318 snapfix)", async () => {
+    // Production: one vault's nightly snapshot failed every night from one
+    // note on, because toTar threw on a path it could not split into the
+    // 100-byte name + 155-byte prefix fields. One long title is enough.
+    const src = freshVault("rs");
+    const paths = [
+      "t".repeat(120), // one segment over 100 bytes, no "/" to split at
+      `Journal/${"é".repeat(60)}`, // 120-byte non-ASCII leaf under a folder
+      `${"d".repeat(160)}/leaf`, // the only split leaves a prefix over 155 bytes
+      `notes/${"w".repeat(140)}/${"x".repeat(140)}`, // over 255 bytes in all
+    ];
+    for (const [i, path] of paths.entries()) await createNote(src, { content: `long path ${i}`, path });
+    await createNote(src, { content: "short neighbour", path: "notes/short" });
+
+    const snap = await takeSnapshot(src);
+    expect(snap.notes).toBeGreaterThanOrEqual(paths.length + 1);
+
+    const dst = freshVault("rt");
+    expect((await op(dst, "")).status).toBe(200);
+    expect((await restoreInto(dst, src, snap.key)).status).toBe(200);
+    expect(await normalizedExport(dst)).toEqual(await normalizedExport(src));
+    // Each note is back under its FULL path with the same id (content gains
+    // the trailing newline every portable-md round trip adds).
+    for (const [i, path] of paths.entries()) {
+      const [a, b] = await Promise.all(
+        [src, dst].map(async (v) => {
+          const res = await op(v, `/api/notes/${encodeURIComponent(path)}`);
+          expect(res.status).toBe(200);
+          const n = (await res.json()) as { id: string; path: string; content: string };
+          return { id: n.id, path: n.path, content: n.content.trimEnd() };
+        }),
+      );
+      expect(b).toEqual(a);
+      expect(b).toMatchObject({ path, content: `long path ${i}` });
+    }
+  });
+
   it("indexed-field schemas survive restore (operator queries work in the restored vault)", async () => {
     const src = freshVault("rs");
     await seedSource(src);
@@ -274,6 +311,23 @@ describe("restore — tar plumbing (unit)", () => {
     expect(files.map((f) => f.name)).toEqual(["notes/first.md", longName]);
     expect(files[0]!.text).toContain("hello");
     expect(files[1]!.text).toBe("deep");
+  });
+
+  it("PAX path records round-trip through toTar/parseTar and apply to one entry only; bad PAX is refused", async () => {
+    const { toTar } = await import("../src/export.ts");
+    const enc = new TextEncoder();
+    const names = ["t".repeat(130), `${"é".repeat(70)}.md`, "after/short.md", `${"d".repeat(160)}/x.md`];
+    const tar = toTar(names.map((name, i) => ({ name, bytes: enc.encode(`body ${i}`) })));
+    expect(parseTar(tar)).toEqual(names.map((name, i) => ({ name, text: `body ${i}` })));
+
+    // A PAX record whose length field lies is refused, never guessed at.
+    const broken = tar.slice();
+    broken.set(enc.encode("9"), 512); // first record's "<len>" → wrong length
+    expect(() => parseTar(broken)).toThrow(UnreadableTarError);
+    // PAX global headers stay refused.
+    const global = tar.slice();
+    global[156] = 0x67;
+    expect(() => parseTar(global)).toThrow(UnreadableTarError);
   });
 
   it("TarImportSource partitions sidecar vs content and excludes dot-paths", () => {

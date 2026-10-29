@@ -72,6 +72,7 @@ import {
   pruneExportTarballs,
   streamTar,
   tarSize,
+  needsPaxPath,
   toTar,
 } from "./export.js";
 import {
@@ -1353,15 +1354,24 @@ export class VaultDO extends DurableObject {
    * D1 in one hop. Snapshots never touch the r2_bytes cap meter (no
    * meterAdd/meterSub — quota honesty, pinned by the conformance suite).
    *
-   * CONCURRENCY NOTE: the manifest read-modify-write below is NOT mutexed —
-   * DO event interleaving across awaits means two concurrent snapshot POSTs
-   * to the same vault could race it. Acceptable by topology: the only callers
-   * are the single nightly cron and the staging test trigger, and a same-
-   * millisecond collision degrades to a key overwrite + manifest replace
-   * (handled below). Add blockConcurrencyWhile before ever giving this verb
-   * a second concurrent caller.
+   * CONCURRENCY: runs are SERIALIZED per vault ({@link snapshotQueue}). The
+   * manifest read-modify-write + list-based prune spans many awaits (R2 I/O
+   * does not hold the DO's input gate), and two interleaved runs each pruned
+   * the other's new tarball and published a manifest naming a deleted one.
+   * The nightly sweep and POST /ops/snapshot-run (T-318) can overlap, so the
+   * queue is load-bearing. A queue, not blockConcurrencyWhile: the vault keeps
+   * serving reads and writes while a snapshot exports.
    */
-  private async handleSnapshot(request: Request, vaultName: string): Promise<Response> {
+  private handleSnapshot(request: Request, vaultName: string): Promise<Response> {
+    const run = this.snapshotQueue.then(() => this.takeSnapshot(request, vaultName));
+    this.snapshotQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** The tail of this instance's snapshot queue (see handleSnapshot). */
+  private snapshotQueue: Promise<unknown> = Promise.resolve();
+
+  private async takeSnapshot(request: Request, vaultName: string): Promise<Response> {
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
     let body: { retention?: unknown };
     try {
@@ -1394,6 +1404,10 @@ export class VaultDO extends DurableObject {
     await this.env.ATTACHMENTS.put(key, tar);
 
     const entry: SnapshotEntry = { key, taken_at: now.toISOString(), bytes: tar.byteLength, notes: stats.notes, ranks };
+    // How many entries needed a PAX path record (count only, never names):
+    // before T-318 any one of them failed the snapshot.
+    const longPaths = entries.filter((e) => needsPaxPath(e.name)).length;
+    if (longPaths > 0) console.log(`[snapshot ${vaultName}] long_paths=${longPaths}`);
     // Same-millisecond double snapshot overwrites one R2 key — keep the
     // manifest consistent with that (replace, never duplicate, the entry).
     manifest.snapshots = manifest.snapshots.filter((s) => s.key !== key);
@@ -1407,7 +1421,7 @@ export class VaultDO extends DurableObject {
     await saveManifest(this.env.ATTACHMENTS, manifest);
 
     if (pruned.length > 0) console.log(`[snapshot-prune ${vaultName}] deleted ${pruned.length} stale snapshot(s)`);
-    return json({ skipped: false, entry, pruned, manifest: manifest.snapshots });
+    return json({ skipped: false, entry, pruned, long_paths: longPaths, manifest: manifest.snapshots });
   }
 
   /** GET /api/internal/snapshots — the manifest (restore points), for the

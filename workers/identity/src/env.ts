@@ -135,6 +135,12 @@ export interface Env {
    */
   OPS_READ_TOKEN?: string;
   /**
+   * SECRET (`wrangler secret put OPS_RUN_TOKEN`), optional: the bearer for
+   * `POST /ops/snapshot-run` (re-run the stale vaults' backups now). Separate
+   * from OPS_READ_TOKEN because it writes. Unset → 404.
+   */
+  OPS_RUN_TOKEN?: string;
+  /**
    * 5xx responses in one 10-minute window at or above which the health cron
    * raises an `errors:5xx` alert. Optional var; default 25 (ops.ts).
    */

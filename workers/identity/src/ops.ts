@@ -178,7 +178,8 @@ export async function handleScheduled(cron: string, env: Env, sender: EmailSende
     // shape as the usage rollup.
     const sweepDeps = depsForEnv(env);
     if (deps.now) sweepDeps.now = deps.now;
-    await runSnapshotSweep(env, sweepDeps);
+    // The sender goes in so a failed vault backup pages the operator.
+    await runSnapshotSweep(env, sweepDeps, { sender, fetchFn: deps.webhookFetchFn });
   } else {
     await runHealthCheck(env, sender, deps);
   }

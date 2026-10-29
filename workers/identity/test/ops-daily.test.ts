@@ -102,6 +102,18 @@ async function seedDay(): Promise<void> {
   await setCounter(`${DAY}T12:00`, "http_5xx", 2);
   await setCounter(`${DAY}T00:00`, "health_ok", 143);
   await setCounter(`${DAY}T13:00`, "health_fail", 1);
+
+  // Backups: three vaults got last night's 04:00 snapshot; v-legacy's newest
+  // is two nights older (its sweep has been failing) → 1 stale.
+  await env.DB.prepare("UPDATE vaults SET created_at = '2026-10-01T10:00:00Z'").run();
+  for (const v of ["v-big", "v-small", "v-quiet"]) await seedSnapshot(v, `${DAY}T04:00:30Z`);
+  await seedSnapshot("v-legacy", "2026-10-25T04:00:30Z");
+}
+
+async function seedSnapshot(vault: string, takenAt: string): Promise<void> {
+  await env.DB.prepare("INSERT INTO vault_snapshots (vault_name, key, taken_at, bytes, ranks) VALUES (?, ?, ?, 1, '[\"daily\"]')")
+    .bind(vault, `vault-${vault}/snapshots/${takenAt}.tar`, takenAt)
+    .run();
 }
 
 // --- the daily line ------------------------------------------------------------
@@ -123,14 +135,14 @@ describe("daily ops line", () => {
 
     const expected =
       "parachute-cloud 2026-10-27 · users 4 (+3) · active vaults 2 · notes changed 210 · storage 1.2 GB · " +
-      "voice 34 min this month · sign-ins 25 · deletions pending 1 · alerts 0 · 5xx 2 · health ok 143/144";
+      "voice 34 min this month · sign-ins 25 · deletions pending 1 · stale backups 1 · alerts 0 · 5xx 2 · health ok 143/144";
     expect(r.day).toBe(DAY);
     expect(r.line).toBe(expected);
 
     // Stored (the /admin + JSON source of truth).
     const row = await env.DB.prepare("SELECT line, json FROM ops_daily WHERE day = ?").bind(DAY).first<{ line: string; json: string }>();
     expect(row?.line).toBe(expected);
-    expect(JSON.parse(row!.json)).toMatchObject({ users: 4, usersNew: 3, notesChanged: 210, healthOk: 143, healthRuns: 144 });
+    expect(JSON.parse(row!.json)).toMatchObject({ users: 4, usersNew: 3, notesChanged: 210, staleSnapshots: 1, healthOk: 143, healthRuns: 144 });
 
     // Logged as event=ops_daily line="…".
     expect(logs).toContain(`event=ops_daily day=${DAY} line=${JSON.stringify(expected)}`);
@@ -154,7 +166,7 @@ describe("daily ops line", () => {
     const stats = await collectDailyStats(env.DB, DAY, "staging");
     expect(renderDailyLine(stats)).toBe(
       "parachute-cloud staging 2026-10-27 · users 0 (+0) · active vaults n/a · notes changed n/a · storage n/a · " +
-        "voice n/a this month · sign-ins 0 · deletions pending 0 · alerts 0 · 5xx 0 · health ok 0/144",
+        "voice n/a this month · sign-ins 0 · deletions pending 0 · stale backups 0 · alerts 0 · 5xx 0 · health ok 0/144",
     );
   });
 

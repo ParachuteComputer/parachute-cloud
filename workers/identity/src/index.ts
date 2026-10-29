@@ -43,7 +43,7 @@ import {
   handleAdminVaultsGet,
 } from "./admin.ts";
 import { handleAdminGrowthGet } from "./admin-growth.ts";
-import { handleOpsDailyGet, runDailyLine } from "./ops-daily.ts";
+import { handleOpsDailyGet, handleOpsSnapshotRunPost, runDailyLine } from "./ops-daily.ts";
 import { bumpOpsCounter } from "./ops-counters.ts";
 import { handleAdminDeleteGet, handleAdminDeletePost } from "./admin-delete.ts";
 import { handleTestAccountDeleteReport, handleTestAccountDeleteSweep } from "./account-delete-hooks.ts";
@@ -486,6 +486,12 @@ app.post("/__test/ops-daily-run", async (c) => {
 // The daily ops lines for an operator AGENT (Uni) without a browser: bearer
 // OPS_READ_TOKEN (a secret). Unset secret → the router's plain 404.
 app.get("/ops/daily", async (c) => (await handleOpsDailyGet(c.env, c.req.raw)) ?? c.notFound());
+
+// Re-run the backups of the vaults whose backups are stale (T-318): bearer
+// OPS_RUN_TOKEN (a secret, separate from the read token). Unset → 404.
+app.post("/ops/snapshot-run", async (c) =>
+  (await handleOpsSnapshotRunPost(c.env, c.req.raw, depsFor(c.env), senderFor(c.env))) ?? c.notFound(),
+);
 
 // Staging/dev-only deletion-proof hooks (T-318, account-delete-hooks.ts) —
 // same allowlist gate as the triggers above (404 off staging|development|test,

@@ -92,42 +92,89 @@ export class UnreadableTarError extends Error {
 }
 
 /**
- * Minimal POSIX ustar decoder — regular files only (typeflag '0'/NUL), which
- * is all `toTar`/`streamTar` (export.ts) ever emit. Foreign tars with benign
+ * Minimal POSIX ustar decoder — regular files (typeflag '0'/NUL) plus the
+ * PAX long-path header below, which is all `toTar`/`streamTar` (export.ts)
+ * ever emit. Foreign tars with benign
  * other entry types (dirs, links) have those entries skipped rather than failing
  * the import. Preserves raw bytes; {@link parseTar} decodes to text on top of it.
  *
- * PAX/GNU EXTENSION records are REJECTED, not skipped: typeflag 'x'/'g' (PAX)
- * and 'L'/'K' (GNU longname/longlink) carry the real name/metadata for the
- * FOLLOWING entry out-of-band. Silently skipping the record while keeping the
- * next entry's truncated 100-byte ustar name would import notes under WRONG
- * paths. Our exports never emit these (ustar prefix-split), but bsdtar/GNU tar
- * do for long or non-ASCII paths — so we abort rather than mangle.
+ * A PAX extended header ('x') is APPLIED: its `path` (and `size`) records
+ * replace the FOLLOWING entry's ustar name (and size). export.ts emits one for
+ * any path ustar can't hold (T-318: a note title over 100 bytes), and GNU
+ * tar/bsdtar emit them for long or non-ASCII paths.
+ *
+ * The other extension records are REJECTED, not skipped: 'g' (PAX global) and
+ * 'L'/'K' (GNU longname/longlink) also carry the real name/metadata
+ * out-of-band. Silently skipping one while keeping the next entry's truncated
+ * 100-byte ustar name would import notes under WRONG paths — so we abort
+ * rather than mangle.
  */
 export function parseTarBinary(buf: Uint8Array): TarBinaryFile[] {
   const dec = new TextDecoder();
   const str = (off: number, len: number) => dec.decode(buf.subarray(off, off + len)).replace(/\0.*$/s, "");
   const out: TarBinaryFile[] = [];
+  let pax: Map<string, string> | null = null;
   let off = 0;
   while (off + BLOCK <= buf.length) {
     const header = buf.subarray(off, off + BLOCK);
     if (header.every((b) => b === 0)) break; // terminator
     const name = str(off, 100);
     const prefix = str(off + 345, 155);
-    const size = parseInt(str(off + 124, 12).trim() || "0", 8);
+    let size = parseInt(str(off + 124, 12).trim() || "0", 8);
     const typeflag = header[156];
     off += BLOCK;
-    // PAX ('x'=0x78, 'g'=0x67) / GNU long-name ('L'=0x4C) / long-link ('K'=0x4B)
+    if (typeflag === 0x78) {
+      pax = parsePaxRecords(buf.subarray(off, off + size));
+      off += Math.ceil(size / BLOCK) * BLOCK;
+      continue;
+    }
+    // PAX global ('g'=0x67) / GNU long-name ('L'=0x4C) / long-link ('K'=0x4B)
     // extension records → we can't apply the out-of-band name, so REJECT.
-    if (typeflag === 0x78 || typeflag === 0x67 || typeflag === 0x4c || typeflag === 0x4b) {
+    if (typeflag === 0x67 || typeflag === 0x4c || typeflag === 0x4b) {
       throw new UnreadableTarError(
-        "this tar uses an extension we can't read yet (PAX/GNU long names) — re-export with a Parachute export, or contact us",
+        "this tar uses an extension we can't read yet (PAX global/GNU long names) — re-export with a Parachute export, or contact us",
       );
     }
+    const paxPath = pax?.get("path");
+    const paxSize = pax?.get("size");
+    pax = null; // a PAX header applies to the next entry only
+    if (paxSize !== undefined) {
+      if (!/^\d+$/.test(paxSize)) throw new UnreadableTarError("this tar has a PAX size record we can't read");
+      size = Number(paxSize);
+    }
     if (typeflag === 0x30 || typeflag === 0) {
-      out.push({ name: prefix ? `${prefix}/${name}` : name, bytes: buf.subarray(off, off + size) });
+      out.push({ name: paxPath ?? (prefix ? `${prefix}/${name}` : name), bytes: buf.subarray(off, off + size) });
     }
     off += Math.ceil(size / BLOCK) * BLOCK;
+  }
+  return out;
+}
+
+/** Decode a PAX extended-header body: "<len> <key>=<value>\n" records, each
+ *  <len> bytes long including its own digits. Malformed → UnreadableTarError
+ *  (never a guessed name). */
+function parsePaxRecords(data: Uint8Array): Map<string, string> {
+  const dec = new TextDecoder("utf-8", { fatal: true });
+  const out = new Map<string, string>();
+  let off = 0;
+  while (off < data.length) {
+    let sp = off;
+    while (sp < data.length && data[sp] !== 0x20) sp++;
+    const digits = String.fromCharCode(...data.subarray(off, sp));
+    const len = /^\d+$/.test(digits) ? Number(digits) : NaN;
+    if (!Number.isSafeInteger(len) || len <= sp - off + 1 || off + len > data.length || data[off + len - 1] !== 0x0a) {
+      throw new UnreadableTarError("this tar has a PAX header we can't read");
+    }
+    let rec: string;
+    try {
+      rec = dec.decode(data.subarray(sp + 1, off + len - 1));
+    } catch {
+      throw new UnreadableTarError("this tar has a PAX header we can't read");
+    }
+    const eq = rec.indexOf("=");
+    if (eq <= 0) throw new UnreadableTarError("this tar has a PAX header we can't read");
+    out.set(rec.slice(0, eq), rec.slice(eq + 1));
+    off += len;
   }
   return out;
 }

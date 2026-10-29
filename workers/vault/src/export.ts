@@ -243,8 +243,10 @@ function writeAscii(buf: Uint8Array, offset: number, str: string, maxLen: number
   buf.set(bytes.subarray(0, Math.min(bytes.length, maxLen)), offset);
 }
 
-/** Split a >100-byte path into ustar name (≤100) + prefix (≤155) at a "/". */
-function splitName(path: string): { name: string; prefix: string } {
+/** Split a >100-byte path into ustar name (≤100) + prefix (≤155) at a "/".
+ *  null when no split fits — {@link entryHeader} then carries the path in a
+ *  PAX record instead. */
+function splitName(path: string): { name: string; prefix: string } | null {
   if (byteLen(path) <= 100) return { name: path, prefix: "" };
   let idx = path.length;
   for (;;) {
@@ -254,12 +256,17 @@ function splitName(path: string): { name: string; prefix: string } {
     const prefix = path.slice(0, idx);
     if (byteLen(name) <= 100 && byteLen(prefix) <= 155) return { name, prefix };
   }
-  throw new Error(`export: path too long for tar (name >100 bytes, unsplittable): ${path}`);
+  return null;
 }
 
-function tarHeader(entryName: string, size: number): Uint8Array {
+/** Whether `path` needs a PAX path record (no ustar name/prefix split fits).
+ *  Before T-318's fix these were the paths that failed the whole archive. */
+export function needsPaxPath(path: string): boolean {
+  return splitName(path) === null;
+}
+
+function tarHeader(name: string, prefix: string, size: number, typeflag = 0x30): Uint8Array {
   const header = new Uint8Array(BLOCK);
-  const { name, prefix } = splitName(entryName);
 
   writeAscii(header, 0, name, 100);
   writeAscii(header, 100, octalField(0o644, 8), 8); // mode
@@ -269,7 +276,7 @@ function tarHeader(entryName: string, size: number): Uint8Array {
   writeAscii(header, 136, octalField(0, 12), 12); // mtime (0 → byte-stable across runs)
   // chksum (148, 8) filled after summing, with 8 spaces as placeholder.
   header.fill(0x20, 148, 156);
-  header[156] = 0x30; // typeflag '0' = regular file
+  header[156] = typeflag; // '0' = regular file, 'x' = PAX extended header
   writeAscii(header, 257, "ustar\0", 6); // magic
   writeAscii(header, 263, "00", 2); // version
   writeAscii(header, 345, prefix, 155);
@@ -282,6 +289,48 @@ function tarHeader(entryName: string, size: number): Uint8Array {
   return header;
 }
 
+/** One PAX record, "<len> <key>=<value>\n", where <len> counts the whole
+ *  record including its own digits (POSIX.1-2001 pax). */
+function paxRecord(key: string, value: string): Uint8Array {
+  const body = ` ${key}=${value}\n`;
+  const bodyLen = byteLen(body);
+  let len = bodyLen + 1;
+  while (String(len).length + bodyLen !== len) len = String(len).length + bodyLen;
+  return new TextEncoder().encode(`${len}${body}`);
+}
+
+/** The longest leading slice of `s` that is at most `max` UTF-8 bytes and
+ *  never cuts a character in half. */
+function truncateUtf8(s: string, max: number): string {
+  let out = "";
+  for (const ch of s) {
+    if (byteLen(out + ch) > max) break;
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Every header block for one entry. A path that fits ustar (≤100-byte name,
+ * or a name/prefix split at a "/") gets the single ustar header. A path that
+ * doesn't — one segment over 100 bytes, which a long note title is (T-318:
+ * that threw here and failed a vault's nightly snapshot every night) — gets a
+ * POSIX PAX extended header ('x') whose `path` record holds the full name,
+ * then the ustar header with a truncated name as the fallback for readers
+ * that ignore PAX. GNU tar, bsdtar and restore.ts's decoder all read it.
+ */
+function entryHeader(entryName: string, size: number): Uint8Array {
+  const split = splitName(entryName);
+  if (split) return tarHeader(split.name, split.prefix, size);
+  const record = paxRecord("path", entryName);
+  const padded = Math.ceil(record.length / BLOCK) * BLOCK;
+  const out = new Uint8Array(BLOCK + padded + BLOCK);
+  out.set(tarHeader("PaxHeader", "", record.length, 0x78), 0);
+  out.set(record, BLOCK);
+  out.set(tarHeader(truncateUtf8(entryName, 100), "", size), BLOCK + padded);
+  return out;
+}
+
 /** Exact archive size for a set of entries — header + padded data per entry
  *  + the two-block trailer. `FixedLengthStream` (the R2 streaming write) and
  *  the HTTP `Content-Length` both need it before any byte flows. */
@@ -289,7 +338,7 @@ export function tarSize(entries: readonly TarEntrySpec[]): number {
   let total = BLOCK * 2; // trailer
   for (const e of entries) {
     const size = isR2Entry(e) ? e.size : e.bytes.length;
-    total += BLOCK + Math.ceil(size / BLOCK) * BLOCK;
+    total += entryHeader(e.name, size).length + Math.ceil(size / BLOCK) * BLOCK;
   }
   return total;
 }
@@ -302,9 +351,9 @@ export function toTar(entries: TarEntry[]): Uint8Array {
   const blocks: Uint8Array[] = [];
   let total = 0;
   for (const entry of entries) {
-    const header = tarHeader(entry.name, entry.bytes.length);
+    const header = entryHeader(entry.name, entry.bytes.length);
     blocks.push(header);
-    total += BLOCK;
+    total += header.length;
     blocks.push(entry.bytes);
     total += entry.bytes.length;
     const rem = entry.bytes.length % BLOCK;
@@ -353,7 +402,7 @@ export async function streamTar(
   try {
     for (const e of entries) {
       const size = isR2Entry(e) ? e.size : e.bytes.length;
-      await writer.write(tarHeader(e.name, size));
+      await writer.write(entryHeader(e.name, size));
       if (isR2Entry(e)) {
         const obj = await getObject(e.key);
         if (!obj || obj.size !== e.size) {

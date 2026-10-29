@@ -5,7 +5,7 @@
  *
  *   parachute-cloud 2026-10-27 · users 42 (+3) · active vaults 17 · notes changed 210 ·
  *   storage 1.2 GB · voice 34 min this month · sign-ins 25 · deletions pending 1 ·
- *   alerts 0 · 5xx 0 · health ok 144/144
+ *   stale backups 0 · alerts 0 · 5xx 0 · health ok 144/144
  *
  * Runs once a day, chained after the 03:30 UTC usage rollup (ops.ts, the
  * USAGE_CRON branch — no new cron pattern), for the UTC day that just ended.
@@ -34,6 +34,12 @@
  *                             morning, because the next one has already reset.
  *   - sign-ins              — `ops_counters.sign_in` (sessions started).
  *   - deletions pending     — accounts inside their 24 h undo window right now.
+ *   - stale backups         — vaults of live accounts whose newest snapshot
+ *                             (`vault_snapshots`, or the vault's creation if
+ *                             none) is older than its plan's cadence allows,
+ *                             as of the run (snapshots.ts countStaleSnapshots).
+ *                             Should be 0; T-318 found one vault failing
+ *                             nightly for two months with nothing showing it.
  *   - alerts                — `ops_counters.alert` (alerts actually delivered).
  *   - 5xx                   — `ops_counters.http_5xx` (identity responses ≥ 500).
  *   - health ok N/144       — `ops_counters.health_ok`: 10-minute health runs
@@ -43,11 +49,14 @@
  *
  * NO PERSONAL DATA: counts only — no email, no vault name, no IP.
  */
+import { type BillingMode, billingMode } from "./billing-config.ts";
 import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
 import { type NotifyResult, notifyOperators } from "./ops-alerts.ts";
 import { pruneOpsCounters, sumOpsCounter } from "./ops-counters.ts";
 import { sha256Hex, timingSafeEqualString } from "./crypto.ts";
+import { billingModeOf, type OAuthDeps } from "./oauth-shared.ts";
+import { countStaleSnapshots, runSnapshotSweep, type SnapshotSweepSummary, staleSnapshotVaults } from "./snapshots.ts";
 
 /** 24 h / 10 min — the health runs a full day should contain. */
 export const HEALTH_RUNS_PER_DAY = 144;
@@ -75,6 +84,8 @@ export interface DailyStats {
   vaultsTotal: number;
   signIns: number;
   deletionsPending: number;
+  /** Vaults whose newest backup is overdue at the time of the run. */
+  staleSnapshots: number;
   alerts: number;
   errors5xx: number;
   healthOk: number;
@@ -90,7 +101,12 @@ function nextDay(day: string): string {
   return new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
 }
 
-export async function collectDailyStats(db: D1Database, day: string, environment: string): Promise<DailyStats> {
+export async function collectDailyStats(
+  db: D1Database,
+  day: string,
+  environment: string,
+  opts: { now?: Date; billingMode?: BillingMode } = {},
+): Promise<DailyStats> {
   const end = nextDay(day);
   const count = async (sql: string, ...binds: string[]): Promise<number> => {
     const row = await db.prepare(sql).bind(...binds).first<{ n: number }>();
@@ -156,6 +172,8 @@ export async function collectDailyStats(db: D1Database, day: string, environment
     voiceMinutesThisMonth = Math.round(v?.m ?? 0);
   }
 
+  const { stale: staleSnapshots } = await countStaleSnapshots(db, opts.now ?? new Date(), opts.billingMode ?? "open_beta");
+
   return {
     day,
     environment,
@@ -170,6 +188,7 @@ export async function collectDailyStats(db: D1Database, day: string, environment
     vaultsTotal,
     signIns,
     deletionsPending,
+    staleSnapshots,
     alerts,
     errors5xx,
     healthOk,
@@ -207,6 +226,7 @@ export function renderDailyLine(s: DailyStats): string {
     `voice ${s.voiceMinutesThisMonth === null ? "n/a" : `${s.voiceMinutesThisMonth} min`} this month`,
     `sign-ins ${s.signIns}`,
     `deletions pending ${s.deletionsPending}`,
+    `stale backups ${s.staleSnapshots}`,
     `alerts ${s.alerts}`,
     `5xx ${s.errors5xx}`,
     `health ok ${s.healthOk}/${HEALTH_RUNS_PER_DAY}`,
@@ -232,7 +252,7 @@ export async function runDailyLine(
   const now = opts.now ?? new Date();
   const day = opts.day ?? previousUtcDay(now);
   const environment = env.ENVIRONMENT ?? "unknown";
-  const stats = await collectDailyStats(env.DB, day, environment);
+  const stats = await collectDailyStats(env.DB, day, environment, { now, billingMode: billingMode(env) });
   const line = renderDailyLine(stats);
 
   await env.DB.prepare(
@@ -308,17 +328,56 @@ export async function dailyJsonResponse(db: D1Database, req: Request): Promise<R
  * SHA-256 digests, constant-time, so neither length nor prefix leaks.
  */
 export async function handleOpsDailyGet(env: Env, req: Request): Promise<Response | null> {
-  const secret = env.OPS_READ_TOKEN?.trim();
+  const refused = await opsBearerRefusal(env.OPS_READ_TOKEN, req);
+  if (refused !== undefined) return refused;
+  return dailyJsonResponse(env.DB, req);
+}
+
+/** The shared bearer gate of the /ops endpoints: null = the secret is unset
+ *  (the router 404s), a 401 Response = wrong/missing bearer, undefined = ok.
+ *  SHA-256 digests compared in constant time, so neither length nor prefix
+ *  leaks. */
+async function opsBearerRefusal(secretRaw: string | undefined, req: Request): Promise<Response | null | undefined> {
+  const secret = secretRaw?.trim();
   if (!secret) return null;
   const auth = req.headers.get("authorization") ?? "";
   const m = /^Bearer\s+(.+)$/i.exec(auth);
   const presented = m?.[1]?.trim() ?? "";
   const ok = presented !== "" && timingSafeEqualString(await sha256Hex(presented), await sha256Hex(secret));
-  if (!ok) {
-    return Response.json(
-      { error: "unauthorized" },
-      { status: 401, headers: { "www-authenticate": "Bearer", "cache-control": "no-store" } },
-    );
-  }
-  return dailyJsonResponse(env.DB, req);
+  if (ok) return undefined;
+  return Response.json(
+    { error: "unauthorized" },
+    { status: 401, headers: { "www-authenticate": "Bearer", "cache-control": "no-store" } },
+  );
+}
+
+/**
+ * POST /ops/snapshot-run — take a backup NOW of every vault whose backup is
+ * stale (the daily line's "stale backups" set), for an operator agent after a
+ * fix, instead of waiting for the 04:00 sweep. Bearer `OPS_RUN_TOKEN` (its own
+ * secret: this one writes, /ops/daily only reads); unset → null (404).
+ *
+ * Takes no vault name and returns none — counts only: stale before, the run's
+ * summary, stale after. It can only do what the nightly sweep does, to the
+ * vaults the sweep already failed; the GFS ranks + retention bound the work.
+ */
+export async function handleOpsSnapshotRunPost(
+  env: Env,
+  req: Request,
+  deps: OAuthDeps,
+  sender: EmailSender | undefined,
+): Promise<Response | null> {
+  const refused = await opsBearerRefusal(env.OPS_RUN_TOKEN, req);
+  if (refused !== undefined) return refused;
+  if (req.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
+  const mode = billingModeOf(deps);
+  const before = await staleSnapshotVaults(env.DB, deps.now?.() ?? new Date(), mode);
+  let run: SnapshotSweepSummary | null = null;
+  if (before.names.length > 0) run = await runSnapshotSweep(env, deps, { onlyVaults: before.names, sender });
+  const after = await countStaleSnapshots(env.DB, deps.now?.() ?? new Date(), mode);
+  console.log(`event=ops_snapshot_run stale_before=${before.names.length} stale_after=${after.stale}`);
+  return Response.json(
+    { stale_before: before.names.length, run, stale_after: after.stale, vaults: after.vaults },
+    { headers: { "cache-control": "no-store" } },
+  );
 }
