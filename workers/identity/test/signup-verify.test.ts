@@ -21,6 +21,8 @@ import { persistEnrollment, isTotpEnrolled } from "../src/two-factor.ts";
 import { generateTotpSecret } from "../src/totp.ts";
 import { createUser } from "../src/users.ts";
 import { billingModeOf, depsForEnv } from "../src/oauth-shared.ts";
+import { AuthCodeNotFoundError, issueAuthCode, redeemAuthCode } from "../src/auth-codes.ts";
+import { sha256Base64url } from "../src/crypto.ts";
 import { CSRF, ISSUER, mintInitialPair, seedApprovedClient, seedSession } from "./helpers.ts";
 
 const BINDING = "parachute_id_signup";
@@ -244,12 +246,24 @@ describe("accounts made by the old unverified sign-up", () => {
     const session = await seedSession(user.id);
     const { clientId } = await seedApprovedClient();
     await mintInitialPair(clientId, user.id, { scope: `vault:legacy-${user.id.slice(0, 8)}:read` });
-    return { user, session };
+    // An authorization code issued just before the claim (Codex P1): it must
+    // not be redeemable for fresh tokens after the owner takes the account.
+    const verifier = "legacy-verifier-0123456789abcdefghijklmnopqrstuvwxyz";
+    const redirectUri = "https://example.com/cb";
+    const authCode = await issueAuthCode(env.DB, {
+      clientId,
+      userId: user.id,
+      redirectUri,
+      scopes: [`vault:legacy-${user.id.slice(0, 8)}:read`],
+      codeChallenge: await sha256Base64url(verifier),
+      codeChallengeMethod: "S256",
+    });
+    return { user, session, pendingCode: { code: authCode.code, clientId, redirectUri, codeVerifier: verifier } };
   }
 
   test("the address owner's first magic-link sign-in takes the account over and drops every credential set before the proof", async () => {
     const email = "planted@example.com";
-    const { user, session } = await legacyAccount(email);
+    const { user, session, pendingCode } = await legacyAccount(email);
     // Password sign-in still works until the address is proven (we can't lock
     // out real people who signed up this way).
     expect(await isTotpEnrolled(env.DB, user.id)).toBe(true);
@@ -279,6 +293,7 @@ describe("accounts made by the old unverified sign-up", () => {
     expect(live?.n).toBe(0);
     const grants = await env.DB.prepare("SELECT COUNT(*) AS n FROM grants WHERE user_id = ?").bind(user.id).first<{ n: number }>();
     expect(grants?.n).toBe(0);
+    await expect(redeemAuthCode(env.DB, pendingCode)).rejects.toBeInstanceOf(AuthCodeNotFoundError);
   }, 30_000);
 
   test("a verified password account is untouched by a magic-link sign-in", async () => {

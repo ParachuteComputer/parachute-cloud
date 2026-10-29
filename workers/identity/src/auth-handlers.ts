@@ -354,7 +354,8 @@ async function resolveVerifiedUser(
  * anything that password led to) may not be the address owner. The owner now
  * takes the account over and everything set before the proof is dropped: the
  * password, 2FA (a planted second factor would lock the owner out), every
- * session and half-finished 2FA login, every OAuth token, and standing consent.
+ * session and half-finished 2FA login, every OAuth token and unredeemed
+ * authorization code, and standing consent.
  * The vaults and their contents stay with the account.
  *
  * Conditional on `email_verified = 0` so it runs once, even under a race of
@@ -378,6 +379,9 @@ async function claimUnverifiedAccount(db: D1Database, userId: string, now: Date)
     db.prepare("DELETE FROM pending_logins WHERE user_id = ?").bind(userId),
     db.prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(nowIso, userId),
     db.prepare("DELETE FROM grants WHERE user_id = ?").bind(userId),
+    // An unredeemed authorization code would otherwise still trade for fresh
+    // tokens after the claim (redemption checks the code, not the grant).
+    db.prepare("DELETE FROM auth_codes WHERE user_id = ?").bind(userId),
   ]);
   console.log(`event=unverified_account_claimed user=${userId}`);
 }
