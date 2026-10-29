@@ -40,10 +40,10 @@
  *     say WHEN someone arrived, never WHERE FROM.
  */
 import { CONSOLE_CLIENT_ID } from "./drip.ts";
-import { PAID_TIERS, coercePlanId, type PlanId } from "./plans.ts";
+import { type BillingMode, PAID_TIERS, coercePlanId, type PlanId } from "./plans.ts";
 import { operatorFor, notFound } from "./admin.ts";
 import { renderAdminGrowth } from "./admin-growth-ui.ts";
-import { type OAuthDeps, htmlResponse } from "./oauth-shared.ts";
+import { type OAuthDeps, billingModeOf, htmlResponse } from "./oauth-shared.ts";
 
 const DAY_MS = 86_400_000;
 
@@ -104,6 +104,8 @@ export interface GrowthProps {
   trials: TrialPipeline;
   promoDays: Array<{ code: string; day: string; count: number }>;
   promoTotals: Array<{ code: string; count: number }>;
+  /** The money switch: open beta has no trial pipeline to show. */
+  billingMode: BillingMode;
 }
 
 // --- arrival ------------------------------------------------------------------
@@ -376,6 +378,7 @@ export async function handleAdminGrowthGet(db: D1Database, req: Request, deps: O
       trials,
       promoDays: promo.days,
       promoTotals: promo.totals,
+      billingMode: billingModeOf(deps),
     }),
   );
 }

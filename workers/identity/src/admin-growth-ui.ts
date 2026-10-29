@@ -13,12 +13,12 @@
  * growth judgement, and a proxy presented as a fact is worse than no number.
  */
 import { esc, page } from "./ui.ts";
-import { ADMIN_STYLE, adminHeader } from "./admin-ui.ts";
+import { ADMIN_STYLE, adminHeader, adminPlanLabel } from "./admin-ui.ts";
 // Durations in the copy are INTERPOLATED from their defining constants, never
 // spelled as literals. The trial length is in flight (30 → 90) and the session
 // / refresh TTLs are equally free to move; a page whose whole premise is honest
 // measurement must not be the thing that goes stale.
-import { PLAN_SPECS, TRIAL_DURATION_DAYS } from "./plans.ts";
+import { type BillingMode, OPEN_BETA_SHORT, TRIAL_DURATION_DAYS } from "./plans.ts";
 import { SESSION_TTL_MS } from "./sessions.ts";
 import { REFRESH_TOKEN_TTL_MS } from "./tokens.ts";
 
@@ -32,6 +32,7 @@ import {
   type FunnelCohort,
   type FunnelStageKey,
   type GrowthProps,
+  type TrialPipeline,
 } from "./admin-growth.ts";
 
 /**
@@ -127,10 +128,50 @@ function cohortColumn(c: FunnelCohort): string {
     </div>`;
 }
 
+// --- the money card: trial pipeline (paid) or paid accounts (open beta) ---------
+
+/** The three paid-account tiles, shared by both modes. */
+function paidTiles(trials: TrialPipeline): string {
+  return `${stat("Paying subscribers", trials.subscribers, "paid plan + live subscription")}
+         ${stat("Comped", trials.comps, "paid plan, no subscription")}
+         ${stat("Scheduled churn", trials.scheduledChurn, "downgrade already booked")}`;
+}
+
+/** Why the subscriber tile keys on the plan as well as the Stripe id (both modes). */
+const SUBSCRIBER_HOW = `A subscriber is on a PAID PLAN <em>and</em> carries a <code>stripe_subscription_id</code>; a comp is a paid plan with none. <strong>The plan half of that is load-bearing</strong>: the subscription id is write-once and never cleared, so a churned account keeps its old id forever on the expired floor &mdash; counting the id alone would report everyone who has EVER paid, a number that can only ever go up.`;
+
+/** BILLING_MODE=paid: the no-card trial clock is live, so the pipeline counts it. */
+function trialPipelineCard(trials: TrialPipeline): string {
+  return `<div class="card" data-testid="growth-trials">
+       <h2>Trial pipeline</h2>
+       <div class="statgrid">
+         ${stat(`Trials ending ≤${TRIAL_HORIZON_DAYS}d`, trials.trialsExpiringSoon)}
+         ${paidTiles(trials)}
+       </div>
+       <p class="how">How measured: a trial is "ending" when <code>plan_downgrade_at</code> falls within ${TRIAL_HORIZON_DAYS} days (this includes any already past due and waiting on the hourly sweep). ${SUBSCRIBER_HOW} <strong>Scheduled churn excludes trials on purpose</strong>: every new account is written with <code>pending_plan='expired'</code> because that flag IS the trial clock, so counting it unqualified would just re-report the trial cohort. (The clock length is stamped per row at signup &mdash; new signups get ${TRIAL_DURATION_DAYS} days, but rows written under an earlier setting keep whatever they were stamped with, so a mixed cohort is expected and counted correctly either way.) Here it means a paid or comped account with a downgrade on the books.</p>
+     </div>`;
+}
+
+/**
+ * Open beta: no account runs a clock (new signups get none; the sweep lands any
+ * old clock on the beta), so a "trials ending" count would be counting nothing
+ * that happens. Only the paid accounts are shown.
+ */
+function openBetaMoneyCard(trials: TrialPipeline): string {
+  return `<div class="card" data-testid="growth-paid">
+       <h2>Paid accounts</h2>
+       <p class="muted" style="margin:.1rem 0 .3rem">${esc(OPEN_BETA_SHORT)} No account has a clock running out, so there is nothing to count down here; with <code>BILLING_MODE=paid</code> this card also counts accounts nearing the end of their free period.</p>
+       <div class="statgrid">
+         ${paidTiles(trials)}
+       </div>
+       <p class="how">How measured: ${SUBSCRIBER_HOW} <strong>Scheduled churn</strong> is a paid or comped account with a downgrade on the books (a cancellation at period end); when it lands, the account lives on the open beta.</p>
+     </div>`;
+}
+
 // --- the page -------------------------------------------------------------------
 
 export function renderAdminGrowth(props: GrowthProps): string {
-  const { arrival, cohorts, planMix, totalUsers, trials, promoDays, promoTotals } = props;
+  const { arrival, cohorts, planMix, totalUsers, trials, promoDays, promoTotals, billingMode } = props;
 
   // --- arrival
   const delta = arrival.signups7d - arrival.signupsPrev7d;
@@ -145,7 +186,7 @@ export function renderAdminGrowth(props: GrowthProps): string {
       : planMix
           .map(
             (p) => `<tr data-testid="growth-plan-row">
-        <td>${esc(PLAN_SPECS[p.plan].label)}</td>
+        <td>${esc(adminPlanLabel(p.plan, billingMode))}</td>
         <td style="text-align:right">${p.count}</td>
         <td style="width:55%"><span class="bar" style="width:${pct(p.count, totalUsers)}%"></span> <span class="muted">${pct(p.count, totalUsers)}%</span></td>
       </tr>`,
@@ -205,19 +246,14 @@ export function renderAdminGrowth(props: GrowthProps): string {
          <thead><tr><th>Plan</th><th style="text-align:right">Accounts</th><th>Share of ${totalUsers}</th></tr></thead>
          <tbody>${planRows}</tbody>
        </table></div>
-       <p class="how">How measured: <code>users.plan</code> as stored, with unknown/legacy labels coerced the same way the rest of the console coerces them. Exact.</p>
+       <p class="how">How measured: <code>users.plan</code> as stored, with unknown/legacy labels coerced the same way the rest of the console coerces them. Exact.${
+         billingMode === "open_beta"
+           ? ` In the open beta every account without a paid plan reads "Open beta" (the stored plan id is kept as it was, for rollback); an <code>expired</code> row lives as the beta too, but is listed apart because the lift has not reached it yet.`
+           : ""
+       }</p>
      </div>
 
-     <div class="card" data-testid="growth-trials">
-       <h2>Trial pipeline</h2>
-       <div class="statgrid">
-         ${stat(`Trials ending ≤${TRIAL_HORIZON_DAYS}d`, trials.trialsExpiringSoon)}
-         ${stat("Paying subscribers", trials.subscribers, "paid plan + live subscription")}
-         ${stat("Comped", trials.comps, "paid plan, no subscription")}
-         ${stat("Scheduled churn", trials.scheduledChurn, "downgrade already booked")}
-       </div>
-       <p class="how">How measured: a trial is "ending" when <code>plan_downgrade_at</code> falls within ${TRIAL_HORIZON_DAYS} days (this includes any already past due and waiting on the hourly sweep). A subscriber is on a PAID PLAN <em>and</em> carries a <code>stripe_subscription_id</code>; a comp is a paid plan with none. <strong>The plan half of that is load-bearing</strong>: the subscription id is write-once and never cleared, so a churned account keeps its old id forever on the expired floor &mdash; counting the id alone would report everyone who has EVER paid, a number that can only ever go up. <strong>Scheduled churn excludes trials on purpose</strong>: every new account is written with <code>pending_plan='expired'</code> because that flag IS the trial clock, so counting it unqualified would just re-report the trial cohort. (The clock length is stamped per row at signup &mdash; new signups get ${TRIAL_DURATION_DAYS} days, but rows written under an earlier setting keep whatever they were stamped with, so a mixed cohort is expected and counted correctly either way.) Here it means a paid or comped account with a downgrade on the books.</p>
-     </div>
+     ${billingMode === "open_beta" ? openBetaMoneyCard(trials) : trialPipelineCard(trials)}
 
      <div class="card">
        <h2>Campaign &mdash; promo redemptions</h2>
