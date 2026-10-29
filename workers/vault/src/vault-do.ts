@@ -94,7 +94,7 @@ import {
   restoreFromTar,
 } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
-import { WELCOME_SEEDED_KEY, seedWelcome, type WelcomeSeedResult } from "./welcome.js";
+import { WELCOME_SEEDED_KEY, seedWelcome, withCloudGuideText, type WelcomeSeedResult } from "./welcome.js";
 import {
   SEED_PACK_NAMES,
   applySeedPack,
@@ -1047,7 +1047,7 @@ export class VaultDO extends DurableObject {
       if (await this.ctx.storage.get<boolean>(WELCOME_SEEDED_KEY)) return;
       const stats = await this.store.getVaultStats();
       if (stats.totalNotes === 0) {
-        await seedWelcome(this.store, { consoleOrigin: this.env.ISSUER_ORIGIN });
+        await seedWelcome(this.store, { consoleOrigin: this.env.CONSOLE_PUBLIC_ORIGIN ?? this.env.ISSUER_ORIGIN });
       }
       await this.ctx.storage.put(WELCOME_SEEDED_KEY, true);
     } catch (e) {
@@ -1065,7 +1065,7 @@ export class VaultDO extends DurableObject {
    */
   async seedWelcomeAgain(vaultName: string): Promise<WelcomeSeedResult> {
     await this.ensureState(vaultName);
-    return seedWelcome(this.store, { consoleOrigin: this.env.ISSUER_ORIGIN });
+    return seedWelcome(this.store, { consoleOrigin: this.env.CONSOLE_PUBLIC_ORIGIN ?? this.env.ISSUER_ORIGIN });
   }
 
   /**
@@ -1087,11 +1087,14 @@ export class VaultDO extends DurableObject {
     }
     // consoleOrigin only affects the `welcome` pack's Connect-your-AI note —
     // same origin the create-time seed uses, so a re-apply is byte-identical.
-    const pack = getSeedPack(packName, { consoleOrigin: this.env.ISSUER_ORIGIN });
+    const pack = getSeedPack(packName, { consoleOrigin: this.env.CONSOLE_PUBLIC_ORIGIN ?? this.env.ISSUER_ORIGIN });
     if (!pack) {
       return json({ error: `Unknown pack '${packName}'`, available: [...SEED_PACK_NAMES] }, 404);
     }
-    const result = await applySeedPack(this.store, pack);
+    // The cloud's guide-text corrections apply here too (welcome.ts
+    // CLOUD_GUIDE_EDITS), so a re-applied guide never teaches what the app no
+    // longer does. Tags stay core's full declared set.
+    const result = await applySeedPack(this.store, withCloudGuideText(pack));
     return json({
       pack: result.pack,
       applied: result.seededNotes,

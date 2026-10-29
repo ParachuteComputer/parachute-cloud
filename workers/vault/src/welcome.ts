@@ -10,7 +10,9 @@
  *     Core's pack also declares `capture`; the cloud default seed drops it
  *     (T-318, DESIGN-0.9 §8b/§8c): `#capture` is opt-in in the Notes app now,
  *     and the app declares the tag lazily the first time it actually adds it.
- *     See DEFAULT_SEED_OMITTED_TAGS below. The five guides are ordinary notes tagged `#guide`,
+ *     See DEFAULT_SEED_OMITTED_TAGS below. Core's guide text still says the
+ *     app tags everything #capture; CLOUD_GUIDE_EDITS below corrects those
+ *     passages (default seed AND explicit pack apply). The five guides are ordinary notes tagged `#guide`,
  *     forming a small linked web (Welcome → all four; the rest chain,
  *     Connect-your-AI also links [[Getting Started]]).
  *     The Connect-your-AI note names the console origin (ISSUER_ORIGIN). This
@@ -38,6 +40,8 @@
 import type { Store } from "@openparachute/core/src/types.js";
 import {
   GETTING_STARTED_PACK,
+  GETTING_STARTED_PATH,
+  TAGS_GRAPH_PATH,
   type SeedPack,
   applySeedPack,
   welcomePack,
@@ -101,10 +105,63 @@ export interface WelcomeSeedResult {
 export async function seedWelcome(store: Store, opts: { consoleOrigin: string }): Promise<WelcomeSeedResult> {
   const result: WelcomeSeedResult = { seededNotes: [], skippedNotes: [], tags: [] };
   for (const pack of [welcomePack({ consoleOrigin: opts.consoleOrigin }), GETTING_STARTED_PACK]) {
-    const applied = await applySeedPack(store, forDefaultSeed(pack));
+    const applied = await applySeedPack(store, withCloudGuideText(forDefaultSeed(pack)));
     result.seededNotes.push(...applied.seededNotes);
     result.skippedNotes.push(...applied.skippedNotes);
     result.tags.push(...applied.tags);
   }
   return result;
+}
+
+
+/**
+ * Cloud corrections to core's guide text (T-318). Core's guides, at the pinned
+ * commit, say the Notes app puts `#capture` on whatever you write; it no longer
+ * does unless the owner turns on "Tag new notes as an inbox" (Settings → Tag
+ * roles). Each edit swaps one exact passage of core's text for the true one
+ * and leaves the rest of the note byte-equal to core. welcome.test.ts checks
+ * every `from` still appears in core, so a vault-source.env bump that fixes the
+ * text upstream fails loudly here instead of silently keeping a stale edit.
+ * The new wording holds whether or not the vault declares `capture` (the
+ * default seed omits it; an explicit welcome-pack apply declares it).
+ */
+export const CLOUD_GUIDE_EDITS: ReadonlyArray<{ path: string; from: string; to: string }> = [
+  {
+    path: TAGS_GRAPH_PATH,
+    from: `everything half-finished. Your vault starts with just two:
+
+- #capture — the Notes app puts it on whatever you write or speak in directly,
+  marking your own raw words.
+- #guide — these notes.
+`,
+    to: `everything half-finished. Your vault starts with #guide, on these notes.
+
+Want an inbox? In the Notes app, open Settings → Tag roles and turn on
+"Tag new notes as an inbox". Then a new note you write or speak in without a
+tag gets an inbox tag (#capture unless you change it), so you can sort it
+later. It's off unless you turn it on.
+`,
+  },
+  {
+    path: GETTING_STARTED_PATH,
+    from: `small welcome web and the \`capture\` tag the Notes surface uses; no other
+predefined tags or schema.`,
+    to: `small welcome web tagged \`guide\`; no other predefined tags or schema. (The
+Notes app tags new notes \`capture\` only if the person turns on its inbox option,
+"Tag new notes as an inbox".)`,
+  },
+];
+
+/** `pack` with {@link CLOUD_GUIDE_EDITS} applied to its notes (others untouched). */
+export function withCloudGuideText(pack: SeedPack): SeedPack {
+  return {
+    ...pack,
+    notes: pack.notes.map((note) => {
+      let content = note.content;
+      for (const edit of CLOUD_GUIDE_EDITS) {
+        if (edit.path === note.path) content = content.replace(edit.from, () => edit.to);
+      }
+      return content === note.content ? note : { ...note, content };
+    }),
+  };
 }
