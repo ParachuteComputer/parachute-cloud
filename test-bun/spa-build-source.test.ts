@@ -53,7 +53,8 @@ describe("served SPA source", () => {
     const sourcePin = read("scripts/spa-source.env");
     const script = read("scripts/build-spa.sh");
 
-    expect(sourcePin).toContain('SPA_APP_VERSION="0.22.15-rc.2"');
+    // The version moves with every pin bump; the shape (and build-spa.sh's check of it) is the contract.
+    expect(sourcePin).toMatch(/SPA_APP_VERSION="\d+\.\d+\.\d+(-rc\.\d+)?"/);
     expect(sourcePin).toMatch(/SPA_APP_REF="[0-9a-f]{40}"/);
     expect(script).toContain('source "$ROOT/scripts/spa-source.env"');
     expect(script).toContain("SPA_APP_REF");
