@@ -1069,6 +1069,8 @@ export interface ConsoleProps {
   totalUsedBytes?: number | null;
   /** At/over the plan's vault count → the create form yields to the at-cap note. */
   atVaultCap: boolean;
+  /** The stored pending plan, so the at-cap note names the real limit (a former Power subscriber keeps ten). */
+  pendingPlan?: PlanId | null;
   /** Operator account → the quiet "Admin" header link (/admin). */
   isOperator?: boolean;
   /**
@@ -1749,7 +1751,7 @@ export function renderConsole(props: ConsoleProps): string {
   const createCard = atVaultCap
     ? `<div class="card" data-testid="vault-cap">
        <h2>Create a vault</h2>
-       <p class="muted" style="margin:.35rem 0 0">${esc(vaultCapMessage(plan, mode))}</p>
+       <p class="muted" style="margin:.35rem 0 0">${esc(vaultCapMessage(plan, mode, props.pendingPlan ?? null))}</p>
        ${error ? `<div class="err">${esc(error)}</div>` : ""}
      </div>`
     : `<div class="card">

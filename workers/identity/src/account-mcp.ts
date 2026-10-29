@@ -43,9 +43,9 @@ import { type OAuthDeps, billingModeOf, vaultAdvertisedUrl } from "./oauth-share
 import {
   PLAN_SPECS,
   entitlementPlanFor,
-  livePlan,
   planEntitlement,
   vaultCapMessage,
+  vaultLimitPlan,
 } from "./plans.ts";
 import type { User } from "./users.ts";
 import { callVaultApi, pushVaultCap } from "./vault-call.ts";
@@ -281,9 +281,9 @@ const createVaultTool: AccountMcpTool = {
     // Plan vault-count gate — IDENTICAL to handleAccountVaultCreate / the
     // console's handleCreateVaultPost: `>=` grandfathers users already over a
     // cap (an expired plan has vault_count=0 → refused here).
-    const spec = PLAN_SPECS[livePlan(user.plan, billingModeOf(deps))];
+    const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
     if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-      throw new AccountToolError("vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps)));
+      throw new AccountToolError("vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
     }
 
     const rawName = typeof args.name === "string" ? args.name : "";

@@ -464,6 +464,28 @@ export function entitlementPlanFor(plan: PlanId, pendingPlan: PlanId | null, mod
   return live;
 }
 
+/**
+ * Where a PAYING subscriber lands when their subscription ends during the open
+ * beta (T-318 night, "stop charging existing subscribers"): the beta's plan id
+ * (`trial`, clockless), with the Power marker kept for a Power subscriber so
+ * nobody shrinks (entitlementPlanFor honours `trial` + pending `power` in open
+ * beta). Every other tier is at or below the beta's Plus-level limits, so the
+ * beta is the same or more for them. Returns the `pending_plan` to store.
+ */
+export function openBetaLandingPending(plan: PlanId, pendingPlan: PlanId | null): PlanId | null {
+  return plan === "power" || (plan === "trial" && pendingPlan === "power") ? "power" : null;
+}
+
+/**
+ * The plan whose `vault_count` gates creating a NEW vault. Paid mode keeps the
+ * stored plan's own count (a trialist's tier pick never changed it). In open
+ * beta it follows the entitlement, so a former Power subscriber (or a lifted
+ * Power trialist) keeps Power's ten, matching the caps their vaults get.
+ */
+export function vaultLimitPlan(plan: PlanId, pendingPlan: PlanId | null, mode: BillingMode): PlanId {
+  return mode === "open_beta" ? entitlementPlanFor(plan, pendingPlan, mode) : livePlan(plan, mode);
+}
+
 /** The entitlement pushed to every vault DO for a plan (vault-call.ts). */
 export function planEntitlement(plan: PlanId): VaultEntitlement {
   const spec = PLAN_SPECS[plan];
@@ -624,9 +646,10 @@ export function trialBannerLine(tierLabel: string, isDefault: boolean, daysLeft:
  * The friendly refusal when a restore would need a vault slot the plan doesn't
  * have (restore always creates a NEW vault — it never overwrites).
  */
-export function restoreAtCapMessage(plan: PlanId, mode: BillingMode): string {
+export function restoreAtCapMessage(plan: PlanId, mode: BillingMode, pendingPlan: PlanId | null = null): string {
+  const limit = PLAN_SPECS[vaultLimitPlan(plan, pendingPlan, mode)].vault_count;
   plan = livePlan(plan, mode);
-  const spec = PLAN_SPECS[plan];
+  const spec = { ...PLAN_SPECS[plan], vault_count: limit };
   if (mode === "open_beta" && plan === "trial") {
     return `Restoring creates a new vault, and your account is at its ${spec.vault_count}-vault limit for the open beta. Free up a slot first, or write hello@parachute.computer.`;
   }
@@ -638,9 +661,10 @@ export function restoreAtCapMessage(plan: PlanId, mode: BillingMode): string {
  * (grandfathered) see the same message: they keep everything they have — the
  * cap only refuses NEW creation until they're under it.
  */
-export function vaultCapMessage(plan: PlanId, mode: BillingMode): string {
+export function vaultCapMessage(plan: PlanId, mode: BillingMode, pendingPlan: PlanId | null = null): string {
+  const limit = PLAN_SPECS[vaultLimitPlan(plan, pendingPlan, mode)].vault_count;
   plan = livePlan(plan, mode);
-  const spec = PLAN_SPECS[plan];
+  const spec = { ...PLAN_SPECS[plan], vault_count: limit };
   if (mode === "open_beta" && plan === "trial") {
     const n = `${spec.vault_count} vault${spec.vault_count === 1 ? "" : "s"}`;
     return `During the open beta your account includes ${n} — that's the current ceiling. Need more? Write hello@parachute.computer.`;

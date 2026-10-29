@@ -7,8 +7,9 @@
  *   - `checkout.session.completed` — the upgrade path (plan + ids + cap push).
  *   - `invoice.paid` — clear dunning state (renewal succeeded).
  *   - `invoice.payment_failed` — flag dunning; no auto-suspend.
- *   - `customer.subscription.deleted` — schedule the downgrade (pending_plan
- *     + plan_downgrade_at; the hourly sweep applies it — billing-lifecycle.ts).
+ *   - `customer.subscription.deleted` — paid mode: schedule the downgrade
+ *     (pending_plan + plan_downgrade_at; the hourly sweep applies it —
+ *     billing-lifecycle.ts). Open beta: land the owner on the beta now.
  *   - `customer.subscription.updated` — sync plan / scheduled cancels.
  *   - All other event types are accepted (200) and ignored.
  *
@@ -133,7 +134,7 @@ export async function handleStripeWebhookPost(
       break;
     }
     case "customer.subscription.deleted": {
-      const result = await handleSubscriptionDeleted(env.DB, event, now);
+      const result = await handleSubscriptionDeleted(env.DB, deps, event, now);
       response = jsonResponse(result);
       outcome = result.action;
       break;
