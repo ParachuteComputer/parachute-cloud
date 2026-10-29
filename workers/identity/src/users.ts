@@ -11,7 +11,7 @@
  * login password is stored differs, and that never crosses the wire to a client.
  */
 import { bytesToBase64url, randomUUID, timingSafeEqualString } from "./crypto.ts";
-import { type PlanId, TRIAL_DURATION_DAYS, coercePlanId } from "./plans.ts";
+import { type BillingMode, type PlanId, TRIAL_DURATION_DAYS, coercePlanId } from "./plans.ts";
 
 const encoder = new TextEncoder();
 // KDF POSTURE (#28, settled 2026-07-02 — the honest version):
@@ -251,14 +251,17 @@ function base64urlToBytes(s: string): Uint8Array {
  * Create a user. An empty `password` produces a passwordless (magic-link)
  * account — stored as an empty hash, which `verifyPassword` rejects, so password
  * login fails until one is set via {@link setPassword}. `emailVerified` starts
- * true for a magic-link signup (the link proves the address).
+ * true for a magic-link signup (the link proves the address). Since T-318
+ * night the password sign-up is a magic-link sign-up too: its row is created
+ * on verify, verified, with the pending verifier passed as `opts.passwordHash`.
  *
  * EVERY new account STARTS THE NO-CARD TRIAL (the pricing model — there is no
  * perpetual free tier; self-host is the free-forever option). Its LENGTH is
  * plans.ts `TRIAL_DURATION_DAYS` — 90 days, the "three months free" campaign
  * (2026-07-25) — and this is the only place it's stamped. We write the full
- * trial state machine right here so BOTH signup paths (password /signup and the
- * first magic-link, auth-handlers.ts) land on it identically:
+ * trial state machine right here so every signup lands on it identically (both
+ * the password /signup and the plain magic link now create the row in
+ * auth-handlers.ts resolveVerifiedUser):
  *   - plan            = 'trial'   (mirrors PLUS entitlements — full experience)
  *   - pending_plan    = 'expired' (the floor the hourly sweep flips to when due)
  *   - plan_downgrade_at = now + TRIAL_DURATION_DAYS (when the sweep applies it)
@@ -271,25 +274,33 @@ export async function createUser(
   email: string,
   password: string,
   now: Date = new Date(),
-  opts: { emailVerified?: boolean } = {},
+  opts: { emailVerified?: boolean; billingMode?: BillingMode; passwordHash?: string } = {},
 ): Promise<User> {
   const id = randomUUID();
   // NEVER hash an empty password — an empty hash means "no password", which
   // verifyPassword refuses. Hashing "" would produce a hash the empty string
-  // verifies against.
-  const passwordHash = password.length > 0 ? await hashPassword(password) : "";
+  // verifies against. `opts.passwordHash` is a verifier hashed earlier (the
+  // password sign-up hashes at request time and creates the row only once the
+  // address is proven — magic-links.ts PendingSignup); it wins over `password`.
+  const passwordHash = opts.passwordHash ?? (password.length > 0 ? await hashPassword(password) : "");
   const emailVerified = opts.emailVerified ?? false;
   const createdAt = now.toISOString();
-  const planDowngradeAt = new Date(now.getTime() + TRIAL_DURATION_DAYS * 86_400_000).toISOString();
+  // OPEN BETA (T-318; unset billingMode = open_beta, like BILLING_MODE): the
+  // account lands on a CLOCKLESS trial — the beta — with no pending floor and
+  // no downgrade date, so the hourly sweep never selects it. Paid mode keeps
+  // the original trial state machine below.
+  const paid = opts.billingMode === "paid";
+  const pendingPlan: PlanId | null = paid ? "expired" : null;
+  const planDowngradeAt = paid ? new Date(now.getTime() + TRIAL_DURATION_DAYS * 86_400_000).toISOString() : null;
   // `role` is deliberately NOT in the INSERT (migration DEFAULT 'user'); `plan`
   // + the trial pair ARE written explicitly so the state machine is set the
   // same way regardless of the migration DEFAULT.
   await db
     .prepare(
       `INSERT INTO users (id, email, password_hash, created_at, email_verified, plan, pending_plan, plan_downgrade_at)
-       VALUES (?, ?, ?, ?, ?, 'trial', 'expired', ?)`,
+       VALUES (?, ?, ?, ?, ?, 'trial', ?, ?)`,
     )
-    .bind(id, email, passwordHash, createdAt, emailVerified ? 1 : 0, planDowngradeAt)
+    .bind(id, email, passwordHash, createdAt, emailVerified ? 1 : 0, pendingPlan, planDowngradeAt)
     .run();
   return {
     id,
@@ -307,7 +318,7 @@ export async function createUser(
     deletePurgeAttempts: 0,
     stripeCustomerId: null,
     stripeSubscriptionId: null,
-    pendingPlan: "expired",
+    pendingPlan,
     planDowngradeAt,
     lastInvoicePaidAt: null,
     paymentFailedAt: null,

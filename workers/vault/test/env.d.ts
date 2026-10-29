@@ -8,5 +8,7 @@ declare module "cloudflare:test" {
     /** Test-config value (vitest.config.ts) — the welcome seed bakes it into
      *  the "Connect your AI" note, so tests assert against it. */
     ISSUER_ORIGIN: string;
+    /** Test-config value: the front door the seeded "Connect your AI" note names. */
+    CONSOLE_PUBLIC_ORIGIN: string;
   }
 }

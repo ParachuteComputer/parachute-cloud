@@ -44,8 +44,8 @@ import {
 
 const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 
-function htmlError(title: string, message: string, status: number): Response {
-  return htmlResponse(renderError({ title, message }), status);
+function htmlError(title: string, message: string, status: number, action?: { href: string; label: string }): Response {
+  return htmlResponse(renderError({ title, message, ...(action ? { action } : {}) }), status);
 }
 
 /**
@@ -230,7 +230,7 @@ async function authorizeCore(
 
   // Pending client: single-consent — a session auto-approves it, else login.
   if (client.status !== "approved") {
-    if (!session) return renderLoginPage(req, params);
+    if (!session) return renderLoginPage(req, params, undefined, client.clientName);
     await approveClient(db, client.clientId);
   }
 
@@ -246,7 +246,7 @@ async function authorizeCore(
     );
   }
 
-  if (!session) return renderLoginPage(req, params);
+  if (!session) return renderLoginPage(req, params, undefined, client.clientName);
 
   // Account-vaults (Wave A) — a wholly separate consent surface from the vault
   // picker. Refuse a mixed/foreign-id request, then ALWAYS render consent (never
@@ -273,7 +273,7 @@ async function authorizeCore(
         accountVaults: { ownedVaults },
         issuerHost: consentIssuedByHost(req, params.resource, deps),
         email: consentUser?.email ?? "",
-        notYouNext: buildAuthorizeUrl(deps.issuer, params),
+        notYouNext: authorizeResumePath(params),
       }),
       200,
       extra,
@@ -338,20 +338,72 @@ async function authorizeCore(
       // logout lands back here (no session → the login page, params intact)
       // and the connector request resumes without any new machinery.
       email: consentUser?.email ?? "",
-      notYouNext: buildAuthorizeUrl(deps.issuer, params),
+      notYouNext: authorizeResumePath(params),
     }),
     200,
     extra,
   );
 }
 
-function renderLoginPage(req: Request, params: AuthorizeParams, error?: string): Response {
+function renderLoginPage(req: Request, params: AuthorizeParams, error?: string, clientName?: string | null): Response {
   const csrf = ensureCsrfToken(req);
   const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
   // Errors on this page today only come from the password submit path, so an
   // error render opens the password disclosure (magic-send errors re-render via
   // auth-handlers.ts with showPassword: false).
-  return htmlResponse(renderLogin({ params, csrfToken: csrf.token, error, showPassword: Boolean(error) }), 200, extra);
+  return htmlResponse(renderLogin({ params, csrfToken: csrf.token, error, showPassword: Boolean(error), clientName }), 200, extra);
+}
+
+/**
+ * The origin where a person's sign-in session lives, when that is NOT the
+ * issuer origin — `APP_ORIGIN` (my.parachute.computer in production), but only
+ * when it is a DIFFERENT origin from the issuer AND a bound origin of this same
+ * worker (so the consent POST from there passes the same-origin gate, and we
+ * never send anyone to a host this worker doesn't serve — e.g. the legacy
+ * Notes PWA default when APP_ORIGIN is unset). Null when the issuer IS the
+ * home origin (staging: single-origin), so the authorize flow runs in place.
+ */
+export function authorizeHomeOrigin(deps: OAuthDeps): string | null {
+  const home = deps.appOrigin.replace(/\/$/, "");
+  if (home === deps.issuer) return null;
+  return resolveBoundOrigins(deps).includes(home) ? home : null;
+}
+
+/**
+ * ONE-PASS CONNECT (T-318). The OAuth issuer is `cloud.parachute.computer`
+ * (every registered connector, the AS metadata, `iss`, JWKS — fixed forever),
+ * but people sign in on `my.parachute.computer`. Both are Custom Domains of
+ * THIS worker, yet the session cookie is host-only, so an authorize request
+ * rendered on cloud. saw no session and asked for a SECOND email sign-in in the
+ * middle of connecting Claude.
+ *
+ * So a browser GET of `/oauth/authorize` on the ISSUER host is sent (302, path +
+ * query byte-identical) to the same path on the home origin, where the session
+ * lives. Sign-in (only if truly signed out) and consent then run there; the
+ * consent POST is same-origin on my. (a bound origin); the auth code lands in
+ * the shared D1; the client's redirect carries the same `code` + `state`; and
+ * the token exchange stays at `cloud./oauth/token`. Nothing a client can
+ * observe about the issuer changes — only where the human pages render.
+ *
+ * Scope: GET only. A POST to cloud./oauth/authorize (a login/consent form that
+ * was rendered on cloud. before this deploy) is still served in place — a 302
+ * would turn it into a GET and drop the body. Requests on any other host (my.,
+ * app., workers.dev) are served in place.
+ *
+ * `enabled` is the caller's production gate (index.ts): the cloud./my. split
+ * exists only in production, while the handler-integration suite drives the
+ * authorize pages on the ISSUER host under the committed production [vars]
+ * with ENVIRONMENT="test" — the same gate `cloudFrontDoorRedirect` uses.
+ * Staging is single-origin (APP_ORIGIN == ISSUER), so it is a no-op there
+ * regardless.
+ */
+export function authorizeHomeRedirect(req: Request, deps: OAuthDeps, enabled: boolean): Response | null {
+  if (!enabled) return null;
+  const home = authorizeHomeOrigin(deps);
+  if (!home) return null;
+  const url = new URL(req.url);
+  if (url.origin !== deps.issuer) return null;
+  return redirectResponse(`${home}${url.pathname}${url.search}`, { "cache-control": "no-store" });
 }
 
 export async function handleAuthorizeGet(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
@@ -430,11 +482,13 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   const email = String(form.get("email") ?? "");
   const password = String(form.get("password") ?? "");
   const now = deps.now?.() ?? new Date();
+  // Keep naming the connecting app on an error re-render.
+  const clientName = (await getClient(db, params.clientId))?.clientName ?? null;
   // Same brute-force fence as the console /login (this is the other public
   // login-submit path). Check lockout BEFORE the expensive password verify.
   const key = loginKey(clientIp(req), email);
   if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
-    return renderLoginPage(req, params, "Too many attempts. Please wait a few minutes and try again.");
+    return renderLoginPage(req, params, "Too many attempts. Please wait a few minutes and try again.", clientName);
   }
   const user = email ? await getUserByEmail(db, email) : null;
   // SUSPENDED or DELETED accounts get the same wrong-password message here
@@ -442,7 +496,7 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   // never an oracle.
   if (!user || !(await verifyPassword(user, password)) || user.suspendedAt || user.deletedAt) {
     await recordLoginFailure(deps.rateLimiter, key, now);
-    return renderLoginPage(req, params, "Incorrect email or password.");
+    return renderLoginPage(req, params, "Incorrect email or password.", clientName);
   }
   await clearLoginFailures(deps.rateLimiter, key);
   // Transparent KDF upgrade: a verified-correct password stored under the
@@ -453,7 +507,7 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   // Stash a pending login whose `next` resumes THIS authorize request (with the
   // session the /login/2fa handler mints), and send the user to the code prompt.
   if (await isTotpEnrolled(db, user.id)) {
-    const token = await createPendingLogin(db, user.id, buildAuthorizeUrl(deps.issuer, params), now);
+    const token = await createPendingLogin(db, user.id, authorizeResumePath(params), now);
     return redirectResponse("/login/2fa", { "set-cookie": buildPendingLoginCookie(token) });
   }
 
@@ -469,23 +523,34 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
 }
 
 /**
- * Reconstruct the GET /oauth/authorize URL from parsed params — the resume
- * handle for flows that leave this page and come back with a session: the
- * post-2FA `next` (pending_logins), and the magic-link `next` (magic_links,
- * migration 0017 — auth-handlers.ts stores it server-side at send time).
+ * Reconstruct the pending GET /oauth/authorize request from parsed params, as
+ * an ORIGIN-RELATIVE path (`/oauth/authorize?…`) — the resume handle for flows
+ * that leave this page and come back with a session: the post-2FA `next`
+ * (pending_logins), the magic-link / sign-in-code `next` (magic_links,
+ * migration 0017 — auth-handlers.ts stores it server-side at send time), and
+ * the consent page's "Not you?" logout `next`.
+ *
+ * Relative on purpose (T-318 one-pass connect): the authorize pages now render
+ * on the home origin (my.) while the issuer is cloud. A resume target pinned
+ * to the issuer would (a) land on a host where the just-minted session cookie
+ * doesn't exist, and (b) turn every form POST that ends in it (/auth/code,
+ * /login/2fa, /logout) into a cross-origin 302, which Chrome's
+ * `form-action 'self'` silently blocks. Relative resumes on whichever origin
+ * the person signed in on — the one where their session now lives.
+ * `safeNext` accepts a relative path, so no new trust is introduced.
  */
-export function buildAuthorizeUrl(issuer: string, params: AuthorizeParams): string {
-  const u = new URL(`${issuer}/oauth/authorize`);
-  u.searchParams.set("client_id", params.clientId);
-  u.searchParams.set("redirect_uri", params.redirectUri);
-  u.searchParams.set("response_type", params.responseType);
-  u.searchParams.set("scope", params.scope);
-  u.searchParams.set("code_challenge", params.codeChallenge);
-  u.searchParams.set("code_challenge_method", params.codeChallengeMethod);
-  if (params.state !== null) u.searchParams.set("state", params.state);
-  if (params.resource !== null) u.searchParams.set("resource", params.resource);
-  if (params.vault !== null) u.searchParams.set("vault", params.vault);
-  return u.toString();
+export function authorizeResumePath(params: AuthorizeParams): string {
+  const q = new URLSearchParams();
+  q.set("client_id", params.clientId);
+  q.set("redirect_uri", params.redirectUri);
+  q.set("response_type", params.responseType);
+  q.set("scope", params.scope);
+  q.set("code_challenge", params.codeChallenge);
+  q.set("code_challenge_method", params.codeChallengeMethod);
+  if (params.state !== null) q.set("state", params.state);
+  if (params.resource !== null) q.set("resource", params.resource);
+  if (params.vault !== null) q.set("vault", params.vault);
+  return `/oauth/authorize?${q.toString()}`;
 }
 
 async function handleConsentSubmit(db: D1Database, req: Request, form: FormData, deps: OAuthDeps): Promise<Response> {
@@ -497,7 +562,14 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   }
   const sessionId = parseSessionCookie(req.headers.get("cookie"));
   const session = sessionId ? await findActiveSession(db, sessionId, deps.now?.() ?? new Date()) : null;
-  if (!session) return htmlError("Session expired", "Please sign in again.", 401);
+  if (!session) {
+    return htmlError(
+      "Signed out",
+      "You were signed out before allowing the connection. Sign in, then go back to your AI app and connect again.",
+      401,
+      { href: "/login", label: "Sign in" },
+    );
+  }
   const client = await getClient(db, params.clientId);
   if (!client) return htmlError("Unknown application", "The client is not registered.", 400);
   try {
@@ -597,7 +669,12 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   if (unnamedVaultVerbs(scopes).length > 0) {
     const picked = String(form.get("vault_pick") ?? "") || (params.vault ?? "");
     if (!picked || !VAULT_NAME_RE.test(picked)) {
-      return htmlError("Vault required", "Choose a vault to authorize.", 400);
+      return htmlError(
+        "Make a vault first",
+        "A connection needs a vault to read and write. Make one, then go back to your AI app and connect again.",
+        400,
+        { href: "/console", label: "Make your first vault" },
+      );
     }
     // hub#689 port — owner-elected verb widening. `verb_select` is an UNTRUSTED
     // hint from the consent radio; re-level the unnamed read/write verb(s) to the

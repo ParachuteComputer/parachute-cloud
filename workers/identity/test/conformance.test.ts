@@ -134,13 +134,10 @@ describe("discovery endpoints", () => {
     // flag is the ONLY thing a client reads to decide whether to offer delete;
     // an unadvertised working route ships dark.
     expect((md.capabilities as Record<string, unknown>).vault_delete).toBe(true);
-    // Its whole-account sibling (A-3) has NO flag yet, and that absence is
-    // pinned rather than left ambiguous: `AccountCapabilities` is the shared,
-    // CI-pinned door contract from parachute-hub, so adding a key is an
-    // upstream PR. This assertion is what will fail — loudly, and in the right
-    // place — the day someone widens the contract and forgets to light the
-    // cloud door up.
-    expect((md.capabilities as Record<string, unknown>).account_delete).toBeUndefined();
+    // T-318: the whole-account sibling (A-3) is advertised as an ADDITIVE
+    // cloud key on top of the shared contract (checkAccountDescriptor above
+    // still passes); the app gates its Delete-account section on it.
+    expect((md.capabilities as Record<string, unknown>).account_delete).toBe(true);
     expect(Array.isArray(md.plans) && (md.plans as unknown[]).length).toBe(4);
     // PR-2: the {name}-placeholder vault-URL template, derived from vaultInstanceUrl.
     expect(md.vault_url_template).toContain("{name}");
@@ -966,7 +963,7 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     );
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("Authorize");
+    expect(html).toContain('data-testid="consent-ask"');
     expect(res.headers.get("set-cookie")).toContain("parachute_id_session=");
   });
 
@@ -1076,8 +1073,10 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
 
     // The "Not you?" next is THIS exact pending request, reconstructed —
     // proven by round-tripping every param a resumed authorize would need.
-    const next = new URL(extractNotYouNext(html));
-    expect(next.origin + next.pathname).toBe(`${ISSUER}/oauth/authorize`);
+    // Origin-relative (T-318): the logout lands back on the same origin.
+    expect(extractNotYouNext(html).startsWith("/oauth/authorize?")).toBe(true);
+    const next = new URL(extractNotYouNext(html), ISSUER);
+    expect(next.pathname).toBe("/oauth/authorize");
     expect(next.searchParams.get("client_id")).toBe(clientId);
     expect(next.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
     expect(next.searchParams.get("scope")).toBe("vault:default:read");
@@ -1151,10 +1150,10 @@ describe("authorize flow — login, consent, skip-consent, errors", () => {
     // re-enters /oauth/authorize with every original param intact — the
     // SAME session-less login render a first-time visitor would see, ready
     // for the right person to sign in and resume the connector request.
-    const resumed = await handleAuthorizeGet(env.DB, new Request(next), deps());
+    const resumed = await handleAuthorizeGet(env.DB, new Request(new URL(next, ISSUER)), deps());
     expect(resumed.status).toBe(200);
     const resumedHtml = await resumed.text();
-    expect(resumedHtml).toContain("Sign in to Parachute");
+    expect(resumedHtml).toContain("Sign in to");
     expect(resumedHtml).not.toContain("Signed in as");
     expect(resumedHtml).toContain(`value="${clientId}"`);
     expect(resumedHtml).toContain(`value="${challenge}"`);

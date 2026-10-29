@@ -19,6 +19,7 @@
  */
 import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
+import { bumpOpsCounter } from "./ops-counters.ts";
 
 /** Re-alert at most once per hour per key. */
 export const ALERT_DEDUPE_MS = 60 * 60 * 1000;
@@ -55,45 +56,201 @@ export async function markAlerted(db: D1Database, key: string, now: Date): Promi
   }
 }
 
+// --- operator channels: every recipient + an optional webhook -----------------
+
 /**
- * Raise one deduped operator alert. Returns whether an email actually went
- * out, so a caller can log the difference between "condition seen" and
- * "operator told".
+ * The operator email recipients. `OPERATOR_ALERT_EMAIL` keeps its name for
+ * compatibility but accepts a LIST (comma, semicolon or whitespace separated)
+ * so alerts don't depend on one inbox. Blank / malformed entries are dropped;
+ * duplicates collapse (case-insensitive).
+ */
+export function operatorRecipients(env: Pick<Env, "OPERATOR_ALERT_EMAIL">): string[] {
+  const raw = env.OPERATOR_ALERT_EMAIL ?? "";
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of raw.split(/[,;\s]+/)) {
+    const addr = part.trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(addr)) continue;
+    const key = addr.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(addr);
+  }
+  return out;
+}
+
+export type OpsSeverity = "info" | "warning" | "critical";
+
+/**
+ * The webhook body — deliberately generic so one secret works with ntfy.sh
+ * (shows the raw body), Slack-compatible incoming webhooks (read `text`), and
+ * Buzz/other incoming webhooks: `{ text, severity, key, at }`.
+ */
+export interface OpsWebhookPayload {
+  text: string;
+  severity: OpsSeverity;
+  key: string;
+  at: string;
+}
+
+/** The webhook POST budget — an alert must never hang a cron tick. */
+export const OPS_WEBHOOK_TIMEOUT_MS = 5_000;
+
+/**
+ * POST the payload to `OPS_ALERT_WEBHOOK_URL` (a secret). Returns null when no
+ * webhook is configured, otherwise whether it answered 2xx. NEVER THROWS, and
+ * never logs the URL (it usually embeds a token).
+ */
+/** The configured webhook URL (trimmed), or null. */
+export function opsWebhookUrl(env: Pick<Env, "OPS_ALERT_WEBHOOK_URL">): string | null {
+  return env.OPS_ALERT_WEBHOOK_URL?.trim() || null;
+}
+
+export async function postOpsWebhook(
+  env: Pick<Env, "OPS_ALERT_WEBHOOK_URL">,
+  payload: OpsWebhookPayload,
+  fetchFn: typeof fetch = fetch,
+): Promise<boolean | null> {
+  const url = opsWebhookUrl(env);
+  if (!url) return null;
+  try {
+    const res = await fetchFn(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(OPS_WEBHOOK_TIMEOUT_MS),
+    });
+    // Drain so the connection is released; the body is never used.
+    await res.body?.cancel().catch(() => {});
+    if (!res.ok) {
+      console.error(`event=ops_webhook_failed key=${payload.key} status=${res.status}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error(
+      `event=ops_webhook_failed key=${payload.key} error=${JSON.stringify(err instanceof Error ? `${err.name}: ${err.message}` : String(err))}`,
+    );
+    return false;
+  }
+}
+
+export interface NotifyResult {
+  /** Recipients whose email send returned ok. */
+  emailed: number;
+  /** Recipients whose email send failed. */
+  emailFailed: number;
+  /** Webhook outcome: null = not configured / not requested. */
+  webhook: boolean | null;
+  /** True when at least one channel delivered. */
+  delivered: boolean;
+}
+
+/**
+ * Fan one operator message out to EVERY recipient (one email each, so one bad
+ * address never blocks the rest) and, when `webhook` is set, ONE webhook POST.
+ * No dedupe here — callers own that (raiseOpsAlert, the health check). NEVER
+ * THROWS.
+ */
+export async function notifyOperators(
+  env: Env,
+  sender: EmailSender | undefined,
+  msg: {
+    subject: string;
+    text: string;
+    key: string;
+    severity: OpsSeverity;
+    now: Date;
+    /** Also POST the webhook (alerts + the daily line; the weekly digest is email-only). */
+    webhook: boolean;
+    /** Webhook body text; defaults to subject + text. */
+    webhookText?: string;
+    fetchFn?: typeof fetch;
+  },
+): Promise<NotifyResult> {
+  let emailed = 0;
+  let emailFailed = 0;
+  const recipients = operatorRecipients(env);
+  if (sender && recipients.length > 0) {
+    for (const to of recipients) {
+      try {
+        const r = await sender.sendOps({ to, subject: msg.subject, text: msg.text });
+        if (r.ok) emailed++;
+        else {
+          emailFailed++;
+          console.error(`event=ops_email_send_failed key=${msg.key} sender=${sender.kind} error=${JSON.stringify(r.error)}`);
+        }
+      } catch (err) {
+        emailFailed++;
+        console.error(`event=ops_email_send_failed key=${msg.key} error=${JSON.stringify(String(err))}`);
+      }
+    }
+  } else {
+    console.error(
+      `event=ops_email_skipped key=${msg.key} reason=${recipients.length === 0 ? "no_operator_alert_email" : "no_sender"}`,
+    );
+  }
+  const webhook = msg.webhook
+    ? await postOpsWebhook(
+        env,
+        {
+          text: (msg.webhookText ?? `${msg.subject}\n\n${msg.text}`).slice(0, 4000),
+          severity: msg.severity,
+          key: msg.key,
+          at: msg.now.toISOString(),
+        },
+        msg.fetchFn,
+      )
+    : null;
+  return { emailed, emailFailed, webhook, delivered: emailed > 0 || webhook === true };
+}
+
+/**
+ * Raise one deduped operator alert. Returns whether it was delivered on any
+ * channel (an email to at least one recipient, or the webhook), so a caller
+ * can log the difference between "condition seen" and "operator told".
  *
  * NEVER THROWS. Every call site is already handling a failure, and an alert
  * that escalates into a second exception would replace a recoverable problem
  * with an unhandled one — in a cron tick, that means the jobs after it never
  * run. A send failure is logged and swallowed.
  *
+ * Dedupe is per KEY across all channels: one hourly window covers every
+ * recipient and the webhook together.
+ *
  * The structured log is emitted regardless of dedupe or delivery, so the trail
- * is complete even when the email is suppressed.
+ * is complete even when the alert is suppressed.
  */
 export async function raiseOpsAlert(
   env: Env,
   sender: EmailSender | undefined,
-  opts: { key: string; subject: string; text: string; now: Date },
+  opts: { key: string; subject: string; text: string; now: Date; severity?: OpsSeverity; fetchFn?: typeof fetch },
 ): Promise<boolean> {
   console.error(`event=ops_alert key=${opts.key} detail=${JSON.stringify(opts.subject)}`);
   try {
-    if (!sender) return false;
-    const to = env.OPERATOR_ALERT_EMAIL;
-    if (!to) {
-      console.error("event=ops_alert_skipped reason=no_operator_alert_email");
+    if (!sender && !opsWebhookUrl(env)) return false;
+    if (operatorRecipients(env).length === 0 && !opsWebhookUrl(env)) {
+      console.error("event=ops_alert_skipped reason=no_operator_channel");
       return false;
     }
     if (!(await shouldAlert(env.DB, opts.key, opts.now))) return false;
 
     const envName = env.ENVIRONMENT ?? "unknown";
-    const result = await sender.sendOps({
-      to,
+    const result = await notifyOperators(env, sender, {
       subject: `[parachute-cloud ${envName}] ${opts.subject}`,
       text: opts.text,
+      key: opts.key,
+      severity: opts.severity ?? "warning",
+      now: opts.now,
+      webhook: true,
+      fetchFn: opts.fetchFn,
     });
-    if (!result.ok) {
-      console.error(`event=ops_alert_send_failed key=${opts.key} error=${JSON.stringify(result.error)}`);
+    if (!result.delivered) {
+      console.error(`event=ops_alert_send_failed key=${opts.key}`);
       return false;
     }
     await markAlerted(env.DB, opts.key, opts.now);
+    await bumpOpsCounter(env.DB, "alert", opts.now);
     return true;
   } catch (err) {
     console.error(

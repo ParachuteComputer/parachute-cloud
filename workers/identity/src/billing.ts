@@ -78,6 +78,7 @@ import {
   jsonResponse,
   redirectResponse,
   resolveBoundOrigins,
+  billingModeOf,
 } from "./oauth-shared.ts";
 import { renderRedirectBridge } from "./ui.ts";
 import { verifyCsrfToken } from "./csrf.ts";
@@ -87,10 +88,11 @@ import {
   type BillingInterval,
   billingConfig,
   billingNotConfiguredResponse,
+  billingPausedResponse,
   priceFor,
 } from "./billing-config.ts";
 import { makeStripe } from "./stripe-client.ts";
-import { type PaidTier, canStartCheckout, cheapestInterval, isPaidTier } from "./plans.ts";
+import { type PaidTier, canStartCheckout, cheapestInterval, isExistingSubscriber, isPaidTier } from "./plans.ts";
 import { type User, setUserPlan } from "./users.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 import { readJsonBody, requireAccount } from "./account-api.ts";
@@ -347,6 +349,9 @@ export async function handleCheckoutPost(
   deps: OAuthDeps,
   overrides?: BillingOverrides,
 ): Promise<Response> {
+  // Open beta: Stripe stays dormant even with the keys present — no new
+  // subscription can start. Before the config gate, so a probe sees it.
+  if (billingModeOf(deps) !== "paid") return billingPausedResponse();
   const config = billingConfig(env);
   if (!config) return billingNotConfiguredResponse();
 
@@ -491,6 +496,12 @@ export async function handlePortalPost(
 
   const user = await sessionUser(env.DB, req, deps);
   if (!user) return redirectResponse("/login");
+  // Open beta: the portal stays open ONLY for an existing paying subscriber
+  // (so they can see or cancel what they pay); everyone else has nothing to
+  // manage.
+  if (billingModeOf(deps) !== "paid" && !isExistingSubscriber(user.plan, user.stripeSubscriptionId)) {
+    return billingPausedResponse();
+  }
   const form = await req.formData();
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
     return redirectResponse("/console?billing_err=session");
@@ -543,6 +554,10 @@ export async function handleAccountBillingPortalPost(
 ): Promise<Response> {
   const auth = await requireAccount(env.DB, req, deps, "admin");
   if (!auth.ok) return auth.response;
+  // Open beta: existing paying subscribers only (see handlePortalPost).
+  if (billingModeOf(deps) !== "paid" && !isExistingSubscriber(auth.user.plan, auth.user.stripeSubscriptionId)) {
+    return billingPausedResponse();
+  }
 
   const config = billingConfig(env);
   if (!config) return billingNotConfiguredResponse();
@@ -605,6 +620,8 @@ export async function handleAccountBillingCheckoutPost(
 ): Promise<Response> {
   const auth = await requireAccount(env.DB, req, deps, "admin");
   if (!auth.ok) return auth.response;
+  // Open beta: no new subscriptions (auth-first, this surface's convention).
+  if (billingModeOf(deps) !== "paid") return billingPausedResponse();
 
   const body = await readJsonBody(req);
   const rawTier = typeof body.tier === "string" ? body.tier : "";

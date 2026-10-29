@@ -29,7 +29,7 @@
  */
 import type { Env } from "./env.ts";
 import type { EmailSender } from "./email.ts";
-import type { OAuthDeps } from "./oauth-shared.ts";
+import { type OAuthDeps, billingModeOf } from "./oauth-shared.ts";
 import { type VaultEntitlement, entitlementPlanFor, isPlanId, planEntitlement } from "./plans.ts";
 import { type ResolvedVaultEntitlement, pushVaultCap, readVaultUsage } from "./vault-call.ts";
 import { getUserById } from "./users.ts";
@@ -154,20 +154,25 @@ async function reconcileVaultEntitlement(
     return NO_PUSH;
   }
 
-  const snapshotExpected = planEntitlement(entitlementPlanFor(v.plan, v.pending_plan));
-  if (resolvedEntitlementMatches(entitlement, snapshotExpected)) return NO_PUSH;
+  // T-318 (Codex): a vault still LOCKED for a live owner (the snapshot only
+  // holds owners with deleted_at IS NULL) is a failed unlock from an undo —
+  // a drift like any other, repaired here with `reopen` so a transient vault
+  // outage during undo never strands a restored account.
+  const stuckClosed = entitlement.closed === true;
+  const snapshotExpected = planEntitlement(entitlementPlanFor(v.plan, v.pending_plan, billingModeOf(deps)));
+  if (!stuckClosed && resolvedEntitlementMatches(entitlement, snapshotExpected)) return NO_PUSH;
 
   // Mismatch per the snapshot — re-read the owner FRESH before pushing
   // anything (review D1).
   const freshUser = await getUserById(db, v.owner_user_id);
-  if (!freshUser) {
+  if (!freshUser || (stuckClosed && freshUser.deletedAt !== null)) {
     // Deleted between the snapshot and here — not this rollup's place to
     // push anything for an owner that may no longer exist.
     console.log(`event=entitlement_reconcile_skipped_owner_missing vault=${v.name}`);
     return NO_PUSH;
   }
-  const freshExpected = planEntitlement(entitlementPlanFor(freshUser.plan, freshUser.pendingPlan));
-  if (resolvedEntitlementMatches(entitlement, freshExpected)) {
+  const freshExpected = planEntitlement(entitlementPlanFor(freshUser.plan, freshUser.pendingPlan, billingModeOf(deps)));
+  if (!stuckClosed && resolvedEntitlementMatches(entitlement, freshExpected)) {
     // The owner's plan changed since the snapshot and the DO ALREADY
     // reflects the new truth (e.g. a concurrent checkout's own push landed
     // first) — pushing the stale snapshot value now would clobber a correct,
@@ -179,7 +184,7 @@ async function reconcileVaultEntitlement(
   // Push the FRESH truth, never the stale snapshot — closes the race window
   // even when the owner's plan changed to a THIRD value, not just back to
   // one that happens to already match the DO.
-  const push = await pushVaultCap(db, deps, v.owner_user_id, v.name, freshExpected);
+  const push = await pushVaultCap(db, deps, v.owner_user_id, v.name, freshExpected, { reopen: stuckClosed });
   // Emit the issue-specified event for every detected (and still-current)
   // mismatch. The additive `ok` field lets operators distinguish a repaired
   // vault from a best-effort push that still needs the next daily tick.
@@ -273,11 +278,11 @@ export async function runUsageRollup(
         now,
       });
       await env.DB.prepare(
-        `INSERT INTO vault_usage (vault_name, day, db_bytes, r2_bytes, transcribe_minutes) VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO vault_usage (vault_name, day, db_bytes, r2_bytes, transcribe_minutes, notes_changed_24h) VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(vault_name, day) DO UPDATE SET db_bytes = excluded.db_bytes, r2_bytes = excluded.r2_bytes,
-           transcribe_minutes = excluded.transcribe_minutes`,
+           transcribe_minutes = excluded.transcribe_minutes, notes_changed_24h = excluded.notes_changed_24h`,
       )
-        .bind(v.name, day, usage.dbBytes, usage.r2Bytes, usage.transcribeMinutes)
+        .bind(v.name, day, usage.dbBytes, usage.r2Bytes, usage.transcribeMinutes, usage.notesChanged24h)
         .run();
       recorded++;
 

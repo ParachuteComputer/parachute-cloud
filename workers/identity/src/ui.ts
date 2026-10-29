@@ -7,6 +7,9 @@
 // Plan copy renders from plans.ts (the single source of truth for
 // entitlements + display strings) — the console can never drift from it.
 import {
+  type BillingMode,
+  OPEN_BETA_LONG,
+  OPEN_BETA_SHORT,
   PAID_TIERS,
   PLAN_SPECS,
   TIER_PRICE_LABEL,
@@ -229,11 +232,14 @@ export function renderLogin(opts: {
   showPassword?: boolean;
   /** Opens the "have a code?" disclosure with `error` shown there instead. */
   showCode?: boolean;
+  /** The connecting app's display name (untrusted DCR `client_name`), when known. */
+  clientName?: string | null;
 }): string {
-  const { params, csrfToken, error, showPassword, showCode } = opts;
+  const { params, csrfToken, error, showPassword, showCode, clientName } = opts;
+  const heading = clientName ? `Sign in to connect ${esc(clientName)}` : "Sign in to Parachute";
   return page(
     "Sign in — Parachute",
-    `<h1>Sign in to Parachute</h1>
+    `<h1>${heading}</h1>
      <div class="card">
        <form method="post" action="/auth/magic">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -294,7 +300,7 @@ export interface ConsentProps {
   issuerHost: string;
   /** The authenticated account approving this grant — the "Signed in as" line. */
   email: string;
-  /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `buildAuthorizeUrl`). */
+  /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `authorizeResumePath`). */
   notYouNext: string;
   /**
    * hub#689 port — the owner-elected read/write/admin selector, or null. Set
@@ -356,7 +362,9 @@ export interface OwnerVerbSelector {
  * landing on `/login` byte-identical to before this line existed.
  */
 function signedInAsLine(email: string, csrfToken: string, next?: string): string {
-  return `<p class="muted" data-testid="signed-in-as" style="margin:0 0 1rem">Signed in as <strong>${esc(email)}</strong> &middot; <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}">${next ? `<input type="hidden" name="next" value="${esc(next)}">` : ""}<button class="linkbtn" type="submit">Not you?</button></form></p>`;
+  // A <div>, not a <p>: the inline logout <form> would otherwise end the
+  // paragraph and drop "Not you?" onto its own line.
+  return `<div class="muted" data-testid="signed-in-as" style="margin:0 0 1rem">Signed in as <strong>${esc(email)}</strong> &middot; <form class="inline" method="post" action="/logout"><input type="hidden" name="__csrf" value="${esc(csrfToken)}">${next ? `<input type="hidden" name="next" value="${esc(next)}">` : ""}<button class="linkbtn" type="submit">Not you?</button></form></div>`;
 }
 
 function scopeLabel(scope: string): string {
@@ -384,9 +392,9 @@ export function describeScopes(scopes: string[]): Array<{ scope: string; label: 
  * consent CSP is untouched. The submit path re-validates ownership server-side,
  * so this list is UX, not the security boundary.
  */
-function renderVaultPicker(ownedVaults: string[]): string {
+function renderVaultPicker(ownedVaults: string[], clientName: string): string {
   if (ownedVaults.length === 0) {
-    return `<p class="muted" data-testid="no-vaults" style="margin:.85rem 0 0">You don't have a vault yet — <a href="/console">create one</a>, then reconnect to authorize it.</p>`;
+    return `<p data-testid="no-vaults" style="margin:.85rem 0 0">You don't have a vault yet. <a href="/console">Make your first vault</a>, then go back to ${esc(clientName)} and connect again.</p>`;
   }
   const options = ownedVaults
     .map((name, i) => `<option value="${esc(name)}"${i === 0 ? " selected" : ""}>${esc(name)}</option>`)
@@ -495,23 +503,29 @@ export function renderConsent(props: ConsentProps): string {
   const scopeList = scopeDescriptions
     .map((s) => `<li><strong>${esc(s.label)}</strong><br><span class="muted">${esc(s.scope)}</span></li>`)
     .join("\n");
-  const vaultDisplay = lockedVault ? `<p class="muted">Vault: <strong>${esc(lockedVault)}</strong></p>` : "";
   const vaultField = lockedVault
     ? `<input type="hidden" name="vault_pick" value="${esc(lockedVault)}">`
     : needsVaultPick
-      ? renderVaultPicker(ownedVaults)
+      ? renderVaultPicker(ownedVaults, clientName)
       : "";
+  // Nothing to pick: an Allow here could only fail ("Vault required").
+  const nothingToPick = !lockedVault && needsVaultPick && ownedVaults.length === 0;
   const verbSelectorField = verbSelector ? renderVerbSelector(verbSelector) : "";
   const accountVaultsField = accountVaults ? renderAccountVaultsBlock(accountVaults) : "";
+  const ask = consentAsk({
+    clientName,
+    scopes: scopeDescriptions.map((s) => s.scope),
+    lockedVault,
+    needsVaultPick,
+    account: accountVaults !== null,
+  });
   return page(
-    "Authorize — Parachute",
-    `<h1>Authorize ${esc(clientName)}</h1>
-     <p class="muted" style="margin:0 0 .3rem">issued by <strong>${esc(issuerHost)}</strong></p>
+    `Connect ${clientName} — Parachute`,
+    `<h1>Connect ${esc(clientName)}</h1>
      ${signedInAsLine(email, csrfToken, notYouNext)}
      <div class="card">
-       <p class="muted"><strong>${esc(clientName)}</strong> is requesting access to:</p>
+       <p class="lead" data-testid="consent-ask">${ask}</p>
        <ul class="scopes">${scopeList}</ul>
-       ${vaultDisplay}
        <form method="post" action="/oauth/authorize">
          <input type="hidden" name="__action" value="consent">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -521,17 +535,69 @@ export function renderConsent(props: ConsentProps): string {
          ${accountVaultsField}
          <div class="row">
            <button class="deny" type="submit" name="decision" value="deny">Deny</button>
-           <button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Approve</button>
+           ${nothingToPick ? "" : `<button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Allow</button>`}
          </div>
        </form>
-     </div>`,
+       <p class="muted" style="margin:.9rem 0 0">You can disconnect it anytime from your vault's settings.</p>
+     </div>
+     <p class="muted foot">issued by <strong>${esc(issuerHost)}</strong></p>`,
   );
 }
 
-export function renderError(opts: { title: string; message: string }): string {
+/**
+ * The plain one-line ask at the top of the consent card — names the app and
+ * the vault: "Claude wants to read and write notes in my-notes." The verb comes
+ * from the strongest vault verb requested (admin > write > read); the vault
+ * from the `vault=` hint, else the single named vault in the (resource-
+ * narrowed) scopes, else the picker below. Account-vaults requests (one
+ * connection across vaults) say so instead. `clientName` is untrusted (a
+ * self-registered DCR `client_name`) — escaped, like every name here.
+ */
+export function consentAsk(opts: {
+  clientName: string;
+  scopes: readonly string[];
+  lockedVault: string | null;
+  needsVaultPick: boolean;
+  account: boolean;
+}): string {
+  const who = `<strong>${esc(opts.clientName)}</strong>`;
+  if (opts.account) return `${who} wants to see and work with the vaults in your account.`;
+  const verbs = new Set<string>();
+  const named = new Set<string>();
+  for (const s of opts.scopes) {
+    const parts = s.split(":");
+    if (parts[0] !== "vault") continue;
+    if (parts.length === 2 && parts[1]) verbs.add(parts[1]);
+    if (parts.length === 3 && parts[1] && parts[2]) {
+      named.add(parts[1]);
+      verbs.add(parts[2]);
+    }
+  }
+  if (verbs.size === 0) return `${who} wants access to your Parachute account.`;
+  const what = verbs.has("admin")
+    ? "read, write and manage notes in"
+    : verbs.has("write")
+      ? "read and write notes in"
+      : "read notes in";
+  const single = named.size === 1 ? [...named][0]! : null;
+  const vault = opts.lockedVault ?? single;
+  const where = vault
+    ? `<strong>${esc(vault)}</strong>`
+    : opts.needsVaultPick
+      ? "the vault you choose below"
+      : "your vaults";
+  return `${who} wants to ${what} ${where}.`;
+}
+
+export function renderError(opts: { title: string; message: string; action?: { href: string; label: string } }): string {
+  // A page that stops someone says what to do next and links to it (T-318
+  // night: "Link expired" and "Vault required" were dead ends).
+  const action = opts.action
+    ? `<a class="primary" style="display:block;text-align:center;text-decoration:none;padding:.62rem 1rem;margin-top:.9rem" href="${esc(opts.action.href)}">${esc(opts.action.label)}</a>`
+    : "";
   return page(
     opts.title,
-    `<h1>${esc(opts.title)}</h1><div class="card"><p>${esc(opts.message)}</p></div>`,
+    `<h1>${esc(opts.title)}</h1><div class="card"><p>${esc(opts.message)}</p>${action}</div>`,
   );
 }
 
@@ -637,14 +703,22 @@ function codeForm(csrfToken: string, email: string | undefined, error: string | 
 }
 
 /** Signup — create a cloud account. Magic-link default; password in the disclosure. */
-export function renderSignup(opts: { csrfToken: string; error?: string; email?: string; showPassword?: boolean }): string {
+export function renderSignup(opts: {
+  csrfToken: string;
+  error?: string;
+  email?: string;
+  showPassword?: boolean;
+  billingMode?: BillingMode;
+}): string {
   const { csrfToken, error, email, showPassword } = opts;
+  const pricing =
+    opts.billingMode === "paid" ? `From $1/mo · ${TRIAL_LENGTH_COPY} free · no card to start` : OPEN_BETA_SHORT;
   return page(
     "Create your account — Parachute",
     `<h1>Create your account</h1>
      <div class="lead" data-testid="signup-context">
        <p style="margin:.2rem 0 .5rem">A private vault your AI can read and write — your notes, and everything you want it to remember, in one place you own.</p>
-       <p class="pricepill" data-testid="signup-pricing">From $1/mo · ${TRIAL_LENGTH_COPY} free · no card to start</p>
+       <p class="pricepill" data-testid="signup-pricing">${esc(pricing)}</p>
      </div>
      <div class="card">
        ${magicForm(csrfToken, email, "Email me a sign-in link", showPassword ? undefined : error)}
@@ -657,7 +731,7 @@ export function renderSignup(opts: { csrfToken: string; error?: string; email?: 
            <input id="pw-email" name="email" type="email" autocomplete="username" value="${esc(email ?? "")}" required>
            <label for="password">Password</label>
            <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
-           <p class="muted" style="margin:.35rem 0 0">At least 8 characters.</p>
+           <p class="muted" style="margin:.35rem 0 0">At least 8 characters. We'll email you a link to confirm the address first.</p>
            ${showPassword && error ? `<div class="err">${esc(error)}</div>` : ""}
            <button class="secondary" type="submit">Create account with a password</button>
          </form>
@@ -706,23 +780,32 @@ export function renderConsoleLogin(opts: {
            <input id="su-email" name="email" type="email" autocomplete="username" required>
            <label for="su-password">Password</label>
            <input id="su-password" name="password" type="password" autocomplete="new-password" minlength="8" required>
-           <p class="muted" style="margin:.35rem 0 0">At least 8 characters.</p>
+           <p class="muted" style="margin:.35rem 0 0">At least 8 characters. We'll email you a link to confirm the address first.</p>
            <button class="secondary" type="submit">Create account with a password</button>
          </form>
        </details>
      </div>
-     <div class="foot" data-testid="login-signup-door">New to Parachute? <a href="/signup"><strong>Create your free account</strong></a></div>`,
+     <div class="foot" data-testid="login-signup-door">New to Parachute? <a href="/signup"><strong>Create your account</strong></a></div>`,
   );
 }
 
-/** "Check your email" — the neutral response to a magic-link request (no enumeration). */
-export function renderMagicSent(opts: { email: string; csrfToken: string }): string {
+/**
+ * "Check your email" — the neutral response to a magic-link request (no
+ * enumeration). `signup` is the password sign-up's variant (POST /signup): the
+ * same page whether or not the address already has an account, so its copy
+ * covers both and never says which.
+ */
+export function renderMagicSent(opts: { email: string; csrfToken: string; signup?: boolean }): string {
+  const lead = opts.signup
+    ? `<p>We sent a link to <strong>${esc(opts.email)}</strong>. Open it to confirm the address is yours. Your account is created only then. If the address already has an account, the link signs you in and nothing about it changes.</p>
+       <p class="muted" data-testid="signup-same-browser">Open the link in this browser to keep the password you chose. Opened anywhere else, it still signs you in, and you can set a password later under Security. The link works once and expires in 10 minutes.</p>`
+    : `<p>If <strong>${esc(opts.email)}</strong> has (or can have) a Parachute account, a sign-in link is on its way.</p>
+       <p class="muted">The link works once and expires in 10 minutes. You can close this tab — open the link from your email to continue.</p>`;
   return page(
     "Check your email — Parachute",
     `<h1>Check your email</h1>
      <div class="card">
-       <p>If <strong>${esc(opts.email)}</strong> has (or can have) a Parachute account, a sign-in link is on its way.</p>
-       <p class="muted">The link works once and expires in 10 minutes. You can close this tab — open the link from your email to continue.</p>
+       ${lead}
        <details open>
          <summary>Have the code instead?</summary>
          <p class="muted" style="margin:.35rem 0 .5rem">Click the link in the email — or type the 6-digit code from it here.</p>
@@ -993,6 +1076,8 @@ export interface ConsoleProps {
   totalUsedBytes?: number | null;
   /** At/over the plan's vault count → the create form yields to the at-cap note. */
   atVaultCap: boolean;
+  /** The stored pending plan, so the at-cap note names the real limit (a former Power subscriber keeps ten). */
+  pendingPlan?: PlanId | null;
   /** Operator account → the quiet "Admin" header link (/admin). */
   isOperator?: boolean;
   /**
@@ -1011,6 +1096,20 @@ export interface ConsoleProps {
   mockBillingEnabled?: boolean;
   /** The user has a Stripe customer (false for comped accounts). */
   hasBillingAccount?: boolean;
+  /**
+   * The money switch (billing-config.ts). Unset = open_beta. In open beta the
+   * plan line reads the beta, the plan cards / tier picker / promo box are
+   * replaced by the one money story, and no trial clock or Upgrade renders.
+   * console.ts also passes `plan` through livePlan, so `expired` never reaches
+   * this view in open beta.
+   */
+  billingMode?: BillingMode;
+  /**
+   * Open beta only: an EXISTING paying subscriber (paid tier + live Stripe
+   * subscription) keeps a "Manage billing" door so they can see or cancel what
+   * they pay — the beta must never trap someone in a charge.
+   */
+  subscriberPortal?: boolean;
   /**
    * Whether the account may START a checkout / redeem a promo (plans.ts
    * canStartCheckout: a trial or expired account with no live subscription).
@@ -1053,19 +1152,21 @@ function connectAiContent(v: ConsoleVaultCard): string {
     <div class="connect-block">
       <h4>Claude</h4>
       <ol class="steps">
-        <li>Open <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> and go to <strong>Settings → Connectors</strong></li>
-        <li>Choose <strong>Add custom connector</strong></li>
-        <li>Paste the URL above and connect</li>
+        <li>Open <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> and go to <strong>Customize → Connectors</strong></li>
+        <li>Click <strong>+ Add</strong>, then <strong>Add custom connector</strong></li>
+        <li>Paste the URL above, click <strong>Continue</strong>, and allow access when Parachute asks</li>
       </ol>
+      <p class="muted" style="margin:.2rem 0 0">On Claude&#39;s free plan you can add one custom connector.</p>
     </div>
     <div class="connect-block">
       <h4>ChatGPT</h4>
       <ol class="steps">
-        <li>Open ChatGPT and go to <strong>Settings → Connectors</strong> (available on paid plans)</li>
-        <li>In your connector settings, add a custom connector / MCP server</li>
+        <li>Open ChatGPT&#39;s <strong>Settings</strong> and find <strong>Apps &amp; Connectors</strong> (custom connectors need a paid plan, and may need Developer mode turned on)</li>
+        <li>Create a custom connector / MCP server</li>
         <li>Paste the URL above and connect</li>
       </ol>
     </div>
+    <p class="muted" style="margin:.65rem 0 0">Disconnect anytime from your vault&#39;s settings in the app.</p>
     <p class="muted" style="margin:.65rem 0 0"><strong>Other AIs:</strong> that same URL works in any MCP-compatible client — paste it wherever your AI asks for an MCP server.</p>
     <p class="muted" style="margin:.45rem 0 0">Command line: <code>${esc(v.connectCmd)}</code></p>
     <p class="muted" style="margin:.45rem 0 0">Need more detail? See the <a href="https://parachute.computer/guides/connect-your-ai/" target="_blank" rel="noopener">Connect your AI guide</a>.</p>`;
@@ -1551,7 +1652,10 @@ export function renderConsole(props: ConsoleProps): string {
     hasBillingAccount,
     canCheckout,
     trial,
+    subscriberPortal,
   } = props;
+  const mode: BillingMode = props.billingMode === "paid" ? "paid" : "open_beta";
+  const openBeta = mode === "open_beta";
   // Plan display. The across-vaults usage total (latest rollup rows) rides the
   // plan line. The plan-line TEXT depends on state: a trial user gets the
   // "you're trying <Tier> — N days left" banner (trial.tierLabel from
@@ -1569,7 +1673,7 @@ export function renderConsole(props: ConsoleProps): string {
       ? ` <span data-testid="usage-total">&middot; Using ${esc(formatUsageBytes(totalUsedBytes))}</span>`
       : "";
   const manageBillingHtml =
-    isPaidTier(plan) && billingConfigured && hasBillingAccount
+    isPaidTier(plan) && hasBillingAccount && (openBeta ? subscriberPortal === true : billingConfigured)
       ? ` <form class="inline" method="post" action="/billing/portal" data-testid="manage-billing">
            <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
            <span style="opacity:.75">&middot;</span> <button class="linkbtn" type="submit">Manage billing</button>
@@ -1586,14 +1690,19 @@ export function renderConsole(props: ConsoleProps): string {
   // The plan-line lead text: the trial banner (with a "Change plan" jump to the
   // cards) when trialing, else the plan's spec line.
   const planLead =
-    plan === "trial" && trial
+    !openBeta && plan === "trial" && trial
       ? `<span data-testid="trial-banner">${esc(trialBannerLine(trial.tierLabel, trial.isDefault, trial.daysLeft))}</span> <a href="#plans" data-testid="change-plan">Change plan</a>`
-      : esc(planLine(plan));
+      : esc(planLine(plan, mode));
   const planHtml = `${planLead}${planUntilHtml}${usageHtml}${manageBillingHtml}`;
   // The always-visible plan cards — for checkout-eligible (trial/expired) users
   // only; a paid tier / live-sub account uses Manage billing and never sees it.
-  const plansSectionHtml =
-    canCheckout === true
+  // OPEN BETA: no plan grid, no picker, no Subscribe — the one money story.
+  const plansSectionHtml = openBeta
+    ? `<section id="plans" data-testid="open-beta" style="margin:0 0 1.1rem">
+       <h2 style="margin:0 0 .4rem;font-size:1rem">Plan</h2>
+       <p class="muted" data-testid="open-beta-story" style="margin:0">${esc(OPEN_BETA_LONG)}</p>
+     </section>`
+    : canCheckout === true
       ? renderPlanCards({
           csrfToken,
           plan,
@@ -1607,7 +1716,7 @@ export function renderConsole(props: ConsoleProps): string {
   // A quiet disclosure under the plan line: present for launch codes, invisible
   // noise otherwise. Inline styles undo the details/input defaults.
   const promoHtml =
-    canCheckout
+    canCheckout && !openBeta
       ? `<details data-testid="promo-code" style="margin:-.9rem 0 1.2rem;border-top:0;padding-top:0;font-size:.88rem">
        <summary class="muted" style="font-weight:500">Have a code?</summary>
        <form method="post" action="/console/promo" style="display:flex;gap:.5rem;align-items:center;margin-top:.45rem;max-width:22rem">
@@ -1649,7 +1758,7 @@ export function renderConsole(props: ConsoleProps): string {
   const createCard = atVaultCap
     ? `<div class="card" data-testid="vault-cap">
        <h2>Create a vault</h2>
-       <p class="muted" style="margin:.35rem 0 0">${esc(vaultCapMessage(plan))}</p>
+       <p class="muted" style="margin:.35rem 0 0">${esc(vaultCapMessage(plan, mode, props.pendingPlan ?? null))}</p>
        ${error ? `<div class="err">${esc(error)}</div>` : ""}
      </div>`
     : `<div class="card">

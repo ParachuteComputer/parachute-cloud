@@ -243,9 +243,15 @@ async function main() {
     const su = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
     assert(su.status === 302 && su.headers.get("location") === `${MY}/`, "cloud./signup → 302 my./ (handler front door, unchanged)", `status ${su.status} → ${su.headers.get("location")}`);
 
+    // ONE-PASS CONNECT (T-318, oauth-authorize.ts authorizeHomeRedirect): a browser GET of cloud./oauth/authorize
+    // is handed to my. with path + query byte-identical, so the consent page sees the my. session. A POST is still
+    // served in place (not probed here: it would need a form body).
+    const authzQ = "/oauth/authorize?client_id=unknown&redirect_uri=https%3A%2F%2Fx.example%2Fcb&response_type=code";
+    const authz = await fetch(`${IDENTITY}${authzQ}`, { redirect: "manual" });
+    assert(authz.status === 302 && authz.headers.get("location") === `${MY}${authzQ}`, "cloud. GET /oauth/authorize → 302 my. (path+query preserved)", `status ${authz.status} → ${authz.headers.get("location")}`);
+
     // MUST-NEVER-REDIRECT: machine paths on cloud. keep serving (never 3xx→my.).
     const machinePaths = [
-      "/oauth/authorize?client_id=unknown&redirect_uri=https%3A%2F%2Fx.example%2Fcb&response_type=code",
       `/auth/verify?token=bogus-${Date.now()}`,
       `/unsubscribe?t=bogus-${Date.now()}`,
       "/.well-known/oauth-authorization-server",
@@ -314,6 +320,26 @@ async function main() {
     assert(usage.status === 404, "PRODUCTION: /__test/usage-run does not exist (404)", `status ${usage.status}`);
     const snap = await fetch(`${IDENTITY}/__test/snapshot-run`, { method: "POST" });
     assert(snap.status === 404, "PRODUCTION: /__test/snapshot-run does not exist (404)", `status ${snap.status}`);
+    const daily = await fetch(`${IDENTITY}/__test/ops-daily-run`, { method: "POST" });
+    assert(daily.status === 404, "PRODUCTION: /__test/ops-daily-run does not exist (404)", `status ${daily.status}`);
+    // The operator-agent read never answers without its bearer: 404 while
+    // OPS_READ_TOKEN is unset, 401 once it is set. Either is a pass; 200 is not.
+    const opsDaily = await fetch(`${IDENTITY}/ops/daily`);
+    assert(
+      opsDaily.status === 404 || opsDaily.status === 401,
+      "PRODUCTION: /ops/daily without a bearer is refused (404 unset / 401 set)",
+      `status ${opsDaily.status}`,
+    );
+    // T-318 deletion-proof hooks: a scoped purge fast-forward and a footprint
+    // report — both must not exist in production.
+    for (const hook of ["/__test/account-delete/sweep", "/__test/account-delete/report"]) {
+      const r = await fetch(`${IDENTITY}${hook}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email: "smoke-prod-probe@example.com" }),
+      });
+      assert(r.status === 404, `PRODUCTION: ${hook} does not exist (404)`, `status ${r.status}`);
+    }
     // THE MOCK-BILLING SECURITY PIN: the interim mock-checkout endpoint is
     // hard-gated to non-production (billing-config.ts mockBillingEnabled). In
     // prod it 404s exactly like the __test/* hooks — a free self-upgrade is
@@ -333,14 +359,27 @@ async function main() {
     assert(admin.status === 404, "PRODUCTION: unauthenticated /admin → 404 (surface hidden)", `status ${admin.status}`);
   }
 
-  // 3d. Billing (Wave 4d) — state-adaptive, all state-free probes. NOT
+  // 3d. Billing (Wave 4d) — state-adaptive, all state-free probes. OPEN BETA
+  //     (T-318, the default): checkout answers 409 billing_paused. NOT
   //     CONFIGURED (until the Stripe keys land): /billing/* answers the clean
   //     503. CONFIGURED: anonymous checkout redirects to /login and an
   //     unsigned webhook is refused 400. Either state is a pass; the detail
   //     names which one this deploy is in.
   {
     const probe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
-    if (probe.status === 503) {
+    if (probe.status === 409) {
+      // OPEN BETA (T-318, BILLING_MODE unset/open_beta): checkout is paused
+      // even with Stripe keys present; the webhook stays live so any existing
+      // subscription still reconciles (an unsigned one is refused 400).
+      const body = (await probe.json()) as { error?: string };
+      assert(body.error === "billing_paused", "billing: OPEN BETA — checkout answers 409 billing_paused", String(body.error));
+      const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
+      assert(
+        webhook.status === 400 || webhook.status === 503,
+        "billing: OPEN BETA — the webhook stays wired (unsigned → 400; 503 only if keys are absent)",
+        `status ${webhook.status}`,
+      );
+    } else if (probe.status === 503) {
       const body = (await probe.json()) as { error?: string };
       assert(body.error === "billing_not_configured", "billing: NOT CONFIGURED — checkout answers the clean 503", String(body.error));
       const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
@@ -390,6 +429,8 @@ async function main() {
     // hook must NOT exist in production.
     const embedRun = await fetch(`${VAULT}/vault/${VAULT_NAME}/__test/embed-run`, { method: "POST" });
     assert(embedRun.status === 404, "PRODUCTION: /vault/<name>/__test/embed-run does not exist (404)", `status ${embedRun.status}`);
+    const purgeCheck = await fetch(`${VAULT}/vault/${VAULT_NAME}/__test/purge-check`);
+    assert(purgeCheck.status === 404, "PRODUCTION: /vault/<name>/__test/purge-check does not exist (404)", `status ${purgeCheck.status}`);
 
     // Attachment tickets (cloud#177's DO mirror): a bogus/unknown ticket id
     // answers the SAME uniform 404 as a spent/expired/wrong-vault/wrong-kind

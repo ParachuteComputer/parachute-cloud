@@ -177,6 +177,9 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
     //               navigational (the SW's nav fallback only affects GET
     //               navigations) and staging-only, so the SW needn't deny them;
     //               run_worker_first includes them as genuinely server-owned.
+    // - /ops      : ceremony-manifest-only. Bearer-authed JSON for an operator
+    //               agent (/ops/daily) — never a browser navigation, so the SW
+    //               nav fallback never sees it; run_worker_first claims it.
     // - /mcp      : identity-manifest-only for this task (parachute-cloud#196).
     //               The parachute-app SW entry `/^\/mcp(\/|$)/` is a separate
     //               follow-up in the other repo, per PR #195's Judgment call,
@@ -185,6 +188,7 @@ describe("route manifest — the run_worker_first contract (P0.4)", () => {
       swOnly: ["/api", "/u"],
       manifestOnly: [
         "/__test",
+        "/ops", // operator-agent JSON (/ops/daily, bearer) — non-navigational, like /__test; the SW needn't deny it.
         "/mcp", // cloud#196 ships the identity half; parachute-app follows separately.
       ],
     };

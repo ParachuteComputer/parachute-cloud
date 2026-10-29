@@ -48,6 +48,7 @@ import { isUnverifiable, resolveMinAssertions, STAGING_MIN_ASSERTIONS, summarize
 // core resolves from the sibling parachute-vault checkout, copied into the vault
 // worker's node_modules by `bun install` (the same explicit path test-bun uses).
 import { GETTING_STARTED_PACK, welcomePack } from "../workers/vault/node_modules/@openparachute/core/src/seed-packs.js";
+import { DEFAULT_SEED_OMITTED_TAGS } from "../workers/vault/src/welcome.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.openparachute.workers.dev").replace(/\/$/, "");
@@ -138,6 +139,33 @@ function form(o: Record<string, string>): string {
   return new URLSearchParams(o).toString();
 }
 const FORM = { "content-type": "application/x-www-form-urlencoded" };
+
+/**
+ * Password sign-up, the way a person does it since T-318 night: POST /signup
+ * only emails a link (staging echoes it in x-parachute-dev-magic-link and sends
+ * nothing); opening it in the same "browser" (the parachute_id_signup cookie)
+ * creates the account with the chosen password and a session.
+ */
+async function passwordSignup(email: string, password: string): Promise<{ csrf: string | null; session: string | null; detail: string }> {
+  const suGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
+  const csrf = cookieVal(suGet.headers.getSetCookie(), "parachute_id_csrf");
+  const suRes = await fetch(`${IDENTITY}/signup`, {
+    method: "POST",
+    headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${csrf}` },
+    redirect: "manual",
+    body: form({ __csrf: csrf!, email, password }),
+  });
+  const early = cookieVal(suRes.headers.getSetCookie(), "parachute_id_session");
+  if (early) return { csrf, session: null, detail: "POST /signup minted a session before the address was proven" };
+  const binding = cookieVal(suRes.headers.getSetCookie(), "parachute_id_signup");
+  const link = suRes.headers.get("x-parachute-dev-magic-link");
+  if (suRes.status !== 200 || !binding || !link) {
+    return { csrf, session: null, detail: `signup status ${suRes.status}, binding ${!!binding}, link ${!!link}` };
+  }
+  const verify = await fetch(link, { redirect: "manual", headers: { cookie: `parachute_id_signup=${binding}` } });
+  const session = cookieVal(verify.headers.getSetCookie(), "parachute_id_session");
+  return { csrf, session, detail: `verify status ${verify.status}` };
+}
 /**
  * Extract the cross-origin redirect target from a rendered same-origin
  * bridge page (workers/identity/src/ui.ts renderRedirectBridge — the
@@ -161,6 +189,13 @@ function bridgeTarget(html: string): string | null {
 async function main() {
   console.log(`\nSmoke: identity=${IDENTITY}\n       vault=${VAULT} (name="${VAULT_NAME}")  marker=${MARKER}\n`);
   const { email, password } = readDevSecrets();
+
+  // The money switch (T-318). The door descriptor says which mode this deploy
+  // runs; an older deploy with no `billing_mode` is the paid-shaped one.
+  const OPEN_BETA =
+    ((await (await fetch(`${IDENTITY}/.well-known/parachute-account`)).json()) as { billing_mode?: string })
+      .billing_mode === "open_beta";
+  console.log(`  billing mode: ${OPEN_BETA ? "open_beta" : "paid"}\n`);
 
   // 0. Liveness — the endpoints the ops cron + external monitors watch.
   {
@@ -547,17 +582,11 @@ async function main() {
     const newPassword = b64url(crypto.getRandomValues(new Uint8Array(18)));
     const newVault = `box-${Date.now()}`;
 
-    // Signup (GET for CSRF, then POST).
-    const suGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
-    const suCsrf = cookieVal(suGet.headers.getSetCookie(), "parachute_id_csrf");
-    const suRes = await fetch(`${IDENTITY}/signup`, {
-      method: "POST",
-      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${suCsrf}` },
-      redirect: "manual",
-      body: form({ __csrf: suCsrf!, email: newEmail, password: newPassword }),
-    });
-    const newSession = cookieVal(suRes.headers.getSetCookie(), "parachute_id_session");
-    assert(suRes.status === 302 && suRes.headers.get("location") === "/console" && !!newSession, "signup → session + /console", `status ${suRes.status}`);
+    // Password sign-up: the emailed link (echoed on staging) creates the account.
+    const su = await passwordSignup(newEmail, newPassword);
+    const suCsrf = su.csrf;
+    const newSession = su.session;
+    assert(!!newSession, "password signup → link → session", su.detail);
 
     // Create a vault (GET /console for CSRF, then POST).
     const conGet = await fetch(`${IDENTITY}/console`, { headers: { cookie: `parachute_id_session=${newSession}` }, redirect: "manual" });
@@ -588,6 +617,20 @@ async function main() {
     // path (POST /console/plan, no Stripe). The Stripe "Add a card" affordance is
     // additive on top when billing is available (mock buttons on staging today,
     // real Upgrade once keys land).
+    if (OPEN_BETA) {
+      // OPEN BETA: one money story, no clock, no grid, no Upgrade, no code box.
+      assert(
+        conHtml.includes('data-testid="open-beta-story"') &&
+          conHtml.includes("Free during the open beta.") &&
+          !conHtml.includes('data-testid="trial-banner"') &&
+          !conHtml.includes("days left") &&
+          !conHtml.includes('data-testid="plan-card-') &&
+          !conHtml.includes("$1/mo") &&
+          !conHtml.includes('data-testid="promo-code"'),
+        "OPEN BETA: console shows the money story — no countdown, plan grid, prices or promo box",
+        "",
+      );
+    } else {
     assert(
       conHtml.includes('data-testid="trial-banner"') && conHtml.includes("days left"),
       "console shows the trial banner (mirrored tier + days left)",
@@ -604,6 +647,7 @@ async function main() {
       "console shows all four plan cards + prices + the free 'Choose this plan' path (no Stripe needed)",
       "",
     );
+    }
 
     // Trial vault-count: the trial includes 5 vaults, so a 2nd create SUCCEEDS
     // (the full paid experience during the trial).
@@ -663,8 +707,8 @@ async function main() {
       // The fresh vault materialized with the DEFAULT SEED PACKS (core's
       // welcome + getting-started): exactly 6 notes (the five-guide welcome
       // ring + Getting Started, the guides-ring rewrite vault#544) + core's
-      // declared seed tags (capture + guide + pinned), before this user writes
-      // anything. Asserted dynamically against the import so core-side
+      // declared seed tags minus DEFAULT_SEED_OMITTED_TAGS (so: guide, not
+      // capture — T-318), before this user writes anything. Asserted dynamically against the import so core-side
       // vocabulary changes can't strand a stale literal pin here again.
       const expectedSeedPaths = welcomePack().notes.map((n) => n.path).concat(GETTING_STARTED_PACK.notes.map((n) => n.path));
       const seededRes = await fetch(`${VAULT}/vault/${newVault}/api/notes`, { headers: OWN_AUTH });
@@ -679,11 +723,14 @@ async function main() {
       );
       const tagRes = await fetch(`${VAULT}/vault/${newVault}/api/tags`, { headers: OWN_AUTH });
       const tagRows = (await tagRes.json()) as Array<{ name: string }>;
-      const expectedTagNames = welcomePack().tags.map((t) => t.name).sort();
+      const expectedTagNames = welcomePack()
+        .tags.map((t) => t.name)
+        .filter((n) => !DEFAULT_SEED_OMITTED_TAGS.has(n))
+        .sort();
       assert(
         tagRes.status === 200 &&
           tagRows.map((r) => r.name).sort().join(",") === expectedTagNames.join(","),
-        `fresh vault seeds exactly core's declared tag set (${expectedTagNames.join(", ")})`,
+        `fresh vault seeds core's declared tag set minus capture (${expectedTagNames.join(", ")})`,
         tagRows.map((r) => r.name).join(", "),
       );
 
@@ -1030,7 +1077,7 @@ async function main() {
         });
         const rConsent = await rResumed.text();
         assert(
-          rResumed.status === 200 && /Authorize|Approve/.test(rConsent) && rConsent.includes(rState),
+          rResumed.status === 200 && /Authorize|Approve|Allow/.test(rConsent) && rConsent.includes(rState),
           "resumed authorize renders consent for the pending request",
           `status ${rResumed.status}`,
         );
@@ -1111,7 +1158,7 @@ async function main() {
         });
         const rcConsent = await rcResumed.text();
         assert(
-          rcResumed.status === 200 && /Authorize|Approve/.test(rcConsent) && rcConsent.includes(rcState),
+          rcResumed.status === 200 && /Authorize|Approve|Allow/.test(rcConsent) && rcConsent.includes(rcState),
           "resumed-by-code authorize renders consent for the pending request",
           `status ${rcResumed.status}`,
         );
@@ -1194,18 +1241,12 @@ async function main() {
     const vaultName = `arrive-${Date.now()}`;
     const firstNote = `Remember: I am rebuilding my garden (${MARKER})`;
 
-    // Signup → session.
-    const suGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
-    const csrf = cookieVal(suGet.headers.getSetCookie(), "parachute_id_csrf");
-    const suRes = await fetch(`${IDENTITY}/signup`, {
-      method: "POST",
-      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${csrf}` },
-      redirect: "manual",
-      body: form({ __csrf: csrf!, email, password }),
-    });
-    const session = cookieVal(suRes.headers.getSetCookie(), "parachute_id_session");
+    // Signup → emailed link → session.
+    const su = await passwordSignup(email, password);
+    const csrf = su.csrf;
+    const session = su.session;
     const cookie = `parachute_id_session=${session}; parachute_id_csrf=${csrf}`;
-    assert(suRes.status === 302 && !!session, "arrival: signup → session", `status ${suRes.status}`);
+    assert(!!session, "arrival: signup → link → session", su.detail);
     arrivalCookie = cookie;
     arrivalVault = vaultName;
     arrivalEmail = email;
@@ -1531,7 +1572,18 @@ async function main() {
   {
     const conHtml = await (await fetch(`${IDENTITY}/console`, { headers: { cookie: arrivalCookie } })).text();
     const mockMode = conHtml.includes('action="/billing/mock-checkout"');
-    if (mockMode) {
+    if (OPEN_BETA) {
+      // OPEN BETA: Stripe is dormant even with keys — checkout 409s, the mock
+      // 404s, the webhook stays wired for existing subscriptions.
+      const probe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
+      const pj = (await probe.json()) as { error?: string };
+      assert(probe.status === 409 && pj.error === "billing_paused", "billing OPEN BETA: checkout → 409 billing_paused", `status ${probe.status}`);
+      const mock = await fetch(`${IDENTITY}/billing/mock-checkout`, { method: "POST", body: "", redirect: "manual" });
+      assert(mock.status === 404, "billing OPEN BETA: the mock endpoint 404s", `status ${mock.status}`);
+      const webhook = await fetch(`${IDENTITY}/billing/webhook`, { method: "POST", body: "{}" });
+      assert(webhook.status === 400 || webhook.status === 503, "billing OPEN BETA: webhook still answers (unsigned → 400)", `status ${webhook.status}`);
+      assert(!conHtml.includes('data-testid="upgrade-billing"'), "billing OPEN BETA: no Upgrade buttons on the console");
+    } else if (mockMode) {
       // The real checkout route stays config-gated (503) even in mock mode; the
       // mock is a SEPARATE endpoint.
       const realProbe = await fetch(`${IDENTITY}/billing/checkout`, { method: "POST", body: "", redirect: "manual" });
@@ -1578,20 +1630,16 @@ async function main() {
   //      landing's caps FLIP to Power (1 GiB notes + 50 GiB attach = 51 GiB), and
   //      the trial clock is unchanged. Then change to standard and assert the
   //      caps flip again — proving the free tier-change re-pushes entitlements.
-  try {
+  //      OPEN BETA: there is no tier to pick — skipped (the picker refuses
+  //      with plan_err=paused, pinned in test/open-beta).
+  if (!OPEN_BETA) try {
     const tEmail = `tier-${Date.now()}@smoke.test`;
     const tPass = b64url(crypto.getRandomValues(new Uint8Array(18)));
     const tVault = `tierbox-${Date.now()}`;
-    const tSuGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
-    const tCsrf = cookieVal(tSuGet.headers.getSetCookie(), "parachute_id_csrf");
-    const tSu = await fetch(`${IDENTITY}/signup`, {
-      method: "POST",
-      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${tCsrf}` },
-      redirect: "manual",
-      body: form({ __csrf: tCsrf!, email: tEmail, password: tPass }),
-    });
-    const tSession = cookieVal(tSu.headers.getSetCookie(), "parachute_id_session");
-    assert(tSu.status === 302 && !!tSession, "tier-change: fresh signup → session", `status ${tSu.status}`);
+    const tSu = await passwordSignup(tEmail, tPass);
+    const tCsrf = tSu.csrf;
+    const tSession = tSu.session;
+    assert(!!tSession, "tier-change: fresh signup → link → session", tSu.detail);
     const tCookie = `parachute_id_session=${tSession}; parachute_id_csrf=${tCsrf}`;
 
     const tCv = await fetch(`${IDENTITY}/console/vaults`, {

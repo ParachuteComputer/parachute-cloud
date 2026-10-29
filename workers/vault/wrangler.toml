@@ -162,6 +162,9 @@ binding = "AI"
 # deploy-time `--var` to forget). Tests use TEST_JWKS (gated on ENVIRONMENT=test),
 # so this value doesn't affect the vault vitest suite.
 ISSUER_ORIGIN = "https://cloud.parachute.computer"
+# Where a person finds their connection URL (the app front door). The seeded
+# Connect-your-AI guide names it; unset falls back to ISSUER_ORIGIN (T-318).
+CONSOLE_PUBLIC_ORIGIN = "https://my.parachute.computer"
 # ADDITIVE set of extra token `iss` values to accept beyond ISSUER_ORIGIN
 # (comma-separated). scope-guard unions this with ISSUER_ORIGIN and verifies the
 # signature FIRST regardless of `iss`, so widening it never weakens auth. UNSET =
@@ -184,6 +187,11 @@ ENVIRONMENT = "production"
 # config. Only the literal "false" disables it; flip + redeploy this worker
 # ONLY (the pinned vault-worker-only ladder) to turn it off in an incident.
 EMBEDDINGS_ENABLED = "true"
+# The money switch (T-318) — the SAME var as the identity worker's. Anything
+# but "paid" (including unset) is the open beta: this worker then never
+# refuses a write as `plan_required`, whatever `frozen` flag a vault's stored
+# config still carries (src/caps.ts writesFrozen). Flip both workers together.
+BILLING_MODE = "open_beta"
 
 # A single incoming request's CPU budget resets per message; a large import that
 # arrives as one request may exceed the 30s default. Raise the ceiling.
@@ -229,6 +237,7 @@ binding = "AI"
 # workers/identity/wrangler.toml) — staging vaults trust the STAGING issuer.
 [env.staging.vars]
 ISSUER_ORIGIN = "https://parachute-identity-staging.openparachute.workers.dev"
+CONSOLE_PUBLIC_ORIGIN = "https://parachute-identity-staging.openparachute.workers.dev"
 # ADDITIVE extra-`iss` set (see the top-level [vars] note). UNSET = today's
 # single-ISSUER_ORIGIN match. The staging soak first runs it unset (behavior
 # unchanged), then sets a synthetic second value pointing at the SAME staging
@@ -240,6 +249,8 @@ CAP_BYTES = "1073741824"
 ENVIRONMENT = "staging"
 # Semantic search off switch (C2, EXPERIMENTAL) — see the top-level [vars] note.
 EMBEDDINGS_ENABLED = "true"
+# Money switch — restated per env; see the top-level [vars] note.
+BILLING_MODE = "open_beta"
 
 # Workers Logs for staging too (explicit per-env restatement; see the top-level
 # [observability] note).

@@ -41,8 +41,8 @@
  *     tarball into THAT.
  */
 import type { Env } from "./env.ts";
-import type { OAuthDeps } from "./oauth-shared.ts";
-import { PLAN_SPECS, coercePlanId, type SnapshotRetention } from "./plans.ts";
+import { type OAuthDeps, billingModeOf } from "./oauth-shared.ts";
+import { PLAN_SPECS, coercePlanId, livePlan, type SnapshotRetention } from "./plans.ts";
 import { callVaultApi } from "./vault-call.ts";
 
 /**
@@ -127,7 +127,7 @@ export async function runSnapshotSweep(
   let failed = 0;
   for (const v of vaults) {
     try {
-      const retention: SnapshotRetention = PLAN_SPECS[coercePlanId(v.plan)].snapshot_retention;
+      const retention: SnapshotRetention = PLAN_SPECS[livePlan(coercePlanId(v.plan), billingModeOf(deps))].snapshot_retention;
       const resp = await callVaultApi(env.DB, deps, {
         userId: v.owner_user_id,
         vaultName: v.name,
