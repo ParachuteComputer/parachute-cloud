@@ -10,8 +10,8 @@
  *   - A-1 (migration 0023 + the read-time chokepoints): `users.deleted_at` is
  *     the tombstone. Every surface that can ACT on an account already refuses a
  *     tombstoned row — the bearer gate, the session JOIN, both password logins,
- *     magic-link request/consume, the drip, and the billing/usage/snapshot
- *     sweeps. THIS MODULE IS THE FIRST THING THAT WRITES THAT COLUMN. Because
+ *     magic-link request/consume, the /oauth/token mint (both grants), the
+ *     drip, and the billing/usage/snapshot sweeps. THIS MODULE IS THE FIRST THING THAT WRITES THAT COLUMN. Because
  *     A-1 is already everywhere, the instant the tombstone lands the account
  *     stops working — that is what "severs auth immediately" means mechanically,
  *     and it is why the session/token wipe below is belt, not braces.
@@ -124,11 +124,13 @@ function hasBillingArtifacts(user: Pick<User, "stripeCustomerId" | "stripeSubscr
  *      before answering — the one place this module unwinds itself, because a
  *      standing cancel-at-period-end on an account that was never deleted is
  *      silent money loss nobody would think to look for.
- *   3. Auth severance — sessions dropped, live tokens revoked. Belt, not
- *      braces: A-1's chokepoints already refuse a tombstoned account at every
- *      read path, so the account is dead the instant step 2 commits whether or
- *      not this succeeds. It runs anyway so the rows don't sit there
- *      spendable-looking for a day, and a failure is logged, not fatal —
+ *   3. Auth severance — sessions dropped, unredeemed codes deleted, live
+ *      tokens revoked. Belt, not braces: A-1's chokepoints already refuse a
+ *      tombstoned account at every read path, /oauth/token included (its
+ *      closed-account mint gate covers both grants), so the account is dead
+ *      the instant step 2 commits whether or not this succeeds. It runs anyway
+ *      so the rows don't sit there spendable-looking for a day, and so what it
+ *      revokes stays revoked after an undo. A failure is logged, not fatal —
  *      failing the request here would be the worst outcome, since the delete
  *      HAS taken effect.
  *   4. The notice email, carrying the undo link. Non-fatal for the same
@@ -318,17 +320,35 @@ export async function requestAccountDeletion(
     return fail(409, "already_deleting", "This account is already scheduled for deletion.");
   }
 
-  // 3. Sever the credentials that exist right now (belt — see the doc above).
-  try {
-    await deleteSessionsForUser(env.DB, user.id);
-    await env.DB
-      .prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
-      .bind(nowIso, user.id)
-      .run();
-  } catch (err) {
-    console.error(
-      `event=account_delete_severance_incomplete user=${user.id} error=${err instanceof Error ? err.message : String(err)}`,
-    );
+  // 3. Sever the credentials that exist right now (belt — see the doc above;
+  //    /oauth/token refuses a tombstoned subject on its own, so a failure
+  //    here leaves nothing spendable). Unredeemed codes go before the token
+  //    revoke so a redemption that read the account live a moment before the
+  //    tombstone either loses its code (and the token endpoint's "code still
+  //    granted" fence refuses it) or inserted its token before the revoke
+  //    below, which then catches it — either way nothing it minted survives
+  //    an undo. Each step is attempted on its own, so one failure doesn't
+  //    skip the others.
+  const severance: Array<[step: string, run: () => Promise<unknown>]> = [
+    ["sessions", () => deleteSessionsForUser(env.DB, user.id)],
+    ["auth_codes", () => env.DB.prepare("DELETE FROM auth_codes WHERE user_id = ?").bind(user.id).run()],
+    [
+      "tokens",
+      () =>
+        env.DB
+          .prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
+          .bind(nowIso, user.id)
+          .run(),
+    ],
+  ];
+  for (const [step, run] of severance) {
+    try {
+      await run();
+    } catch (err) {
+      console.error(
+        `event=account_delete_severance_incomplete user=${user.id} step=${step} error=${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   // 3b. Lock every owned vault (T-318). The tombstone already stops every

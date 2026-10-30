@@ -39,6 +39,7 @@ import {
   signRefreshToken,
 } from "./tokens.ts";
 import { type OAuthDeps, buildServicesCatalog, jsonResponse } from "./oauth-shared.ts";
+import { getUserById } from "./users.ts";
 import { namedVaultsInScopes, unownedNamedVaults } from "./vaults.ts";
 
 /**
@@ -74,6 +75,27 @@ async function denyUnownedVaultMint(
     { error: "invalid_scope", error_description: `subject does not own vault(s): ${unowned.join(", ")}` },
     400,
   );
+}
+
+/**
+ * Closed-account mint gate, applied in BOTH mint paths (code redemption and
+ * refresh rotation). A subject whose account carries the deletion tombstone
+ * (`users.deleted_at`, migration 0023) — or whose row is gone — gets no new
+ * token, answered `400 invalid_grant` like any other grant that can no longer
+ * be used (RFC 6749 §5.2).
+ *
+ * This is what makes "deleting an account severs auth immediately" true at
+ * the token endpoint. The delete request also drops the account's unredeemed
+ * codes and revokes its refresh tokens (account-delete.ts step 3), but each of
+ * those writes only logs on failure; without this read, one transient D1
+ * error left an in-flight code redeemable, or a refresh token minting, for
+ * the whole 24-hour window. Undo clears `deleted_at`, so a restored account
+ * mints again; whatever the delete did revoke stays revoked.
+ */
+async function denyClosedAccountMint(db: D1Database, userId: string): Promise<Response | null> {
+  const user = await getUserById(db, userId);
+  if (user && user.deletedAt === null) return null;
+  return jsonResponse({ error: "invalid_grant", error_description: "account is closed" }, 400);
 }
 
 /** A `400 invalid_scope` refusal — the single shape every account-mint gate uses. */
@@ -292,6 +314,8 @@ async function handleTokenAuthorizationCode(
   } catch (err) {
     return mapAuthCodeError(err);
   }
+  const closedDenied = await denyClosedAccountMint(db, redeemed.userId);
+  if (closedDenied) return closedDenied;
   const ownershipDenied = await denyUnownedVaultMint(db, redeemed.userId, redeemed.scopes);
   if (ownershipDenied) return ownershipDenied;
   const foreignAccountDenied = denyForeignAccountMint(redeemed.userId, redeemed.scopes);
@@ -411,6 +435,8 @@ async function rotateAndRespond(
   now: Date,
 ): Promise<Response> {
   const refreshUserId = row.userId ?? "";
+  const closedDenied = await denyClosedAccountMint(db, refreshUserId);
+  if (closedDenied) return closedDenied;
   const ownershipDenied = await denyUnownedVaultMint(db, refreshUserId, row.scopes);
   if (ownershipDenied) return ownershipDenied;
   const foreignAccountDenied = denyForeignAccountMint(refreshUserId, row.scopes);
