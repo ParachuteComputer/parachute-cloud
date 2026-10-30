@@ -990,10 +990,13 @@ export async function runAccountDeleteSweep(
     .prepare(
       // `deleted_at` rides along because the claim below CASes on its exact
       // value (cloud#248) — the tombstone this pass decided was expired must
-      // be the same one it destroys against.
+      // be the same one it destroys against. Fewest failed passes first: an
+      // account this sweep keeps deferring must not hold a slot ahead of one
+      // it has never tried, or a cap's worth of wedged accounts would block
+      // every later deletion forever (and those never alert: 0 attempts).
       `SELECT id, deleted_at FROM users
        WHERE deleted_at IS NOT NULL AND deleted_at <= ?${only !== undefined ? " AND id = ?" : ""}
-       ORDER BY deleted_at ASC LIMIT ?`,
+       ORDER BY delete_purge_attempts ASC, deleted_at ASC LIMIT ?`,
     )
     .bind(...(only !== undefined ? [cutoff, only] : [cutoff]), ACCOUNT_DELETE_SWEEP_CAP)
     .all<{ id: string; deleted_at: string }>();
