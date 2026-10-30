@@ -71,6 +71,8 @@ import {
   countVaultsForOwner,
   createVault,
   getVault,
+  isImportPending,
+  isRestorePending,
   listVaultsForOwner,
   userOwnsVault,
 } from "./vaults.ts";
@@ -918,7 +920,7 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
   const now = deps.now?.() ?? new Date();
   const canonicalName = rawName.trim().toLowerCase();
   const existing = canonicalName ? await getVault(db, canonicalName) : null;
-  if (existing && (existing.ownerUserId !== user.id || existing.importPendingAt === null)) {
+  if (existing && (existing.ownerUserId !== user.id || !isImportPending(existing))) {
     return consoleError(db, req, deps, user, "That vault name is already taken.");
   }
 
@@ -1113,8 +1115,10 @@ function routerNotFound(): Response {
  * converges) and reports honestly.
  *
  * Reuse is gated like the import door's: the target is created flagged
- * `import_pending_at`, success clears the flag, and only a still-flagged row
- * of this owner (an attempt that didn't finish) is replayed into again — a
+ * `import_pending_at` (with the restore door's own marker, so neither door
+ * replays into the other's unfinished vault), success clears the flag, and
+ * only a still-flagged restore target of this owner (an attempt that didn't
+ * finish) is replayed into again — a
  * retry never burns a second slot. A finished restore is the owner's vault
  * now, maybe written to since, so a second same-day restore takes
  * `…-restored-<date>-2` (then -3, …) instead of wiping it. An unflagged row
@@ -1155,13 +1159,13 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
       targetName = name;
       break;
     }
-    if (existing.ownerUserId === user.id && existing.importPendingAt !== null) {
+    if (existing.ownerUserId === user.id && isRestorePending(existing)) {
       targetName = name;
       reuse = true;
       break;
     }
-    // A finished restore (the owner's vault now), or a name someone else
-    // holds: never replay into it.
+    // A finished restore (the owner's vault now), an unfinished import, or a
+    // name someone else holds: never replay into it.
   }
   if (!targetName) {
     return consoleError(db, req, deps, user, "Couldn't claim a name for the restored vault. Please try again tomorrow.");
@@ -1174,7 +1178,7 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
     }
     try {
       // Flagged so a retry after a failed replay may reuse it (cleared below).
-      await createVault(db, targetName, user.id, now, { importPending: true });
+      await createVault(db, targetName, user.id, now, { pending: "restore" });
     } catch (err) {
       if (err instanceof VaultNameTakenError || err instanceof VaultNameInvalidError) {
         return consoleError(db, req, deps, user, "Couldn't claim a name for the restored vault. Please try again.");
