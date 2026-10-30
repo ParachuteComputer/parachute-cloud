@@ -36,6 +36,7 @@
 import type { Database } from "bun:sqlite";
 import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.js";
 import { buildVaultProjection, attachmentsInstructionBlock } from "@openparachute/core/src/vault-projection.js";
+import { MCP_TOOL_REFERENCE } from "@openparachute/core/src/mcp-manifest.js";
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
@@ -246,6 +247,12 @@ function publicOrigin(req: Request): string {
  * vault-info-with-`description` as a gated write → a frozen vault refuses with the
  * SAME 402 `plan_required` shape as create-note; a plain read carries no
  * `description`, skips the gate, and works on a frozen vault — reads stay sacred).
+ *
+ * `help: "<tool>"` (core 0.9, T-318 §4) returns that tool's full reference: the
+ * long description and every parameter, which tools/list no longer carries
+ * (its short descriptions end "Every parameter: vault-info {help: …}"). Bun's
+ * twin is the `help` branch of its overrideVaultInfo. Only tools this caller
+ * sees here are answered; any other name is a structured `unknown_tool` error.
  */
 function overrideVaultInfo(
   tools: McpToolDef[],
@@ -262,6 +269,18 @@ function overrideVaultInfo(
   if (!vaultInfo) return;
 
   vaultInfo.execute = async (params) => {
+    if (params.help !== undefined) {
+      const name = String(params.help);
+      const ref = tools.some((t) => t.name === name) ? MCP_TOOL_REFERENCE.find((e) => e.name === name) : undefined;
+      if (!ref) {
+        throw Object.assign(new Error(`No tool named "${name}". Tools: ${tools.map((t) => t.name).join(", ")}.`), {
+          error_type: "unknown_tool",
+          field: "help",
+          hint: "pass one of the tool names",
+        });
+      }
+      return { tool: ref.name, description: ref.description, parameters: ref.inputSchema };
+    }
     let description = opts.description;
 
     if (params.description !== undefined) {

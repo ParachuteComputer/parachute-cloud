@@ -365,6 +365,47 @@ describe("MCP — vault-info (server-layer override)", () => {
     return JSON.parse(body.result.content[0].text);
   }
 
+  // 0.9 (T-318 §4): tools/list carries short descriptions that end "Every parameter: vault-info {help: "<tool>"}",
+  // and vault-info's schema lists `help`. Bun answers it (packages/vault/src/mcp-tools.ts overrideVaultInfo); cloud
+  // must too, or every pointer in its own tools/list leads to the plain projection (T-318-09 shadow finding).
+  it("vault-info {help} returns a tool's full reference, every parameter included", async () => {
+    const v = freshVault();
+    const help = await callVaultInfo(v, await READ(v), { help: "query-notes" });
+    expect(help.tool).toBe("query-notes");
+    expect(typeof help.description).toBe("string");
+    expect(Object.keys(help.parameters.properties)).toEqual(
+      expect.arrayContaining(["has_broken_links", "expand_links", "order_by", "created_by", "search_mode"]),
+    );
+  });
+
+  it("vault-info {help} for a tool this vault doesn't serve is a structured unknown_tool error", async () => {
+    const v = freshVault();
+    const res = await mcpPost(v, await READ(v), {
+      jsonrpc: "2.0",
+      id: 31,
+      method: "tools/call",
+      params: { name: "vault-info", arguments: { help: "no-such-tool" } },
+    });
+    const body = (await res.json()) as any;
+    const err = body.error ?? body.result;
+    expect(JSON.stringify(err)).toContain("unknown_tool");
+    expect(JSON.stringify(err)).toContain("query-notes"); // names the tools there are
+  });
+
+  it("every vault-info {help} pointer in tools/list resolves", async () => {
+    const v = freshVault();
+    const token = await ADMIN(v);
+    const res = await mcpPost(v, token, { jsonrpc: "2.0", id: 32, method: "tools/list", params: {} });
+    const tools = ((await res.json()) as any).result.tools as { name: string; description: string }[];
+    const pointed = [...new Set(tools.flatMap((t) => [...t.description.matchAll(/vault-info \{help: \\?"([^"\\]+)\\?"\}/g)].map((m) => m[1]!)))];
+    expect(pointed.length).toBeGreaterThan(3);
+    for (const name of pointed) {
+      const help = await callVaultInfo(v, token, { help: name });
+      expect(help.tool).toBe(name);
+      expect(help.parameters).toBeTruthy();
+    }
+  });
+
   // Bun twin: parachute-vault/src/vault.test.ts — "vault-info includes a compact
   // structural map WITHOUT include_stats (front-door)"; the server override at
   // parachute-vault/src/mcp-tools.ts:996 returns projection.map (cloud#134 C.5).
