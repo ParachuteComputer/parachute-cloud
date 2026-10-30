@@ -177,7 +177,7 @@ async function takeValidTicket(
 }
 
 /** Byte-identical to bun's `ticketNotFound()` (src/attachment-tickets.ts). */
-function ticketNotFound(): Response {
+export function ticketNotFound(): Response {
   return json(
     {
       error: "Not found",
