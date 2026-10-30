@@ -325,17 +325,29 @@ export async function requestAccountDeletion(
   //    order a redemption racing us either loses its code (and the token
   //    endpoint's "code still granted" fence refuses it) or inserted its token
   //    before the revoke below, which then catches it.
-  try {
-    await deleteSessionsForUser(env.DB, user.id);
-    await env.DB.prepare("DELETE FROM auth_codes WHERE user_id = ?").bind(user.id).run();
-    await env.DB
-      .prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
-      .bind(nowIso, user.id)
-      .run();
-  } catch (err) {
-    console.error(
-      `event=account_delete_severance_incomplete user=${user.id} error=${err instanceof Error ? err.message : String(err)}`,
-    );
+  //    Each step is attempted on its own: a failed session wipe must not skip
+  //    the code delete or the revoke, which are the two the tombstone does
+  //    NOT cover (/oauth/token never reads it).
+  const severance: Array<[step: string, run: () => Promise<unknown>]> = [
+    ["sessions", () => deleteSessionsForUser(env.DB, user.id)],
+    ["auth_codes", () => env.DB.prepare("DELETE FROM auth_codes WHERE user_id = ?").bind(user.id).run()],
+    [
+      "tokens",
+      () =>
+        env.DB
+          .prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
+          .bind(nowIso, user.id)
+          .run(),
+    ],
+  ];
+  for (const [step, run] of severance) {
+    try {
+      await run();
+    } catch (err) {
+      console.error(
+        `event=account_delete_severance_incomplete user=${user.id} step=${step} error=${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   // 3b. Lock every owned vault (T-318). The tombstone already stops every
