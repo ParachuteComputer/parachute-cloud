@@ -597,14 +597,18 @@ function login2faError(req: Request, message: string, email: string, notYouNext:
  * re-implemented so the open-redirect fence has exactly one body.
  */
 export function safeNext(next: string, deps: OAuthDeps): string {
-  // A leading `/` NOT followed by `/` or `\`. Rejecting the backslash matters:
-  // a browser normalizes `\`→`/`, so `/\evil.com` (which is not `//…`) would
-  // resolve to `https://evil.com/` — an open redirect. This handler now STORES a
-  // caller-supplied `next` and replays it at verify time, so the guard is
-  // load-bearing against an authenticated redirect-phish.
-  if (/^\/(?![/\\])/.test(next)) return next;
+  // Printable ASCII only. A browser's URL parser strips every ASCII tab/LF/CR
+  // from a Location before parsing, so `/\t/evil.com` becomes `//evil.com` —
+  // off-site — while still passing a "slash not followed by / or \" check.
+  // LF/CR/NUL can't go in a header at all (the redirect would 500). Anyone can
+  // store a `next` on a sign-in link for someone else's address, so this guard
+  // is load-bearing against a redirect-phish after a genuine sign-in.
+  if (!/^[\x21-\x7e]+$/.test(next)) return "/console";
+  // A leading `/` NOT followed by `/` or `\` (a browser reads `\` as `/`), and
+  // then resolved the way a browser would: it must stay on the issuer.
+  const isPath = /^\/(?![/\\])/.test(next);
   try {
-    if (new URL(next).origin === deps.issuer) return next;
+    if ((isPath ? new URL(next, deps.issuer) : new URL(next)).origin === deps.issuer) return next;
   } catch {
     /* fall through */
   }
