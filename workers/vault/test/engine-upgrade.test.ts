@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { createNote, freshVault, op } from "./helpers.ts";
 import { NewerSchemaError, SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 import { DoSqliteStore } from "../src/store-do.ts";
+import { ROLLBACK_ENGINE, ROLLBACK_ENGINE_DDL } from "./fixtures/engine-ddl-f147e34.ts";
 
 /**
  * Engine upgrade on a LIVE vault DO. A deploy that moves the engine pin does
@@ -76,6 +77,27 @@ describe("engine upgrade on an existing vault DO", () => {
       expect(master(sql)).toEqual(masterBefore);
       // Leave the DO usable for nothing else in this file: unique name, discarded.
       sql.exec("DELETE FROM schema_version WHERE version = ?", SCHEMA_VERSION + 1);
+    });
+  });
+
+  // The test above re-boots a DO the CURRENT engine already booted, so it cannot see DDL the current engine runs on
+  // every boot. This one compares against what the rollback engine itself writes: if they differ, a deploy migrates
+  // existing vaults to something the rollback target may not open.
+  it(`a fresh DO has exactly the rollback engine's DDL (${ROLLBACK_ENGINE})`, async () => {
+    const v = freshVault("engddl");
+    // The same four notes the fixture was generated with: they create the lazy link tables.
+    await createNote(v, { content: "x [[Nowhere]]" });
+    await createNote(v, { content: "a", path: "A/Same" });
+    await createNote(v, { content: "b", path: "B/Same" });
+    await createNote(v, { content: "[[Same]]" });
+    await runInDurableObject<DurableObject, void>(stubFor(v), async (inst: any) => {
+      const sql: SqlStorage = inst.ctx.storage.sql;
+      expect(SCHEMA_VERSION).toBe(ROLLBACK_ENGINE_DDL.schema_version);
+      expect(versions(sql).at(-1)).toEqual({ version: ROLLBACK_ENGINE_DDL.schema_version });
+      // Cloud-owned objects and the platform's own tables are not the engine's.
+      const cloudOwned = new Set(["attachment_tickets"]);
+      const engine = master(sql).filter((o: any) => !String(o.name).startsWith("_cf_") && !String(o.name).startsWith("sqlite_") && !cloudOwned.has(String(o.name)));
+      expect(engine).toEqual(ROLLBACK_ENGINE_DDL.objects);
     });
   });
 });
