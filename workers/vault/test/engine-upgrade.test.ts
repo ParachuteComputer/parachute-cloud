@@ -97,7 +97,22 @@ describe("engine upgrade on an existing vault DO", () => {
       // Cloud-owned objects and the platform's own tables are not the engine's.
       const cloudOwned = new Set(["attachment_tickets"]);
       const engine = master(sql).filter((o: any) => !String(o.name).startsWith("_cf_") && !String(o.name).startsWith("sqlite_") && !cloudOwned.has(String(o.name)));
-      expect(engine).toEqual(ROLLBACK_ENGINE_DDL.objects);
+      // T-318-09 (STAGING branch only): core 0.9 adds one column, tags.kind (UPGRADE-0.9.md: additive, no schema
+      // number; older engines never read it). Everything else must still equal the rollback engine's DDL exactly.
+      expect(engine).toEqual(ROLLBACK_ENGINE_DDL.objects.map(with09TagKind));
     });
   });
 });
+
+/** The rollback engine's object as core 0.9 writes it: the tags table with `kind TEXT` appended, nothing else. */
+function with09TagKind(o: { type: string; name: string; tbl_name: string; sql: string | null }) {
+  if (o.type !== "table" || o.name !== "tags" || !o.sql) return o;
+  const i = o.sql.lastIndexOf("updated_at TEXT");
+  return {
+    ...o,
+    sql:
+      o.sql.slice(0, i) +
+      "updated_at TEXT,\n  -- T-318 §8a: 'type' (fields, parents) or 'tag' (a flat label); NULL on a\n  -- row made implicitly by tagging, read by the same rule (tag-kind.ts).\n  -- Additive, with no schema number: see ensureTagKinds.\n  kind TEXT" +
+      o.sql.slice(i + "updated_at TEXT".length),
+  };
+}
