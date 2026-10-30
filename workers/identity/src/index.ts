@@ -126,15 +126,18 @@ export function senderFor(env: Env): EmailSender {
 export const app = new Hono<{ Bindings: Env }>();
 
 /**
- * A request body the runtime cannot parse as a form (multipart with no or a
- * broken boundary, a Content-Type FormData doesn't accept) makes
- * `req.formData()` throw a TypeError with one of these messages. That is the
- * CLIENT's error. Left to Hono's default handler it was a 500, and every 5xx
- * feeds the ops counter that pages the operator at 25 per 10 minutes — so 25
- * anonymous junk POSTs could page on demand. Matching the runtime's messages
- * is deliberately narrow: an unrecognised error still answers 500 and counts.
+ * A request body the runtime cannot parse as a form makes `req.formData()`
+ * throw a TypeError: multipart with no or a broken boundary, a part with no
+ * header terminator, no Content-Type or one FormData doesn't accept, an
+ * urlencoded body that isn't UTF-8. That is the CLIENT's error. Left to Hono's
+ * default handler it was a 500, and every 5xx feeds the ops counter that pages
+ * the operator at 25 per 10 minutes — so 25 anonymous junk POSTs could page on
+ * demand. workerd words these several ways (and the test pool differs from
+ * production), so match the subject, not one exact message. Only a TypeError
+ * naming forms or multipart bodies is taken; anything else still answers 500
+ * and counts.
  */
-const FORM_PARSE_ERROR = /multipart\/form-data MIME type requires a boundary|No initial boundary string|FormData can only parse/;
+const FORM_PARSE_ERROR = /FormData|multipart|boundary|form-urlencoded/i;
 
 app.onError((err, c) => {
   if (err instanceof TypeError && FORM_PARSE_ERROR.test(err.message)) {
