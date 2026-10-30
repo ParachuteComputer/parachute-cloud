@@ -89,41 +89,83 @@ export interface IssueAuthCodeOpts {
   now?: () => Date;
 }
 
-export async function issueAuthCode(db: D1Database, opts: IssueAuthCodeOpts): Promise<AuthCode> {
-  const code = randomBase64url(32);
+const INSERT_COLUMNS =
+  "INSERT INTO auth_codes (code, client_id, user_id, redirect_uri, scopes, code_challenge, code_challenge_method, expires_at, used_at, created_at)";
+
+/** A fresh code and its insert binds (the nine non-NULL columns, in INSERT_COLUMNS order). */
+function newAuthCode(opts: IssueAuthCodeOpts): { code: AuthCode; binds: string[] } {
   const now = opts.now?.() ?? new Date();
-  const createdAt = now.toISOString();
-  const expiresAt = new Date(now.getTime() + AUTH_CODE_TTL_SECONDS * 1000).toISOString();
-  await db
-    .prepare(
-      `INSERT INTO auth_codes
-       (code, client_id, user_id, redirect_uri, scopes, code_challenge, code_challenge_method, expires_at, used_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
-    )
-    .bind(
-      code,
-      opts.clientId,
-      opts.userId,
-      opts.redirectUri,
-      opts.scopes.join(" "),
-      opts.codeChallenge,
-      opts.codeChallengeMethod,
-      expiresAt,
-      createdAt,
-    )
-    .run();
-  return {
-    code,
+  const code: AuthCode = {
+    code: randomBase64url(32),
     clientId: opts.clientId,
     userId: opts.userId,
     redirectUri: opts.redirectUri,
     scopes: opts.scopes,
     codeChallenge: opts.codeChallenge,
     codeChallengeMethod: opts.codeChallengeMethod,
-    expiresAt,
+    expiresAt: new Date(now.getTime() + AUTH_CODE_TTL_SECONDS * 1000).toISOString(),
     usedAt: null,
-    createdAt,
+    createdAt: now.toISOString(),
   };
+  const binds = [
+    code.code,
+    code.clientId,
+    code.userId,
+    code.redirectUri,
+    code.scopes.join(" "),
+    code.codeChallenge,
+    code.codeChallengeMethod,
+    code.expiresAt,
+    code.createdAt,
+  ];
+  return { code, binds };
+}
+
+/**
+ * Insert a code with NO grant check — for tests and seeding only. Every
+ * authorize path issues through {@link issueGrantedAuthCode}, so a code can't
+ * outlive the Disconnect of the grant it came from.
+ */
+export async function issueAuthCode(db: D1Database, opts: IssueAuthCodeOpts): Promise<AuthCode> {
+  const { code, binds } = newAuthCode(opts);
+  await db
+    .prepare(`${INSERT_COLUMNS} VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`)
+    .bind(...binds)
+    .run();
+  return code;
+}
+
+/**
+ * Issue a code ONLY while the user's grant for this client still holds every
+ * scope the code carries, as one statement (T-318 review c of cloud#314).
+ *
+ * Both authorize paths read or write the grant and THEN insert the code. A
+ * Disconnect that commits between the two deletes the grant and every code it
+ * can see, but this one doesn't exist yet; inserted after, it trades for a
+ * token no Connections page can list or revoke (no grant row). Putting the
+ * grant check inside the INSERT closes that: D1 serializes the statement
+ * against Disconnect's batch, so either the code exists first (Disconnect
+ * deletes it, and the token endpoint's fence catches an exchange in flight) or
+ * the grant is already gone and nothing is inserted. Returns null then.
+ */
+export async function issueGrantedAuthCode(db: D1Database, opts: IssueAuthCodeOpts): Promise<AuthCode | null> {
+  const { code, binds } = newAuthCode(opts);
+  // "No requested scope is missing from the grant": literal token matches on
+  // the space-separated set (instr, no LIKE wildcards), with the scopes as ONE
+  // JSON bind so a long request can't run into D1's bind-parameter cap.
+  const res = await db
+    .prepare(
+      `${INSERT_COLUMNS} SELECT ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?
+       WHERE EXISTS (
+         SELECT 1 FROM grants g WHERE g.user_id = ? AND g.client_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM json_each(?) j WHERE instr(' ' || g.scopes || ' ', ' ' || j.value || ' ') = 0
+           )
+       )`,
+    )
+    .bind(...binds, opts.userId, opts.clientId, JSON.stringify(opts.scopes))
+    .run();
+  return (res.meta.changes ?? 0) === 1 ? code : null;
 }
 
 export interface RedeemAuthCodeOpts {

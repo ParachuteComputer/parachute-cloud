@@ -64,11 +64,15 @@ function rowToGrant(row: GrantRow): Grant {
   };
 }
 
-export async function findGrant(db: D1Database, userId: string, clientId: string): Promise<Grant | null> {
-  const row = await db
+function findGrantRow(db: D1Database, userId: string, clientId: string): Promise<GrantRow | null> {
+  return db
     .prepare("SELECT user_id, client_id, scopes, granted_at FROM grants WHERE user_id = ? AND client_id = ?")
     .bind(userId, clientId)
     .first<GrantRow>();
+}
+
+export async function findGrant(db: D1Database, userId: string, clientId: string): Promise<Grant | null> {
+  const row = await findGrantRow(db, userId, clientId);
   return row ? rowToGrant(row) : null;
 }
 
@@ -133,6 +137,18 @@ export interface RecordedGrant extends Grant {
  * window: the record says "narrow" while a wide token is still spendable, which
  * is the bug, reintroduced as a race. D1's batch is its atomic unit, so neither
  * window exists.
+ *
+ * THE WRITE IS CONDITIONAL ON THE ROW IT READ (T-318 review c of cloud#314).
+ * This is read-merge-write. An unconditional INSERT OR REPLACE let a
+ * Disconnect that committed between the read and the write be overwritten:
+ * the disconnected vault's scopes came back from the stale read, and the next
+ * authorize for that vault skipped consent. So the write only lands on the
+ * row we merged from (UPDATE … WHERE scopes = <read>, or INSERT OR IGNORE when
+ * there was none); if anything changed it meanwhile, re-read and merge again,
+ * like Disconnect's own guarded rewrite. A revoke that ran in a batch whose
+ * write missed still counts: it fails toward revoking, and this client is
+ * mid-authorization. After four misses in a row it gives up with
+ * {@link GrantWriteConflictError} rather than write over a row it never read.
  */
 export async function recordGrant(
   db: D1Database,
@@ -141,7 +157,40 @@ export async function recordGrant(
   newScopes: readonly string[],
   now: Date = new Date(),
 ): Promise<RecordedGrant> {
-  const existing = await findGrant(db, userId, clientId);
+  let revokedTokens = 0;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const r = await tryRecordGrant(db, userId, clientId, newScopes, now);
+    revokedTokens += r.revokedTokens;
+    if (!r.written) continue;
+    if (r.familyMoved || revokedTokens > 0) {
+      // Ids only. No scope strings, no jtis, no token material — this line is for
+      // answering "why did that client have to re-authorize", and a count answers
+      // it. Both ids are already routine in this worker's logs.
+      console.log(`event=grant_vault_family_moved user=${userId} client=${clientId} revoked_tokens=${revokedTokens}`);
+    }
+    return { userId, clientId, scopes: r.scopes, grantedAt: r.grantedAt, revokedTokens };
+  }
+  throw new GrantWriteConflictError();
+}
+
+/** The grant kept changing under a consent write; nothing was recorded. */
+export class GrantWriteConflictError extends Error {
+  constructor() {
+    super("grant changed concurrently; consent not recorded");
+    this.name = "GrantWriteConflictError";
+  }
+}
+
+/** One read-merge-conditional-write. `written` is false when the row changed after the read. */
+async function tryRecordGrant(
+  db: D1Database,
+  userId: string,
+  clientId: string,
+  newScopes: readonly string[],
+  now: Date,
+): Promise<{ written: boolean; familyMoved: boolean; scopes: string[]; grantedAt: string; revokedTokens: number }> {
+  const existingRow = await findGrantRow(db, userId, clientId);
+  const existing = existingRow ? rowToGrant(existingRow) : null;
   // Family-replace the account-vaults family when this consent carries one, so a
   // narrowing re-consent is not silently re-widened by a union with the prior
   // blanket. Every other scope family is preserved (union).
@@ -155,22 +204,26 @@ export async function recordGrant(
   const grantedAt = now.toISOString();
 
   const familyMoved = vaultFamilyKey(existing?.scopes ?? []) !== vaultFamilyKey(scopes);
-  const record = db
-    .prepare("INSERT OR REPLACE INTO grants (user_id, client_id, scopes, granted_at) VALUES (?, ?, ?, ?)")
-    .bind(userId, clientId, scopes.join(" "), grantedAt);
+  const record = existingRow
+    ? db
+        .prepare("UPDATE grants SET scopes = ?, granted_at = ? WHERE user_id = ? AND client_id = ? AND scopes = ?")
+        .bind(scopes.join(" "), grantedAt, userId, clientId, existingRow.scopes)
+    : db
+        .prepare("INSERT OR IGNORE INTO grants (user_id, client_id, scopes, granted_at) VALUES (?, ?, ?, ?)")
+        .bind(userId, clientId, scopes.join(" "), grantedAt);
 
   if (!familyMoved) {
-    await record.run();
-    return { userId, clientId, scopes, grantedAt, revokedTokens: 0 };
+    const written = await record.run();
+    return { written: written.meta.changes === 1, familyMoved, scopes, grantedAt, revokedTokens: 0 };
   }
-
-  const [revoke] = await db.batch([prepareRevokeClientTokens(db, userId, clientId, now), record]);
-  const revokedTokens = revoke?.meta.changes ?? 0;
-  // Ids only. No scope strings, no jtis, no token material — this line is for
-  // answering "why did that client have to re-authorize", and a count answers
-  // it. Both ids are already routine in this worker's logs.
-  console.log(`event=grant_vault_family_moved user=${userId} client=${clientId} revoked_tokens=${revokedTokens}`);
-  return { userId, clientId, scopes, grantedAt, revokedTokens };
+  const [revoke, written] = await db.batch([prepareRevokeClientTokens(db, userId, clientId, now), record]);
+  return {
+    written: written?.meta.changes === 1,
+    familyMoved,
+    scopes,
+    grantedAt,
+    revokedTokens: revoke?.meta.changes ?? 0,
+  };
 }
 
 /**

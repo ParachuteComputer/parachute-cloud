@@ -198,6 +198,40 @@ describe("Disconnect racing a grant reader", () => {
     expect(await leftovers(userId, clientId)).toEqual({ tokens: 0, codes: 0 });
   });
 
+  test("A'. skip-consent authorize: the grant survives for another vault, but holds nothing for this one — still no code", async () => {
+    const { userId, vault, other, sessionId, clientId, admin } = await setup("gr-skip2");
+    const scope = `vault:${vault}:read vault:${vault}:write`;
+    await connect(clientId, sessionId, `${scope} vault:${other}:read`);
+
+    const { db, raced } = raceAt(GRANT_READ, async () => {
+      expect((await api("DELETE", `/account/vaults/${vault}/connections/${clientId}`, admin)).status).toBe(200);
+    });
+    const { challenge } = await makePkce();
+    const res = await worker.fetch(
+      authorizeGetReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope,
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "s5",
+        },
+        sessionId,
+      ),
+      { ...env, DB: db },
+    );
+    expect(raced()).toBe(true);
+    expect(res.status).toBe(200);
+    // No code for this vault. (The one live token named both vaults, so Disconnect revoked it.)
+    expect(await leftovers(userId, clientId)).toEqual({ tokens: 0, codes: 0 });
+    const grant = await env.DB.prepare("SELECT scopes FROM grants WHERE user_id = ? AND client_id = ?")
+      .bind(userId, clientId)
+      .first<{ scopes: string }>();
+    expect(grant?.scopes).toBe(`vault:${other}:read`);
+  });
+
   test("B. consent submit: a Disconnect after recordGrant's read is not overwritten — the vault stays disconnected", async () => {
     const { userId, vault, other, sessionId, clientId, admin } = await setup("gr-consent");
     await connect(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`);

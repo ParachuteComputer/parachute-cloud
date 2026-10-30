@@ -12,7 +12,7 @@ import {
   composedWildcardVaultsScope,
   parseAccountVaultsScope,
 } from "@openparachute/door-contract";
-import { issueAuthCode } from "./auth-codes.ts";
+import { issueGrantedAuthCode } from "./auth-codes.ts";
 import {
   narrowResourceVaultScopes,
   narrowVaultScopes,
@@ -21,7 +21,7 @@ import {
   widenUnnamedVaultVerb,
 } from "./audience.ts";
 import { approveClient, getClient, requireRegisteredRedirectUri } from "./clients.ts";
-import { isCoveredByGrant, recordGrant } from "./grants.ts";
+import { GrantWriteConflictError, isCoveredByGrant, recordGrant } from "./grants.ts";
 import { listVaultsForOwner, unownedNamedVaults, userOwnsVault } from "./vaults.ts";
 import { SESSION_COOKIE, buildSessionCookie, createSession, findActiveSession, parseSessionCookie } from "./sessions.ts";
 import { getUserByEmail, getUserById, needsRehash, setPassword, verifyPassword } from "./users.ts";
@@ -46,6 +46,41 @@ const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 
 function htmlError(title: string, message: string, status: number, action?: { href: string; label: string }): Response {
   return htmlResponse(renderError({ title, message, ...(action ? { action } : {}) }), status);
+}
+
+/**
+ * The consent couldn't turn into a code because the grant changed meanwhile:
+ * a Disconnect removed it before the code existed, another consent for the
+ * same app replaced it, or the conditional write kept missing. The person
+ * starts again from the app; nothing was issued.
+ */
+function grantChangedWhileApproving(): Response {
+  return htmlError(
+    "Connect again",
+    "This app's access to your vaults changed while you were approving it (it may have been disconnected). Nothing was connected. Go back to the app and connect again.",
+    409,
+  );
+}
+
+/** Record the consent and issue its code, or the 409 page if the grant changed under us. */
+async function recordGrantAndRedirect(
+  db: D1Database,
+  params: AuthorizeParams,
+  scopes: string[],
+  userId: string,
+  clientId: string,
+  deps: OAuthDeps,
+): Promise<Response> {
+  try {
+    await recordGrant(db, userId, clientId, scopes, deps.now?.() ?? new Date());
+  } catch (err) {
+    if (err instanceof GrantWriteConflictError) return grantChangedWhileApproving();
+    throw err;
+  }
+  return (
+    (await issueAuthCodeRedirect(db, { ...params, scope: scopes.join(" ") }, scopes, userId, deps)) ??
+    grantChangedWhileApproving()
+  );
 }
 
 /**
@@ -162,14 +197,20 @@ export function authorizeParamsFromForm(form: FormData): AuthorizeParams | null 
   return "error" in parsed ? null : parsed;
 }
 
+/**
+ * The redirect carrying a fresh code, or null when the grant no longer holds
+ * these scopes — a Disconnect committed after the caller read or wrote it
+ * (see {@link issueGrantedAuthCode}). Every authorize path records or checks a
+ * grant before it lands here, so null means "disconnected meanwhile".
+ */
 async function issueAuthCodeRedirect(
   db: D1Database,
   params: AuthorizeParams,
   scopes: string[],
   userId: string,
   deps: OAuthDeps,
-): Promise<Response> {
-  const code = await issueAuthCode(db, {
+): Promise<Response | null> {
+  const code = await issueGrantedAuthCode(db, {
     clientId: params.clientId,
     userId,
     redirectUri: params.redirectUri,
@@ -178,6 +219,7 @@ async function issueAuthCodeRedirect(
     codeChallengeMethod: params.codeChallengeMethod,
     now: deps.now,
   });
+  if (!code) return null;
   const u = new URL(params.redirectUri);
   u.searchParams.set("code", code.code);
   if (params.state) u.searchParams.set("state", params.state);
@@ -291,7 +333,9 @@ async function authorizeCore(
   // always render consent (the vault choice isn't recorded literally).
   const hasUnnamedVault = unnamedVaultVerbs(requestedScopes).length > 0;
   if (!hasUnnamedVault && (await isCoveredByGrant(db, session.userId, client.clientId, requestedScopes))) {
-    return issueAuthCodeRedirect(db, params, requestedScopes, session.userId, deps);
+    const redirect = await issueAuthCodeRedirect(db, params, requestedScopes, session.userId, deps);
+    if (redirect) return redirect;
+    // Disconnected between the grant read and the code insert: ask again.
   }
 
   const lockedVault = params.vault && VAULT_NAME_RE.test(params.vault) ? params.vault : null;
@@ -661,8 +705,7 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
       composedScopes.push(composedVaultCreateScope(session.userId));
     }
 
-    await recordGrant(db, session.userId, client.clientId, composedScopes, deps.now?.() ?? new Date());
-    return issueAuthCodeRedirect(db, { ...params, scope: composedScopes.join(" ") }, composedScopes, session.userId, deps);
+    return recordGrantAndRedirect(db, params, composedScopes, session.userId, client.clientId, deps);
   }
 
   // Narrow unnamed vault verbs to the picked vault (form pick or `vault=` hint).
@@ -699,6 +742,5 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   const ownershipDenied = await denyUnownedVaults(db, session.userId, scopes, params);
   if (ownershipDenied) return ownershipDenied;
 
-  await recordGrant(db, session.userId, client.clientId, scopes, deps.now?.() ?? new Date());
-  return issueAuthCodeRedirect(db, { ...params, scope: scopes.join(" ") }, scopes, session.userId, deps);
+  return recordGrantAndRedirect(db, params, scopes, session.userId, client.clientId, deps);
 }
