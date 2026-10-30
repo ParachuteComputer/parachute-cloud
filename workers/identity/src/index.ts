@@ -521,7 +521,7 @@ app.post("/ops/snapshot-run", async (c) =>
 // Erase ONE account on its holder's written request (T-328,
 // ops-account-delete.ts): bearer OPS_DELETE_TOKEN (its own secret). Unset → 404.
 app.post("/ops/account-delete", async (c) =>
-  (await handleOpsAccountDeletePost(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound(),
+  (await handleOpsAccountDeletePost(c.env, c.req.raw, depsFor(c.env), senderFor(c.env))) ?? c.notFound(),
 );
 
 // Staging/dev-only deletion-proof hooks (T-318, account-delete-hooks.ts) —

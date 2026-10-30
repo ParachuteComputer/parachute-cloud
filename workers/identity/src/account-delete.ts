@@ -219,8 +219,12 @@ export async function requestAccountDeletion(
     sender?: EmailSender;
     overrides?: BillingOverrides;
     actor: AuditActor;
-    /** Extra audit-note fields (the ops door's written-request reference). */
-    note?: Record<string, string>;
+    /** The ops door's reference to the holder's written request, kept on the
+     *  audit row (never an address: the caller refuses one). */
+    writtenRequest?: string;
+    /** false = do not mail the holder (the ops door: they asked in writing and
+     *  the operator replies by hand). `sender` still carries operator alerts. */
+    notifyHolder?: boolean;
   },
 ): Promise<DeletionRequestOutcome> {
   const { sender, overrides, actor } = opts;
@@ -381,7 +385,7 @@ export async function requestAccountDeletion(
   const purgeAt = new Date(now.getTime() + DELETE_UNDO_WINDOW_MS);
   const undoUrl = `${deps.issuer}/account/undo-delete?token=${encodeURIComponent(undoToken)}`;
   let noticeSent = false;
-  if (sender) {
+  if (sender && opts.notifyHolder !== false) {
     // TRANSPORT NOTE: this rides `sendOps` — plain text, no List-Unsubscribe
     // headers, which is CORRECT for a transactional deletion notice (an
     // unsubscribable "your account is closing" email would be a bug). What it
@@ -424,7 +428,12 @@ export async function requestAccountDeletion(
     actor,
     action: "delete_requested",
     userId: user.id,
-    note: { ...opts.note, notice_sent: noticeSent, vaults_locked: vaultsLocked, vaults_lock_failed: vaultsLockFailed },
+    note: {
+      ...(opts.writtenRequest !== undefined ? { written_request: opts.writtenRequest } : {}),
+      notice_sent: noticeSent,
+      vaults_locked: vaultsLocked,
+      vaults_lock_failed: vaultsLockFailed,
+    },
     now,
   });
   console.log(
@@ -1005,7 +1014,13 @@ export async function runAccountDeleteSweep(
   env: Env,
   deps: OAuthDeps,
   now: Date = new Date(),
-  overrides?: BillingOverrides & { sender?: EmailSender; onlyUserId?: string; waiveWindow?: boolean },
+  overrides?: BillingOverrides & {
+    sender?: EmailSender;
+    onlyUserId?: string;
+    waiveWindow?: boolean;
+    /** The ops door's written-request reference, onto the purge audit row. */
+    writtenRequest?: string;
+  },
 ): Promise<AccountDeleteSweepSummary> {
   // `onlyUserId` scopes the pass to one account — the staging proof hook
   // (`/__test/account-delete/sweep`) uses it so a test run never purges
@@ -1123,6 +1138,7 @@ export async function runAccountDeleteSweep(
           vaults_destroyed: vaultsDestroyed,
           r2_objects_deleted: r2ObjectsDeleted,
           ...(waived ? { undo_window_waived: true } : {}),
+          ...(overrides?.writtenRequest !== undefined ? { written_request: overrides.writtenRequest } : {}),
         },
         now,
       });

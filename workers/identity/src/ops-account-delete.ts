@@ -14,7 +14,9 @@
  *
  * What it runs is NOT a second deletion. It is the self-service pair, in order:
  *   1. `requestAccountDeletion` — billing hold, tombstone, sessions + tokens +
- *      auth codes cut, vaults locked — with NO sender, so no email goes out;
+ *      auth codes cut, vaults locked — with `notifyHolder: false`, so the
+ *      holder is not mailed (the sender still carries OPERATOR alerts: a
+ *      stuck billing hold, a purge that will not converge);
  *   2. `runAccountDeleteSweep` for this one account with the window waived —
  *      the same claim, Stripe teardown, vault destroy (DO SQLite + the whole
  *      R2 prefix: attachments, snapshots, exports) and D1 purge as the hourly
@@ -23,13 +25,15 @@
  *      when no account row exists — an address that started a sign-up and never
  *      finished has no account to purge, and was otherwise unreachable.
  * Then it answers the purge report (counts only, every D1 table enumerated at
- * runtime). A vault that will not destroy defers like the sweep does: the
- * account row stays (still closed) and a second call converges.
+ * runtime, `bounded` matching so a look-alike address or vault name is not a
+ * false leftover). A vault that will not destroy defers like the sweep does:
+ * the account row stays (still closed), the answer says how many passes have
+ * failed, and a second call converges.
  *
  * Body: `{ email, confirm, written_request, dry_run? }` — the address twice
  * (the retype guard) and a short reference to the written request, kept on the
- * audit row. The reference must not contain an address: the audit table never
- * holds one. `dry_run: true` reads only.
+ * audit rows (the request's and the purge's). The reference must not contain
+ * an address: the audit table never holds one. `dry_run: true` reads only.
  *
  * Operator accounts are refused (409): erasing the console's own operator is
  * never an emailed request.
@@ -37,9 +41,11 @@
 import { confirmMatchesEmail, requestAccountDeletion, runAccountDeleteSweep } from "./account-delete.ts";
 import { buildPurgeReport } from "./account-delete-hooks.ts";
 import { opsBearerRefusal } from "./ops-daily.ts";
+import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
 import type { OAuthDeps } from "./oauth-shared.ts";
-import { getUserByEmail } from "./users.ts";
+import { getUserByEmail, getUserById } from "./users.ts";
+import { EMAIL_RE } from "./validation.ts";
 import { listVaultsForOwner } from "./vaults.ts";
 
 const NO_STORE = { "cache-control": "no-store" };
@@ -57,6 +63,7 @@ export async function handleOpsAccountDeletePost(
   env: Env,
   req: Request,
   deps: OAuthDeps,
+  sender?: EmailSender,
 ): Promise<Response | null> {
   const refused = await opsBearerRefusal(env.OPS_DELETE_TOKEN, req);
   if (refused !== undefined) return refused;
@@ -70,7 +77,7 @@ export async function handleOpsAccountDeletePost(
     return refuse(400, "invalid_request", "body must be JSON");
   }
   const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
-  if (!email.includes("@") || email.length < 3) return refuse(400, "invalid_request", "email is required");
+  if (!EMAIL_RE.test(email)) return refuse(400, "invalid_request", "email must be one address");
   if (!confirmMatchesEmail(body.confirm, email)) {
     return refuse(400, "confirm_mismatch", "confirm must repeat email. Nothing was deleted.");
   }
@@ -102,10 +109,10 @@ export async function handleOpsAccountDeletePost(
       {
         dry_run: true,
         ...found,
-        tombstoned: user?.deletedAt != null,
         purge_claimed: user?.deletePurgeClaimedAt != null,
         stripe_customer: user?.stripeCustomerId != null,
         stripe_subscription: user?.stripeSubscriptionId != null,
+        purge_attempts: user?.deletePurgeAttempts ?? 0,
         email_rows: { magic_links: await countMagicLinks(env.DB, email) },
       },
       { headers: NO_STORE },
@@ -115,10 +122,12 @@ export async function handleOpsAccountDeletePost(
   let sweep = null;
   if (user) {
     if (user.deletedAt === null) {
-      // No sender: the person asked in writing; the operator replies by hand.
+      // The person asked in writing; the operator replies by hand.
       const outcome = await requestAccountDeletion(env, deps, user, {
         actor: "operator:ops-agent",
-        note: { written_request: ref },
+        writtenRequest: ref,
+        notifyHolder: false,
+        ...(sender ? { sender } : {}),
       });
       if (!outcome.ok && outcome.error !== "already_deleting") {
         return refuse(outcome.status, outcome.error, outcome.message);
@@ -127,6 +136,8 @@ export async function handleOpsAccountDeletePost(
     sweep = await runAccountDeleteSweep(env, deps, deps.now?.() ?? new Date(), {
       onlyUserId: user.id,
       waiveWindow: true,
+      writtenRequest: ref,
+      ...(sender ? { sender } : {}),
     });
   }
 
@@ -144,9 +155,14 @@ export async function handleOpsAccountDeletePost(
     ...(user ? { userId: user.id } : {}),
     ...(user?.ownerId ? { ownerId: user.ownerId } : {}),
     vaults: vaults.map((v) => v.name),
+    bounded: true,
   });
   const nonzero = Object.fromEntries(Object.entries(report.tables).filter(([, t]) => t.rows > 0));
   const done = purged && report.remaining_rows_total === 0 && report.email_rows_total === 0;
+  // Still there after a deferral: how many passes have failed (the sweep pages
+  // the operator at ACCOUNT_PURGE_ALERT_AFTER_ATTEMPTS). The reason is on the
+  // `event=account_purge_deferred` log line.
+  const purgeAttempts = user && !purged ? ((await getUserById(env.DB, user.id))?.deletePurgeAttempts ?? null) : null;
   console.log(
     `event=ops_account_delete user=${user?.id ?? "none"} found=${user !== null} purged=${purged} vaults=${vaults.length} magic_links=${magicLinksDeleted} remaining=${report.remaining_rows_total} done=${done}`,
   );
@@ -155,6 +171,7 @@ export async function handleOpsAccountDeletePost(
       done,
       ...found,
       sweep,
+      ...(purgeAttempts !== null ? { purge_attempts: purgeAttempts } : {}),
       magic_links_deleted: magicLinksDeleted,
       report: {
         remaining_rows_total: report.remaining_rows_total,

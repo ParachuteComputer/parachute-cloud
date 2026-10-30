@@ -48,7 +48,7 @@ function recordingVault(failDestroy: string[] = []): { vaultFetch: VaultFetch; d
 
 function call(
   body: unknown,
-  opts: { auth?: string; secret?: string | null; vaultFetch?: VaultFetch; now?: Date } = {},
+  opts: { auth?: string; secret?: string | null; vaultFetch?: VaultFetch; now?: Date; sender?: EmailSender } = {},
 ): Promise<Response | null> {
   const e = opts.secret === null ? { ...env } : { ...env, OPS_DELETE_TOKEN: opts.secret ?? TOKEN };
   const headers: Record<string, string> = { "content-type": "application/json" };
@@ -59,7 +59,18 @@ function call(
     e,
     new Request(`${ISSUER}/ops/account-delete`, { method: "POST", headers, body: JSON.stringify(body) }),
     { ...deps(now ? () => now : undefined), vaultFetch: opts.vaultFetch ?? recordingVault().vaultFetch },
+    opts.sender,
   );
+}
+
+/** Records every send; the ops door must never mail the account holder. */
+function spySender(): { sender: EmailSender; to: string[] } {
+  const to: string[] = [];
+  const rec = async (m: { to: string }) => (to.push(m.to), { ok: true });
+  return {
+    sender: { kind: "devlog", sendOps: rec, sendMagicLink: rec, sendDrip: rec } as unknown as EmailSender,
+    to,
+  };
 }
 
 async function json(res: Response | null): Promise<Record<string, any>> {
@@ -118,6 +129,7 @@ describe("POST /ops/account-delete — the gate", () => {
       // The reference is stored on the audit row, which never holds an address.
       { email: "retype@example.com", confirm: "retype@example.com", written_request: "from retype@example.com" },
       { email: "", confirm: "", written_request: REF },
+      { email: "a@b", confirm: "a@b", written_request: REF },
     ]) {
       expect((await call(body))!.status, JSON.stringify(body)).toBe(400);
     }
@@ -133,7 +145,7 @@ describe("POST /ops/account-delete — dry run", () => {
     await seedVault("dry-two", id);
     await createMagicLink(db(), email, null, new Date());
     const out = await json(await call({ email, confirm: email, written_request: REF, dry_run: true }));
-    expect(out).toMatchObject({ dry_run: true, account_found: true, user_id: id, tombstoned: false });
+    expect(out).toMatchObject({ dry_run: true, account_found: true, user_id: id, tombstoned_before: false });
     expect(out.vaults.map((v: { name: string }) => v.name).sort()).toEqual(["dry-one", "dry-two"]);
     expect(out.email_rows.magic_links).toBe(1);
     expect((await getUserById(db(), id))?.deletedAt).toBeNull();
@@ -156,10 +168,15 @@ describe("POST /ops/account-delete — the purge", () => {
     await createMagicLink(db(), "bystander@example.com", null, new Date());
 
     const { vaultFetch, destroyed } = recordingVault();
+    const mail = spySender();
     // Typed with different case and spaces, as it may arrive in an email.
     const out = await json(
-      await call({ email: " Erase-Now@Example.com ", confirm: "erase-now@example.com", written_request: REF }, { vaultFetch }),
+      await call(
+        { email: " Erase-Now@Example.com ", confirm: "erase-now@example.com", written_request: REF },
+        { vaultFetch, sender: mail.sender },
+      ),
     );
+    expect(mail.to).toEqual([]); // the holder is not mailed; the operator replies by hand
     expect(out).toMatchObject({ done: true, account_found: true, user_id: id });
     expect(out.sweep).toMatchObject({ purged: 1, deferred: 0 });
     expect(destroyed.sort()).toEqual(["erase-now-a", "erase-now-b"]);
@@ -182,7 +199,7 @@ describe("POST /ops/account-delete — the purge", () => {
       ["sweep", "purged"],
     ]);
     expect(audit[0]!.note).toMatchObject({ notice_sent: false, written_request: REF });
-    expect(audit[1]!.note).toMatchObject({ undo_window_waived: true, vaults_destroyed: 2 });
+    expect(audit[1]!.note).toMatchObject({ undo_window_waived: true, vaults_destroyed: 2, written_request: REF });
   });
 
   test("an account already inside its self-service 24-hour window is erased now, not tomorrow", async () => {
@@ -224,6 +241,34 @@ describe("POST /ops/account-delete — the purge", () => {
     expect(destroyed).toEqual(["in-window-notes"]);
     expect(await getUserById(db(), id)).toBeNull();
     expect(sent).toHaveLength(1); // the operator path sent nothing more
+    // The holder's own request opened it; the purge row carries the written request that waived the window.
+    const audit = await auditRowsFor(db(), id);
+    expect(audit.map((a) => [a.actor, a.action])).toEqual([
+      ["self", "delete_requested"],
+      ["sweep", "purged"],
+    ]);
+    expect(audit[1]!.note).toMatchObject({ undo_window_waived: true, written_request: REF });
+  });
+
+  test("a look-alike address or vault name elsewhere is not a leftover: done is true, and those rows stay", async () => {
+    const email = "ike@example.co";
+    const { id } = await seedUser(email);
+    await seedVault("notes", id);
+    // Someone else: an address that CONTAINS this one, a vault whose name starts with this one's,
+    // and a client registration naming that other vault.
+    const { id: other } = await seedUser("mike@example.com");
+    await seedVault("notes2", other);
+    await createMagicLink(db(), "mike@example.com", null, new Date());
+    await env.DB.prepare("INSERT INTO ops_alerts (key, last_alert_at) VALUES (?, ?)")
+      .bind("snapshot:vault.notes2:stale", new Date().toISOString())
+      .run();
+    const out = await json(await call({ email, confirm: email, written_request: REF }));
+    expect(out, JSON.stringify(out.report)).toMatchObject({ done: true, account_found: true });
+    expect(out.report.remaining_rows_total).toBe(0);
+    expect(await getUserById(db(), other)).not.toBeNull();
+    expect(await count("SELECT COUNT(*) AS n FROM vaults WHERE name = 'notes2'")).toBe(1);
+    expect(await count("SELECT COUNT(*) AS n FROM magic_links WHERE email = 'mike@example.com'")).toBe(1);
+    expect(await count("SELECT COUNT(*) AS n FROM ops_alerts WHERE key = 'snapshot:vault.notes2:stale'")).toBe(1);
   });
 
   test("no account row, only a never-finished sign-up: the email-keyed rows still go", async () => {
@@ -249,6 +294,7 @@ describe("POST /ops/account-delete — the purge", () => {
     const out = await json(res);
     expect(out).toMatchObject({ done: false, account_found: true });
     expect(out.sweep).toMatchObject({ purged: 0, deferred: 1 });
+    expect(out.purge_attempts).toBe(1);
     const user = await getUserById(db(), id);
     expect(user?.deletedAt).not.toBeNull();
     expect(await count("SELECT COUNT(*) AS n FROM vaults WHERE owner_user_id = ?", id)).toBe(1);
