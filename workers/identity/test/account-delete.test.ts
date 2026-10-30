@@ -135,19 +135,34 @@ function undoPostReq(body: unknown): Request {
 // --- the injected Stripe stub (billing-teardown.test.ts's seam) ---------------
 
 interface StripeCalls {
-  updated: Array<{ id: string; cancelAtPeriodEnd: boolean }>;
+  updated: Array<{ id: string; cancelAtPeriodEnd?: boolean }>;
   canceled: string[];
   deletedCustomers: string[];
 }
 
 function makeStripeStub(opts: { hardFailUpdate?: boolean } = {}): { stripe: Stripe; calls: StripeCalls } {
   const calls: StripeCalls = { updated: [], canceled: [], deletedCustomers: [] };
+  // Stateful like Stripe: a renewing active subscription per id; update
+  // merges metadata ("" unsets a key) and retrieve reads the current state.
+  const subs = new Map<string, { cancel_at_period_end: boolean; metadata: Record<string, string> }>();
+  const subOf = (id: string) => {
+    if (!subs.has(id)) subs.set(id, { cancel_at_period_end: false, metadata: {} });
+    return subs.get(id)!;
+  };
+  const view = (id: string) => ({ id, status: "active", ...subOf(id), metadata: { ...subOf(id).metadata } });
   const stripe = {
     subscriptions: {
-      update: async (id: string, params: { cancel_at_period_end?: boolean }) => {
-        calls.updated.push({ id, cancelAtPeriodEnd: params.cancel_at_period_end ?? false });
+      retrieve: async (id: string) => view(id),
+      update: async (id: string, params: { cancel_at_period_end?: boolean; metadata?: Record<string, string> }) => {
+        calls.updated.push({ id, cancelAtPeriodEnd: params.cancel_at_period_end });
         if (opts.hardFailUpdate) throw new Error("stripe is down");
-        return { id, status: "active" };
+        const sub = subOf(id);
+        if (params.cancel_at_period_end !== undefined) sub.cancel_at_period_end = params.cancel_at_period_end;
+        for (const [k, v] of Object.entries(params.metadata ?? {})) {
+          if (v === "") delete sub.metadata[k];
+          else sub.metadata[k] = v;
+        }
+        return view(id);
       },
       cancel: async (id: string) => {
         calls.canceled.push(id);
@@ -425,12 +440,20 @@ describe("A-3 — DELETE /account/delete opens the undo window", () => {
     // the product shows this; the alert is the only way it becomes work.
     const acct = await seedAccount("req-hold-stuck@example.com", { stripe: true });
     let updateCalls = 0;
+    let held = false;
     const oneWayStripe = {
       subscriptions: {
+        retrieve: async (id: string) => ({
+          id,
+          status: "active",
+          cancel_at_period_end: held,
+          metadata: held ? { parachute_delete_hold: "placed" } : {},
+        }),
         update: async (_id: string, params: { cancel_at_period_end?: boolean }) => {
           updateCalls++;
           // The hold lands; the RELEASE is what fails.
           if (params.cancel_at_period_end === false) throw new Error("stripe is down");
+          held = true;
           return { id: _id, status: "active" };
         },
       },
@@ -620,6 +643,8 @@ describe("A-3 — undo inside the window restores the account", () => {
     const StripeCtor = (await import("stripe")).default;
     const canceledStripe = {
       subscriptions: {
+        // Stripe still reads a canceled subscription; only updating it fails.
+        retrieve: async (id: string) => ({ id, status: "canceled", cancel_at_period_end: true, metadata: {} }),
         update: async () => {
           throw new StripeCtor.errors.StripeInvalidRequestError({
             message: "cannot update a canceled subscription",

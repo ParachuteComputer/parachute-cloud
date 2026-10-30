@@ -10,6 +10,9 @@
 import Stripe from "stripe";
 import { describe, expect, test } from "vitest";
 import {
+  DELETE_HOLD_KEPT,
+  DELETE_HOLD_METADATA_KEY,
+  DELETE_HOLD_PLACED,
   type ResumeBillingResult,
   type TeardownBillingResult,
   deferBilling,
@@ -27,6 +30,8 @@ function tolerableError(message: string): InstanceType<typeof Stripe.errors.Stri
 }
 
 interface StripeStubOptions {
+  /** Starting state of named subscriptions (default: active, renewing, no metadata). */
+  subs?: Record<string, { status?: Stripe.Subscription.Status; cancel_at_period_end?: boolean; metadata?: Record<string, string> }>;
   /** subscription ids whose cancel/update should behave as "already gone". */
   tolerableSubIds?: Set<string>;
   /** subscription ids whose cancel/update should throw a genuine (non-tolerable) failure. */
@@ -40,21 +45,57 @@ interface StripeStubOptions {
 }
 
 interface StripeStubCalls {
-  updated: Array<{ id: string; cancelAtPeriodEnd: boolean }>;
+  updated: Array<{ id: string; cancelAtPeriodEnd?: boolean; metadata?: Record<string, string> }>;
   canceled: string[];
   listed: string[];
   deletedCustomers: string[];
 }
 
-function makeStripeStub(opts: StripeStubOptions = {}): { stub: Stripe; calls: StripeStubCalls } {
+function makeStripeStub(opts: StripeStubOptions = {}): {
+  stub: Stripe;
+  calls: StripeStubCalls;
+  sub: (id: string) => { status: string; cancel_at_period_end: boolean; metadata: Record<string, string> };
+} {
   const calls: StripeStubCalls = { updated: [], canceled: [], listed: [], deletedCustomers: [] };
+  // A small stateful model of each subscription, answering the way Stripe
+  // does: retrieve reads a canceled subscription fine; update refuses one
+  // (invalid request); update merges metadata, and "" unsets a key.
+  const state = new Map<string, { status: Stripe.Subscription.Status; cancel_at_period_end: boolean; metadata: Record<string, string> }>();
+  const subOf = (id: string) => {
+    let s = state.get(id);
+    if (!s) {
+      const seed = opts.subs?.[id] ?? {};
+      s = { status: seed.status ?? "active", cancel_at_period_end: seed.cancel_at_period_end ?? false, metadata: { ...seed.metadata } };
+      state.set(id, s);
+    }
+    return s;
+  };
+  const view = (id: string) => ({ id, object: "subscription", ...subOf(id), metadata: { ...subOf(id).metadata } });
   const stub = {
     subscriptions: {
-      update: async (id: string, params: { cancel_at_period_end?: boolean }) => {
-        calls.updated.push({ id, cancelAtPeriodEnd: params.cancel_at_period_end ?? false });
+      retrieve: async (id: string) => {
+        if (opts.hardFailSubIds?.has(id)) throw new Error(`hard failure retrieving ${id}`);
+        if (opts.tolerableSubIds?.has(id)) throw tolerableError(`No such subscription: ${id}`);
+        return view(id);
+      },
+      update: async (id: string, params: { cancel_at_period_end?: boolean; metadata?: Record<string, string> }) => {
+        calls.updated.push({
+          id,
+          ...(params.cancel_at_period_end !== undefined ? { cancelAtPeriodEnd: params.cancel_at_period_end } : {}),
+          ...(params.metadata !== undefined ? { metadata: params.metadata } : {}),
+        });
         if (opts.hardFailSubIds?.has(id)) throw new Error(`hard failure updating ${id}`);
         if (opts.tolerableSubIds?.has(id)) throw tolerableError(`No such subscription: ${id}`);
-        return { id, status: "active" };
+        const sub = subOf(id);
+        if (sub.status === "canceled") {
+          throw new Stripe.errors.StripeInvalidRequestError({ message: "cannot update a canceled subscription", statusCode: 400 });
+        }
+        if (params.cancel_at_period_end !== undefined) sub.cancel_at_period_end = params.cancel_at_period_end;
+        for (const [k, v] of Object.entries(params.metadata ?? {})) {
+          if (v === "") delete sub.metadata[k];
+          else sub.metadata[k] = v;
+        }
+        return view(id);
       },
       cancel: async (id: string) => {
         calls.canceled.push(id);
@@ -76,7 +117,7 @@ function makeStripeStub(opts: StripeStubOptions = {}): { stub: Stripe; calls: St
       },
     },
   } as unknown as Stripe;
-  return { stub, calls };
+  return { stub, calls, sub: view };
 }
 
 async function seedBilledUser(
@@ -112,10 +153,30 @@ async function stripeIdsOf(userId: string): Promise<{ customer: string | null; s
 // --- deferBilling — the reversible hold -----------------------------------
 
 describe("deferBilling — sets the reversible hold", () => {
-  test("sets cancel_at_period_end = true on the stored subscription", async () => {
-    const { stub, calls } = makeStripeStub();
+  test("a renewing subscription: sets cancel_at_period_end = true and marks the hold as ours", async () => {
+    const { stub, calls, sub } = makeStripeStub();
     await deferBilling(stub, "sub_defer_1");
-    expect(calls.updated).toEqual([{ id: "sub_defer_1", cancelAtPeriodEnd: true }]);
+    expect(calls.updated).toEqual([
+      { id: "sub_defer_1", cancelAtPeriodEnd: true, metadata: { [DELETE_HOLD_METADATA_KEY]: DELETE_HOLD_PLACED } },
+    ]);
+    expect(sub("sub_defer_1").cancel_at_period_end).toBe(true);
+  });
+
+  test("a subscription already stopping is left stopping and marked kept — its renewal flag is never written", async () => {
+    const { stub, calls, sub } = makeStripeStub({ subs: { sub_stopping: { cancel_at_period_end: true, metadata: { plan: "standard" } } } });
+    await deferBilling(stub, "sub_stopping");
+    expect(calls.updated).toEqual([{ id: "sub_stopping", metadata: { [DELETE_HOLD_METADATA_KEY]: DELETE_HOLD_KEPT } }]);
+    expect(sub("sub_stopping").metadata).toEqual({ plan: "standard", [DELETE_HOLD_METADATA_KEY]: DELETE_HOLD_KEPT });
+  });
+
+  test("a second call (retry / double-submitted delete) keeps the first call's record: our hold stays ours", async () => {
+    const { stub, sub } = makeStripeStub();
+    await deferBilling(stub, "sub_twice");
+    await deferBilling(stub, "sub_twice");
+    expect(sub("sub_twice").metadata[DELETE_HOLD_METADATA_KEY]).toBe(DELETE_HOLD_PLACED);
+    // ...so undo still releases it.
+    await expect(resumeBilling(stub, "sub_twice")).resolves.toEqual({ resumed: true });
+    expect(sub("sub_twice").cancel_at_period_end).toBe(false);
   });
 
   test("a missing (null) subscription id is a no-op success — no Stripe call at all", async () => {
@@ -129,27 +190,47 @@ describe("deferBilling — sets the reversible hold", () => {
     await expect(deferBilling(stub, "sub_gone")).resolves.toBeUndefined();
   });
 
-  test("tolerant of an already-canceled subscription", async () => {
-    // Same tolerable error class Stripe uses for "you cannot update a
-    // canceled subscription" — deferBilling must not distinguish the two.
-    const { stub } = makeStripeStub({ tolerableSubIds: new Set(["sub_already_canceled"]) });
+  test("an already-canceled subscription: nothing to hold, no write", async () => {
+    const { stub, calls } = makeStripeStub({ subs: { sub_already_canceled: { status: "canceled" } } });
     await expect(deferBilling(stub, "sub_already_canceled")).resolves.toBeUndefined();
+    expect(calls.updated).toEqual([]);
   });
 
   test("a genuine Stripe failure propagates — the caller must know the hold may not have landed", async () => {
     const { stub } = makeStripeStub({ hardFailSubIds: new Set(["sub_boom"]) });
-    await expect(deferBilling(stub, "sub_boom")).rejects.toThrow("hard failure updating sub_boom");
+    await expect(deferBilling(stub, "sub_boom")).rejects.toThrow("hard failure retrieving sub_boom");
   });
 });
 
 // --- resumeBilling — release the hold -------------------------------------
 
 describe("resumeBilling — releases the hold (or says plainly it couldn't)", () => {
-  test("flips cancel_at_period_end back to false → { resumed: true }", async () => {
-    const { stub, calls } = makeStripeStub();
+  test("our hold: flips cancel_at_period_end back to false and drops the marker → { resumed: true }", async () => {
+    const { stub, calls, sub } = makeStripeStub({
+      subs: { sub_resume_1: { cancel_at_period_end: true, metadata: { plan: "standard", [DELETE_HOLD_METADATA_KEY]: DELETE_HOLD_PLACED } } },
+    });
     const result: ResumeBillingResult = await resumeBilling(stub, "sub_resume_1");
     expect(result).toEqual({ resumed: true });
-    expect(calls.updated).toEqual([{ id: "sub_resume_1", cancelAtPeriodEnd: false }]);
+    expect(calls.updated).toEqual([
+      { id: "sub_resume_1", cancelAtPeriodEnd: false, metadata: { [DELETE_HOLD_METADATA_KEY]: "" } },
+    ]);
+    expect(sub("sub_resume_1")).toMatchObject({ cancel_at_period_end: false, metadata: { plan: "standard" } });
+  });
+
+  test("kept (already stopping before the delete): stays stopping, only the marker goes", async () => {
+    const { stub, calls, sub } = makeStripeStub({
+      subs: { sub_kept: { cancel_at_period_end: true, metadata: { [DELETE_HOLD_METADATA_KEY]: DELETE_HOLD_KEPT } } },
+    });
+    await expect(resumeBilling(stub, "sub_kept")).resolves.toEqual({ resumed: true });
+    expect(calls.updated).toEqual([{ id: "sub_kept", metadata: { [DELETE_HOLD_METADATA_KEY]: "" } }]);
+    expect(sub("sub_kept")).toMatchObject({ cancel_at_period_end: true, metadata: {} });
+  });
+
+  test("no marker (a hold placed before the marker existed): released as before, so a renewing subscriber is not stranded", async () => {
+    const { stub, calls, sub } = makeStripeStub({ subs: { sub_legacy: { cancel_at_period_end: true } } });
+    await expect(resumeBilling(stub, "sub_legacy")).resolves.toEqual({ resumed: true });
+    expect(calls.updated).toEqual([{ id: "sub_legacy", cancelAtPeriodEnd: false }]);
+    expect(sub("sub_legacy").cancel_at_period_end).toBe(false);
   });
 
   test("a missing (null) subscription id: nothing to release → { resumed: true }, no Stripe call", async () => {
@@ -159,14 +240,22 @@ describe("resumeBilling — releases the hold (or says plainly it couldn't)", ()
   });
 
   test("THE MONEY CASE: the period boundary passed during the undo window — Stripe has no un-cancel. Must return the not-resumed result, never throw, never claim success", async () => {
-    const { stub } = makeStripeStub({ tolerableSubIds: new Set(["sub_boundary_passed"]) });
+    const { stub, calls } = makeStripeStub({
+      subs: { sub_boundary_passed: { status: "canceled", cancel_at_period_end: true, metadata: { [DELETE_HOLD_METADATA_KEY]: DELETE_HOLD_PLACED } } },
+    });
     const result = await resumeBilling(stub, "sub_boundary_passed");
     expect(result).toEqual({ resumed: false, reason: "already_canceled" });
+    expect(calls.updated).toEqual([]);
+  });
+
+  test("a subscription Stripe no longer knows (404) → the same not-resumed answer", async () => {
+    const { stub } = makeStripeStub({ tolerableSubIds: new Set(["sub_gone"]) });
+    await expect(resumeBilling(stub, "sub_gone")).resolves.toEqual({ resumed: false, reason: "already_canceled" });
   });
 
   test("a genuine Stripe failure propagates (not silently swallowed into a resumed/not-resumed answer)", async () => {
     const { stub } = makeStripeStub({ hardFailSubIds: new Set(["sub_boom"]) });
-    await expect(resumeBilling(stub, "sub_boom")).rejects.toThrow("hard failure updating sub_boom");
+    await expect(resumeBilling(stub, "sub_boom")).rejects.toThrow("hard failure retrieving sub_boom");
   });
 });
 
