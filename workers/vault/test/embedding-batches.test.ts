@@ -222,4 +222,23 @@ describe("embedding batches (T-318): oversized input is capped and split, not re
     }
     expect(await vectorCount(v, note.id)).toBe(chunks.length);
   }, 120_000);
+  it("a too-long input whose message carries a number like 3040 is still rejected, not retried forever", async () => {
+    // Second-review finding on the capacity fix: matching a bare `3040` (or
+    // "capacity"/"try again") anywhere in the message took a real too-long
+    // answer with that token count for an outage, so the chunk stayed stale
+    // and was retried on every wake.
+    for (const msg of [
+      "input exceeded the model context window (3040 > 512 tokens)",
+      "input too long: 3036 tokens, please try again with a shorter input",
+    ]) {
+      const provider = new WorkersAiEmbeddingProvider({
+        run: async () => {
+          throw new Error(msg);
+        },
+      } as any);
+      const err = await provider.embed({ texts: ["x"] } as EmbedInput).catch((e) => e);
+      expect(err, msg).toBeInstanceOf(EmbeddingError);
+      expect((err as EmbeddingError).code, msg).toBe("input_rejected");
+    }
+  });
 });
