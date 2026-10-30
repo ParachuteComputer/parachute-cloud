@@ -7,6 +7,9 @@
  *   - a sign-in already in flight when the claim lands (password at /login or
  *     /oauth/authorize, the 2FA code step, the legacy-hash upgrade write) must
  *     not leave a session or a password behind;
+ *   - a credential write from the planter's session already in flight
+ *     (set-password, 2FA enrolment, an account-token mint) must not land
+ *     after the claim deleted that session;
  *   - an account token (stateless, no `tokens` row for the claim to revoke)
  *     minted before the claim must stop working at /account/*.
  *
@@ -218,6 +221,96 @@ describe("a sign-in in flight when the owner claims the account", () => {
     // And the planted password no longer signs in.
     const again = await app.fetch(formPost("/login", { __csrf: CSRF, email, password: "plantedpw1" }, "10.91.3.3"), env);
     expect(cookieVal(again, "parachute_id_session")).toBeNull();
+  }, 30_000);
+});
+
+describe("a console write in flight from the planter's session when the owner claims", () => {
+  async function planterSession(email: string, ip: string): Promise<string> {
+    const login = await app.fetch(formPost("/login", { __csrf: CSRF, email, password: "plantedpw1" }, ip), env);
+    const session = cookieVal(login, "parachute_id_session")!;
+    expect(session).toBeTruthy();
+    return session;
+  }
+
+  test("set-password does not put a password back", async () => {
+    const email = "claim-race-setpw@example.com";
+    const userId = await plantAccount(email);
+    const session = await planterSession(email, "10.93.0.1");
+    const link = await ownerLink(email, "10.93.0.2");
+    // The session was live when the request started; the claim lands during
+    // the new password's PBKDF2, before the write.
+    const race = raceDb("UPDATE users SET password_hash", claimNow(link));
+    await app.fetch(
+      formPost(
+        "/console/security",
+        { __csrf: CSRF, action: "set-password", password: "planter-new-pw1" },
+        "10.93.0.3",
+        `parachute_id_session=${session}`,
+      ),
+      { ...env, DB: race.db },
+    );
+    expect(race.fired()).toBe(true);
+    await expectClaimed(userId);
+    const again = await app.fetch(
+      formPost("/login", { __csrf: CSRF, email, password: "planter-new-pw1" }, "10.93.0.4"),
+      env,
+    );
+    expect(cookieVal(again, "parachute_id_session")).toBeNull();
+  }, 30_000);
+
+  test("2FA enrolment does not plant a second factor", async () => {
+    const email = "claim-race-enrol@example.com";
+    const userId = await plantAccount(email);
+    const session = await planterSession(email, "10.93.1.1");
+    const link = await ownerLink(email, "10.93.1.2");
+    const secret = generateTotpSecret();
+    const race = raceDb("UPDATE users SET totp_secret", claimNow(link));
+    await app.fetch(
+      formPost(
+        "/console/security",
+        { __csrf: CSRF, action: "confirm", secret, code: await totpCodeAt(secret, new Date()) },
+        "10.93.1.3",
+        `parachute_id_session=${session}`,
+      ),
+      { ...env, DB: race.db },
+    );
+    expect(race.fired()).toBe(true);
+    await expectClaimed(userId);
+    expect(
+      await env.DB.prepare("SELECT totp_secret FROM users WHERE id = ?").bind(userId).first("totp_secret"),
+      "a second factor the planter set after the claim would lock the owner out",
+    ).toBeNull();
+  }, 30_000);
+
+  test("an account-token mint racing the claim yields nothing usable", async () => {
+    const email = "claim-race-mint@example.com";
+    const userId = await plantAccount(email);
+    await seedVault("claim-race-mint-vault", userId);
+    const session = await planterSession(email, "10.93.2.1");
+    const link = await ownerLink(email, "10.93.2.2");
+    // The session lookup has passed; the claim lands before the user row read.
+    const race = raceDb("SELECT * FROM users WHERE id = ?", claimNow(link));
+    const mint = await app.fetch(
+      new Request(`${ISSUER}/account/token`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: ISSUER,
+          cookie: `parachute_id_csrf=${CSRF}; parachute_id_session=${session}`,
+        },
+        body: JSON.stringify({ __csrf: CSRF }),
+      }),
+      { ...env, DB: race.db },
+    );
+    expect(race.fired()).toBe(true);
+    await expectClaimed(userId);
+    if (mint.status !== 200) return;
+    const token = ((await mint.json()) as { token: string }).token;
+    const list = await app.fetch(
+      new Request(`${ISSUER}/account/vaults`, { headers: { authorization: `Bearer ${token}` } }),
+      env,
+    );
+    expect(list.status, "a token minted across the claim opens the owner's account").toBe(401);
   }, 30_000);
 });
 
