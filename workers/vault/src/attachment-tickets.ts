@@ -207,6 +207,10 @@ export interface TicketSpendDeps {
   attachments: R2Bucket;
   mintGate: (declaredBytes: number) => Response | null;
   meterAdd: (bytes: number) => Promise<void>;
+  /** The DO's post-write check (`VaultDO.refuseLateWrite`): a Response when
+   *  the vault was destroyed or the account closed while the body streamed
+   *  (the object is already deleted), null when the write may stand. */
+  refuseLateWrite: (key: string) => Promise<Response | null>;
   scheduleTranscription: () => Promise<void>;
 }
 
@@ -314,6 +318,11 @@ async function handleUploadSpend(req: Request, ticketId: string, deps: TicketSpe
       500,
     );
   }
+
+  // The closed/destroyed checks ran when this request STARTED; the body can
+  // stream for minutes. Re-check now the object exists, before any DO write.
+  const late = await deps.refuseLateWrite(key);
+  if (late) return late;
 
   await deps.meterAdd(contentLength);
 

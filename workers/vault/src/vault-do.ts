@@ -155,7 +155,7 @@ function json(data: unknown, status = 200): Response {
  */
 async function accountClosed(request: Request): Promise<Response> {
   await request.body?.cancel().catch(() => {});
-  return json({ error: "Unauthorized", error_type: "account_closed", message: "This account has been closed." }, 401);
+  return accountClosedResponse();
 }
 
 // `detail` is heterogeneous measurement payload — see the note in the Phase-0
@@ -419,6 +419,14 @@ export async function purgePrefix(bucket: R2Bucket, prefix: string): Promise<num
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
   return deleted;
+}
+
+/** The refusal every tenant door gives once the owner closed the account (T-318). */
+function accountClosedResponse(): Response {
+  return json(
+    { error: "Unauthorized", error_type: "account_closed", message: "This account has been closed." },
+    401,
+  );
 }
 
 /** 503 while the import lock is held (T-318). The console re-checks via import-status. */
@@ -863,6 +871,7 @@ export class VaultDO extends DurableObject {
         attachments: this.env.ATTACHMENTS,
         mintGate: (declaredBytes) => this.attachmentMintGate(declaredBytes),
         meterAdd: (bytes) => this.meterAdd(bytes),
+        refuseLateWrite: (key) => this.refuseLateWrite(vaultName, key),
         scheduleTranscription: () => this.scheduleTranscriptionAlarm(),
       });
     }
@@ -1589,6 +1598,10 @@ export class VaultDO extends DurableObject {
       .filter((s) => retained.has(s.key))
       .sort((a, b) => (a.taken_at < b.taken_at ? -1 : a.taken_at > b.taken_at ? 1 : 0));
     await saveManifest(this.env.ATTACHMENTS, manifest);
+    // The snapshot's last R2 write: a destroy during the export/prune awaits
+    // must not leave the tarball or the manifest behind.
+    const late = await this.refuseLateWrite(vaultName);
+    if (late) return late;
 
     if (pruned.length > 0) console.log(`[snapshot-prune ${vaultName}] deleted ${pruned.length} stale snapshot(s)`);
     return json({ skipped: false, entry, pruned, long_paths: longPaths, manifest: manifest.snapshots });
@@ -2129,6 +2142,46 @@ export class VaultDO extends DurableObject {
     const used = usedBytes(Number(this.raw().databaseSize), this.r2Bytes);
     const cap = this.capBytes();
     if (used + declaredBytes > cap) return capExceededResponse(used, cap, declaredBytes);
+    return null;
+  }
+
+  /**
+   * The post-write check for a request that wrote to R2 across awaits. The
+   * closed/destroyed checks in `fetch()` run at request START; a slow upload
+   * (or an export, or a snapshot) can still be streaming when the account
+   * closes or the vault is destroyed, and its R2 object lands AFTER
+   * `handleDestroy`'s prefix purge already ran. Nothing purges a destroyed
+   * vault again: the account-delete sweep calls destroy once, then deletes
+   * the D1 rows that are the only record of whose prefix it was, so a late
+   * object would survive forever (and a warm destroyed instance answers a
+   * destroy retry from its flag without rescanning). Call this right after
+   * the LAST R2 write the handler makes and BEFORE any DO-storage write
+   * (`meterAdd`, an attachment row), so a destroyed instance isn't re-filled
+   * either.
+   *
+   *   - Destroyed: purge the whole `vault-<name>/` prefix again (it must be
+   *     empty, so this removes exactly the late writes, however many keys the
+   *     handler made) and answer the same 410 a later request gets.
+   *   - Closed (upload doors only, `closedKey` set): delete the one object
+   *     this request wrote and answer the door's 401, the same way the close
+   *     ends live streams that were authed before it. The bytes would be
+   *     purged with the vault anyway; refusing them keeps "nothing lands
+   *     after the close" true, and an undo leaves no unattached object.
+   *
+   * Returns null when the write may stand. Both R2 writes that completed
+   * before destroy's purge listed the prefix and ones that land after are
+   * covered: the former are purged by destroy, the latter here.
+   */
+  private async refuseLateWrite(vaultName: string, closedKey?: string): Promise<Response | null> {
+    if (this.destroyed) {
+      const n = await purgePrefix(this.env.ATTACHMENTS, `vault-${vaultName}/`);
+      console.log(`[destroy ${vaultName}] late_r2_objects_deleted=${n}`);
+      return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
+    }
+    if (closedKey !== undefined && this.config?.closed === true) {
+      await this.env.ATTACHMENTS.delete(closedKey);
+      return accountClosedResponse();
+    }
     return null;
   }
 
@@ -3438,9 +3491,12 @@ export class VaultDO extends DurableObject {
       const relativePath = `${date}/${filename}`;
       const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
       const bytes = await file.arrayBuffer();
-      await this.env.ATTACHMENTS.put(r2Key(vaultName, relativePath), bytes, {
+      const key = r2Key(vaultName, relativePath);
+      await this.env.ATTACHMENTS.put(key, bytes, {
         httpMetadata: { contentType: mimeType },
       });
+      const late = await this.refuseLateWrite(vaultName, key);
+      if (late) return late;
       await this.meterAdd(bytes.byteLength);
       return json({ path: relativePath, size: bytes.byteLength, mimeType }, 201);
     }
@@ -3545,6 +3601,9 @@ export class VaultDO extends DurableObject {
       console.error(`[export ${vaultName}] failed: ${errText(e)}`);
       return json({ error: "export_failed", message: "Export could not be assembled. Please retry." }, 500);
     }
+    // A destroy that ran while the tarball streamed must not leave it behind.
+    const late = await this.refuseLateWrite(vaultName);
+    if (late) return late;
     // Retention: keep only the newest EXPORT_KEEP tarballs. Best-effort — a
     // prune failure is logged and never fails the export response (the caller
     // gets their bytes either way; a leaked tarball is caught by the next
