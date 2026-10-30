@@ -818,6 +818,27 @@ describe("restore POST", () => {
     expect((await getVault(env.DB, target))?.importPendingAt).toBeNull();
   });
 
+  test("a double-submitted restore goes to the same target, where the vault's lock refuses it (no second vault)", async () => {
+    const { id: userId } = await seedUser("rp-double@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-double-v", userId);
+    const entry = wireEntry("rp-double-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-double-v", entry);
+    const target = restoredVaultName("rp-double-v", new Date());
+    await createVault(env.DB, target, userId, new Date(), { pending: "restore" });
+
+    interceptImportStatus(target, { state: "running", kind: "restore" });
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: `/vault/${target}/api/internal/restore`, method: "POST" })
+      .reply(503, { error_type: "import_in_progress" }, { headers: { "content-type": "application/json" } });
+    const res = await quietly(async () =>
+      app.fetch(restoreReq({ vault: "rp-double-v", key: entry.key }, sessionCookie(await seedSession(userId))), env),
+    );
+    expect(await res.text()).toContain("Restore didn&#39;t complete");
+    expect(await getVault(env.DB, `${target}-2`)).toBeNull();
+  });
+
   test("a restore-flagged target the vault can't report on is left alone (no replay into it)", async () => {
     const { id: userId } = await seedUser("rp-unknown@example.com");
     await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();

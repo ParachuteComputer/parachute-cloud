@@ -1127,6 +1127,26 @@ function routerNotFound(): Response {
 /** Same-day restores of one vault before the console asks to wait a day. */
 const MAX_SAME_DAY_RESTORES = 20;
 
+/**
+ * Whether the vault says its last restore did NOT land (failed, interrupted
+ * by a reset, never started), so replaying into it again is the retry. One
+ * still running counts too: the vault's import lock refuses the second replay
+ * (a double submit gets "try again", not a second vault). A finished restore,
+ * or no answer at all, is false: never replay into a vault that may hold the
+ * owner's writes. Never throws.
+ */
+async function restoreDidNotFinish(db: D1Database, deps: OAuthDeps, userId: string, vaultName: string): Promise<boolean> {
+  try {
+    const res = await callVaultImportStatus(db, deps, userId, vaultName);
+    if (!res.ok) return false;
+    const rec = (await res.json()) as { state?: unknown; kind?: unknown };
+    if (rec.state === "none") return true;
+    return rec.kind === "restore" && (rec.state === "failed" || rec.state === "interrupted" || rec.state === "running");
+  } catch {
+    return false;
+  }
+}
+
 export async function handleRestorePost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
@@ -1160,9 +1180,15 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
       break;
     }
     if (existing.ownerUserId === user.id && isRestorePending(existing)) {
-      targetName = name;
-      reuse = true;
-      break;
+      if (await restoreDidNotFinish(db, deps, user.id, name)) {
+        targetName = name;
+        reuse = true;
+        break;
+      }
+      // The flag outlived a finished restore (its clear failed, or the answer
+      // was lost after the vault committed): the owner's vault now. Drop the
+      // stale flag (best-effort) and take the next name.
+      await clearImportPending(db, name, user.id).catch(() => undefined);
     }
     // A finished restore (the owner's vault now), an unfinished import, or a
     // name someone else holds: never replay into it.
