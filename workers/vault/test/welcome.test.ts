@@ -117,6 +117,20 @@ describe("default seed — a new vault's first materialization", () => {
     expect(tags.find((t) => t.name === "pinned")).toBeUndefined();
   });
 
+  it("a newcomer's Recent list opens on Welcome, with the AI-facing Getting Started last", async () => {
+    // T-318 newcomer walk: all six guides share one timestamp (time doesn't move
+    // inside the DO seed), so newest-first falls back to id order, and the last
+    // note seeded led the list. That was Getting Started, a brief addressed to
+    // "a connected AI (you)", shown to the person before anything meant for them.
+    const v = freshVault("w");
+    const res = await op(v, "/api/notes?sort=desc&include_content=false");
+    expect(res.status).toBe(200);
+    const paths = ((await res.json()) as any[]).map((n) => n.path);
+    expect(paths[0]).toBe(WELCOME_PATH);
+    expect(paths.at(-1)).toBe(GETTING_STARTED_PATH);
+    expect(paths.slice(0, 5)).toEqual(WELCOME_GUIDES);
+  });
+
   it("seeded content is byte-equal to core's packs plus the listed cloud corrections", async () => {
     const v = freshVault("w");
     const notes = await listNotes(v);
