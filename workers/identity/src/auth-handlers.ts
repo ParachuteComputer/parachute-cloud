@@ -40,7 +40,7 @@ import {
   loginKey,
   recordLoginFailure,
 } from "./rate-limit.ts";
-import { buildSessionCookie, createSession } from "./sessions.ts";
+import { buildSessionCookie, createSession, createSessionIfProofHolds, type SessionProof } from "./sessions.ts";
 import { clearSignupBindingCookie, requestHoldsBinding } from "./signup-binding.ts";
 import { sessionUser } from "./session-user.ts";
 import {
@@ -118,6 +118,9 @@ export async function finishPrimaryAuth(
   deps: OAuthDeps,
   userId: string,
   next: string,
+  // A password sign-in passes the verifier it matched: the session lands only
+  // if the row still holds it (sessions.ts createSessionIfProofHolds).
+  proof?: SessionProof,
 ): Promise<Response> {
   const now = deps.now?.() ?? new Date();
   const user = await getUserById(db, userId);
@@ -126,7 +129,8 @@ export async function finishPrimaryAuth(
     const token = await createPendingLogin(db, userId, next, now);
     return redirectResponse("/login/2fa", { "set-cookie": buildPendingLoginCookie(token) });
   }
-  const session = await createSession(db, userId, now);
+  const session = proof ? await createSessionIfProofHolds(db, userId, proof, now) : await createSession(db, userId, now);
+  if (!session) return redirectResponse("/login");
   return redirectResponse(next, { "set-cookie": buildSessionCookie(session.id) });
 }
 
@@ -560,6 +564,9 @@ export async function handleLogin2faPost(db: D1Database, req: Request, deps: OAu
   if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
     return login2faError(req, "Too many attempts. Please wait a few minutes and try again.", email, notYouNext);
   }
+  // The secret the code is checked against, read first: the session below
+  // lands only if the row still holds it (a legacy-account claim clears it).
+  const totpSecret = (await getTotpState(db, pending.userId)).secret;
   const result = await verifySecondFactor(db, pending.userId, String(form.get("code") ?? ""), now);
   if (!result.ok) {
     await recordLoginFailure(deps.rateLimiter, key, now);
@@ -574,7 +581,8 @@ export async function handleLogin2faPost(db: D1Database, req: Request, deps: OAu
   if (!pendingUser || pendingUser.suspendedAt || pendingUser.deletedAt) {
     return redirectResponse("/login", { "set-cookie": clearPendingLoginCookie() });
   }
-  const session = await createSession(db, pending.userId, now);
+  const session = totpSecret ? await createSessionIfProofHolds(db, pending.userId, { totpSecret }, now) : null;
+  if (!session) return redirectResponse("/login", { "set-cookie": clearPendingLoginCookie() });
   const headers = new Headers({ location: notYouNext });
   headers.append("set-cookie", buildSessionCookie(session.id));
   headers.append("set-cookie", clearPendingLoginCookie());

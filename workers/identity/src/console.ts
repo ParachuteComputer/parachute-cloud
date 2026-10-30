@@ -63,7 +63,14 @@ import { finishPrimaryAuth, safeNext, sendSignInLink } from "./auth-handlers.ts"
 import type { EmailSender } from "./email.ts";
 import { buildSignupBindingCookie, signupBindingFor } from "./signup-binding.ts";
 import { EMAIL_RE, PASSWORD_MIN, normalizeEmail } from "./validation.ts";
-import { getUserByEmail, hashPassword, needsRehash, setPassword, verifyPassword, type User } from "./users.ts";
+import {
+  getUserByEmail,
+  hashPassword,
+  needsRehash,
+  rehashPasswordIfUnchanged,
+  verifyPassword,
+  type User,
+} from "./users.ts";
 import {
   VaultNameInvalidError,
   VaultNameTakenError,
@@ -269,9 +276,14 @@ export async function handleLoginPost(db: D1Database, req: Request, deps: OAuthD
   await clearLoginFailures(deps.rateLimiter, key);
   // Transparent KDF upgrade: a verified-correct password stored under the
   // legacy sha256 verifier is re-hashed to the current format (users.ts, #28).
-  if (needsRehash(user)) await setPassword(db, user.id, password);
-  // 2FA on → this diverts to the code prompt; otherwise it mints the session.
-  return finishPrimaryAuth(db, deps, user.id, "/console");
+  // Conditional on the verifier just matched, so it never puts back a password
+  // that changed meanwhile (a legacy-account claim clears the planted one).
+  const passwordHash = needsRehash(user)
+    ? await rehashPasswordIfUnchanged(db, user.id, user.passwordHash, password)
+    : user.passwordHash;
+  // 2FA on → this diverts to the code prompt; otherwise it mints the session,
+  // only if the row still holds that verifier.
+  return finishPrimaryAuth(db, deps, user.id, "/console", { passwordHash });
 }
 
 function loginError(req: Request, message: string, email: string): Response {

@@ -52,6 +52,47 @@ export async function createSession(db: D1Database, userId: string, now: Date = 
 }
 
 /**
+ * The credential a sign-in checked before asking for a session: the password
+ * verifier it matched, or the TOTP secret the code matched.
+ */
+export type SessionProof = { passwordHash: string } | { totpSecret: string };
+
+/**
+ * Create a session only if the user row still holds the credential the sign-in
+ * checked, tested in the same INSERT. A password check runs PBKDF2 (tens of
+ * ms) on a row read earlier; if a legacy-account claim (auth-handlers.ts
+ * claimUnverifiedAccount) or anything else replaced that credential in
+ * between, the sign-in proved a credential that no longer exists and gets no
+ * session. Returns null then; the claim has already deleted every session, so
+ * the guard is what keeps a racing one from landing after it.
+ */
+export async function createSessionIfProofHolds(
+  db: D1Database,
+  userId: string,
+  proof: SessionProof,
+  now: Date = new Date(),
+): Promise<Session | null> {
+  const id = randomBase64url(32);
+  const createdAt = now.toISOString();
+  const expiresAt = new Date(now.getTime() + SESSION_TTL_MS).toISOString();
+  // Fixed column names, never caller input.
+  const [column, value] = "passwordHash" in proof ? ["password_hash", proof.passwordHash] : ["totp_secret", proof.totpSecret];
+  const res = await db
+    .prepare(
+      `INSERT INTO sessions (id, user_id, created_at, expires_at)
+       SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM users WHERE id = ? AND ${column} = ? AND ${column} != '')`,
+    )
+    .bind(id, userId, createdAt, expiresAt, userId, value)
+    .run();
+  if ((res.meta.changes ?? 0) === 0) {
+    console.log(`event=session_refused_credential_changed user=${userId}`);
+    return null;
+  }
+  await bumpOpsCounter(db, "sign_in", now);
+  return { id, userId, createdAt, expiresAt };
+}
+
+/**
  * Find a live (un-expired) session by id. A session whose user is SUSPENDED
  * (users.suspended_at, migration 0011) or DELETED (users.deleted_at,
  * migration 0023) is refused here — the single read-time chokepoint that

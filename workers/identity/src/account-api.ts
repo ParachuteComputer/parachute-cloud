@@ -187,6 +187,14 @@ export async function requireAccount(
   if (user.suspendedAt !== null) {
     return { ok: false, response: authError(401, "account_suspended", "this account is suspended") };
   }
+  // Minted while the address was unproven, and the account has since been
+  // claimed by the address owner (auth-handlers.ts claimUnverifiedAccount):
+  // the token belongs to whoever held the account before the proof. The claim
+  // drops every session and registry token; this is the same cut for the
+  // stateless account token, using the row already read above.
+  if (result.token.payload.email_verified === false && user.emailVerified) {
+    return { ok: false, response: authError(401, "invalid_token", "token predates the account's address proof") };
+  }
   if (!hasAccountScope(result.token.scopes, accountId, verb)) {
     return {
       ok: false,

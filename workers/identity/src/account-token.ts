@@ -43,7 +43,10 @@
  * persisted in the `tokens` table — no registry row, no per-jti revocation. It
  * is short-lived (10 min) and re-minted from the live session cookie; revocation
  * is by logout (kills the cookie → no re-mint, sessions.ts deleteSession) plus
- * the read-time suspend chokepoint above. A stateless mint avoids a DB write on
+ * the read-time suspend chokepoint above. A legacy-account claim (the owner
+ * proving an address someone else signed up with) can't reach it either, so
+ * the token carries `email_verified` as minted and `/account/*` refuses one
+ * minted unverified once the account is verified (account-api.ts). A stateless mint avoids a DB write on
  * every re-mint, matching the internal `parachute-console` mints (vault-call.ts).
  */
 import { csrfTokenValid, CSRF_FIELD } from "./csrf.ts";
@@ -129,6 +132,9 @@ export async function handleAccountToken(db: D1Database, req: Request, deps: OAu
     vaultScope: [],
     ttlSeconds: ACCOUNT_TOKEN_TTL_SECONDS,
     now: deps.now,
+    // Stateless, so a legacy-account claim can't revoke it; the /account/*
+    // gate refuses a token minted unverified once the account is verified.
+    emailVerified: user.emailVerified,
   });
 
   return jsonResponse(

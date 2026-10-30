@@ -341,6 +341,29 @@ export async function setPassword(db: D1Database, userId: string, password: stri
 }
 
 /**
+ * The transparent KDF upgrade after a correct sign-in: re-hash `password` and
+ * store it ONLY if the row still holds `oldHash`, the verifier the sign-in
+ * just matched. Unconditional, the write would put a password back that
+ * changed in between (a legacy-account claim clears the planted one while the
+ * sign-in runs PBKDF2). Returns the verifier the row now holds if the upgrade
+ * landed, else `oldHash`, for the session guard (sessions.ts
+ * createSessionIfProofHolds), which then refuses if the row moved on.
+ */
+export async function rehashPasswordIfUnchanged(
+  db: D1Database,
+  userId: string,
+  oldHash: string,
+  password: string,
+): Promise<string> {
+  const passwordHash = await hashPassword(password);
+  const res = await db
+    .prepare("UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?")
+    .bind(passwordHash, userId, oldHash)
+    .run();
+  return (res.meta.changes ?? 0) > 0 ? passwordHash : oldHash;
+}
+
+/**
  * Set a user's plan. The plan-change seam (admin / Stripe webhook, later PRs)
  * calls this then `applyPlanToVaults` (vault-call.ts) so storage caps follow
  * the entitlement. Type-narrowed to PlanId — callers validate raw input.
