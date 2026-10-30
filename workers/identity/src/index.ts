@@ -125,6 +125,27 @@ export function senderFor(env: Env): EmailSender {
 // The DEFAULT export stays the `{ fetch, scheduled }` handler wrangler runs.
 export const app = new Hono<{ Bindings: Env }>();
 
+/**
+ * A request body the runtime cannot parse as a form (multipart with no or a
+ * broken boundary, a Content-Type FormData doesn't accept) makes
+ * `req.formData()` throw a TypeError with one of these messages. That is the
+ * CLIENT's error. Left to Hono's default handler it was a 500, and every 5xx
+ * feeds the ops counter that pages the operator at 25 per 10 minutes — so 25
+ * anonymous junk POSTs could page on demand. Matching the runtime's messages
+ * is deliberately narrow: an unrecognised error still answers 500 and counts.
+ */
+const FORM_PARSE_ERROR = /multipart\/form-data MIME type requires a boundary|No initial boundary string|FormData can only parse/;
+
+app.onError((err, c) => {
+  if (err instanceof TypeError && FORM_PARSE_ERROR.test(err.message)) {
+    return c.text("Bad Request: the request body could not be read as a form.", 400);
+  }
+  // Hono's default handler, unchanged.
+  if ("getResponse" in err && typeof err.getResponse === "function") return err.getResponse() as Response;
+  console.error(err);
+  return c.text("Internal Server Error", 500);
+});
+
 // --- liveness (public, unauthenticated, no D1) ---
 // Cheap JSON for external monitors + the smoke scripts. The scheduled health
 // check does NOT fetch this (a worker can't fetch its own route, and "the cron
