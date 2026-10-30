@@ -128,7 +128,7 @@ export interface PurgeReport {
  */
 export async function buildPurgeReport(
   db: D1Database,
-  input: { email: string; userId?: string; ownerId?: string; vaults?: string[]; bounded?: boolean },
+  input: { email: string; userId?: string; ownerId?: string; vaults?: string[] },
 ): Promise<PurgeReport> {
   const email = input.email.trim().toLowerCase();
   const userRow = await db
@@ -168,70 +168,29 @@ export async function buildPurgeReport(
   // term blows past that. The terms are an email, UUIDs and vault slugs, and
   // doubling `'` is the complete escaping rule for an SQLite string literal.
   const lit = (t: string) => `'${t.replace(/'/g, "''")}'`;
-  /** Characters that end an address or a vault slug (bounded mode). */
-  const EMAIL_DELIMS = [
-    `'"'`, `''''`, `'<'`, `'>'`, `','`, `';'`, `':'`, `'|'`, `'('`, `')'`,
-    `'['`, `']'`, `'{'`, `'}'`, `'='`, `'/'`, `'\\'`, "char(9)", "char(10)", "char(13)",
-  ];
-  const VAULT_DELIMS = [...EMAIL_DELIMS, `'.'`, `'@'`, `'?'`, `'&'`, `'#'`];
   const statements: D1PreparedStatement[] = [];
   const shapes: Array<{ table: string; columns: string[] }> = [];
   tables.forEach((table, i) => {
     const columns = ((infos[i]?.results ?? []) as Array<{ name: string }>).map((c) => c.name);
     if (columns.length === 0) return;
-    // `bounded` (the ops door, T-328): the email and vault terms must stand
-    // alone, so another account whose address CONTAINS this one (`a@x.io` in
-    // `ba@x.io`, `bob@gmail.co` in `bob@gmail.com`) or a vault whose name starts
-    // with this one's (`notes` / `notes2`) is not counted as a leftover: every
-    // delimiter becomes a space, the value is space-padded, and the term must
-    // have a space on each side. Ids (UUIDs) stay substring matches; they
-    // cannot collide that way. The staging proof keeps the wider substring net.
-    // The padded values are computed ONCE per column in the innermost SELECT
-    // (`p<j>` for the email, `q<j>` for vault names), so a wide table cannot
-    // push the statement past D1's SQL length cap.
-    const bounded = input.bounded === true;
-    const pad = (v: string, delims: string[]) =>
-      `(' ' || ${delims.reduce((acc, d) => `replace(${acc}, ${d}, ' ')`, v)} || ' ')`;
-    // A full stop is part of an address, so it is not a delimiter; an address
-    // that ENDS a sentence ("… person@example.com.") is matched on its own.
-    const boundedEmail = (p: string) =>
-      `(instr(${p}, ${lit(` ${email} `)}) > 0 OR instr(${p}, ${lit(` ${email}. `)}) > 0)`;
-    const conds = columns.map((col, j) => {
-      const v = `v${j}`;
+    const conds = columns.map((col) => {
+      const v = `lower(CAST(${ident(col)} AS TEXT))`;
       const parts: string[] = [];
-      for (const term of idTerms) {
-        parts.push(
-          bounded && term === email ? boundedEmail(`p${j}`) : `instr(${v}, ${lit(term.toLowerCase())}) > 0`,
-        );
-      }
+      for (const term of idTerms) parts.push(`instr(${v}, ${lit(term.toLowerCase())}) > 0`);
       const vaultColumn = /vault/i.test(col) || (table === "vaults" && col === "name");
       for (const name of vaultList) {
         if (vaultColumn) parts.push(`${v} = ${lit(name)}`);
-        // Bounded: `vault:<n>:`, `vault.<n>`, `:vaults:<n>` read ` vault <n> ` /
-        // ` vaults <n> ` once padded; `vault-<n>/` reads ` vault-<n> `.
-        const spellings = bounded
-          ? [` vault ${name} `, ` vaults ${name} `, ` vault-${name} `]
-          : [`vault:${name}:`, `vault-${name}/`, `vault.${name}`, `:vaults:${name}`];
-        for (const spelled of spellings) parts.push(`instr(${bounded ? `q${j}` : v}, ${lit(spelled)}) > 0`);
+        for (const spelled of [`vault:${name}:`, `vault-${name}/`, `vault.${name}`, `:vaults:${name}`]) {
+          parts.push(`instr(${v}, ${lit(spelled)}) > 0`);
+        }
       }
       return parts.length > 0 ? `(${parts.join(" OR ")})` : "0";
     });
-    // One pass: the innermost SELECT lowers (and pads) each column once, the
-    // middle computes a 0/1 match per column per row, the outer sums them per
-    // column and for "any column" (no repeated predicate). `e` flags rows
-    // carrying the EMAIL anywhere, reported apart so "no email-bearing rows
-    // remain" is its own checkable number.
-    const emailCond = columns
-      .map((_, j) => (bounded ? boundedEmail(`p${j}`) : `instr(v${j}, ${lit(email)}) > 0`))
-      .join(" OR ");
-    const base = columns
-      .flatMap((col, j) => {
-        const v = `lower(CAST(${ident(col)} AS TEXT))`;
-        return bounded
-          ? [`${v} AS v${j}`, `${pad(v, EMAIL_DELIMS)} AS p${j}`, `${pad(v, VAULT_DELIMS)} AS q${j}`]
-          : [`${v} AS v${j}`];
-      })
-      .join(", ");
+    // One pass: an inner SELECT computes a 0/1 match per column per row, the
+    // outer sums them per column and for "any column" (no repeated predicate).
+    // `e` flags rows carrying the EMAIL anywhere, reported apart so "no
+    // email-bearing rows remain" is its own checkable number.
+    const emailCond = columns.map((col) => `instr(lower(CAST(${ident(col)} AS TEXT)), ${lit(email)}) > 0`).join(" OR ");
     const inner = [
       ...conds.map((c, j) => `(CASE WHEN ${c} THEN 1 ELSE 0 END) AS m${j}`),
       `(CASE WHEN ${emailCond} THEN 1 ELSE 0 END) AS e`,
@@ -241,11 +200,7 @@ export async function buildPurgeReport(
       `COALESCE(SUM(CASE WHEN ${columns.map((_, j) => `m${j} = 1`).join(" OR ")} THEN 1 ELSE 0 END), 0) AS any_row`,
       `COALESCE(SUM(e), 0) AS email_rows`,
     ].join(", ");
-    statements.push(
-      // MATERIALIZED: without it SQLite flattens the padded columns back into
-      // every predicate that reads them, and the expression tree blows up.
-      db.prepare(`WITH b AS MATERIALIZED (SELECT ${base} FROM ${ident(table)}) SELECT ${outer} FROM (SELECT ${inner} FROM b)`),
-    );
+    statements.push(db.prepare(`SELECT ${outer} FROM (SELECT ${inner} FROM ${ident(table)})`));
     shapes.push({ table, columns });
   });
   const counted = statements.length > 0 ? await db.batch(statements) : [];

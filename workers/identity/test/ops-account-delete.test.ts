@@ -73,6 +73,8 @@ function spySender(): { sender: EmailSender; to: string[] } {
   };
 }
 
+const EMAIL_UPPER = (e: string) => e.toUpperCase();
+
 async function json(res: Response | null): Promise<Record<string, any>> {
   expect(res).not.toBeNull();
   return (await res!.json()) as Record<string, any>;
@@ -180,6 +182,7 @@ describe("POST /ops/account-delete — the purge", () => {
     expect(out).toMatchObject({ done: true, account_found: true, user_id: id });
     expect(out.sweep).toMatchObject({ purged: 1, deferred: 0 });
     expect(destroyed.sort()).toEqual(["erase-now-a", "erase-now-b"]);
+    expect(out.leftovers.rows_total).toBe(0);
     expect(out.report.remaining_rows_total).toBe(0);
     expect(out.report.email_rows_total).toBe(0);
 
@@ -264,7 +267,9 @@ describe("POST /ops/account-delete — the purge", () => {
       .run();
     const out = await json(await call({ email, confirm: email, written_request: REF }));
     expect(out, JSON.stringify(out.report)).toMatchObject({ done: true, account_found: true });
-    expect(out.report.remaining_rows_total).toBe(0);
+    expect(out.leftovers.rows_total).toBe(0);
+    // The wide net did flag them; the re-read cleared them.
+    expect(out.report.remaining_rows_total).toBeGreaterThan(0);
     expect(await getUserById(db(), other)).not.toBeNull();
     expect(await count("SELECT COUNT(*) AS n FROM vaults WHERE name = 'notes2'")).toBe(1);
     expect(await count("SELECT COUNT(*) AS n FROM magic_links WHERE email = 'mike@example.com'")).toBe(1);
@@ -283,18 +288,26 @@ describe("POST /ops/account-delete — the purge", () => {
     expect(await count("SELECT COUNT(*) AS n FROM magic_links WHERE email = ?", "someone-else@example.com")).toBe(1);
   });
 
-  test("bounded still catches the real leftover: the address ending a sentence in a row the purge does not reach", async () => {
-    const email = "ends-sentence@example.co";
+  test("the re-read still catches a real leftover, whatever follows the address", async () => {
+    const email = "left-behind@example.co";
     await seedUser(email);
-    await env.DB.prepare("INSERT INTO ops_alerts (key, last_alert_at) VALUES (?, ?)")
-      .bind(`note:contact ${email}.`, new Date().toISOString())
-      .run();
+    const at = new Date().toISOString();
+    const keys = [
+      `note:contact ${email}.`,
+      `mailto:${email}?subject=x`,
+      `who=${email}!`,
+      `${email}`,
+      `<${EMAIL_UPPER(email)}>`,
+    ];
+    for (const key of keys) {
+      await env.DB.prepare("INSERT INTO ops_alerts (key, last_alert_at) VALUES (?, ?)").bind(key, at).run();
+    }
+    // Not this address: the domain goes on.
+    await env.DB.prepare("INSERT INTO ops_alerts (key, last_alert_at) VALUES (?, ?)").bind(`x:${email}.uk`, at).run();
     const res = await call({ email, confirm: email, written_request: REF });
     const out = await json(res);
     expect(res!.status).toBe(502);
-    expect(out).toMatchObject({ done: false });
-    expect(out.report.email_rows_total).toBe(1);
-    expect(Object.keys(out.report.tables_with_rows)).toEqual(["ops_alerts"]);
+    expect(out).toMatchObject({ done: false, leftovers: { rows_total: keys.length, tables: { ops_alerts: keys.length } } });
   });
 
   test("a vault that will not destroy defers: the account row and that vault stay, done is false", async () => {

@@ -25,8 +25,11 @@
  *      when no account row exists — an address that started a sign-up and never
  *      finished has no account to purge, and was otherwise unreachable.
  * Then it answers the purge report (counts only, every D1 table enumerated at
- * runtime, `bounded` matching so a look-alike address or vault name is not a
- * false leftover). A vault that will not destroy defers like the sweep does:
+ * runtime). That report is a deliberately wide substring net, so every row it
+ * flags is re-read here and judged with real boundaries ({@link confirmLeftovers}):
+ * another account whose address CONTAINS this one (`ike@x.co` in
+ * `mike@x.com`) or a vault named `notes2` next to `notes` is not a leftover,
+ * and must not hold `done` at false forever. A vault that will not destroy defers like the sweep does:
  * the account row stays (still closed), the answer says how many passes have
  * failed, and a second call converges.
  *
@@ -52,6 +55,72 @@ const NO_STORE = { "cache-control": "no-store" };
 
 function refuse(status: number, error: string, message: string): Response {
   return Response.json({ error, message }, { status, headers: NO_STORE });
+}
+
+const escapeRe = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Double-quote an SQL identifier. */
+const ident = (name: string) => `"${name.replace(/"/g, '""')}"`;
+/** Inline an SQL string literal (D1 caps bound parameters at 100 per statement). */
+const lit = (t: string) => `'${t.replace(/'/g, "''")}'`;
+/** Rows re-read per flagged table; past this every flagged row counts. */
+const CONFIRM_ROW_CAP = 500;
+
+/**
+ * Re-read the rows the purge report flagged and keep only the ones that
+ * really name this account: an id (UUID) anywhere; the email with nothing
+ * address-like on either side (a full stop counts as the end unless the domain
+ * goes on, so `…@x.co.` is a hit and `…@x.co.uk` is not); a vault name exactly in
+ * a vault column, or as `vault:<n>:` / `vault-<n>/` / `vault.<n>` /
+ * `:vaults:<n>` with no slug character after it. Counts only; nothing read
+ * here leaves the worker.
+ */
+export async function confirmLeftovers(
+  db: D1Database,
+  tables: Record<string, { rows: number; columns: Record<string, number> }>,
+  terms: { email: string; ids: string[]; vaults: string[] },
+): Promise<{ rows_total: number; tables: Record<string, number> }> {
+  const emailRe = new RegExp(`(?<![a-z0-9._%+\\-])${escapeRe(terms.email)}(?![a-z0-9\\-]|\\.[a-z0-9])`);
+  const vaultRes = terms.vaults.map(
+    (n) => new RegExp(`vault:${escapeRe(n)}:|vault-${escapeRe(n)}/|(?:vault\\.|:vaults:)${escapeRe(n)}(?![a-z0-9\\-])`),
+  );
+  const prefilter = [terms.email, ...terms.ids, ...terms.vaults];
+  const out: Record<string, number> = {};
+  let total = 0;
+  for (const [table, t] of Object.entries(tables)) {
+    if (t.rows === 0) continue;
+    const cols = Object.entries(t.columns).filter(([, n]) => n > 0).map(([c]) => c);
+    if (cols.length === 0) continue;
+    const where = cols
+      .flatMap((c) => prefilter.map((term) => `instr(lower(CAST(${ident(c)} AS TEXT)), ${lit(term)}) > 0`))
+      .join(" OR ");
+    const res = await db
+      .prepare(`SELECT ${cols.map(ident).join(", ")} FROM ${ident(table)} WHERE ${where} LIMIT ${CONFIRM_ROW_CAP + 1}`)
+      .all<Record<string, unknown>>();
+    const rows = res.results ?? [];
+    let n = 0;
+    if (rows.length > CONFIRM_ROW_CAP) {
+      n = t.rows;
+    } else {
+      for (const row of rows) {
+        const hit = cols.some((c) => {
+          const raw = row[c];
+          if (raw === null || raw === undefined) return false;
+          const v = String(raw).toLowerCase();
+          const vaultColumn = /vault/i.test(c) || (table === "vaults" && c === "name");
+          return (
+            terms.ids.some((id) => v.includes(id.toLowerCase())) ||
+            emailRe.test(v) ||
+            (vaultColumn && terms.vaults.includes(v)) ||
+            vaultRes.some((r) => r.test(v))
+          );
+        });
+        if (hit) n++;
+      }
+    }
+    if (n > 0) out[table] = n;
+    total += n;
+  }
+  return { rows_total: total, tables: out };
 }
 
 async function countMagicLinks(db: D1Database, email: string): Promise<number> {
@@ -155,10 +224,13 @@ export async function handleOpsAccountDeletePost(
     ...(user ? { userId: user.id } : {}),
     ...(user?.ownerId ? { ownerId: user.ownerId } : {}),
     vaults: vaults.map((v) => v.name),
-    bounded: true,
   });
-  const nonzero = Object.fromEntries(Object.entries(report.tables).filter(([, t]) => t.rows > 0));
-  const done = purged && report.remaining_rows_total === 0 && report.email_rows_total === 0;
+  const confirmed = await confirmLeftovers(env.DB, report.tables, {
+    email,
+    ids: [user?.id, user?.ownerId].filter((t): t is string => typeof t === "string" && t.length >= 3),
+    vaults: vaults.map((v) => v.name.toLowerCase()),
+  });
+  const done = purged && confirmed.rows_total === 0;
   // Still there after a deferral: how many passes have failed (the sweep pages
   // the operator at ACCOUNT_PURGE_ALERT_AFTER_ATTEMPTS). The reason is on the
   // `event=account_purge_deferred` log line.
@@ -173,10 +245,11 @@ export async function handleOpsAccountDeletePost(
       sweep,
       ...(purgeAttempts !== null ? { purge_attempts: purgeAttempts } : {}),
       magic_links_deleted: magicLinksDeleted,
+      leftovers: confirmed,
       report: {
         remaining_rows_total: report.remaining_rows_total,
         email_rows_total: report.email_rows_total,
-        tables_with_rows: nonzero,
+        tables_with_rows: Object.fromEntries(Object.entries(report.tables).filter(([, t]) => t.rows > 0)),
         checked_tables: report.checked_tables.length,
         audit: report.audit,
       },
