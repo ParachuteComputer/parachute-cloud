@@ -349,6 +349,12 @@ export async function deleteVaultD1Rows(
  * {@link clearImportPending} on import success; every other creation path
  * leaves it NULL.
  *
+ * `opts.pending: "restore"` (restore door only) stamps the same column with
+ * {@link RESTORE_PENDING_PREFIX} + the time, so each door reuses only its own
+ * unfinished vault: a restore never replays into a failed import, and an
+ * upload never lands on a failed restore. The column is TEXT and otherwise
+ * only checked for NULL.
+ *
  * Every insert also mints a `vault_id` (migration 0020) — the immutable
  * identity groundwork for handles/sharing. `randomUUID()` (opaque, 122 bits of
  * randomness) is plenty collision-resistant for this fleet size; a UNIQUE
@@ -359,13 +365,15 @@ export async function createVault(
   rawName: string,
   ownerUserId: string,
   now: Date = new Date(),
-  opts: { importPending?: boolean } = {},
+  opts: { importPending?: boolean; pending?: "import" | "restore" } = {},
 ): Promise<Vault> {
   const check = validateVaultName(rawName);
   if (!check.ok) throw new VaultNameInvalidError(check.reason, rawName);
   const name = check.name;
   const createdAt = now.toISOString();
-  const importPendingAt = opts.importPending === true ? createdAt : null;
+  const pending = opts.pending ?? (opts.importPending === true ? "import" : undefined);
+  const importPendingAt =
+    pending === "restore" ? `${RESTORE_PENDING_PREFIX}${createdAt}` : pending === "import" ? createdAt : null;
   const vaultId = randomUUID();
   try {
     await db
@@ -383,6 +391,19 @@ export async function createVault(
     throw err;
   }
   return { name, ownerUserId, createdAt, importPendingAt, vaultId };
+}
+
+/** Marks an `import_pending_at` value as the restore door's (see {@link createVault}). */
+export const RESTORE_PENDING_PREFIX = "restore:";
+
+/** Whether a vault is an unfinished restore target the restore door may replay into again. */
+export function isRestorePending(v: Vault): boolean {
+  return v.importPendingAt !== null && v.importPendingAt.startsWith(RESTORE_PENDING_PREFIX);
+}
+
+/** Whether a vault is an unfinished import the import door may replay into again. */
+export function isImportPending(v: Vault): boolean {
+  return v.importPendingAt !== null && !v.importPendingAt.startsWith(RESTORE_PENDING_PREFIX);
 }
 
 /**

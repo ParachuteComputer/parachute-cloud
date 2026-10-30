@@ -31,6 +31,7 @@ import {
   type SnapshotEntryWire,
 } from "../src/snapshots.ts";
 import { PLAN_SPECS } from "../src/plans.ts";
+import { createVault, getVault } from "../src/vaults.ts";
 import { handleOpsSnapshotRunPost } from "../src/ops-daily.ts";
 import { validateAccessToken } from "../src/tokens.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
@@ -108,6 +109,14 @@ function interceptRestoreFlow(
       { restored: true, stats: { notes_created: 3 } },
       { headers: { "content-type": "application/json" } },
     );
+}
+
+/** The vault's answer to the console's "how did the last restore go?" (GET import-status). */
+function interceptImportStatus(target: string, body: Record<string, unknown>): void {
+  fetchMock
+    .get(env.VAULT_ORIGIN!)
+    .intercept({ path: `/vault/${target}/api/internal/import-status`, method: "GET" })
+    .reply(200, body, { headers: { "content-type": "application/json" } });
 }
 
 async function mirrorRows(): Promise<Array<{ vault_name: string; key: string; taken_at: string; bytes: number; ranks: string }>> {
@@ -579,6 +588,14 @@ describe("restoredVaultName", () => {
     expect(name.endsWith("-restored-2026-07-03")).toBe(true);
     expect(name).not.toContain("--restored"); // trailing hyphens trimmed off the base
   });
+
+  test("the nth same-day restore gets -n, still within 63 chars", () => {
+    expect(restoredVaultName("field-notes", NOW, 1)).toBe("field-notes-restored-2026-07-03");
+    expect(restoredVaultName("field-notes", NOW, 3)).toBe("field-notes-restored-2026-07-03-3");
+    const name = restoredVaultName("a".repeat(63), NOW, 12);
+    expect(name.length).toBeLessThanOrEqual(63);
+    expect(name.endsWith("-restored-2026-07-03-12")).toBe(true);
+  });
 });
 
 // --- the console History section ------------------------------------------------------
@@ -699,7 +716,9 @@ describe("restore POST", () => {
     expect(html).toContain("don&#39;t include attachment files");
   });
 
-  test("a same-day re-restore REUSES the target vault (no second slot burned, no duplicate row)", async () => {
+  test("a second same-day restore after one that SUCCEEDED makes <target>-2 and never replays into the first", async () => {
+    // The first restored vault is the owner's now: they may have written to
+    // it since. Replaying (blow-away) into it again would wipe that.
     const { id: userId } = await seedUser("rp-again@example.com");
     await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
     await seedVault("rp-again-v", userId);
@@ -707,22 +726,181 @@ describe("restore POST", () => {
     await seedMirrorRow("rp-again-v", entry);
 
     const target = restoredVaultName("rp-again-v", new Date());
+    const second = restoredVaultName("rp-again-v", new Date(), 2);
+    expect(second).toBe(`${target}-2`);
     interceptRestoreFlow(target);
     const cookie = sessionCookie(await seedSession(userId));
     const first = await quietly(async () => app.fetch(restoreReq({ vault: "rp-again-v", key: entry.key }, cookie), env));
     expect(first.status).toBe(302);
 
-    // Second restore, same day: only the restore POST fires (no create, no
-    // second cap push — the target is reused).
+    // Only the -2 vault's create + restore are intercepted: a restore POST
+    // into the first target would be an unmatched request and fail the test.
+    interceptRestoreFlow(second);
+    const again = await quietly(async () => app.fetch(restoreReq({ vault: "rp-again-v", key: entry.key }, cookie), env));
+    expect(again.status).toBe(302);
+    expect(again.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(second)}`);
+
+    const rows = await env.DB.prepare("SELECT name, import_pending_at FROM vaults WHERE name IN (?, ?) ORDER BY name")
+      .bind(target, second)
+      .all<{ name: string; import_pending_at: string | null }>();
+    // Both are finished restores: neither may be reused by a later restore.
+    expect(rows.results).toEqual([
+      { name: target, import_pending_at: null },
+      { name: second, import_pending_at: null },
+    ]);
+  });
+
+  test("a retry after a FAILED restore reuses its target (no second slot burned, no duplicate row)", async () => {
+    const { id: userId } = await seedUser("rp-retry@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-retry-v", userId);
+    const entry = wireEntry("rp-retry-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-retry-v", entry);
+
+    const target = restoredVaultName("rp-retry-v", new Date());
+    interceptRestoreFlow(target, { restoreStatus: 500 });
+    const cookie = sessionCookie(await seedSession(userId));
+    const failed = await quietly(async () => app.fetch(restoreReq({ vault: "rp-retry-v", key: entry.key }, cookie), env));
+    expect(await failed.text()).toContain("Restore didn&#39;t complete");
+
+    // The retry asks the vault how that attempt ended, then only the restore
+    // POST fires (no create, no second cap push).
+    interceptImportStatus(target, { state: "failed", kind: "restore", error_type: "restore_failed" });
     fetchMock
       .get(env.VAULT_ORIGIN!)
       .intercept({ path: `/vault/${target}/api/internal/restore`, method: "POST" })
       .reply(200, { restored: true }, { headers: { "content-type": "application/json" } });
-    const second = await quietly(async () => app.fetch(restoreReq({ vault: "rp-again-v", key: entry.key }, cookie), env));
-    expect(second.status).toBe(302);
+    const retry = await quietly(async () => app.fetch(restoreReq({ vault: "rp-retry-v", key: entry.key }, cookie), env));
+    expect(retry.status).toBe(302);
+    expect(retry.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(target)}`);
 
-    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM vaults WHERE name = ?").bind(target).first<{ n: number }>();
+    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM vaults WHERE name LIKE ?").bind(`${target}%`).first<{ n: number }>();
     expect(count?.n).toBe(1);
+  });
+
+  test("a same-day restore never replays into a pre-existing restored vault that has no retry flag", async () => {
+    // A target made before restores carried the flag (or by any other door)
+    // is a real vault: treat it as finished.
+    const { id: userId } = await seedUser("rp-legacy@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-legacy-v", userId);
+    const entry = wireEntry("rp-legacy-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-legacy-v", entry);
+    const target = restoredVaultName("rp-legacy-v", new Date());
+    await seedVault(target, userId);
+
+    interceptRestoreFlow(`${target}-2`);
+    const res = await quietly(async () =>
+      app.fetch(restoreReq({ vault: "rp-legacy-v", key: entry.key }, sessionCookie(await seedSession(userId))), env),
+    );
+    expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(`${target}-2`)}`);
+  });
+
+  test("a restore-flagged target whose restore actually FINISHED (flag clear lost) is never replayed into", async () => {
+    // The flag outlives a finished restore when its clear fails, or when the
+    // answer was lost after the vault committed. The vault's own record says
+    // the restore landed: the owner may have written to it since.
+    const { id: userId } = await seedUser("rp-stale@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-stale-v", userId);
+    const entry = wireEntry("rp-stale-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-stale-v", entry);
+    const target = restoredVaultName("rp-stale-v", new Date());
+    await createVault(env.DB, target, userId, new Date(), { pending: "restore" });
+
+    interceptImportStatus(target, { state: "done", kind: "restore", notes: 3 });
+    interceptRestoreFlow(`${target}-2`);
+    const res = await quietly(async () =>
+      app.fetch(restoreReq({ vault: "rp-stale-v", key: entry.key }, sessionCookie(await seedSession(userId))), env),
+    );
+    expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(`${target}-2`)}`);
+    // And the stale flag is gone, so the next restore doesn't have to ask.
+    expect((await getVault(env.DB, target))?.importPendingAt).toBeNull();
+  });
+
+  test("a double-submitted restore goes to the same target, where the vault's lock refuses it (no second vault)", async () => {
+    const { id: userId } = await seedUser("rp-double@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-double-v", userId);
+    const entry = wireEntry("rp-double-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-double-v", entry);
+    const target = restoredVaultName("rp-double-v", new Date());
+    await createVault(env.DB, target, userId, new Date(), { pending: "restore" });
+
+    interceptImportStatus(target, { state: "running", kind: "restore" });
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: `/vault/${target}/api/internal/restore`, method: "POST" })
+      .reply(503, { error_type: "import_in_progress" }, { headers: { "content-type": "application/json" } });
+    const res = await quietly(async () =>
+      app.fetch(restoreReq({ vault: "rp-double-v", key: entry.key }, sessionCookie(await seedSession(userId))), env),
+    );
+    expect(await res.text()).toContain("Restore didn&#39;t complete");
+    expect(await getVault(env.DB, `${target}-2`)).toBeNull();
+  });
+
+  test("a restore-flagged target the vault can't report on is left alone (no replay into it)", async () => {
+    const { id: userId } = await seedUser("rp-unknown@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-unknown-v", userId);
+    const entry = wireEntry("rp-unknown-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-unknown-v", entry);
+    const target = restoredVaultName("rp-unknown-v", new Date());
+    await createVault(env.DB, target, userId, new Date(), { pending: "restore" });
+
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: `/vault/${target}/api/internal/import-status`, method: "GET" })
+      .reply(500, "boom");
+    interceptRestoreFlow(`${target}-2`);
+    const res = await quietly(async () =>
+      app.fetch(restoreReq({ vault: "rp-unknown-v", key: entry.key }, sessionCookie(await seedSession(userId))), env),
+    );
+    expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(`${target}-2`)}`);
+  });
+
+  test("a restore never replays into an unfinished IMPORT that happens to hold the restore name", async () => {
+    // The import door's retry flag means "an upload of the owner's that didn't
+    // finish", not "a restore that didn't finish": its content is not this
+    // snapshot, so blow-away replaying into it would lose it.
+    const { id: userId } = await seedUser("rp-xdoor@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-xdoor-v", userId);
+    const entry = wireEntry("rp-xdoor-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-xdoor-v", entry);
+    const target = restoredVaultName("rp-xdoor-v", new Date());
+    await seedVault(target, userId);
+    await env.DB.prepare("UPDATE vaults SET import_pending_at = created_at WHERE name = ?").bind(target).run();
+
+    interceptRestoreFlow(`${target}-2`);
+    const res = await quietly(async () =>
+      app.fetch(restoreReq({ vault: "rp-xdoor-v", key: entry.key }, sessionCookie(await seedSession(userId))), env),
+    );
+    expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(`${target}-2`)}`);
+  });
+
+  test("the import door refuses an unfinished RESTORE target — an upload never blows it away", async () => {
+    const { id: userId } = await seedUser("rp-xdoor2@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-xdoor2-v", userId);
+    const entry = wireEntry("rp-xdoor2-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-xdoor2-v", entry);
+    const target = restoredVaultName("rp-xdoor2-v", new Date());
+    interceptRestoreFlow(target, { restoreStatus: 500 });
+    const cookie = sessionCookie(await seedSession(userId));
+    const failed = await quietly(async () => app.fetch(restoreReq({ vault: "rp-xdoor2-v", key: entry.key }, cookie), env));
+    expect(await failed.text()).toContain("Restore didn&#39;t complete");
+
+    // No vault interceptor is registered: a forward of the upload would be an
+    // unmatched request (and the console would answer "didn't finish").
+    const fd = new FormData();
+    fd.set("__csrf", CSRF);
+    fd.set("vault_name", target);
+    fd.set("tarball", new File([new Uint8Array([1, 2, 3])], "export.tar", { type: "application/x-tar" }));
+    const res = await quietly(async () =>
+      app.fetch(new Request(`${ISSUER}/console/vaults/import`, { method: "POST", body: fd, headers: { origin: ISSUER, cookie } }), env),
+    );
+    expect(await res.text()).toContain("already taken");
   });
 
   test("at the plan's vault cap → the friendly refusal; NO vault created, NO DO call", async () => {

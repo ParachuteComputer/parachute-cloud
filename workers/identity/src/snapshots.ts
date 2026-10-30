@@ -397,14 +397,15 @@ export async function isKnownSnapshot(db: D1Database, vaultName: string, key: st
 // --- restore orchestration -------------------------------------------------------
 
 /**
- * The restore target's name: `<source>-restored-<YYYY-MM-DD>`, truncating the
- * source part so the whole name fits the 63-char vault slug. Same-day
- * restores of the same source REUSE this name (console.ts treats an
- * already-owned target as "restore into it again" — blow-away import
- * converges, and a slot is never burned on a retry).
+ * The restore target's name: `<source>-restored-<YYYY-MM-DD>`, and
+ * `…-<n>` for the nth same-day restore, truncating the source part so the
+ * whole name fits the 63-char vault slug. console.ts reuses a name only while
+ * its earlier restore never finished (`import_pending_at`, the retry
+ * converges); a finished one is the owner's vault and the next restore takes
+ * the next `n`.
  */
-export function restoredVaultName(source: string, now: Date): string {
-  const suffix = `-restored-${now.toISOString().slice(0, 10)}`;
+export function restoredVaultName(source: string, now: Date, n = 1): string {
+  const suffix = `-restored-${now.toISOString().slice(0, 10)}${n > 1 ? `-${n}` : ""}`;
   const maxBase = 63 - suffix.length;
   const base = source.length > maxBase ? source.slice(0, maxBase).replace(/-+$/, "") : source;
   return `${base}${suffix}`;
@@ -415,7 +416,8 @@ export function restoredVaultName(source: string, now: Date): string {
  * (`POST /api/internal/restore` through the mint seam). NOT best-effort:
  * failures throw to the caller — the console reports them honestly (the
  * target vault row is kept: partial content is the owner's own snapshot
- * data, and a same-day retry reuses + re-wipes the target).
+ * data, and a retry reuses + re-wipes the target while it is still flagged
+ * import-pending).
  */
 export async function callVaultRestore(
   db: D1Database,
