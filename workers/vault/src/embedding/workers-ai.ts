@@ -101,6 +101,13 @@ export class WorkersAiEmbeddingProvider implements EmbeddingProvider {
       out = await this.ai.run(this.model, { text: input.texts, truncate_inputs: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // Capacity and quota answers are transient whatever their wording:
+      // 3040 reads "Capacity temporarily exceeded, please try again", which
+      // the length test below would take for a too-long input. The drain then
+      // splits the batch and stores vectors for halved texts as fresh (T-318).
+      if (/\b(3040|3036)\b|capacity|try again|rate.?limit|daily free allocation/i.test(msg)) {
+        throw err;
+      }
       // A malformed/over-length request is a config/input problem the caller
       // must fix — retrying the SAME input just re-fails (mirrors the
       // transcription provider's terminal/transient split).
