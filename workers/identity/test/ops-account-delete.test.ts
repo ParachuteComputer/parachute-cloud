@@ -76,8 +76,20 @@ describe("POST /ops/account-delete — the gate", () => {
     const { id } = await seedUser("gate@example.com");
     const body = { email: "gate@example.com", confirm: "gate@example.com", written_request: REF };
     expect(await call(body, { secret: null })).toBeNull();
-    const res = await app.request("/ops/account-delete", { method: "POST", body: JSON.stringify(body) }, env);
-    expect(res.status).toBe(404);
+    const routed = (e: typeof env) =>
+      app.fetch(
+        new Request(`${ISSUER}/ops/account-delete`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+          body: JSON.stringify({ ...body, dry_run: true }),
+        }),
+        e,
+      );
+    expect((await routed(env)).status).toBe(404);
+    // Wired: with the secret set, the router reaches the handler (a dry run touches nothing).
+    const wired = await routed({ ...env, OPS_DELETE_TOKEN: TOKEN });
+    expect(wired.status).toBe(200);
+    expect(await wired.json()).toMatchObject({ dry_run: true, account_found: true, user_id: id });
     expect((await call(body, { auth: "" }))!.status).toBe(401);
     expect((await call(body, { auth: `Bearer ${TOKEN}x` }))!.status).toBe(401);
     const runOnly = { ...env, OPS_DELETE_TOKEN: TOKEN, OPS_RUN_TOKEN: "run", OPS_READ_TOKEN: "read" };

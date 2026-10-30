@@ -46,6 +46,7 @@ import { handleAdminGrowthGet } from "./admin-growth.ts";
 import { handleOpsDailyGet, handleOpsSnapshotRunPost, runDailyLine } from "./ops-daily.ts";
 import { bumpOpsCounter } from "./ops-counters.ts";
 import { handleAdminDeleteGet, handleAdminDeletePost } from "./admin-delete.ts";
+import { handleOpsAccountDeletePost } from "./ops-account-delete.ts";
 import { handleTestAccountDeleteReport, handleTestAccountDeleteSweep } from "./account-delete-hooks.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
 import { accountDescriptor } from "./account-descriptor.ts";
@@ -515,6 +516,12 @@ app.get("/ops/daily", async (c) => (await handleOpsDailyGet(c.env, c.req.raw)) ?
 // OPS_RUN_TOKEN (a secret, separate from the read token). Unset → 404.
 app.post("/ops/snapshot-run", async (c) =>
   (await handleOpsSnapshotRunPost(c.env, c.req.raw, depsFor(c.env), senderFor(c.env))) ?? c.notFound(),
+);
+
+// Erase ONE account on its holder's written request (T-328,
+// ops-account-delete.ts): bearer OPS_DELETE_TOKEN (its own secret). Unset → 404.
+app.post("/ops/account-delete", async (c) =>
+  (await handleOpsAccountDeletePost(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound(),
 );
 
 // Staging/dev-only deletion-proof hooks (T-318, account-delete-hooks.ts) —
