@@ -298,7 +298,8 @@ export async function requestAccountDeletion(
             ``,
             `This account is NOT deleted and has no tombstone, so no sweep will`,
             `ever revisit it. Its subscription will silently lapse at the period`,
-            `boundary unless someone clears cancel_at_period_end in Stripe.`,
+            `boundary unless someone clears cancel_at_period_end in Stripe`,
+            `(and removes its parachute_delete_hold metadata key).`,
           ].join("\n"),
           now: deps.now?.() ?? new Date(),
         });

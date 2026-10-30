@@ -60,11 +60,36 @@ async function cancelSubscriptionTolerantly(stripe: Stripe, subscriptionId: stri
 }
 
 /**
+ * The Stripe subscription metadata key {@link deferBilling} stamps with the
+ * subscription's PRE-DELETE renewal state, so {@link resumeBilling} restores
+ * that state instead of forcing renewal back on:
+ *
+ *   - {@link DELETE_HOLD_PLACED}: it was renewing; deferBilling set
+ *     `cancel_at_period_end`, and undo clears it.
+ *   - {@link DELETE_HOLD_KEPT}: it was already stopping (the person cancelled
+ *     at period end, or the operator stopped it for the open beta); undo
+ *     leaves it stopping. Forcing `false` here would re-enable renewal and
+ *     charge the next period.
+ *   - absent: a hold placed before this marker existed; undo releases it, as
+ *     the earlier code did.
+ */
+export const DELETE_HOLD_METADATA_KEY = "parachute_delete_hold";
+export const DELETE_HOLD_PLACED = "placed";
+export const DELETE_HOLD_KEPT = "kept";
+
+/** Statuses after which a subscription never renews again. */
+const ENDED_STATUSES: ReadonlySet<string> = new Set(["canceled", "incomplete_expired"]);
+
+/**
  * Set the reversible hold on a subscription: `cancel_at_period_end = true`.
  * Run the instant an account-delete is requested (A-3). Guarantees no NEW
  * charge posts after the request, while staying reversible up to the period
  * boundary — including a `trialing` subscription, where this means the trial
  * lapses at its own boundary instead of converting and charging.
+ *
+ * Reads the subscription first and records its pre-delete state in
+ * {@link DELETE_HOLD_METADATA_KEY}. One that is already stopping is NOT
+ * touched beyond that marker.
  *
  * Tolerant of a missing id (nothing to defer — no subscription on file: not a
  * Stripe call at all), a 404, or a subscription already canceled. Any other
@@ -74,7 +99,27 @@ async function cancelSubscriptionTolerantly(stripe: Stripe, subscriptionId: stri
 export async function deferBilling(stripe: Stripe, subscriptionId: string | null): Promise<void> {
   if (!subscriptionId) return;
   try {
-    await stripe.subscriptions.update(subscriptionId, { cancel_at_period_end: true });
+    const sub = await stripe.subscriptions.retrieve(subscriptionId);
+    if (ENDED_STATUSES.has(sub.status)) return;
+    const marker = sub.metadata?.[DELETE_HOLD_METADATA_KEY];
+    if (sub.cancel_at_period_end === true) {
+      // Our own earlier call (a retry, or a double-submitted delete) already
+      // recorded the pre-delete state: keep it. Re-reading "stopping" here as
+      // "was already stopping" would turn our own hold into a kept one, and
+      // undo would then strand a renewing subscription.
+      if (marker === DELETE_HOLD_PLACED || marker === DELETE_HOLD_KEPT) return;
+      // Already stopping before this delete (the person cancelled at period
+      // end, or the operator stopped it for the open beta). No charge can
+      // post; record that so undo leaves it stopping.
+      await stripe.subscriptions.update(subscriptionId, {
+        metadata: { [DELETE_HOLD_METADATA_KEY]: DELETE_HOLD_KEPT },
+      });
+      return;
+    }
+    await stripe.subscriptions.update(subscriptionId, {
+      cancel_at_period_end: true,
+      metadata: { [DELETE_HOLD_METADATA_KEY]: DELETE_HOLD_PLACED },
+    });
   } catch (err) {
     if (!isTolerableStripeError(err)) throw err;
   }
@@ -85,7 +130,9 @@ export type ResumeBillingResult = { resumed: true } | { resumed: false; reason: 
 
 /**
  * Release the hold {@link deferBilling} set: flip `cancel_at_period_end` back
- * to `false`. Run if the account reactivates inside the 24h undo window.
+ * to `false`. Run if the account reactivates inside the 24h undo window. A
+ * subscription that was already stopping before the delete
+ * ({@link DELETE_HOLD_KEPT}) keeps stopping.
  *
  * A missing id means there was never a hold to release (no subscription on
  * file) — trivially resumed, no Stripe call needed.
@@ -103,7 +150,25 @@ export type ResumeBillingResult = { resumed: true } | { resumed: false; reason: 
 export async function resumeBilling(stripe: Stripe, subscriptionId: string | null): Promise<ResumeBillingResult> {
   if (!subscriptionId) return { resumed: true };
   try {
-    await stripe.subscriptions.update(subscriptionId, { cancel_at_period_end: false });
+    const sub = await stripe.subscriptions.retrieve(subscriptionId);
+    if (ENDED_STATUSES.has(sub.status)) return { resumed: false, reason: "already_canceled" };
+    const marker = sub.metadata?.[DELETE_HOLD_METADATA_KEY];
+    if (marker === DELETE_HOLD_KEPT) {
+      // It was already stopping before the delete: leave it stopping, drop
+      // only our marker. ("" unsets a metadata key in Stripe.)
+      await stripe.subscriptions.update(subscriptionId, { metadata: { [DELETE_HOLD_METADATA_KEY]: "" } });
+      return { resumed: true };
+    }
+    // DELETE_HOLD_PLACED: our hold. No marker at all: a hold placed by the
+    // code before the marker existed (a delete requested before this shipped,
+    // undone after) — release it as that code would have, so a renewing
+    // subscriber is not left silently lapsing.
+    await stripe.subscriptions.update(
+      subscriptionId,
+      marker === undefined
+        ? { cancel_at_period_end: false }
+        : { cancel_at_period_end: false, metadata: { [DELETE_HOLD_METADATA_KEY]: "" } },
+    );
     return { resumed: true };
   } catch (err) {
     if (!isTolerableStripeError(err)) throw err;

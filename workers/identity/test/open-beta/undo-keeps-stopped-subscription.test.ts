@@ -69,22 +69,30 @@ async function seedSubscriber(email: string): Promise<{ id: string; token: strin
   return { id, token: signed.token };
 }
 
-async function deleteThenUndo(email: string, stripe: Stripe): Promise<Response> {
+function deleteRequest(token: string, email: string): Request {
+  return new Request(`${ISSUER}/account/delete`, {
+    method: "DELETE",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ confirm: email }),
+  });
+}
+
+async function deleteThenUndo(
+  email: string,
+  stripe: Stripe,
+  opts: { betweenDeleteAndUndo?: () => void; doubleSubmit?: boolean } = {},
+): Promise<Response> {
   const acct = await seedSubscriber(email);
   const d = { ...deps(), vaultFetch: okVault };
-  const del = await handleAccountDelete(
-    env,
-    new Request(`${ISSUER}/account/delete`, {
-      method: "DELETE",
-      headers: { "content-type": "application/json", authorization: `Bearer ${acct.token}` },
-      body: JSON.stringify({ confirm: email }),
-    }),
-    d,
-    undefined,
-    { stripe },
+  const dels = await Promise.all(
+    Array.from({ length: opts.doubleSubmit ? 2 : 1 }, () =>
+      handleAccountDelete(env, deleteRequest(acct.token, email), d, undefined, { stripe }),
+    ),
   );
-  expect(del.status).toBe(200);
-  const { undo_token } = (await del.json()) as { undo_token: string };
+  const del = dels.find((r) => r.status === 200);
+  expect(del).toBeDefined();
+  const { undo_token } = (await del!.json()) as { undo_token: string };
+  opts.betweenDeleteAndUndo?.();
   return handleAccountDeleteUndo(
     env,
     new Request(`${ISSUER}/account/undo-delete`, {
@@ -110,6 +118,29 @@ describe("undo restores the subscription's pre-delete renewal state", () => {
   test("a renewing subscription is held on delete and renews again after undo", async () => {
     const { stripe, sub } = stripeModel({ cancel_at_period_end: false, metadata: {} });
     const undo = await deleteThenUndo("renewing-sub@example.com", stripe);
+    expect(undo.status).toBe(200);
+    expect(sub.cancel_at_period_end).toBe(false);
+  });
+
+  test("a delete double-submitted on a renewing subscription still renews after undo", async () => {
+    // The second request reads the subscription AFTER the first placed the
+    // hold. It must not mistake that hold for "was already stopping".
+    const { stripe, sub } = stripeModel({ cancel_at_period_end: false, metadata: {} });
+    const undo = await deleteThenUndo("double-delete@example.com", stripe, { doubleSubmit: true });
+    expect(undo.status).toBe(200);
+    expect(sub.cancel_at_period_end).toBe(false);
+  });
+
+  test("a hold placed before the marker existed (delete requested on the old code, undone after deploy) is released", async () => {
+    // The old deferBilling set cancel_at_period_end and wrote no metadata.
+    // Without a fallback, undo would leave a renewing subscriber lapsing at
+    // period end while answering billing_resumed: true.
+    const { stripe, sub } = stripeModel({ cancel_at_period_end: false, metadata: {} });
+    const undo = await deleteThenUndo("legacy-hold@example.com", stripe, {
+      betweenDeleteAndUndo: () => {
+        sub.metadata = {};
+      },
+    });
     expect(undo.status).toBe(200);
     expect(sub.cancel_at_period_end).toBe(false);
   });
