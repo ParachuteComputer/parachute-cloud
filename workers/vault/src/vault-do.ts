@@ -133,6 +133,7 @@ import { capEmbedText, embedSplitting, planEmbedBatches } from "./embedding/batc
 import {
   DoAttachmentTicketProvider,
   handleTicketSpend,
+  ticketNotFound,
   type TicketSpendDeps,
 } from "./attachment-tickets.js";
 import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
@@ -144,6 +145,17 @@ function errText(e: unknown): string {
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, { status });
+}
+
+/**
+ * The refusal an AUTHENTICATED tenant gets from a closed vault (T-318). Never
+ * sent before the caller's credential checks out — see the call sites in
+ * `handleFetch`. Discards an unread body (MCP/REST POSTs) so the runtime
+ * doesn't log a "read after response" error for a refusal that never needed it.
+ */
+async function accountClosed(request: Request): Promise<Response> {
+  await request.body?.cancel().catch(() => {});
+  return json({ error: "Unauthorized", error_type: "account_closed", message: "This account has been closed." }, 401);
 }
 
 // `detail` is heterogeneous measurement payload — see the note in the Phase-0
@@ -208,9 +220,11 @@ type VaultConfigState = {
    * WITHOUT the key leaves it as it is. While set, every
    * TENANT request is refused 401 `account_closed` — including stateless
    * vault tokens minted before the request, which carry no registry row the
-   * revocation list could name. Only the platform's own `/api/internal/*`
-   * calls (first-party mint / operator bearer) still pass, so the sweep can
-   * destroy and undo can re-open. Data is untouched: this is a lock, not an
+   * revocation list could name. The refusal comes AFTER authentication: a
+   * caller without a valid credential gets the same answer as for an open
+   * vault, so the flag is not readable by strangers. Only the platform's own
+   * `/api/internal/*` calls (first-party mint / operator bearer) still pass,
+   * so the sweep can destroy and undo can re-open. Data is untouched: this is a lock, not an
    * erase.
    */
   closed?: boolean;
@@ -807,21 +821,20 @@ export class VaultDO extends DurableObject {
     }
 
     // ACCOUNT CLOSED (T-318): the owner asked to delete their account. Every
-    // tenant door — tickets, MCP, the landing, REST, SSE, the WS upgrade —
-    // answers 401 from here on, whatever credential it carries. This is the
-    // lever that makes a stateless 15-minute vault token stop working at
-    // REQUEST time rather than at expiry. `/api/internal/*` stays reachable
-    // (its own first-party/operator gate still applies) so the purge sweep
-    // can destroy and an undo can re-open.
-    if (this.config?.closed === true && !rest.startsWith("/api/internal/")) {
-      // Discard an unread body (MCP/REST POSTs) so the runtime doesn't log a
-      // "read after response" error for a refusal that never needed it.
-      await request.body?.cancel().catch(() => {});
-      return json(
-        { error: "Unauthorized", error_type: "account_closed", message: "This account has been closed." },
-        401,
-      );
-    }
+    // tenant door — tickets, MCP, the landing, REST, SSE, the WS socket —
+    // refuses from here on, whatever credential it carries. This is the lever
+    // that makes a stateless 15-minute vault token stop working at REQUEST
+    // time rather than at expiry. `/api/internal/*` stays reachable (its own
+    // first-party/operator gate still applies) so the purge sweep can destroy
+    // and an undo can re-open.
+    //
+    // The check runs AFTER each door authenticates, never before: a caller
+    // with no valid credential for this vault must get exactly the answer an
+    // open (or never-created) vault gives, or the 401 `account_closed` body
+    // tells anyone who knows the vault name that its owner asked to delete
+    // their account. Only a caller that proves it holds this vault's
+    // credential learns the account is closed.
+    const closed = this.config?.closed === true;
 
     // Attachment ticket spend (attachment-tickets design, Wave 1 DO mirror) —
     // NO auth beyond the ticket itself; the ticket IS the credential
@@ -834,6 +847,14 @@ export class VaultDO extends DurableObject {
     // tickets are minted.
     const ticketMatch = rest.match(/^\/tickets\/([^/]+)$/);
     if (ticketMatch) {
+      // Closed: every ticket gets the uniform not-found answer an unknown,
+      // spent or expired ticket gets (so a guessed id learns nothing), and a
+      // real one is refused WITHOUT being consumed (an undo inside its TTL
+      // leaves it spendable).
+      if (closed) {
+        await request.body?.cancel().catch(() => {});
+        return ticketNotFound();
+      }
       const ticketId = decodeURIComponent(ticketMatch[1]!);
       return handleTicketSpend(request, ticketId, {
         vaultName,
@@ -857,6 +878,7 @@ export class VaultDO extends DurableObject {
         headers.set("WWW-Authenticate", mcpWwwAuthenticate(request, vaultName));
         return new Response(mauth.error.body, { status: mauth.error.status, headers });
       }
+      if (closed) return accountClosed(request);
       // The write gate: MCP is the flagship write door, so the paywall (frozen
       // → 402) + the two-meter notes cap MUST bite on MCP write verbs exactly as
       // on REST. handleMcp applies it per-tool (write-class only; read + DELETE
@@ -898,6 +920,7 @@ export class VaultDO extends DurableObject {
       if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
       const auth = await authenticateVaultRequest(request, this.env, vaultName);
       if ("error" in auth) return auth.error;
+      if (closed) return accountClosed(request);
       const caps = this.capsCapability();
       return json({
         name: this.config!.name,
@@ -943,6 +966,7 @@ export class VaultDO extends DurableObject {
     // Health is read-only + cheap; still requires read scope like the bun vault.
     const auth = await authenticateVaultRequest(request, this.env, vaultName);
     if ("error" in auth) return auth.error;
+    if (closed && !apiPath.startsWith("/internal/")) return accountClosed(request);
 
     // REST scope gate — mirrors bun's routing.ts: GET/HEAD/OPTIONS → read,
     // other methods → write, EXCEPT the enumerated tag-schema mutations
@@ -2350,6 +2374,14 @@ export class VaultDO extends DurableObject {
       this.closeWs(ws, result.reason === "vault_scope_mismatch" ? WS_CLOSE.FORBIDDEN : WS_CLOSE.UNAUTHORIZED, result.reason);
       return;
     }
+    // Closed account (T-318): the upgrade is accepted like any vault's (a
+    // refused upgrade would tell a stranger the account is closed), so the
+    // refusal lands here, once the token checks out. Read AFTER the await, so
+    // a close that lands mid-validation is still caught.
+    if (this.config?.closed === true) {
+      this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "account closed");
+      return;
+    }
     const auth = result.auth;
 
     const matcher = await this.buildMatcherFromQuery(att.q);
@@ -2411,6 +2443,11 @@ export class VaultDO extends DurableObject {
     const result = await authenticateVaultToken(token, this.env, vaultName);
     if (!result.ok) {
       this.closeWs(ws, result.reason === "vault_scope_mismatch" ? WS_CLOSE.FORBIDDEN : WS_CLOSE.UNAUTHORIZED, result.reason);
+      return;
+    }
+    // Closed account (T-318): same refusal as authenticatePendingSocket.
+    if (this.config?.closed === true) {
+      this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "account closed");
       return;
     }
     const auth = result.auth;
