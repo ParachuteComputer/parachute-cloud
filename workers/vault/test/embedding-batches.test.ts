@@ -22,11 +22,13 @@ import {
 import { chunkNoteContent } from "@openparachute/core/src/embedding/chunker.ts";
 import { getNotesPendingEmbedding } from "@openparachute/core/src/embedding/vectors.ts";
 import {
+  EMBED_FALLBACK_TEXT,
   EMBED_MAX_CHARS_PER_CALL,
   EMBED_MAX_CHARS_PER_TEXT,
   capEmbedText,
   planEmbedBatches,
 } from "../src/embedding/batches.ts";
+import { WorkersAiEmbeddingProvider } from "../src/embedding/workers-ai.ts";
 import { createNote, freshVault, op } from "./helpers.ts";
 
 const MODEL = "test-window-model";
@@ -168,5 +170,56 @@ describe("embedding batches (T-318): oversized input is capped and split, not re
     for (const n of notes) {
       expect(await vectorCount(v, n.id)).toBe(chunkNoteContent(n.content).filter((c) => c.text.trim()).length);
     }
+  }, 120_000);
+
+  it("a capacity outage (Workers AI 3040) leaves chunks stale: no split storm, no fallback or truncated vectors", async () => {
+    const v = freshVault("ecap");
+    expect((await op(v, "")).status).toBe(200);
+    const content = longNote(400, 12);
+    const note = await createNote(v, { content, path: "cap/n" });
+    const chunks = chunkNoteContent(content).filter((c) => c.text.trim()).map((c) => capEmbedText(c.text));
+    expect(chunks.length).toBeGreaterThan(1);
+
+    // The real provider over a binding that is out of capacity for its first
+    // few calls, with Workers AI's documented 3040 message, then recovers.
+    const accepted: string[][] = [];
+    let calls = 0;
+    const ai = {
+      async run(_model: string, inputs: { text: string[] }) {
+        calls++;
+        if (calls <= 6) throw new Error("3040: Capacity temporarily exceeded, please try again.");
+        accepted.push(inputs.text);
+        return { data: inputs.text.map(() => [1, 0, 0]) };
+      },
+    };
+    const provider = new WorkersAiEmbeddingProvider(ai);
+
+    // One wake during the outage (this note and the welcome seed fit one planned
+    // call): one call, nothing stored, the chunks stay pending.
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      inst.__setTestEmbeddingProvider(provider);
+      await inst.alarm();
+    });
+    expect(calls).toBe(1);
+    expect(await vectorCount(v, note.id)).toBe(0);
+
+    // Later wakes, once capacity is back: every vector stands for its whole chunk.
+    let pending = -1;
+    for (let i = 0; i < 25 && pending !== 0; i++) {
+      await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+        inst.__setTestEmbeddingProvider(provider);
+        await inst.alarm();
+        pending = getNotesPendingEmbedding(inst.store.db, provider.model, 1000).length;
+      });
+    }
+    expect(pending).toBe(0);
+    const sent = accepted.flat();
+    expect(sent).not.toContain(EMBED_FALLBACK_TEXT);
+    for (const c of chunks) {
+      // The whole chunk was embedded, never a halved prefix standing in for it.
+      expect(sent).toContain(c);
+      expect(sent.filter((t) => t !== c && c.startsWith(t)).map((t) => t.length)).toEqual([]);
+    }
+    expect(await vectorCount(v, note.id)).toBe(chunks.length);
   }, 120_000);
 });
