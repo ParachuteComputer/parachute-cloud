@@ -283,6 +283,20 @@ describe("POST /ops/account-delete — the purge", () => {
     expect(await count("SELECT COUNT(*) AS n FROM magic_links WHERE email = ?", "someone-else@example.com")).toBe(1);
   });
 
+  test("bounded still catches the real leftover: the address ending a sentence in a row the purge does not reach", async () => {
+    const email = "ends-sentence@example.co";
+    await seedUser(email);
+    await env.DB.prepare("INSERT INTO ops_alerts (key, last_alert_at) VALUES (?, ?)")
+      .bind(`note:contact ${email}.`, new Date().toISOString())
+      .run();
+    const res = await call({ email, confirm: email, written_request: REF });
+    const out = await json(res);
+    expect(res!.status).toBe(502);
+    expect(out).toMatchObject({ done: false });
+    expect(out.report.email_rows_total).toBe(1);
+    expect(Object.keys(out.report.tables_with_rows)).toEqual(["ops_alerts"]);
+  });
+
   test("a vault that will not destroy defers: the account row and that vault stay, done is false", async () => {
     const email = "wedged@example.com";
     const { id } = await seedUser(email);

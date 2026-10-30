@@ -192,12 +192,16 @@ export async function buildPurgeReport(
     const bounded = input.bounded === true;
     const pad = (v: string, delims: string[]) =>
       `(' ' || ${delims.reduce((acc, d) => `replace(${acc}, ${d}, ' ')`, v)} || ' ')`;
+    // A full stop is part of an address, so it is not a delimiter; an address
+    // that ENDS a sentence ("… person@example.com.") is matched on its own.
+    const boundedEmail = (p: string) =>
+      `(instr(${p}, ${lit(` ${email} `)}) > 0 OR instr(${p}, ${lit(` ${email}. `)}) > 0)`;
     const conds = columns.map((col, j) => {
       const v = `v${j}`;
       const parts: string[] = [];
       for (const term of idTerms) {
         parts.push(
-          bounded && term === email ? `instr(p${j}, ${lit(` ${email} `)}) > 0` : `instr(${v}, ${lit(term.toLowerCase())}) > 0`,
+          bounded && term === email ? boundedEmail(`p${j}`) : `instr(${v}, ${lit(term.toLowerCase())}) > 0`,
         );
       }
       const vaultColumn = /vault/i.test(col) || (table === "vaults" && col === "name");
@@ -218,7 +222,7 @@ export async function buildPurgeReport(
     // carrying the EMAIL anywhere, reported apart so "no email-bearing rows
     // remain" is its own checkable number.
     const emailCond = columns
-      .map((_, j) => (bounded ? `instr(p${j}, ${lit(` ${email} `)}) > 0` : `instr(v${j}, ${lit(email)}) > 0`))
+      .map((_, j) => (bounded ? boundedEmail(`p${j}`) : `instr(v${j}, ${lit(email)}) > 0`))
       .join(" OR ");
     const base = columns
       .flatMap((col, j) => {
