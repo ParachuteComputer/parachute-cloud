@@ -785,6 +785,50 @@ describe("restore POST", () => {
     expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(`${target}-2`)}`);
   });
 
+  test("a restore never replays into an unfinished IMPORT that happens to hold the restore name", async () => {
+    // The import door's retry flag means "an upload of the owner's that didn't
+    // finish", not "a restore that didn't finish": its content is not this
+    // snapshot, so blow-away replaying into it would lose it.
+    const { id: userId } = await seedUser("rp-xdoor@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-xdoor-v", userId);
+    const entry = wireEntry("rp-xdoor-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-xdoor-v", entry);
+    const target = restoredVaultName("rp-xdoor-v", new Date());
+    await seedVault(target, userId);
+    await env.DB.prepare("UPDATE vaults SET import_pending_at = created_at WHERE name = ?").bind(target).run();
+
+    interceptRestoreFlow(`${target}-2`);
+    const res = await quietly(async () =>
+      app.fetch(restoreReq({ vault: "rp-xdoor-v", key: entry.key }, sessionCookie(await seedSession(userId))), env),
+    );
+    expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(`${target}-2`)}`);
+  });
+
+  test("the import door refuses an unfinished RESTORE target — an upload never blows it away", async () => {
+    const { id: userId } = await seedUser("rp-xdoor2@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-xdoor2-v", userId);
+    const entry = wireEntry("rp-xdoor2-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-xdoor2-v", entry);
+    const target = restoredVaultName("rp-xdoor2-v", new Date());
+    interceptRestoreFlow(target, { restoreStatus: 500 });
+    const cookie = sessionCookie(await seedSession(userId));
+    const failed = await quietly(async () => app.fetch(restoreReq({ vault: "rp-xdoor2-v", key: entry.key }, cookie), env));
+    expect(await failed.text()).toContain("Restore didn&#39;t complete");
+
+    // No vault interceptor is registered: a forward of the upload would be an
+    // unmatched request (and the console would answer "didn't finish").
+    const fd = new FormData();
+    fd.set("__csrf", CSRF);
+    fd.set("vault_name", target);
+    fd.set("tarball", new File([new Uint8Array([1, 2, 3])], "export.tar", { type: "application/x-tar" }));
+    const res = await quietly(async () =>
+      app.fetch(new Request(`${ISSUER}/console/vaults/import`, { method: "POST", body: fd, headers: { origin: ISSUER, cookie } }), env),
+    );
+    expect(await res.text()).toContain("already taken");
+  });
+
   test("at the plan's vault cap → the friendly refusal; NO vault created, NO DO call", async () => {
     const { id: userId } = await seedUser("rp-cap@example.com");
     await env.DB.prepare("UPDATE users SET plan = 'plus' WHERE id = ?").bind(userId).run();
