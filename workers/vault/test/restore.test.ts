@@ -341,6 +341,24 @@ describe("restore — tar plumbing (unit)", () => {
     expect(() => parseTar(global)).toThrow(UnreadableTarError);
   });
 
+  it("PAX record length counts its own digits where the digit count rolls over (990- and 9989-byte names)", async () => {
+    // "<len> path=<name>\n": <len> includes its own digits. A 990-byte name
+    // makes the body 997 bytes, so the record is 1001 (four digits), not 1000.
+    // The shorter PAX names elsewhere in this suite never reach a rollover.
+    const { toTar } = await import("../src/export.ts");
+    const enc = new TextEncoder();
+    const names = [989, 990, 991, 992, 9988, 9989, 9990].map((n) => "r".repeat(n));
+    names.push("é".repeat(495)); // 990 bytes, 495 chars: the length is in bytes
+    for (const name of names) {
+      const tar = toTar([{ name, bytes: enc.encode("x") }]);
+      const dec = new TextDecoder();
+      const recLen = parseInt(dec.decode(tar.subarray(124, 136)).replace(/\0.*$/s, "").trim(), 8); // the 'x' header's size
+      const record = dec.decode(tar.subarray(512, 512 + recLen));
+      expect(Number(record.slice(0, record.indexOf(" ")))).toBe(enc.encode(record).length);
+      expect(parseTar(tar)).toEqual([{ name, text: "x" }]);
+    }
+  });
+
   it("TarImportSource partitions sidecar vs content and excludes dot-paths", () => {
     const source = new TarImportSource([
       { name: ".parachute/vault.yaml", text: "name: v" },
