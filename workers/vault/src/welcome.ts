@@ -104,7 +104,13 @@ export interface WelcomeSeedResult {
  */
 export async function seedWelcome(store: Store, opts: { consoleOrigin: string }): Promise<WelcomeSeedResult> {
   const result: WelcomeSeedResult = { seededNotes: [], skippedNotes: [], tags: [] };
-  for (const pack of [welcomePack({ consoleOrigin: opts.consoleOrigin }), GETTING_STARTED_PACK]) {
+  // Seed order is what a newcomer sees first. Time doesn't move inside the DO
+  // seed, so all six guides share one timestamp and newest-first lists fall
+  // back to id order. Core's note ids are monotonic ULIDs (core src/ulid.ts:
+  // within one millisecond the next id increments the last), so id order IS
+  // seed order: seed the AI-facing Getting Started first and the welcome ring
+  // backwards, so a Recent list opens on "Welcome to your vault".
+  for (const pack of [GETTING_STARTED_PACK, newestFirst(welcomePack({ consoleOrigin: opts.consoleOrigin }))]) {
     const applied = await applySeedPack(store, withCloudGuideText(forDefaultSeed(pack)));
     result.seededNotes.push(...applied.seededNotes);
     result.skippedNotes.push(...applied.skippedNotes);
@@ -113,6 +119,10 @@ export async function seedWelcome(store: Store, opts: { consoleOrigin: string })
   return result;
 }
 
+/** `pack` with its notes in reverse, so the first note reads first in a newest-first list. */
+function newestFirst(pack: SeedPack): SeedPack {
+  return { ...pack, notes: [...pack.notes].reverse() };
+}
 
 /**
  * Cloud corrections to core's guide text (T-318). Core's guides, at the pinned
