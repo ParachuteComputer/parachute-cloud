@@ -335,9 +335,29 @@ export async function markEmailVerified(db: D1Database, userId: string): Promise
 }
 
 /** Set (or change) an account's password — the optional secondary factor. */
-export async function setPassword(db: D1Database, userId: string, password: string): Promise<void> {
+/**
+ * Set a user's password. `whileSession`: write only if that session still
+ * exists, in the same UPDATE; returns whether the write landed. The
+ * /console/security set-password passes its session, so a request in flight
+ * when a legacy-account claim deleted that session can't put a password back
+ * after the claim cleared it.
+ */
+export async function setPassword(
+  db: D1Database,
+  userId: string,
+  password: string,
+  whileSession?: string,
+): Promise<boolean> {
   const passwordHash = await hashPassword(password);
-  await db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(passwordHash, userId).run();
+  const res = await (whileSession === undefined
+    ? db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(passwordHash, userId)
+    : db
+        .prepare(
+          "UPDATE users SET password_hash = ? WHERE id = ? AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ?)",
+        )
+        .bind(passwordHash, userId, whileSession, userId)
+  ).run();
+  return (res.meta.changes ?? 0) > 0;
 }
 
 /**

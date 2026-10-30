@@ -53,6 +53,7 @@ import { csrfTokenValid, CSRF_FIELD } from "./csrf.ts";
 import { ACCOUNT_TOKEN_AUDIENCE } from "./account-auth.ts";
 import { isSameOriginRequest, jsonResponse, resolveBoundOrigins, type OAuthDeps } from "./oauth-shared.ts";
 import { sessionUser } from "./session-user.ts";
+import { parseSessionCookie } from "./sessions.ts";
 import { signAccessToken } from "./tokens.ts";
 
 /** Short TTL — a page-snapshot threat can't carry the token for long. Matches
@@ -119,6 +120,20 @@ export async function handleAccountToken(db: D1Database, req: Request, deps: OAu
     return jsonError(403, "foreign_origin", "request origin is not allowed");
   }
 
+  // The `email_verified` stamp, read in ONE statement with the session. Read
+  // apart (sessionUser's two queries), a legacy-account claim landing between
+  // them would hand a pre-claim session a token stamped verified, which the
+  // /account/* gate accepts. Joined: either the claim already deleted the
+  // session (no row → 401) or the flag predates the claim (stamped false →
+  // refused once the account is verified).
+  const verified = await db
+    .prepare("SELECT u.email_verified AS v FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ? AND u.id = ?")
+    .bind(parseSessionCookie(req.headers.get("cookie")), user.id)
+    .first<number>("v");
+  if (verified === null) {
+    return jsonError(401, "unauthenticated", "no active session — sign in first");
+  }
+
   // Mint — `account:<owner-id>:admin`, aud="account", stateless (no registry
   // row). `<owner-id>` = the session user; the scope keys the token to exactly
   // this account owner.
@@ -134,7 +149,7 @@ export async function handleAccountToken(db: D1Database, req: Request, deps: OAu
     now: deps.now,
     // Stateless, so a legacy-account claim can't revoke it; the /account/*
     // gate refuses a token minted unverified once the account is verified.
-    emailVerified: user.emailVerified,
+    emailVerified: verified === 1,
   });
 
   return jsonResponse(

@@ -77,6 +77,11 @@ export interface EnrollResult {
  * set of backup-code hashes, stamp `totp_enrolled_at`, reset the replay guard.
  * The caller MUST have verified a live code against `secret` first (proves the
  * authenticator was provisioned). Overwrites any prior enrollment.
+ *
+ * `whileSession`: write only if that session still exists, in the same
+ * UPDATE, and return null if it doesn't. The /console/security enrolment
+ * passes its session, so an enrolment in flight when a legacy-account claim
+ * deleted that session can't plant a second factor after it.
  */
 export async function persistEnrollment(
   db: D1Database,
@@ -84,18 +89,24 @@ export async function persistEnrollment(
   secret: string,
   now: Date = new Date(),
   confirmedStep: number | null = null,
-): Promise<EnrollResult> {
+  whileSession?: string,
+): Promise<EnrollResult | null> {
   const { codes, hashes } = await generateBackupCodes();
   const enrolledAt = now.toISOString();
   // Seed the replay guard with the step of the code the user just confirmed, so
   // that same code can't be replayed at their first login.
-  const res = await db
-    .prepare(
-      "UPDATE users SET totp_secret = ?, totp_backup_codes = ?, totp_enrolled_at = ?, totp_last_step = ? WHERE id = ?",
-    )
-    .bind(secret, JSON.stringify(hashes), enrolledAt, confirmedStep, userId)
-    .run();
-  if (res.meta.changes === 0) throw new Error(`persistEnrollment: no user row for id ${userId}`);
+  const sql =
+    "UPDATE users SET totp_secret = ?, totp_backup_codes = ?, totp_enrolled_at = ?, totp_last_step = ? WHERE id = ?";
+  const res = await (whileSession === undefined
+    ? db.prepare(sql).bind(secret, JSON.stringify(hashes), enrolledAt, confirmedStep, userId)
+    : db
+        .prepare(`${sql} AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ?)`)
+        .bind(secret, JSON.stringify(hashes), enrolledAt, confirmedStep, userId, whileSession, userId)
+  ).run();
+  if (res.meta.changes === 0) {
+    if (whileSession !== undefined) return null;
+    throw new Error(`persistEnrollment: no user row for id ${userId}`);
+  }
   return { backupCodes: codes, enrolledAt };
 }
 
@@ -109,7 +120,12 @@ export async function clearEnrollment(db: D1Database, userId: string): Promise<v
     .run();
 }
 
-export type SecondFactorResult = { ok: true; via: "totp" } | { ok: true; via: "backup_code" } | { ok: false };
+/** `secret` is the TOTP secret the row held when the code was checked (the
+ *  /login/2fa session guard re-checks it at insert, sessions.ts). */
+export type SecondFactorResult =
+  | { ok: true; via: "totp"; secret: string }
+  | { ok: true; via: "backup_code"; secret: string }
+  | { ok: false };
 
 /**
  * Verify a submitted second factor during login. Tries the TOTP code first
@@ -139,7 +155,7 @@ export async function verifySecondFactor(
       )
       .bind(totp.step, userId, totp.step)
       .run();
-    return advanced.meta.changes > 0 ? { ok: true, via: "totp" } : { ok: false };
+    return advanced.meta.changes > 0 ? { ok: true, via: "totp", secret: state.secret } : { ok: false };
   }
 
   // Backup-code path. Match a hash, then consume it with a CAS on the blob so a
@@ -153,5 +169,5 @@ export async function verifySecondFactor(
     .prepare("UPDATE users SET totp_backup_codes = ? WHERE id = ? AND totp_backup_codes = ?")
     .bind(JSON.stringify(remaining), userId, priorBlob)
     .run();
-  return consumed.meta.changes > 0 ? { ok: true, via: "backup_code" } : { ok: false };
+  return consumed.meta.changes > 0 ? { ok: true, via: "backup_code", secret: state.secret } : { ok: false };
 }

@@ -304,8 +304,9 @@ describe("a console write in flight from the planter's session when the owner cl
     );
     expect(race.fired()).toBe(true);
     await expectClaimed(userId);
+    const body = (await mint.json()) as { token?: string };
     if (mint.status !== 200) return;
-    const token = ((await mint.json()) as { token: string }).token;
+    const token = body.token!;
     const list = await app.fetch(
       new Request(`${ISSUER}/account/vaults`, { headers: { authorization: `Bearer ${token}` } }),
       env,

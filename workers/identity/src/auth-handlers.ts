@@ -40,7 +40,13 @@ import {
   loginKey,
   recordLoginFailure,
 } from "./rate-limit.ts";
-import { buildSessionCookie, createSession, createSessionIfProofHolds, type SessionProof } from "./sessions.ts";
+import {
+  buildSessionCookie,
+  createSession,
+  createSessionIfProofHolds,
+  parseSessionCookie,
+  type SessionProof,
+} from "./sessions.ts";
 import { clearSignupBindingCookie, requestHoldsBinding } from "./signup-binding.ts";
 import { sessionUser } from "./session-user.ts";
 import {
@@ -564,9 +570,6 @@ export async function handleLogin2faPost(db: D1Database, req: Request, deps: OAu
   if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
     return login2faError(req, "Too many attempts. Please wait a few minutes and try again.", email, notYouNext);
   }
-  // The secret the code is checked against, read first: the session below
-  // lands only if the row still holds it (a legacy-account claim clears it).
-  const totpSecret = (await getTotpState(db, pending.userId)).secret;
   const result = await verifySecondFactor(db, pending.userId, String(form.get("code") ?? ""), now);
   if (!result.ok) {
     await recordLoginFailure(deps.rateLimiter, key, now);
@@ -581,7 +584,9 @@ export async function handleLogin2faPost(db: D1Database, req: Request, deps: OAu
   if (!pendingUser || pendingUser.suspendedAt || pendingUser.deletedAt) {
     return redirectResponse("/login", { "set-cookie": clearPendingLoginCookie() });
   }
-  const session = totpSecret ? await createSessionIfProofHolds(db, pending.userId, { totpSecret }, now) : null;
+  // Only if the row still holds the secret the code was checked against (a
+  // legacy-account claim that landed meanwhile cleared it).
+  const session = await createSessionIfProofHolds(db, pending.userId, { totpSecret: result.secret }, now);
   if (!session) return redirectResponse("/login", { "set-cookie": clearPendingLoginCookie() });
   const headers = new Headers({ location: notYouNext });
   headers.append("set-cookie", buildSessionCookie(session.id));
@@ -634,6 +639,9 @@ export async function handleSecurityGet(db: D1Database, req: Request, deps: OAut
 export async function handleSecurityPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
+  // Credential writes below land only while this session still exists (a
+  // legacy-account claim deletes every session mid-request).
+  const sessionId = parseSessionCookie(req.headers.get("cookie"))!;
   const form = await req.formData();
   if (!checkForm(req, form, deps)) return securityOverview(db, req, user, { error: "Your session expired. Please try again." });
   const now = deps.now?.() ?? new Date();
@@ -649,8 +657,9 @@ export async function handleSecurityPost(db: D1Database, req: Request, deps: OAu
     const code = String(form.get("code") ?? "");
     const v = await verifyTotp(secret, code, now);
     if (!v.ok) return renderEnrolling(req, user, secret, "That code didn't match. Enter the current 6-digit code.");
-    const { backupCodes } = await persistEnrollment(db, user.id, secret, now, v.step);
-    return renderSecurityState(req, user, { kind: "backup-codes", codes: backupCodes });
+    const enrolled = await persistEnrollment(db, user.id, secret, now, v.step, sessionId);
+    if (!enrolled) return redirectResponse("/login");
+    return renderSecurityState(req, user, { kind: "backup-codes", codes: enrolled.backupCodes });
   }
 
   if (action === "disable") {
@@ -668,7 +677,7 @@ export async function handleSecurityPost(db: D1Database, req: Request, deps: OAu
       return securityOverview(db, req, user, { error: `Password must be at least ${PASSWORD_MIN} characters.` });
     }
     const had = hasPassword(user);
-    await setPassword(db, user.id, password);
+    if (!(await setPassword(db, user.id, password, sessionId))) return redirectResponse("/login");
     return securityOverview(db, req, user, {
       notice: had ? "Password updated." : "Password set — you can now sign in with it as well.",
     });
