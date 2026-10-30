@@ -31,6 +31,7 @@ import {
   type SnapshotEntryWire,
 } from "../src/snapshots.ts";
 import { PLAN_SPECS } from "../src/plans.ts";
+import { createVault, getVault } from "../src/vaults.ts";
 import { handleOpsSnapshotRunPost } from "../src/ops-daily.ts";
 import { validateAccessToken } from "../src/tokens.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
@@ -108,6 +109,14 @@ function interceptRestoreFlow(
       { restored: true, stats: { notes_created: 3 } },
       { headers: { "content-type": "application/json" } },
     );
+}
+
+/** The vault's answer to the console's "how did the last restore go?" (GET import-status). */
+function interceptImportStatus(target: string, body: Record<string, unknown>): void {
+  fetchMock
+    .get(env.VAULT_ORIGIN!)
+    .intercept({ path: `/vault/${target}/api/internal/import-status`, method: "GET" })
+    .reply(200, body, { headers: { "content-type": "application/json" } });
 }
 
 async function mirrorRows(): Promise<Array<{ vault_name: string; key: string; taken_at: string; bytes: number; ranks: string }>> {
@@ -754,7 +763,9 @@ describe("restore POST", () => {
     const failed = await quietly(async () => app.fetch(restoreReq({ vault: "rp-retry-v", key: entry.key }, cookie), env));
     expect(await failed.text()).toContain("Restore didn&#39;t complete");
 
-    // The retry: only the restore POST fires (no create, no second cap push).
+    // The retry asks the vault how that attempt ended, then only the restore
+    // POST fires (no create, no second cap push).
+    interceptImportStatus(target, { state: "failed", kind: "restore", error_type: "restore_failed" });
     fetchMock
       .get(env.VAULT_ORIGIN!)
       .intercept({ path: `/vault/${target}/api/internal/restore`, method: "POST" })
@@ -781,6 +792,48 @@ describe("restore POST", () => {
     interceptRestoreFlow(`${target}-2`);
     const res = await quietly(async () =>
       app.fetch(restoreReq({ vault: "rp-legacy-v", key: entry.key }, sessionCookie(await seedSession(userId))), env),
+    );
+    expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(`${target}-2`)}`);
+  });
+
+  test("a restore-flagged target whose restore actually FINISHED (flag clear lost) is never replayed into", async () => {
+    // The flag outlives a finished restore when its clear fails, or when the
+    // answer was lost after the vault committed. The vault's own record says
+    // the restore landed: the owner may have written to it since.
+    const { id: userId } = await seedUser("rp-stale@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-stale-v", userId);
+    const entry = wireEntry("rp-stale-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-stale-v", entry);
+    const target = restoredVaultName("rp-stale-v", new Date());
+    await createVault(env.DB, target, userId, new Date(), { pending: "restore" });
+
+    interceptImportStatus(target, { state: "done", kind: "restore", notes: 3 });
+    interceptRestoreFlow(`${target}-2`);
+    const res = await quietly(async () =>
+      app.fetch(restoreReq({ vault: "rp-stale-v", key: entry.key }, sessionCookie(await seedSession(userId))), env),
+    );
+    expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(`${target}-2`)}`);
+    // And the stale flag is gone, so the next restore doesn't have to ask.
+    expect((await getVault(env.DB, target))?.importPendingAt).toBeNull();
+  });
+
+  test("a restore-flagged target the vault can't report on is left alone (no replay into it)", async () => {
+    const { id: userId } = await seedUser("rp-unknown@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-unknown-v", userId);
+    const entry = wireEntry("rp-unknown-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-unknown-v", entry);
+    const target = restoredVaultName("rp-unknown-v", new Date());
+    await createVault(env.DB, target, userId, new Date(), { pending: "restore" });
+
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: `/vault/${target}/api/internal/import-status`, method: "GET" })
+      .reply(500, "boom");
+    interceptRestoreFlow(`${target}-2`);
+    const res = await quietly(async () =>
+      app.fetch(restoreReq({ vault: "rp-unknown-v", key: entry.key }, sessionCookie(await seedSession(userId))), env),
     );
     expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(`${target}-2`)}`);
   });
