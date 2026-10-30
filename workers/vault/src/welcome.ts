@@ -106,8 +106,10 @@ export async function seedWelcome(store: Store, opts: { consoleOrigin: string })
   const result: WelcomeSeedResult = { seededNotes: [], skippedNotes: [], tags: [] };
   // Seed order is what a newcomer sees first. Time doesn't move inside the DO
   // seed, so all six guides share one timestamp and newest-first lists fall
-  // back to id (seed) order: seed the AI-facing Getting Started first and the
-  // welcome ring backwards, so a Recent list opens on "Welcome to your vault".
+  // back to id order. Core's note ids are monotonic ULIDs (core src/ulid.ts:
+  // within one millisecond the next id increments the last), so id order IS
+  // seed order: seed the AI-facing Getting Started first and the welcome ring
+  // backwards, so a Recent list opens on "Welcome to your vault".
   for (const pack of [GETTING_STARTED_PACK, newestFirst(welcomePack({ consoleOrigin: opts.consoleOrigin }))]) {
     const applied = await applySeedPack(store, withCloudGuideText(forDefaultSeed(pack)));
     result.seededNotes.push(...applied.seededNotes);
