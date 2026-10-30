@@ -1105,15 +1105,24 @@ function routerNotFound(): Response {
  *   6. the plan's vault-count cap (restore CREATES a vault — friendly
  *   refusal at the cap).
  *
- * Then: claim `<vault>-restored-<date>` (REUSED if this user already owns it
- * — the same-day-retry convergence; a retry never burns a second slot), push
- * the plan cap, and have the target DO replay the tarball
- * (snapshots.ts callVaultRestore → POST /api/internal/restore, blow-away
- * import). The SOURCE vault is never touched — the DO enforces that too
- * (restore_into_self → 400). A failed replay keeps the target row (its
- * content is the owner's own snapshot data; retrying converges) and reports
- * honestly.
+ * Then: claim `<vault>-restored-<date>`, push the plan cap, and have the
+ * target DO replay the tarball (snapshots.ts callVaultRestore → POST
+ * /api/internal/restore, blow-away import). The SOURCE vault is never touched
+ * — the DO enforces that too (restore_into_self → 400). A failed replay keeps
+ * the target row (its content is the owner's own snapshot data; retrying
+ * converges) and reports honestly.
+ *
+ * Reuse is gated like the import door's: the target is created flagged
+ * `import_pending_at`, success clears the flag, and only a still-flagged row
+ * of this owner (an attempt that didn't finish) is replayed into again — a
+ * retry never burns a second slot. A finished restore is the owner's vault
+ * now, maybe written to since, so a second same-day restore takes
+ * `…-restored-<date>-2` (then -3, …) instead of wiping it. An unflagged row
+ * made before restores carried the flag counts as finished.
  */
+/** Same-day restores of one vault before the console asks to wait a day. */
+const MAX_SAME_DAY_RESTORES = 20;
+
 export async function handleRestorePost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
@@ -1137,21 +1146,35 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
   }
 
   const now = deps.now?.() ?? new Date();
-  const targetName = restoredVaultName(vaultName, now);
-  const existing = await getVault(db, targetName);
-  if (existing && existing.ownerUserId !== user.id) {
-    // Practically unreachable (restored-names derive from a vault the user
-    // owns), but never restore into someone else's vault.
+  let targetName = "";
+  let reuse = false;
+  for (let n = 1; n <= MAX_SAME_DAY_RESTORES; n++) {
+    const name = restoredVaultName(vaultName, now, n);
+    const existing = await getVault(db, name);
+    if (!existing) {
+      targetName = name;
+      break;
+    }
+    if (existing.ownerUserId === user.id && existing.importPendingAt !== null) {
+      targetName = name;
+      reuse = true;
+      break;
+    }
+    // A finished restore (the owner's vault now), or a name someone else
+    // holds: never replay into it.
+  }
+  if (!targetName) {
     return consoleError(db, req, deps, user, "Couldn't claim a name for the restored vault. Please try again tomorrow.");
   }
-  if (!existing) {
+  if (!reuse) {
     // Restore creates a NEW vault — it counts against the plan's vault limit
     // exactly like any other creation (same `>=` grandfathering rule).
     if ((await countVaultsForOwner(db, user.id)) >= vaultLimit) {
       return consoleError(db, req, deps, user, restoreAtCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
     }
     try {
-      await createVault(db, targetName, user.id, now);
+      // Flagged so a retry after a failed replay may reuse it (cleared below).
+      await createVault(db, targetName, user.id, now, { importPending: true });
     } catch (err) {
       if (err instanceof VaultNameTakenError || err instanceof VaultNameInvalidError) {
         return consoleError(db, req, deps, user, "Couldn't claim a name for the restored vault. Please try again.");
@@ -1176,6 +1199,16 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
       deps,
       user,
       `Restore didn't complete — please try again in a moment. (Retrying reuses "${targetName}"; it never touches "${vaultName}".)`,
+    );
+  }
+  // Finished: the target is the owner's vault now, never a retry target. A
+  // D1 hiccup here must not turn the restore into an error; the residual (a
+  // still-flagged restored vault a same-day retry could replay into) is logged.
+  try {
+    await clearImportPending(db, targetName, user.id);
+  } catch (err) {
+    console.error(
+      `event=restore_flag_clear_failed vault=${vaultName} target=${targetName} error=${err instanceof Error ? err.message : String(err)}`,
     );
   }
   console.log(`event=restore_completed vault=${vaultName} target=${targetName}`);
