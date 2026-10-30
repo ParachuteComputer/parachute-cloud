@@ -450,23 +450,40 @@ export async function handleSubscriptionDeleted(
  * churned row whose stale subscription id Stripe fans out again). A
  * tombstoned owner gets the D1 write but no DO push (cloud#234).
  */
-async function landSubscriberOnOpenBeta(db: D1Database, deps: OAuthDeps, user: User): Promise<LifecycleResult> {
-  if (!isPaidTier(user.plan)) {
-    return { ok: true, userId: user.id, action: "subscription_deleted_idempotent" };
-  }
-  const pending = openBetaLandingPending(user.plan, user.pendingPlan);
+async function landSubscriberOnOpenBeta(db: D1Database, deps: OAuthDeps, first: User): Promise<LifecycleResult> {
   // Conditional on the row still being this paid subscriber, so a concurrent
-  // write that already moved it (another delivery, an operator comp) wins.
-  const write = await db
-    .prepare(
-      `UPDATE users SET plan = 'trial', pending_plan = ?, plan_downgrade_at = NULL
-         WHERE id = ? AND plan = ? AND stripe_subscription_id IS ?`,
-    )
-    .bind(pending, user.id, user.plan, user.stripeSubscriptionId)
-    .run();
-  if ((write.meta.changes ?? 0) === 0) {
-    return { ok: true, userId: user.id, action: "subscription_deleted_idempotent" };
+  // write that already moved it OFF the paid tiers (another delivery, an
+  // operator comp) wins. A miss is re-read, not taken as done: a plan-changing
+  // subscription.updated that wrote between our read and our write (an
+  // upgrade just before the cancel) leaves the row on ANOTHER paid tier of
+  // this same, now-dead subscription — and Stripe won't resend a deletion we
+  // answered 200. Bounded: each retry needs yet another concurrent write.
+  let user: User | null = first;
+  for (let attempt = 0; attempt < 3 && user; attempt++) {
+    if (!isPaidTier(user.plan) || user.stripeSubscriptionId !== first.stripeSubscriptionId) {
+      return { ok: true, userId: first.id, action: "subscription_deleted_idempotent" };
+    }
+    const pending = openBetaLandingPending(user.plan, user.pendingPlan);
+    const write = await db
+      .prepare(
+        `UPDATE users SET plan = 'trial', pending_plan = ?, plan_downgrade_at = NULL
+           WHERE id = ? AND plan = ? AND stripe_subscription_id IS ?`,
+      )
+      .bind(pending, user.id, user.plan, user.stripeSubscriptionId)
+      .run();
+    if ((write.meta.changes ?? 0) > 0) return landedOnOpenBeta(db, deps, user, pending);
+    user = await getUserById(db, first.id);
   }
+  if (user) console.error(`event=billing_subscriber_landing_contended user=${first.id}`);
+  return { ok: true, userId: first.id, action: "subscription_deleted_idempotent" };
+}
+
+async function landedOnOpenBeta(
+  db: D1Database,
+  deps: OAuthDeps,
+  user: User,
+  pending: PlanId | null,
+): Promise<LifecycleResult> {
   if (user.deletedAt !== null) {
     console.log(`event=billing_cap_push_skipped_tombstone user=${user.id} plan=trial`);
     return { ok: true, userId: user.id, action: "subscription_deleted_open_beta_recorded_tombstoned" };
