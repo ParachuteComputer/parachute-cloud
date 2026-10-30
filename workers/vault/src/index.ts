@@ -16,7 +16,7 @@
  */
 import type { Env } from "./env.js";
 import { handleDiscovery, rootMcpWwwAuthenticate } from "./discovery.js";
-import { deriveVaultFromToken } from "./auth.js";
+import { deriveVaultFromToken, extractApiKey } from "./auth.js";
 
 export { VaultDO } from "./vault-do.js";
 
@@ -40,6 +40,18 @@ function json(data: unknown, status = 200): Response {
 /** A client asking to upgrade to a WebSocket (the live-query WS binding). */
 function isWebSocketUpgrade(request: Request): boolean {
   return (request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket";
+}
+
+/**
+ * A top-level browser visit to the bare vault address: GET of exactly the
+ * vault root, asking for HTML, carrying no credential in any form auth.ts
+ * reads (any Authorization header, X-API-Key, `?key=`). API clients send JSON
+ * or no Accept at all and keep the landing's 401 / JSON answer.
+ */
+function isBrowserNavigationToLanding(request: Request, rel: string): boolean {
+  if (request.method !== "GET" || (rel !== "" && rel !== "/")) return false;
+  if (!(request.headers.get("Accept") ?? "").toLowerCase().includes("text/html")) return false;
+  return !request.headers.has("Authorization") && extractApiKey(request) === null;
 }
 
 /** Subdomains that are NOT tenant vaults (reserved for platform services). */
@@ -157,6 +169,22 @@ export default {
         }
       }
       return json({ error: "vault not addressable" }, 404);
+    }
+
+    // A person opening a vault's address in a browser (the app showed it as
+    // "your vault will live at …/vault/<name>", so it is bookmarked) goes to
+    // the app page for that vault instead of the landing's JSON 401. Answered
+    // HERE, before any DO wakes, so it is the same for an open, a closed and a
+    // never-created vault: a stranger learns nothing about the name. Any
+    // credential, a non-HTML Accept, or any deeper path keeps the wire contract.
+    if (isBrowserNavigationToLanding(request, resolved.rel)) {
+      const appOrigin = env.CONSOLE_PUBLIC_ORIGIN ?? env.ISSUER_ORIGIN;
+      return withCors(
+        new Response(null, {
+          status: 302,
+          headers: { Location: `${appOrigin}/v/${encodeURIComponent(resolved.name)}`, Vary: "Accept, Authorization" },
+        }),
+      );
     }
 
     // Canonicalize to `/vault/<name><rel>` so the DO sees the wire-contract path.
