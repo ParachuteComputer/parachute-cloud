@@ -102,6 +102,44 @@ describe("engine upgrade on an existing vault DO", () => {
       expect(engine).toEqual(ROLLBACK_ENGINE_DDL.objects.map(with09TagKind));
     });
   });
+
+  it("the first 0.9 wake over a DO whose tags table has no kind (as the rollback engine wrote it) adds only that column (T-318-09)", async () => {
+    const v = freshVault("engddl09");
+    // Wake the DO with no notes, so no tag rows hold note_tags' foreign key.
+    await runInDurableObject<DurableObject, void>(stubFor(v), async (inst: any) => {
+      const sql: SqlStorage = inst.ctx.storage.sql;
+      // Put the rollback engine's tags table in place (its fixture DDL, no kind): build it beside, drop the 0.9 one,
+      // rename. Renaming INTO "tags" leaves note_tags' foreign key (to "tags") as it was.
+      const tags = ROLLBACK_ENGINE_DDL.objects.find((o) => o.type === "table" && o.name === "tags")!.sql!;
+      sql.exec(tags.replace(/CREATE TABLE (IF NOT EXISTS )?"?tags"?/, "CREATE TABLE tags_old"));
+      sql.exec("DROP TABLE tags");
+      sql.exec("ALTER TABLE tags_old RENAME TO tags");
+      for (const o of ROLLBACK_ENGINE_DDL.objects.filter((o) => o.type === "index" && o.tbl_name === "tags" && o.sql)) sql.exec(o.sql!);
+      const cols = () => sql.exec("PRAGMA table_info(tags)").toArray().map((c: any) => c.name);
+      const oldCols = ["name", "description", "fields", "relationships", "parent_names", "created_at", "updated_at"];
+      expect(cols()).toEqual(oldCols);
+      const others = () => master(sql).filter((o: any) => o.tbl_name !== "tags");
+      const othersBefore = others();
+      const versionsBefore = versions(sql);
+      // The first wake of the 0.9 engine over it: one ALTER, nothing else, schema_version unchanged.
+      new DoSqliteStore(inst.shim, inst.ctx.storage);
+      expect(cols()).toEqual([...oldCols, "kind"]);
+      expect(others()).toEqual(othersBefore);
+      expect(versions(sql)).toEqual(versionsBefore);
+      // A second wake runs no DDL at all.
+      const masterAfter = master(sql);
+      new DoSqliteStore(inst.shim, inst.ctx.storage);
+      expect(master(sql)).toEqual(masterAfter);
+    });
+    // The live DO (its own store) works on it: a type with fields, and a note's types.
+    await runInDurableObject<DurableObject, void>(stubFor(v), async (inst: any) => {
+      await inst.store.upsertTagRecord("task", { fields: { status: { type: "string" } } });
+    });
+    const n = await createNote(v, { content: "after", tags: ["task", "pinned"] });
+    const got = (await (await op(v, `/api/notes/${n.id}`)).json()) as any;
+    expect(got.tags.sort()).toEqual(["pinned", "task"]);
+    expect(got.types).toEqual(["task"]);
+  });
 });
 
 /** The rollback engine's object as core 0.9 writes it: the tags table with `kind TEXT` appended, nothing else. */
