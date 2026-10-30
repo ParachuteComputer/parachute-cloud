@@ -337,7 +337,7 @@ export async function handleOpsDailyGet(env: Env, req: Request): Promise<Respons
  *  (the router 404s), a 401 Response = wrong/missing bearer, undefined = ok.
  *  SHA-256 digests compared in constant time, so neither length nor prefix
  *  leaks. */
-async function opsBearerRefusal(secretRaw: string | undefined, req: Request): Promise<Response | null | undefined> {
+export async function opsBearerRefusal(secretRaw: string | undefined, req: Request): Promise<Response | null | undefined> {
   const secret = secretRaw?.trim();
   if (!secret) return null;
   const auth = req.headers.get("authorization") ?? "";

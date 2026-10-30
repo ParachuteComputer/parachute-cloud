@@ -141,6 +141,13 @@ export interface Env {
    */
   OPS_RUN_TOKEN?: string;
   /**
+   * SECRET (`wrangler secret put OPS_DELETE_TOKEN`), optional: the bearer for
+   * `POST /ops/account-delete` (erase ONE account on its holder's written
+   * request, no undo window, no email). Its own secret because it erases.
+   * Set it for the job that needs it and delete it after. Unset → 404.
+   */
+  OPS_DELETE_TOKEN?: string;
+  /**
    * 5xx responses in one 10-minute window at or above which the health cron
    * raises an `errors:5xx` alert. Optional var; default 25 (ops.ts).
    */

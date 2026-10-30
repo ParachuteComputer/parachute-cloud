@@ -295,6 +295,9 @@ EMAIL_FROM = "noreply@parachute.computer"
 #                           daily lines without a browser). Unset → 404.
 #   OPS_RUN_TOKEN         — bearer for POST /ops/snapshot-run (re-run the stale
 #                           vaults' backups now). Unset → 404.
+#   OPS_DELETE_TOKEN      — bearer for POST /ops/account-delete (erase ONE account
+#                           on its holder's written request). Set only for the
+#                           job that needs it, deleted after. Unset → 404.
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
 # --- money switch (T-318, Aaron 10-29: "Parachute open beta") -----------------
 # BILLING_MODE = "open_beta" | "paid" (src/billing-config.ts billingMode). UNSET

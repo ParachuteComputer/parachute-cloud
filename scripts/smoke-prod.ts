@@ -330,6 +330,24 @@ async function main() {
       "PRODUCTION: /ops/daily without a bearer is refused (404 unset / 401 set)",
       `status ${opsDaily.status}`,
     );
+    // The erase door (T-328) likewise: 404 while OPS_DELETE_TOKEN is unset (its
+    // normal state between jobs), 401 while a job holds it. A dry run, so even
+    // a broken gate would only read.
+    const opsDelete = await fetch(`${IDENTITY}/ops/account-delete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email: "smoke-prod-probe@example.com",
+        confirm: "smoke-prod-probe@example.com",
+        written_request: "smoke-prod probe",
+        dry_run: true,
+      }),
+    });
+    assert(
+      opsDelete.status === 404 || opsDelete.status === 401,
+      "PRODUCTION: /ops/account-delete without a bearer is refused (404 unset / 401 set)",
+      `status ${opsDelete.status}`,
+    );
     // T-318 deletion-proof hooks: a scoped purge fast-forward and a footprint
     // report — both must not exist in production.
     for (const hook of ["/__test/account-delete/sweep", "/__test/account-delete/report"]) {
