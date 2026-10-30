@@ -16,10 +16,15 @@ import { sumOpsCounter } from "../src/ops-counters.ts";
 
 const ORIGIN = "https://cloud.parachute.computer";
 
-async function post(path: string, contentType: string, body: string): Promise<Response> {
+async function post(path: string, contentType: string, body: string | Uint8Array): Promise<Response> {
   const ctx = createExecutionContext();
   const res = await worker.fetch(
-    new Request(`${ORIGIN}${path}`, { method: "POST", headers: { "content-type": contentType, origin: ORIGIN }, body }),
+    new Request(`${ORIGIN}${path}`, {
+      method: "POST",
+      // "" = send no Content-Type at all.
+      headers: contentType ? { "content-type": contentType, origin: ORIGIN } : { origin: ORIGIN },
+      body,
+    }),
     env,
     ctx,
   );
@@ -30,13 +35,19 @@ async function post(path: string, contentType: string, body: string): Promise<Re
 describe("a malformed request body is the client's error, not a server error", () => {
   test("anonymous junk POSTs answer 400 and never reach the 5xx counter", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const cases: Array<[string, string, string]> = [
+    const cases: Array<[string, string, string | Uint8Array]> = [
       ["/auth/magic", "multipart/form-data", "x"],
       ["/auth/code", "multipart/form-data", "x"],
       ["/login", "multipart/form-data", "x"],
       ["/signup", "multipart/form-data", "x"],
       ["/logout", "multipart/form-data", "x"],
       ["/oauth/authorize", "multipart/form-data", "x"],
+      // Other bodies a stranger can send that workerd's formData() refuses
+      // (found by a second review): no Content-Type, a multipart part with no
+      // header terminator, an urlencoded body that isn't UTF-8.
+      ["/auth/magic", "", "x"],
+      ["/auth/magic", "multipart/form-data; boundary=zz", "--zz\r\nfoo\r\n--zz--"],
+      ["/auth/magic", "application/x-www-form-urlencoded", new Uint8Array([0x61, 0x3d, 0xff, 0xfe])],
     ];
     const statuses: string[] = [];
     for (const [path, ct, body] of cases) {
