@@ -95,18 +95,14 @@ describe("a rename's repair writes reach live subscribers", () => {
 
     const renamed = await op(v, `/api/notes/${project.id}`, { method: "PATCH", ...json({ path: "Projects/New", force: true, update_links: true }) });
     expect(renamed.status).toBe(200);
-    const after = (await (await op(v, `/api/notes/${task.id}`)).json()) as any;
+    // The cascade committed: REST reads the rewritten link.
+    expect(((await (await op(v, `/api/notes/${task.id}`)).json()) as any).content).toBe("see [[Projects/New]]");
 
     const sentinel = (await createNote(v, { content: "sentinel", tags: ["task"] })).id;
     const seen = await upsertsUntilSentinel(sse, sentinel);
     await sse.cancel();
-    if (after.content === "see [[Projects/Old]]") {
-      // This door did not cascade the content: nothing to push.
-      expect(seen.find((n) => n.id === task.id)).toBeFalsy();
-      return;
-    }
     const pushed = seen.find((n) => n.id === task.id);
-    expect(pushed, `content after rename: ${after.content}`).toBeTruthy();
-    expect(pushed.content).toBe(after.content);
+    expect(pushed, "no upsert for the linking task before the sentinel").toBeTruthy();
+    expect(pushed.content).toBe("see [[Projects/New]]");
   });
 });
