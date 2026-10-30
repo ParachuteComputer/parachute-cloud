@@ -105,7 +105,10 @@ export class WorkersAiEmbeddingProvider implements EmbeddingProvider {
       // 3040 reads "Capacity temporarily exceeded, please try again", which
       // the length test below would take for a too-long input. The drain then
       // splits the batch and stores vectors for halved texts as fresh (T-318).
-      if (/\b(3040|3036)\b|capacity|try again|rate.?limit|daily free allocation/i.test(msg)) {
+      // Match the error code only where Workers AI puts it (the start of the
+      // message), never a bare number: a too-long answer can carry a token
+      // count like 3040.
+      if (/^(?:\w*Error:\s*)?(?:3040|3036)\b|capacity temporarily exceeded|rate.?limit|daily free allocation/i.test(msg)) {
         throw err;
       }
       // A malformed/over-length request is a config/input problem the caller
