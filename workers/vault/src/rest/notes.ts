@@ -25,6 +25,8 @@ import {
   MAX_BATCH_SIZE,
   validateExtension,
   PathConflictError,
+  isValidIfUpdatedAt,
+  IF_UPDATED_AT_HINT,
 } from "@openparachute/core/src/notes.js";
 import { applyContentRange } from "@openparachute/core/src/content-range.js";
 import { attachValidationStatus, enforceStrictWrite } from "@openparachute/core/src/mcp.js";
@@ -84,6 +86,23 @@ export type RestDeps = {
   deleteObject: (relativePath: string) => Promise<void>;
   scheduleTranscription: () => Promise<void>;
 };
+
+/**
+ * vault#739 — mirrors routes.ts:invalidIfUpdatedAtResponse. A non-ISO
+ * `if_updated_at` would reach core's updateNote and throw in its Date parse
+ * (a 500); both doors answer 400 before any write.
+ */
+function invalidIfUpdatedAtResponse(): Response {
+  return json(
+    {
+      error: "if_updated_at must be an ISO-8601 timestamp string",
+      error_type: "invalid_request",
+      field: "if_updated_at",
+      hint: IF_UPDATED_AT_HINT,
+    },
+    400,
+  );
+}
 
 /** Strict-schema gate — mirrors routes.ts:gateStrictWrite (bun#299). */
 function gateStrictWrite(
@@ -1299,6 +1318,7 @@ async function handleNotesInner(
     } else if (sub === "/restore" && method === "POST") {
       const body = await historyBody(req);
       if (body instanceof Response) return body;
+      if (body.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
       let selector: ReturnType<typeof parseHistorySelector>;
       try { selector = parseHistorySelector(body); }
       catch { return json({ error: "Invalid history selector", error_type: "invalid_request" }, 400); }
@@ -1359,6 +1379,7 @@ async function handleNotesInner(
   if (method === "PATCH") {
     try {
       const body = await req.json() as any;
+      if (body?.if_updated_at !== undefined && !isValidIfUpdatedAt(body.if_updated_at)) return invalidIfUpdatedAtResponse();
       const note = await resolveNote(store, idOrPath);
       if (!note) {
         if (body.if_missing === "create") {
