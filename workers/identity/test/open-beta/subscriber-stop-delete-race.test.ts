@@ -67,8 +67,8 @@ function sub(id: string, price: string, status = "active") {
   };
 }
 
-/** Run `inject` once, right before the .run() of the statement whose SQL contains `needle`. */
-function dbInjectingBeforeRun(realDb: D1Database, needle: string, inject: () => Promise<void>): D1Database {
+/** Run `inject` right before the .run() of the statement whose SQL contains `needle`: once, or before every run with `every`. */
+function dbInjectingBeforeRun(realDb: D1Database, needle: string, inject: () => Promise<void>, every = false): D1Database {
   let fired = false;
   return new Proxy(realDb, {
     get(target, prop) {
@@ -91,7 +91,7 @@ function dbInjectingBeforeRun(realDb: D1Database, needle: string, inject: () => 
                 get(b, bp) {
                   if (bp === "run") {
                     return async () => {
-                      if (!fired) {
+                      if (every || !fired) {
                         fired = true;
                         await inject();
                       }
@@ -134,6 +134,45 @@ describe("open beta: a deletion that read the row before a plan-changing update 
     expect({ action: del.action, plan: row.plan, subscriber: isExistingSubscriber(row.plan, row.stripeSubscriptionId) }).toEqual({
       action: "subscription_deleted_open_beta",
       plan: "trial",
+      subscriber: false,
+    });
+  });
+
+  // Codex review (PR #340): a bounded re-read loop still gives up. If every
+  // conditional write misses while the row stays paid on the SAME (now dead)
+  // subscription, answering 200 "idempotent" loses the deletion for good:
+  // Stripe won't resend it, and a 5xx would only hit the event-id dedup wall.
+  test("the deletion lands even when a tier change beats every write it tries", async () => {
+    const { id } = await seedUser("stop-race-every@example.com");
+    await env.DB.prepare(
+      "UPDATE users SET plan = 'standard', stripe_customer_id = 'cus_rx', stripe_subscription_id = 'sub_rx', pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+
+    // Before each landing write, a concurrent tier change on sub_rx moves the
+    // row to another paid tier (standard -> power -> plus -> power ...).
+    let injections = 0;
+    const tiers = ["power", "plus"];
+    const racingDb = dbInjectingBeforeRun(
+      env.DB,
+      "UPDATE users SET plan = 'trial'",
+      async () => {
+        await env.DB.prepare("UPDATE users SET plan = ? WHERE id = ?").bind(tiers[injections++ % 2], id).run();
+      },
+      true,
+    );
+
+    const del = await webhook({ ...STRIPE_ENV, DB: racingDb }, "customer.subscription.deleted", sub("sub_rx", "price_w_m", "canceled"));
+    expect(del.status).toBe(200);
+    expect(injections).toBeGreaterThan(0);
+
+    const row = (await getUserById(env.DB, id))!;
+    expect({ action: del.action, plan: row.plan, pending: row.pendingPlan, subscriber: isExistingSubscriber(row.plan, row.stripeSubscriptionId) }).toEqual({
+      action: "subscription_deleted_open_beta",
+      plan: "trial",
+      // The tier the row held when the landing wrote was Power, so the Power marker is kept.
+      pending: "power",
       subscriber: false,
     });
   });
