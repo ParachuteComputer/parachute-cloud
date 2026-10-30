@@ -38,17 +38,66 @@ interface Row {
   expires_at: string;
 }
 
+function newSession(userId: string, now: Date): Session {
+  return {
+    id: randomBase64url(32),
+    userId,
+    createdAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + SESSION_TTL_MS).toISOString(),
+  };
+}
+
 export async function createSession(db: D1Database, userId: string, now: Date = new Date()): Promise<Session> {
-  const id = randomBase64url(32);
-  const createdAt = now.toISOString();
-  const expiresAt = new Date(now.getTime() + SESSION_TTL_MS).toISOString();
+  const s = newSession(userId, now);
   await db
     .prepare("INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)")
-    .bind(id, userId, createdAt, expiresAt)
+    .bind(s.id, s.userId, s.createdAt, s.expiresAt)
     .run();
   // The daily ops line's "sign-ins" (counts only; never throws).
   await bumpOpsCounter(db, "sign_in", now);
-  return { id, userId, createdAt, expiresAt };
+  return s;
+}
+
+/**
+ * The credential a sign-in checked before asking for a session: the password
+ * verifier it matched, or the TOTP secret the code matched.
+ */
+export type SessionProof = { passwordHash: string } | { totpSecret: string };
+
+/**
+ * Create a session only if the user row still holds the credential the sign-in
+ * checked, tested in the same INSERT. A password check runs PBKDF2 (tens of
+ * ms) on a row read earlier; if a legacy-account claim (auth-handlers.ts
+ * claimUnverifiedAccount) or anything else replaced that credential in
+ * between, the sign-in proved a credential that no longer exists and gets no
+ * session. Returns null then; the claim has already deleted every session, so
+ * the guard is what keeps a racing one from landing after it.
+ */
+export async function createSessionIfProofHolds(
+  db: D1Database,
+  userId: string,
+  proof: SessionProof,
+  now: Date = new Date(),
+): Promise<Session | null> {
+  const s = newSession(userId, now);
+  // Fixed column names, never caller input. Suspended/deleted re-checked too:
+  // findActiveSession would refuse such a row anyway, but it needn't exist.
+  const [column, value] = "passwordHash" in proof ? ["password_hash", proof.passwordHash] : ["totp_secret", proof.totpSecret];
+  const res = await db
+    .prepare(
+      `INSERT INTO sessions (id, user_id, created_at, expires_at)
+       SELECT ?, ?, ?, ? WHERE EXISTS (
+         SELECT 1 FROM users WHERE id = ? AND ${column} = ? AND ${column} != ''
+           AND suspended_at IS NULL AND deleted_at IS NULL)`,
+    )
+    .bind(s.id, s.userId, s.createdAt, s.expiresAt, userId, value)
+    .run();
+  if ((res.meta.changes ?? 0) === 0) {
+    console.log(`event=session_refused_credential_changed user=${userId}`);
+    return null;
+  }
+  await bumpOpsCounter(db, "sign_in", now);
+  return s;
 }
 
 /**

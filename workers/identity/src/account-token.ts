@@ -43,13 +43,17 @@
  * persisted in the `tokens` table — no registry row, no per-jti revocation. It
  * is short-lived (10 min) and re-minted from the live session cookie; revocation
  * is by logout (kills the cookie → no re-mint, sessions.ts deleteSession) plus
- * the read-time suspend chokepoint above. A stateless mint avoids a DB write on
+ * the read-time suspend chokepoint above. A legacy-account claim (the owner
+ * proving an address someone else signed up with) can't reach it either, so
+ * the token carries `email_verified` as minted and `/account/*` refuses one
+ * minted unverified once the account is verified (account-api.ts). A stateless mint avoids a DB write on
  * every re-mint, matching the internal `parachute-console` mints (vault-call.ts).
  */
 import { csrfTokenValid, CSRF_FIELD } from "./csrf.ts";
 import { ACCOUNT_TOKEN_AUDIENCE } from "./account-auth.ts";
 import { isSameOriginRequest, jsonResponse, resolveBoundOrigins, type OAuthDeps } from "./oauth-shared.ts";
 import { sessionUser } from "./session-user.ts";
+import { parseSessionCookie } from "./sessions.ts";
 import { signAccessToken } from "./tokens.ts";
 
 /** Short TTL — a page-snapshot threat can't carry the token for long. Matches
@@ -116,6 +120,20 @@ export async function handleAccountToken(db: D1Database, req: Request, deps: OAu
     return jsonError(403, "foreign_origin", "request origin is not allowed");
   }
 
+  // The `email_verified` stamp, read in ONE statement with the session. Read
+  // apart (sessionUser's two queries), a legacy-account claim landing between
+  // them would hand a pre-claim session a token stamped verified, which the
+  // /account/* gate accepts. Joined: either the claim already deleted the
+  // session (no row → 401) or the flag predates the claim (stamped false →
+  // refused once the account is verified).
+  const verified = await db
+    .prepare("SELECT u.email_verified AS v FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ? AND u.id = ?")
+    .bind(parseSessionCookie(req.headers.get("cookie")), user.id)
+    .first<number>("v");
+  if (verified === null) {
+    return jsonError(401, "unauthenticated", "no active session — sign in first");
+  }
+
   // Mint — `account:<owner-id>:admin`, aud="account", stateless (no registry
   // row). `<owner-id>` = the session user; the scope keys the token to exactly
   // this account owner.
@@ -129,6 +147,9 @@ export async function handleAccountToken(db: D1Database, req: Request, deps: OAu
     vaultScope: [],
     ttlSeconds: ACCOUNT_TOKEN_TTL_SECONDS,
     now: deps.now,
+    // Stateless, so a legacy-account claim can't revoke it; the /account/*
+    // gate refuses a token minted unverified once the account is verified.
+    emailVerified: verified === 1,
   });
 
   return jsonResponse(

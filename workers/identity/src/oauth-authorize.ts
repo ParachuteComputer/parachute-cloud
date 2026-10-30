@@ -23,8 +23,14 @@ import {
 import { approveClient, getClient, requireRegisteredRedirectUri } from "./clients.ts";
 import { GrantWriteConflictError, isCoveredByGrant, recordGrant } from "./grants.ts";
 import { listVaultsForOwner, unownedNamedVaults, userOwnsVault } from "./vaults.ts";
-import { SESSION_COOKIE, buildSessionCookie, createSession, findActiveSession, parseSessionCookie } from "./sessions.ts";
-import { getUserByEmail, getUserById, needsRehash, setPassword, verifyPassword } from "./users.ts";
+import {
+  SESSION_COOKIE,
+  buildSessionCookie,
+  createSessionIfProofHolds,
+  findActiveSession,
+  parseSessionCookie,
+} from "./sessions.ts";
+import { getUserByEmail, getUserById, needsRehash, rehashPasswordIfUnchanged, verifyPassword } from "./users.ts";
 import { isTotpEnrolled } from "./two-factor.ts";
 import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
 import { clearLoginFailures, clientIp, isLoginLocked, loginKey, recordLoginFailure } from "./rate-limit.ts";
@@ -545,7 +551,10 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   await clearLoginFailures(deps.rateLimiter, key);
   // Transparent KDF upgrade: a verified-correct password stored under the
   // legacy sha256 verifier is re-hashed to the current format (users.ts, #28).
-  if (needsRehash(user)) await setPassword(db, user.id, password);
+  // Conditional on the verifier just matched (see console.ts handleLoginPost).
+  const passwordHash = needsRehash(user)
+    ? await rehashPasswordIfUnchanged(db, user.id, user.passwordHash, password)
+    : user.passwordHash;
 
   // 2FA gate: a password login here must NOT bypass an enrolled second factor.
   // Stash a pending login whose `next` resumes THIS authorize request (with the
@@ -555,7 +564,10 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
     return redirectResponse("/login/2fa", { "set-cookie": buildPendingLoginCookie(token) });
   }
 
-  const session = await createSession(db, user.id, now);
+  // Only if the row still holds the verifier just matched: a legacy-account
+  // claim that landed during the check leaves this sign-in nothing.
+  const session = await createSessionIfProofHolds(db, user.id, { passwordHash }, now);
+  if (!session) return renderLoginPage(req, params, "Incorrect email or password.", clientName);
   // Re-enter the flow WITH the session cookie; attach it to the response.
   const carrier = new Request(`${deps.issuer}/oauth/authorize`, {
     headers: { cookie: `${SESSION_COOKIE}=${session.id}` },

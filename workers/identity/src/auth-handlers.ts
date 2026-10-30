@@ -40,7 +40,13 @@ import {
   loginKey,
   recordLoginFailure,
 } from "./rate-limit.ts";
-import { buildSessionCookie, createSession } from "./sessions.ts";
+import {
+  buildSessionCookie,
+  createSession,
+  createSessionIfProofHolds,
+  parseSessionCookie,
+  type SessionProof,
+} from "./sessions.ts";
 import { clearSignupBindingCookie, requestHoldsBinding } from "./signup-binding.ts";
 import { sessionUser } from "./session-user.ts";
 import {
@@ -118,6 +124,9 @@ export async function finishPrimaryAuth(
   deps: OAuthDeps,
   userId: string,
   next: string,
+  // A password sign-in passes the verifier it matched: the session lands only
+  // if the row still holds it (sessions.ts createSessionIfProofHolds).
+  proof?: SessionProof,
 ): Promise<Response> {
   const now = deps.now?.() ?? new Date();
   const user = await getUserById(db, userId);
@@ -126,7 +135,8 @@ export async function finishPrimaryAuth(
     const token = await createPendingLogin(db, userId, next, now);
     return redirectResponse("/login/2fa", { "set-cookie": buildPendingLoginCookie(token) });
   }
-  const session = await createSession(db, userId, now);
+  const session = proof ? await createSessionIfProofHolds(db, userId, proof, now) : await createSession(db, userId, now);
+  if (!session) return redirectResponse("/login");
   return redirectResponse(next, { "set-cookie": buildSessionCookie(session.id) });
 }
 
@@ -574,7 +584,10 @@ export async function handleLogin2faPost(db: D1Database, req: Request, deps: OAu
   if (!pendingUser || pendingUser.suspendedAt || pendingUser.deletedAt) {
     return redirectResponse("/login", { "set-cookie": clearPendingLoginCookie() });
   }
-  const session = await createSession(db, pending.userId, now);
+  // Only if the row still holds the secret the code was checked against (a
+  // legacy-account claim that landed meanwhile cleared it).
+  const session = await createSessionIfProofHolds(db, pending.userId, { totpSecret: result.secret }, now);
+  if (!session) return redirectResponse("/login", { "set-cookie": clearPendingLoginCookie() });
   const headers = new Headers({ location: notYouNext });
   headers.append("set-cookie", buildSessionCookie(session.id));
   headers.append("set-cookie", clearPendingLoginCookie());
@@ -626,6 +639,9 @@ export async function handleSecurityGet(db: D1Database, req: Request, deps: OAut
 export async function handleSecurityPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const user = await sessionUser(db, req, deps);
   if (!user) return redirectResponse("/login");
+  // Credential writes below land only while this session still exists (a
+  // legacy-account claim deletes every session mid-request).
+  const sessionId = parseSessionCookie(req.headers.get("cookie"))!;
   const form = await req.formData();
   if (!checkForm(req, form, deps)) return securityOverview(db, req, user, { error: "Your session expired. Please try again." });
   const now = deps.now?.() ?? new Date();
@@ -641,8 +657,9 @@ export async function handleSecurityPost(db: D1Database, req: Request, deps: OAu
     const code = String(form.get("code") ?? "");
     const v = await verifyTotp(secret, code, now);
     if (!v.ok) return renderEnrolling(req, user, secret, "That code didn't match. Enter the current 6-digit code.");
-    const { backupCodes } = await persistEnrollment(db, user.id, secret, now, v.step);
-    return renderSecurityState(req, user, { kind: "backup-codes", codes: backupCodes });
+    const enrolled = await persistEnrollment(db, user.id, secret, now, v.step, sessionId);
+    if (!enrolled) return redirectResponse("/login");
+    return renderSecurityState(req, user, { kind: "backup-codes", codes: enrolled.backupCodes });
   }
 
   if (action === "disable") {
@@ -660,7 +677,7 @@ export async function handleSecurityPost(db: D1Database, req: Request, deps: OAu
       return securityOverview(db, req, user, { error: `Password must be at least ${PASSWORD_MIN} characters.` });
     }
     const had = hasPassword(user);
-    await setPassword(db, user.id, password);
+    if (!(await setPassword(db, user.id, password, sessionId))) return redirectResponse("/login");
     return securityOverview(db, req, user, {
       notice: had ? "Password updated." : "Password set — you can now sign in with it as well.",
     });

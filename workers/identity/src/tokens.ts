@@ -82,6 +82,13 @@ export interface SignAccessTokenOpts {
    * token. Today the only producer is {@link principalAttributionClaims}.
    */
   permissions?: Record<string, unknown>;
+  /**
+   * Optional `email_verified` claim: whether the subject's address was proven
+   * when the token was minted. The account token carries it so the
+   * `/account/*` gate can refuse one minted before a legacy-account claim
+   * (account-api.ts requireAccount).
+   */
+  emailVerified?: boolean;
 }
 
 export interface SignedAccessToken {
@@ -102,6 +109,7 @@ export async function signAccessToken(db: D1Database, opts: SignAccessTokenOpts)
     client_id: opts.clientId,
     vault_scope: opts.vaultScope ?? [],
     ...(opts.permissions !== undefined ? { permissions: opts.permissions } : {}),
+    ...(opts.emailVerified !== undefined ? { email_verified: opts.emailVerified } : {}),
   })
     .setProtectedHeader({ alg: SIGNING_ALGORITHM, kid: key.kid })
     .setSubject(opts.sub)

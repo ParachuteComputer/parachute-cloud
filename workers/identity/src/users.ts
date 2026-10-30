@@ -335,9 +335,52 @@ export async function markEmailVerified(db: D1Database, userId: string): Promise
 }
 
 /** Set (or change) an account's password — the optional secondary factor. */
-export async function setPassword(db: D1Database, userId: string, password: string): Promise<void> {
+/**
+ * Set a user's password. `whileSession`: write only if that session still
+ * exists, in the same UPDATE; returns whether the write landed. The
+ * /console/security set-password passes its session, so a request in flight
+ * when a legacy-account claim deleted that session can't put a password back
+ * after the claim cleared it.
+ */
+export async function setPassword(
+  db: D1Database,
+  userId: string,
+  password: string,
+  whileSession?: string,
+): Promise<boolean> {
   const passwordHash = await hashPassword(password);
-  await db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(passwordHash, userId).run();
+  const res = await (whileSession === undefined
+    ? db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(passwordHash, userId)
+    : db
+        .prepare(
+          "UPDATE users SET password_hash = ? WHERE id = ? AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ?)",
+        )
+        .bind(passwordHash, userId, whileSession, userId)
+  ).run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+/**
+ * The transparent KDF upgrade after a correct sign-in: re-hash `password` and
+ * store it ONLY if the row still holds `oldHash`, the verifier the sign-in
+ * just matched. Unconditional, the write would put a password back that
+ * changed in between (a legacy-account claim clears the planted one while the
+ * sign-in runs PBKDF2). Returns the verifier the row now holds if the upgrade
+ * landed, else `oldHash`, for the session guard (sessions.ts
+ * createSessionIfProofHolds), which then refuses if the row moved on.
+ */
+export async function rehashPasswordIfUnchanged(
+  db: D1Database,
+  userId: string,
+  oldHash: string,
+  password: string,
+): Promise<string> {
+  const passwordHash = await hashPassword(password);
+  const res = await db
+    .prepare("UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?")
+    .bind(passwordHash, userId, oldHash)
+    .run();
+  return (res.meta.changes ?? 0) > 0 ? passwordHash : oldHash;
 }
 
 /**
