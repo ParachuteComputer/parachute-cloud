@@ -10,7 +10,7 @@
 import { env } from "cloudflare:test";
 import { describe, expect, test, vi } from "vitest";
 import { ACCOUNT_TOKEN_AUDIENCE } from "../src/account-auth.ts";
-import { handleAccountDelete } from "../src/account-delete.ts";
+import { handleAccountDelete, handleAccountDeleteUndo } from "../src/account-delete.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "../src/account-token.ts";
 import { issueAuthCode } from "../src/auth-codes.ts";
 import type { EmailSender } from "../src/email.ts";
@@ -52,7 +52,7 @@ async function bearer(userId: string): Promise<string> {
   ).token;
 }
 
-async function requestDelete(userId: string, email: string, d: OAuthDeps, e: typeof env = env): Promise<void> {
+async function requestDelete(userId: string, email: string, d: OAuthDeps, e: typeof env = env): Promise<string> {
   const res = await handleAccountDelete(
     e,
     new Request(`${ISSUER}/account/delete`, {
@@ -64,6 +64,58 @@ async function requestDelete(userId: string, email: string, d: OAuthDeps, e: typ
     okSender,
   );
   expect(res.status).toBe(200);
+  return ((await res.json()) as { undo_token: string }).undo_token;
+}
+
+/** A connector's view of /oauth/token for one user and client. */
+function connector(userId: string, clientId: string, vault: string) {
+  const issue = async (at: Date) => {
+    const pkce = await makePkce();
+    const code = await issueAuthCode(env.DB, {
+      clientId,
+      userId,
+      redirectUri: REDIRECT_URI,
+      scopes: [`vault:${vault}:write`],
+      codeChallenge: pkce.challenge,
+      codeChallengeMethod: "S256",
+      now: () => at,
+    });
+    return { code: code.code, verifier: pkce.verifier };
+  };
+  const redeem = (c: { code: string; verifier: string }, at: Date) =>
+    handleToken(
+      env.DB,
+      tokenReq({
+        grant_type: "authorization_code",
+        code: c.code,
+        client_id: clientId,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: c.verifier,
+      }),
+      deps(() => at),
+    );
+  const refresh = (refreshToken: string, at: Date) =>
+    handleToken(
+      env.DB,
+      tokenReq({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId }),
+      deps(() => at),
+    );
+  return { issue, redeem, refresh };
+}
+
+/** env.DB, except any statement whose SQL contains one of `failing` throws. */
+function dbFailing(...failing: string[]): D1Database {
+  return new Proxy(env.DB, {
+    get(target, prop, receiver) {
+      if (prop === "prepare") {
+        return (sql: string) => {
+          if (failing.some((f) => sql.includes(f))) throw new Error("D1 exploded mid-severance");
+          return target.prepare(sql);
+        };
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
 }
 
 describe("deleting an account voids its unredeemed authorization codes", () => {
@@ -190,5 +242,82 @@ describe("deleting an account voids its unredeemed authorization codes", () => {
       deps(() => late),
     );
     expect.soft(refresh.status, "pre-delete refresh token still mints after the delete").toBe(400);
+  });
+
+  test("with EVERY severance step failing, the tombstone alone stops the token endpoint minting", async () => {
+    // Review finding (Codex round 3, #339): each severance write only logs on
+    // failure, and /oauth/token never read the tombstone — so a transient D1
+    // error on the code DELETE (or the token revoke) left a deleted account's
+    // in-flight code redeemable and its refresh tokens minting through the
+    // window. The mint itself has to refuse a tombstoned subject.
+    const email = "review-code-all-fail@example.com";
+    const { id } = await seedUser(email);
+    await seedVault("review-code-af-vault", id);
+    const { clientId } = await seedApprovedClient();
+    const t0 = new Date();
+    const c = connector(id, clientId, "review-code-af-vault");
+
+    const live = (await (await c.redeem(await c.issue(t0), t0)).json()) as { refresh_token: string };
+    const inFlight = await c.issue(t0);
+
+    const failingDb = dbFailing(
+      "DELETE FROM sessions WHERE user_id",
+      "DELETE FROM auth_codes WHERE user_id",
+      "UPDATE tokens SET revoked_at = ? WHERE user_id",
+    );
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await requestDelete(id, email, { ...deps(() => t0), vaultFetch: okVault }, { ...env, DB: failingDb });
+      const failedSteps = errSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("event=account_delete_severance_incomplete"));
+      expect(failedSteps, "all three severance steps should have failed").toHaveLength(3);
+    } finally {
+      errSpy.mockRestore();
+    }
+    // The severance really did not happen: the code row and the live token are still there.
+    expect(await env.DB.prepare("SELECT 1 FROM auth_codes WHERE code = ?").bind(inFlight.code).first()).not.toBeNull();
+
+    const late = new Date(t0.getTime() + 5_000);
+    const redeemed = await c.redeem(inFlight, late);
+    expect.soft(redeemed.status, "in-flight code redeemed for a deleted account").toBe(400);
+    expect.soft(((await redeemed.json()) as { error?: string }).error).toBe("invalid_grant");
+    const refreshed = await c.refresh(live.refresh_token, late);
+    expect.soft(refreshed.status, "pre-delete refresh token minted for a deleted account").toBe(400);
+    expect.soft(((await refreshed.json()) as { error?: string }).error).toBe("invalid_grant");
+  });
+
+  test("after undo the account can authorise connectors again; tokens revoked at delete stay revoked", async () => {
+    const email = "review-code-undo@example.com";
+    const { id } = await seedUser(email);
+    await seedVault("review-code-undo-vault", id);
+    const { clientId } = await seedApprovedClient();
+    const t0 = new Date();
+    const c = connector(id, clientId, "review-code-undo-vault");
+
+    const before = (await (await c.redeem(await c.issue(t0), t0)).json()) as { refresh_token: string };
+    const undoToken = await requestDelete(id, email, { ...deps(() => t0), vaultFetch: okVault });
+
+    const restoredAt = new Date(t0.getTime() + 60_000);
+    const undo = await handleAccountDeleteUndo(
+      env,
+      new Request(`${ISSUER}/account/undo-delete`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: undoToken }),
+      }),
+      { ...deps(() => restoredAt), vaultFetch: okVault },
+    );
+    expect(undo.status).toBe(200);
+    expect((await getUserById(db(), id))?.deletedAt).toBeNull();
+
+    const later = new Date(restoredAt.getTime() + 5_000);
+    // A fresh authorisation redeems and its refresh token rotates.
+    const fresh = await c.redeem(await c.issue(restoredAt), later);
+    expect(fresh.status).toBe(200);
+    const { refresh_token } = (await fresh.json()) as { refresh_token: string };
+    expect((await c.refresh(refresh_token, later)).status).toBe(200);
+    // The family revoked at delete time is not resurrected by the undo.
+    expect((await c.refresh(before.refresh_token, later)).status).toBe(400);
   });
 });
