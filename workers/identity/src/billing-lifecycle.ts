@@ -450,32 +450,30 @@ export async function handleSubscriptionDeleted(
  * churned row whose stale subscription id Stripe fans out again). A
  * tombstoned owner gets the D1 write but no DO push (cloud#234).
  */
-async function landSubscriberOnOpenBeta(db: D1Database, deps: OAuthDeps, first: User): Promise<LifecycleResult> {
-  // Conditional on the row still being this paid subscriber, so a concurrent
-  // write that already moved it OFF the paid tiers (another delivery, an
-  // operator comp) wins. A miss is re-read, not taken as done: a plan-changing
-  // subscription.updated that wrote between our read and our write (an
-  // upgrade just before the cancel) leaves the row on ANOTHER paid tier of
-  // this same, now-dead subscription — and Stripe won't resend a deletion we
-  // answered 200. Bounded: each retry needs yet another concurrent write.
-  let user: User | null = first;
-  for (let attempt = 0; attempt < 3 && user; attempt++) {
-    if (!isPaidTier(user.plan) || user.stripeSubscriptionId !== first.stripeSubscriptionId) {
-      return { ok: true, userId: first.id, action: "subscription_deleted_idempotent" };
-    }
-    const pending = openBetaLandingPending(user.plan, user.pendingPlan);
-    const write = await db
-      .prepare(
-        `UPDATE users SET plan = 'trial', pending_plan = ?, plan_downgrade_at = NULL
-           WHERE id = ? AND plan = ? AND stripe_subscription_id IS ?`,
-      )
-      .bind(pending, user.id, user.plan, user.stripeSubscriptionId)
-      .run();
-    if ((write.meta.changes ?? 0) > 0) return landedOnOpenBeta(db, deps, user, pending);
-    user = await getUserById(db, first.id);
-  }
-  if (user) console.error(`event=billing_subscriber_landing_contended user=${first.id}`);
-  return { ok: true, userId: first.id, action: "subscription_deleted_idempotent" };
+async function landSubscriberOnOpenBeta(db: D1Database, deps: OAuthDeps, user: User): Promise<LifecycleResult> {
+  // ONE atomic write, conditional on the row still being a paid subscriber on
+  // THIS subscription — any paid tier, not the tier we read. The Power marker
+  // is chosen in SQL from the tier the row holds at write time, so a
+  // concurrent plan-changing subscription.updated (an upgrade just before the
+  // cancel) can't make the write miss: there is no read->write window to lose.
+  // That matters because a miss can't be retried: Stripe won't resend a
+  // deletion we answered 200, and a 5xx redelivery only hits the event-id
+  // dedup wall (billing-webhook.ts). So a miss now means exactly one thing —
+  // the row already left the paid tiers or moved to another subscription
+  // (another delivery, an operator comp, a re-subscribe) — and that write wins.
+  const keepWhen = PAID_TIERS.map(() => "WHEN ? THEN ?").join(" ");
+  const keepBinds = PAID_TIERS.flatMap((tier) => [tier, openBetaLandingPending(tier, null)]);
+  const landed = await db
+    .prepare(
+      `UPDATE users SET plan = 'trial', pending_plan = CASE plan ${keepWhen} END, plan_downgrade_at = NULL
+         WHERE id = ? AND plan IN (${PAID_TIERS.map(() => "?").join(", ")}) AND stripe_subscription_id IS ?
+       RETURNING pending_plan`,
+    )
+    .bind(...keepBinds, user.id, ...PAID_TIERS, user.stripeSubscriptionId)
+    .first<{ pending_plan: string | null }>();
+  if (!landed) return { ok: true, userId: user.id, action: "subscription_deleted_idempotent" };
+  const pending = landed.pending_plan === null ? null : coercePlanId(landed.pending_plan);
+  return landedOnOpenBeta(db, deps, user, pending);
 }
 
 async function landedOnOpenBeta(

@@ -67,7 +67,7 @@ function sub(id: string, price: string, status = "active") {
   };
 }
 
-/** Run `inject` right before the .run() of the statement whose SQL contains `needle`: once, or before every run with `every`. */
+/** Run `inject` right before the statement whose SQL contains `needle` executes (run/first/all): once, or every time with `every`. */
 function dbInjectingBeforeRun(realDb: D1Database, needle: string, inject: () => Promise<void>, every = false): D1Database {
   let fired = false;
   return new Proxy(realDb, {
@@ -89,13 +89,13 @@ function dbInjectingBeforeRun(realDb: D1Database, needle: string, inject: () => 
               const bound = s.bind(...(args as [])) as D1PreparedStatement;
               return new Proxy(bound, {
                 get(b, bp) {
-                  if (bp === "run") {
-                    return async () => {
+                  if (bp === "run" || bp === "first" || bp === "all") {
+                    return async (...callArgs: unknown[]) => {
                       if (every || !fired) {
                         fired = true;
                         await inject();
                       }
-                      return b.run();
+                      return (b[bp] as (...a: unknown[]) => unknown).apply(b, callArgs);
                     };
                   }
                   const v = (b as unknown as Record<string | symbol, unknown>)[bp];
