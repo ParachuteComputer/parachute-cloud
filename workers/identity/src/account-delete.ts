@@ -319,8 +319,15 @@ export async function requestAccountDeletion(
   }
 
   // 3. Sever the credentials that exist right now (belt — see the doc above).
+  //    Unredeemed authorization codes go FIRST: /oauth/token does not read
+  //    the tombstone, so a code issued a moment before this request would
+  //    otherwise redeem after it into a fresh, unrevoked token family. In this
+  //    order a redemption racing us either loses its code (and the token
+  //    endpoint's "code still granted" fence refuses it) or inserted its token
+  //    before the revoke below, which then catches it.
   try {
     await deleteSessionsForUser(env.DB, user.id);
+    await env.DB.prepare("DELETE FROM auth_codes WHERE user_id = ?").bind(user.id).run();
     await env.DB
       .prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
       .bind(nowIso, user.id)

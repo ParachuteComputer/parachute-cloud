@@ -67,7 +67,7 @@ async function requestDelete(userId: string, email: string, d: OAuthDeps): Promi
 }
 
 describe("deleting an account voids its unredeemed authorization codes", () => {
-  test("an auth code issued just before the delete request still redeems after it, and its refresh token keeps minting", async () => {
+  test("an auth code issued just before the delete request does not redeem after it (nor mint refreshes through the window)", async () => {
     const email = "review-code@example.com";
     const { id } = await seedUser(email);
     await seedVault("review-code-vault", id);
