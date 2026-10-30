@@ -392,6 +392,28 @@ describe("MCP — vault-info (server-layer override)", () => {
     expect(JSON.stringify(err)).toContain("query-notes"); // names the tools there are
   });
 
+  it("vault-info {help} for a tool the caller can't see is refused like an unknown one (no reference leaks)", async () => {
+    const v = freshVault();
+    const res = await mcpPost(v, await READ(v), {
+      jsonrpc: "2.0",
+      id: 33,
+      method: "tools/call",
+      params: { name: "vault-info", arguments: { help: "update-tag" } },
+    });
+    const text = JSON.stringify((await res.json()) as any);
+    expect(text).toContain("unknown_tool");
+    expect(text).not.toContain("parent_names");
+  });
+
+  it("vault-info {help, description} answers help and changes nothing, even for a read token", async () => {
+    const v = freshVault();
+    const before = await callVaultInfo(v, await ADMIN(v), {});
+    const help = await callVaultInfo(v, await READ(v), { help: "query-notes", description: "should not land" });
+    expect(help.tool).toBe("query-notes");
+    const after = await callVaultInfo(v, await ADMIN(v), {});
+    expect(after.description).toEqual(before.description);
+  });
+
   it("every vault-info {help} pointer in tools/list resolves", async () => {
     const v = freshVault();
     const token = await ADMIN(v);
