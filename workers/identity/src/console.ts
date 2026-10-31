@@ -1140,22 +1140,31 @@ function routerNotFound(): Response {
 const MAX_SAME_DAY_RESTORES = 20;
 
 /**
- * Whether the vault says its last restore did NOT land (failed, interrupted
- * by a reset, never started), so replaying into it again is the retry. One
- * still running counts too: the vault's import lock refuses the second replay
- * (a double submit gets "try again", not a second vault). A finished restore,
- * or no answer at all, is false: never replay into a vault that may hold the
- * owner's writes. Never throws.
+ * What the vault says about its last restore. "unfinished": it did NOT land
+ * (failed, interrupted by a reset, never started), so replaying into it again
+ * is the retry. One still running counts too: the vault's import lock refuses
+ * the second replay (a double submit gets "try again", not a second vault).
+ * "finished": the vault answered and the restore landed. "unknown": no
+ * answer; never replay into it (it may hold the owner's writes), but don't
+ * call it finished either. Never throws.
  */
-async function restoreDidNotFinish(db: D1Database, deps: OAuthDeps, userId: string, vaultName: string): Promise<boolean> {
+async function restoreOutcome(
+  db: D1Database,
+  deps: OAuthDeps,
+  userId: string,
+  vaultName: string,
+): Promise<"unfinished" | "finished" | "unknown"> {
   try {
     const res = await callVaultImportStatus(db, deps, userId, vaultName);
-    if (!res.ok) return false;
+    if (!res.ok) return "unknown";
     const rec = (await res.json()) as { state?: unknown; kind?: unknown };
-    if (rec.state === "none") return true;
-    return rec.kind === "restore" && (rec.state === "failed" || rec.state === "interrupted" || rec.state === "running");
+    if (rec.state === "none") return "unfinished";
+    if (rec.kind === "restore" && (rec.state === "failed" || rec.state === "interrupted" || rec.state === "running")) {
+      return "unfinished";
+    }
+    return rec.state === "done" ? "finished" : "unknown";
   } catch {
-    return false;
+    return "unknown";
   }
 }
 
@@ -1192,15 +1201,17 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
       break;
     }
     if (existing.ownerUserId === user.id && isRestorePending(existing)) {
-      if (await restoreDidNotFinish(db, deps, user.id, name)) {
+      const outcome = await restoreOutcome(db, deps, user.id, name);
+      if (outcome === "unfinished") {
         targetName = name;
         reuse = true;
         break;
       }
       // The flag outlived a finished restore (its clear failed, or the answer
       // was lost after the vault committed): the owner's vault now. Drop the
-      // stale flag (best-effort) and take the next name.
-      await clearImportPending(db, name, user.id).catch(() => undefined);
+      // stale flag (best-effort) and take the next name. With no answer, keep
+      // the flag (a later restore may still converge into it) and move on.
+      if (outcome === "finished") await clearImportPending(db, name, user.id).catch(() => undefined);
     }
     // A finished restore (the owner's vault now), an unfinished import, or a
     // name someone else holds: never replay into it.
