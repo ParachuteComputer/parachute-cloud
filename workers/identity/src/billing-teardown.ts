@@ -68,8 +68,9 @@ async function cancelSubscriptionTolerantly(stripe: Stripe, subscriptionId: stri
  *     `cancel_at_period_end`, and undo clears it.
  *   - {@link DELETE_HOLD_KEPT}: it was already stopping (the person cancelled
  *     at period end, or the operator stopped it for the open beta); undo
- *     leaves it stopping. Forcing `false` here would re-enable renewal and
- *     charge the next period.
+ *     leaves it stopping, and leaves the marker (see resumeBilling).
+ *     Forcing `false` here would re-enable renewal and charge the next
+ *     period.
  *   - absent: a hold placed before this marker existed; undo releases it, as
  *     the earlier code did.
  */
@@ -154,9 +155,14 @@ export async function resumeBilling(stripe: Stripe, subscriptionId: string | nul
     if (ENDED_STATUSES.has(sub.status)) return { resumed: false, reason: "already_canceled" };
     const marker = sub.metadata?.[DELETE_HOLD_METADATA_KEY];
     if (marker === DELETE_HOLD_KEPT) {
-      // It was already stopping before the delete: leave it stopping, drop
-      // only our marker. ("" unsets a metadata key in Stripe.)
-      await stripe.subscriptions.update(subscriptionId, { metadata: { [DELETE_HOLD_METADATA_KEY]: "" } });
+      // It was already stopping before the delete: leave it stopping, and
+      // leave the marker too — no Stripe write at all. Dropping it was a
+      // write whose reply can be lost after Stripe applied it: undo then
+      // answers 502, and the retry finds a stopping subscription with NO
+      // marker, which reads as a pre-marker hold and gets renewal turned back
+      // on. A leftover "kept" is harmless: deferBilling overwrites it with
+      // "placed" whenever the subscription is renewing again, and while it is
+      // stopping "kept" is the truth.
       return { resumed: true };
     }
     // DELETE_HOLD_PLACED: our hold. No marker at all: a hold placed by the
