@@ -145,6 +145,12 @@ export async function handleOpsAccountDeletePost(
   } catch {
     return refuse(400, "invalid_request", "body must be JSON");
   }
+  // A dry run is the ONLY thing standing between a typo and an erase with no
+  // undo, so only a JSON boolean (or no field) is accepted: `"true"` or `1`
+  // was meant as a dry run and must not fall through to the real delete.
+  if (body.dry_run !== undefined && typeof body.dry_run !== "boolean") {
+    return refuse(400, "invalid_request", "dry_run must be true or false (a JSON boolean). Nothing was deleted.");
+  }
   const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
   if (!EMAIL_RE.test(email)) return refuse(400, "invalid_request", "email must be one address");
   if (!confirmMatchesEmail(body.confirm, email)) {
