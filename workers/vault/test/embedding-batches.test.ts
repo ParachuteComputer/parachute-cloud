@@ -242,3 +242,39 @@ describe("embedding batches (T-318): oversized input is capped and split, not re
     }
   });
 });
+
+describe("embedding drain during a Workers AI outage (T-318 day review 2)", () => {
+  // #334 made a capacity (3040) or quota (3036) answer transient, which is
+  // right: nothing is stored. But a failed wake re-arms the alarm for NOW, and
+  // an alarm set for now fires at once, so for as long as the outage lasts
+  // every vault with stale chunks calls Workers AI back to back (and logs an
+  // error per call). A wake that made no progress must wait before it retries.
+  it("a wake whose every call failed waits before the next one, instead of re-firing at once", async () => {
+    const v = freshVault("eout");
+    expect((await op(v, "")).status).toBe(200);
+    await createNote(v, { content: "a note to embed while Workers AI is out of capacity" });
+    let calls = 0;
+    const provider = new WorkersAiEmbeddingProvider({
+      run: async () => {
+        calls++;
+        throw new Error("3040: Capacity temporarily exceeded, please try again.");
+      },
+    });
+    let alarmIn = 0;
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      inst.__setTestEmbeddingProvider(provider);
+      await inst.ctx.storage.deleteAlarm();
+      await inst.alarm();
+      const at = await inst.ctx.storage.getAlarm();
+      expect(at).not.toBeNull(); // the chunks are still pending: it must come back
+      alarmIn = (at as number) - Date.now();
+    });
+    expect(calls).toBeGreaterThan(0);
+    const afterWake = calls;
+    // Give an alarm armed for "now" time to fire on its own, as it does in production.
+    await new Promise((r) => setTimeout(r, 1_500));
+    // At most one more wake: the alarm createNote armed may already be in
+    // flight in the pool when this test's own wake runs (it backs off too).
+    expect({ alarmIn: alarmIn >= 10_000, atMostOneMoreCall: calls - afterWake <= 1 }).toEqual({ alarmIn: true, atMostOneMoreCall: true });
+  });
+});
