@@ -368,6 +368,11 @@ export async function setPassword(
  * sign-in runs PBKDF2). Returns the verifier the row now holds if the upgrade
  * landed, else `oldHash`, for the session guard (sessions.ts
  * createSessionIfProofHolds), which then refuses if the row moved on.
+ *
+ * One exception on a miss: if the row now holds a verifier of this SAME
+ * password (an overlapping correct sign-in upgraded it first: a double submit,
+ * two tabs), that is still this sign-in's proof and is returned. A claim's
+ * cleared password or a changed one doesn't verify, so those still refuse.
  */
 export async function rehashPasswordIfUnchanged(
   db: D1Database,
@@ -380,7 +385,15 @@ export async function rehashPasswordIfUnchanged(
     .prepare("UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?")
     .bind(passwordHash, userId, oldHash)
     .run();
-  return (res.meta.changes ?? 0) > 0 ? passwordHash : oldHash;
+  if ((res.meta.changes ?? 0) > 0) return passwordHash;
+  const current = await db
+    .prepare("SELECT password_hash FROM users WHERE id = ?")
+    .bind(userId)
+    .first<string>("password_hash");
+  if (current && current !== oldHash && (await verifyPassword({ passwordHash: current } as User, password))) {
+    return current;
+  }
+  return oldHash;
 }
 
 /**
