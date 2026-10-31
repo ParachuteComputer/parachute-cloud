@@ -18,7 +18,7 @@ import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { IMPORTED_VAULT_DESCRIPTION } from "@openparachute/core/src/seed-packs.js";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
-import { MAX_IMPORT_BYTES } from "../src/restore.ts";
+import { MAX_IMPORT_BYTES, parseTarBinary } from "../src/restore.ts";
 import { base, createNote, freshVault, mintToken, op } from "./helpers.ts";
 
 const FIXED = "2026-07-03T00:00:00.000Z";
@@ -213,6 +213,54 @@ describe("import — end to end (upload export → new vault → equality + atta
     // The imported binary DID land under attachments/, and the meter counts ONLY
     // it (the directly-put exports/snapshots objects never touched the meter).
     expect((await internalConfig(dst)).r2_bytes).toBe(4);
+  });
+});
+
+describe("export → import — a note's link to its own attachment (T-318 #8)", () => {
+  // The app writes an attached image into the body as ![name](/api/storage/<path>),
+  // a URL only a running vault serves. The export tar must point that link at the
+  // copied binary instead, and import must give the original body back.
+  it("the tar links the exported file relatively (body_link recorded); import restores the body", async () => {
+    const src = freshVault("is");
+    const IMG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff]);
+    const form = new FormData();
+    form.set("file", new File([IMG], "garden.png", { type: "image/png" }));
+    const up = await op(src, "/api/storage/upload", { method: "POST", body: form });
+    expect(up.status).toBe(201);
+    const { path } = (await up.json()) as { path: string };
+    const body = `![garden](/api/storage/${path})\nPlant the garlic before the first frost.\n`;
+    const note = await createNote(src, { content: body, path: "notes/garden" });
+    const linked = await op(src, `/api/notes/${note.id}/attachments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, mimeType: "image/png" }),
+    });
+    expect(linked.status).toBe(201);
+    const att = (await linked.json()) as { id: string };
+
+    const tar = await exportTar(src);
+    const files = new Map(parseTarBinary(tar).map((e) => [e.name, e.bytes]));
+    const exported = new TextDecoder().decode(files.get("notes/garden.md"));
+    const sidecar = `.parachute/attachments/${att.id}/${path.split("/").pop()}`;
+    const target = `../${sidecar.split("/").map(encodeURIComponent).join("/")}`;
+    expect(exported).toContain(`![garden](${target})\n`);
+    expect(exported).not.toContain("/api/storage/");
+    expect(exported).toContain(`body_link: ${target}`);
+    // The link resolves, from the note file, to the attachment's entry in the tar.
+    const resolved = decodeURIComponent(target).replace(/^\.\.\//, "");
+    expect(resolved).toBe(sidecar);
+    expect(files.get(resolved)).toEqual(IMG);
+
+    const dst = freshVault("it");
+    expect((await importInto(dst, tar)).status).toBe(200);
+    const back = (await (await op(dst, `/api/notes/${note.id}?include_attachments=true`)).json()) as {
+      content: string;
+      attachments: Array<Record<string, unknown>>;
+    };
+    expect(back.content).toBe(body);
+    expect(back.attachments.map((a) => a.path)).toEqual([path]);
+    expect(JSON.stringify(back.attachments)).not.toContain("body_link");
+    expect(new Uint8Array(await (await op(dst, `/api/storage/${path}`)).arrayBuffer())).toEqual(IMG);
   });
 });
 

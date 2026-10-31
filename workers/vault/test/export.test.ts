@@ -141,6 +141,9 @@ describe("export — same core seam (byte identity)", () => {
     await seed(v);
     // An attachment in the vault must not perturb the text entries — the
     // binary sidecar is EXTRA, pinned separately in the attachments suite.
+    // (A body link to the note's own attachment would differ: the tar copies
+    // the binary and rewrites the link to it, the markdown-only RPC copies
+    // none. That rewrite is pinned in import.test.ts.)
     const note = await createNote(v, { content: "note with audio", path: "notes/audio" });
     await uploadAndAttach(v, note.id, new Uint8Array([1, 2, 3]), "clip.wav", "audio/wav");
 
