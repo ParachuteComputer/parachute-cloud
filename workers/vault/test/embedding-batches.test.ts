@@ -277,4 +277,36 @@ describe("embedding drain during a Workers AI outage (T-318 day review 2)", () =
     // flight in the pool when this test's own wake runs (it backs off too).
     expect({ alarmIn: alarmIn >= 10_000, atMostOneMoreCall: calls - afterWake <= 1 }).toEqual({ alarmIn: true, atMostOneMoreCall: true });
   });
+
+  it("the wait grows across stalled wakes, even when the DO is evicted between them, and resets once a wake stores anything", async () => {
+    const v = freshVault("eout");
+    expect((await op(v, "")).status).toBe(200);
+    await createNote(v, { content: "a note to embed while Workers AI is out of capacity" });
+    let up = false;
+    const provider = new WorkersAiEmbeddingProvider({
+      run: async (_m: string, inputs: { text: string[] }) => {
+        if (!up) throw new Error("3040: Capacity temporarily exceeded, please try again.");
+        return { data: inputs.text.map(() => [1, 0, 0]) };
+      },
+    });
+    const wake = async (): Promise<number | null> => {
+      let at: number | null = null;
+      await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+        inst.__setTestEmbeddingProvider(provider);
+        inst.embedStalls = undefined; // as after an eviction: only DO storage carries the count
+        await inst.alarm();
+        const a = await inst.ctx.storage.getAlarm();
+        at = a === null ? null : a - Date.now();
+      });
+      return at;
+    };
+    const first = (await wake())!;
+    const second = (await wake())!;
+    expect(second).toBeGreaterThan(first + 10_000);
+    up = true;
+    await wake();
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      expect(await inst.ctx.storage.get("embedding_stalls")).toBeUndefined();
+    });
+  });
 });

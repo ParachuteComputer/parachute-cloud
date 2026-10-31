@@ -254,6 +254,10 @@ const TRANSCRIBE_MAX_ATTEMPTS = 3;
  * that re-run actually happen instead of the flag masking it forever.
  */
 const EMBEDDING_BACKFILL_DONE_KEY = "embedding_backfill_done";
+
+/** DO-storage count of consecutive stalled embedding wakes (see EMBED_STALL_BASE_MS); kept in
+ *  storage because an idle DO is evicted between backed-off wakes, which would reset a field. */
+const EMBED_STALLS_KEY = "embedding_stalls";
 interface EmbeddingBackfillState {
   done: boolean;
   model: string;
@@ -286,6 +290,19 @@ const EMBED_NOTES_PER_WAKE = 25;
  * `embeddingBackfillDone`, never letting the DO's alarm go idle).
  */
 const EMBED_MAX_TEXTS_PER_CALL = 90;
+
+/**
+ * Backoff for a wake whose provider calls ALL failed (T-318 day review 2): a
+ * Workers AI outage (3040 capacity, 3036 quota, timeouts) is transient, so the
+ * chunks stay stale, but an alarm re-armed for now fires at once, and every
+ * vault with stale chunks would call Workers AI back to back for as long as
+ * the outage lasts. The wait doubles per consecutive stalled wake, from
+ * {@link EMBED_STALL_BASE_MS} up to {@link EMBED_STALL_MAX_MS}, and resets as
+ * soon as a wake stores anything. A wake that made progress re-arms at once,
+ * as before, so one bad chunk does not slow a backfill.
+ */
+const EMBED_STALL_BASE_MS = 30_000;
+const EMBED_STALL_MAX_MS = 10 * 60_000;
 
 /**
  * DO-storage record of the last import or snapshot restore into this vault
@@ -722,6 +739,9 @@ export class VaultDO extends DurableObject {
 
   /** Event handlers (fetch, WebSocket) currently running in this instance. */
   private inflight = 0;
+
+  /** Cache of {@link EMBED_STALLS_KEY}; undefined until first read in this instance. */
+  private embedStalls: number | undefined;
 
   /**
    * Bumped each time an import or restore takes the lock (T-318). Background
@@ -2895,6 +2915,20 @@ export class VaultDO extends DurableObject {
         embedOutcome.kind === "empty" || (embedOutcome.kind === "partial" && !embedOutcome.more);
       let embeddingNeedsRearm =
         embedOutcome.kind === "failed" || (embedOutcome.kind === "partial" && embedOutcome.more);
+      // Every provider call this wake failed and nothing was stored: wait
+      // before the next try instead of re-firing at once (see EMBED_STALL_BASE_MS).
+      let embedDelayMs = 0;
+      if (embedOutcome.kind === "failed" && embedOutcome.stalled) {
+        const stalls = (this.embedStalls ?? (await this.ctx.storage.get<number>(EMBED_STALLS_KEY)) ?? 0) + 1;
+        this.embedStalls = stalls;
+        await this.ctx.storage.put(EMBED_STALLS_KEY, stalls);
+        embedDelayMs = Math.min(EMBED_STALL_BASE_MS * 2 ** Math.min(stalls - 1, 20), EMBED_STALL_MAX_MS);
+      } else if (embedOutcome.kind === "partial" || embedOutcome.kind === "failed") {
+        if ((this.embedStalls ?? (await this.ctx.storage.get<number>(EMBED_STALLS_KEY)) ?? 0) !== 0) {
+          await this.ctx.storage.delete(EMBED_STALLS_KEY);
+        }
+        this.embedStalls = 0;
+      }
 
       if (embeddingDone) {
         // Concurrent-write race guard: a REST/MCP write can land (and
@@ -2927,7 +2961,7 @@ export class VaultDO extends DurableObject {
       // anything pending. One whisper inference per wake either way, and we
       // wake exactly when the next item is actually due (never spin early on a
       // backed-off item).
-      await this.rearmFromPending(vaultName, embeddingNeedsRearm);
+      await this.rearmFromPending(vaultName, embeddingNeedsRearm, embedDelayMs);
     } finally {
       this.alarmRunning = false;
     }
@@ -3013,7 +3047,7 @@ export class VaultDO extends DurableObject {
    * return;` early exit exactly. So this is a superset, not a rewrite, of
    * the pre-C2 transcription-only logic.
    */
-  private async rearmFromPending(vaultName: string, embeddingNeedsRearm: boolean): Promise<void> {
+  private async rearmFromPending(vaultName: string, embeddingNeedsRearm: boolean, embedDelayMs = 0): Promise<void> {
     try {
       const pending = await this.store.listAttachmentsByTranscribeStatus("pending", 50);
       const now = Date.now();
@@ -3024,7 +3058,7 @@ export class VaultDO extends DurableObject {
           return Math.min(min, until <= now ? now : until);
         }, soonest);
       }
-      if (embeddingNeedsRearm) soonest = Math.min(soonest, now);
+      if (embeddingNeedsRearm) soonest = Math.min(soonest, now + embedDelayMs);
       if (!Number.isFinite(soonest)) return; // neither queue has anything pending
       await this.ctx.storage.setAlarm(soonest);
     } catch (e) {
@@ -3064,7 +3098,8 @@ export class VaultDO extends DurableObject {
    */
   private async drainEmbeddingsOnce(): Promise<
     | { kind: "disabled" | "unavailable" | "empty" }
-    | { kind: "partial" | "failed"; more: boolean }
+    | { kind: "partial"; more: boolean }
+    | { kind: "failed"; more: boolean; stalled?: boolean }
   > {
     const provider = this.store.embeddingProvider;
     if (!provider) return { kind: "disabled" };
@@ -3107,6 +3142,7 @@ export class VaultDO extends DurableObject {
     // long chunks pass bge-m3's 60,000-token window; the same call then
     // failed on every wake, forever.
     let anyFailure = false;
+    let anyStored = false;
     for (const indexes of planEmbedBatches(toEmbed.map((t) => t.chunk.text), EMBED_MAX_TEXTS_PER_CALL)) {
       const slice = indexes.map((i) => toEmbed[i]!);
       if (this.alarmMustYield(generation)) return { kind: "failed", more: true };
@@ -3120,6 +3156,7 @@ export class VaultDO extends DurableObject {
           if (!vector) continue; // defensive: provider returned fewer vectors than requested
           const { noteId, chunk } = slice[j]!;
           upsertNoteVector(db, noteId, chunk, normalize(vector), provider.model, contentHash(chunk.text));
+          anyStored = true;
         }
       } catch (e) {
         console.error(`[embeddings ${this.config?.name}] embed sub-batch failed:`, errText(e));
@@ -3132,7 +3169,8 @@ export class VaultDO extends DurableObject {
         // every time) and retries.
       }
     }
-    return { kind: anyFailure ? "failed" : "partial", more };
+    if (anyFailure) return { kind: "failed", more, stalled: !anyStored };
+    return { kind: "partial", more };
   }
 
   /**
