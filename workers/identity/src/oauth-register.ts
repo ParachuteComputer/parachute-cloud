@@ -31,6 +31,16 @@ export async function handleRegister(db: D1Database, req: Request, deps: OAuthDe
   } catch {
     return jsonResponse({ error: "invalid_client_metadata", error_description: "body must be JSON" }, 400);
   }
+  // A stranger's wrong-shape body is a 400, never a TypeError 500: this door
+  // is anonymous and every 5xx counts toward the operator page (ops.ts).
+  const invalid = (what: string) =>
+    jsonResponse({ error: "invalid_client_metadata", error_description: what }, 400);
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return invalid("body must be a JSON object");
+  }
+  for (const field of ["scope", "client_name", "token_endpoint_auth_method"] as const) {
+    if (body[field] !== undefined && typeof body[field] !== "string") return invalid(`${field} must be a string`);
+  }
   const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
   if (redirectUris.length === 0) {
     return jsonResponse(
