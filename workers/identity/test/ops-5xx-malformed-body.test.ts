@@ -73,4 +73,26 @@ describe("a malformed request body is the client's error, not a server error", (
     expect(res.status).toBe(500);
     expect(await sumOpsCounter(env.DB, "http_5xx", "2000", "3000")).toBe(1);
   });
+
+  test("a JSON body of the wrong shape on the anonymous client registration door answers 400", async () => {
+    // Review 2 (key b): #341 left JSON to the handlers; /oauth/register
+    // (RFC 7591, no auth, no rate limit) parsed fine but then read fields off
+    // `null` or called .split on a non-string scope: a TypeError, a 500, and
+    // one more toward the 25 that page the operator.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const cases = [
+      "null",
+      JSON.stringify({ redirect_uris: ["https://x.example/cb"], scope: 5 }),
+      JSON.stringify({ redirect_uris: ["https://x.example/cb"], client_name: { a: 1 } }),
+    ];
+    const results: string[] = [];
+    for (const body of cases) {
+      const res = await post("/oauth/register", "application/json", body);
+      results.push(`${body} ${res.status} ${await res.text()}`);
+    }
+    expect(results.filter((r) => !/ 400 /.test(r))).toEqual([]);
+    // A refusal names the field, not the database underneath.
+    expect(results.filter((r) => r.includes("D1_"))).toEqual([]);
+    expect(await sumOpsCounter(env.DB, "http_5xx", "2000", "3000")).toBe(0);
+  });
 });
