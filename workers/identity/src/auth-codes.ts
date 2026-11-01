@@ -87,6 +87,13 @@ export interface IssueAuthCodeOpts {
   codeChallenge: string;
   codeChallengeMethod: string;
   now?: () => Date;
+  /**
+   * {@link issueGrantedAuthCode} only: insert only while this session (of
+   * `userId`) still exists. The authorize paths pass the session they checked,
+   * so a legacy-account claim, which deletes every session, also stops a code
+   * from a sign-in or consent already in flight.
+   */
+  whileSession?: string;
 }
 
 const INSERT_COLUMNS =
@@ -147,6 +154,8 @@ export async function issueAuthCode(db: D1Database, opts: IssueAuthCodeOpts): Pr
  * against Disconnect's batch, so either the code exists first (Disconnect
  * deletes it, and the token endpoint's fence catches an exchange in flight) or
  * the grant is already gone and nothing is inserted. Returns null then.
+ * With `whileSession`, the session must still exist too (the same reasoning,
+ * for a legacy-account claim, which deletes sessions and grants together).
  */
 export async function issueGrantedAuthCode(db: D1Database, opts: IssueAuthCodeOpts): Promise<AuthCode | null> {
   const { code, binds } = newAuthCode(opts);
@@ -161,9 +170,15 @@ export async function issueGrantedAuthCode(db: D1Database, opts: IssueAuthCodeOp
            AND NOT EXISTS (
              SELECT 1 FROM json_each(?) j WHERE instr(' ' || g.scopes || ' ', ' ' || j.value || ' ') = 0
            )
-       )`,
+       )${opts.whileSession === undefined ? "" : " AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = ? AND s.user_id = ?)"}`,
     )
-    .bind(...binds, opts.userId, opts.clientId, JSON.stringify(opts.scopes))
+    .bind(
+      ...binds,
+      opts.userId,
+      opts.clientId,
+      JSON.stringify(opts.scopes),
+      ...(opts.whileSession === undefined ? [] : [opts.whileSession, opts.userId]),
+    )
     .run();
   return (res.meta.changes ?? 0) === 1 ? code : null;
 }

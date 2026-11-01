@@ -68,23 +68,30 @@ function grantChangedWhileApproving(): Response {
   );
 }
 
-/** Record the consent and issue its code, or the 409 page if the grant changed under us. */
+/**
+ * Record the consent and issue its code, or the 409 page if the grant changed
+ * under us. Both writes land only while `sessionId` (the session the consent
+ * was checked against) still exists: a legacy-account claim deletes every
+ * session, grant and code, and a consent from the planter's session already
+ * in flight must not write a fresh grant and code after it.
+ */
 async function recordGrantAndRedirect(
   db: D1Database,
   params: AuthorizeParams,
   scopes: string[],
   userId: string,
   clientId: string,
+  sessionId: string,
   deps: OAuthDeps,
 ): Promise<Response> {
   try {
-    await recordGrant(db, userId, clientId, scopes, deps.now?.() ?? new Date());
+    await recordGrant(db, userId, clientId, scopes, deps.now?.() ?? new Date(), sessionId);
   } catch (err) {
     if (err instanceof GrantWriteConflictError) return grantChangedWhileApproving();
     throw err;
   }
   return (
-    (await issueAuthCodeRedirect(db, { ...params, scope: scopes.join(" ") }, scopes, userId, deps)) ??
+    (await issueAuthCodeRedirect(db, { ...params, scope: scopes.join(" ") }, scopes, userId, sessionId, deps)) ??
     grantChangedWhileApproving()
   );
 }
@@ -207,16 +214,19 @@ export function authorizeParamsFromForm(form: FormData): AuthorizeParams | null 
  * The redirect carrying a fresh code, or null when the grant no longer holds
  * these scopes — a Disconnect committed after the caller read or wrote it
  * (see {@link issueGrantedAuthCode}). Every authorize path records or checks a
- * grant before it lands here, so null means "disconnected meanwhile".
+ * grant before it lands here, so null means "disconnected meanwhile" (or the
+ * session was deleted meanwhile, e.g. by a legacy-account claim).
  */
 async function issueAuthCodeRedirect(
   db: D1Database,
   params: AuthorizeParams,
   scopes: string[],
   userId: string,
+  sessionId: string,
   deps: OAuthDeps,
 ): Promise<Response | null> {
   const code = await issueGrantedAuthCode(db, {
+    whileSession: sessionId,
     clientId: params.clientId,
     userId,
     redirectUri: params.redirectUri,
@@ -339,7 +349,7 @@ async function authorizeCore(
   // always render consent (the vault choice isn't recorded literally).
   const hasUnnamedVault = unnamedVaultVerbs(requestedScopes).length > 0;
   if (!hasUnnamedVault && (await isCoveredByGrant(db, session.userId, client.clientId, requestedScopes))) {
-    const redirect = await issueAuthCodeRedirect(db, params, requestedScopes, session.userId, deps);
+    const redirect = await issueAuthCodeRedirect(db, params, requestedScopes, session.userId, session.id, deps);
     if (redirect) return redirect;
     // Disconnected between the grant read and the code insert: ask again.
   }
@@ -717,7 +727,7 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
       composedScopes.push(composedVaultCreateScope(session.userId));
     }
 
-    return recordGrantAndRedirect(db, params, composedScopes, session.userId, client.clientId, deps);
+    return recordGrantAndRedirect(db, params, composedScopes, session.userId, client.clientId, session.id, deps);
   }
 
   // Narrow unnamed vault verbs to the picked vault (form pick or `vault=` hint).
@@ -754,5 +764,5 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   const ownershipDenied = await denyUnownedVaults(db, session.userId, scopes, params);
   if (ownershipDenied) return ownershipDenied;
 
-  return recordGrantAndRedirect(db, params, scopes, session.userId, client.clientId, deps);
+  return recordGrantAndRedirect(db, params, scopes, session.userId, client.clientId, session.id, deps);
 }

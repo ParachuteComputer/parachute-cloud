@@ -149,6 +149,13 @@ export interface RecordedGrant extends Grant {
  * write missed still counts: it fails toward revoking, and this client is
  * mid-authorization. After four misses in a row it gives up with
  * {@link GrantWriteConflictError} rather than write over a row it never read.
+ *
+ * `whileSession`: the write lands only while that session still exists, in
+ * the same statement. The consent submit passes the session it checked, so a
+ * legacy-account claim (auth-handlers.ts claimUnverifiedAccount), which
+ * deletes every session and grant, can't be followed by a grant written from
+ * the planter's session that was already in flight. A miss with the session
+ * gone gives up at once with {@link GrantWriteConflictError}.
  */
 export async function recordGrant(
   db: D1Database,
@@ -156,12 +163,16 @@ export async function recordGrant(
   clientId: string,
   newScopes: readonly string[],
   now: Date = new Date(),
+  whileSession?: string,
 ): Promise<RecordedGrant> {
   let revokedTokens = 0;
   for (let attempt = 0; attempt < 4; attempt++) {
-    const r = await tryRecordGrant(db, userId, clientId, newScopes, now);
+    const r = await tryRecordGrant(db, userId, clientId, newScopes, now, whileSession);
     revokedTokens += r.revokedTokens;
-    if (!r.written) continue;
+    if (!r.written) {
+      if (whileSession !== undefined && !(await sessionExists(db, whileSession, userId))) break;
+      continue;
+    }
     if (r.familyMoved || revokedTokens > 0) {
       // Ids only. No scope strings, no jtis, no token material — this line is for
       // answering "why did that client have to re-authorize", and a count answers
@@ -181,13 +192,22 @@ export class GrantWriteConflictError extends Error {
   }
 }
 
-/** One read-merge-conditional-write. `written` is false when the row changed after the read. */
+async function sessionExists(db: D1Database, sessionId: string, userId: string): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT 1 AS ok FROM sessions WHERE id = ? AND user_id = ?")
+    .bind(sessionId, userId)
+    .first();
+  return row !== null;
+}
+
+/** One read-merge-conditional-write. `written` is false when the row changed after the read (or the session is gone). */
 async function tryRecordGrant(
   db: D1Database,
   userId: string,
   clientId: string,
   newScopes: readonly string[],
   now: Date,
+  whileSession?: string,
 ): Promise<{ written: boolean; familyMoved: boolean; scopes: string[]; grantedAt: string; revokedTokens: number }> {
   const existingRow = await findGrantRow(db, userId, clientId);
   const existing = existingRow ? rowToGrant(existingRow) : null;
@@ -204,13 +224,15 @@ async function tryRecordGrant(
   const grantedAt = now.toISOString();
 
   const familyMoved = vaultFamilyKey(existing?.scopes ?? []) !== vaultFamilyKey(scopes);
+  const live = whileSession === undefined ? "" : " AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ?)";
+  const liveBinds = whileSession === undefined ? [] : [whileSession, userId];
   const record = existingRow
     ? db
-        .prepare("UPDATE grants SET scopes = ?, granted_at = ? WHERE user_id = ? AND client_id = ? AND scopes = ?")
-        .bind(scopes.join(" "), grantedAt, userId, clientId, existingRow.scopes)
+        .prepare(`UPDATE grants SET scopes = ?, granted_at = ? WHERE user_id = ? AND client_id = ? AND scopes = ?${live}`)
+        .bind(scopes.join(" "), grantedAt, userId, clientId, existingRow.scopes, ...liveBinds)
     : db
-        .prepare("INSERT OR IGNORE INTO grants (user_id, client_id, scopes, granted_at) VALUES (?, ?, ?, ?)")
-        .bind(userId, clientId, scopes.join(" "), grantedAt);
+        .prepare(`INSERT OR IGNORE INTO grants (user_id, client_id, scopes, granted_at) SELECT ?, ?, ?, ? WHERE 1${live}`)
+        .bind(userId, clientId, scopes.join(" "), grantedAt, ...liveBinds);
 
   if (!familyMoved) {
     const written = await record.run();
