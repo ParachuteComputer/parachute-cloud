@@ -154,6 +154,21 @@ describe("POST /ops/account-delete — dry run", () => {
     expect(await count("SELECT COUNT(*) AS n FROM vaults WHERE owner_user_id = ?", id)).toBe(2);
     expect(await count("SELECT COUNT(*) AS n FROM magic_links WHERE email = ?", email)).toBe(1);
   });
+
+  test("a dry_run that is not a JSON boolean is refused, never read as a real delete", async () => {
+    // An agent writing `"dry_run": "true"` (or 1) meant a dry run. Read as
+    // "not true", it erased the account with no undo and no notice.
+    const email = "dry-typed@example.com";
+    const { id } = await seedUser(email);
+    await seedVault("dry-typed-notes", id);
+    for (const dry_run of ["true", "false", 1, 0, "yes", null, {}]) {
+      const res = await call({ email, confirm: email, written_request: REF, dry_run });
+      expect(res!.status, JSON.stringify(dry_run)).toBe(400);
+      expect(await json(res)).toMatchObject({ error: "invalid_request" });
+    }
+    expect((await getUserById(db(), id))?.deletedAt).toBeNull();
+    expect(await count("SELECT COUNT(*) AS n FROM vaults WHERE owner_user_id = ?", id)).toBe(1);
+  });
 });
 
 describe("POST /ops/account-delete — the purge", () => {
