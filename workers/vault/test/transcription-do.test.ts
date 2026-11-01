@@ -794,4 +794,54 @@ describe("transcription during an embedding backoff (T-318 day review 2)", () =>
     }
     expect(body).toContain("transcribed during the outage");
   });
+
+  // The backoff used to live only in the alarm TIME. Any earlier wake (a due
+  // transcription, or a new memo pulling the alarm in) still ran the
+  // embedding drain, so Workers AI was called again before the backoff ran
+  // out. A wake inside the backoff must transcribe and leave embedding alone.
+  it("a wake brought forward during the embedding backoff transcribes without calling Workers AI", async () => {
+    const v = freshVault("tvembw");
+    await pushEntitlement(v, true, 600);
+    await op(v, "/api/notes", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: "a note to embed while Workers AI is out of capacity" }),
+    });
+    let embedCalls = 0;
+    const outage = new WorkersAiEmbeddingProvider({
+      run: async () => {
+        embedCalls++;
+        throw new Error("3040: Capacity temporarily exceeded, please try again.");
+      },
+    });
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      inst.__setTestEmbeddingProvider(outage);
+      inst.__setTestProvider(stubProvider(() => ({ text: "transcribed inside the backoff", audioSeconds: 20 })));
+      await inst.ctx.storage.deleteAlarm();
+      await inst.alarm();
+      expect((await inst.ctx.storage.getAlarm()) - Date.now()).toBeGreaterThan(10_000);
+    });
+    expect(embedCalls).toBeGreaterThan(0); // the backoff has started
+    const callsAtBackoff = embedCalls;
+
+    // A memo lands: its link pulls the alarm in to now, and that wake runs.
+    const { noteId } = await setupVoiceNote(v);
+    await runAlarmWith(v, stubProvider(() => ({ text: "transcribed inside the backoff", audioSeconds: 20 })));
+    let body = "";
+    for (let i = 0; i < 50 && !body.includes("transcribed inside the backoff"); i++) {
+      body = await noteBody(v, noteId);
+      if (!body.includes("transcribed inside the backoff")) await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(body).toContain("transcribed inside the backoff");
+    expect(embedCalls).toBe(callsAtBackoff); // no Workers AI call before the backoff ran out
+
+    // The chunks are still stale, so the alarm stays armed for the retry.
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      expect((await inst.ctx.storage.getAlarm()) - Date.now()).toBeGreaterThan(10_000);
+      // Let the backoff run out, then wake: embedding is retried.
+      await inst.ctx.storage.put("embedding_retry_at", Date.now() - 1);
+      await inst.alarm();
+    });
+    expect(embedCalls).toBeGreaterThan(callsAtBackoff);
+  });
 });
