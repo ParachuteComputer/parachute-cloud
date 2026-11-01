@@ -217,13 +217,16 @@ describe("resumeBilling — releases the hold (or says plainly it couldn't)", ()
     expect(sub("sub_resume_1")).toMatchObject({ cancel_at_period_end: false, metadata: { plan: "standard" } });
   });
 
-  test("kept (already stopping before the delete): stays stopping, only the marker goes", async () => {
+  test("kept (already stopping before the delete): stays stopping, no Stripe write (the marker stays)", async () => {
     const { stub, calls, sub } = makeStripeStub({
       subs: { sub_kept: { cancel_at_period_end: true, metadata: { [DELETE_HOLD_METADATA_KEY]: DELETE_HOLD_KEPT } } },
     });
     await expect(resumeBilling(stub, "sub_kept")).resolves.toEqual({ resumed: true });
-    expect(calls.updated).toEqual([{ id: "sub_kept", metadata: { [DELETE_HOLD_METADATA_KEY]: "" } }]);
-    expect(sub("sub_kept")).toMatchObject({ cancel_at_period_end: true, metadata: {} });
+    expect(calls.updated).toEqual([]);
+    expect(sub("sub_kept")).toMatchObject({
+      cancel_at_period_end: true,
+      metadata: { [DELETE_HOLD_METADATA_KEY]: DELETE_HOLD_KEPT },
+    });
   });
 
   test("no marker (a hold placed before the marker existed): released as before, so a renewing subscriber is not stranded", async () => {

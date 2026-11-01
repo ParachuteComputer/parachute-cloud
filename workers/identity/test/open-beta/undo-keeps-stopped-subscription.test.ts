@@ -15,7 +15,7 @@
  * merges metadata; "" unsets a key).
  */
 import { env } from "cloudflare:test";
-import type Stripe from "stripe";
+import Stripe from "stripe";
 import { describe, expect, test } from "vitest";
 import { ACCOUNT_TOKEN_AUDIENCE } from "../../src/account-auth.ts";
 import { handleAccountDelete, handleAccountDeleteUndo } from "../../src/account-delete.ts";
@@ -32,8 +32,11 @@ interface SubState {
   metadata: Record<string, string>;
 }
 
-function stripeModel(initial: SubState): { stripe: Stripe; sub: SubState } {
+function stripeModel(initial: SubState): { stripe: Stripe; sub: SubState; loseNextUpdateReply: () => void } {
   const sub: SubState = { ...initial, metadata: { ...initial.metadata } };
+  // A lost reply: Stripe APPLIES the update, but the caller sees a network
+  // error (timeout, connection reset) instead of the 200.
+  let loseReply = false;
   const view = (id: string) => ({ id, object: "subscription", status: "active", ...sub, metadata: { ...sub.metadata } });
   const stripe = {
     subscriptions: {
@@ -44,11 +47,15 @@ function stripeModel(initial: SubState): { stripe: Stripe; sub: SubState } {
           if (v === "") delete sub.metadata[k];
           else sub.metadata[k] = v;
         }
+        if (loseReply) {
+          loseReply = false;
+          throw new Stripe.errors.StripeConnectionError({ message: "An error occurred with our connection to Stripe." });
+        }
         return view(id);
       },
     },
   } as unknown as Stripe;
-  return { stripe, sub };
+  return { stripe, sub, loseNextUpdateReply: () => (loseReply = true) };
 }
 
 async function seedSubscriber(email: string): Promise<{ id: string; token: string }> {
@@ -143,5 +150,39 @@ describe("undo restores the subscription's pre-delete renewal state", () => {
     });
     expect(undo.status).toBe(200);
     expect(sub.cancel_at_period_end).toBe(false);
+  });
+
+  test("an undo retried after Stripe applied the first attempt but its reply was lost keeps a stopping subscription stopping", async () => {
+    // Already stopping before the delete (the person cancelled, or the
+    // operator's open-beta stop). The first undo's marker-only update lands in
+    // Stripe but the reply is lost, so undo answers 502 "retry" and puts the
+    // tombstone back. The retry then finds a stopping subscription with NO
+    // marker, which reads exactly like a hold placed by the pre-marker code,
+    // and turns renewal back on: the next period is charged.
+    const { stripe, sub, loseNextUpdateReply } = stripeModel({ cancel_at_period_end: true, metadata: {} });
+    const email = "kept-lost-reply@example.com";
+    const acct = await seedSubscriber(email);
+    const d = { ...deps(), vaultFetch: okVault };
+    const del = await handleAccountDelete(env, deleteRequest(acct.token, email), d, undefined, { stripe });
+    expect(del.status).toBe(200);
+    const { undo_token } = (await del.json()) as { undo_token: string };
+    const undo = () =>
+      handleAccountDeleteUndo(
+        env,
+        new Request(`${ISSUER}/account/undo-delete`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token: undo_token }),
+        }),
+        d,
+        { stripe },
+      );
+    loseNextUpdateReply();
+    const first = await undo();
+    // The person retries what told them to retry (on the code under test the
+    // first attempt answers 502 billing_resume_failed).
+    const final = first.status === 200 ? first : await undo();
+    expect(final.status).toBe(200);
+    expect(sub.cancel_at_period_end).toBe(true);
   });
 });
