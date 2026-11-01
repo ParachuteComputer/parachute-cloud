@@ -208,6 +208,7 @@ describe("embedding batches (T-318): oversized input is capped and split, not re
     for (let i = 0; i < 25 && pending !== 0; i++) {
       await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
         inst.__setTestEmbeddingProvider(provider);
+        await inst.ctx.storage.delete("embedding_retry_at"); // as when the outage backoff has run out
         await inst.alarm();
         pending = getNotesPendingEmbedding(inst.store.db, provider.model, 1000).length;
       });
@@ -240,5 +241,75 @@ describe("embedding batches (T-318): oversized input is capped and split, not re
       expect(err, msg).toBeInstanceOf(EmbeddingError);
       expect((err as EmbeddingError).code, msg).toBe("input_rejected");
     }
+  });
+});
+
+describe("embedding drain during a Workers AI outage (T-318 day review 2)", () => {
+  // #334 made a capacity (3040) or quota (3036) answer transient, which is
+  // right: nothing is stored. But a failed wake re-arms the alarm for NOW, and
+  // an alarm set for now fires at once, so for as long as the outage lasts
+  // every vault with stale chunks calls Workers AI back to back (and logs an
+  // error per call). A wake that made no progress must wait before it retries.
+  it("a wake whose every call failed waits before the next one, instead of re-firing at once", async () => {
+    const v = freshVault("eout");
+    expect((await op(v, "")).status).toBe(200);
+    await createNote(v, { content: "a note to embed while Workers AI is out of capacity" });
+    let calls = 0;
+    const provider = new WorkersAiEmbeddingProvider({
+      run: async () => {
+        calls++;
+        throw new Error("3040: Capacity temporarily exceeded, please try again.");
+      },
+    });
+    let alarmIn = 0;
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      inst.__setTestEmbeddingProvider(provider);
+      await inst.ctx.storage.deleteAlarm();
+      await inst.alarm();
+      const at = await inst.ctx.storage.getAlarm();
+      expect(at).not.toBeNull(); // the chunks are still pending: it must come back
+      alarmIn = (at as number) - Date.now();
+    });
+    expect(calls).toBeGreaterThan(0);
+    const afterWake = calls;
+    // Give an alarm armed for "now" time to fire on its own, as it does in production.
+    await new Promise((r) => setTimeout(r, 1_500));
+    // At most one more wake: the alarm createNote armed may already be in
+    // flight in the pool when this test's own wake runs (it backs off too).
+    expect({ alarmIn: alarmIn >= 10_000, atMostOneMoreCall: calls - afterWake <= 1 }).toEqual({ alarmIn: true, atMostOneMoreCall: true });
+  });
+
+  it("the wait grows across stalled wakes, even when the DO is evicted between them, and resets once a wake stores anything", async () => {
+    const v = freshVault("eout");
+    expect((await op(v, "")).status).toBe(200);
+    await createNote(v, { content: "a note to embed while Workers AI is out of capacity" });
+    let up = false;
+    const provider = new WorkersAiEmbeddingProvider({
+      run: async (_m: string, inputs: { text: string[] }) => {
+        if (!up) throw new Error("3040: Capacity temporarily exceeded, please try again.");
+        return { data: inputs.text.map(() => [1, 0, 0]) };
+      },
+    });
+    const wake = async (): Promise<number | null> => {
+      let at: number | null = null;
+      await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+        inst.__setTestEmbeddingProvider(provider);
+        inst.embedStalls = undefined; // as after an eviction: only DO storage carries the count
+        await inst.ctx.storage.delete("embedding_retry_at"); // as when the previous wait has run out
+        await inst.alarm();
+        const a = await inst.ctx.storage.getAlarm();
+        at = a === null ? null : a - Date.now();
+      });
+      return at;
+    };
+    const first = (await wake())!;
+    const second = (await wake())!;
+    expect(second).toBeGreaterThan(first + 10_000);
+    up = true;
+    await wake();
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      expect(await inst.ctx.storage.get("embedding_stalls")).toBeUndefined();
+      expect(await inst.ctx.storage.get("embedding_retry_at")).toBeUndefined();
+    });
   });
 });
