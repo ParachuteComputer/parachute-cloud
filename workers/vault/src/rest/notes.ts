@@ -70,6 +70,7 @@ import {
   tagScopeForbidden,
 } from "./tag-scope.js";
 import { logStrictBypass } from "./shims.js";
+import { holdTypes, markTypes, mergeTypesIntoTags, prepareCallTypes, refreshTypes } from "@openparachute/core/src/tag-kind.js";
 import { bodyWithPendingRestored, segmentPart } from "../transcription/pipeline.js";
 
 /**
@@ -282,9 +283,24 @@ export async function handleNotes(
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
   writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
+  // T-318 §8a ("writes accept both"): a body's `types` fold into its tags before the write, as bun's REST does;
+  // the names are marked as types once the write has succeeded, so a refused write makes nothing.
+  const folded = await foldRestTypes(req, store, subpath, tagScope);
+  if (folded instanceof Response) return folded;
+  req = folded.req;
   try {
-    return await handleNotesInner(req, store, subpath, deps, tagScope, writeCtx);
+    const res = await handleNotesInner(req, store, subpath, deps, tagScope, writeCtx);
+    if (!folded.types.length) return res;
+    folded.release();
+    if (res.status >= 300) return res;
+    markTypes(store.db, folded.types);
+    // The body was built before the marking: read its notes' types again.
+    if (!(res.headers.get("content-type") ?? "").includes("application/json")) return res;
+    const headers = new Headers(res.headers);
+    headers.delete("content-length");
+    return new Response(JSON.stringify(refreshTypes(store.db, await res.json())), { status: res.status, headers });
   } catch (e: any) {
+    folded.release();
     if (e?.code === "HISTORY_NOT_FOUND") return json({ error: e.message, error_type: "not_found" }, 404);
     if (e?.code === "HISTORY_OVERFLOW") return json({
       error_type: "history_overflow", note_id: e.note_id, byte_size: e.byte_size, limit: e.limit, message: e.message,
@@ -305,6 +321,55 @@ export async function handleNotes(
     const ambig = ambiguousPathResponse(e);
     if (ambig) return ambig;
     throw e;
+  }
+}
+
+/**
+ * REST's half of "writes accept both" (T-318 §8a), the twin of bun's `foldRestTypes` (routes.ts): POST /notes and
+ * PATCH /notes/:idOrPath take `types` (each batch item's too), merged into the tags the handlers below already
+ * write, or a 422 `tag_kind` with the fix for a plain tag. Any other route, or a body that isn't JSON, passes
+ * through untouched (the handler answers it as before). A tag-scoped caller's types are only merged, so no kind is
+ * looked at for a name outside its scope; the scope checks below refuse it.
+ */
+async function foldRestTypes(
+  req: Request,
+  store: Store,
+  subpath: string,
+  tagScope: TagScopeCtx,
+): Promise<Response | { req: Request; types: string[]; release: () => void }> {
+  const none = { req, types: [] as string[], release: () => {} };
+  const mode = req.method === "POST" && subpath === "" ? "create" : req.method === "PATCH" && /^\/[^/]+$/.test(subpath) ? "update" : null;
+  if (!mode) return none;
+  let body: unknown;
+  try {
+    body = await req.clone().json();
+  } catch {
+    return none;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return none;
+  const b = body as Record<string, unknown>;
+  const batchTypes = Array.isArray(b.notes) && (b.notes as unknown[]).some((n) => (n as Record<string, unknown> | null)?.types !== undefined);
+  if (b.types === undefined && !batchTypes) return none;
+  const rebuilt = (next: unknown) => {
+    const headers = new Headers(req.headers);
+    headers.delete("content-length");
+    return new Request(req, { body: JSON.stringify(next), headers });
+  };
+  try {
+    // PATCH ignores a tags array on an existing note, so types go with tags {add, remove} or alone (as bun).
+    if (mode === "update" && b.types !== undefined && Array.isArray(b.tags)) {
+      return json({ error: "send types with tags: {add, remove}, or alone", error_type: "tag_kind", field: "types", hint: "tags: {add: [...]}, types: {add: [...]}" }, 400);
+    }
+    if (tagScope.allowed) {
+      const merged = mergeTypesIntoTags(b, mode);
+      const notes = Array.isArray(merged.notes) ? (merged.notes as Record<string, unknown>[]).map((i) => mergeTypesIntoTags(i, mode)) : null;
+      return { ...none, req: rebuilt(notes ? { ...merged, notes } : merged) };
+    }
+    const prepared = prepareCallTypes(store.db, b, mode, { named: mode === "update" });
+    return { req: rebuilt(prepared.params), types: prepared.types, release: holdTypes(store.db, prepared.types) };
+  } catch (err) {
+    if ((err as { error_type?: string })?.error_type !== "tag_kind") throw err;
+    return json({ error: (err as Error).message, error_type: "tag_kind", field: "types", hint: (err as { hint?: string }).hint }, 422);
   }
 }
 
