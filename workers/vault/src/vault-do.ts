@@ -791,6 +791,33 @@ export class VaultDO extends DurableObject {
       return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
     }
 
+    const res = await this.handleLive(request, url, vaultName, rest);
+    // The destroyed check above runs at request START. A request that was
+    // still awaiting (a streaming body, a model) when the vault was destroyed
+    // may have written DO storage after destroy's wipe: a settings PATCH puts
+    // `config` back, which a cold wake would load as this name's config. So a
+    // request that saw the flag flip wipes again and answers 410, whatever its
+    // route. R2 writers already purge their late objects (refuseLateWrite).
+    if (this.destroyed) return this.wipeAfterLateDestroy(vaultName);
+    return res;
+  }
+
+  /**
+   * A request that started on a live vault and finished on a destroyed one
+   * (see {@link handleFetch}): clear the alarm and DO storage again, with
+   * other events held off, the same steps {@link handleDestroy} ran, and
+   * answer the 410 a later request gets.
+   */
+  private async wipeAfterLateDestroy(vaultName: string): Promise<Response> {
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.deleteAll();
+    });
+    console.log(`[destroy ${vaultName}] late request: storage wiped again`);
+    return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
+  }
+
+  private async handleLive(request: Request, url: URL, vaultName: string, rest: string): Promise<Response> {
     await this.ensureState(vaultName);
 
     // Live-query WS binding: rebuild in-memory subscriptions from the sockets'
