@@ -275,6 +275,7 @@ export async function handleTags(
       relationships?: Record<string, unknown> | null;
       parent_names?: unknown;
       replace_fields?: unknown;
+      kind?: unknown;
     };
     const replaceFields = body.replace_fields === true;
 
@@ -379,8 +380,13 @@ export async function handleTags(
         ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
         ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
         ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
+        // T-318 §8a: kind "type" promotes a tag, "tag" demotes one (refused while it has fields or parents).
+        ...(body.kind !== undefined ? { kind: body.kind as "type" | "tag" } : {}),
       });
     } catch (err) {
+      if ((err as { error_type?: string })?.error_type === "tag_kind") {
+        return json({ error: (err as Error).message, error_type: "tag_kind", field: (err as { field?: string }).field }, 422);
+      }
       if (err instanceof IndexedFieldError) {
         return json({ error: err.message, error_type: "invalid_indexed_field" }, 400);
       }
