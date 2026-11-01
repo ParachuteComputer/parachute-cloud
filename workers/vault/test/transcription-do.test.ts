@@ -22,6 +22,7 @@ import type { TranscriptionProvider, TranscribeInput, TranscribeResult } from "@
 import { TranscriptionError } from "@openparachute/core/src/transcription/provider.ts";
 import { MAX_TRANSCRIBE_BYTES } from "../src/transcription/workers-ai.ts";
 import type { TextGeneratorLike } from "../src/transcription/cleanup.ts";
+import { WorkersAiEmbeddingProvider } from "../src/embedding/workers-ai.ts";
 
 /** First-party admin token — exactly what identity's plan push mints. */
 function firstPartyToken(vault: string): Promise<string> {
@@ -754,5 +755,43 @@ describe("retry-transcription endpoint (voice W2)", () => {
 
     const res = await retryTranscription(v, noteId, readToken);
     expect(res.status).toBe(403);
+  });
+});
+
+describe("transcription during an embedding backoff (T-318 day review 2)", () => {
+  // The embedding drain now waits (30 s doubling to 10 min) after a wake whose
+  // Workers AI calls all failed. The upload armer only arms when NO alarm is
+  // set, on the assumption that any armed alarm is sooner. A voice memo
+  // uploaded during that wait sat untranscribed until the embedding backoff
+  // ran out, up to 10 minutes, though nothing about transcription had failed.
+  it("a voice memo linked while the embedding drain backs off is still transcribed at once", async () => {
+    const v = freshVault("tvemb");
+    await pushEntitlement(v, true, 600);
+    await op(v, "/api/notes", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: "a note to embed while Workers AI is out of capacity" }),
+    });
+    const outage = new WorkersAiEmbeddingProvider({
+      run: async () => {
+        throw new Error("3040: Capacity temporarily exceeded, please try again.");
+      },
+    });
+    await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
+      inst.__setTestEmbeddingProvider(outage);
+      inst.__setTestProvider(stubProvider(() => ({ text: "transcribed during the outage", audioSeconds: 20 })));
+      await inst.ctx.storage.deleteAlarm();
+      await inst.alarm();
+      // Precondition: the embedding drain is backing off.
+      expect((await inst.ctx.storage.getAlarm()) - Date.now()).toBeGreaterThan(10_000);
+    });
+    const { noteId } = await setupVoiceNote(v);
+    // The armed alarm fires on its own in the pool, as it does in production.
+    let body = "";
+    for (let i = 0; i < 50 && !body.includes("transcribed during the outage"); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      body = await noteBody(v, noteId);
+    }
+    expect(body).toContain("transcribed during the outage");
   });
 });
