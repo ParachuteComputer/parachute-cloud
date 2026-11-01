@@ -90,7 +90,7 @@ function pageParam(req: Request, totalPages: number): number {
 const NOTICES: Record<string, string> = {
   "plan-updated": "Plan updated — storage caps pushed to the user's vaults.",
   "plan-partial": "Plan updated, but one or more vault cap pushes failed — they self-heal via the daily reconcilers, or re-run scripts/backfill-plans.ts.",
-  suspended: "Account suspended — sessions invalidated; sign-in now answers neutrally. Vault data untouched; tokens expire naturally.",
+  suspended: "Account suspended — sessions invalidated; sign-in now answers neutrally. Vault data untouched; connected apps can't refresh, so their access ends within 15 minutes.",
   unsuspended: "Account un-suspended — sign-in works again.",
   "delete-requested": "Deletion requested — the account is closed now, the holder was emailed an undo link, and it is erased after 24 hours. Logged.",
 };

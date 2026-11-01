@@ -80,9 +80,13 @@ async function denyUnownedVaultMint(
 /**
  * Closed-account mint gate, applied in BOTH mint paths (code redemption and
  * refresh rotation). A subject whose account carries the deletion tombstone
- * (`users.deleted_at`, migration 0023) — or whose row is gone — gets no new
- * token, answered `400 invalid_grant` like any other grant that can no longer
- * be used (RFC 6749 §5.2).
+ * (`users.deleted_at`, migration 0023) or is SUSPENDED (`users.suspended_at`,
+ * migration 0011) — or whose row is gone — gets no new token, answered
+ * `400 invalid_grant` like any other grant that can no longer be used
+ * (RFC 6749 §5.2). Suspension already refuses every other mint (sign-in,
+ * magic link, 2FA, account MCP); without it here a connected app's refresh
+ * token kept rotating, so a suspended account's apps never lost vault access.
+ * Nothing is revoked, so un-suspending lets the same apps refresh again.
  *
  * This is what makes "deleting an account severs auth immediately" true at
  * the token endpoint. The delete request also drops the account's unredeemed
@@ -94,7 +98,7 @@ async function denyUnownedVaultMint(
  */
 async function denyClosedAccountMint(db: D1Database, userId: string): Promise<Response | null> {
   const user = await getUserById(db, userId);
-  if (user && user.deletedAt === null) return null;
+  if (user && user.deletedAt === null && user.suspendedAt === null) return null;
   return jsonResponse({ error: "invalid_grant", error_description: "account is closed" }, 400);
 }
 
