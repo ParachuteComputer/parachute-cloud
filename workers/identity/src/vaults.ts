@@ -144,14 +144,16 @@ export interface VaultDeleteD1Summary {
 }
 
 /**
- * A LIKE pattern matching any scope string that CONTAINS the `vault:<name>:`
+ * The needle matching any scope string that CONTAINS the `vault:<name>:`
  * segment prefix — the cheap D1-side CANDIDATE filter for the delete cascade,
- * never the authority (see {@link deleteVaultD1Rows}). Wildcards in the name are
- * escaped (`ESCAPE '\'`) because `_` is a LIKE single-char wildcard and legacy
- * rows can predate today's stricter slug gate.
+ * never the authority (see {@link deleteVaultD1Rows}). Matched with
+ * `instr(lower(scopes), ?)`, not LIKE: D1 refuses a LIKE pattern over 50
+ * bytes, and `%vault:<name>:%` passes that for any name of 42+ characters
+ * (names may be 63). `lower()` keeps LIKE's ASCII case-folding, so the
+ * candidate set is still a superset; `instr` has no wildcards to escape.
  */
-function vaultScopeLikePattern(vaultName: string): string {
-  return `%vault:${vaultName.replace(/[\\%_]/g, "\\$&")}:%`;
+function vaultScopeNeedle(vaultName: string): string {
+  return `vault:${vaultName}:`;
 }
 
 /** The scope strings in a space-delimited scope column, as an array. */
@@ -169,12 +171,12 @@ function splitScopes(scopes: string): string[] {
  * MATCHING IS EXACT SCOPE-SEGMENT COMPARISON, NEVER `LIKE` — the twin's rule,
  * kept here. A scope names this vault iff it parses as the three-part
  * `vault:<name>:<verb>` grammar ({@link vaultScopeName}) with `<name>` equal;
- * a substring hit is not enough. The one adaptation for D1 is that a `LIKE`
- * pattern PRE-FILTERS which rows are read (the hub reads the whole unrevoked
+ * a substring hit is not enough. The one adaptation for D1 is that a substring
+ * test (`instr`, {@link vaultScopeNeedle}) PRE-FILTERS which rows are read (the hub reads the whole unrevoked
  * registry into memory; cloud's is multi-tenant and must not). That is sound in
  * exactly one direction: every true match contains the `vault:<name>:` substring,
- * so the pattern is a superset — it can over-fetch candidates, never miss one,
- * and the JS check discards the extras. Do not promote the pattern to the
+ * so the substring test is a superset — it can over-fetch candidates, never miss one,
+ * and the JS check discards the extras. Do not promote the substring test to the
  * decision; `xvault:foo:read` and `account:<id>:vaults:foo:read` are precisely
  * the strings that must survive it.
  *
@@ -223,7 +225,7 @@ export async function deleteVaultD1Rows(
   now: Date = new Date(),
 ): Promise<VaultDeleteD1Summary> {
   const vaultName = name.toLowerCase();
-  const pattern = vaultScopeLikePattern(vaultName);
+  const needle = vaultScopeNeedle(vaultName);
   // `instr`, not LIKE, for the composed family: D1 caps LIKE pattern length
   // and `account:<uuid>:vaults:<name>` is longer than that cap. Still only a
   // superset prefilter — the JS check below is the decision.
@@ -233,12 +235,12 @@ export async function deleteVaultD1Rows(
 
   const [tokenCandidates, grantCandidates, composedTokens, composedGrants, clientCandidates] = await Promise.all([
     db
-      .prepare("SELECT jti, scopes FROM tokens WHERE revoked_at IS NULL AND scopes LIKE ? ESCAPE '\\'")
-      .bind(pattern)
+      .prepare("SELECT jti, scopes FROM tokens WHERE revoked_at IS NULL AND instr(lower(scopes), ?) > 0")
+      .bind(needle)
       .all<{ jti: string; scopes: string }>(),
     db
-      .prepare("SELECT user_id, client_id, scopes FROM grants WHERE scopes LIKE ? ESCAPE '\\'")
-      .bind(pattern)
+      .prepare("SELECT user_id, client_id, scopes FROM grants WHERE instr(lower(scopes), ?) > 0")
+      .bind(needle)
       .all<{ user_id: string; client_id: string; scopes: string }>(),
     db
       .prepare("SELECT jti, scopes FROM tokens WHERE revoked_at IS NULL AND user_id = ? AND instr(scopes, ?) > 0")
@@ -255,8 +257,8 @@ export async function deleteVaultD1Rows(
     // DCR response, never enforced), so dropping the dead name's scopes from
     // it changes no authorization.
     db
-      .prepare("SELECT client_id, scopes FROM clients WHERE scopes LIKE ? ESCAPE '\\'")
-      .bind(pattern)
+      .prepare("SELECT client_id, scopes FROM clients WHERE instr(lower(scopes), ?) > 0")
+      .bind(needle)
       .all<{ client_id: string; scopes: string }>(),
   ]);
 
@@ -294,7 +296,7 @@ export async function deleteVaultD1Rows(
   for (const row of grantRows.values()) {
     const scopes = splitScopes(row.scopes);
     const kept = scopes.filter((s) => !namesThisVault(s));
-    if (kept.length === scopes.length) continue; // LIKE over-fetch — not a real match.
+    if (kept.length === scopes.length) continue; // substring over-fetch — not a real match.
     if (kept.length === 0) {
       statements.push(
         db.prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?").bind(row.user_id, row.client_id),
