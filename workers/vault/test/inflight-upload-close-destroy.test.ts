@@ -150,4 +150,29 @@ describe("an upload in flight across an account close or a vault destroy", () =>
       kv_keys: [],
     });
   });
+
+  it("a vault-settings PATCH whose body streams across a destroy re-persists nothing", async () => {
+    // Not an R2 write, so refuseLateWrite never sees it: the handler persists
+    // `config` (the owner's description) into the storage destroy just wiped.
+    // A later cold wake would load it as this name's config.
+    const v = freshVault("ifp");
+    await createNote(v, { content: "n" });
+    const enc = new TextEncoder();
+    const json = JSON.stringify({ description: "the owner's own words" });
+    const { body, release } = slowBody(enc.encode(json.slice(0, 5)), enc.encode(json.slice(5)));
+    const done = SELF.fetch(`${base(v)}/api/vault`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${OP}`, "content-type": "application/json" },
+      body,
+      duplex: "half",
+    });
+    await tick(300); // the DO is now awaiting the PATCH body
+
+    await destroy(v);
+
+    release();
+    const res = await done;
+    const probe = await purgeCheck(v);
+    expect({ patch: res.status, kv_keys: probe.kv_keys, alarm: probe.alarm }).toEqual({ patch: 410, kv_keys: [], alarm: null });
+  });
 });
