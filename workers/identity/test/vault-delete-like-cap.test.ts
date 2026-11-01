@@ -85,7 +85,10 @@ describe("deleting a vault with a long (legal) name, on D1's 50-byte LIKE cap", 
     );
     expect(res.status, await res.clone().text()).toBe(200);
     expect(await getVault(env.DB, name)).toBeNull();
-    expect(await revokedAt("like-cap-door-token")).not.toBeNull();
+    const revoked = await revokedAt("like-cap-door-token");
+    // undefined = the token row is gone; the cascade must keep it, revoked.
+    expect(revoked).toBeDefined();
+    expect(revoked).not.toBeNull();
   });
 
   test("an account owning a 63-character vault is purged when its window closes", async () => {
