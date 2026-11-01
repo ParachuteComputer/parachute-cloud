@@ -911,7 +911,8 @@ export interface AccountDeleteSweepSummary {
    * the guard working exactly as designed and must never page anyone.
    */
   skipped: number;
-  /** Accounts that threw — counted separately from an orderly deferral. */
+  /** Accounts that threw — counted apart from an orderly deferral, but a
+   *  claimed one also takes an attempt (and pages past the threshold). */
   failed: number;
 }
 
@@ -1049,6 +1050,7 @@ export async function runAccountDeleteSweep(
   const summary: AccountDeleteSweepSummary = { due: due.length, purged: 0, deferred: 0, skipped: 0, failed: 0 };
 
   for (const { id: userId, deleted_at: tombstone } of due) {
+    let claimed: User | null = null;
     try {
       const user = await getUserById(env.DB, userId);
       if (!user) continue; // Raced with another pass — already gone.
@@ -1066,6 +1068,7 @@ export async function runAccountDeleteSweep(
         console.log(`event=account_purge_skipped_unclaimed user=${userId} tombstone=${tombstone}`);
         continue;
       }
+      claimed = user;
 
       // 1. Billing. What Stripe held is recorded on the audit row at purge
       //    (T-318) — after this account's row is gone, that row is the only
@@ -1148,10 +1151,24 @@ export async function runAccountDeleteSweep(
         `event=account_purged user=${userId} vaults_destroyed=${vaultsDestroyed} r2_objects_deleted=${r2ObjectsDeleted} stripe_customer_deleted=${hadStripeCustomer}`,
       );
     } catch (err) {
-      console.error(
-        `event=account_purge_failed user=${userId} error=${err instanceof Error ? err.message : String(err)}`,
-      );
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`event=account_purge_failed user=${userId} error=${message}`);
       summary.failed++;
+      // A claimed account that THROWS is as stuck as one that defers, and a
+      // deterministic throw (D1 refusing a statement for this account, say)
+      // recurs every pass. Count it like a deferral: otherwise its counter
+      // stays NULL, it sorts ahead of every later deletion forever (attempts
+      // ASC) and the operator is never paged. Not before the claim: a throw
+      // there is a read or the CAS itself, with nothing of the account's yet
+      // decided. deferAccount never throws on its counter write; the alert
+      // send is guarded here so one account can't stop the queue.
+      if (claimed !== null) {
+        await deferAccount(env, overrides?.sender, claimed, now, `error:${message}`).catch((alertErr) =>
+          console.error(
+            `event=account_purge_throw_count_failed user=${userId} error=${alertErr instanceof Error ? alertErr.message : String(alertErr)}`,
+          ),
+        );
+      }
     }
   }
 
