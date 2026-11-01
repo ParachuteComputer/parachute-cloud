@@ -208,6 +208,7 @@ describe("embedding batches (T-318): oversized input is capped and split, not re
     for (let i = 0; i < 25 && pending !== 0; i++) {
       await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
         inst.__setTestEmbeddingProvider(provider);
+        await inst.ctx.storage.delete("embedding_retry_at"); // as when the outage backoff has run out
         await inst.alarm();
         pending = getNotesPendingEmbedding(inst.store.db, provider.model, 1000).length;
       });
@@ -294,6 +295,7 @@ describe("embedding drain during a Workers AI outage (T-318 day review 2)", () =
       await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
         inst.__setTestEmbeddingProvider(provider);
         inst.embedStalls = undefined; // as after an eviction: only DO storage carries the count
+        await inst.ctx.storage.delete("embedding_retry_at"); // as when the previous wait has run out
         await inst.alarm();
         const a = await inst.ctx.storage.getAlarm();
         at = a === null ? null : a - Date.now();
@@ -307,6 +309,7 @@ describe("embedding drain during a Workers AI outage (T-318 day review 2)", () =
     await wake();
     await runInDurableObject<DurableObject, void>(doStub(v), async (inst: any) => {
       expect(await inst.ctx.storage.get("embedding_stalls")).toBeUndefined();
+      expect(await inst.ctx.storage.get("embedding_retry_at")).toBeUndefined();
     });
   });
 });

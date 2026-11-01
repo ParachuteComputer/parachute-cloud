@@ -258,6 +258,11 @@ const EMBEDDING_BACKFILL_DONE_KEY = "embedding_backfill_done";
 /** DO-storage count of consecutive stalled embedding wakes (see EMBED_STALL_BASE_MS); kept in
  *  storage because an idle DO is evicted between backed-off wakes, which would reset a field. */
 const EMBED_STALLS_KEY = "embedding_stalls";
+/** DO-storage epoch ms before which no wake may call the embedding provider (set with
+ *  {@link EMBED_STALLS_KEY}). The alarm time alone is not enough: a wake brought forward for
+ *  transcription, or by a new memo, must skip the drain too. In storage, not a field, so an
+ *  eviction during the backoff can't lift it early. */
+const EMBED_RETRY_AT_KEY = "embedding_retry_at";
 interface EmbeddingBackfillState {
   done: boolean;
   model: string;
@@ -2914,22 +2919,29 @@ export class VaultDO extends DurableObject {
       // shape; `more`/`failed` decide the re-arm below, `empty`/(`partial` with
       // no more) persist the backfill-complete flag so idle requests stop
       // arm-checking (maybeArmEmbeddingBackfill).
-      const embedOutcome = await this.drainEmbeddingsOnce();
+      // Inside an outage backoff (EMBED_RETRY_AT_KEY), this wake came early for
+      // another reason (a transcription, a new memo): leave Workers AI alone and
+      // keep the alarm armed for the retry time.
+      const embedRetryAt = (await this.ctx.storage.get<number>(EMBED_RETRY_AT_KEY)) ?? 0;
+      const embedHeldMs = embedRetryAt - Date.now();
+      const embedOutcome = embedHeldMs > 0 ? { kind: "held" as const } : await this.drainEmbeddingsOnce();
       let embeddingDone =
         embedOutcome.kind === "empty" || (embedOutcome.kind === "partial" && !embedOutcome.more);
       let embeddingNeedsRearm =
-        embedOutcome.kind === "failed" || (embedOutcome.kind === "partial" && embedOutcome.more);
+        embedOutcome.kind === "held" ||
+        embedOutcome.kind === "failed" ||
+        (embedOutcome.kind === "partial" && embedOutcome.more);
       // Every provider call this wake failed and nothing was stored: wait
       // before the next try instead of re-firing at once (see EMBED_STALL_BASE_MS).
-      let embedDelayMs = 0;
+      let embedDelayMs = embedOutcome.kind === "held" ? embedHeldMs : 0;
       if (embedOutcome.kind === "failed" && embedOutcome.stalled) {
         const stalls = (this.embedStalls ?? (await this.ctx.storage.get<number>(EMBED_STALLS_KEY)) ?? 0) + 1;
         this.embedStalls = stalls;
-        await this.ctx.storage.put(EMBED_STALLS_KEY, stalls);
         embedDelayMs = Math.min(EMBED_STALL_BASE_MS * 2 ** Math.min(stalls - 1, 20), EMBED_STALL_MAX_MS);
+        await this.ctx.storage.put({ [EMBED_STALLS_KEY]: stalls, [EMBED_RETRY_AT_KEY]: Date.now() + embedDelayMs });
       } else if (embedOutcome.kind === "partial" || embedOutcome.kind === "failed") {
         if ((this.embedStalls ?? (await this.ctx.storage.get<number>(EMBED_STALLS_KEY)) ?? 0) !== 0) {
-          await this.ctx.storage.delete(EMBED_STALLS_KEY);
+          await this.ctx.storage.delete([EMBED_STALLS_KEY, EMBED_RETRY_AT_KEY]);
         }
         this.embedStalls = 0;
       }
@@ -3035,9 +3047,8 @@ export class VaultDO extends DurableObject {
    * Set the alarm to when the next pending item becomes due, across BOTH
    * queues — transcription attachments AND (C2) the embedding backfill/
    * on-write drain. `embeddingNeedsRearm=true` means "wake again ~now"
-   * (mirrors a due transcription item, not a backed-off one — embedding
-   * failures/more-pending both want a prompt retry, there is no embedding
-   * backoff schedule).
+   * plus `embedDelayMs` (0 for more-pending or a partial failure; the outage
+   * backoff when every call failed or the wake fell inside that backoff).
    *
    * PROOF this is transcription-behavior-preserving when
    * `embeddingNeedsRearm=false` (the only value this function saw before
