@@ -2749,15 +2749,19 @@ export class VaultDO extends DurableObject {
   /**
    * Arm the transcription alarm to fire ~immediately. Called when a
    * `transcribe:true` attachment link lands (notes handler → RestDeps). If an
-   * alarm is already pending (a burst of uploads, or a backoff re-arm), leave
-   * the earlier one — the alarm drains ALL pending attachments, so one wake
-   * covers the batch. Best-effort: a scheduling hiccup is caught by the fact
+   * alarm is already due (a burst of uploads), leave it — the alarm drains ALL
+   * pending attachments, so one wake covers the batch. An alarm parked later
+   * (a backoff) is pulled in to now. Best-effort: a scheduling hiccup is caught by the fact
    * that the note keeps its `pending` attachment and a later upload re-arms.
    */
   private async scheduleTranscriptionAlarm(): Promise<void> {
     try {
+      // An alarm parked in the future (a transcription retry backoff, or the
+      // embedding drain's outage backoff, up to 10 min) must not hold a new
+      // memo back: pull it in to now. The wake re-arms from what is pending.
       const existing = await this.ctx.storage.getAlarm();
-      if (existing === null) await this.ctx.storage.setAlarm(Date.now());
+      const now = Date.now();
+      if (existing === null || existing > now) await this.ctx.storage.setAlarm(now);
     } catch (e) {
       console.warn(`[transcribe-schedule ${this.config?.name}]`, errText(e));
     }
