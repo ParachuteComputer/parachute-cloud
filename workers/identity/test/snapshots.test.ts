@@ -859,6 +859,37 @@ describe("restore POST", () => {
     expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(`${target}-2`)}`);
   });
 
+  test("a status read that fails once doesn't strip the retry flag: the next restore still converges into the unfinished target", async () => {
+    // "No answer" is not "finished". Clearing the flag on a hiccup would turn a
+    // half-restored vault into a permanent one the owner can never retry into,
+    // and every later restore would burn a new slot instead.
+    const { id: userId } = await seedUser("rp-hiccup@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'standard' WHERE id = ?").bind(userId).run();
+    await seedVault("rp-hiccup-v", userId);
+    const entry = wireEntry("rp-hiccup-v", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-hiccup-v", entry);
+    const target = restoredVaultName("rp-hiccup-v", new Date());
+    await createVault(env.DB, target, userId, new Date(), { pending: "restore" });
+    const cookie = sessionCookie(await seedSession(userId));
+
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: `/vault/${target}/api/internal/import-status`, method: "GET" })
+      .reply(500, "boom");
+    interceptRestoreFlow(`${target}-2`);
+    const res = await quietly(async () => app.fetch(restoreReq({ vault: "rp-hiccup-v", key: entry.key }, cookie), env));
+    expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(`${target}-2`)}`);
+
+    // The vault answers now: its restore failed, so the next restore is the retry.
+    interceptImportStatus(target, { state: "failed", kind: "restore", error_type: "exception" });
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: `/vault/${target}/api/internal/restore`, method: "POST" })
+      .reply(200, { restored: true }, { headers: { "content-type": "application/json" } });
+    const retry = await quietly(async () => app.fetch(restoreReq({ vault: "rp-hiccup-v", key: entry.key }, cookie), env));
+    expect(retry.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(target)}`);
+  });
+
   test("a restore never replays into an unfinished IMPORT that happens to hold the restore name", async () => {
     // The import door's retry flag means "an upload of the owner's that didn't
     // finish", not "a restore that didn't finish": its content is not this
