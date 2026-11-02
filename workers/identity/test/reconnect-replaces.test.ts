@@ -178,6 +178,24 @@ describe("reconnecting the same app replaces its earlier connection", () => {
     expect(await liveTokens(userId, first)).toBe(0);
   });
 
+  test("the account-wide consent page also says it replaces the earlier connection (Codex r1)", async () => {
+    const { sessionId } = await owner("reconnect-g@example.com", ["notes-g"]);
+    const first = await dcr("Claude", CLAUDE_CB);
+    await connect(sessionId, first, CLAUDE_CB, "vault:notes-g:read vault:notes-g:write");
+    const second = await dcr("Claude", CLAUDE_CB);
+    const { challenge } = await makePkce();
+    const page = await handleAuthorizeGet(
+      db(),
+      authorizeGetReq(
+        { client_id: second, redirect_uri: CLAUDE_CB, response_type: "code", scope: "account:vaults", code_challenge: challenge, code_challenge_method: "S256" },
+        sessionId,
+      ),
+      deps(),
+    );
+    const html = await page.text();
+    expect(html).toContain("replaces");
+  });
+
   test("another person's connection of the same app is never touched", async () => {
     const a = await owner("reconnect-e1@example.com", ["notes-e1"]);
     const b = await owner("reconnect-e2@example.com", ["notes-e2"]);
