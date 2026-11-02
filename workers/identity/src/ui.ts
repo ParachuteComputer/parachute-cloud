@@ -500,9 +500,11 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
 
 export function renderConsent(props: ConsentProps): string {
   const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults } = props;
-  const scopeList = scopeDescriptions
-    .map((s) => `<li><strong>${esc(s.label)}</strong><br><span class="muted">${esc(s.scope)}</span></li>`)
-    .join("\n");
+  // The plain sentence is the list (T-318 #15: raw `vault:<name>:read` under it
+  // read as jargon). A scope with no sentence keeps its raw string here, so no
+  // requested scope is ever only in the closed "Technical details" below.
+  const scopeList = scopeDescriptions.map((s) => `<li><strong>${esc(s.label)}</strong></li>`).join("\n");
+  const rawScopes = scopeDescriptions.map((s) => `<li><code>${esc(s.scope)}</code></li>`).join("");
   const vaultField = lockedVault
     ? `<input type="hidden" name="vault_pick" value="${esc(lockedVault)}">`
     : needsVaultPick
@@ -539,6 +541,7 @@ export function renderConsent(props: ConsentProps): string {
          </div>
        </form>
        <p class="muted" style="margin:.9rem 0 0">You can disconnect it anytime from your vault's settings.</p>
+       <details data-testid="consent-scopes"><summary>Technical details</summary><p class="muted" style="margin:0">Scopes requested:</p><ul class="muted" style="margin:.3rem 0 0;padding-left:1.1rem">${rawScopes}</ul></details>
      </div>
      <p class="muted foot">issued by <strong>${esc(issuerHost)}</strong></p>`,
   );
