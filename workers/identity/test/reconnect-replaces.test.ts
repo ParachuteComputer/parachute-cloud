@@ -196,6 +196,37 @@ describe("reconnecting the same app replaces its earlier connection", () => {
     expect(html).toContain("replaces");
   });
 
+  test("a vault picked on the page: the page names the earlier connection, and picking that vault replaces it (Codex r2)", async () => {
+    const { userId, sessionId } = await owner("reconnect-h@example.com", ["notes-h", "other-h"]);
+    const first = await dcr("Claude", CLAUDE_CB);
+    await connect(sessionId, first, CLAUDE_CB, "vault:notes-h:read vault:notes-h:write");
+    const second = await dcr("Claude", CLAUDE_CB);
+    const { verifier, challenge } = await makePkce();
+    const q = { client_id: second, redirect_uri: CLAUDE_CB, response_type: "code", scope: "vault:read vault:write", code_challenge: challenge, code_challenge_method: "S256", state: "s" };
+    const html = await (await handleAuthorizeGet(db(), authorizeGetReq(q, sessionId), deps())).text();
+    expect(html).toContain("already has an earlier connection to notes-h");
+    expect(html).not.toContain("Allowing replaces"); // not known until the pick
+    const consent = await handleAuthorizePost(db(), consentReq({ ...q, vault_pick: "notes-h" }, { sessionId }), deps());
+    const code = new URL((consent.headers.get("location") ?? bridgeTarget(await consent.text()))!).searchParams.get("code")!;
+    await handleToken(db(), tokenReq({ grant_type: "authorization_code", code, client_id: second, redirect_uri: CLAUDE_CB, code_verifier: verifier }), deps());
+    expect((await listVaultConnections(env.DB, userId, "notes-h")).map((r) => r.client_id)).toEqual([second]);
+  });
+
+  test("account consent with a specific vault that does not overlap: no claim of replacing, and nothing is replaced (Codex r2)", async () => {
+    const { userId, sessionId } = await owner("reconnect-i@example.com", ["notes-i", "other-i"]);
+    const first = await dcr("Claude", CLAUDE_CB);
+    await connect(sessionId, first, CLAUDE_CB, "vault:notes-i:read vault:notes-i:write");
+    const second = await dcr("Claude", CLAUDE_CB);
+    const { challenge } = await makePkce();
+    const q = { client_id: second, redirect_uri: CLAUDE_CB, response_type: "code", scope: "account:vaults", code_challenge: challenge, code_challenge_method: "S256", state: "s" };
+    const html = await (await handleAuthorizeGet(db(), authorizeGetReq(q, sessionId), deps())).text();
+    expect(html).not.toContain("Allowing replaces");
+    expect(html).toContain("already has an earlier connection to notes-i");
+    await handleAuthorizePost(db(), consentReq({ ...q, access_verb: "write", vault_mode: "specific", vault_include: "other-i" }, { sessionId }), deps());
+    expect((await listVaultConnections(env.DB, userId, "notes-i")).map((r) => r.client_id)).toEqual([first]);
+    expect(await liveTokens(userId, first)).toBe(1);
+  });
+
   test("another person's connection of the same app is never touched", async () => {
     const a = await owner("reconnect-e1@example.com", ["notes-e1"]);
     const b = await owner("reconnect-e2@example.com", ["notes-e2"]);
