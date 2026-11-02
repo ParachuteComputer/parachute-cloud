@@ -138,9 +138,47 @@ export async function verifyClientSecret(client: OAuthClient, presented: string)
 }
 
 /**
+ * Dotless private-use schemes accepted anyway, because a real MCP client
+ * registers them: xAI's Grok Bot sends `cursor://anysphere.cursor-mcp/oauth/
+ * callback` next to its https callback (T-307). Add one only with evidence of
+ * a client that uses it.
+ */
+const KNOWN_NATIVE_SCHEMES = new Set(["cursor"]);
+
+/**
+ * A native app's private-use URI scheme redirect (RFC 8252 §7.1), held to
+ * what OAuth 2.1 (draft-13 §2.3.1) asks of one: a reverse-domain scheme, so
+ * one containing a period, or a dotless scheme a known MCP client uses
+ * ({@link KNOWN_NATIVE_SCHEMES}). Browser-internal and network schemes have no
+ * period and are not known clients, so they stay refused. No fragment
+ * (RFC 6749 §3.1.2) and something after the scheme. PKCE S256 is mandatory
+ * at authorize, which is what keeps another app claiming the same scheme from
+ * spending an intercepted code (RFC 8252 §8.1).
+ */
+function isPrivateUseRedirect(u: URL): boolean {
+  const scheme = u.protocol.slice(0, -1);
+  if (!/^[a-z][a-z0-9+.-]*$/.test(scheme)) return false;
+  if (!scheme.includes(".") && !KNOWN_NATIVE_SCHEMES.has(scheme)) return false;
+  if (u.hash !== "" || u.href.includes("#")) return false;
+  return u.host !== "" || (u.pathname !== "" && u.pathname !== "/");
+}
+
+/** A redirect URI that is not http(s): a native app's private-use scheme, shown on the consent page. */
+export function isNativeAppRedirect(uri: string): boolean {
+  try {
+    const u = new URL(uri);
+    return u.protocol !== "http:" && u.protocol !== "https:";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Light validation — refuses obviously-wrong shapes (relative paths,
- * javascript:/data: URIs, embedded control chars, userinfo). Registration-time
- * hygiene; exact-match against the registered set is `requireRegisteredRedirectUri`.
+ * javascript:/data: URIs, embedded control chars, userinfo). http(s), or a
+ * native app's private-use scheme ({@link isPrivateUseRedirect}).
+ * Registration-time hygiene; exact-match against the registered set is
+ * `requireRegisteredRedirectUri`.
  */
 export function isValidRedirectUri(uri: string): boolean {
   for (let i = 0; i < uri.length; i++) {
@@ -151,7 +189,8 @@ export function isValidRedirectUri(uri: string): boolean {
     const u = new URL(uri);
     if (u.protocol === "javascript:" || u.protocol === "data:") return false;
     if (u.username !== "" || u.password !== "") return false;
-    return u.protocol === "http:" || u.protocol === "https:";
+    if (u.protocol === "http:" || u.protocol === "https:") return true;
+    return isPrivateUseRedirect(u);
   } catch {
     return false;
   }
