@@ -273,8 +273,19 @@ export function renderLogin(opts: {
   );
 }
 
+/**
+ * What Allow does to the same app's earlier connection (T-307, a reconnect
+ * replaces it; oauth-connections.ts). `exact`: the vaults are already named
+ * and Allow replaces it. `if-chosen`: the vaults are chosen on the page, so
+ * the page names the earlier connection's vaults and which choice replaces it.
+ */
+export type ReplacesNote =
+  | { kind: "exact" }
+  | { kind: "if-chosen"; vaults: string[]; accountWide: boolean; account: boolean };
+
 export interface ConsentProps {
   params: AuthorizeParams;
+  replaces?: ReplacesNote | null;
   csrfToken: string;
   clientName: string;
   scopeDescriptions: Array<{ scope: string; label: string }>;
@@ -504,7 +515,7 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
 }
 
 export function renderConsent(props: ConsentProps): string {
-  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults } = props;
+  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults, replaces } = props;
   // The plain sentence is the list (T-318 #15: raw `vault:<name>:read` under it
   // read as jargon). A scope with no sentence keeps its raw string here, so no
   // requested scope is ever only in the closed "Technical details" below.
@@ -534,6 +545,7 @@ export function renderConsent(props: ConsentProps): string {
        <p class="lead" data-testid="consent-ask">${ask}</p>
        <ul class="scopes">${scopeList}</ul>
        ${returnsToLine(params.redirectUri)}
+       ${replacesLine(clientName, replaces ?? null)}
        <form method="post" action="/oauth/authorize">
          <input type="hidden" name="__action" value="consent">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -565,6 +577,27 @@ function returnsToLine(redirectUri: string): string {
   const u = new URL(redirectUri);
   const where = u.host ? `${u.protocol}//${u.host}` : `${u.protocol}${u.pathname}`;
   return `<p class="muted" data-testid="consent-returns-to">After you allow, the connection goes back to an app on this device: <code>${esc(where)}</code>.</p>`;
+}
+
+function replacesLine(clientName: string, note: ReplacesNote | null): string {
+  if (!note) return "";
+  const app = esc(clientName);
+  const say = (t: string) => `<p class="muted" data-testid="consent-replaces">${t}</p>`;
+  if (note.kind === "exact") {
+    return say(`Allowing replaces ${app}'s earlier connection to the same vaults, so it shows once under Connected apps.`);
+  }
+  const parts: string[] = [];
+  if (note.vaults.length > 0) {
+    const list = note.vaults.map(esc).join(", ");
+    const one = note.vaults.length === 1;
+    parts.push(
+      `${app} already has an earlier connection to ${list}. If you allow ${one ? "that vault" : "one of those vaults"} here, this replaces it, so it shows once under Connected apps.`,
+    );
+  }
+  if (note.accountWide && note.account) {
+    parts.push(`${app} already has an earlier connection to every vault. Choosing “Any vault” replaces it.`);
+  }
+  return parts.length > 0 ? say(parts.join(" ")) : "";
 }
 
 /**

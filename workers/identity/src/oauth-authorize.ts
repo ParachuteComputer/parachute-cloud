@@ -20,7 +20,8 @@ import {
   unnamedVaultVerbs,
   widenUnnamedVaultVerb,
 } from "./audience.ts";
-import { approveClient, getClient, requireRegisteredRedirectUri } from "./clients.ts";
+import { type OAuthClient, approveClient, getClient, requireRegisteredRedirectUri } from "./clients.ts";
+import { earlierSameAppReach, findSupersededConnections, retireSupersededConnections } from "./oauth-connections.ts";
 import { GrantWriteConflictError, isCoveredByGrant, recordGrant } from "./grants.ts";
 import { listVaultsForOwner, unownedNamedVaults, userOwnsVault } from "./vaults.ts";
 import {
@@ -35,7 +36,7 @@ import { isTotpEnrolled } from "./two-factor.ts";
 import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
 import { clearLoginFailures, clientIp, isLoginLocked, loginKey, recordLoginFailure } from "./rate-limit.ts";
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { type AuthorizeParams, describeScopes, renderConsent, renderError, renderLogin, renderRedirectBridge } from "./ui.ts";
+import { type AuthorizeParams, type ReplacesNote, describeScopes, renderConsent, renderError, renderLogin, renderRedirectBridge } from "./ui.ts";
 import {
   type OAuthDeps,
   consentIssuedByHost,
@@ -101,15 +102,26 @@ async function recordGrantAndRedirect(
   params: AuthorizeParams,
   scopes: string[],
   userId: string,
-  clientId: string,
+  client: OAuthClient,
   sessionId: string,
   deps: OAuthDeps,
 ): Promise<Response> {
+  const now = deps.now?.() ?? new Date();
   try {
-    await recordGrant(db, userId, clientId, scopes, deps.now?.() ?? new Date(), sessionId);
+    await recordGrant(db, userId, client.clientId, scopes, now, sessionId);
   } catch (err) {
     if (err instanceof GrantWriteConflictError) return grantChangedWhileApproving();
     throw err;
+  }
+  // A reconnect replaces the same app's earlier connection (T-307: claude.ai
+  // registers a new client every time). After the new grant is recorded, so a
+  // failure here never leaves the person with neither; and a failure to tidy
+  // the old one must not refuse the connection they just approved.
+  try {
+    const superseded = await findSupersededConnections(db, userId, client, scopes);
+    if (superseded.length > 0) await retireSupersededConnections(db, userId, client.clientId, superseded, now);
+  } catch (err) {
+    console.error(`event=connection_supersede_failed user=${userId} client=${client.clientId} error=${err instanceof Error ? err.name : "unknown"}`);
   }
   return (
     (await issueAuthCodeRedirect(db, { ...params, scope: scopes.join(" ") }, scopes, userId, sessionId, deps)) ??
@@ -340,6 +352,11 @@ async function authorizeCore(
     const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
     const consentUser = await getUserById(db, session.userId);
     const ownedVaults = (await listVaultsForOwner(db, session.userId)).map((v) => v.name);
+    // The vaults are chosen on this page, so name the same app's earlier
+    // connections and say which choices replace them (Codex r1/r2 on #383).
+    const earlier = await earlierSameAppReach(db, session.userId, client);
+    const replaces: ReplacesNote | null =
+      earlier.vaults.length > 0 || earlier.accountWide ? { kind: "if-chosen", ...earlier, account: true } : null;
     return htmlResponse(
       renderConsent({
         params,
@@ -351,6 +368,7 @@ async function authorizeCore(
         ownedVaults: [],
         verbSelector: null,
         accountVaults: { ownedVaults },
+        replaces,
         issuerHost: consentIssuedByHost(req, params.resource, deps),
         email: consentUser?.email ?? "",
         notYouNext: authorizeResumePath(params),
@@ -397,6 +415,17 @@ async function authorizeCore(
   // empty upgradeable set → no selector (it is already the top level).
   const upgradeableVerbs = unnamedVaultVerbs(requestedScopes).filter((v) => v === "read" || v === "write");
   const verbSelector = needsVaultPick && ownedVaults.length > 0 && upgradeableVerbs.length > 0 ? { requestedVerbs: upgradeableVerbs } : null;
+  // Say before Allow what this replaces of the same app's earlier connection:
+  // exactly, when the vault is already named; conditionally, when it is
+  // picked below (Codex r2 on #383). An account-wide earlier connection is
+  // never replaced by a single-vault pick, so it is not mentioned there.
+  let replaces: ReplacesNote | null = null;
+  if (needsVaultPick) {
+    const earlier = await earlierSameAppReach(db, session.userId, client);
+    if (earlier.vaults.length > 0) replaces = { kind: "if-chosen", vaults: earlier.vaults, accountWide: false, account: false };
+  } else if ((await findSupersededConnections(db, session.userId, client, requestedScopes)).length > 0) {
+    replaces = { kind: "exact" };
+  }
   return htmlResponse(
     renderConsent({
       params,
@@ -408,6 +437,7 @@ async function authorizeCore(
       ownedVaults,
       verbSelector,
       accountVaults: null,
+      replaces,
       // The "issued by <host>" trust line — the DOOR the user came through (the
       // bound request/resource origin, e.g. my.parachute.computer for a my./mcp
       // connect), else the issuer. Bound-gated in consentIssuedByHost, so never
@@ -750,7 +780,7 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
       composedScopes.push(composedVaultCreateScope(session.userId));
     }
 
-    return recordGrantAndRedirect(db, params, composedScopes, session.userId, client.clientId, session.id, deps);
+    return recordGrantAndRedirect(db, params, composedScopes, session.userId, client, session.id, deps);
   }
 
   // Narrow unnamed vault verbs to the picked vault (form pick or `vault=` hint).
@@ -787,5 +817,5 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   const ownershipDenied = await denyUnownedVaults(db, session.userId, scopes, params);
   if (ownershipDenied) return ownershipDenied;
 
-  return recordGrantAndRedirect(db, params, scopes, session.userId, client.clientId, session.id, deps);
+  return recordGrantAndRedirect(db, params, scopes, session.userId, client, session.id, deps);
 }
