@@ -53,7 +53,7 @@ async function connect(
   const q = { client_id: clientId, redirect_uri: redirect, response_type: "code", scope, code_challenge: challenge, code_challenge_method: "S256", state: "s" };
   const page = await handleAuthorizeGet(db(), authorizeGetReq(q, sessionId), deps());
   const html = await page.text();
-  const consent = await handleAuthorizePost(db(), consentReq(q, { sessionId }), deps());
+  const consent = await handleAuthorizePost(db(), consentReq({ ...q, replace_earlier: "1" }, { sessionId }), deps());
   const target = consent.headers.get("location") ?? bridgeTarget(await consent.text());
   const code = new URL(target!).searchParams.get("code");
   if (!code) throw new Error(`no code: ${target}`);
@@ -157,7 +157,7 @@ describe("reconnecting the same app replaces its earlier connection", () => {
       await handleAuthorizeGet(db(), authorizeGetReq(q, sessionId), deps());
       const consent = await handleAuthorizePost(
         db(),
-        consentReq({ ...q, access_verb: "write", vault_mode: "wildcard" }, { sessionId }),
+        consentReq({ ...q, access_verb: "write", vault_mode: "wildcard", replace_earlier: "1" }, { sessionId }),
         deps(),
       );
       const target = consent.headers.get("location") ?? bridgeTarget(await consent.text());
@@ -206,7 +206,7 @@ describe("reconnecting the same app replaces its earlier connection", () => {
     const html = await (await handleAuthorizeGet(db(), authorizeGetReq(q, sessionId), deps())).text();
     expect(html).toContain("already has an earlier connection to notes-h");
     expect(html).not.toContain("Allowing replaces"); // not known until the pick
-    const consent = await handleAuthorizePost(db(), consentReq({ ...q, vault_pick: "notes-h" }, { sessionId }), deps());
+    const consent = await handleAuthorizePost(db(), consentReq({ ...q, vault_pick: "notes-h", replace_earlier: "1" }, { sessionId }), deps());
     const code = new URL((consent.headers.get("location") ?? bridgeTarget(await consent.text()))!).searchParams.get("code")!;
     await handleToken(db(), tokenReq({ grant_type: "authorization_code", code, client_id: second, redirect_uri: CLAUDE_CB, code_verifier: verifier }), deps());
     expect((await listVaultConnections(env.DB, userId, "notes-h")).map((r) => r.client_id)).toEqual([second]);
@@ -222,7 +222,7 @@ describe("reconnecting the same app replaces its earlier connection", () => {
     const html = await (await handleAuthorizeGet(db(), authorizeGetReq(q, sessionId), deps())).text();
     expect(html).not.toContain("Allowing replaces");
     expect(html).toContain("already has an earlier connection to notes-i");
-    await handleAuthorizePost(db(), consentReq({ ...q, access_verb: "write", vault_mode: "specific", vault_include: "other-i" }, { sessionId }), deps());
+    await handleAuthorizePost(db(), consentReq({ ...q, access_verb: "write", vault_mode: "specific", vault_include: "other-i", replace_earlier: "1" }, { sessionId }), deps());
     expect((await listVaultConnections(env.DB, userId, "notes-i")).map((r) => r.client_id)).toEqual([first]);
     expect(await liveTokens(userId, first)).toBe(1);
   });
