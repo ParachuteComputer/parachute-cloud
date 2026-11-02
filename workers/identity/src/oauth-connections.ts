@@ -353,6 +353,58 @@ function grantVaults(scopes: readonly string[], userId: string): { vaults: Set<s
   return { vaults, accountWide };
 }
 
+/** The same app's earlier connections for this person (other client ids): what each reaches. */
+async function sameAppConnections(
+  db: D1Database,
+  userId: string,
+  client: Pick<OAuthClient, "clientId" | "clientName" | "redirectUris">,
+): Promise<Array<{ clientId: string; vaults: Set<string>; accountWide: boolean }>> {
+  if (!client.clientName || FIRST_PARTY_CLIENTS.has(client.clientId)) return [];
+  const key = sameAppKey(client.redirectUris);
+  const res = await db
+    .prepare(
+      `SELECT g.client_id, g.scopes, c.redirect_uris
+         FROM grants g JOIN clients c ON c.client_id = g.client_id
+        WHERE g.user_id = ? AND c.client_name = ? AND g.client_id <> ?`,
+    )
+    .bind(userId, client.clientName, client.clientId)
+    .all<{ client_id: string; scopes: string; redirect_uris: string }>();
+  const out: Array<{ clientId: string; vaults: Set<string>; accountWide: boolean }> = [];
+  for (const row of res.results ?? []) {
+    if (FIRST_PARTY_CLIENTS.has(row.client_id)) continue;
+    let uris: string[];
+    try {
+      uris = JSON.parse(row.redirect_uris) as string[];
+    } catch {
+      continue;
+    }
+    if (sameAppKey(uris) !== key) continue;
+    const reach = grantVaults(splitScopes(row.scopes), userId);
+    if (reach.accountWide || reach.vaults.size > 0) out.push({ clientId: row.client_id, ...reach });
+  }
+  return out;
+}
+
+/**
+ * What the consent page says about the same app's earlier connections, for
+ * the case where the vaults are chosen ON the page (the vault picker, the
+ * account-vaults page), so what Allow replaces depends on the choice: the
+ * vaults an earlier connection reaches, and whether one reaches every vault.
+ */
+export async function earlierSameAppReach(
+  db: D1Database,
+  userId: string,
+  client: Pick<OAuthClient, "clientId" | "clientName" | "redirectUris">,
+): Promise<{ vaults: string[]; accountWide: boolean }> {
+  const vaults = new Set<string>();
+  let accountWide = false;
+  for (const c of await sameAppConnections(db, userId, client)) {
+    for (const v of c.vaults) vaults.add(v);
+    accountWide ||= c.accountWide;
+  }
+  return { vaults: [...vaults].sort(), accountWide };
+}
+
 /** An earlier connection of the same app that a consent to `scopes` replaces. */
 export interface SupersededConnection {
   clientId: string;
@@ -374,35 +426,16 @@ export async function findSupersededConnections(
   client: Pick<OAuthClient, "clientId" | "clientName" | "redirectUris">,
   scopes: readonly string[],
 ): Promise<SupersededConnection[]> {
-  if (!client.clientName || FIRST_PARTY_CLIENTS.has(client.clientId)) return [];
   const next = grantVaults(scopes, userId);
   if (!next.accountWide && next.vaults.size === 0) return [];
-  const key = sameAppKey(client.redirectUris);
-  const res = await db
-    .prepare(
-      `SELECT g.client_id, g.scopes, c.redirect_uris
-         FROM grants g JOIN clients c ON c.client_id = g.client_id
-        WHERE g.user_id = ? AND c.client_name = ? AND g.client_id <> ?`,
-    )
-    .bind(userId, client.clientName, client.clientId)
-    .all<{ client_id: string; scopes: string; redirect_uris: string }>();
   const out: SupersededConnection[] = [];
-  for (const row of res.results ?? []) {
-    if (FIRST_PARTY_CLIENTS.has(row.client_id)) continue;
-    let uris: string[];
-    try {
-      uris = JSON.parse(row.redirect_uris) as string[];
-    } catch {
-      continue;
-    }
-    if (sameAppKey(uris) !== key) continue;
-    const old = grantVaults(splitScopes(row.scopes), userId);
+  for (const old of await sameAppConnections(db, userId, client)) {
     if (old.accountWide) {
-      if (next.accountWide) out.push({ clientId: row.client_id, vaults: "all" });
+      if (next.accountWide) out.push({ clientId: old.clientId, vaults: "all" });
       continue;
     }
     const covered = [...old.vaults].filter((v) => next.accountWide || next.vaults.has(v));
-    if (covered.length > 0) out.push({ clientId: row.client_id, vaults: covered });
+    if (covered.length > 0) out.push({ clientId: old.clientId, vaults: covered });
   }
   return out;
 }

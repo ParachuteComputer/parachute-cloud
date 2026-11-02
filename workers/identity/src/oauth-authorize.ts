@@ -21,7 +21,7 @@ import {
   widenUnnamedVaultVerb,
 } from "./audience.ts";
 import { type OAuthClient, approveClient, getClient, requireRegisteredRedirectUri } from "./clients.ts";
-import { findSupersededConnections, retireSupersededConnections } from "./oauth-connections.ts";
+import { earlierSameAppReach, findSupersededConnections, retireSupersededConnections } from "./oauth-connections.ts";
 import { GrantWriteConflictError, isCoveredByGrant, recordGrant } from "./grants.ts";
 import { listVaultsForOwner, unownedNamedVaults, userOwnsVault } from "./vaults.ts";
 import {
@@ -36,7 +36,7 @@ import { isTotpEnrolled } from "./two-factor.ts";
 import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
 import { clearLoginFailures, clientIp, isLoginLocked, loginKey, recordLoginFailure } from "./rate-limit.ts";
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { type AuthorizeParams, describeScopes, renderConsent, renderError, renderLogin, renderRedirectBridge } from "./ui.ts";
+import { type AuthorizeParams, type ReplacesNote, describeScopes, renderConsent, renderError, renderLogin, renderRedirectBridge } from "./ui.ts";
 import {
   type OAuthDeps,
   consentIssuedByHost,
@@ -352,11 +352,11 @@ async function authorizeCore(
     const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
     const consentUser = await getUserById(db, session.userId);
     const ownedVaults = (await listVaultsForOwner(db, session.userId)).map((v) => v.name);
-    // Which vaults are included is chosen below, so ask with the widest
-    // choice (every vault): if the same app has an earlier connection that
-    // could be replaced, say so before Allow (Codex r1 on #383).
-    const replacesEarlier =
-      (await findSupersededConnections(db, session.userId, client, [composedWildcardVaultsScope(session.userId, "write")])).length > 0;
+    // The vaults are chosen on this page, so name the same app's earlier
+    // connections and say which choices replace them (Codex r1/r2 on #383).
+    const earlier = await earlierSameAppReach(db, session.userId, client);
+    const replaces: ReplacesNote | null =
+      earlier.vaults.length > 0 || earlier.accountWide ? { kind: "if-chosen", ...earlier, account: true } : null;
     return htmlResponse(
       renderConsent({
         params,
@@ -368,7 +368,7 @@ async function authorizeCore(
         ownedVaults: [],
         verbSelector: null,
         accountVaults: { ownedVaults },
-        replacesEarlier,
+        replaces,
         issuerHost: consentIssuedByHost(req, params.resource, deps),
         email: consentUser?.email ?? "",
         notYouNext: authorizeResumePath(params),
@@ -415,8 +415,17 @@ async function authorizeCore(
   // empty upgradeable set → no selector (it is already the top level).
   const upgradeableVerbs = unnamedVaultVerbs(requestedScopes).filter((v) => v === "read" || v === "write");
   const verbSelector = needsVaultPick && ownedVaults.length > 0 && upgradeableVerbs.length > 0 ? { requestedVerbs: upgradeableVerbs } : null;
-  // Say before Allow that this replaces the same app's earlier connection.
-  const replacesEarlier = (await findSupersededConnections(db, session.userId, client, requestedScopes)).length > 0;
+  // Say before Allow what this replaces of the same app's earlier connection:
+  // exactly, when the vault is already named; conditionally, when it is
+  // picked below (Codex r2 on #383). An account-wide earlier connection is
+  // never replaced by a single-vault pick, so it is not mentioned there.
+  let replaces: ReplacesNote | null = null;
+  if (needsVaultPick) {
+    const earlier = await earlierSameAppReach(db, session.userId, client);
+    if (earlier.vaults.length > 0) replaces = { kind: "if-chosen", vaults: earlier.vaults, accountWide: false, account: false };
+  } else if ((await findSupersededConnections(db, session.userId, client, requestedScopes)).length > 0) {
+    replaces = { kind: "exact" };
+  }
   return htmlResponse(
     renderConsent({
       params,
@@ -428,7 +437,7 @@ async function authorizeCore(
       ownedVaults,
       verbSelector,
       accountVaults: null,
-      replacesEarlier,
+      replaces,
       // The "issued by <host>" trust line — the DOOR the user came through (the
       // bound request/resource origin, e.g. my.parachute.computer for a my./mcp
       // connect), else the issuer. Bound-gated in consentIssuedByHost, so never
