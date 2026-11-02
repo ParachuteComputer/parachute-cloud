@@ -368,9 +368,13 @@ function signedInAsLine(email: string, csrfToken: string, next?: string): string
 }
 
 function scopeLabel(scope: string): string {
-  if (scope === "vault:read" || /^vault:[^:]+:read$/.test(scope)) return "Read your vault notes";
-  if (scope === "vault:write" || /^vault:[^:]+:write$/.test(scope)) return "Create and edit your vault notes";
-  if (scope === "vault:admin" || /^vault:[^:]+:admin$/.test(scope)) return "Full administrative access to your vault";
+  // A scope that names a vault says which one: the raw string sits in the
+  // closed "Technical details", so the sentence is where a person reads it.
+  const named = scope.match(/^vault:([^:]+):(read|write|admin)$/);
+  const inVault = named ? ` in ${named[1]}` : "";
+  if (scope === "vault:read" || named?.[2] === "read") return `Read your vault notes${inVault}`;
+  if (scope === "vault:write" || named?.[2] === "write") return `Create and edit your vault notes${inVault}`;
+  if (scope === "vault:admin" || named?.[2] === "admin") return `Full administrative access to your vault${inVault}`;
   // Wave A account-vaults connection scope: the un-narrowed request form
   // (`account:vaults`) and the consent-bound blanket (`account:<id>:vaults`).
   if (scope === "account:vaults" || /^account:[^:]+:vaults$/.test(scope)) {
