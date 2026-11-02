@@ -12,6 +12,7 @@ import { ACCOUNT_TOKEN_CLIENT_ID } from "../src/account-token.ts";
 import type { EmailSender } from "../src/email.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "../src/oauth-authorize.ts";
 import { signAccessToken } from "../src/tokens.ts";
+import { describeScopes } from "../src/ui.ts";
 import {
   CSRF,
   ISSUER,
@@ -86,6 +87,14 @@ describe("the consent screen speaks plainly", () => {
     const details = html.match(/<details data-testid="consent-scopes">([\s\S]*?)<\/details>/)?.[1] ?? "";
     expect(details).toContain("<summary>Technical details</summary>");
     for (const s of ["vault:garden-notes:read", "vault:garden-notes:write", "scribe:read"]) expect(details).toContain(s);
+  });
+  test("each vault a request names stays named in the visible list", () => {
+    // Codex P2: with the raw scopes tucked away, a request naming two vaults
+    // must still say which vaults, outside the closed details.
+    const labels = describeScopes(["vault:garden-notes:read", "vault:herbs:write", "vault:read"]).map((s) => s.label);
+    expect(labels[0]).toContain("garden-notes");
+    expect(labels[1]).toContain("herbs");
+    expect(labels[2]).toBe("Read your vault notes");
   });
 });
 
