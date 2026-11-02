@@ -195,4 +195,31 @@ describe("authorize with no Parachute scope", () => {
     );
     expect(((await tok.json()) as { scope: string }).scope).toBe("vault:muse-g:read");
   });
+
+  test("a registered scope naming another vault only lends its access level; the default binds to the resource vault (Codex r1)", async () => {
+    const { id: userId } = await seedUser("noscope-h@example.com");
+    await seedVault("muse-h", userId);
+    const sessionId = await seedSession(userId);
+    const reg = await registerClient(env.DB, { redirectUris: [REDIRECT_URI], clientName: "Reader", scopes: ["vault:other-h:read"], status: "approved" });
+    const { verifier, challenge } = await makePkce();
+    const q = {
+      client_id: reg.client.clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      resource: `https://muse-h.${VAULT_BASE}/mcp`,
+    };
+    const html = await (await handleAuthorizeGet(db(), authorizeGetReq(q, sessionId), deps())).text();
+    expect(html).toContain("read notes in <strong>muse-h</strong>");
+    const consent = await handleAuthorizePost(db(), consentReq(consentFields(html), { sessionId }), deps());
+    const code = new URL((consent.headers.get("location") ?? bridgeTarget(await consent.text()))!).searchParams.get("code")!;
+    const tok = await handleToken(
+      db(),
+      tokenReq({ grant_type: "authorization_code", code, client_id: reg.client.clientId, redirect_uri: REDIRECT_URI, code_verifier: verifier }),
+      deps(),
+    );
+    expect(((await tok.json()) as { scope: string }).scope).toBe("vault:muse-h:read");
+  });
 });
+
