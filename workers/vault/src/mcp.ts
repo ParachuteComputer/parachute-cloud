@@ -768,19 +768,26 @@ function modernRequestError(req: Request, m: JsonRpcMessage): Response | null {
  * initialize and ping (removed in this revision), is 404 -32601. Every result
  * carries `resultType: "complete"` and the server's identity in `_meta`.
  */
-async function handleModern(
-  req: Request,
-  raw: unknown,
-  m: JsonRpcMessage,
-  ctx: Parameters<typeof handleOne>[1],
-): Promise<Response> {
+const MODERN_METHODS = new Set(["server/discover", "tools/list", "tools/call"]);
+
+/**
+ * Everything a modern POST can be answered with before the tool set is built
+ * (a batch, a notification, a failed validation, an unknown method), or null
+ * to serve it: cheap refusals never pay for visibleTools on the Durable Object.
+ */
+function modernEarlyResponse(req: Request, raw: unknown, m: JsonRpcMessage): Response | null {
   if (Array.isArray(raw)) {
     return modernHttpError(400, null, INVALID_REQUEST, "Invalid Request: a 2026-07-28 POST carries one JSON-RPC message, not a batch");
   }
   if (!isRequest(m)) return new Response(null, { status: 202 });
   const invalid = modernRequestError(req, m);
   if (invalid) return invalid;
+  if (!MODERN_METHODS.has(m.method ?? "")) return modernHttpError(404, m.id ?? null, METHOD_NOT_FOUND, `Method not found: ${m.method}`);
+  return null;
+}
 
+/** Serve a modern POST that passed {@link modernEarlyResponse}. */
+async function handleModern(m: JsonRpcMessage, ctx: Parameters<typeof handleOne>[1]): Promise<Response> {
   const id = m.id ?? null;
   const serverInfo = { name: `parachute-vault/${ctx.vaultName}`, version: "0.1.0" };
   let reply: JsonRpcMessage;
@@ -892,6 +899,11 @@ export async function handleMcp(
     }
   }
 
+  if (modern) {
+    const early = modernEarlyResponse(req, raw, messages[0]!);
+    if (early) return early;
+  }
+
   const requests = messages.filter(isRequest);
   if (!modern && requests.length === 0) {
     // Notifications / responses only — nothing to answer.
@@ -911,7 +923,7 @@ export async function handleMcp(
   // layer"). Parity with bun's mcp-tools.ts overrideVaultInfo.
   overrideVaultInfo(tools, { vaultName, auth, description, origin, ctx: vaultInfo });
   const ctx = { tools, vaultName, description, writeGate, attachmentMintGate: tickets.mintGate };
-  if (modern) return handleModern(req, raw, messages[0]!, ctx);
+  if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));
 

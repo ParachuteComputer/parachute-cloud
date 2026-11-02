@@ -416,14 +416,20 @@ function modernRequestError(req: Request, m: JsonRpcMessage): Response | null {
   return null;
 }
 
-async function handleModern(req: Request, raw: unknown, m: JsonRpcMessage, ctx: AccountToolContext): Promise<Response> {
+const MODERN_METHODS = new Set(["server/discover", "tools/list", "tools/call"]);
+
+function modernEarlyResponse(req: Request, raw: unknown, m: JsonRpcMessage): Response | null {
   if (Array.isArray(raw)) {
     return modernHttpError(400, null, INVALID_REQUEST, "Invalid Request: a 2026-07-28 POST carries one JSON-RPC message, not a batch");
   }
   if (!isRequest(m)) return withMcpCors(new Response(null, { status: 202 }));
   const invalid = modernRequestError(req, m);
   if (invalid) return invalid;
+  if (!MODERN_METHODS.has(m.method ?? "")) return modernHttpError(404, m.id ?? null, METHOD_NOT_FOUND, `Method not found: ${m.method}`);
+  return null;
+}
 
+async function handleModern(m: JsonRpcMessage, ctx: AccountToolContext): Promise<Response> {
   const id = m.id ?? null;
   let reply: JsonRpcMessage;
   switch (m.method) {
@@ -535,6 +541,11 @@ export async function handleAccountMcp(db: D1Database, req: Request, deps: OAuth
     }
   }
 
+  if (modern) {
+    const early = modernEarlyResponse(req, raw, messages[0]!);
+    if (early) return early;
+  }
+
   const requests = messages.filter(isRequest);
   if (!modern && requests.length === 0) {
     // Notifications / responses only — nothing to answer.
@@ -552,7 +563,7 @@ export async function handleAccountMcp(db: D1Database, req: Request, deps: OAuth
     // carry no permissions.principal_pubkey (cloud#278).
     principal: { authKind: "bearer" },
   };
-  if (modern) return handleModern(req, raw, messages[0]!, ctx);
+  if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));
 
