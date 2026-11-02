@@ -324,7 +324,9 @@ export async function deleteVaultD1Rows(
     db.prepare("DELETE FROM vault_usage WHERE vault_name = ?").bind(vaultName),
     db.prepare("DELETE FROM vault_snapshots WHERE vault_name = ?").bind(vaultName),
     db.prepare("DELETE FROM vaults WHERE name = ? AND owner_user_id = ?").bind(vaultName, ownerUserId),
-    db.prepare("DELETE FROM ops_alerts WHERE substr(key, -?) = ?").bind(vaultName.length + 1, `:${vaultName}`),
+    // The exact key vault-call.ts raises for this vault: a bare `:<name>`
+    // suffix also matched unrelated alerts (`snapshot:failed`, `errors:5xx`).
+    db.prepare("DELETE FROM ops_alerts WHERE key = ?").bind(`internal-config-caps-malformed:${vaultName}`),
   );
 
   const results = await db.batch(statements);
