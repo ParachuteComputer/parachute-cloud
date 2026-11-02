@@ -235,6 +235,15 @@ describe("MCP 2026-07-28 — version and header validation", () => {
   });
 });
 
+describe("MCP 2026-07-28 — browser clients", () => {
+  it("the CORS preflight allows the modern request headers", async () => {
+    const v = freshVault();
+    const res = await SELF.fetch(`${base(v)}/mcp`, { method: "OPTIONS" });
+    const allowed = (res.headers.get("Access-Control-Allow-Headers") ?? "").toLowerCase();
+    for (const h of ["mcp-protocol-version", "mcp-method", "mcp-name"]) expect(allowed).toContain(h);
+  });
+});
+
 describe("MCP 2026-07-28 — the legacy era is unchanged", () => {
   it("initialize + tools/list without _meta still negotiate 2025-11-25 and carry no resultType", async () => {
     const v = freshVault();
