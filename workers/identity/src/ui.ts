@@ -280,7 +280,7 @@ export function renderLogin(opts: {
  * the page names the earlier connection's vaults and which choice replaces it.
  */
 export type ReplacesNote =
-  | { kind: "exact" }
+  | { kind: "exact"; vaults: string[] }
   | { kind: "if-chosen"; vaults: string[]; accountWide: boolean; account: boolean };
 
 export interface ConsentProps {
@@ -545,7 +545,6 @@ export function renderConsent(props: ConsentProps): string {
        <p class="lead" data-testid="consent-ask">${ask}</p>
        <ul class="scopes">${scopeList}</ul>
        ${returnsToLine(params.redirectUri)}
-       ${replacesLine(clientName, replaces ?? null)}
        <form method="post" action="/oauth/authorize">
          <input type="hidden" name="__action" value="consent">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -553,6 +552,7 @@ export function renderConsent(props: ConsentProps): string {
          ${vaultField}
          ${verbSelectorField}
          ${accountVaultsField}
+         ${replacesBox(clientName, replaces ?? null)}
          <div class="row">
            <button class="deny" type="submit" name="decision" value="deny">Deny</button>
            ${nothingToPick ? "" : `<button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Allow</button>`}
@@ -579,25 +579,39 @@ function returnsToLine(redirectUri: string): string {
   return `<p class="muted" data-testid="consent-returns-to">After you allow, the connection goes back to an app on this device: <code>${esc(where)}</code>.</p>`;
 }
 
-function replacesLine(clientName: string, note: ReplacesNote | null): string {
+/**
+ * The replace box (T-307, a reconnect replaces the earlier connection): what
+ * Allow disconnects of the same app's earlier connection, as a box ticked by
+ * default. "Same app" (same name + redirect) is also what a second install
+ * looks like (another computer, another claude.ai account), so the person can
+ * untick it and keep both; an unticked box, or a form without one, replaces
+ * nothing (oauth-authorize.ts handleConsentSubmit).
+ */
+function replacesBox(clientName: string, note: ReplacesNote | null): string {
   if (!note) return "";
   const app = esc(clientName);
-  const say = (t: string) => `<p class="muted" data-testid="consent-replaces">${t}</p>`;
+  const list = (vaults: string[]) => vaults.map(esc).join(", ");
+  let lead = "";
+  let label: string;
   if (note.kind === "exact") {
-    return say(`Allowing replaces ${app}'s earlier connection to the same vaults, so it shows once under Connected apps.`);
+    label = `Disconnect ${app}'s earlier connection to ${list(note.vaults)}: this replaces it, so ${app} shows once under Connected apps.`;
+  } else {
+    const leads: string[] = [];
+    const ifs: string[] = [];
+    if (note.vaults.length > 0) {
+      leads.push(`${app} already has an earlier connection to ${list(note.vaults)}.`);
+      const which = note.vaults.length === 1 ? "that vault" : "one of those vaults";
+      ifs.push(note.account ? `include ${which} or choose “Any vault”` : `allow ${which} here`);
+    }
+    if (note.accountWide && note.account) {
+      leads.push(`${app} already has an earlier connection to every vault.`);
+      if (note.vaults.length === 0) ifs.push("choose “Any vault”");
+    }
+    if (leads.length === 0) return "";
+    lead = `<p class="muted" style="margin:.2rem 0 .4rem">${leads.join(" ")}</p>`;
+    label = `If you ${ifs.join(", or ")}, disconnect the earlier connection: this replaces it.`;
   }
-  const parts: string[] = [];
-  if (note.vaults.length > 0) {
-    const list = note.vaults.map(esc).join(", ");
-    const one = note.vaults.length === 1;
-    parts.push(
-      `${app} already has an earlier connection to ${list}. If you allow ${one ? "that vault" : "one of those vaults"} here, this replaces it, so it shows once under Connected apps.`,
-    );
-  }
-  if (note.accountWide && note.account) {
-    parts.push(`${app} already has an earlier connection to every vault. Choosing “Any vault” replaces it.`);
-  }
-  return parts.length > 0 ? say(parts.join(" ")) : "";
+  return `<div data-testid="consent-replaces">${lead}<label class="muted" style="display:flex;gap:.5rem;align-items:flex-start;margin:.4rem 0 .9rem"><input type="checkbox" name="replace_earlier" value="1" checked> <span>${label} Untick to keep both (for example, ${app} on a second computer).</span></label></div>`;
 }
 
 /**

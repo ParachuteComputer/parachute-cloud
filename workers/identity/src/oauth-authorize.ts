@@ -105,6 +105,7 @@ async function recordGrantAndRedirect(
   client: OAuthClient,
   sessionId: string,
   deps: OAuthDeps,
+  replaceEarlier: boolean,
 ): Promise<Response> {
   const now = deps.now?.() ?? new Date();
   try {
@@ -114,11 +115,14 @@ async function recordGrantAndRedirect(
     throw err;
   }
   // A reconnect replaces the same app's earlier connection (T-307: claude.ai
-  // registers a new client every time). After the new grant is recorded, so a
-  // failure here never leaves the person with neither; and a failure to tidy
-  // the old one must not refuse the connection they just approved.
+  // registers a new client every time), when the person left the Allow page's
+  // replace box ticked (an unticked box is a second install they keep). This
+  // runs at consent, after the new grant is written: the earlier connection
+  // is gone before the app redeems its new code, so an app that then fails
+  // its token exchange has to be connected again. A failure to tidy the old
+  // one never refuses the connection just approved.
   try {
-    const superseded = await findSupersededConnections(db, userId, client, scopes);
+    const superseded = replaceEarlier ? await findSupersededConnections(db, userId, client, scopes) : [];
     if (superseded.length > 0) await retireSupersededConnections(db, userId, client.clientId, superseded, now);
   } catch (err) {
     console.error(`event=connection_supersede_failed user=${userId} client=${client.clientId} error=${err instanceof Error ? err.name : "unknown"}`);
@@ -423,8 +427,12 @@ async function authorizeCore(
   if (needsVaultPick) {
     const earlier = await earlierSameAppReach(db, session.userId, client);
     if (earlier.vaults.length > 0) replaces = { kind: "if-chosen", vaults: earlier.vaults, accountWide: false, account: false };
-  } else if ((await findSupersededConnections(db, session.userId, client, requestedScopes)).length > 0) {
-    replaces = { kind: "exact" };
+  } else {
+    // A `vault=` hint names the vault the unnamed verbs narrow to at submit.
+    const effective = lockedVault && hasUnnamedVault ? narrowVaultScopes(requestedScopes, lockedVault) : requestedScopes;
+    const superseded = await findSupersededConnections(db, session.userId, client, effective);
+    const vaults = [...new Set(superseded.flatMap((x) => (x.vaults === "all" ? [] : x.vaults)))].sort();
+    if (superseded.length > 0) replaces = { kind: "exact", vaults: vaults.length > 0 ? vaults : ["every vault"] };
   }
   return htmlResponse(
     renderConsent({
@@ -699,6 +707,8 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   if (String(form.get("decision") ?? "") !== "approve") {
     return oauthErrorRedirect(params.redirectUri, "access_denied", "user denied the request", params.state);
   }
+  // The Allow page's replace box (ui.ts replacesBox): ticked by default; absent or unticked replaces nothing.
+  const replaceEarlier = form.get("replace_earlier") !== null;
 
   const boundVault = resolveResourceVault(params.resource, {
     boundOrigins: resolveBoundOrigins(deps),
@@ -780,7 +790,7 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
       composedScopes.push(composedVaultCreateScope(session.userId));
     }
 
-    return recordGrantAndRedirect(db, params, composedScopes, session.userId, client, session.id, deps);
+    return recordGrantAndRedirect(db, params, composedScopes, session.userId, client, session.id, deps, replaceEarlier);
   }
 
   // Narrow unnamed vault verbs to the picked vault (form pick or `vault=` hint).
@@ -817,5 +827,5 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   const ownershipDenied = await denyUnownedVaults(db, session.userId, scopes, params);
   if (ownershipDenied) return ownershipDenied;
 
-  return recordGrantAndRedirect(db, params, scopes, session.userId, client, session.id, deps);
+  return recordGrantAndRedirect(db, params, scopes, session.userId, client, session.id, deps, replaceEarlier);
 }
