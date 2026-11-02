@@ -128,3 +128,30 @@ describe("B1 query parameter parity", () => {
     expect(result.error?.data?.error_type).toBe("missing_required_field");
   });
 });
+
+// The app reads its per-vault settings note (`.parachute/notes/settings`) on
+// every vault page load with the exact-path list filter, because most vaults
+// never write that note and the single-note `?id=` form answers 404 for it
+// (snag #20b: a console 404 on every load). Pin both halves of that contract.
+describe("exact path filter for an optional note (app settings read)", () => {
+  const settingsPath = ".parachute/notes/settings";
+  it("absent: ?path= answers 200 [] while ?id= answers 404", async () => {
+    const f = await fixture();
+    await createNote(f.vault, { path: "garden/Tomatoes", content: "water daily" });
+    expect(await f.rows(`?path=${encodeURIComponent(settingsPath)}&limit=1`)).toEqual([]);
+    expect((await f.get(`?id=${encodeURIComponent(settingsPath)}`)).status).toBe(404);
+  });
+  it("present: ?path= answers exactly that note with its metadata", async () => {
+    const f = await fixture();
+    await createNote(f.vault, { path: "garden/Tomatoes", content: "water daily" });
+    const settings = await createNote(f.vault, {
+      path: settingsPath,
+      content: "",
+      metadata: { notes: { schemaVersion: 1, tagRoles: { pinned: "starred" } } },
+    });
+    const rows = await f.rows(`?path=${encodeURIComponent(settingsPath)}&limit=1`) as any[];
+    expect(rows.map(n => n.id)).toEqual([settings.id]);
+    expect(rows[0].metadata.notes.tagRoles.pinned).toBe("starred");
+    expect(typeof rows[0].updatedAt).toBe("string");
+  });
+});
