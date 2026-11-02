@@ -12,7 +12,20 @@ import { ACCOUNT_TOKEN_CLIENT_ID } from "../src/account-token.ts";
 import type { EmailSender } from "../src/email.ts";
 import { handleAuthorizeGet, handleAuthorizePost } from "../src/oauth-authorize.ts";
 import { signAccessToken } from "../src/tokens.ts";
-import { CSRF, ISSUER, REDIRECT_URI, authorizeGetReq, db, deps, makePkce, seedApprovedClient, seedSession, seedUser } from "./helpers.ts";
+import { describeScopes } from "../src/ui.ts";
+import {
+  CSRF,
+  ISSUER,
+  REDIRECT_URI,
+  authorizeGetReq,
+  db,
+  deps,
+  makePkce,
+  seedApprovedClient,
+  seedSession,
+  seedUser,
+  seedVault,
+} from "./helpers.ts";
 
 const pickerParams = (clientId: string, challenge: string): Record<string, string> => ({
   client_id: clientId,
@@ -34,6 +47,54 @@ describe("connecting an AI before you have a vault", () => {
     expect(html).not.toContain('value="approve"');
     expect(html).toMatch(/<a[^>]*href="\/console"[^>]*>Make your first vault<\/a>/);
     expect(html).toContain("connect again");
+  });
+});
+
+// T-318 snag #15: the consent list showed raw scopes (`vault:garden-1030:read`)
+// under each plain sentence. The sentences are the list; the raw strings sit in
+// a closed "Technical details". A scope with no sentence stays in the list as is,
+// so nothing requested is ever hidden.
+describe("the consent screen speaks plainly", () => {
+  test("raw scopes move into Technical details; an unmapped scope stays visible", async () => {
+    const { id: userId } = await seedUser("plain-consent@example.com");
+    await seedVault("garden-notes", userId);
+    const { clientId } = await seedApprovedClient({ clientName: "Claude" });
+    const sessionId = await seedSession(userId);
+    const { challenge } = await makePkce();
+    const res = await handleAuthorizeGet(
+      env.DB,
+      authorizeGetReq(
+        {
+          client_id: clientId,
+          redirect_uri: REDIRECT_URI,
+          response_type: "code",
+          scope: "vault:garden-notes:read vault:garden-notes:write scribe:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        },
+        sessionId,
+      ),
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const list = html.match(/<ul class="scopes">([\s\S]*?)<\/ul>/)?.[1] ?? "";
+    expect(list).toContain("Read your vault notes");
+    expect(list).toContain("Create and edit your vault notes");
+    expect(list).not.toContain("vault:garden-notes:read");
+    expect(list).not.toContain("vault:garden-notes:write");
+    expect(list).toContain("scribe:read");
+    const details = html.match(/<details data-testid="consent-scopes">([\s\S]*?)<\/details>/)?.[1] ?? "";
+    expect(details).toContain("<summary>Technical details</summary>");
+    for (const s of ["vault:garden-notes:read", "vault:garden-notes:write", "scribe:read"]) expect(details).toContain(s);
+  });
+  test("each vault a request names stays named in the visible list", () => {
+    // Codex P2: with the raw scopes tucked away, a request naming two vaults
+    // must still say which vaults, outside the closed details.
+    const labels = describeScopes(["vault:garden-notes:read", "vault:herbs:write", "vault:read"]).map((s) => s.label);
+    expect(labels[0]).toContain("garden-notes");
+    expect(labels[1]).toContain("herbs");
+    expect(labels[2]).toBe("Read your vault notes");
   });
 });
 

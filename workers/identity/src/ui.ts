@@ -368,9 +368,13 @@ function signedInAsLine(email: string, csrfToken: string, next?: string): string
 }
 
 function scopeLabel(scope: string): string {
-  if (scope === "vault:read" || /^vault:[^:]+:read$/.test(scope)) return "Read your vault notes";
-  if (scope === "vault:write" || /^vault:[^:]+:write$/.test(scope)) return "Create and edit your vault notes";
-  if (scope === "vault:admin" || /^vault:[^:]+:admin$/.test(scope)) return "Full administrative access to your vault";
+  // A scope that names a vault says which one: the raw string sits in the
+  // closed "Technical details", so the sentence is where a person reads it.
+  const named = scope.match(/^vault:([^:]+):(read|write|admin)$/);
+  const inVault = named ? ` in ${named[1]}` : "";
+  if (scope === "vault:read" || named?.[2] === "read") return `Read your vault notes${inVault}`;
+  if (scope === "vault:write" || named?.[2] === "write") return `Create and edit your vault notes${inVault}`;
+  if (scope === "vault:admin" || named?.[2] === "admin") return `Full administrative access to your vault${inVault}`;
   // Wave A account-vaults connection scope: the un-narrowed request form
   // (`account:vaults`) and the consent-bound blanket (`account:<id>:vaults`).
   if (scope === "account:vaults" || /^account:[^:]+:vaults$/.test(scope)) {
@@ -500,9 +504,11 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
 
 export function renderConsent(props: ConsentProps): string {
   const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults } = props;
-  const scopeList = scopeDescriptions
-    .map((s) => `<li><strong>${esc(s.label)}</strong><br><span class="muted">${esc(s.scope)}</span></li>`)
-    .join("\n");
+  // The plain sentence is the list (T-318 #15: raw `vault:<name>:read` under it
+  // read as jargon). A scope with no sentence keeps its raw string here, so no
+  // requested scope is ever only in the closed "Technical details" below.
+  const scopeList = scopeDescriptions.map((s) => `<li><strong>${esc(s.label)}</strong></li>`).join("\n");
+  const rawScopes = scopeDescriptions.map((s) => `<li><code>${esc(s.scope)}</code></li>`).join("");
   const vaultField = lockedVault
     ? `<input type="hidden" name="vault_pick" value="${esc(lockedVault)}">`
     : needsVaultPick
@@ -539,6 +545,7 @@ export function renderConsent(props: ConsentProps): string {
          </div>
        </form>
        <p class="muted" style="margin:.9rem 0 0">You can disconnect it anytime from your vault's settings.</p>
+       <details data-testid="consent-scopes"><summary>Technical details</summary><p class="muted" style="margin:0">Scopes requested:</p><ul class="muted" style="margin:.3rem 0 0;padding-left:1.1rem">${rawScopes}</ul></details>
      </div>
      <p class="muted foot">issued by <strong>${esc(issuerHost)}</strong></p>`,
   );
