@@ -7,6 +7,7 @@
  * consent + minted scopes to a named vault.
  */
 import {
+  ACCOUNT_VAULTS_UNNARROWED,
   composedVaultCreateScope,
   composedVaultScope,
   composedWildcardVaultsScope,
@@ -17,6 +18,7 @@ import {
   narrowResourceVaultScopes,
   narrowVaultScopes,
   resolveResourceVault,
+  VAULT_VERBS,
   unnamedVaultVerbs,
   widenUnnamedVaultVerb,
 } from "./audience.ts";
@@ -40,6 +42,7 @@ import { type AuthorizeParams, type ReplacesNote, describeScopes, renderConsent,
 import {
   type OAuthDeps,
   consentIssuedByHost,
+  frontDoorOrigin,
   findNonRequestableScopes,
   htmlResponse,
   isCrossOrigin,
@@ -66,10 +69,54 @@ const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 const DEFAULT_CONNECT_SCOPES = ["vault:read", "vault:write"];
 const GENERIC_OIDC_SCOPES = new Set(["openid", "profile", "email", "offline_access"]);
 
-function applyDefaultScope(params: AuthorizeParams, boundVault: string | null): void {
+/**
+ * Which default (/code-review of #382): the account MCP door's own scope when
+ * `resource` is that door (it refuses a vault token), else the scope the app
+ * registered at DCR (RFC 7591 `scope`: what it means to ask for), else
+ * {@link DEFAULT_CONNECT_SCOPES}; narrowed to the `resource` vault when bound.
+ */
+function applyDefaultScope(
+  params: AuthorizeParams,
+  boundVault: string | null,
+  client: Pick<OAuthClient, "scopes">,
+  deps: OAuthDeps,
+): void {
   const requested = params.scope.split(" ").filter((s) => s.length > 0);
   if (requested.some((s) => !GENERIC_OIDC_SCOPES.has(s))) return;
-  params.scope = (boundVault ? narrowResourceVaultScopes(DEFAULT_CONNECT_SCOPES, boundVault) : DEFAULT_CONNECT_SCOPES).join(" ");
+  if (!boundVault && isAccountMcpResource(params.resource, deps)) {
+    params.scope = ACCOUNT_VAULTS_UNNARROWED;
+    return;
+  }
+  // The registered scope lends only its ACCESS LEVEL (read/write/admin of
+  // `vault:<verb>` or `vault:<any>:<verb>`): a vault it names must not steer
+  // the default away from the `resource` vault or the person's pick (Codex r1
+  // on #385). An app that registered only account:vaults, with no vault
+  // resource, gets the account consent.
+  const verbs = new Set<string>();
+  for (const s of client.scopes) {
+    const parts = s.split(":");
+    const verb = parts[parts.length - 1];
+    if (parts[0] === "vault" && (parts.length === 2 || parts.length === 3) && verb && VAULT_VERBS.has(verb)) verbs.add(verb);
+  }
+  if (!boundVault && verbs.size === 0 && client.scopes.includes(ACCOUNT_VAULTS_UNNARROWED)) {
+    params.scope = ACCOUNT_VAULTS_UNNARROWED;
+    return;
+  }
+  const base = verbs.size > 0 ? ["read", "write", "admin"].filter((v) => verbs.has(v)).map((v) => `vault:${v}`) : DEFAULT_CONNECT_SCOPES;
+  params.scope = (boundVault ? narrowResourceVaultScopes(base, boundVault) : base).join(" ");
+}
+
+/** `resource` names the account MCP door (`<front door or a bound origin>/account/mcp`). */
+function isAccountMcpResource(resource: string | null, deps: OAuthDeps): boolean {
+  if (!resource) return false;
+  let u: URL;
+  try {
+    u = new URL(resource);
+  } catch {
+    return false;
+  }
+  if (u.pathname.replace(/\/$/, "") !== "/account/mcp") return false;
+  return u.origin === frontDoorOrigin(deps) || resolveBoundOrigins(deps).includes(u.origin);
 }
 
 function htmlError(title: string, message: string, status: number, action?: { href: string; label: string }): Response {
@@ -305,7 +352,7 @@ async function authorizeCore(
   if (boundVault) {
     params.scope = narrowResourceVaultScopes(params.scope.split(" ").filter((s) => s.length > 0), boundVault).join(" ");
   }
-  applyDefaultScope(params, boundVault);
+  applyDefaultScope(params, boundVault, client, deps);
 
   // Validate redirect_uri BEFORE redirecting any protocol error to it (RFC
   // 6749 §4.1.2.1 — an unvalidated redirect_uri error is shown, never redirected).
@@ -718,7 +765,7 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   if (boundVault) {
     params.scope = narrowResourceVaultScopes(params.scope.split(" ").filter((s) => s.length > 0), boundVault).join(" ");
   }
-  applyDefaultScope(params, boundVault);
+  applyDefaultScope(params, boundVault, client, deps);
 
   let scopes = params.scope.split(" ").filter((s) => s.length > 0);
   const blocked = findNonRequestableScopes(scopes);
