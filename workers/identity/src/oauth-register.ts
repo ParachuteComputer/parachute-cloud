@@ -51,7 +51,8 @@ export async function handleRegister(db: D1Database, req: Request, deps: OAuthDe
   for (const uri of redirectUris) {
     if (typeof uri !== "string" || !isValidRedirectUri(uri)) {
       return jsonResponse(
-        { error: "invalid_redirect_uri", error_description: `invalid redirect_uri "${uri}"` },
+        // Never stringify a non-string: `{"toString": 1}` throws (a 500).
+        { error: "invalid_redirect_uri", error_description: `invalid redirect_uri "${typeof uri === "string" ? uri : typeof uri}"` },
         400,
       );
     }

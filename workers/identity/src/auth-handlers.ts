@@ -169,7 +169,12 @@ async function readMagicForm(req: Request): Promise<FormData> {
     const data = (await req.json().catch(() => null)) as Record<string, unknown> | null;
     if (data && typeof data === "object") {
       for (const [key, value] of Object.entries(data)) {
-        if (value != null) fd.set(key, String(value));
+        // Primitives only: String() on an object whose own `toString` is not
+        // a function (`{"toString": 1}`) throws, a 500 from a stranger. No
+        // field here is an object, so dropping one is the right reading.
+        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+          fd.set(key, String(value));
+        }
       }
     }
     return fd;
