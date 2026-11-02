@@ -352,6 +352,11 @@ async function authorizeCore(
     const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
     const consentUser = await getUserById(db, session.userId);
     const ownedVaults = (await listVaultsForOwner(db, session.userId)).map((v) => v.name);
+    // Which vaults are included is chosen below, so ask with the widest
+    // choice (every vault): if the same app has an earlier connection that
+    // could be replaced, say so before Allow (Codex r1 on #383).
+    const replacesEarlier =
+      (await findSupersededConnections(db, session.userId, client, [composedWildcardVaultsScope(session.userId, "write")])).length > 0;
     return htmlResponse(
       renderConsent({
         params,
@@ -363,6 +368,7 @@ async function authorizeCore(
         ownedVaults: [],
         verbSelector: null,
         accountVaults: { ownedVaults },
+        replacesEarlier,
         issuerHost: consentIssuedByHost(req, params.resource, deps),
         email: consentUser?.email ?? "",
         notYouNext: authorizeResumePath(params),

@@ -536,7 +536,7 @@ export function renderConsent(props: ConsentProps): string {
        <p class="lead" data-testid="consent-ask">${ask}</p>
        <ul class="scopes">${scopeList}</ul>
        ${returnsToLine(params.redirectUri)}
-       ${replacesEarlier ? `<p class="muted" data-testid="consent-replaces">This replaces ${esc(clientName)}'s earlier connection here, so it shows once under Connected apps.</p>` : ""}
+       ${replacesEarlier ? `<p class="muted" data-testid="consent-replaces">Allowing replaces ${esc(clientName)}'s earlier connection to the same vaults, so it shows once under Connected apps.</p>` : ""}
        <form method="post" action="/oauth/authorize">
          <input type="hidden" name="__action" value="consent">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
