@@ -109,46 +109,69 @@ export async function handleStripeWebhookPost(
 
   let response: Response;
   let outcome: string;
-  switch (event.type) {
-    case "checkout.session.completed": {
-      const result = await handleCheckoutSessionCompleted(env.DB, deps, event, stripe, config);
-      if (result instanceof Response) {
-        response = result;
-        outcome = `http_${result.status}`;
-      } else {
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const result = await handleCheckoutSessionCompleted(env.DB, deps, event, stripe, config);
+        if (result instanceof Response) {
+          response = result;
+          outcome = `http_${result.status}`;
+        } else {
+          response = jsonResponse(result);
+          outcome = result.action;
+        }
+        break;
+      }
+      case "invoice.paid": {
+        const result = await handleInvoicePaid(env.DB, event, now);
         response = jsonResponse(result);
         outcome = result.action;
+        break;
       }
-      break;
+      case "invoice.payment_failed": {
+        const result = await handleInvoicePaymentFailed(env.DB, event, now);
+        response = jsonResponse(result);
+        outcome = result.action;
+        break;
+      }
+      case "customer.subscription.deleted": {
+        const result = await handleSubscriptionDeleted(env.DB, deps, event, now);
+        response = jsonResponse(result);
+        outcome = result.action;
+        break;
+      }
+      case "customer.subscription.updated": {
+        const result = await handleSubscriptionUpdated(env.DB, deps, event, config);
+        response = jsonResponse(result);
+        outcome = result.action;
+        break;
+      }
+      default: {
+        response = jsonResponse({ ok: true, ignored: event.type });
+        outcome = "ignored";
+      }
     }
-    case "invoice.paid": {
-      const result = await handleInvoicePaid(env.DB, event, now);
-      response = jsonResponse(result);
-      outcome = result.action;
-      break;
+  } catch (err) {
+    // A handler that THREW may not have applied the event (a transient D1
+    // error on its write), so Stripe's redelivery must be processed, not
+    // acked by the dedup row inserted above: drop that row (only while no
+    // outcome is recorded) and answer 500 so Stripe retries. Every handler is
+    // safe to re-run, also after a throw past its write (layer 2: the row
+    // already reflects the event). If the drop fails, the event is lost as
+    // before, and the log line says so.
+    console.error(
+      `event=billing_webhook_handler_failed event_id=${event.id} type=${event.type} error=${err instanceof Error ? err.message : String(err)}`,
+    );
+    try {
+      await env.DB.prepare("DELETE FROM processed_stripe_events WHERE event_id = ? AND outcome IS NULL")
+        .bind(event.id)
+        .run();
+    } catch (dropErr) {
+      console.error(
+        `event=billing_webhook_dedup_release_failed event_id=${event.id} error=${dropErr instanceof Error ? dropErr.message : String(dropErr)}`,
+      );
     }
-    case "invoice.payment_failed": {
-      const result = await handleInvoicePaymentFailed(env.DB, event, now);
-      response = jsonResponse(result);
-      outcome = result.action;
-      break;
-    }
-    case "customer.subscription.deleted": {
-      const result = await handleSubscriptionDeleted(env.DB, deps, event, now);
-      response = jsonResponse(result);
-      outcome = result.action;
-      break;
-    }
-    case "customer.subscription.updated": {
-      const result = await handleSubscriptionUpdated(env.DB, deps, event, config);
-      response = jsonResponse(result);
-      outcome = result.action;
-      break;
-    }
-    default: {
-      response = jsonResponse({ ok: true, ignored: event.type });
-      outcome = "ignored";
-    }
+    return jsonResponse({ error: "handler_failed" }, 500);
   }
 
   // Forensics: stamp the dispatch outcome on the dedup row (see the module
