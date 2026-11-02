@@ -3596,12 +3596,16 @@ export class VaultDO extends DurableObject {
       const obj = await this.env.ATTACHMENTS.get(r2Key(vaultName, reqPath));
       if (!obj) return json({ error: "Not found" }, 404);
       const ext = extLower(reqPath);
-      // cloud#257: extension-first, matching bun. Historical R2 objects
-      // stamped a lying httpMetadata.contentType (pre-#255) still serve
-      // that type if metadata wins; MIME_TYPES[ext] covers all history
-      // with no backfill. Fall through to metadata only when the
-      // extension is uncurated.
-      const contentType = MIME_TYPES[ext] ?? obj.httpMetadata?.contentType ?? "application/octet-stream";
+      // Extension ONLY, never R2 httpMetadata — the same rule as the ticket
+      // download spend and bun's GET /storage/ (vault#617). Pre-#255 ticket
+      // uploads stamped httpMetadata with the caller's `mime_type`, and the
+      // mint refuses only the blocked extensions, so an uncurated `x.dat`
+      // stamped `text/html` exists in that window's history (cloud#257 fixed
+      // curated extensions only). This door answers on my.parachute.computer,
+      // the SPA's own origin: an active type here is script that can read
+      // the owner's tokens. Every current writer stamps exactly this value,
+      // so honest objects serve unchanged.
+      const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
       return new Response(obj.body, {
         headers: {
           "Content-Type": contentType,
