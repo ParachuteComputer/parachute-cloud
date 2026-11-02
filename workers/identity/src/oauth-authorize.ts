@@ -50,6 +50,27 @@ import {
 
 const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 
+/**
+ * The scope a sign-in gets when it asks for nothing Parachute grants (T-307).
+ * RFC 6749 §3.3: a client that omits `scope` gets the server's default, or
+ * the request fails. Before this, such a request (an app that sends no scope
+ * and no `resource`) showed "<app> wants access to your Parachute account"
+ * and minted an empty-scope `aud: "hub"` token that every vault refuses, so
+ * the person approved something that could never work. The default is what a
+ * connector is for: read and write one vault, the one `resource` names, else
+ * the one picked on the consent page (where the owner can also lower it to
+ * read). Generic OIDC scopes alone ask for nothing here either and are
+ * replaced the same way; any other requested scope is left as it was.
+ */
+const DEFAULT_CONNECT_SCOPES = ["vault:read", "vault:write"];
+const GENERIC_OIDC_SCOPES = new Set(["openid", "profile", "email", "offline_access"]);
+
+function applyDefaultScope(params: AuthorizeParams, boundVault: string | null): void {
+  const requested = params.scope.split(" ").filter((s) => s.length > 0);
+  if (requested.some((s) => !GENERIC_OIDC_SCOPES.has(s))) return;
+  params.scope = (boundVault ? narrowResourceVaultScopes(DEFAULT_CONNECT_SCOPES, boundVault) : DEFAULT_CONNECT_SCOPES).join(" ");
+}
+
 function htmlError(title: string, message: string, status: number, action?: { href: string; label: string }): Response {
   return htmlResponse(renderError({ title, message, ...(action ? { action } : {}) }), status);
 }
@@ -268,6 +289,7 @@ async function authorizeCore(
   if (boundVault) {
     params.scope = narrowResourceVaultScopes(params.scope.split(" ").filter((s) => s.length > 0), boundVault).join(" ");
   }
+  applyDefaultScope(params, boundVault);
 
   // Validate redirect_uri BEFORE redirecting any protocol error to it (RFC
   // 6749 §4.1.2.1 — an unvalidated redirect_uri error is shown, never redirected).
@@ -656,6 +678,7 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   if (boundVault) {
     params.scope = narrowResourceVaultScopes(params.scope.split(" ").filter((s) => s.length > 0), boundVault).join(" ");
   }
+  applyDefaultScope(params, boundVault);
 
   let scopes = params.scope.split(" ").filter((s) => s.length > 0);
   const blocked = findNonRequestableScopes(scopes);
