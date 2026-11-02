@@ -18,6 +18,7 @@ import {
   narrowResourceVaultScopes,
   narrowVaultScopes,
   resolveResourceVault,
+  VAULT_VERBS,
   unnamedVaultVerbs,
   widenUnnamedVaultVerb,
 } from "./audience.ts";
@@ -86,10 +87,23 @@ function applyDefaultScope(
     params.scope = ACCOUNT_VAULTS_UNNARROWED;
     return;
   }
-  const registered = client.scopes.filter((s) => !GENERIC_OIDC_SCOPES.has(s));
-  const base = registered.length > 0 ? registered : DEFAULT_CONNECT_SCOPES;
-  const narrowed = boundVault ? narrowResourceVaultScopes(base, boundVault) : base;
-  params.scope = (narrowed.length > 0 ? narrowed : boundVault ? narrowResourceVaultScopes(DEFAULT_CONNECT_SCOPES, boundVault) : DEFAULT_CONNECT_SCOPES).join(" ");
+  // The registered scope lends only its ACCESS LEVEL (read/write/admin of
+  // `vault:<verb>` or `vault:<any>:<verb>`): a vault it names must not steer
+  // the default away from the `resource` vault or the person's pick (Codex r1
+  // on #385). An app that registered only account:vaults, with no vault
+  // resource, gets the account consent.
+  const verbs = new Set<string>();
+  for (const s of client.scopes) {
+    const parts = s.split(":");
+    const verb = parts[parts.length - 1];
+    if (parts[0] === "vault" && (parts.length === 2 || parts.length === 3) && verb && VAULT_VERBS.has(verb)) verbs.add(verb);
+  }
+  if (!boundVault && verbs.size === 0 && client.scopes.includes(ACCOUNT_VAULTS_UNNARROWED)) {
+    params.scope = ACCOUNT_VAULTS_UNNARROWED;
+    return;
+  }
+  const base = verbs.size > 0 ? ["read", "write", "admin"].filter((v) => verbs.has(v)).map((v) => `vault:${v}`) : DEFAULT_CONNECT_SCOPES;
+  params.scope = (boundVault ? narrowResourceVaultScopes(base, boundVault) : base).join(" ");
 }
 
 /** `resource` names the account MCP door (`<front door or a bound origin>/account/mcp`). */
