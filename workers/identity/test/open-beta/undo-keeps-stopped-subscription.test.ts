@@ -185,4 +185,37 @@ describe("undo restores the subscription's pre-delete renewal state", () => {
     expect(final.status).toBe(200);
     expect(sub.cancel_at_period_end).toBe(true);
   });
+  test("an undo whose release landed in Stripe but whose reply was lost leaves the closed account held, not renewing", async () => {
+    // Review 3 (key c). A renewing subscription: the delete placed the hold.
+    // Undo clears the tombstone, then releases the hold; Stripe applies the
+    // release but the reply is lost, so undo puts the tombstone back and
+    // answers 502 "Nothing changed". It did change: the account is closed
+    // again and its subscription renews. If the person doesn't retry, the
+    // period boundary inside the window charges a closed account (the hold's
+    // whole promise is that no new charge posts after a delete request).
+    const { stripe, sub, loseNextUpdateReply } = stripeModel({ cancel_at_period_end: false, metadata: {} });
+    const email = "placed-lost-reply@example.com";
+    const acct = await seedSubscriber(email);
+    const d = { ...deps(), vaultFetch: okVault };
+    const del = await handleAccountDelete(env, deleteRequest(acct.token, email), d, undefined, { stripe });
+    expect(del.status).toBe(200);
+    expect(sub.cancel_at_period_end).toBe(true);
+    const { undo_token } = (await del.json()) as { undo_token: string };
+    loseNextUpdateReply();
+    const undo = await handleAccountDeleteUndo(
+      env,
+      new Request(`${ISSUER}/account/undo-delete`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: undo_token }),
+      }),
+      d,
+      { stripe },
+    );
+    expect(undo.status).toBe(502);
+    const row = await env.DB.prepare("SELECT deleted_at FROM users WHERE id = ?").bind(acct.id).first<{ deleted_at: string | null }>();
+    expect(row?.deleted_at).not.toBeNull();
+    // Still closed, so still held.
+    expect(sub.cancel_at_period_end).toBe(true);
+  });
 });
