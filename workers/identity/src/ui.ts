@@ -26,6 +26,7 @@ import {
   vaultCapMessage,
   vaultUsageLine,
 } from "./plans.ts";
+import { isNativeAppRedirect } from "./clients.ts";
 import { type BillingInterval } from "./billing-config.ts";
 import { NONCE_ATTR } from "./oauth-shared.ts";
 
@@ -532,6 +533,7 @@ export function renderConsent(props: ConsentProps): string {
      <div class="card">
        <p class="lead" data-testid="consent-ask">${ask}</p>
        <ul class="scopes">${scopeList}</ul>
+       ${returnsToLine(params.redirectUri)}
        <form method="post" action="/oauth/authorize">
          <input type="hidden" name="__action" value="consent">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
@@ -549,6 +551,20 @@ export function renderConsent(props: ConsentProps): string {
      </div>
      <p class="muted foot">issued by <strong>${esc(issuerHost)}</strong></p>`,
   );
+}
+
+/**
+ * Where the connection goes back to, when that is an app on this device (a
+ * private-use scheme redirect, RFC 8252 §7.1) rather than a web address: any
+ * app can claim such a scheme, so the person sees which one before Allow
+ * (MCP 2026-07-28 security considerations: inform the user when the redirect
+ * is not one the server can vouch for). Empty for http(s).
+ */
+function returnsToLine(redirectUri: string): string {
+  if (!isNativeAppRedirect(redirectUri)) return "";
+  const u = new URL(redirectUri);
+  const where = u.host ? `${u.protocol}//${u.host}` : `${u.protocol}${u.pathname}`;
+  return `<p class="muted" data-testid="consent-returns-to">After you allow, the connection goes back to an app on this device: <code>${esc(where)}</code>.</p>`;
 }
 
 /**
