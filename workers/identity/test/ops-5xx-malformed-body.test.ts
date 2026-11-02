@@ -95,4 +95,25 @@ describe("a malformed request body is the client's error, not a server error", (
     expect(results.filter((r) => r.includes("D1_"))).toEqual([]);
     expect(await sumOpsCounter(env.DB, "http_5xx", "2000", "3000")).toBe(0);
   });
+  test("a JSON value that cannot be turned into a string answers 400 on the anonymous doors", async () => {
+    // Review 3 (key c): a JSON object whose own `toString` is not a function
+    // (`{"toString": 1}`) throws a TypeError the moment anything stringifies
+    // it. /oauth/register put a non-string redirect_uri into its error message
+    // with a template literal, and /auth/magic's JSON reader ran String() on
+    // every field: each a 500 from a stranger, counted toward the operator page.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const poisoned = { toString: 1 };
+    const cases: Array<[string, string]> = [
+      ["/oauth/register", JSON.stringify({ redirect_uris: [poisoned] })],
+      ["/auth/magic", JSON.stringify({ email: poisoned })],
+      ["/auth/magic", JSON.stringify({ email: "a@example.com", next: poisoned })],
+    ];
+    const results: string[] = [];
+    for (const [path, body] of cases) {
+      const res = await post(path, "application/json", body);
+      results.push(`${path} ${body} ${res.status}`);
+    }
+    expect(results.filter((r) => r.endsWith(" 500"))).toEqual([]);
+    expect(await sumOpsCounter(env.DB, "http_5xx", "2000", "3000")).toBe(0);
+  });
 });
