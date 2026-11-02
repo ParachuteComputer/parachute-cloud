@@ -598,6 +598,18 @@ async function restoreAccount(
       console.error(
         `event=account_undo_billing_failed user=${user.id} error=${err instanceof Error ? err.message : String(err)}`,
       );
+      // The account is closed again, so it must be held again. A throw does
+      // not mean the release didn't land: Stripe can apply it and lose the
+      // reply, leaving a closed account renewing until purge. deferBilling
+      // reads first, so a release that never landed (our hold still there)
+      // is left exactly as it is, and a "kept" subscription stays kept.
+      try {
+        await deferBilling(stripe!, user.stripeSubscriptionId);
+      } catch (holdErr) {
+        console.error(
+          `event=account_undo_rehold_failed user=${user.id} error=${holdErr instanceof Error ? holdErr.message : String(holdErr)}`,
+        );
+      }
       return {
         ok: false,
         status: 502,
