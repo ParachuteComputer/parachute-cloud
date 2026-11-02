@@ -50,6 +50,28 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
   "2024-10-07",
 ];
 
+/**
+ * MCP 2026-07-28, the "modern" era (T-307). It has no initialize handshake:
+ * every request carries its version and client capabilities in `params._meta`
+ * and the `MCP-Protocol-Version` header, plus `Mcp-Method` (and `Mcp-Name` for
+ * tools/call); `server/discover` replaces initialize as the way to learn the
+ * server. This door is dual-era (spec basic/versioning.mdx): a request that
+ * carries a modern `_meta` version, or a modern version header, is served by
+ * {@link handleModern}; everything else keeps the legacy behavior above byte
+ * for byte. ChatGPT is reported to speak this revision, and was refused with
+ * "Unsupported protocol version" before.
+ */
+const MODERN_PROTOCOL_VERSIONS = ["2026-07-28"];
+const ALL_SUPPORTED_VERSIONS = [...MODERN_PROTOCOL_VERSIONS, ...SUPPORTED_PROTOCOL_VERSIONS];
+const META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion";
+const META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
+const META_SERVER_INFO = "io.modelcontextprotocol/serverInfo";
+// Spec-reserved codes (basic/index.mdx "Error Codes").
+const HEADER_MISMATCH = -32020;
+const UNSUPPORTED_PROTOCOL_VERSION = -32022;
+/** CacheableResult hint for server/discover + tools/list: the tool set only moves with a deploy or a new token. */
+const MODERN_CACHE_TTL_MS = 300_000;
+
 // JSON-RPC error codes (SDK types.js ErrorCode).
 const PARSE_ERROR = -32700;
 const INVALID_REQUEST = -32600;
@@ -637,6 +659,160 @@ async function handleOne(
   }
 }
 
+/** A JSON-RPC error with an HTTP status, for the modern era's 400/404 rules (no batches there, so the id is known). */
+function modernHttpError(status: number, id: JsonRpcId, code: number, message: string, data?: unknown): Response {
+  return new Response(JSON.stringify(rpcError(id, code, message, data)), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/** The `_meta` object of a message's params, or undefined. */
+function requestMeta(m: JsonRpcMessage): Record<string, unknown> | undefined {
+  const meta = m.params?._meta;
+  return meta && typeof meta === "object" && !Array.isArray(meta) ? (meta as Record<string, unknown>) : undefined;
+}
+
+/**
+ * Whether a POST is in the modern (2026-07-28) era: a message declares its
+ * version in `_meta`, or the header names a modern version. A legacy client
+ * never sends either, so its traffic keeps the legacy path.
+ */
+function isModernRequest(req: Request, messages: readonly JsonRpcMessage[]): boolean {
+  const pv = req.headers.get("mcp-protocol-version");
+  if (pv !== null && MODERN_PROTOCOL_VERSIONS.includes(pv)) return true;
+  return messages.some((m) => requestMeta(m)?.[META_PROTOCOL_VERSION] !== undefined);
+}
+
+/**
+ * A mirrored header value (`Mcp-Name`), decoded from the spec's Base64
+ * sentinel form `=?base64?…?=` when used. Null when the value is malformed.
+ */
+function decodeMirroredHeader(value: string): string | null {
+  const m = /^=\?base64\?([A-Za-z0-9+/]*={0,2})\?=$/.exec(value);
+  if (!m) return value.startsWith("=?base64?") ? null : value;
+  try {
+    const bytes = Uint8Array.from(atob(m[1]!), (c) => c.charCodeAt(0));
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validate one modern request against the spec's rules and return the error
+ * Response, or null to serve it. Order: the required header, the required
+ * `_meta` fields (-32602), header/body agreement (-32020), then the version
+ * (-32022, listing every version this door speaks).
+ */
+function modernRequestError(req: Request, m: JsonRpcMessage): Response | null {
+  const id = m.id ?? null;
+  const meta = requestMeta(m);
+  const version = meta?.[META_PROTOCOL_VERSION];
+  const header = req.headers.get("mcp-protocol-version");
+  if (typeof version !== "string") {
+    return modernHttpError(400, id, INVALID_PARAMS, `Invalid params: _meta["${META_PROTOCOL_VERSION}"] is required`);
+  }
+  const caps = meta?.[META_CLIENT_CAPABILITIES];
+  if (!caps || typeof caps !== "object" || Array.isArray(caps)) {
+    return modernHttpError(400, id, INVALID_PARAMS, `Invalid params: _meta["${META_CLIENT_CAPABILITIES}"] is required`);
+  }
+  if (header === null) {
+    return modernHttpError(400, id, HEADER_MISMATCH, "Header mismatch: the MCP-Protocol-Version header is required");
+  }
+  if (header !== version) {
+    return modernHttpError(
+      400,
+      id,
+      HEADER_MISMATCH,
+      `Header mismatch: MCP-Protocol-Version header value '${header}' does not match body value '${version}'`,
+    );
+  }
+  const methodHeader = req.headers.get("mcp-method");
+  if (methodHeader !== m.method) {
+    return modernHttpError(
+      400,
+      id,
+      HEADER_MISMATCH,
+      methodHeader === null
+        ? "Header mismatch: the Mcp-Method header is required"
+        : `Header mismatch: Mcp-Method header value '${methodHeader}' does not match body value '${m.method}'`,
+    );
+  }
+  if (m.method === "tools/call") {
+    // A gateway may route or allow-list on Mcp-Name; the body must not run a different tool.
+    const raw = req.headers.get("mcp-name");
+    const name = raw === null ? null : decodeMirroredHeader(raw);
+    if (name === null || name !== m.params?.name) {
+      return modernHttpError(
+        400,
+        id,
+        HEADER_MISMATCH,
+        raw === null ? "Header mismatch: the Mcp-Name header is required for tools/call" : "Header mismatch: Mcp-Name header value does not match body value",
+      );
+    }
+  }
+  if (!MODERN_PROTOCOL_VERSIONS.includes(version)) {
+    return modernHttpError(400, id, UNSUPPORTED_PROTOCOL_VERSION, "Unsupported protocol version", {
+      supported: ALL_SUPPORTED_VERSIONS,
+      requested: version,
+    });
+  }
+  return null;
+}
+
+/**
+ * Serve one modern-era (2026-07-28) POST. One message per POST (the revision
+ * dropped batching); a notification is 202 like the legacy era. The method
+ * set is server/discover, tools/list and tools/call; anything else, including
+ * initialize and ping (removed in this revision), is 404 -32601. Every result
+ * carries `resultType: "complete"` and the server's identity in `_meta`.
+ */
+async function handleModern(
+  req: Request,
+  raw: unknown,
+  m: JsonRpcMessage,
+  ctx: Parameters<typeof handleOne>[1],
+): Promise<Response> {
+  if (Array.isArray(raw)) {
+    return modernHttpError(400, null, INVALID_REQUEST, "Invalid Request: a 2026-07-28 POST carries one JSON-RPC message, not a batch");
+  }
+  if (!isRequest(m)) return new Response(null, { status: 202 });
+  const invalid = modernRequestError(req, m);
+  if (invalid) return invalid;
+
+  const id = m.id ?? null;
+  const serverInfo = { name: `parachute-vault/${ctx.vaultName}`, version: "0.1.0" };
+  let reply: JsonRpcMessage;
+  switch (m.method) {
+    case "server/discover":
+      reply = result(id, {
+        supportedVersions: ALL_SUPPORTED_VERSIONS,
+        capabilities: { tools: {} },
+        instructions: serverInstruction(ctx.vaultName, ctx.description),
+        ttlMs: MODERN_CACHE_TTL_MS,
+        cacheScope: "private",
+      });
+      break;
+    case "tools/list": {
+      const listed = await handleOne(m, ctx);
+      reply = listed.result ? { ...listed, result: { ...(listed.result as object), ttlMs: MODERN_CACHE_TTL_MS, cacheScope: "private" } } : listed;
+      break;
+    }
+    case "tools/call":
+      reply = await handleOne(m, ctx);
+      break;
+    default:
+      return modernHttpError(404, id, METHOD_NOT_FOUND, `Method not found: ${m.method}`);
+  }
+  if (reply.result && typeof reply.result === "object") {
+    const r = reply.result as Record<string, unknown>;
+    const meta = r._meta && typeof r._meta === "object" ? (r._meta as Record<string, unknown>) : {};
+    reply = { ...reply, result: { resultType: "complete", ...r, _meta: { ...meta, [META_SERVER_INFO]: serverInfo } } };
+  }
+  return new Response(JSON.stringify(reply), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
 /**
  * Handle an MCP request at `/vault/<name>/mcp`. Auth is resolved by the caller
  * (the DO's fetch, same credential order + challenge as REST); `auth` is the
@@ -703,8 +879,9 @@ export async function handleMcp(
   // POST that is NOT an initialize, an *unsupported* version header → 400. An
   // absent header is fine (the client defaults to the negotiated version).
   // Initialize negotiates the version in-body, so it is exempt.
+  const modern = isModernRequest(req, messages);
   const isInit = messages.some((m) => m.method === "initialize");
-  if (!isInit) {
+  if (!modern && !isInit) {
     const pv = req.headers.get("mcp-protocol-version");
     if (pv !== null && !SUPPORTED_PROTOCOL_VERSIONS.includes(pv)) {
       return jsonRpcHttpError(
@@ -716,7 +893,7 @@ export async function handleMcp(
   }
 
   const requests = messages.filter(isRequest);
-  if (requests.length === 0) {
+  if (!modern && requests.length === 0) {
     // Notifications / responses only — nothing to answer.
     return new Response(null, { status: 202 });
   }
@@ -734,6 +911,7 @@ export async function handleMcp(
   // layer"). Parity with bun's mcp-tools.ts overrideVaultInfo.
   overrideVaultInfo(tools, { vaultName, auth, description, origin, ctx: vaultInfo });
   const ctx = { tools, vaultName, description, writeGate, attachmentMintGate: tickets.mintGate };
+  if (modern) return handleModern(req, raw, messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));
 

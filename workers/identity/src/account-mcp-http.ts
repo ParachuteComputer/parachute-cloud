@@ -52,8 +52,25 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
   "2024-10-07",
 ];
 
+/**
+ * MCP 2026-07-28, the "modern" stateless era — transcribed from the vault
+ * door's `handleModern` (workers/vault/src/mcp.ts, T-307), pinned by
+ * test/account-mcp-modern.test.ts against its twin. A request carrying a
+ * modern `_meta` version (or a modern version header) is served per request
+ * with no initialize; everything else keeps the legacy path below.
+ */
+const MODERN_PROTOCOL_VERSIONS = ["2026-07-28"];
+const ALL_SUPPORTED_VERSIONS = [...MODERN_PROTOCOL_VERSIONS, ...SUPPORTED_PROTOCOL_VERSIONS];
+const META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion";
+const META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
+const META_SERVER_INFO = "io.modelcontextprotocol/serverInfo";
+const HEADER_MISMATCH = -32020;
+const UNSUPPORTED_PROTOCOL_VERSION = -32022;
+const MODERN_CACHE_TTL_MS = 300_000;
+
 // JSON-RPC error codes (SDK types.js ErrorCode).
 const PARSE_ERROR = -32700;
+const INVALID_REQUEST = -32600;
 const METHOD_NOT_FOUND = -32601;
 const INVALID_PARAMS = -32602;
 const INTERNAL_ERROR = -32603;
@@ -101,7 +118,7 @@ function preflight(): Response {
     headers: {
       "access-control-allow-origin": "*",
       "access-control-allow-methods": "POST, DELETE, OPTIONS",
-      "access-control-allow-headers": "Authorization, Content-Type, Accept, Mcp-Protocol-Version",
+      "access-control-allow-headers": "Authorization, Content-Type, Accept, Mcp-Protocol-Version, Mcp-Method, Mcp-Name",
       "access-control-max-age": "86400",
     },
   });
@@ -311,6 +328,136 @@ async function handleOne(m: JsonRpcMessage, ctx: AccountToolContext): Promise<Js
   }
 }
 
+// --- the modern era (2026-07-28), transcribed from workers/vault/src/mcp.ts ---
+
+function modernHttpError(status: number, id: JsonRpcId, code: number, message: string, data?: unknown): Response {
+  return withMcpCors(
+    new Response(JSON.stringify(rpcError(id, code, message, data)), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+}
+
+function requestMeta(m: JsonRpcMessage): Record<string, unknown> | undefined {
+  const meta = m.params?._meta;
+  return meta && typeof meta === "object" && !Array.isArray(meta) ? (meta as Record<string, unknown>) : undefined;
+}
+
+function isModernRequest(req: Request, messages: readonly JsonRpcMessage[]): boolean {
+  const pv = req.headers.get("mcp-protocol-version");
+  if (pv !== null && MODERN_PROTOCOL_VERSIONS.includes(pv)) return true;
+  return messages.some((m) => requestMeta(m)?.[META_PROTOCOL_VERSION] !== undefined);
+}
+
+function decodeMirroredHeader(value: string): string | null {
+  const m = /^=\?base64\?([A-Za-z0-9+/]*={0,2})\?=$/.exec(value);
+  if (!m) return value.startsWith("=?base64?") ? null : value;
+  try {
+    const bytes = Uint8Array.from(atob(m[1]!), (c) => c.charCodeAt(0));
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function modernRequestError(req: Request, m: JsonRpcMessage): Response | null {
+  const id = m.id ?? null;
+  const meta = requestMeta(m);
+  const version = meta?.[META_PROTOCOL_VERSION];
+  const header = req.headers.get("mcp-protocol-version");
+  if (typeof version !== "string") {
+    return modernHttpError(400, id, INVALID_PARAMS, `Invalid params: _meta["${META_PROTOCOL_VERSION}"] is required`);
+  }
+  const caps = meta?.[META_CLIENT_CAPABILITIES];
+  if (!caps || typeof caps !== "object" || Array.isArray(caps)) {
+    return modernHttpError(400, id, INVALID_PARAMS, `Invalid params: _meta["${META_CLIENT_CAPABILITIES}"] is required`);
+  }
+  if (header === null) {
+    return modernHttpError(400, id, HEADER_MISMATCH, "Header mismatch: the MCP-Protocol-Version header is required");
+  }
+  if (header !== version) {
+    return modernHttpError(
+      400,
+      id,
+      HEADER_MISMATCH,
+      `Header mismatch: MCP-Protocol-Version header value '${header}' does not match body value '${version}'`,
+    );
+  }
+  const methodHeader = req.headers.get("mcp-method");
+  if (methodHeader !== m.method) {
+    return modernHttpError(
+      400,
+      id,
+      HEADER_MISMATCH,
+      methodHeader === null
+        ? "Header mismatch: the Mcp-Method header is required"
+        : `Header mismatch: Mcp-Method header value '${methodHeader}' does not match body value '${m.method}'`,
+    );
+  }
+  if (m.method === "tools/call") {
+    const raw = req.headers.get("mcp-name");
+    const name = raw === null ? null : decodeMirroredHeader(raw);
+    if (name === null || name !== m.params?.name) {
+      return modernHttpError(
+        400,
+        id,
+        HEADER_MISMATCH,
+        raw === null ? "Header mismatch: the Mcp-Name header is required for tools/call" : "Header mismatch: Mcp-Name header value does not match body value",
+      );
+    }
+  }
+  if (!MODERN_PROTOCOL_VERSIONS.includes(version)) {
+    return modernHttpError(400, id, UNSUPPORTED_PROTOCOL_VERSION, "Unsupported protocol version", {
+      supported: ALL_SUPPORTED_VERSIONS,
+      requested: version,
+    });
+  }
+  return null;
+}
+
+async function handleModern(req: Request, raw: unknown, m: JsonRpcMessage, ctx: AccountToolContext): Promise<Response> {
+  if (Array.isArray(raw)) {
+    return modernHttpError(400, null, INVALID_REQUEST, "Invalid Request: a 2026-07-28 POST carries one JSON-RPC message, not a batch");
+  }
+  if (!isRequest(m)) return withMcpCors(new Response(null, { status: 202 }));
+  const invalid = modernRequestError(req, m);
+  if (invalid) return invalid;
+
+  const id = m.id ?? null;
+  let reply: JsonRpcMessage;
+  switch (m.method) {
+    case "server/discover":
+      reply = result(id, {
+        supportedVersions: ALL_SUPPORTED_VERSIONS,
+        capabilities: { tools: {} },
+        instructions: instructions(),
+        ttlMs: MODERN_CACHE_TTL_MS,
+        cacheScope: "private",
+      });
+      break;
+    case "tools/list": {
+      const listed = await handleOne(m, ctx);
+      reply = listed.result ? { ...listed, result: { ...(listed.result as object), ttlMs: MODERN_CACHE_TTL_MS, cacheScope: "private" } } : listed;
+      break;
+    }
+    case "tools/call":
+      reply = await handleOne(m, ctx);
+      break;
+    default:
+      return modernHttpError(404, id, METHOD_NOT_FOUND, `Method not found: ${m.method}`);
+  }
+  if (reply.result && typeof reply.result === "object") {
+    const r = reply.result as Record<string, unknown>;
+    const meta = r._meta && typeof r._meta === "object" ? (r._meta as Record<string, unknown>) : {};
+    reply = {
+      ...reply,
+      result: { resultType: "complete", ...r, _meta: { ...meta, [META_SERVER_INFO]: { name: "parachute-account", version: "0.1.0" } } },
+    };
+  }
+  return withMcpCors(new Response(JSON.stringify(reply), { status: 200, headers: { "Content-Type": "application/json" } }));
+}
+
 // --- the endpoint ------------------------------------------------------------
 
 /**
@@ -375,8 +522,9 @@ export async function handleAccountMcp(db: D1Database, req: Request, deps: OAuth
   // Mcp-Protocol-Version validation (SDK rule): a NON-initialize POST carrying an
   // unsupported version header → 400. Absent header is fine; initialize negotiates
   // in-body and is exempt.
+  const modern = isModernRequest(req, messages);
   const isInit = messages.some((m) => m.method === "initialize");
-  if (!isInit) {
+  if (!modern && !isInit) {
     const pv = req.headers.get("mcp-protocol-version");
     if (pv !== null && !SUPPORTED_PROTOCOL_VERSIONS.includes(pv)) {
       return jsonRpcHttpError(
@@ -388,7 +536,7 @@ export async function handleAccountMcp(db: D1Database, req: Request, deps: OAuth
   }
 
   const requests = messages.filter(isRequest);
-  if (requests.length === 0) {
+  if (!modern && requests.length === 0) {
     // Notifications / responses only — nothing to answer.
     return withMcpCors(new Response(null, { status: 202 }));
   }
@@ -404,6 +552,7 @@ export async function handleAccountMcp(db: D1Database, req: Request, deps: OAuth
     // carry no permissions.principal_pubkey (cloud#278).
     principal: { authKind: "bearer" },
   };
+  if (modern) return handleModern(req, raw, messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));
 

@@ -23,7 +23,7 @@ export { VaultDO } from "./vault-do.js";
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Mcp-Session-Id",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Mcp-Session-Id, Mcp-Protocol-Version, Mcp-Method, Mcp-Name",
   "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id, X-Next-Cursor",
 };
 
