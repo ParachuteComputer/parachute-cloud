@@ -761,7 +761,9 @@ export class VaultDO extends DurableObject {
    * and the alarm picks it up again after the import.
    */
   private alarmMustYield(generation: number): boolean {
-    return this.importRun !== null || this.importGeneration !== generation;
+    // A destroy that landed while the work awaited a model (T-318 review 3):
+    // nothing more of the vault goes to Workers AI, and nothing is written.
+    return this.destroyed || this.importRun !== null || this.importGeneration !== generation;
   }
 
   private async handleFetch(request: Request): Promise<Response> {
@@ -834,12 +836,17 @@ export class VaultDO extends DurableObject {
    * answer the 410 a later request gets.
    */
   private async wipeAfterLateDestroy(vaultName: string): Promise<Response> {
+    await this.wipeStorageAgain();
+    console.log(`[destroy ${vaultName}] late request: storage wiped again`);
+    return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
+  }
+
+  /** Clear the alarm and DO storage again, other events held off (the steps {@link handleDestroy} ran). */
+  private async wipeStorageAgain(): Promise<void> {
     await this.ctx.blockConcurrencyWhile(async () => {
       await this.ctx.storage.deleteAlarm();
       await this.ctx.storage.deleteAll();
     });
-    console.log(`[destroy ${vaultName}] late request: storage wiped again`);
-    return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
   }
 
   private async handleLive(request: Request, url: URL, vaultName: string, rest: string): Promise<Response> {
@@ -3007,6 +3014,13 @@ export class VaultDO extends DurableObject {
       await this.rearmFromPending(vaultName, embeddingNeedsRearm, embedDelayMs);
     } finally {
       this.alarmRunning = false;
+      // A destroy that landed while this wake awaited a model (the alarm twin
+      // of handleFetch's re-check): the wake may have written the backoff
+      // keys or re-armed into the wiped object. Wipe again.
+      if (this.destroyed) {
+        await this.wipeStorageAgain();
+        console.log(`[destroy] late alarm wake: storage wiped again`);
+      }
     }
   }
 
@@ -3288,6 +3302,9 @@ export class VaultDO extends DurableObject {
       });
       text = result.text;
       audioSeconds = result.audioSeconds;
+      // An import or a destroy began while whisper ran: the transcript must
+      // not go on to the cleanup model either.
+      if (this.alarmMustYield(generation)) return;
     } catch (err) {
       // An import began while whisper ran: write nothing (T-318, alarmMustYield).
       if (this.alarmMustYield(generation)) return;
