@@ -169,6 +169,23 @@ describe("POST /ops/account-delete — dry run", () => {
     expect((await getUserById(db(), id))?.deletedAt).toBeNull();
     expect(await count("SELECT COUNT(*) AS n FROM vaults WHERE owner_user_id = ?", id)).toBe(1);
   });
+
+  test("a misspelled dry_run key is refused, never read as a real delete", async () => {
+    // Review 3 (key c): #355 closed `"dry_run": "true"`, but the same typo one
+    // character over (`dryRun`, `dry-run`, `dryrun`) still dropped the field,
+    // and a dry run carries every field a real delete needs, so it erased the
+    // account with no undo. Only the four documented fields are accepted.
+    const email = "dry-key@example.com";
+    const { id } = await seedUser(email);
+    await seedVault("dry-key-notes", id);
+    for (const key of ["dryRun", "dry-run", "dryrun", "DRY_RUN", "dry_run "]) {
+      const res = await call({ email, confirm: email, written_request: REF, [key]: true });
+      expect(res!.status, key).toBe(400);
+      expect(await json(res)).toMatchObject({ error: "invalid_request" });
+    }
+    expect((await getUserById(db(), id))?.deletedAt).toBeNull();
+    expect(await count("SELECT COUNT(*) AS n FROM vaults WHERE owner_user_id = ?", id)).toBe(1);
+  });
 });
 
 describe("POST /ops/account-delete — the purge", () => {

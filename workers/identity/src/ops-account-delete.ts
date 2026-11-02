@@ -52,6 +52,8 @@ import { EMAIL_RE } from "./validation.ts";
 import { listVaultsForOwner } from "./vaults.ts";
 
 const NO_STORE = { "cache-control": "no-store" };
+/** Every field the body may carry (see the module note). */
+const OPS_DELETE_FIELDS: ReadonlySet<string> = new Set(["email", "confirm", "written_request", "dry_run"]);
 
 function refuse(status: number, error: string, message: string): Response {
   return Response.json({ error, message }, { status, headers: NO_STORE });
@@ -148,6 +150,16 @@ export async function handleOpsAccountDeletePost(
   // A dry run is the ONLY thing standing between a typo and an erase with no
   // undo, so only a JSON boolean (or no field) is accepted: `"true"` or `1`
   // was meant as a dry run and must not fall through to the real delete.
+  // The same typo one key over (`dryRun`, `dry-run`) would drop the field
+  // and erase, so the body takes exactly the documented fields.
+  const unknown = Object.keys(body).filter((k) => !OPS_DELETE_FIELDS.has(k));
+  if (unknown.length > 0) {
+    return refuse(
+      400,
+      "invalid_request",
+      `unknown field(s): ${unknown.slice(0, 5).map((k) => JSON.stringify(k.slice(0, 40))).join(", ")}. The body takes only email, confirm, written_request and dry_run. Nothing was deleted.`,
+    );
+  }
   if (body.dry_run !== undefined && typeof body.dry_run !== "boolean") {
     return refuse(400, "invalid_request", "dry_run must be true or false (a JSON boolean). Nothing was deleted.");
   }
