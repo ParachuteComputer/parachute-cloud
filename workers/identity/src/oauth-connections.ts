@@ -38,8 +38,10 @@ import { parseComposedAccountScope } from "@openparachute/door-contract";
 import { requireAccount } from "./account-api.ts";
 import { APP_CLIENT_ID } from "./account-descriptor.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
+import type { OAuthClient } from "./clients.ts";
 import { CONSOLE_CLIENT_ID } from "./drip.ts";
 import { type OAuthDeps, jsonResponse } from "./oauth-shared.ts";
+import { prepareRevokeClientTokens } from "./tokens.ts";
 import { userOwnsVault } from "./vaults.ts";
 
 /** Parachute's own clients — never shown as a "connected app". */
@@ -299,6 +301,141 @@ export async function disconnectVaultClient(
   // Ids and a count only — no scopes, no token material.
   console.log(`event=connection_disconnected user=${userId} client=${clientId} revoked_tokens=${revokedTokens}`);
   return { revokedTokens, covers: reach.covers };
+}
+
+// --- a reconnect replaces the app's earlier connection (T-307) ---------------
+//
+// claude.ai registers a NEW OAuth client (DCR) on every connect and reconnect.
+// Each consent recorded a grant for the new client and left the old one, so
+// Connected apps grew one more "Claude" row per reconnect and the old client's
+// refresh token kept working for up to 30 days. A consent now retires the
+// SAME app's earlier access to the vaults it covers, exactly as Disconnect
+// would. "The same app" is the same registered client_name AND the same
+// redirect URIs (loopback ports ignored: RFC 8252 §7.3, a CLI listens on a new
+// port each run). Both are self-declared at DCR, so this is never a security
+// boundary: it only acts on the signed-in person's own grants, at the moment
+// they approve a connection, and a look-alike that copies the name and the
+// redirect can only send codes to the real app's callback. The consent page
+// says so before Allow.
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/** A redirect URI with a loopback port removed, for comparing apps. */
+function sameAppRedirect(uri: string): string {
+  try {
+    const u = new URL(uri);
+    if (u.protocol === "http:" && LOOPBACK_HOSTS.has(u.hostname)) u.port = "";
+    return u.toString();
+  } catch {
+    return uri;
+  }
+}
+
+function sameAppKey(redirectUris: readonly string[]): string {
+  return [...new Set(redirectUris.map(sameAppRedirect))].sort().join(" ");
+}
+
+/** Which of this account's vaults a scope set reaches: named ones, or every vault. */
+function grantVaults(scopes: readonly string[], userId: string): { vaults: Set<string>; accountWide: boolean } {
+  const vaults = new Set<string>();
+  let accountWide = false;
+  for (const s of scopes) {
+    const parts = s.split(":");
+    if (parts.length === 3 && parts[0] === "vault" && parts[1] && VERB_RANK[parts[2]!]) {
+      vaults.add(parts[1]);
+      continue;
+    }
+    const parsed = parseComposedAccountScope(s);
+    if (!parsed || parsed.id !== userId) continue;
+    if (parsed.kind === "wildcard-vaults" || parsed.kind === "legacy-blanket") accountWide = true;
+    else if (parsed.kind === "vault" || parsed.kind === "legacy-vault") vaults.add(parsed.vault);
+  }
+  return { vaults, accountWide };
+}
+
+/** An earlier connection of the same app that a consent to `scopes` replaces. */
+export interface SupersededConnection {
+  clientId: string;
+  /** The vaults it loses, or "all" when an account-wide connection is replaced by another. */
+  vaults: string[] | "all";
+}
+
+/**
+ * The same app's earlier connections (other client ids, this user) that a
+ * consent to `scopes` for `client` covers. A per-vault connection loses the
+ * vaults the new consent reaches; an account-wide one is replaced only by
+ * another account-wide consent (a single-vault reconnect is narrower, so the
+ * wide one stays). Nothing when the client has no name or the scopes name no
+ * vault (an unnamed pick is resolved at submit, and checked again there).
+ */
+export async function findSupersededConnections(
+  db: D1Database,
+  userId: string,
+  client: Pick<OAuthClient, "clientId" | "clientName" | "redirectUris">,
+  scopes: readonly string[],
+): Promise<SupersededConnection[]> {
+  if (!client.clientName || FIRST_PARTY_CLIENTS.has(client.clientId)) return [];
+  const next = grantVaults(scopes, userId);
+  if (!next.accountWide && next.vaults.size === 0) return [];
+  const key = sameAppKey(client.redirectUris);
+  const res = await db
+    .prepare(
+      `SELECT g.client_id, g.scopes, c.redirect_uris
+         FROM grants g JOIN clients c ON c.client_id = g.client_id
+        WHERE g.user_id = ? AND c.client_name = ? AND g.client_id <> ?`,
+    )
+    .bind(userId, client.clientName, client.clientId)
+    .all<{ client_id: string; scopes: string; redirect_uris: string }>();
+  const out: SupersededConnection[] = [];
+  for (const row of res.results ?? []) {
+    if (FIRST_PARTY_CLIENTS.has(row.client_id)) continue;
+    let uris: string[];
+    try {
+      uris = JSON.parse(row.redirect_uris) as string[];
+    } catch {
+      continue;
+    }
+    if (sameAppKey(uris) !== key) continue;
+    const old = grantVaults(splitScopes(row.scopes), userId);
+    if (old.accountWide) {
+      if (next.accountWide) out.push({ clientId: row.client_id, vaults: "all" });
+      continue;
+    }
+    const covered = [...old.vaults].filter((v) => next.accountWide || next.vaults.has(v));
+    if (covered.length > 0) out.push({ clientId: row.client_id, vaults: covered });
+  }
+  return out;
+}
+
+/**
+ * Retire superseded connections as Disconnect does: per vault through
+ * {@link disconnectVaultClient} (grant scopes, live tokens, codes, in one
+ * batch each), or the whole grant + every live token + every code for an
+ * account-wide one. Returns the live token rows revoked.
+ */
+export async function retireSupersededConnections(
+  db: D1Database,
+  userId: string,
+  supersededBy: string,
+  superseded: readonly SupersededConnection[],
+  now: Date,
+): Promise<number> {
+  let revoked = 0;
+  for (const s of superseded) {
+    if (s.vaults === "all") {
+      const [, tokens] = await db.batch([
+        db.prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?").bind(userId, s.clientId),
+        prepareRevokeClientTokens(db, userId, s.clientId, now),
+        db.prepare("DELETE FROM auth_codes WHERE user_id = ? AND client_id = ?").bind(userId, s.clientId),
+      ]);
+      revoked += tokens?.meta.changes ?? 0;
+    } else {
+      for (const v of s.vaults) revoked += (await disconnectVaultClient(db, userId, v, s.clientId, now))?.revokedTokens ?? 0;
+    }
+    // Ids and a count only.
+    console.log(`event=connection_superseded user=${userId} client=${s.clientId} by=${supersededBy}`);
+  }
+  return revoked;
 }
 
 /** GET /account/vaults/<name>/connections */

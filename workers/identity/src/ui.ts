@@ -275,6 +275,8 @@ export function renderLogin(opts: {
 
 export interface ConsentProps {
   params: AuthorizeParams;
+  /** True when Allow replaces this same app's earlier connection to these vaults (T-307, oauth-connections.ts). */
+  replacesEarlier?: boolean;
   csrfToken: string;
   clientName: string;
   scopeDescriptions: Array<{ scope: string; label: string }>;
@@ -504,7 +506,7 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
 }
 
 export function renderConsent(props: ConsentProps): string {
-  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults } = props;
+  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults, replacesEarlier } = props;
   // The plain sentence is the list (T-318 #15: raw `vault:<name>:read` under it
   // read as jargon). A scope with no sentence keeps its raw string here, so no
   // requested scope is ever only in the closed "Technical details" below.
@@ -534,6 +536,7 @@ export function renderConsent(props: ConsentProps): string {
        <p class="lead" data-testid="consent-ask">${ask}</p>
        <ul class="scopes">${scopeList}</ul>
        ${returnsToLine(params.redirectUri)}
+       ${replacesEarlier ? `<p class="muted" data-testid="consent-replaces">This replaces ${esc(clientName)}'s earlier connection here, so it shows once under Connected apps.</p>` : ""}
        <form method="post" action="/oauth/authorize">
          <input type="hidden" name="__action" value="consent">
          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
