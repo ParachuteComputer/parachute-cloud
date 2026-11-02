@@ -886,6 +886,28 @@ describe("storage — R2 round-trip + caps", () => {
     expect(get.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
 
+  // The #257 fix covered curated extensions only. Between the ticket door
+  // landing (d3aaab7, 07-17) and #255 (08-25 on main), a ticket upload stamped
+  // R2 httpMetadata with the caller's `mime_type`, and the mint only refuses
+  // the blocked extensions — so `request-attachment-upload {filename: "x.dat",
+  // mime_type: "text/html"}` left an object this GET still serves as active
+  // content, on my.parachute.computer/vault/*, the SPA's own origin.
+  it.each([
+    ["2026-08-01/page.dat", "text/html"],
+    ["2026-08-01/img.bin", "image/svg+xml"],
+    ["2026-08-01/run.txt2", "text/javascript"],
+    ["2026-08-01/noext", "application/xhtml+xml"],
+  ])("GET never serves an active type from lying R2 httpMetadata on an uncurated extension (%s)", async (rel, lie) => {
+    const v = freshVault();
+    await env.ATTACHMENTS.put(r2Key(v, rel), new TextEncoder().encode("<script>alert(1)</script>"), {
+      httpMetadata: { contentType: lie },
+    });
+    const get = await op(v, `/api/storage/${rel}`);
+    expect(get.status).toBe(200);
+    expect(get.headers.get("Content-Type")).toBe("application/octet-stream");
+    expect(get.headers.get("X-Content-Type-Options")).toBe("nosniff");
+  });
+
   it("disallowed active-content extension (.svg) → 400", async () => {
     const v = freshVault();
     const form = new FormData();
