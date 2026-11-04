@@ -212,6 +212,9 @@ export interface TicketSpendDeps {
    *  (the object is already deleted), null when the write may stand. */
   refuseLateWrite: (key: string) => Promise<Response | null>;
   scheduleTranscription: () => Promise<void>;
+  /** The DO's written-since-import flag (T-379). Only a good ticket sets it: a
+   *  stranger's guess at this bearerless route must not be able to stop a move. */
+  markWritten: () => Promise<void>;
 }
 
 function r2Key(vaultName: string, relativePath: string): string {
@@ -232,6 +235,7 @@ export async function handleTicketSpend(req: Request, ticketId: string, deps: Ti
 async function handleUploadSpend(req: Request, ticketId: string, deps: TicketSpendDeps): Promise<Response> {
   const ticket = await takeValidTicket(deps.provider, ticketId, deps.vaultName, "upload");
   if (!ticket || !ticket.noteId || !ticket.filename || !ticket.mimeType) return ticketNotFound();
+  await deps.markWritten();
 
   // Declared size at mint IS the ceiling this spend enforces (mirrors bun's
   // `declaredMax` exactly) — a ticket somehow minted with no declared size

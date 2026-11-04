@@ -294,7 +294,8 @@ EMAIL_FROM = "noreply@parachute.computer"
 #   OPS_READ_TOKEN        — bearer for GET /ops/daily (operator agent reads the
 #                           daily lines without a browser). Unset → 404.
 #   OPS_RUN_TOKEN         — bearer for POST /ops/snapshot-run (re-run the stale
-#                           vaults' backups now). Unset → 404.
+#                           vaults' backups now) and /ops/vault-import* (move a
+#                           person's vault into their account). Unset → 404.
 #   OPS_DELETE_TOKEN      — bearer for POST /ops/account-delete (erase ONE account
 #                           on its holder's written request). Set only for the
 #                           job that needs it, deleted after. Unset → 404.

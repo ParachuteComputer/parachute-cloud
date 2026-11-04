@@ -359,6 +359,10 @@ export async function deleteVaultD1Rows(
  * upload never lands on a failed restore. The column is TEXT and otherwise
  * only checked for NULL.
  *
+ * `opts.pending: "operator"` (the operator import, ops-vault-import.ts) stamps
+ * {@link OPERATOR_PENDING_PREFIX} the same way: only that door may replay into,
+ * add files to or finish such a vault.
+ *
  * Every insert also mints a `vault_id` (migration 0020) — the immutable
  * identity groundwork for handles/sharing. `randomUUID()` (opaque, 122 bits of
  * randomness) is plenty collision-resistant for this fleet size; a UNIQUE
@@ -369,7 +373,7 @@ export async function createVault(
   rawName: string,
   ownerUserId: string,
   now: Date = new Date(),
-  opts: { importPending?: boolean; pending?: "import" | "restore" } = {},
+  opts: { importPending?: boolean; pending?: "import" | "restore" | "operator" } = {},
 ): Promise<Vault> {
   const check = validateVaultName(rawName);
   if (!check.ok) throw new VaultNameInvalidError(check.reason, rawName);
@@ -377,7 +381,13 @@ export async function createVault(
   const createdAt = now.toISOString();
   const pending = opts.pending ?? (opts.importPending === true ? "import" : undefined);
   const importPendingAt =
-    pending === "restore" ? `${RESTORE_PENDING_PREFIX}${createdAt}` : pending === "import" ? createdAt : null;
+    pending === "restore"
+      ? `${RESTORE_PENDING_PREFIX}${createdAt}`
+      : pending === "operator"
+        ? `${OPERATOR_PENDING_PREFIX}${createdAt}`
+        : pending === "import"
+          ? createdAt
+          : null;
   const vaultId = randomUUID();
   try {
     await db
@@ -407,7 +417,19 @@ export function isRestorePending(v: Vault): boolean {
 
 /** Whether a vault is an unfinished import the import door may replay into again. */
 export function isImportPending(v: Vault): boolean {
-  return v.importPendingAt !== null && !v.importPendingAt.startsWith(RESTORE_PENDING_PREFIX);
+  return (
+    v.importPendingAt !== null &&
+    !v.importPendingAt.startsWith(RESTORE_PENDING_PREFIX) &&
+    !v.importPendingAt.startsWith(OPERATOR_PENDING_PREFIX)
+  );
+}
+
+/** Marks an `import_pending_at` value as the operator import's (see {@link createVault}). */
+export const OPERATOR_PENDING_PREFIX = "operator:";
+
+/** Whether a vault is an operator import not yet finished (ops-vault-import.ts). */
+export function isOperatorImportPending(v: Vault): boolean {
+  return v.importPendingAt !== null && v.importPendingAt.startsWith(OPERATOR_PENDING_PREFIX);
 }
 
 /**

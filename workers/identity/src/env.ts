@@ -137,7 +137,8 @@ export interface Env {
   /**
    * SECRET (`wrangler secret put OPS_RUN_TOKEN`), optional: the bearer for
    * `POST /ops/snapshot-run` (re-run the stale vaults' backups now). Separate
-   * from OPS_READ_TOKEN because it writes. Unset → 404.
+   * from OPS_READ_TOKEN because it writes. Also the bearer for the operator
+   * import, `/ops/vault-import*` (T-379, ops-vault-import.ts). Unset → 404.
    */
   OPS_RUN_TOKEN?: string;
   /**

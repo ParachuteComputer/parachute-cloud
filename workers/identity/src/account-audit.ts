@@ -6,12 +6,21 @@
  *
  * No email and no user id in clear: rows are keyed by {@link auditTargetHash},
  * a salted hash of the (random, purged-with-the-account) user id. `note` is
- * counts and booleans only.
+ * counts and booleans only, with one exception: a `vault_import_*` row (the
+ * operator import, T-379) names the vault and the operator's reference while the
+ * account exists, and the purge takes those two out ({@link scrubOperatorImportNotes}).
  */
 import { randomBase64url, sha256Hex } from "./crypto.ts";
 
 export type AuditActor = "self" | "sweep" | `operator:${string}`;
-export type AuditAction = "delete_requested" | "delete_undone" | "purged";
+export type AuditAction =
+  | "delete_requested"
+  | "delete_undone"
+  | "purged"
+  | "vault_import_started"
+  | "vault_import_finished"
+  | "vault_import_read_token"
+  | "vault_import_abort";
 
 /** Stable per-account key that is not the user id itself. */
 export function auditTargetHash(userId: string): Promise<string> {
@@ -39,6 +48,16 @@ export async function auditStatement(db: D1Database, entry: AuditEntry): Promise
       await auditTargetHash(entry.userId),
       entry.note ? JSON.stringify(entry.note) : null,
     );
+}
+
+/** The purge's statement: the rows it keeps stop naming the vault (see the module note). */
+export async function scrubOperatorImportNotes(db: D1Database, userId: string): Promise<D1PreparedStatement> {
+  return db
+    .prepare(
+      "UPDATE account_audit SET note = json_remove(note, '$.vault', '$.reference') " +
+        "WHERE target_hash = ? AND action IN ('vault_import_started', 'vault_import_finished', 'vault_import_read_token', 'vault_import_abort')",
+    )
+    .bind(await auditTargetHash(userId));
 }
 
 /** Write one audit row, best-effort: a failed audit write is logged loudly but
