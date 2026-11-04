@@ -26,6 +26,18 @@ type ImportStatusBody = { state?: unknown; import_id?: unknown; notes?: unknown;
 const IMPORT_CONFIRM_INTERVAL_MS = 2_000;
 const IMPORT_CONFIRM_BUDGET_MS = 85_000;
 
+/**
+ * Log a failed import forward. Wrapped so a logging failure can NEVER escalate a
+ * handled import error into an unhandled 500 (this worker has no Hono onError).
+ */
+export function logForwardFailed(userId: string, vaultName: string, detail: string): void {
+  try {
+    console.error(`event=import_forward_failed user=${userId} vault=${vaultName} error=${detail}`);
+  } catch {
+    /* a logging error must not propagate */
+  }
+}
+
 export async function forwardImport(
   db: D1Database,
   deps: OAuthDeps,
@@ -42,7 +54,10 @@ export async function forwardImport(
   } catch (err) {
     forwardError = err instanceof Error ? err.message : String(err);
   }
-  if (res?.status === 413) return { kind: "too_large" };
+  if (res?.status === 413) {
+    logForwardFailed(userId, vaultName, "status=413");
+    return { kind: "too_large" };
+  }
   if (res?.ok) {
     const summary = (await res.json().catch(() => ({}))) as {
       notes?: unknown;
@@ -58,6 +73,7 @@ export async function forwardImport(
     return { kind: "landed", notes, skipped };
   }
   const detail = res ? `status=${res.status}` : forwardError;
+  logForwardFailed(userId, vaultName, detail);
   const definite = res !== null && res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
   if (definite) {
     const body = (await res!.clone().json().catch(() => ({}))) as { error_type?: unknown };

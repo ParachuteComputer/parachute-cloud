@@ -1963,14 +1963,23 @@ export class VaultDO extends DurableObject {
 
   /**
    * GET /api/internal/import-check — what the vault holds after an operator
-   * import: notes, attachment rows, and how many of those rows have no file in
-   * R2 yet (T-379). Counts only. Lists the prefix rather than one HEAD per row.
+   * import: notes, attachment rows, how many of those rows have no file in R2
+   * yet (T-379), and `changed_since_import`, non-zero once anyone has written:
+   * imported notes keep their old timestamps, so a note stamped after the replay
+   * began is a write, and a count off the replay's record is a create or a delete
+   * (the operator's retry and abort refuse then). Counts only. Lists the prefix
+   * rather than one HEAD per row.
    */
   private async handleImportCheck(request: Request, vaultName: string): Promise<Response> {
     if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
     const raw = this.raw();
     const notes = raw.exec("SELECT COUNT(*) AS n FROM notes").one().n as number;
     const paths = raw.exec("SELECT DISTINCT path FROM attachments").toArray().map((r) => r.path as string);
+    const rec = (await this.ctx.storage.get<ImportStateRecord>(IMPORT_STATE_KEY)) ?? null;
+    // No replay has started yet: the fresh vault's own welcome notes are not a write.
+    const sinceMs = rec?.started_at ? Date.parse(rec.started_at) : Date.parse(this.config?.createdAt ?? "") + 60_000;
+    const stamped = raw.exec("SELECT COUNT(*) AS n FROM notes WHERE updated_at_ms > ?", sinceMs).one().n as number;
+    const offRecord = rec?.state === "done" && typeof rec.notes === "number" ? Math.abs(notes - rec.notes) : 0;
     const prefix = r2Key(vaultName, "");
     const stored = new Set<string>();
     let cursor: string | undefined;
@@ -1985,6 +1994,7 @@ export class VaultDO extends DurableObject {
       attachments: paths.length,
       files_stored: stored.size,
       missing_files: paths.filter((p) => !stored.has(p)).length,
+      changed_since_import: Math.max(stamped, offRecord),
       r2_bytes: this.r2Bytes,
     });
   }

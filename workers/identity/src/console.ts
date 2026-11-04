@@ -41,7 +41,7 @@
  * connect-your-AI consent without a second login.
  */
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { forwardImport } from "./import-forward.ts";
+import { forwardImport, logForwardFailed } from "./import-forward.ts";
 import { MAX_IMPORT_BYTES, MAX_IMPORT_MIB } from "./import-limit.ts";
 export { MAX_IMPORT_BYTES, MAX_IMPORT_MIB };
 import {
@@ -817,18 +817,6 @@ function importFailedMessage(vaultName: string): string {
 }
 
 /**
- * Log a failed import forward. Wrapped so a logging failure can NEVER escalate a
- * handled import error into an unhandled 500 (this worker has no Hono onError).
- */
-function logImportForwardFailed(userId: string, vaultName: string, detail: string): void {
-  try {
-    console.error(`event=import_forward_failed user=${userId} vault=${vaultName} error=${detail}`);
-  } catch {
-    /* a logging error must not propagate */
-  }
-}
-
-/**
  * Render a friendly import-failure page, falling back to a dependency-free plain
  * response if the console re-render itself throws (its DB reads could hiccup, and
  * there is no Hono onError to catch an escaped exception). Either way the caller
@@ -844,7 +832,7 @@ async function importFailureResponse(
   try {
     return await consoleError(db, req, deps, user, message);
   } catch (err) {
-    logImportForwardFailed(user.id, "-", `render_failed:${err instanceof Error ? err.message : String(err)}`);
+    logForwardFailed(user.id, "-", `render_failed:${err instanceof Error ? err.message : String(err)}`);
     return new Response(message, {
       status: 200,
       headers: { "content-type": "text/plain; charset=UTF-8" },
@@ -985,14 +973,8 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
   //
   // An error here is not proof the import failed (forwardImport asks the vault).
   const outcome = await forwardImport(db, deps, user.id, vaultName, buf, startedMs);
-  if (outcome.kind === "too_large") {
-    logImportForwardFailed(user.id, vaultName, "status=413");
-    return importFailureResponse(db, req, deps, user, importTooLargeMessage());
-  }
-  if (outcome.kind !== "landed") {
-    logImportForwardFailed(user.id, vaultName, outcome.detail);
-    return importFailureResponse(db, req, deps, user, importFailedMessage(vaultName));
-  }
+  if (outcome.kind === "too_large") return importFailureResponse(db, req, deps, user, importTooLargeMessage());
+  if (outcome.kind !== "landed") return importFailureResponse(db, req, deps, user, importFailedMessage(vaultName));
   const { notes, skipped } = outcome;
   // Import succeeded — the vault now holds real content, so CLOSE the retry-
   // reuse gate (a later import naming this vault must get "already taken",
@@ -1002,7 +984,7 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
   try {
     await clearImportPending(db, vaultName, user.id);
   } catch (err) {
-    logImportForwardFailed(user.id, vaultName, `flag_clear_failed:${err instanceof Error ? err.message : String(err)}`);
+    logForwardFailed(user.id, vaultName, `flag_clear_failed:${err instanceof Error ? err.message : String(err)}`);
   }
   console.log(`event=import_completed vault=${vaultName} notes=${notes} skipped_attachments=${skipped}`);
   return redirectResponse(

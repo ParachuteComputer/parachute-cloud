@@ -1,8 +1,11 @@
 /**
  * /ops/vault-import (T-379): the operator AGENT moves a person's vault into the
  * account they signed up for, so the person does nothing beyond signing up.
- * Bearer `OPS_RUN_TOKEN`, the existing operator bearer that writes but cannot
- * erase an account. Unset → null, and the router answers its plain 404.
+ * Bearer `OPS_RUN_TOKEN`, the existing operator bearer. These doors widen it
+ * from "re-run the stale backups" to: say whether an account exists, put a new
+ * vault with chosen content in any proven account, and read or destroy a vault
+ * this door has not finished. It still can't touch a finished vault or erase an
+ * account. Unset → null, and the router answers its plain 404.
  *
  * Consent is the shape of the door. It only ever creates a NEW vault in an
  * account that ALREADY exists, named by email: an unknown address is refused
@@ -10,21 +13,28 @@
  * stamped operator-pending ({@link isOperatorImportPending}), and only while
  * that stamp stands can the operator touch it again:
  *
- *   POST /ops/vault-import             multipart: email, confirm, vault_name, reference,
- *                                      description?, dry_run?, tarball. Creates (or, for a
- *                                      failed earlier attempt, re-replays) and imports.
+ *   POST /ops/vault-import             multipart: email, confirm, vault_name, reference, dry_run?,
+ *                                      tarball. Creates (or, for a failed earlier attempt,
+ *                                      re-replays) and imports.
  *   POST /ops/vault-import/file        multipart: vault_name, path, sha256, file. One attachment
  *                                      binary that did not fit the 50 MiB import.
  *   POST /ops/vault-import/status      JSON: vault_name. Replay state and counts.
  *   POST /ops/vault-import/read-token  JSON: vault_name. A 5-minute read token, for the digest.
- *   POST /ops/vault-import/finish      JSON: email, confirm, vault_name, reference,
- *                                      allow_missing_files?, dry_run?. Clears the stamp.
+ *   POST /ops/vault-import/finish      JSON: email, confirm, vault_name, reference, description?,
+ *                                      allow_missing_files?, dry_run?. Puts the person's
+ *                                      description back, then clears the stamp.
  *   POST /ops/vault-import/abort       JSON: email, confirm, vault_name, reference, dry_run?.
  *                                      Destroys the vault and frees the name.
  *
  * After /finish it is the person's plain vault: every door here refuses it. The
- * read token adds no reach: the operator sent that content in, and can only
- * read it until /finish.
+ * read token adds no reach: the operator sent that content in. One minted just
+ * before /finish lives out its five minutes; it can't be revoked (it is
+ * stateless, so no Connected apps row either), and each mint is audited.
+ *
+ * The vault is in the person's console from the first step, and nothing stops
+ * them writing in it. So a retry, an abort or a read token first asks the vault
+ * whether anything changed since the import, and refuses if it did or if it can't
+ * tell ({@link refuseIfInUse}): what the person wrote is never replaced or read.
  *
  * The address goes in the body, never the URL, and is not logged. Each step that
  * changes something writes an `account_audit` row (who, when, the account's hash,
@@ -65,7 +75,7 @@ import {
 const NO_STORE = { "cache-control": "no-store" };
 const ACTOR = "operator:ops-agent";
 /** Every field /ops/vault-import may carry: a typo must not drop `dry_run` and write. */
-const IMPORT_FIELDS: ReadonlySet<string> = new Set(["email", "confirm", "vault_name", "reference", "description", "dry_run", "tarball"]);
+const IMPORT_FIELDS: ReadonlySet<string> = new Set(["email", "confirm", "vault_name", "reference", "dry_run", "tarball"]);
 /** Room for the multipart framing and the small fields around a full-size file. */
 const FORM_OVERHEAD = 64 * 1024;
 /** A vault description is one short paragraph; refuse a stray file in the field. */
@@ -133,11 +143,6 @@ export async function handleOpsVaultImportPost(env: Env, req: Request, deps: OAu
     return refuse(400, "vault_name_invalid", `vault_name is not usable (${nameCheck.reason}). Nothing changed.`);
   }
   const vaultName = nameCheck.name;
-  const descriptionRaw = form.get("description");
-  const description = typeof descriptionRaw === "string" ? descriptionRaw.replace(/\n+$/, "") : "";
-  if (description.length > MAX_DESCRIPTION_CHARS) {
-    return refuse(400, "invalid_request", `description is over ${MAX_DESCRIPTION_CHARS} characters. Nothing changed.`);
-  }
 
   const user = await getUserByEmail(env.DB, who.email);
   if (!user) return refuse(404, "account_not_found", "No account has this address: they sign up first. Nothing changed.");
@@ -153,6 +158,10 @@ export async function handleOpsVaultImportPost(env: Env, req: Request, deps: OAu
   const vaultLimit = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))].vault_count;
   if (!retry && vaultsOwned >= vaultLimit) {
     return refuse(409, "vault_cap", `This account is at its plan's ${vaultLimit} vaults. Nothing changed.`, { vaults_owned: vaultsOwned, vault_limit: vaultLimit });
+  }
+  if (retry) {
+    const inUse = await refuseIfInUse(env, deps, existing);
+    if (inUse) return inUse;
   }
   if (dryRun) {
     return ok({ dry_run: true, account_found: true, vault_name: vaultName, retry, vaults_owned: vaultsOwned, vault_limit: vaultLimit });
@@ -175,8 +184,9 @@ export async function handleOpsVaultImportPost(env: Env, req: Request, deps: OAu
       }
       throw err;
     }
-    await pushVaultCap(env.DB, deps, user.id, vaultName, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps))));
   }
+  // Best-effort, as at any creation; a retry pushes again in case the first one missed.
+  await pushVaultCap(env.DB, deps, user.id, vaultName, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps))));
   await audit(env, deps, "vault_import_started", user.id, { vault: vaultName, reference: who.reference, tar_bytes: tar.byteLength, retry });
 
   // The name stays reserved however this ends (the console door's reasoning: a
@@ -192,21 +202,6 @@ export async function handleOpsVaultImportPost(env: Env, req: Request, deps: OAu
     return refuse(502, "import_failed", "The import did not land. The name stays reserved; a retry replaces anything that landed.");
   }
 
-  // The import replaces the vault's description with stock text; put the person's back.
-  if (description) {
-    const patched = await callVaultApi(env.DB, deps, {
-      userId: user.id,
-      vaultName,
-      method: "PATCH",
-      apiPath: "/api/vault",
-      verb: "admin",
-      jsonBody: { description },
-    }).catch(() => null);
-    if (!patched?.ok) {
-      console.error(`event=ops_vault_import_description_failed user=${user.id} vault=${vaultName} status=${patched?.status ?? "transport"}`);
-      return refuse(502, "description_failed", "The notes landed but the description did not. A retry converges.", { notes: outcome.notes });
-    }
-  }
   console.log(`event=ops_vault_import user=${user.id} vault=${vaultName} notes=${outcome.notes} skipped_attachments=${outcome.skipped} retry=${retry}`);
   return ok({ imported: true, vault_name: vaultName, notes: outcome.notes, skipped_attachments: outcome.skipped, retry });
 }
@@ -245,12 +240,34 @@ async function pendingVault(env: Env, vaultName: string): Promise<Vault | Respon
 }
 
 /**
+ * Refuse when anything changed in the vault since the import, or when it can't
+ * say: the person may have written there (see the module note). A vault mid-replay
+ * answers 503, which lands here as "can't say" too.
+ */
+async function refuseIfInUse(env: Env, deps: OAuthDeps, vault: Vault): Promise<Response | null> {
+  const check = await importCheck(env, deps, vault);
+  if (!check) {
+    return refuse(409, "vault_state_unknown", "The vault can't say whether it was used since the import. Try again in a moment. Nothing changed.");
+  }
+  const changed = check.changed_since_import ?? 0;
+  if (changed !== 0) {
+    return refuse(409, "vault_in_use", "The vault changed since the import, so the person may have written in it. Talk to them first. Nothing changed.", { changed_since_import: changed });
+  }
+  return null;
+}
+
+/**
  * The operator-pending vault named in a finish/abort body, checked against the
  * address and reference that come with it (so a slip of the name can't close or
  * destroy somebody else's unfinished move).
  */
-async function ownedPendingVault(env: Env, body: Record<string, unknown>): Promise<{ vault: Vault; reference: string; userId: string } | Response> {
-  const unknown = Object.keys(body).filter((k) => !["email", "confirm", "vault_name", "reference", "allow_missing_files", "dry_run"].includes(k));
+async function ownedPendingVault(
+  env: Env,
+  body: Record<string, unknown>,
+  extraFields: string[] = [],
+): Promise<{ vault: Vault; reference: string; userId: string } | Response> {
+  const fields = ["email", "confirm", "vault_name", "reference", "dry_run", ...extraFields];
+  const unknown = Object.keys(body).filter((k) => !fields.includes(k));
   if (unknown.length > 0) {
     return refuse(400, "invalid_request", `unknown field(s): ${unknown.slice(0, 5).map((k) => JSON.stringify(k.slice(0, 40))).join(", ")}. Nothing changed.`);
   }
@@ -302,22 +319,44 @@ export async function handleOpsVaultImportFile(env: Env, req: Request, deps: OAu
   return new Response(res.body, { status: res.status, headers: { "content-type": "application/json", ...NO_STORE } });
 }
 
-/** The vault's own answers about the import: replay state, and counts when it isn't mid-replay. */
-async function vaultImportFacts(env: Env, deps: OAuthDeps, vault: Vault): Promise<{ state: string; replay: Record<string, unknown>; check: Record<string, number> | null }> {
-  const status = await callVaultImportStatus(env.DB, deps, vault.ownerUserId, vault.name).catch(() => null);
-  const replay = status?.ok ? ((await status.json().catch(() => ({}))) as Record<string, unknown>) : {};
-  const check = await callVaultApi(env.DB, deps, {
+/** The vault's counts (GET /api/internal/import-check), or null while it won't answer. */
+async function importCheck(env: Env, deps: OAuthDeps, vault: Vault): Promise<Record<string, number> | null> {
+  const res = await callVaultApi(env.DB, deps, {
     userId: vault.ownerUserId,
     vaultName: vault.name,
     method: "GET",
     apiPath: "/api/internal/import-check",
     verb: "admin",
   }).catch(() => null);
+  return res?.ok ? ((await res.json().catch(() => null)) as Record<string, number> | null) : null;
+}
+
+/** The vault's own answers about the import: replay state, and counts when it isn't mid-replay. */
+async function vaultImportFacts(env: Env, deps: OAuthDeps, vault: Vault): Promise<{ state: string; check: Record<string, number> | null }> {
+  const status = await callVaultImportStatus(env.DB, deps, vault.ownerUserId, vault.name).catch(() => null);
+  const replay = status?.ok ? ((await status.json().catch(() => ({}))) as Record<string, unknown>) : {};
   return {
     state: typeof replay.state === "string" ? replay.state : "unknown",
-    replay,
-    check: check?.ok ? ((await check.json().catch(() => null)) as Record<string, number> | null) : null,
+    check: await importCheck(env, deps, vault),
   };
+}
+
+/** PATCH the description, then read it back: `description_failed` rather than a vault with stock text. */
+async function restoreDescription(env: Env, deps: OAuthDeps, vault: Vault, description: string): Promise<boolean> {
+  const call = (method: "GET" | "PATCH", jsonBody?: unknown) =>
+    callVaultApi(env.DB, deps, {
+      userId: vault.ownerUserId,
+      vaultName: vault.name,
+      method,
+      apiPath: "/api/vault",
+      verb: "admin",
+      ...(jsonBody !== undefined ? { jsonBody } : {}),
+    }).catch(() => null);
+  const patched = await call("PATCH", { description });
+  if (!patched?.ok) return false;
+  const back = await call("GET");
+  if (!back?.ok) return false;
+  return ((await back.json().catch(() => ({}))) as { description?: unknown }).description === description;
 }
 
 export async function handleOpsVaultImportStatus(env: Env, req: Request, deps: OAuthDeps): Promise<Response | null> {
@@ -343,6 +382,9 @@ export async function handleOpsVaultImportReadToken(env: Env, req: Request, deps
   if (name instanceof Response) return name;
   const vault = await pendingVault(env, name);
   if (vault instanceof Response) return vault;
+  const inUse = await refuseIfInUse(env, deps, vault);
+  if (inUse) return inUse;
+  await audit(env, deps, "vault_import_read_token", vault.ownerUserId, { vault: vault.name, expires_in: READ_TOKEN_TTL_SECONDS });
   const signed = await signAccessToken(env.DB, {
     sub: vault.ownerUserId,
     scopes: [`vault:${vault.name}:read`],
@@ -361,8 +403,15 @@ export async function handleOpsVaultImportFinish(env: Env, req: Request, deps: O
   if (refused !== undefined) return refused;
   const body = await jsonBody(req);
   if (body instanceof Response) return body;
-  const target = await ownedPendingVault(env, body);
+  const target = await ownedPendingVault(env, body, ["allow_missing_files", "description"]);
   if (target instanceof Response) return target;
+  if (body.description !== undefined && typeof body.description !== "string") {
+    return refuse(400, "invalid_request", "description must be a string. Nothing changed.");
+  }
+  const description = (body.description ?? "").replace(/\n+$/, "");
+  if (description.length > MAX_DESCRIPTION_CHARS) {
+    return refuse(400, "invalid_request", `description is over ${MAX_DESCRIPTION_CHARS} characters. Nothing changed.`);
+  }
   const allowed = body.allow_missing_files ?? 0;
   if (typeof allowed !== "number" || !Number.isSafeInteger(allowed) || allowed < 0) {
     return refuse(400, "invalid_request", "allow_missing_files must be a whole number. Nothing changed.");
@@ -378,10 +427,15 @@ export async function handleOpsVaultImportFinish(env: Env, req: Request, deps: O
     return refuse(409, "files_missing", `${missing} attachment file(s) are missing; allow_missing_files says ${allowed}. Nothing changed.`, { missing_files: missing });
   }
   if (body.dry_run === true) return ok({ dry_run: true, would_finish: true, vault_name: vault.name, notes, attachments, missing_files: missing });
+  // The import replaces the vault's description with stock text; put the person's back.
+  if (description && !(await restoreDescription(env, deps, vault, description))) {
+    console.error(`event=ops_vault_import_description_failed user=${userId} vault=${vault.name}`);
+    return refuse(502, "description_failed", "The description did not take. The vault stays unfinished; finish again.");
+  }
   await audit(env, deps, "vault_import_finished", userId, { vault: vault.name, reference, notes, attachments, missing_files: missing });
   await clearImportPending(env.DB, vault.name, userId);
   console.log(`event=ops_vault_import_finished user=${userId} vault=${vault.name} notes=${notes} attachments=${attachments} missing_files=${missing}`);
-  return ok({ finished: true, vault_name: vault.name, notes, attachments, missing_files: missing });
+  return ok({ finished: true, vault_name: vault.name, notes, attachments, missing_files: missing, description_set: description !== "" });
 }
 
 export async function handleOpsVaultImportAbort(env: Env, req: Request, deps: OAuthDeps): Promise<Response | null> {
@@ -392,14 +446,17 @@ export async function handleOpsVaultImportAbort(env: Env, req: Request, deps: OA
   const target = await ownedPendingVault(env, body);
   if (target instanceof Response) return target;
   const { vault, reference, userId } = target;
+  const inUse = await refuseIfInUse(env, deps, vault);
+  if (inUse) return inUse;
   if (body.dry_run === true) return ok({ dry_run: true, would_abort: true, vault_name: vault.name });
+  // On the record first: past this point the vault may be gone, and a repeat call gets 404.
+  await audit(env, deps, "vault_import_abort", userId, { vault: vault.name, reference });
   const outcome = await readDestroyOutcome(await callVaultDestroy(env.DB, deps, userId, vault.name));
   if (!outcome.ok) {
     console.error(`event=ops_vault_import_abort_failed user=${userId} vault=${vault.name} reason=${outcome.reason}`);
     return refuse(502, "destroy_failed", "The vault did not destroy. The row stays, so a second call converges.");
   }
   await deleteVaultD1Rows(env.DB, userId, vault.name, deps.now?.() ?? new Date());
-  await audit(env, deps, "vault_import_aborted", userId, { vault: vault.name, reference, r2_objects_deleted: outcome.r2ObjectsDeleted });
   console.log(`event=ops_vault_import_aborted user=${userId} vault=${vault.name} r2_objects_deleted=${outcome.r2ObjectsDeleted}`);
   return ok({ aborted: true, vault_name: vault.name, r2_objects_deleted: outcome.r2ObjectsDeleted });
 }

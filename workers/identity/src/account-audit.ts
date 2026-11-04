@@ -19,7 +19,8 @@ export type AuditAction =
   | "purged"
   | "vault_import_started"
   | "vault_import_finished"
-  | "vault_import_aborted";
+  | "vault_import_read_token"
+  | "vault_import_abort";
 
 /** Stable per-account key that is not the user id itself. */
 export function auditTargetHash(userId: string): Promise<string> {
@@ -54,7 +55,7 @@ export async function scrubOperatorImportNotes(db: D1Database, userId: string): 
   return db
     .prepare(
       "UPDATE account_audit SET note = json_remove(note, '$.vault', '$.reference') " +
-        "WHERE target_hash = ? AND action IN ('vault_import_started', 'vault_import_finished', 'vault_import_aborted')",
+        "WHERE target_hash = ? AND action IN ('vault_import_started', 'vault_import_finished', 'vault_import_read_token', 'vault_import_abort')",
     )
     .bind(await auditTargetHash(userId));
 }
