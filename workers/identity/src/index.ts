@@ -47,6 +47,14 @@ import { handleOpsDailyGet, handleOpsSnapshotRunPost, runDailyLine } from "./ops
 import { bumpOpsCounter } from "./ops-counters.ts";
 import { handleAdminDeleteGet, handleAdminDeletePost } from "./admin-delete.ts";
 import { handleOpsAccountDeletePost } from "./ops-account-delete.ts";
+import {
+  handleOpsVaultImportAbort,
+  handleOpsVaultImportFile,
+  handleOpsVaultImportFinish,
+  handleOpsVaultImportPost,
+  handleOpsVaultImportReadToken,
+  handleOpsVaultImportStatus,
+} from "./ops-vault-import.ts";
 import { handleTestAccountDeleteReport, handleTestAccountDeleteSweep } from "./account-delete-hooks.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
 import { accountDescriptor } from "./account-descriptor.ts";
@@ -523,6 +531,15 @@ app.post("/ops/snapshot-run", async (c) =>
 app.post("/ops/account-delete", async (c) =>
   (await handleOpsAccountDeletePost(c.env, c.req.raw, depsFor(c.env), senderFor(c.env))) ?? c.notFound(),
 );
+
+// Move a person's vault into their existing account (T-379, ops-vault-import.ts):
+// bearer OPS_RUN_TOKEN. Unset → 404.
+app.post("/ops/vault-import", async (c) => (await handleOpsVaultImportPost(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+app.post("/ops/vault-import/file", async (c) => (await handleOpsVaultImportFile(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+app.post("/ops/vault-import/status", async (c) => (await handleOpsVaultImportStatus(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+app.post("/ops/vault-import/read-token", async (c) => (await handleOpsVaultImportReadToken(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+app.post("/ops/vault-import/finish", async (c) => (await handleOpsVaultImportFinish(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+app.post("/ops/vault-import/abort", async (c) => (await handleOpsVaultImportAbort(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
 
 // Staging/dev-only deletion-proof hooks (T-318, account-delete-hooks.ts) —
 // same allowlist gate as the triggers above (404 off staging|development|test,

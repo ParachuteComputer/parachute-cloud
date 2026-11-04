@@ -90,7 +90,7 @@ export async function callVaultApi(
   opts: {
     userId: string;
     vaultName: string;
-    method: "GET" | "POST" | "PUT";
+    method: "GET" | "POST" | "PUT" | "PATCH";
     apiPath: string;
     /** "read" for read-only calls (the console export door); "write" for
      *  content calls (notes); "admin" for the internal config seam AND pack

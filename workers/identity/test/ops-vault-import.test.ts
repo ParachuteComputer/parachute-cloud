@@ -244,7 +244,7 @@ describe("/ops/vault-import — the gate", () => {
     await createVault(env.DB, "other-operator", other, new Date(), { pending: "operator" });
     for (const name of ["own-real-vault", "someone-elses", "own-console-retry", "own-restore", "other-operator"]) {
       const before = await getVault(env.DB, name);
-      for (const extra of [{}, { dry_run: "true" }]) {
+      for (const extra of [{}, { dry_run: "true" }] as Array<Record<string, string>>) {
         const { res, body, vault } = await runImport(person("existing-import@example.com", name, extra));
         expect(res.status, name).toBe(409);
         expect(body.error).toBe("vault_name_taken");

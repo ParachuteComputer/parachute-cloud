@@ -60,7 +60,7 @@ import { makeStripe } from "./stripe-client.ts";
 import { type User, getUserById } from "./users.ts";
 import { applyPlanToVaults, callVaultDestroy, pushVaultsClosed, readDestroyOutcome } from "./vault-call.ts";
 import { deleteVaultD1Rows, listVaultsForOwner } from "./vaults.ts";
-import { type AuditActor, auditStatement, recordAudit } from "./account-audit.ts";
+import { type AuditActor, auditStatement, recordAudit, scrubOperatorImportNotes } from "./account-audit.ts";
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { frontDoorOrigin, htmlResponse, isSameOriginRequest, resolveBoundOrigins } from "./oauth-shared.ts";
 import { humanUtc, renderUndoConfirm, renderUndoDone, renderUndoProblem } from "./account-delete-ui.ts";
@@ -973,6 +973,7 @@ async function purgeAccountRows(
       .prepare("DELETE FROM owners WHERE kind = 'user' AND owner_id = (SELECT owner_id FROM users WHERE id = ?)")
       .bind(userId),
     db.prepare("DELETE FROM users WHERE id = ?").bind(userId),
+    await scrubOperatorImportNotes(db, userId),
     // The record that this happened, in the same atomic batch as the erasure
     // it describes (account-audit.ts — hashed target, counts only).
     audit,

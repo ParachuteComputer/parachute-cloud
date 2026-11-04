@@ -19,7 +19,7 @@ import { base, createNote, freshVault, mintToken, op } from "./helpers.ts";
 
 const BYTES = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
 
-async function sha256(b: Uint8Array): Promise<string> {
+async function sha256(b: Uint8Array<ArrayBuffer>): Promise<string> {
   const d = new Uint8Array(await crypto.subtle.digest("SHA-256", b));
   return [...d].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
@@ -65,7 +65,7 @@ async function importInto(vault: string, tar: Uint8Array): Promise<Response> {
 
 async function sendFile(
   vault: string,
-  fields: { path: string; sha256?: string; bytes?: Uint8Array },
+  fields: { path: string; sha256?: string; bytes?: Uint8Array<ArrayBuffer> },
   token?: string,
 ): Promise<Response> {
   const bytes = fields.bytes ?? BYTES;
@@ -105,7 +105,7 @@ async function imported(): Promise<{ vault: string; path: string }> {
 describe("import-file (T-379)", () => {
   it("lands the binary where the vault serves it, meters it, and import-check sees it", async () => {
     const { vault, path } = await imported();
-    expect(await check(vault)).toMatchObject({ notes: 1, attachments: 1, missing_files: 1 });
+    expect(await check(vault)).toMatchObject({ attachments: 1, files_stored: 0, missing_files: 1 });
     expect((await op(vault, `/api/storage/${path}`)).status).toBe(404);
     const before = await meter(vault);
 
@@ -117,7 +117,7 @@ describe("import-file (T-379)", () => {
     expect(served.status).toBe(200);
     expect(new Uint8Array(await served.arrayBuffer())).toEqual(BYTES);
     expect(await meter(vault)).toBe(before + BYTES.length);
-    expect(await check(vault)).toMatchObject({ notes: 1, attachments: 1, missing_files: 0 });
+    expect(await check(vault)).toMatchObject({ attachments: 1, files_stored: 1, missing_files: 0 });
   });
 
   it("the same bytes again are a no-op; different bytes never overwrite", async () => {

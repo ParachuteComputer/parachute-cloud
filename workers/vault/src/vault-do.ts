@@ -451,6 +451,15 @@ function accountClosedResponse(): Response {
   );
 }
 
+/** Room for the multipart framing around one file at MAX_IMPORT_BYTES (T-379). */
+const IMPORT_FILE_FORM_OVERHEAD = 64 * 1024;
+
+/** Lowercase hex of a digest; "" when there is none (an object written without a sha256). */
+function hexOf(digest: ArrayBuffer | undefined): string {
+  if (!digest) return "";
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** 503 while the import lock is held (T-318). The console re-checks via import-status. */
 function importInProgressResponse(): Response {
   const res = json(
@@ -1084,6 +1093,8 @@ export class VaultDO extends DurableObject {
       if (apiPath === "/internal/restore") return this.handleRestore(request, vaultName);
       if (apiPath === "/internal/import") return this.handleImport(request, vaultName);
       if (apiPath === "/internal/import-status") return this.handleImportStatus(request);
+      if (apiPath === "/internal/import-file") return this.handleImportFile(request, vaultName);
+      if (apiPath === "/internal/import-check") return this.handleImportCheck(request, vaultName);
       return json({ error: "Not found" }, 404);
     }
 
@@ -1899,6 +1910,83 @@ export class VaultDO extends DurableObject {
     if (!rec) return json({ state: "none" });
     if (rec.state === "running") return json({ ...rec, state: "interrupted" });
     return json(rec);
+  }
+
+  /**
+   * POST /api/internal/import-file — one attachment binary that did not fit the
+   * 50 MiB import (T-379; identity's /ops/vault-import/file). Multipart: `path`,
+   * `sha256`, `file`. The path must be one the vault already has a row for, the
+   * bytes must match the digest, and it never overwrites: the same bytes again
+   * answer 200 `already` (a retry), different ones 409. Body fields, not the URL,
+   * so a file's name stays out of the request logs.
+   */
+  private async handleImportFile(request: Request, vaultName: string): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    const declared = Number(request.headers.get("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > MAX_IMPORT_BYTES + IMPORT_FILE_FORM_OVERHEAD) {
+      await request.body?.cancel().catch(() => {});
+      return this.importTooLargeResponse();
+    }
+    const form = await request.formData().catch(() => null);
+    if (!form) return json({ error: "Could not read the file", error_type: "import_read_failed" }, 400);
+    const path = form.get("path");
+    const sha256 = form.get("sha256");
+    const file = form.get("file");
+    if (typeof path !== "string" || !path || typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256) || !(file instanceof File)) {
+      return json({ error: "path, sha256 (hex) and file are required", error_type: "import_file_invalid" }, 400);
+    }
+    if (file.size > MAX_IMPORT_BYTES) return this.importTooLargeResponse();
+    const known = this.raw().exec("SELECT 1 FROM attachments WHERE path = ? LIMIT 1", path).toArray().length > 0;
+    if (!known) return json({ error: "No attachment row has this path", error_type: "import_file_unknown" }, 404);
+
+    const key = r2Key(vaultName, path);
+    const existing = await this.env.ATTACHMENTS.head(key);
+    if (existing) {
+      if (existing.size === file.size && hexOf(existing.checksums.sha256) === sha256) {
+        return json({ written: false, already: true, size: existing.size });
+      }
+      return json({ error: "A different file is already stored at this path", error_type: "import_file_conflict" }, 409);
+    }
+    const gated = this.attachmentMintGate(file.size);
+    if (gated) return gated;
+    const bytes = await file.arrayBuffer();
+    if (hexOf(await crypto.subtle.digest("SHA-256", bytes)) !== sha256) {
+      return json({ error: "The file does not match its sha256", error_type: "import_file_digest" }, 400);
+    }
+    const contentType = MIME_TYPES[extLower(path)] ?? "application/octet-stream";
+    await this.env.ATTACHMENTS.put(key, bytes, { httpMetadata: { contentType }, sha256 });
+    const late = await this.refuseLateWrite(vaultName, key);
+    if (late) return late;
+    await this.meterAdd(bytes.byteLength);
+    return json({ written: true, size: bytes.byteLength }, 201);
+  }
+
+  /**
+   * GET /api/internal/import-check — what the vault holds after an operator
+   * import: notes, attachment rows, and how many of those rows have no file in
+   * R2 yet (T-379). Counts only. Lists the prefix rather than one HEAD per row.
+   */
+  private async handleImportCheck(request: Request, vaultName: string): Promise<Response> {
+    if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+    const raw = this.raw();
+    const notes = raw.exec("SELECT COUNT(*) AS n FROM notes").one().n as number;
+    const paths = raw.exec("SELECT DISTINCT path FROM attachments").toArray().map((r) => r.path as string);
+    const prefix = r2Key(vaultName, "");
+    const stored = new Set<string>();
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.env.ATTACHMENTS.list({ prefix, ...(cursor ? { cursor } : {}) });
+      for (const o of page.objects) stored.add(o.key.slice(prefix.length));
+      if (!page.truncated) break;
+      cursor = page.cursor;
+    }
+    return json({
+      notes,
+      attachments: paths.length,
+      files_stored: stored.size,
+      missing_files: paths.filter((p) => !stored.has(p)).length,
+      r2_bytes: this.r2Bytes,
+    });
   }
 
   /** The import replay proper, under the import lock (see {@link underImportLock}). */
