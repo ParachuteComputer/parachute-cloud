@@ -348,6 +348,20 @@ async function main() {
       "PRODUCTION: /ops/account-delete without a bearer is refused (404 unset / 401 set)",
       `status ${opsDelete.status}`,
     );
+    // The operator import (T-379) never answers without its bearer, on any of
+    // its doors. A dry run, so even a broken gate would only read.
+    for (const door of ["", "/file", "/status", "/read-token", "/finish", "/abort"]) {
+      const r = await fetch(`${IDENTITY}/ops/vault-import${door}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ vault_name: "smoke-prod-probe", dry_run: true }),
+      });
+      assert(
+        r.status === 404 || r.status === 401,
+        `PRODUCTION: /ops/vault-import${door} without a bearer is refused (404 unset / 401 set)`,
+        `status ${r.status}`,
+      );
+    }
     // T-318 deletion-proof hooks: a scoped purge fast-forward and a footprint
     // report — both must not exist in production.
     for (const hook of ["/__test/account-delete/sweep", "/__test/account-delete/report"]) {
