@@ -8,7 +8,9 @@
  *   - a retry of the same bytes is a no-op; different bytes never overwrite;
  *   - it is platform-only (a tenant's own admin token gets 403), and the import
  *     lock refuses it mid-replay.
- * GET /api/internal/import-check answers how many rows still lack their file.
+ * GET /api/internal/import-check answers how many rows still lack their file,
+ * and whether anyone has written since the import: the operator's retry and
+ * abort must never replace what the person wrote.
  */
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
@@ -160,6 +162,42 @@ describe("import-file (T-379)", () => {
       headers: { authorization: `Bearer ${tenant}` },
     });
     expect(checked.status).toBe(403);
+  });
+
+  it("a re-import empties the files and the meter, and import-check says so", async () => {
+    const { vault, path } = await imported();
+    expect((await sendFile(vault, { path })).status).toBe(201);
+    expect(await check(vault)).toMatchObject({ missing_files: 0 });
+
+    const { tar } = await notesOnlyTar();
+    expect((await importInto(vault, tar)).status).toBe(200);
+    expect(await env.ATTACHMENTS.head(`vault-${vault}/attachments/${path}`)).toBeNull();
+    expect(await meter(vault)).toBe(0);
+    expect(await check(vault)).toMatchObject({ files_stored: 0 });
+  });
+
+  it("import-check counts a person's writes after the import: a new note, an edit, a delete", async () => {
+    const { vault } = await imported();
+    expect(await check(vault)).toMatchObject({ changed_since_import: 0 });
+
+    const created = await createNote(vault, { content: "written by the person after the move", path: "notes/mine" });
+    expect((await check(vault)).changed_since_import).toBeGreaterThan(0);
+
+    const edit = await imported();
+    const list = (await (await op(edit.vault, "/api/notes?limit=1")).json()) as Array<{ id: string }>;
+    const patched = await op(edit.vault, `/api/notes/${list[0]!.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "edited by the person", force: true }),
+    });
+    expect(patched.status).toBe(200);
+    expect((await check(edit.vault)).changed_since_import).toBeGreaterThan(0);
+
+    const del = await imported();
+    const some = (await (await op(del.vault, "/api/notes?limit=1")).json()) as Array<{ id: string }>;
+    expect((await op(del.vault, `/api/notes/${some[0]!.id}`, { method: "DELETE" })).ok).toBe(true);
+    expect((await check(del.vault)).changed_since_import).toBeGreaterThan(0);
+    expect(created.id).toBeTruthy();
   });
 
   it("the import lock refuses a file while a replay runs", async () => {
