@@ -95,13 +95,13 @@ async function meter(vault: string): Promise<number> {
 }
 
 /** A fresh vault holding the notes-only import; the file not sent yet. */
-async function imported(): Promise<{ vault: string; path: string }> {
+async function imported(): Promise<{ vault: string; path: string; tar: Uint8Array }> {
   const { tar, path } = await notesOnlyTar();
   const vault = freshVault("ift");
   const res = await importInto(vault, tar);
   expect(res.status).toBe(200);
   expect(((await res.json()) as { stats: { skipped_attachments: number } }).stats.skipped_attachments).toBe(1);
-  return { vault, path };
+  return { vault, path, tar };
 }
 
 describe("import-file (T-379)", () => {
@@ -212,6 +212,14 @@ describe("import-file (T-379)", () => {
       }],
       ["a tag schema", (v) => op(v, "/api/tags/mine", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ description: "mine" }) })],
       ["the description", (v) => op(v, "/api/vault", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ description: "mine" }) })],
+      ["an MCP call to the root door", async (v) => {
+        const token = await mintToken({ vault: v, scopes: `vault:${v}:write`, vaultScope: [v], clientId: "some-ai" });
+        return SELF.fetch(`${new URL(base(v)).origin}/mcp`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "create-note", arguments: { content: "mine" } } }),
+        });
+      }],
       ["an MCP call", async (v) => {
         const token = await mintToken({ vault: v, scopes: `vault:${v}:write`, vaultScope: [v], clientId: "some-ai" });
         return SELF.fetch(`${base(v)}/mcp`, {
@@ -234,6 +242,46 @@ describe("import-file (T-379)", () => {
         expect(await written(vault)).toBe(true);
       });
     }
+
+    it("a ticket: a stranger's request doesn't count, a real spend does, even one minted before a replay", async () => {
+      const { vault, tar } = await imported();
+      // No credential, no such ticket: answers 404, and must not be able to stop a move.
+      for (const method of ["PUT", "POST"]) {
+        const stranger = await SELF.fetch(`${base(vault)}/tickets/nonsense`, { method, body: new Uint8Array([1]) });
+        expect(stranger.status).toBe(404);
+      }
+      expect(await written(vault)).toBe(false);
+
+      const [n] = (await (await SELF.fetch(`${base(vault)}/api/notes?limit=1`, {
+        headers: { authorization: `Bearer ${await mintToken({ vault, scopes: `vault:${vault}:read`, vaultScope: [vault], clientId: "reader" })}` },
+      })).json()) as Array<{ id: string }>;
+      const token = await mintToken({ vault, scopes: `vault:${vault}:write`, vaultScope: [vault], clientId: "some-ai" });
+      const minted = await SELF.fetch(`${base(vault)}/mcp`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "request-attachment-upload", arguments: { note_id: n!.id, filename: "mine.png", mime_type: "image/png", size_bytes: 2 } },
+        }),
+      });
+      const raw = await minted.text();
+      const frame = JSON.parse(raw.split("\n").find((l) => l.startsWith("data: "))?.slice(6) ?? raw) as { result: { content: Array<{ text: string }> } };
+      const ticket = JSON.parse(frame.result.content[0]!.text) as { url: string };
+      expect(await written(vault)).toBe(true);
+
+      // A replay starts the count again; the ticket minted before it is still good.
+      expect((await importInto(vault, tar)).status).toBe(200);
+      expect(await written(vault)).toBe(false);
+      const spent = await SELF.fetch(`${base(vault)}${new URL(ticket.url).pathname.replace(`/vault/${vault}`, "")}`, {
+        method: "PUT",
+        body: new Uint8Array([3, 3]),
+      });
+      expect(spent.status).toBeLessThan(300);
+      await spent.body?.cancel();
+      expect(await written(vault)).toBe(true);
+    });
 
     it("a guarded re-import refuses once written, under the lock, and what was written stays", async () => {
       const { vault } = await imported();
