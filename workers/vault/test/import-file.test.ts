@@ -17,7 +17,7 @@ import { describe, expect, it } from "vitest";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { toTar } from "../src/export.ts";
 import { parseTarBinary } from "../src/restore.ts";
-import { base, createNote, freshVault, mintToken, op } from "./helpers.ts";
+import { OP, base, createNote, freshVault, mintToken, op } from "./helpers.ts";
 
 const BYTES = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
 
@@ -255,19 +255,17 @@ describe("import-file (T-379)", () => {
       const [n] = (await (await SELF.fetch(`${base(vault)}/api/notes?limit=1`, {
         headers: { authorization: `Bearer ${await mintToken({ vault, scopes: `vault:${vault}:read`, vaultScope: [vault], clientId: "reader" })}` },
       })).json()) as Array<{ id: string }>;
-      const token = await mintToken({ vault, scopes: `vault:${vault}:write`, vaultScope: [vault], clientId: "some-ai" });
       const minted = await SELF.fetch(`${base(vault)}/mcp`, {
         method: "POST",
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        headers: { authorization: `Bearer ${OP}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
         body: JSON.stringify({
           jsonrpc: "2.0",
           id: 1,
           method: "tools/call",
-          params: { name: "request-attachment-upload", arguments: { note_id: n!.id, filename: "mine.png", mime_type: "image/png", size_bytes: 2 } },
+          params: { name: "request-attachment-upload", arguments: { note: n!.id, filename: "mine.png", size_bytes: 2, mime_type: "image/png" } },
         }),
       });
-      const raw = await minted.text();
-      const frame = JSON.parse(raw.split("\n").find((l) => l.startsWith("data: "))?.slice(6) ?? raw) as { result: { content: Array<{ text: string }> } };
+      const frame = (await minted.json()) as { result: { content: Array<{ text: string }> } };
       const ticket = JSON.parse(frame.result.content[0]!.text) as { url: string };
       expect(await written(vault)).toBe(true);
 

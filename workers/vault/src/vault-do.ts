@@ -945,7 +945,6 @@ export class VaultDO extends DurableObject {
         return ticketNotFound();
       }
       const ticketId = decodeURIComponent(ticketMatch[1]!);
-      if (request.method !== "GET" && request.method !== "HEAD") await this.markWritten();
       return handleTicketSpend(request, ticketId, {
         vaultName,
         store: this.store,
@@ -955,6 +954,7 @@ export class VaultDO extends DurableObject {
         meterAdd: (bytes) => this.meterAdd(bytes),
         refuseLateWrite: (key) => this.refuseLateWrite(vaultName, key),
         scheduleTranscription: () => this.scheduleTranscriptionAlarm(),
+        markWritten: () => this.markWritten(),
       });
     }
 
