@@ -82,7 +82,7 @@ async function sendFile(
   });
 }
 
-async function check(vault: string): Promise<Record<string, number>> {
+async function check(vault: string): Promise<Record<string, any>> {
   const r = await SELF.fetch(`${base(vault)}/api/internal/import-check`, {
     headers: { authorization: `Bearer ${await firstParty(vault)}` },
   });
@@ -176,28 +176,125 @@ describe("import-file (T-379)", () => {
     expect(await check(vault)).toMatchObject({ files_stored: 0 });
   });
 
-  it("import-check counts a person's writes after the import: a new note, an edit, a delete", async () => {
-    const { vault } = await imported();
-    expect(await check(vault)).toMatchObject({ changed_since_import: 0 });
+  describe("written_since_import", () => {
+    const written = async (vault: string) => (await check(vault)).written_since_import;
 
-    const created = await createNote(vault, { content: "written by the person after the move", path: "notes/mine" });
-    expect((await check(vault)).changed_since_import).toBeGreaterThan(0);
-
-    const edit = await imported();
-    const list = (await (await op(edit.vault, "/api/notes?limit=1")).json()) as Array<{ id: string }>;
-    const patched = await op(edit.vault, `/api/notes/${list[0]!.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: "edited by the person", force: true }),
+    it("stays false for a read, a file from the operator, and the platform's own description write", async () => {
+      const { vault, path } = await imported();
+      expect(await written(vault)).toBe(false);
+      const reader = await mintToken({ vault, scopes: `vault:${vault}:read`, vaultScope: [vault], clientId: "parachute-ops-import" });
+      const read = await SELF.fetch(`${base(vault)}/api/notes?limit=1`, { headers: { authorization: `Bearer ${reader}` } });
+      expect(read.status).toBe(200);
+      expect((await sendFile(vault, { path })).status).toBe(201);
+      const patched = await SELF.fetch(`${base(vault)}/api/vault`, {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${await firstParty(vault)}`, "content-type": "application/json" },
+        body: JSON.stringify({ description: "their own words" }),
+      });
+      expect(patched.status).toBe(200);
+      expect(await written(vault)).toBe(false);
     });
-    expect(patched.status).toBe(200);
-    expect((await check(edit.vault)).changed_since_import).toBeGreaterThan(0);
 
-    const del = await imported();
-    const some = (await (await op(del.vault, "/api/notes?limit=1")).json()) as Array<{ id: string }>;
-    expect((await op(del.vault, `/api/notes/${some[0]!.id}`, { method: "DELETE" })).ok).toBe(true);
-    expect((await check(del.vault)).changed_since_import).toBeGreaterThan(0);
-    expect(created.id).toBeTruthy();
+    // Every kind of write a person or their AI can make; none of these need move a note's timestamp.
+    const writes: Array<[string, (vault: string) => Promise<Response>]> = [
+      ["a new note", (v) => op(v, "/api/notes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: "mine", path: "notes/mine" }) })],
+      ["a delete", async (v) => {
+        const [n] = (await (await op(v, "/api/notes?limit=1")).json()) as Array<{ id: string }>;
+        return op(v, `/api/notes/${n!.id}`, { method: "DELETE" });
+      }],
+      ["a file attached with no edit to the note", async (v) => {
+        const form = new FormData();
+        form.set("file", new File([new Uint8Array([3, 3])], "mine.png", { type: "image/png" }));
+        const up = await op(v, "/api/storage/upload", { method: "POST", body: form });
+        const { path } = (await up.json()) as { path: string };
+        const [n] = (await (await op(v, "/api/notes?limit=1")).json()) as Array<{ id: string }>;
+        return op(v, `/api/notes/${n!.id}/attachments`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, mimeType: "image/png" }) });
+      }],
+      ["a tag schema", (v) => op(v, "/api/tags/mine", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ description: "mine" }) })],
+      ["the description", (v) => op(v, "/api/vault", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ description: "mine" }) })],
+      ["an MCP call", async (v) => {
+        const token = await mintToken({ vault: v, scopes: `vault:${v}:write`, vaultScope: [v], clientId: "some-ai" });
+        return SELF.fetch(`${base(v)}/mcp`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "create-note", arguments: { content: "mine" } } }),
+        });
+      }],
+    ];
+    for (const [name, write] of writes) {
+      it(`turns true on ${name}, and stays true after a reset`, async () => {
+        const { vault } = await imported();
+        const res = await write(vault);
+        expect(res.status, name).toBeLessThan(300);
+        await res.body?.cancel();
+        expect(await written(vault)).toBe(true);
+        await runInDurableObject<DurableObject, void>(doStub(vault), async (inst: any) => {
+          inst.writtenSinceImport = undefined;
+        });
+        expect(await written(vault)).toBe(true);
+      });
+    }
+
+    it("a guarded re-import refuses once written, under the lock, and what was written stays", async () => {
+      const { vault } = await imported();
+      const { tar } = await notesOnlyTar();
+      const mine = await createNote(vault, { content: "mine", path: "notes/mine" });
+      const guarded = await SELF.fetch(`${base(vault)}/api/internal/import`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${await firstParty(vault)}`, "content-type": "application/x-tar", "x-parachute-import-if-unwritten": "1" },
+        body: tar,
+      });
+      expect(guarded.status).toBe(409);
+      expect(await guarded.json()).toMatchObject({ error_type: "vault_in_use" });
+      expect((await op(vault, `/api/notes/${mine.id}`)).status).toBe(200);
+      // The import's own record still stands.
+      const st = await SELF.fetch(`${base(vault)}/api/internal/import-status`, { headers: { authorization: `Bearer ${await firstParty(vault)}` } });
+      expect(await st.json()).toMatchObject({ state: "done" });
+    });
+
+    it("a guarded re-import of an unwritten vault goes ahead; any replay starts the count again", async () => {
+      const { vault } = await imported();
+      const { tar } = await notesOnlyTar();
+      const guarded = await SELF.fetch(`${base(vault)}/api/internal/import`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${await firstParty(vault)}`, "content-type": "application/x-tar", "x-parachute-import-if-unwritten": "1" },
+        body: tar,
+      });
+      expect(guarded.status).toBe(200);
+      await createNote(vault, { content: "mine", path: "notes/mine" });
+      expect(await written(vault)).toBe(true);
+      expect((await importInto(vault, tar)).status).toBe(200);
+      expect(await written(vault)).toBe(false);
+    });
+
+    it("a guarded destroy refuses once written, and the vault stays", async () => {
+      const { vault } = await imported();
+      const mine = await createNote(vault, { content: "mine", path: "notes/mine" });
+      const destroy = (extra: object) =>
+        firstParty(vault).then((t) =>
+          SELF.fetch(`${base(vault)}/api/internal/destroy`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${t}`, "content-type": "application/json" },
+            body: JSON.stringify({ confirm: vault, ...extra }),
+          }),
+        );
+      const res = await destroy({ if_unwritten: true });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ error_type: "vault_in_use" });
+      expect((await op(vault, `/api/notes/${mine.id}`)).status).toBe(200);
+      // The person's own delete door sends no guard, and works as it always has.
+      expect((await destroy({})).status).toBe(200);
+    });
+
+    it("a guarded destroy of an unwritten vault goes ahead", async () => {
+      const { vault } = await imported();
+      const res = await SELF.fetch(`${base(vault)}/api/internal/destroy`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${await firstParty(vault)}`, "content-type": "application/json" },
+        body: JSON.stringify({ confirm: vault, if_unwritten: true }),
+      });
+      expect(res.status).toBe(200);
+    });
   });
 
   it("the import lock refuses a file while a replay runs", async () => {

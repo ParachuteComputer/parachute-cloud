@@ -50,13 +50,19 @@ interface VaultScript {
 
 /** Records every call to the vault worker and answers as a healthy one would. */
 function fakeVault(script: VaultScript = {}) {
-  const calls: Array<{ path: string; method: string; auth: string; body?: unknown }> = [];
+  const calls: Array<{ path: string; method: string; auth: string; body?: unknown; ifUnwritten?: string | null }> = [];
   let importId = "";
   let stored = "";
   const vaultFetch: VaultFetch = async (input, init) => {
     const req = new Request(input, init);
     const path = new URL(req.url).pathname.replace(/^\/vault\/[^/]+/, "");
-    const call = { path, method: req.method, auth: req.headers.get("authorization") ?? "", body: undefined as unknown };
+    const call = {
+      path,
+      method: req.method,
+      auth: req.headers.get("authorization") ?? "",
+      body: undefined as unknown,
+      ifUnwritten: req.headers.get("x-parachute-import-if-unwritten"),
+    };
     calls.push(call);
     if (path === "/api/internal/import") {
       importId = req.headers.get("x-parachute-import-id") ?? "";
@@ -68,7 +74,7 @@ function fakeVault(script: VaultScript = {}) {
       return s instanceof Response ? s : j(s);
     }
     if (path === "/api/internal/import-check") {
-      const c = script.check ? script.check() : { notes: 2705, attachments: 42, files_stored: 42, missing_files: 0, changed_since_import: 0, r2_bytes: 44_000_000 };
+      const c = script.check ? script.check() : { notes: 2705, attachments: 42, files_stored: 42, missing_files: 0, written_since_import: false, r2_bytes: 44_000_000 };
       return c instanceof Response ? c : j(c);
     }
     if (path === "/api/internal/import-file") {
@@ -76,7 +82,10 @@ function fakeVault(script: VaultScript = {}) {
       call.body = { path: form.get("path"), sha256: form.get("sha256"), size: (form.get("file") as unknown as File).size };
       return j({ written: true, size: (form.get("file") as unknown as File).size }, 201);
     }
-    if (path === "/api/internal/destroy") return script.destroy ? script.destroy() : j({ destroyed: true, r2_objects_deleted: 2 });
+    if (path === "/api/internal/destroy") {
+      call.body = await req.json();
+      return script.destroy ? script.destroy() : j({ destroyed: true, r2_objects_deleted: 2 });
+    }
     if (path === "/api/vault") {
       if (req.method === "GET") return j({ description: script.description ? script.description() : stored });
       call.body = await req.json();
@@ -298,6 +307,7 @@ describe("/ops/vault-import — the import", () => {
     // The tar reached the vault as is, through the platform's own short-lived token.
     const imp = vault.calls.find((c) => c.path === "/api/internal/import")!;
     expect(imp.body).toEqual(TAR);
+    expect(imp.ifUnwritten).toBe("1");
     const claims = decodeJwtPayload(imp.auth.replace("Bearer ", ""));
     expect(claims.sub).toBe(id);
     expect(claims.scope).toBe("vault:owned-vault:admin");
@@ -376,19 +386,30 @@ describe("/ops/vault-import — the import", () => {
     const auditBefore = (await auditRowsFor(env.DB, id)).length;
 
     for (const extra of [{}, { dry_run: "true" }] as Array<Record<string, string>>) {
-      const v = fakeVault({ check: () => ({ notes: 2706, attachments: 42, files_stored: 42, missing_files: 0, changed_since_import: 1, r2_bytes: 1 }) });
+      const v = fakeVault({ check: () => ({ notes: 2706, attachments: 42, files_stored: 42, missing_files: 0, written_since_import: true, r2_bytes: 1 }) });
       const { res, body } = await runImport({ ...fields, ...extra }, v);
       expect(res.status).toBe(409);
-      expect(body).toMatchObject({ error: "vault_in_use", changed_since_import: 1 });
+      expect(body).toMatchObject({ error: "vault_in_use" });
       expect(v.paths()).not.toContain("/api/internal/import");
     }
+    // The vault's own answer under its lock wins over the check before it (a write in between).
+    const raced = fakeVault({ import: () => j({ error: "written", error_type: "vault_in_use" }, 409) });
+    const late = await runImport(fields, raced);
+    expect(late.res.status).toBe(409);
+    expect(late.body.error).toBe("vault_in_use");
+    expect(raced.calls.find((c) => c.path === "/api/internal/import")?.body).toBeDefined();
     // Can't tell (the vault won't answer) is a refusal too, not a replay.
     const blind = fakeVault({ check: () => j({ error: "boom" }, 500) });
     const unknown = await runImport(fields, blind);
     expect(unknown.res.status).toBe(409);
     expect(unknown.body.error).toBe("vault_state_unknown");
     expect(blind.paths()).not.toContain("/api/internal/import");
-    expect((await auditRowsFor(env.DB, id)).length).toBe(auditBefore);
+    // An answer with no word on it (an older vault worker) is the same.
+    const old = fakeVault({ check: () => ({ notes: 3, attachments: 0, files_stored: 0, missing_files: 0, r2_bytes: 0 }) });
+    expect((await runImport(fields, old)).body.error).toBe("vault_state_unknown");
+    expect(old.paths()).not.toContain("/api/internal/import");
+    // The one row is the raced attempt's, which had passed the first check.
+    expect((await auditRowsFor(env.DB, id)).length).toBe(auditBefore + 1);
   });
 
   test("another attempt mid-replay: the door waits for it and takes its outcome", async () => {
@@ -477,7 +498,7 @@ describe("/ops/vault-import/file, /status, /read-token", () => {
     await pending("status-op@example.com", "status-op-vault");
     const res = await handleOpsVaultImportStatus(OPS_ENV, post("/ops/vault-import/status", { vault_name: "status-op-vault" }), withVault(fakeVault({
       status: () => ({ state: "done", notes: 3, skipped_attachments: 1 }),
-      check: () => ({ notes: 3, attachments: 1, files_stored: 0, missing_files: 1, r2_bytes: 0 }),
+      check: () => ({ notes: 3, attachments: 1, files_stored: 0, missing_files: 1, written_since_import: false, r2_bytes: 0 }),
     })));
     expect(await res!.json()).toMatchObject({
       vault_name: "status-op-vault",
@@ -502,6 +523,7 @@ describe("/ops/vault-import/file, /status, /read-token", () => {
     expect(res!.status).toBe(200);
     const { vault_token: token, expires_in: ttl } = (await res!.json()) as { vault_token: string; expires_in: number };
     expect(ttl).toBe(300);
+    // The first attempt and any retry tell the vault to refuse if it was written.
     // Every mint is on the record.
     const minted = (await auditRowsFor(env.DB, id)).filter((r) => r.action === "vault_import_read_token");
     expect(minted.length).toBe(1);
@@ -520,7 +542,7 @@ describe("once the person has written", () => {
     const { id } = await seedUser("used-op@example.com");
     const fields = person("used-op@example.com", "used-op-vault");
     expect((await runImport(fields)).res.status).toBe(200);
-    const used = () => fakeVault({ check: () => ({ notes: 2706, attachments: 42, files_stored: 42, missing_files: 0, changed_since_import: 3, r2_bytes: 1 }) });
+    const used = () => fakeVault({ check: () => ({ notes: 2706, attachments: 42, files_stored: 42, missing_files: 0, written_since_import: true, r2_bytes: 1 }) });
 
     const tok = await handleOpsVaultImportReadToken(OPS_ENV, post("/ops/vault-import/read-token", { vault_name: "used-op-vault" }), withVault(used()));
     expect(tok!.status).toBe(409);
@@ -590,7 +612,7 @@ describe("/ops/vault-import/finish and /abort", () => {
     expect(notDone.res.status).toBe(409);
     expect(notDone.body.error).toBe("import_not_done");
 
-    const gap = () => fakeVault({ check: () => ({ notes: 3, attachments: 5, files_stored: 3, missing_files: 2, r2_bytes: 9 }) });
+    const gap = () => fakeVault({ check: () => ({ notes: 3, attachments: 5, files_stored: 3, missing_files: 2, written_since_import: false, r2_bytes: 9 }) });
     const missing = await finish(fields, gap());
     expect(missing.res.status).toBe(409);
     expect(missing.body).toMatchObject({ error: "files_missing", missing_files: 2 });
@@ -623,7 +645,8 @@ describe("/ops/vault-import/finish and /abort", () => {
     expect(different.body.error).toBe("description_failed");
     expect((await getVault(env.DB, "desc-op-vault"))?.importPendingAt).toMatch(/^operator:/);
 
-    expect((await finish({ ...fields, description: "x".repeat(5000) })).res.status).toBe(400);
+    expect((await finish({ ...fields, description: "x".repeat(70_000) })).res.status).toBe(400);
+    expect((await finish({ ...fields, description: 7 })).res.status).toBe(400);
 
     const dryVault = fakeVault();
     expect((await finish({ ...fields, description: "my own words", dry_run: true }, dryVault)).res.status).toBe(200);
@@ -636,6 +659,17 @@ describe("/ops/vault-import/finish and /abort", () => {
     const patched = v.calls.find((c) => c.path === "/api/vault" && c.method === "PATCH")!;
     expect(patched.body).toEqual({ description: "my own words" });
     expect((await getVault(env.DB, "desc-op-vault"))?.importPendingAt).toBeNull();
+  });
+
+  test("finish never overwrites a description the person may have edited; it still finishes", async () => {
+    await pending("edited-op@example.com", "edited-op-vault");
+    const fields = person("edited-op@example.com", "edited-op-vault");
+    const v = fakeVault({ check: () => ({ notes: 3, attachments: 0, files_stored: 0, missing_files: 0, written_since_import: true, r2_bytes: 0 }) });
+    const { res, body } = await finish({ ...fields, description: "from the box" }, v);
+    expect(res.status).toBe(200);
+    expect(body).toMatchObject({ finished: true, description_set: false, written_since_import: true });
+    expect(v.calls.filter((c) => c.path === "/api/vault")).toEqual([]);
+    expect((await getVault(env.DB, "edited-op-vault"))?.importPendingAt).toBeNull();
   });
 
   test("finish and abort name the owner: another address gets 409 and nothing moves", async () => {
@@ -656,6 +690,12 @@ describe("/ops/vault-import/finish and /abort", () => {
     const id = await pending("abort-op@example.com", "abort-op-vault");
     const fields = person("abort-op@example.com", "abort-op-vault");
 
+    // A write that lands between the door's check and the destroy: 409, and the row stays.
+    const raced = await handleOpsVaultImportAbort(OPS_ENV, post("/ops/vault-import/abort", fields), withVault(fakeVault({ destroy: () => j({ error_type: "vault_in_use" }, 409) })));
+    expect(raced!.status).toBe(409);
+    expect(await raced!.json()).toMatchObject({ error: "vault_in_use" });
+    expect(await getVault(env.DB, "abort-op-vault")).not.toBeNull();
+
     const dry = await handleOpsVaultImportAbort(OPS_ENV, post("/ops/vault-import/abort", { ...fields, dry_run: true }), withVault(fakeVault()));
     expect(await dry!.json()).toMatchObject({ dry_run: true, would_abort: true });
     expect(await getVault(env.DB, "abort-op-vault")).not.toBeNull();
@@ -668,12 +708,13 @@ describe("/ops/vault-import/finish and /abort", () => {
     const res = await handleOpsVaultImportAbort(OPS_ENV, post("/ops/vault-import/abort", fields), withVault(vault));
     expect(res!.status).toBe(200);
     expect(await res!.json()).toMatchObject({ aborted: true, r2_objects_deleted: 2 });
-    expect(vault.paths()).toContain("/api/internal/destroy");
+    // The vault gets the last word: it refuses under its own hold if it was written.
+    expect(vault.calls.find((c) => c.path === "/api/internal/destroy")?.body).toEqual({ confirm: "abort-op-vault", if_unwritten: true });
     expect(await getVault(env.DB, "abort-op-vault")).toBeNull();
     const rows = await auditRowsFor(env.DB, id);
     // The record comes first: the failed try and the one that worked, then nothing to find.
-    expect(rows.map((r) => r.action)).toEqual(["vault_import_started", "vault_import_abort", "vault_import_abort"]);
-    expect(rows[2]!.note).toMatchObject({ vault: "abort-op-vault", reference: REF });
+    expect(rows.map((r) => r.action)).toEqual(["vault_import_started", "vault_import_abort", "vault_import_abort", "vault_import_abort"]);
+    expect(rows[3]!.note).toMatchObject({ vault: "abort-op-vault", reference: REF });
   });
 
   test("erasing the account takes the vault name and reference out of the audit rows it keeps", async () => {
