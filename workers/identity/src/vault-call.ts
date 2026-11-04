@@ -184,6 +184,7 @@ export async function callVaultImport(
   vaultName: string,
   tarBytes: ArrayBuffer | Uint8Array,
   importId?: string,
+  opts: { ifUnwritten?: boolean } = {},
 ): Promise<Response> {
   return callVaultApi(db, deps, {
     userId,
@@ -193,13 +194,19 @@ export async function callVaultImport(
     verb: "admin",
     rawBody: tarBytes,
     rawContentType: "application/x-tar",
-    ...(importId ? { extraHeaders: { [IMPORT_ID_HEADER]: importId } } : {}),
+    extraHeaders: {
+      ...(importId ? { [IMPORT_ID_HEADER]: importId } : {}),
+      ...(opts.ifUnwritten ? { [IMPORT_IF_UNWRITTEN_HEADER]: "1" } : {}),
+    },
   });
 }
 
 /** The import door's per-attempt id (T-318): the vault records it with the
  *  import's state, so a status check can tell THIS attempt from an older one. */
 export const IMPORT_ID_HEADER = "x-parachute-import-id";
+
+/** The operator import (T-379): the vault refuses, under its lock, if anyone has written since the last replay. */
+export const IMPORT_IF_UNWRITTEN_HEADER = "x-parachute-import-if-unwritten";
 
 /**
  * Ask the vault how its last import went (`GET /api/internal/import-status`,
@@ -241,6 +248,7 @@ export async function callVaultDestroy(
   deps: OAuthDeps,
   userId: string,
   vaultName: string,
+  opts: { ifUnwritten?: boolean } = {},
 ): Promise<Response> {
   return callVaultApi(db, deps, {
     userId,
@@ -248,7 +256,7 @@ export async function callVaultDestroy(
     method: "POST",
     apiPath: "/api/internal/destroy",
     verb: "admin",
-    jsonBody: { confirm: vaultName },
+    jsonBody: { confirm: vaultName, ...(opts.ifUnwritten ? { if_unwritten: true } : {}) },
   });
 }
 

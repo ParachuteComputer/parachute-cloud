@@ -330,6 +330,14 @@ export interface ImportStateRecord {
   error_type?: string;
 }
 
+/**
+ * DO-storage flag: someone other than the platform has written since the last
+ * replay (T-379). Sticky until the next replay clears it. The operator's retry
+ * and abort refuse when it is set: it sees what a note's timestamp can't (a file
+ * attached, a tag, a link, the description), and it is checked under the lock.
+ */
+const WRITTEN_SINCE_IMPORT_KEY = "written_since_import";
+
 /** How long an import waits for in-flight requests to finish before its replay. */
 const IMPORT_DRAIN_MAX_MS = 60_000;
 /** How long it waits for a running alarm; past that the alarm yields to it (see alarmMustYield). */
@@ -458,6 +466,11 @@ const IMPORT_FILE_FORM_OVERHEAD = 64 * 1024;
 function hexOf(digest: ArrayBuffer | undefined): string {
   if (!digest) return "";
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** 409 for the operator's guarded replay or destroy once someone has written (T-379). */
+function vaultInUseResponse(): Response {
+  return json({ error: "Someone has written in this vault since the import.", error_type: "vault_in_use" }, 409);
 }
 
 /** 503 while the import lock is held (T-318). The console re-checks via import-status. */
@@ -932,6 +945,7 @@ export class VaultDO extends DurableObject {
         return ticketNotFound();
       }
       const ticketId = decodeURIComponent(ticketMatch[1]!);
+      if (request.method !== "GET" && request.method !== "HEAD") await this.markWritten();
       return handleTicketSpend(request, ticketId, {
         vaultName,
         store: this.store,
@@ -956,6 +970,8 @@ export class VaultDO extends DurableObject {
         return new Response(mauth.error.body, { status: mauth.error.status, headers });
       }
       if (closed) return accountClosed(request);
+      // Any POST counts, a read too: a connected AI is the vault in use.
+      if (request.method === "POST") await this.markWritten();
       // The write gate: MCP is the flagship write door, so the paywall (frozen
       // → 402) + the two-meter notes cap MUST bite on MCP write verbs exactly as
       // on REST. handleMcp applies it per-tool (write-class only; read + DELETE
@@ -1066,6 +1082,11 @@ export class VaultDO extends DurableObject {
     if (requiredVerb !== "read" && !hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
       return insufficientScope(requiredVerb, vaultName, auth.scopes);
     }
+
+    // Everything but the platform's own hop (first-party admin, the operator's
+    // description at /finish) counts as the person writing (T-379).
+    const platform = auth.clientId === FIRST_PARTY_CLIENT_ID && hasScopeForVault(auth.scopes, vaultName, "admin");
+    if (!apiPath.startsWith("/internal/") && requiredVerb !== "read" && !platform) await this.markWritten();
 
     const writeCtx = { actor: auth.actor, via: auth.via };
     const deps: RestDeps = {
@@ -1812,7 +1833,8 @@ export class VaultDO extends DurableObject {
 
     // The console's attempt id: opaque, bounded, recorded with the state.
     const importId = (request.headers.get("x-parachute-import-id") ?? "").slice(0, 100) || undefined;
-    return this.underImportLock("import", () => this.replayImport(vaultName, tarBytes), importId);
+    const ifUnwritten = request.headers.get("x-parachute-import-if-unwritten") === "1";
+    return this.underImportLock("import", () => this.replayImport(vaultName, tarBytes), importId, ifUnwritten);
   }
 
   /**
@@ -1823,12 +1845,15 @@ export class VaultDO extends DurableObject {
    * lock). The lock covers the whole request — the R2 writes of attachment
    * binaries and the config write too — and is released however it ends.
    * `replay` records "done" itself; a 4xx it returns or anything it throws
-   * records "failed".
+   * records "failed". `ifUnwritten` (the operator's import, T-379) refuses when
+   * someone has written since the last replay: checked here, after the drain, so
+   * no write can slip between the check and the wipe. It leaves the record alone.
    */
   private async underImportLock(
     kind: ImportStateRecord["kind"],
     replay: () => Promise<Response>,
     importId?: string,
+    ifUnwritten = false,
   ): Promise<Response> {
     if (this.importRun) return importInProgressResponse();
     this.importRun = kind;
@@ -1853,6 +1878,9 @@ export class VaultDO extends DurableObject {
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
       if (this.destroyed) return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
+      if (ifUnwritten && (await this.isWritten())) return vaultInUseResponse();
+      await this.ctx.storage.delete(WRITTEN_SINCE_IMPORT_KEY);
+      this.writtenSinceImport = false;
       await this.putImportState({ kind, state: "running" });
       const res = await replay();
       if (!res.ok) await this.putImportState({ kind, state: "failed", error_type: `status_${res.status}` });
@@ -1863,6 +1891,21 @@ export class VaultDO extends DurableObject {
     } finally {
       this.importRun = null;
     }
+  }
+
+  /** Cache of {@link WRITTEN_SINCE_IMPORT_KEY}; undefined until first read in this instance. */
+  private writtenSinceImport: boolean | undefined;
+
+  private async isWritten(): Promise<boolean> {
+    this.writtenSinceImport ??= (await this.ctx.storage.get<boolean>(WRITTEN_SINCE_IMPORT_KEY)) === true;
+    return this.writtenSinceImport;
+  }
+
+  /** Durable before the write it stands for runs. One put per vault until the next replay. */
+  private async markWritten(): Promise<void> {
+    if (await this.isWritten()) return;
+    this.writtenSinceImport = true;
+    await this.ctx.storage.put(WRITTEN_SINCE_IMPORT_KEY, true);
   }
 
   /** TEST-ONLY: see {@link __setTestImportCheckpoint}. Undefined on every deployed path. */
@@ -1964,22 +2007,15 @@ export class VaultDO extends DurableObject {
   /**
    * GET /api/internal/import-check — what the vault holds after an operator
    * import: notes, attachment rows, how many of those rows have no file in R2
-   * yet (T-379), and `changed_since_import`, non-zero once anyone has written:
-   * imported notes keep their old timestamps, so a note stamped after the replay
-   * began is a write, and a count off the replay's record is a create or a delete
-   * (the operator's retry and abort refuse then). Counts only. Lists the prefix
-   * rather than one HEAD per row.
+   * yet (T-379), and whether anyone has written since (see
+   * {@link WRITTEN_SINCE_IMPORT_KEY}). Counts only. Lists the prefix rather than
+   * one HEAD per row.
    */
   private async handleImportCheck(request: Request, vaultName: string): Promise<Response> {
     if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
     const raw = this.raw();
     const notes = raw.exec("SELECT COUNT(*) AS n FROM notes").one().n as number;
     const paths = raw.exec("SELECT DISTINCT path FROM attachments").toArray().map((r) => r.path as string);
-    const rec = (await this.ctx.storage.get<ImportStateRecord>(IMPORT_STATE_KEY)) ?? null;
-    // No replay has started yet: the fresh vault's own welcome notes are not a write.
-    const sinceMs = rec?.started_at ? Date.parse(rec.started_at) : Date.parse(this.config?.createdAt ?? "") + 60_000;
-    const stamped = raw.exec("SELECT COUNT(*) AS n FROM notes WHERE updated_at_ms > ?", sinceMs).one().n as number;
-    const offRecord = rec?.state === "done" && typeof rec.notes === "number" ? Math.abs(notes - rec.notes) : 0;
     const prefix = r2Key(vaultName, "");
     const stored = new Set<string>();
     let cursor: string | undefined;
@@ -1994,7 +2030,7 @@ export class VaultDO extends DurableObject {
       attachments: paths.length,
       files_stored: stored.size,
       missing_files: paths.filter((p) => !stored.has(p)).length,
-      changed_since_import: Math.max(stamped, offRecord),
+      written_since_import: await this.isWritten(),
       r2_bytes: this.r2Bytes,
     });
   }
@@ -2147,9 +2183,9 @@ export class VaultDO extends DurableObject {
    */
   private async handleDestroy(request: Request, vaultName: string): Promise<Response> {
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
-    let body: { confirm?: unknown };
+    let body: { confirm?: unknown; if_unwritten?: unknown };
     try {
-      body = (await request.json()) as { confirm?: unknown };
+      body = (await request.json()) as { confirm?: unknown; if_unwritten?: unknown };
     } catch {
       return json({ error: "Invalid JSON body" }, 400);
     }
@@ -2162,6 +2198,8 @@ export class VaultDO extends DurableObject {
     if (this.destroyed) return json({ destroyed: true, r2_objects_deleted: 0 });
 
     const deleted = await this.ctx.blockConcurrencyWhile(async () => {
+      // The operator's abort (T-379), with other events held off: a write can't slip in after this.
+      if (body.if_unwritten === true && (await this.isWritten())) return null;
       for (const ws of this.ctx.getWebSockets()) this.closeWs(ws, 1001, "vault destroyed");
 
       const n = await purgePrefix(this.env.ATTACHMENTS, `vault-${vaultName}/`);
@@ -2173,6 +2211,7 @@ export class VaultDO extends DurableObject {
       return n;
     });
 
+    if (deleted === null) return vaultInUseResponse();
     console.log(`[destroy ${vaultName}] r2_objects_deleted=${deleted}`);
     return json({ destroyed: true, r2_objects_deleted: deleted });
   }

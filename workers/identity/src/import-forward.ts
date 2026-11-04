@@ -45,12 +45,13 @@ export async function forwardImport(
   vaultName: string,
   tar: ArrayBuffer | Uint8Array,
   startedMs: number,
+  opts: { ifUnwritten?: boolean } = {},
 ): Promise<ImportOutcome> {
   const importId = crypto.randomUUID();
   let res: Response | null = null;
   let forwardError = "";
   try {
-    res = await callVaultImport(db, deps, userId, vaultName, tar, importId);
+    res = await callVaultImport(db, deps, userId, vaultName, tar, importId, opts);
   } catch (err) {
     forwardError = err instanceof Error ? err.message : String(err);
   }
