@@ -33,7 +33,7 @@ import type { Env } from "./env.ts";
 import { type OAuthDeps } from "./oauth-shared.ts";
 import { callVaultApi } from "./vault-call.ts";
 import { getClient } from "./clients.ts";
-import { type HealthData, prevDay } from "./health-report.ts";
+import { type HealthData, prevDay, weekStart } from "./health-report.ts";
 
 export const HEALTH_KEEP_DAYS = 35;
 /** Keys accepted from one vault for one day (the DO caps at 200 + 2 overflow keys; this is the backstop). */
@@ -410,15 +410,12 @@ export async function collectVaultHealth(
 export const HEALTH_SQL = {
   days: "SELECT day, source, version, vault, subject, outcome, n FROM health_counters WHERE day IN (?, ?)",
   versions:
-    "SELECT '' AS day, source, version, vault, subject, outcome, SUM(n) AS n, COUNT(DISTINCT day) AS days FROM health_counters WHERE day >= ? GROUP BY source, version, vault, subject, outcome",
+    "SELECT '' AS day, source, version, vault, subject, outcome, SUM(n) AS n FROM health_counters WHERE day >= ? GROUP BY source, version, vault, subject, outcome",
   // Oldest first: the last row per source wins, ties broken by the later label.
   live: "SELECT source, version FROM health_versions ORDER BY last_seen, version",
 };
 
-/** The week the deploy window looks back over: `day` minus 7 through today. */
-export function weekStart(day: string): string {
-  return new Date(Date.parse(`${day}T00:00:00Z`) - 7 * 86_400_000).toISOString().slice(0, 10);
-}
+export { weekStart };
 
 export async function loadHealthData(db: D1Database, day: string): Promise<HealthData> {
   const [days, versions, live] = await db.batch<Record<string, unknown>>([

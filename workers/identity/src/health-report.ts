@@ -58,8 +58,9 @@
  * real use the day before and none today can still raise one — the gate's
  * HEALTH_GATE=ack is the way past it. (Telling a refused genuine token from a
  * missing or foreign one at the source would close it; not done here.)
- * In the deploy window the earlier version's counts are scaled to a day's
- * share when it served longer than the live one has.
+ * In the deploy window the longer side is scaled down to the shorter by
+ * hours served (deploySpanScale); after a rollback that window only
+ * summarises, it makes no findings.
  * Server errors below rule 1's bar, or present both times and not rising,
  * are listed as "other server errors" — shown, never counted as worse.
  *
@@ -75,8 +76,6 @@ export interface HealthRow {
   subject: string;
   outcome: string;
   n: number;
-  /** `versions` rows only: on how many distinct days this count was seen (the deploy window's per-day scale). */
-  days?: number;
 }
 
 /**
@@ -243,9 +242,9 @@ function sumOf(t: Tally, outcomes: Set<string>): number {
   return n;
 }
 
-/** Rule 4's failures: everything not ok, less a 404 always, and less a 401/403 unless `refusalsCount`. */
-function failures(t: Tally, refusalsCount: boolean): number {
-  return t.total - t.ok - sumOf(t, refusalsCount ? NOT_FOUND : STRANGER_REASONS);
+/** Rule 4's failures: everything not ok, less what is `excluded` (a 404 always; per vault 401/403 too). */
+function failures(t: Tally, excluded: Set<string>): number {
+  return t.total - t.ok - sumOf(t, excluded);
 }
 
 /** Rules 1–4 on one cell (a vault, a connector, an identity route). */
@@ -271,7 +270,7 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
     }
   }
   // Per vault, what a stranger can make (401, 403, 404) is never a failure; elsewhere only a 404 is left out.
-  if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && failures(ta, !perVault) >= STOPPED_FAILURES) {
+  if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && failures(ta, perVault ? STRANGER_REASONS : NOT_FOUND) >= STOPPED_FAILURES) {
     out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${fmtN(tb.ok)} ok ${beforeLabel})` });
   }
 }
@@ -318,7 +317,7 @@ function fleetRules(
     const fresh = cells.filter((c) => c.ta.server > 0 && c.tb.server === 0 && !flaggedServer.has(c.key));
     if (fresh.length >= FLEET_MIN_VAULTS) {
       const n = fresh.reduce((s, c) => s + c.ta.server, 0);
-      const idle = fresh.filter((c) => c.tb.total === 0).length;
+      const idle = fresh.filter((c) => c.tb.total < 1).length;
       const idleNote = idle ? `; ${idle} of them had no traffic then` : "";
       out.worse.push({ ...base, kind: "new_server_errors", detail: `new server errors on ${fresh.length} vaults (${n} in all; none ${beforeLabel}${idleNote})` });
     }
@@ -343,12 +342,45 @@ function fleetRules(
       }
     }
     const stopped = cells.filter(
-      (c) => c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failures(c.ta, realUse(c.tb)) >= STOPPED_FAILURES,
+      (c) => c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failures(c.ta, realUse(c.tb) ? NOT_FOUND : STRANGER_REASONS) >= STOPPED_FAILURES,
     );
     if (enough(stopped.length)) {
       out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${stopped.length} vaults that worked ${beforeLabel}` });
     }
   }
+}
+
+/** Each cell's counts times `f`, rounded to 1e-6 so a scaled sum meets an exact threshold. */
+function scaled(cells: Map<string, Tally>, f: number): Map<string, Tally> {
+  if (f === 1) return cells;
+  const r = (x: number) => Math.round(x * f * 1e6) / 1e6;
+  const out = new Map<string, Tally>();
+  for (const [k, t] of cells) {
+    out.set(k, { total: r(t.total), ok: r(t.ok), server: r(t.server), byOutcome: new Map([...t.byOutcome].map(([o, n]) => [o, r(n)])) });
+  }
+  return out;
+}
+
+/** The upload time a version label starts with (`2026-11-07t09:00:00z~…`), in ms; NaN if it has none. */
+function labelTime(label: string): number {
+  return Date.parse(label.split("~")[0]!.toUpperCase());
+}
+
+/**
+ * The deploy window's two sides cover different spans: the earlier version
+ * may have served a week, the live one a few hours (or, after a hotfix, the
+ * other way round). Scale the longer side down to the shorter, by hours
+ * served — each version from its upload (or the week's start) to the next
+ * upload (or now) — so absolute bars ("≥ 3 ok before", "real use", "oks
+ * halved") mean the same span on both sides. Rates are unchanged.
+ */
+function deploySpanScale(previous: string, current: string, weekStartMs: number, now: number): { before: number; after: number } {
+  const p = labelTime(previous);
+  const c = labelTime(current);
+  const beforeMs = c - Math.max(p, weekStartMs);
+  const afterMs = now - Math.max(c, weekStartMs);
+  if (!(beforeMs > 0 && afterMs > 0)) return { before: 1, after: 1 };
+  return beforeMs > afterMs ? { before: afterMs / beforeMs, after: 1 } : { before: 1, after: beforeMs / afterMs };
 }
 
 /** Apply every rule to one window: each cell, then the fleet. */
@@ -358,9 +390,10 @@ function compare(
   after: HealthRow[],
   who: (vault: string, subject: string) => string,
   beforeLabel: string,
+  scale: { before: number; after: number } = { before: 1, after: 1 },
 ): Compared {
-  const a = tally(after);
-  const b = tally(before);
+  const a = scaled(tally(after), scale.after);
+  const b = scaled(tally(before), scale.before);
   const out: Compared = { worse: [], other: [] };
   const flaggedServer = new Set<string>();
   for (const [key, ta] of a) {
@@ -381,6 +414,11 @@ export async function vaultHash(vaultId: string): Promise<string> {
 
 export function prevDay(day: string): string {
   return new Date(Date.parse(`${day}T00:00:00Z`) - 86_400_000).toISOString().slice(0, 10);
+}
+
+/** The week the deploy window looks back over: `day` minus 7 through now. */
+export function weekStart(day: string): string {
+  return new Date(Date.parse(`${day}T00:00:00Z`) - 7 * 86_400_000).toISOString().slice(0, 10);
 }
 
 /** Labels that start with an upload timestamp can be put in deploy order. */
@@ -422,7 +460,11 @@ function addAll(into: Compared, from: Compared): void {
   }
 }
 
-export async function buildHealthReport(data: HealthData, opts: { day: string; environment: string }): Promise<HealthReport> {
+/**
+ * `now` (default the clock) is where the live version's span ends: the deploy
+ * window's rows run up to the moment the report is read.
+ */
+export async function buildHealthReport(data: HealthData, opts: { day: string; environment: string; now?: number }): Promise<HealthReport> {
   const day = opts.day;
   const hashes = new Map<string, string>();
   for (const v of new Set([...data.days, ...data.versions].map((r) => r.vault))) if (v !== "-") hashes.set(v, await vaultHash(v));
@@ -440,7 +482,8 @@ export async function buildHealthReport(data: HealthData, opts: { day: string; e
   addAll(result, compare("day", dayBefore, dayAfter, who, `on ${prior}`));
   const windows: HealthReport["windows"] = { day: summarize("day", prior, day, dayBefore, dayAfter), deploy: [] };
 
-  // 2. Since the last deploy, per worker.
+  // 2. Since the last deploy, per worker (the versions rows run from a week before `day` to now).
+  const now = opts.now ?? Date.now();
   for (const source of ["vault", "identity"]) {
     const mine = data.versions.filter((r) => r.source === source && TIMESTAMPED.test(r.version));
     const labels = [...new Set(mine.map((r) => r.version))].sort();
@@ -450,15 +493,13 @@ export async function buildHealthReport(data: HealthData, opts: { day: string; e
     if (!current || !previous) continue;
     const after = mine.filter((r) => r.version === current);
     const before = mine.filter((r) => r.version === previous);
-    // The earlier version may have served a week and the live one only since this morning: compare
-    // a day's share of it, so "ok before" and the baselines mean the same span on both sides.
-    const span = (rows: HealthRow[]) => rows.reduce((m, r) => Math.max(m, r.days ?? 1), 1);
-    const scale = Math.min(1, span(after) / span(before));
-    const beforeScaled = scale < 1 ? before.map((r) => ({ ...r, n: r.n * scale })) : before;
-    let label = previous > current ? "on the version rolled back from" : "before the deploy";
-    if (scale < 1) label += ` (a day's share of ${span(before)})`;
-    addAll(result, compare("deploy", beforeScaled, after, who, label));
     windows.deploy.push(summarize(`${source} deploy`, previous, current, before, after));
+    // After a rollback the comparison is only there to stop the bad version alarming: the bad
+    // version's short run is no baseline for the good one's week, so it makes no findings.
+    if (previous > current) continue;
+    const scale = deploySpanScale(previous, current, Date.parse(`${weekStart(day)}T00:00:00Z`), now);
+    const label = scale.before < 1 || scale.after < 1 ? "before the deploy (scaled to the same hours)" : "before the deploy";
+    addAll(result, compare("deploy", before, after, who, label, scale));
   }
 
   const backupRows = dayAfter.filter((r) => r.subject === "backup");
