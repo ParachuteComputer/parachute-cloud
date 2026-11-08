@@ -67,6 +67,8 @@ describe("deleting can forget (T-412)", () => {
     const solo = await withHistory(v, "x/Solo");
     expect((await op(v, `/api/notes/${encodeURIComponent("x/solo")}?erase_history=true`, { method: "DELETE" })).status).toBe(404);
     expect((await op(v, `/api/notes/${solo}`)).status).toBe(200);
+    expect((await op(v, `/api/notes/${encodeURIComponent("x/solo")}/versions`, { method: "DELETE" })).status).toBe(404);
+    expect(((await (await op(v, `/api/notes/${solo}/versions`)).json()) as any).total).toBeGreaterThanOrEqual(1);
     const r = await op(v, `/api/notes/${encodeURIComponent("x/today")}?erase_history=true`, { method: "DELETE" });
     expect(r.status).toBe(200);
     expect(((await r.json()) as any).id).toBe(lower);
