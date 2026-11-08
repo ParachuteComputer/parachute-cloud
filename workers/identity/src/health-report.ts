@@ -10,8 +10,7 @@
  *   - deploy: per worker, rows counted by the LIVE version (the one last seen
  *             answering, `health_versions`) against the newest other version
  *             in the last week. Live, not "newest upload": after a rollback
- *             the bad version is newer but no longer serving (a rollback is
- *             shown, not judged).
+ *             the bad version is newer but no longer serving.
  *
  * AT TWO LEVELS:
  *   - per cell = (worker, vault or connector, subject) — a vault shows as
@@ -38,32 +37,25 @@
  *      vault whose name they know); at fleet level and for identity's own
  *      routes and connectors they count — that is the "tokens broke" signal;
  *   4. stopped working — ok before (≥ 3), none now, and at least 3 failures
- *      now. A 404 is never a failure here; per vault, and anywhere in the
- *      deploy window, a 401 or 403 is not either.
+ *      now. A 404 is never a failure here; per vault a 401 or 403 is not
+ *      either.
  * At fleet level (the vault worker, per subject, over every vault) the same
  * questions are asked of VAULTS, not of summed requests:
  *   - new server errors on at least 3 vaults that had none before, or no
  *     traffic at all then (beyond those already reported one by one) — one
  *     new 500 on each of many vaults;
  *   - a client reason, 401 included, that rose on each vault by its own
- *     measure (≥ 3 of it, ≥ 5 requests before, share ×2 and +10 points; for
- *     what a stranger can make — 401, 403, 404 — the vault also had real use
- *     before, FLEET_REAL_USE_OK, and its ok count halved) — every vault's
- *     tokens failing at once;
+ *     measure (≥ 3 of it, ≥ 5 requests before, share ×2 and +10 points) —
+ *     every vault's tokens failing at once;
  *   - vaults that stopped working by the per-vault bar (≥ 3 ok before, none
- *     now, ≥ 3 failures; a 401/403 counts as a failure only in the day window,
- *     on a vault with real use before).
- * The last two need at least 3 vaults or a tenth of the vaults seen, so a
- * stranger flooding one vault, or poking a few small idle ones, makes no
- * finding. What stays open: a stranger who knows the names of 3+ vaults with
- * real use the day before and none today can still raise one — the gate's
- * HEALTH_GATE=ack is the way past it. (Telling a refused genuine token from a
- * missing or foreign one at the source would close it; not done here.)
- * In the deploy window 401/403/404 are no fleet signal and never a "stopped
- * working" failure: a week of the earlier version against hours of the live
- * one can't show whether a vault's oks fell. A token outage right after a
- * deploy is the staging smoke's (real OAuth) to catch first, and the next day
- * window's.
+ *     now, ≥ 3 failures; a 401/403 counted).
+ * The last two need at least 3 vaults or a tenth of the vaults seen — and for
+ * what a stranger can make (401, 403, 404), at least half of the vaults that
+ * worked before and are seen now. A stranger reaches only the vaults whose
+ * names they know; a token outage or a broken route reaches nearly all of
+ * them, in either window, whatever the spans. To raise one, a stranger must
+ * poke as many previously-used vaults as are in use now (on a fleet of a few
+ * vaults, 3); the gate's HEALTH_GATE=ack is the way past that.
  * Server errors below rule 1's bar, or present both times and not rising,
  * are listed as "other server errors" — shown, never counted as worse.
  *
@@ -161,17 +153,12 @@ const FLEET_MIN_VAULTS = 3;
 const FLEET_VAULT_MIN = 3;
 const FLEET_VAULT_BASELINE = 5;
 /**
- * Fleet level: what a stranger can make (STRANGER_REASONS) counts — toward a
- * rising reason, or a 401/403 as a failure of "stopped working" — only on a
- * vault with at least this many ok before: real use an outage would cut. A
- * small vault that is idle today has no ok left to tell a stranger from an
- * outage. The cost: an outage only on vaults lighter than this goes unseen
- * here (the staging smoke's real OAuth flows catch a token break before a
- * deploy).
+ * Fleet level, for what a stranger can make (STRANGER_REASONS): the change must
+ * be on at least this share of the vaults that worked before and are seen now.
+ * A stranger reaches only the vaults whose names they know; a token outage or a
+ * broken route reaches nearly every vault in use. Whatever the window's spans.
  */
-const FLEET_REAL_USE_OK = 10;
-/** A vault whose 401/403/404s can count at fleet level: real use before, and its oks fell (a stranger can't cut them). */
-const strangerSignal = (c: { ta: Tally; tb: Tally }) => c.tb.ok >= FLEET_REAL_USE_OK && c.ta.ok <= c.tb.ok / 2;
+const FLEET_STRANGER_SHARE = 0.5;
 const NOT_FOUND = new Set(["4xx:404"]);
 const FLEET_MIN_SHARE = 0.1;
 
@@ -244,13 +231,13 @@ function sumOf(t: Tally, outcomes: Set<string>): number {
   return n;
 }
 
-/** Rule 4's failures: everything not ok, less what is `excluded` (a 404 always; 401/403 too where a stranger or a few expired tokens could be all there is). */
+/** Rule 4's failures: everything not ok, less what is `excluded` (a 404 always; 401/403 too where a stranger could be all there is). */
 function failures(t: Tally, excluded: Set<string>): number {
   return t.total - t.ok - sumOf(t, excluded);
 }
 
 /** Rules 1–4 on one cell (a vault, a connector, an identity route). */
-function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, notFailures: Set<string>, beforeLabel: string, out: Compared): void {
+function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLabel: string, out: Compared): void {
   const rateA = pct(ta.server, ta.total);
   const rateB = pct(tb.server, tb.total);
   if (ta.server > 0 && tb.server === 0 && (ta.server >= NEW_SERVER_MIN || rateA >= NEW_SERVER_MIN_RATE)) {
@@ -271,7 +258,8 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, notFailu
       }
     }
   }
-  if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && failures(ta, notFailures) >= STOPPED_FAILURES) {
+  // Per vault, what a stranger can make (401, 403, 404) is never a failure; elsewhere only a 404 is left out.
+  if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && failures(ta, perVault ? STRANGER_REASONS : NOT_FOUND) >= STOPPED_FAILURES) {
     out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${tb.ok} ok ${beforeLabel})` });
   }
 }
@@ -279,16 +267,17 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, notFailu
 /**
  * The fleet level: per (vault worker, subject), over every vault — for what is
  * spread too thin for any one vault to show. Every fleet rule needs the change
- * on several vaults ({@link spread}), counted from each vault's OWN cells, so
- * a stranger flooding one vault never makes a fleet finding:
+ * on several vaults, counted from each vault's OWN cells, so a stranger
+ * flooding one vault never makes a fleet finding:
  *   - new server errors on vaults that had none (or no traffic) before,
  *     beyond the vaults already reported one by one (rule 1 at fleet level);
  *   - a client reason whose share rose on each of those vaults (rule 3; 401s
  *     included — the "tokens broke" signal);
  *   - vaults that worked before and have no ok at all now (rule 4; a 404 is
- *     never a failure, a 401/403 only on a vault with real use before).
- * What a stranger can make (401, 403, 404) counts only in the day window, on
- * a vault with real use before (FLEET_REAL_USE_OK) whose oks fell.
+ *     never a failure).
+ * What a stranger can make (401, 403, 404) must be on at least half of the
+ * vaults that worked before and are seen now ({@link FLEET_STRANGER_SHARE});
+ * anything else on 3 vaults or a tenth of those seen ({@link spread}).
  */
 function fleetRules(
   window: "day" | "deploy",
@@ -298,8 +287,6 @@ function fleetRules(
   beforeLabel: string,
   out: Compared,
 ): void {
-  // Both sides cover a day each only in the day window; only then can "its oks fell" tell an outage from a stranger.
-  const sameSpan = window === "day";
   const groups = new Map<string, Array<{ key: string; ta: Tally; tb: Tally }>>();
   const seenVaults = new Set<string>();
   for (const [key, ta] of a) {
@@ -314,9 +301,10 @@ function fleetRules(
   for (const [g, cells] of groups) {
     const [source, subject] = g.split("\u0000") as [string, string];
     const base = { window, who: "all vaults", source, subject };
+    const worked = cells.filter((c) => c.tb.ok >= STOPPED_OK_BEFORE).length;
+    const most = (n: number) => n >= Math.max(FLEET_MIN_VAULTS, Math.ceil(FLEET_STRANGER_SHARE * worked));
     // A stranger can't cause server errors: 3 vaults are enough, at any fleet size. A vault with
-    // no traffic before counts too (a quiet Sunday, or a short-lived previous version, must not hide
-    // a thin outage); the line says how many of them there were.
+    // no traffic before counts too (as a quiet day must not hide a thin outage); the line says how many.
     const fresh = cells.filter((c) => c.ta.server > 0 && c.tb.server === 0 && !flaggedServer.has(c.key));
     if (fresh.length >= FLEET_MIN_VAULTS) {
       const n = fresh.reduce((s, c) => s + c.ta.server, 0);
@@ -326,32 +314,23 @@ function fleetRules(
     }
     const reasons = new Set(cells.flatMap((c) => [...c.ta.byOutcome.keys()].filter((o) => outcomeClass(o) === "client")));
     for (const outcome of reasons) {
-      // A vault counts only when its own change looks real: a few of them on
-      // a vault that was in use — and, for what a stranger can make (401, 403,
-      // 404), real use before and its ok count fell too (an outage cuts the
-      // oks; expired tokens and a stranger don't).
-      const strangerMade = STRANGER_REASONS.has(outcome);
-      if (strangerMade && !sameSpan) continue;
+      // A vault counts only when its own change looks real: a few of them, on a vault that was in use.
       const rose = cells.filter(
-        (c) =>
-          (c.ta.byOutcome.get(outcome) ?? 0) >= FLEET_VAULT_MIN &&
-          c.tb.total >= FLEET_VAULT_BASELINE &&
-          (!strangerMade || strangerSignal(c)) &&
-          shareRose(c.ta, c.tb, outcome),
+        (c) => (c.ta.byOutcome.get(outcome) ?? 0) >= FLEET_VAULT_MIN && c.tb.total >= FLEET_VAULT_BASELINE && shareRose(c.ta, c.tb, outcome),
       );
       const na = rose.reduce((s, c) => s + (c.ta.byOutcome.get(outcome) ?? 0), 0);
-      if (enough(rose.length) && na >= CLIENT_MIN) {
+      const wide = STRANGER_REASONS.has(outcome) ? most(rose.length) : enough(rose.length);
+      if (wide && na >= CLIENT_MIN) {
         out.worse.push({ ...base, kind: "client_reason_up", reason: outcome, detail: `${outcome} up on ${rose.length} vaults (${na} in all, far fewer ${beforeLabel})` });
       }
     }
-    const stopped = cells.filter(
-      (c) =>
-        c.tb.ok >= STOPPED_OK_BEFORE &&
-        c.ta.ok === 0 &&
-        failures(c.ta, sameSpan && c.tb.ok >= FLEET_REAL_USE_OK ? NOT_FOUND : STRANGER_REASONS) >= STOPPED_FAILURES,
-    );
-    if (enough(stopped.length)) {
-      out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${stopped.length} vaults that worked ${beforeLabel}` });
+    // Stopped: by what no stranger can make, on 3 vaults or a tenth; with 401/403 counted, on most of them.
+    const stoppedBy = (excluded: Set<string>) =>
+      cells.filter((c) => c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failures(c.ta, excluded) >= STOPPED_FAILURES).length;
+    const real = stoppedBy(STRANGER_REASONS);
+    const any = stoppedBy(NOT_FOUND);
+    if (enough(real) || most(any)) {
+      out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${enough(real) ? real : any} vaults that worked ${beforeLabel}` });
     }
   }
 }
@@ -371,11 +350,7 @@ function compare(
   for (const [key, ta] of a) {
     const [source, vault, subject] = key.split("\u0000") as [string, string, string];
     const n = out.worse.length;
-    // Rule 4's non-failures: per vault, and anywhere in the deploy window (a week of the earlier version against
-    // hours of the live one, when a few expired tokens can be all there is), what a stranger can make; else a 404.
-    const perVault = vault !== "-";
-    const notFailures = perVault || window === "deploy" ? STRANGER_REASONS : NOT_FOUND;
-    cellRules({ window, who: who(vault, subject), source, subject }, ta, b.get(key) ?? emptyTally(), perVault, notFailures, beforeLabel, out);
+    cellRules({ window, who: who(vault, subject), source, subject }, ta, b.get(key) ?? emptyTally(), vault !== "-", beforeLabel, out);
     if (out.worse.slice(n).some((f) => f.kind === "new_server_errors" || f.kind === "server_errors_up")) flaggedServer.add(key);
   }
   fleetRules(window, a, b, flaggedServer, beforeLabel, out);
@@ -459,12 +434,9 @@ export async function buildHealthReport(data: HealthData, opts: { day: string; e
     if (!current || !previous) continue;
     const after = mine.filter((r) => r.version === current);
     const before = mine.filter((r) => r.version === previous);
-    // After a rollback the live version is the older, good one: judging it against the bad
-    // version's short run says nothing (and its own week of strays would look "new"), so the
-    // window is shown, not judged.
     const rolledBack = previous > current;
-    windows.deploy.push(summarize(`${source} deploy${rolledBack ? " (rolled back, not judged)" : ""}`, previous, current, before, after));
-    if (!rolledBack) addAll(result, compare("deploy", before, after, who, "before the deploy"));
+    addAll(result, compare("deploy", before, after, who, rolledBack ? "on the version rolled back from" : "before the deploy"));
+    windows.deploy.push(summarize(`${source} deploy${rolledBack ? " (rolled back)" : ""}`, previous, current, before, after));
   }
 
   const backupRows = dayAfter.filter((r) => r.subject === "backup");

@@ -233,56 +233,61 @@ describe("the report rules", () => {
     expect(fleet).toEqual(["all vaults:client_reason_up:4xx:403", "all vaults:stopped_working:"]);
   });
 
-  test("since a deploy this morning, a week of the old version is no 'before' for 401s: stale tokens on idle vaults raise nothing", async () => {
+  test("after a deploy, a few vaults' 401s among many that still work raise nothing; the same on every vault is an outage", async () => {
     const old = "2026-10-31t10:00:00z~aaaaaaaa";
     const cur = "2026-11-07t09:00:00z~bbbbbbbb";
-    const rows: HealthRow[] = [];
+    const days = ["2026-11-01", "2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"];
+    const stale: HealthRow[] = [];
     for (let i = 0; i < 3; i++) {
-      for (const day of ["2026-11-01", "2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"]) {
-        rows.push(row({ vault: `v${i}`, day, version: old, subject: "http:mcp", outcome: "2xx", n: 3 }));
-      }
-      // The owner hasn't been back since the deploy; a connector polls with an expired token.
-      rows.push(row({ vault: `v${i}`, version: cur, subject: "http:mcp", outcome: "4xx:401", n: 4 }));
+      for (const day of days) stale.push(row({ vault: `s${i}`, day, version: old, subject: "http:mcp", outcome: "2xx", n: 3 }));
+      // The owner hasn't been back since the deploy; a connector polls with an expired token (or a stranger pokes).
+      stale.push(row({ vault: `s${i}`, version: cur, subject: "http:mcp", outcome: "4xx:401", n: 4 }));
     }
-    const r = await report(rows, { vault: cur });
-    expect(r.windows.deploy.map((w) => [w.before, w.after])).toEqual([[old, cur]]);
-    expect(r.worse).toEqual([]);
+    const working: HealthRow[] = [];
+    for (let i = 0; i < 27; i++) {
+      for (const day of days) working.push(row({ vault: `w${i}`, day, version: old, subject: "http:mcp", outcome: "2xx", n: 100 }));
+      working.push(row({ vault: `w${i}`, version: cur, subject: "http:mcp", outcome: "2xx", n: 25 }));
+    }
+    expect((await report([...stale, ...working], { vault: cur })).worse).toEqual([]);
+    // If those three are every vault seen since the deploy, nothing tells them from an outage: flagged.
+    expect((await report(stale, { vault: cur })).worse.map((f) => `${f.who}:${f.window}:${f.kind}`)).toContain("all vaults:deploy:client_reason_up");
   });
 
-  test("a deploy at 15:00: hours of busy vaults' oks are not 'halved' against a week, so a stranger's 401s raise nothing", async () => {
+  test("a quiet day (oks halve everywhere) plus a stranger's 401s on three vaults raises nothing", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 30; i++) {
+      rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 100 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "2xx", n: 45 }));
+      if (i < 3) rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "4xx:401", n: 6 }));
+    }
+    expect((await report(rows)).worse).toEqual([]);
+  });
+
+  test("a token outage on most light vaults (a few requests a day each; 24 of 40) is caught at fleet level", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 40; i++) {
+      rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 6 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: i < 24 ? "4xx:401" : "2xx", n: 6 }));
+    }
+    const fleet = (await report(rows)).worse.map((f) => `${f.who}:${f.kind}`).sort();
+    expect(fleet).toEqual(["all vaults:client_reason_up", "all vaults:stopped_working"]);
+  });
+
+  test("a deploy that breaks tokens, or turns a route into 404s, on every vault is caught in the deploy window", async () => {
     const old = "2026-11-01t10:00:00z~aaaaaaaa";
-    const cur = "2026-11-07t15:00:00z~bbbbbbbb";
-    const rows: HealthRow[] = [];
-    for (let i = 0; i < 3; i++) {
-      for (const day of ["2026-11-01", "2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"]) {
-        rows.push(row({ vault: `v${i}`, day, version: old, subject: "http:mcp", outcome: "2xx", n: 100 }));
+    const cur = "2026-11-08t09:00:00z~bbbbbbbb";
+    for (const outcome of ["4xx:401", "4xx:404"]) {
+      const rows: HealthRow[] = [];
+      for (let i = 0; i < 10; i++) {
+        for (const day of ["2026-11-05", PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, version: old, subject: "http:notes", outcome: "2xx", n: 100 }));
+        rows.push(row({ vault: `v${i}`, day: "2026-11-08", version: cur, subject: "http:notes", outcome, n: 30 }));
       }
-      rows.push(row({ vault: `v${i}`, version: old, subject: "http:mcp", outcome: "2xx", n: 62 }));
-      rows.push(row({ vault: `v${i}`, version: cur, subject: "http:mcp", outcome: "2xx", n: 25 }));
-      rows.push(row({ vault: `v${i}`, version: cur, subject: "http:mcp", outcome: "4xx:401", n: 6 }));
+      const kinds = (await report(rows, { vault: cur })).worse.map((f) => `${f.who}:${f.window}:${f.kind}:${f.reason ?? ""}`);
+      expect(kinds).toContain(`all vaults:deploy:client_reason_up:${outcome}`);
     }
-    const r = await report(rows, { vault: cur });
-    expect(r.windows.deploy).toHaveLength(1);
-    expect(r.worse).toEqual([]);
   });
 
-  test("after a rollback, the old version's own week of scattered 500s is not 'new' against the bad version's one day", async () => {
-    const good = "2026-11-01t10:00:00z~aaaaaaaa";
-    const bad = "2026-11-06t09:00:00z~bbbbbbbb";
-    const rows: HealthRow[] = [];
-    for (const day of ["2026-11-01", "2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"]) {
-      rows.push(row({ day, version: good, subject: "http:notes", outcome: "2xx", n: 100 }));
-      rows.push(row({ day, version: good, subject: "http:notes", outcome: "5xx:500", n: 1 }));
-    }
-    rows.push(row({ day: PRIOR, version: bad, subject: "http:notes", outcome: "2xx", n: 50 }));
-    rows.push(row({ day: PRIOR, version: good, subject: "http:notes", outcome: "2xx", n: 50 }));
-    rows.push(row({ version: good, subject: "http:notes", outcome: "2xx", n: 100 }));
-    const r = await report(rows, { vault: good });
-    expect(r.windows.deploy[0]).toMatchObject({ after: good, before: bad });
-    expect(r.worse).toEqual([]);
-  });
-
-  test("a thin outage on vaults that had no traffic the day before still counts at fleet level, and says so", async () => {
+  test("a thin outage on vaults that had no traffic the day before counts at fleet level, and the line says how many", async () => {
     const rows: HealthRow[] = [];
     for (let i = 0; i < 27; i++) {
       for (const day of [PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, subject: "http:notes", outcome: "2xx", n: 100 }));
@@ -391,18 +396,6 @@ describe("the report rules", () => {
     expect(r.worse).toMatchObject([{ window: "deploy", subject: "http:notes", kind: "new_server_errors" }]);
   });
 
-  test("since this morning's deploy, expired tokens on an identity route are not 'stopped working' against the old version's week", async () => {
-    const old = "2026-11-01t10:00:00z~aaaaaaaa";
-    const cur = "2026-11-08t09:00:00z~bbbbbbbb";
-    const id = (p: Partial<HealthRow> & { subject: string; outcome: string; n: number }) => row({ source: "identity", vault: "-", ...p });
-    const rows: HealthRow[] = [];
-    for (const day of ["2026-11-02", "2026-11-04", PRIOR, DAY]) rows.push(id({ day, version: old, subject: "http:account", outcome: "2xx", n: 2 }));
-    rows.push(id({ day: "2026-11-08", version: cur, subject: "http:account", outcome: "4xx:401", n: 3 }));
-    const r = await report(rows, { identity: cur });
-    expect(r.windows.deploy.map((w) => w.label)).toEqual(["identity deploy"]);
-    expect(r.worse).toEqual([]);
-  });
-
   test("after a rollback the live (older) version is 'current', so the bad one stops alarming", async () => {
     const good = "2026-11-05t10:00:00z~aaaaaaaa";
     const bad = "2026-11-06t09:00:00z~bbbbbbbb";
@@ -416,7 +409,7 @@ describe("the report rules", () => {
     const r = await report(rows, { vault: good });
     expect(r.windows.deploy[0]).toMatchObject({ after: good, before: bad });
     expect(r.worse).toEqual([]);
-    expect(r.text).toContain("vault deploy (rolled back, not judged)");
+    expect(r.text).toContain("vault deploy (rolled back)");
   });
 
   test("outcome classes", () => {
