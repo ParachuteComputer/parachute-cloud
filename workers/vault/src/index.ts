@@ -17,6 +17,8 @@
 import type { Env } from "./env.js";
 import { handleDiscovery, rootMcpWwwAuthenticate } from "./discovery.js";
 import { deriveVaultFromToken, extractApiKey } from "./auth.js";
+import { routerFailureKind } from "./health.js";
+import type { VaultDO } from "./vault-do.js";
 
 export { VaultDO } from "./vault-do.js";
 
@@ -86,7 +88,7 @@ export function resolveVault(url: URL, env: { VAULT_BASE_DOMAIN?: string }): { n
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
@@ -165,6 +167,7 @@ export default {
           return withCors(response);
         } catch (err) {
           console.error(`[router ${request.method} ${url.pathname}]`, err);
+          noteRouterFailure(rootStub, err, ctx);
           return json({ error: "Internal server error" }, 500);
         }
       }
@@ -208,7 +211,23 @@ export default {
       return withCors(res);
     } catch (err) {
       console.error(`[router ${request.method} ${url.pathname}]`, err);
+      noteRouterFailure(stub, err, ctx);
       return json({ error: "Internal server error" }, 500);
     }
   },
 };
+
+/**
+ * Count a platform failure of the vault's Durable Object (CPU or memory
+ * limit, reset on a code update, overload) in that vault's own health
+ * counters (T-411, health.ts), after the response. An exception the object's
+ * own code threw is already counted inside it, so only platform kinds go
+ * here. Best-effort: the object may still be resetting; a lost count is
+ * acceptable, a broken response is not.
+ */
+function noteRouterFailure(stub: DurableObjectStub, err: unknown, ctx: ExecutionContext | undefined): void {
+  const kind = routerFailureKind(err);
+  if (!kind) return;
+  const p = (stub as unknown as DurableObjectStub<VaultDO>).recordRouterFailure(kind).catch(() => {});
+  if (ctx?.waitUntil) ctx.waitUntil(p);
+}

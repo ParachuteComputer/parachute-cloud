@@ -67,6 +67,13 @@ export interface Env {
    */
   BILLING_MODE?: string;
 
+  /**
+   * The deployed version (wrangler `[version_metadata]`, both scopes). Tags the
+   * health counters (health.ts) so the report can compare before and after a
+   * deploy. Absent in tests and bare configs → "unversioned".
+   */
+  CF_VERSION_METADATA?: { id: string; tag?: string; timestamp?: string };
+
   /** Deploy environment. TEST_JWKS is honored only when this is "test". */
   ENVIRONMENT?: string;
 

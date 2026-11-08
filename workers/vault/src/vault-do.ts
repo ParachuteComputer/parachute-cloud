@@ -47,6 +47,7 @@ import {
 } from "./caps.js";
 import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./rest/storage-constants.js";
 import { handleMcp } from "./mcp.js";
+import { HealthSink, errorClass, httpOutcome, routeOf, utcDay, versionLabel } from "./health.js";
 import { mcpWwwAuthenticate } from "./discovery.js";
 import { handleSubscribe } from "./live/subscribe.js";
 import { SubscriptionManager, WsSink, type SubscriptionHandle } from "./live/subscriptions.js";
@@ -628,6 +629,7 @@ export class VaultDO extends DurableObject {
     super(ctx, env);
     this.env = env;
     this.attachmentTickets = new DoAttachmentTicketProvider(ctx.storage);
+    this.health = new HealthSink(ctx.storage, versionLabel(env.CF_VERSION_METADATA));
     // The shim carries `ctx.storage` (not just `.sql`) so its `transactionSync`
     // can delegate to the real DO transaction primitive — the free
     // `transaction(db, fn)` path (incl. boot migrations) prefers it (vault#523).
@@ -711,8 +713,58 @@ export class VaultDO extends DurableObject {
       const refused = await this.answerDuringImport(request);
       if (refused) return refused;
     }
-    return this.counted(() => this.handleFetch(request));
+    return this.counted(() => this.countedFetch(request));
   }
+
+  /**
+   * {@link handleFetch}, with its outcome added to the vault's health
+   * counters (T-411, health.ts): the route group and the status class, or the
+   * exception's class name when the handler threw (rethrown unchanged). Not
+   * counted: the staging hooks and the health read itself (routeOf → null), a
+   * vault that is (or became) destroyed — its storage must stay empty — and a
+   * request that never loaded the vault (ensureState did not run).
+   */
+  private async countedFetch(request: Request): Promise<Response> {
+    let res: Response;
+    try {
+      res = await this.handleFetch(request);
+    } catch (err) {
+      const route = this.healthRoute(request);
+      if (route && this.stateLoaded && !this.destroyed) await this.health.record(`http:${route}`, `exception:${errorClass(err)}`);
+      throw err;
+    }
+    const route = this.healthRoute(request);
+    if (route && this.stateLoaded && !this.destroyed) await this.health.record(`http:${route}`, httpOutcome(res.status));
+    return res;
+  }
+
+  private healthRoute(request: Request): string | null {
+    const m = /^\/vault\/[^/]+(\/.*)?$/.exec(new URL(request.url).pathname);
+    if (!m) return null;
+    const rest = m[1] ?? "";
+    if (rest === "/api/internal/destroy") return null;
+    return routeOf(rest, isWebSocketUpgrade(request));
+  }
+
+  /**
+   * RPC from the edge router (index.ts) when a call into this object threw a
+   * platform failure the object's own code never saw: the CPU or memory limit,
+   * a reset for a code update, an overload (health.ts routerFailureKind).
+   * RPC, not a route: no request from the internet can reach it.
+   */
+  async recordRouterFailure(kind: string): Promise<void> {
+    if (this.destroyed) return;
+    await this.health.record("do", kind);
+  }
+
+  /** The vault's health counter sink (T-411); see health.ts. */
+  private readonly health: HealthSink;
+
+  /**
+   * STAGING/DEV-ONLY planted failure (T-411 report proof): the next N
+   * requests to this vault answer 500 (see /__test/fail-next). In memory only.
+   */
+  private plantedFailures = 0;
 
   /**
    * While an import or restore replays (T-318; see `importRun`): the
@@ -834,6 +886,23 @@ export class VaultDO extends DurableObject {
       return json(await this.purgeCheck(vaultName));
     }
 
+    // STAGING/DEV-ONLY planted failure (T-411): POST /vault/<name>/__test/
+    // fail-next?n=N makes this vault's next N requests answer 500, so a
+    // staging run can prove the health report catches a real failure on one
+    // vault and stays quiet on the others. 404 off the dev allowlist
+    // (production included — pinned by smoke-prod).
+    if (rest === "/__test/fail-next") {
+      const envName = this.env.ENVIRONMENT;
+      if (envName !== "staging" && envName !== "development" && envName !== "test") {
+        return json({ error: "Not found" }, 404);
+      }
+      if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+      const n = Number(url.searchParams.get("n") ?? "1");
+      if (!Number.isInteger(n) || n < 0 || n > 50) return json({ error: "n must be 0..50" }, 400);
+      this.plantedFailures = n;
+      return json({ armed: n });
+    }
+
     // Every OTHER route on an already-destroyed warm instance: 410, no
     // writes, no ensureState (the same resurrection concern as above).
     if (this.destroyed) {
@@ -873,6 +942,11 @@ export class VaultDO extends DurableObject {
 
   private async handleLive(request: Request, url: URL, vaultName: string, rest: string): Promise<Response> {
     await this.ensureState(vaultName);
+    if (this.plantedFailures > 0 && !rest.startsWith("/api/internal/")) {
+      this.plantedFailures--;
+      await request.body?.cancel().catch(() => {});
+      return json({ error: "Internal server error", planted: true }, 500);
+    }
 
     // Live-query WS binding: rebuild in-memory subscriptions from the sockets'
     // serialized attachments (once per warm DO), THEN sweep expired/revoked/
@@ -1001,6 +1075,7 @@ export class VaultDO extends DurableObject {
           provider: this.attachmentTickets,
           mintGate: (declaredBytes) => this.attachmentMintGate(declaredBytes),
         },
+        (subject, outcome) => this.health.record(subject, outcome),
       );
     }
 
@@ -1109,6 +1184,7 @@ export class VaultDO extends DurableObject {
       const forbidden = this.internalForbidden(auth, vaultName);
       if (forbidden) return forbidden;
       if (apiPath === "/internal/config") return this.handleInternalConfig(request);
+      if (apiPath === "/internal/health") return this.handleInternalHealth(request);
       if (apiPath === "/internal/snapshot") return this.handleSnapshot(request, vaultName);
       if (apiPath === "/internal/snapshots") return this.handleListSnapshots(request, vaultName);
       if (apiPath === "/internal/restore") return this.handleRestore(request, vaultName);
@@ -1450,6 +1526,19 @@ export class VaultDO extends DurableObject {
    *   - `transcription: { enabled, minutes_limit }` — the voice entitlement.
    * Authorization: {@link internalForbidden} (already enforced by the dispatcher).
    */
+  /**
+   * GET /api/internal/health?since=YYYY-MM-DD (T-411) — this vault's health
+   * counters (health.ts) for each stored day from `since` on (default: two
+   * days back), for the identity worker's nightly collection. Names and
+   * counts only.
+   */
+  private async handleInternalHealth(request: Request): Promise<Response> {
+    if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+    const since = new URL(request.url).searchParams.get("since") ?? utcDay(new Date(Date.now() - 2 * 86_400_000));
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) return json({ error: "since must be YYYY-MM-DD" }, 400);
+    return json({ version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since) });
+  }
+
   private async handleInternalConfig(request: Request): Promise<Response> {
     const shape = () => {
       const dbBytes = Number(this.raw().databaseSize);
@@ -2998,6 +3087,18 @@ export class VaultDO extends DurableObject {
    *   single whisper call.
    */
   async alarm(): Promise<void> {
+    try {
+      await this.runAlarm();
+    } catch (err) {
+      // An alarm that throws is retried by the platform; count each throw
+      // (T-411). Successful wakes are not counted: they are frequent and the
+      // report only needs the failures here.
+      if (!this.destroyed) await this.health.record("alarm", `exception:${errorClass(err)}`);
+      throw err;
+    }
+  }
+
+  private async runAlarm(): Promise<void> {
     if (this.bootError) return;
     if (this.destroyed) return;
     // Reentrancy guard (cloud#171 hardening), checked+set SYNCHRONOUSLY
