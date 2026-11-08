@@ -1745,6 +1745,16 @@ async function handleNotesInner(
     const note = await resolveNote(store, idOrPath);
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
+    // T-412: `?erase_history=true` also erases every version (no tombstone); the DO gate already required admin for
+    // any value but false. Same shape as the bun door.
+    const erase = new URL(req.url).searchParams.get("erase_history");
+    if (erase !== null && erase !== "true" && erase !== "false") {
+      return json({ error: "erase_history must be true or false", error_type: "invalid_request", field: "erase_history" }, 400);
+    }
+    if (erase === "true") {
+      const r = await store.forgetNote(note.id);
+      return json({ deleted: true, id: note.id, history_erased: { versions_deleted: r.versionsDeleted, blobs_deleted: r.blobsDeleted } });
+    }
     await store.deleteNote(note.id);
     return json({ deleted: true, id: note.id });
   }

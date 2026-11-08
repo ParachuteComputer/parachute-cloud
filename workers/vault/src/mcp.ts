@@ -566,6 +566,9 @@ function visibleTools(
   const tools = generateMcpTools(store, {
     writeContext,
     attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
+    // T-412: delete-note's erase_history is admin-only, like DELETE /notes/:id/versions. Core refuses it unless this
+    // is set. Cloud has no tag-scoped passes, so an admin may also name a note already deleted.
+    ...(hasScopeForVault(auth.scopes, vaultName, "admin") ? { eraseHistory: "all" as const } : {}),
   });
   return tools.filter((t) => hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)));
 }

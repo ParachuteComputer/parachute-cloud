@@ -36,3 +36,23 @@ export async function handleHistoryCompact(req: Request, store: Store): Promise<
     return json({ error: "Compaction failed", error_type: "compaction_failed", message: error instanceof Error ? error.message : String(error) }, 500);
   }
 }
+
+/**
+ * GET /api/history/deleted — deleted notes that still have history, newest deletion first (T-412). Admin, gated at
+ * the DO dispatch boundary; cloud has no tag-scoped passes. Same shape and bounds as the bun door
+ * (packages/vault/src/routes.ts handleDeletedNotes).
+ */
+export async function handleDeletedNotes(req: Request, store: Store): Promise<Response> {
+  const url = new URL(req.url);
+  const num = (name: string, dflt: number) => {
+    const raw = url.searchParams.get(name);
+    if (raw === null) return dflt;
+    return /^\d+$/.test(raw) ? Number(raw) : NaN;
+  };
+  const limit = num("limit", 100);
+  const offset = num("offset", 0);
+  if (!Number.isSafeInteger(limit) || !Number.isSafeInteger(offset) || limit > 1000) {
+    return json({ error: "limit (0-1000) and offset must be whole numbers", error_type: "invalid_request" }, 400);
+  }
+  return json(await store.listDeletedNotes({ limit, offset }));
+}

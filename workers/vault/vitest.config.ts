@@ -70,6 +70,9 @@ function project(name: string, billingMode: "paid" | "open_beta", files: { inclu
               VAULT_AUTH_TOKEN: "test-operator-token",
               TEST_JWKS: TEST_PUBLIC_JWKS,
               BILLING_MODE: billingMode,
+              // test/row-cost.test.ts: extra vault sizes to meter (e.g. "5000,50000"); empty in CI.
+              ROW_METER_SIZES: process.env.ROW_METER_SIZES ?? "",
+              ROW_METER_TOP: process.env.ROW_METER_TOP ?? "",
             },
           },
         },

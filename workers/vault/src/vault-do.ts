@@ -32,7 +32,7 @@ import {
 import { NO_TAG_SCOPE } from "./rest/parse.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
-import { handleHistoryCompact } from "./rest/history.js";
+import { handleDeletedNotes, handleHistoryCompact } from "./rest/history.js";
 import { handleTags, handleFindPath } from "./rest/tags.js";
 import { handleDoctor } from "./rest/doctor.js";
 import { handleVault, type VaultConfigLike } from "./rest/vault.js";
@@ -1074,9 +1074,16 @@ export class VaultDO extends DurableObject {
     // collapses write and admin) is what makes the write/admin distinction
     // real on this door: a `vault:<name>:write` token keeps every genuine
     // write, and can never confer the admin tier it wasn't minted at.
-    const isHistoryErase = request.method === "DELETE" && /^\/notes\/[^/]+\/versions$/.test(apiPath);
+    // A delete that erases history (`?erase_history=`, T-412) is admin like DELETE .../versions: any value but an
+    // absent or explicit false is gated here, and the handler refuses one it can't read. So is listing deleted notes.
+    const eraseParam = request.method === "DELETE" && /^\/notes\/[^/]+$/.test(apiPath)
+      ? new URL(request.url).searchParams.get("erase_history")
+      : null;
+    const isHistoryErase = (request.method === "DELETE" && /^\/notes\/[^/]+\/versions$/.test(apiPath)) ||
+      (eraseParam !== null && eraseParam !== "false");
     const isHistoryCompact = request.method === "POST" && apiPath === "/history/compact";
-    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact
+    const isDeletedList = request.method === "GET" && apiPath === "/history/deleted";
+    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDeletedList
       ? "admin"
       : verbForMethod(request.method);
     if (requiredVerb !== "read" && !hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
@@ -1086,7 +1093,7 @@ export class VaultDO extends DurableObject {
     // Everything but the platform's own hop (first-party admin, the operator's
     // description at /finish) counts as the person writing (T-379).
     const platform = auth.clientId === FIRST_PARTY_CLIENT_ID && hasScopeForVault(auth.scopes, vaultName, "admin");
-    if (!apiPath.startsWith("/internal/") && requiredVerb !== "read" && !platform) await this.markWritten();
+    if (!apiPath.startsWith("/internal/") && requiredVerb !== "read" && request.method !== "GET" && !platform) await this.markWritten();
 
     const writeCtx = { actor: auth.actor, via: auth.via };
     const deps: RestDeps = {
@@ -1147,6 +1154,7 @@ export class VaultDO extends DurableObject {
     if (apiPath.startsWith("/notes")) {
       return handleNotes(request, this.store, apiPath.slice(6), deps, NO_TAG_SCOPE, writeCtx);
     }
+    if (isDeletedList) return handleDeletedNotes(request, this.store);
     if (apiPath === "/history/compact") {
       if (request.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
       return handleHistoryCompact(request, this.store);
