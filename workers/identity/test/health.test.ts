@@ -285,7 +285,7 @@ describe("the report rules", () => {
     }
     for (let i = 0; i < 10; i++) {
       rows.push(row({ vault: `l${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 4 }));
-      rows.push(row({ vault: `l${i}`, subject: "http:mcp", outcome: "4xx:401", n: 2 }));
+      rows.push(row({ vault: `l${i}`, subject: "http:mcp", outcome: "4xx:401", n: 3 }));
     }
     const fleet = (await report(rows)).worse.map((f) => `${f.who}:${f.kind}`).sort();
     expect(fleet).toEqual(["all vaults:client_reason_up", "all vaults:stopped_working"]);
@@ -333,6 +333,35 @@ describe("the report rules", () => {
       else if (i < 7) poked.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "4xx:401", n: 1 }));
     }
     expect((await report(poked)).worse).toEqual([]);
+  });
+
+  test("a stranger's 401s on 3 of the vaults that used a route no one has used today raise nothing (the usual spread holds)", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 200; i++) {
+      for (const day of [PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, subject: "http:notes", outcome: "2xx", n: 50 }));
+      if (i < 20) rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:export", outcome: "2xx", n: 10 }));
+      if (i < 3) rows.push(row({ vault: `v${i}`, subject: "http:export", outcome: "4xx:401", n: 3 }));
+    }
+    expect((await report(rows)).worse).toEqual([]);
+  });
+
+  test("401s rising while every vault's oks hold steady (tokens refreshed, no request lost) raise nothing", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 10; i++) {
+      for (const day of [PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, subject: "http:mcp", outcome: "2xx", n: 20 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "4xx:401", n: 5 }));
+    }
+    expect((await report(rows)).worse).toEqual([]);
+  });
+
+  test("vaults a stranger primed the day before (5 refusals, no ok) can't count toward a majority they're not part of", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 10; i++) for (const day of [PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, subject: "http:mcp", outcome: "2xx", n: 20 }));
+    for (let i = 0; i < 5; i++) {
+      rows.push(row({ vault: `s${i}`, day: PRIOR, subject: "http:mcp", outcome: "4xx:404", n: 5 }));
+      rows.push(row({ vault: `s${i}`, subject: "http:mcp", outcome: "4xx:401", n: 3 }));
+    }
+    expect((await report(rows)).worse).toEqual([]);
   });
 
   test("vaults that only ever see stale tokens (no ok before) don't dilute a real token outage", async () => {
