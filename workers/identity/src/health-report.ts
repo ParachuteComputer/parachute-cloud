@@ -49,8 +49,8 @@
  *     — every vault's tokens failing at once;
  *   - vaults that stopped working only once 401/403 count as failures (≥ 3
  *     ok before, none now, ≥ 3 failures) — those stopped by anything else
- *     already have their own line, as with server errors, and don't count
- *     toward the bars below.
+ *     already have their own line, as with server errors, and are left out
+ *     of this line's majority (not of the 401/403/404 rise's).
  * The last two need at least 3 vaults or a tenth of the vaults seen. What a
  * stranger can make (401, 403, 404) also needs at least half of the vaults
  * that could show it in that subject (in use before, and now still working
