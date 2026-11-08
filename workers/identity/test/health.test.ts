@@ -410,6 +410,15 @@ describe("the report rules", () => {
     }
     const m = await report(mixed);
     expect(m.worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working")?.detail).toContain("on 20 vaults");
+    // Vaults stopped by 5xx don't help a lone vault's 401s over the bars: they have their own lines.
+    const lone: HealthRow[] = [];
+    for (let i = 0; i < 20; i++) {
+      lone.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 50 }));
+      lone.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: i < 10 ? "5xx:502" : i === 10 ? "4xx:401" : "2xx", n: 20 }));
+    }
+    const l = await report(lone);
+    expect(l.worse.filter((f) => f.who === "all vaults" && f.kind === "stopped_working")).toEqual([]);
+    expect(l.worse.filter((f) => f.kind === "stopped_working")).toHaveLength(10);
   });
 
   test("a deploy that breaks tokens, or turns a route into 404s, on every vault is caught in the deploy window", async () => {

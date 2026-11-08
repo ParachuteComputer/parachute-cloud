@@ -47,9 +47,9 @@
  *   - a client reason, 401 included, that rose on each vault by its own
  *     measure (≥ 3 of it, ≥ 5 requests before, its share ×2 and +10 points)
  *     — every vault's tokens failing at once;
- *   - vaults that stopped working because every request was refused
- *     (401/403; ≥ 3 ok before, none now, ≥ 3 refusals) — those stopped by
- *     anything else already have their own line, as with server errors.
+ *   - vaults that stopped working only once 401/403 count as failures (≥ 3
+ *     ok before, none now, ≥ 3 failures) — those stopped by anything else
+ *     already have their own line, as with server errors.
  * The last two need at least 3 vaults or a tenth of the vaults seen. What a
  * stranger can make (401, 403, 404) also needs at least half of the vaults
  * that could show it in that subject (in use before, and now still working
@@ -243,6 +243,11 @@ function failures(t: Tally, excluded: Set<string>): number {
   return t.total - t.ok - sumOf(t, excluded);
 }
 
+/** Rule 4, at both levels: ok before (≥ 3), none now, and ≥ 3 failures not in `excluded`. */
+function stoppedBy(ta: Tally, tb: Tally, excluded: Set<string>): boolean {
+  return tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && failures(ta, excluded) >= STOPPED_FAILURES;
+}
+
 /** Rules 1–4 on one cell (a vault, a connector, an identity route). */
 function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLabel: string, out: Compared): void {
   const rateA = pct(ta.server, ta.total);
@@ -266,7 +271,7 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
     }
   }
   // Per vault, what a stranger can make (401, 403, 404) is never a failure; elsewhere only a 404 is left out.
-  if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && failures(ta, perVault ? STRANGER_REASONS : NOT_FOUND) >= STOPPED_FAILURES) {
+  if (stoppedBy(ta, tb, perVault ? STRANGER_REASONS : NOT_FOUND)) {
     out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${tb.ok} ok ${beforeLabel})` });
   }
 }
@@ -345,13 +350,15 @@ function fleetRules(
     }
     // Stopped: a vault stopped by what no stranger can make has its own line (rule 4), so — as with
     // new server errors — the fleet line is for the rest: vaults stopped only because every request
-    // was refused (401/403). It needs the vaults that could show it, stopped with 401/403 counted, to
-    // clear the stranger bars; it then names every refused-only vault, light ones included.
-    const stopped = (c: { ta: Tally; tb: Tally }, excluded: Set<string>) =>
-      c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failures(c.ta, excluded) >= STOPPED_FAILURES;
-    const refusedOnly = cells.filter((c) => stopped(c, NOT_FOUND) && !stopped(c, STRANGER_REASONS));
-    if (refusedOnly.length > 0 && strangerProof(couldShow.filter((c) => stopped(c, NOT_FOUND)).length)) {
-      out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${refusedOnly.length} vaults that worked ${beforeLabel}: every request refused (401/403)` });
+    // was refused (401/403). Those among the vaults that could show it must clear the stranger bars;
+    // the line then names every such vault, light ones included.
+    const refusedOnly = cells.filter((c) => stoppedBy(c.ta, c.tb, NOT_FOUND) && !stoppedBy(c.ta, c.tb, STRANGER_REASONS));
+    if (strangerProof(refusedOnly.filter((c) => couldShow.includes(c)).length)) {
+      out.worse.push({
+        ...base,
+        kind: "stopped_working",
+        detail: `stopped working on ${refusedOnly.length} vaults that worked ${beforeLabel} (no ok; 401/403 among the failures)`,
+      });
     }
   }
 }
