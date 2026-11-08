@@ -250,7 +250,7 @@ describe("the report rules", () => {
     }
     expect((await report([...stale, ...working], { vault: cur })).worse).toEqual([]);
     // If those three are every vault seen since the deploy, nothing tells them from an outage: flagged.
-    expect((await report(stale, { vault: cur })).worse.map((f) => `${f.who}:${f.window}:${f.kind}`)).toContain("all vaults:deploy:client_reason_up");
+    expect((await report(stale, { vault: cur })).worse.map((f) => `${f.who}:${f.kind}`)).toContain("all vaults:client_reason_up");
   });
 
   test("a quiet day (oks halve everywhere) plus a stranger's 401s on three vaults raises nothing", async () => {
@@ -287,17 +287,43 @@ describe("the report rules", () => {
     expect(fleet).toEqual(["all vaults:client_reason_up", "all vaults:stopped_working"]);
   });
 
-  test("401s on 10 of the 20 vaults using a route, in a fleet of 200, also need the usual spread (a tenth of the fleet)", async () => {
-    const rows: HealthRow[] = [];
-    for (let i = 0; i < 200; i++) {
-      for (const day of [PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, subject: "http:notes", outcome: "2xx", n: 50 }));
-      if (i < 20) {
-        rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:export", outcome: "2xx", n: 10 }));
-        rows.push(row({ vault: `v${i}`, subject: "http:export", outcome: "2xx", n: 10 }));
-        if (i < 10) rows.push(row({ vault: `v${i}`, subject: "http:export", outcome: "4xx:401", n: 5 }));
+  test("a route few vaults use (20 of 200) going dark for all of them is caught; on 3 of them it is not", async () => {
+    const build = (broken: number) => {
+      const rows: HealthRow[] = [];
+      for (let i = 0; i < 200; i++) {
+        for (const day of [PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, subject: "http:notes", outcome: "2xx", n: 50 }));
+        if (i < 20) {
+          rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:export", outcome: "2xx", n: 10 }));
+          rows.push(row({ vault: `v${i}`, subject: "http:export", outcome: i < broken ? "4xx:401" : "2xx", n: 10 }));
+        }
       }
+      return rows;
+    };
+    const kinds = (await report(build(20))).worse.map((f) => `${f.who}:${f.subject}:${f.kind}`).sort();
+    expect(kinds).toEqual(["all vaults:http:export:client_reason_up", "all vaults:http:export:stopped_working"]);
+    expect((await report(build(3))).worse).toEqual([]);
+  });
+
+  test("a stranger's 401s on 3 vaults, on a day the other 7 used theirs only lightly (and fine), raise nothing", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 10; i++) {
+      rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 20 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: i < 3 ? "4xx:401" : "2xx", n: i < 3 ? 5 : 2 }));
     }
     expect((await report(rows)).worse).toEqual([]);
+  });
+
+  test("vaults that only ever see stale tokens (no ok before) don't dilute a real token outage", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 12; i++) {
+      for (const day of [PRIOR, DAY]) rows.push(row({ vault: `a${i}`, day, subject: "http:mcp", outcome: "4xx:401", n: 50 }));
+    }
+    for (let i = 0; i < 8; i++) {
+      rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 40 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "4xx:401", n: 40 }));
+    }
+    const fleet = (await report(rows)).worse.filter((f) => f.who === "all vaults").map((f) => f.kind).sort();
+    expect(fleet).toEqual(["client_reason_up", "stopped_working"]);
   });
 
   test("the fleet 'stopped working' line counts every vault that stopped, 401s included", async () => {
