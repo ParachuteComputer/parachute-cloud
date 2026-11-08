@@ -193,6 +193,34 @@ describe("the report rules", () => {
     expect((await report(idle)).worse).toEqual([]);
   });
 
+  test("a stranger's 401s and 403s on three small vaults that were used yesterday and are idle today raise no fleet finding", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 27; i++) {
+      for (const day of [PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, subject: "http:mcp", outcome: "2xx", n: 100 }));
+    }
+    for (let i = 0; i < 3; i++) {
+      rows.push(row({ vault: `i${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 6 }));
+      rows.push(row({ vault: `i${i}`, subject: "http:mcp", outcome: "4xx:401", n: 4 }));
+      rows.push(row({ vault: `i${i}`, subject: "http:mcp", outcome: "4xx:403", n: 3 }));
+    }
+    expect((await report(rows)).worse).toEqual([]);
+  });
+
+  test("three vaults with no row the day before don't count as 'had no server errors before' at fleet level", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 27; i++) {
+      for (const day of [PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, subject: "http:notes", outcome: "2xx", n: 100 }));
+    }
+    for (let i = 0; i < 3; i++) {
+      rows.push(row({ vault: `n${i}`, subject: "http:notes", outcome: "2xx", n: 50 }));
+      rows.push(row({ vault: `n${i}`, subject: "http:notes", outcome: "5xx:500", n: 1 }));
+    }
+    const r = await report(rows);
+    expect(r.worse).toEqual([]);
+    // Still shown, one by one.
+    expect(r.otherServerErrors).toHaveLength(3);
+  });
+
   test("a thin server outage on 15 of 200 vaults is caught (strangers can't make server errors)", async () => {
     const rows: HealthRow[] = [];
     for (let i = 0; i < 200; i++) {

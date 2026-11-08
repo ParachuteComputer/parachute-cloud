@@ -37,16 +37,20 @@
  *      vault whose name they know); at fleet level and for identity's own
  *      routes and connectors they count — that is the "tokens broke" signal;
  *   4. stopped working — ok before (≥ 3), none now, and at least 3 failures
- *      now. A 404 is never a failure here; per vault a 401 is not either.
+ *      now. A 404 is never a failure here; per vault a 401 or 403 is not
+ *      either.
  * At fleet level (the vault worker, per subject, over every vault) the same
  * questions are asked of VAULTS, not of summed requests:
- *   - new server errors on at least 3 vaults that had none (beyond those
- *     already reported one by one) — one new 500 on each of many vaults;
+ *   - new server errors on at least 3 vaults that had rows before and no
+ *     server error in them (beyond those already reported one by one) — one
+ *     new 500 on each of many vaults;
  *   - a client reason, 401 included, that rose on each vault by its own
  *     measure (≥ 3 of it, ≥ 5 requests before, share ×2 and +10 points; for a
- *     401/403 its ok count also halved) — every vault's tokens failing at once;
+ *     401/403 the vault also had ≥ 10 ok before and its ok count halved) —
+ *     every vault's tokens failing at once;
  *   - vaults that stopped working by the per-vault bar (≥ 3 ok before, none
- *     now, ≥ 3 failures, a 401 counted).
+ *     now, ≥ 3 failures; a 401/403 counts as a failure only on a vault with
+ *     ≥ 10 ok before).
  * The last two need at least 3 vaults or a tenth of the vaults seen, so a
  * stranger flooding one vault, or poking a few idle ones, makes no finding.
  * Server errors below rule 1's bar, or present both times and not rising,
@@ -146,6 +150,14 @@ const FLEET_MIN_VAULTS = 3;
 const FLEET_VAULT_MIN = 3;
 const FLEET_VAULT_BASELINE = 5;
 const AUTH_REFUSALS = new Set(["4xx:401", "4xx:403"]);
+/**
+ * Fleet level: a vault's 401/403s count (toward a rising refusal, or as the
+ * failures of "stopped working") only on a vault with at least this many ok
+ * before — real use a token outage would cut. A stranger can make 401/403s on
+ * any vault whose name they know, and a small vault that is idle today has no
+ * ok left to show the difference.
+ */
+const FLEET_AUTH_OK_BEFORE = 10;
 const FLEET_MIN_SHARE = 0.1;
 
 interface Tally {
@@ -211,6 +223,12 @@ function shareRose(ta: Tally, tb: Tally, outcome: string): boolean {
 
 type Base = Omit<Finding, "kind" | "detail">;
 
+function sumOf(t: Tally, outcomes: Set<string>): number {
+  let n = 0;
+  for (const o of outcomes) n += t.byOutcome.get(o) ?? 0;
+  return n;
+}
+
 /** Rules 1–4 on one cell (a vault, a connector, an identity route). */
 function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLabel: string, out: Compared): void {
   const rateA = pct(ta.server, ta.total);
@@ -233,7 +251,8 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
       }
     }
   }
-  const notFailures = (ta.byOutcome.get("4xx:404") ?? 0) + (perVault ? (ta.byOutcome.get("4xx:401") ?? 0) : 0);
+  // Per vault, what a stranger can make (401, 403, 404) is never a failure; elsewhere only a 404 is left out.
+  const notFailures = perVault ? sumOf(ta, STRANGER_REASONS) : (ta.byOutcome.get("4xx:404") ?? 0);
   if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && ta.total - ta.ok - notFailures >= STOPPED_FAILURES) {
     out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${tb.ok} ok ${beforeLabel})` });
   }
@@ -244,12 +263,12 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
  * spread too thin for any one vault to show. Every fleet rule needs the change
  * on several vaults ({@link spread}), counted from each vault's OWN cells, so
  * a stranger flooding one vault never makes a fleet finding:
- *   - new server errors on vaults that had none, beyond the vaults already
- *     reported one by one (rule 1 at fleet level);
+ *   - new server errors on vaults that had rows before and none in them,
+ *     beyond the vaults already reported one by one (rule 1 at fleet level);
  *   - a client reason whose share rose on each of those vaults (rule 3; 401s
  *     included — the "tokens broke" signal);
- *   - vaults that worked before and have no ok at all now (rule 4; a 401 is
- *     a failure here, a 404 never).
+ *   - vaults that worked before and have no ok at all now (rule 4; a 404 is
+ *     never a failure, a 401/403 only on a vault with real use before).
  */
 function fleetRules(
   window: "day" | "deploy",
@@ -274,7 +293,8 @@ function fleetRules(
     const [source, subject] = g.split("\u0000") as [string, string];
     const base = { window, who: "all vaults", source, subject };
     // A stranger without credentials can't cause server errors: 3 vaults are enough, at any fleet size.
-    const fresh = cells.filter((c) => c.ta.server > 0 && c.tb.server === 0 && !flaggedServer.has(c.key));
+    // "None before" needs a before: a vault with no row in the earlier window is not counted here.
+    const fresh = cells.filter((c) => c.ta.server > 0 && c.tb.total > 0 && c.tb.server === 0 && !flaggedServer.has(c.key));
     if (fresh.length >= FLEET_MIN_VAULTS) {
       const n = fresh.reduce((s, c) => s + c.ta.server, 0);
       out.worse.push({ ...base, kind: "new_server_errors", detail: `new server errors on ${fresh.length} vaults (${n} in all; none ${beforeLabel})` });
@@ -282,14 +302,15 @@ function fleetRules(
     const reasons = new Set(cells.flatMap((c) => [...c.ta.byOutcome.keys()].filter((o) => outcomeClass(o) === "client")));
     for (const outcome of reasons) {
       // A vault counts only when its own change looks real: a few of them, a
-      // vault that was in use, and — for a 401/403 — its ok count fell too
-      // (a token outage cuts the oks; expired tokens and a stranger don't).
+      // vault that was in use, and — for a 401/403 — real use before
+      // (FLEET_AUTH_OK_BEFORE) and its ok count fell too (a token outage cuts
+      // the oks; expired tokens and a stranger don't).
       const rose = cells.filter(
         (c) =>
           (c.ta.byOutcome.get(outcome) ?? 0) >= FLEET_VAULT_MIN &&
           c.tb.total >= FLEET_VAULT_BASELINE &&
           shareRose(c.ta, c.tb, outcome) &&
-          (!AUTH_REFUSALS.has(outcome) || c.ta.ok <= c.tb.ok / 2),
+          (!AUTH_REFUSALS.has(outcome) || (c.tb.ok >= FLEET_AUTH_OK_BEFORE && c.ta.ok <= c.tb.ok / 2)),
       );
       const na = rose.reduce((s, c) => s + (c.ta.byOutcome.get(outcome) ?? 0), 0);
       if (enough(rose.length) && na >= CLIENT_MIN) {
@@ -297,7 +318,8 @@ function fleetRules(
       }
     }
     const stopped = cells.filter((c) => {
-      const failed = c.ta.total - c.ta.ok - (c.ta.byOutcome.get("4xx:404") ?? 0);
+      const refusalsCount = c.tb.ok >= FLEET_AUTH_OK_BEFORE;
+      const failed = c.ta.total - c.ta.ok - (c.ta.byOutcome.get("4xx:404") ?? 0) - (refusalsCount ? 0 : sumOf(c.ta, AUTH_REFUSALS));
       return c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failed >= STOPPED_FAILURES;
     });
     if (enough(stopped.length)) {
