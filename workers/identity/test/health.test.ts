@@ -58,12 +58,16 @@ function quietly<T>(fn: () => Promise<T>): Promise<T> {
  */
 function data(rows: HealthRow[], live: Record<string, string> = {}): HealthData {
   const sums = new Map<string, HealthRow>();
+  const daysSeen = new Map<string, Set<string>>();
   for (const r of rows) {
     const k = [r.source, r.version, r.vault, r.subject, r.outcome].join("|");
     const cur = sums.get(k);
     if (cur) cur.n += r.n;
     else sums.set(k, { ...r, day: "" });
+    if (!daysSeen.has(k)) daysSeen.set(k, new Set());
+    daysSeen.get(k)!.add(r.day);
   }
+  for (const [k, r] of sums) r.days = daysSeen.get(k)!.size;
   return { days: rows.filter((r) => r.day === DAY || r.day === PRIOR), versions: [...sums.values()], live };
 }
 const report = (rows: HealthRow[], live: Record<string, string> = {}) => buildHealthReport(data(rows, live), { day: DAY, environment: "production" });
@@ -204,6 +208,49 @@ describe("the report rules", () => {
       rows.push(row({ vault: `i${i}`, subject: "http:mcp", outcome: "4xx:403", n: 3 }));
     }
     expect((await report(rows)).worse).toEqual([]);
+  });
+
+  test("a stranger's 404s raise no fleet finding, on small idle vaults or on busy ones", async () => {
+    const steady = (n: number) => {
+      const rows: HealthRow[] = [];
+      for (let i = 0; i < n; i++) for (const day of [PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, subject: "http:tickets", outcome: "2xx", n: 100 }));
+      return rows;
+    };
+    const idle = steady(27);
+    for (let i = 0; i < 3; i++) {
+      idle.push(row({ vault: `i${i}`, day: PRIOR, subject: "http:tickets", outcome: "2xx", n: 6 }));
+      idle.push(row({ vault: `i${i}`, subject: "http:tickets", outcome: "4xx:404", n: 3 }));
+    }
+    expect((await report(idle)).worse).toEqual([]);
+    const busy = steady(30);
+    for (let i = 0; i < 3; i++) busy.push(row({ vault: `v${i}`, subject: "http:tickets", outcome: "4xx:404", n: 30 }));
+    expect((await report(busy)).worse).toEqual([]);
+  });
+
+  test("every vault's requests turning into 403s at once is caught at fleet level", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 10; i++) {
+      rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:notes", outcome: "2xx", n: 40 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:notes", outcome: "4xx:403", n: 40 }));
+    }
+    const fleet = (await report(rows)).worse.map((f) => `${f.who}:${f.kind}:${f.reason ?? ""}`).sort();
+    expect(fleet).toEqual(["all vaults:client_reason_up:4xx:403", "all vaults:stopped_working:"]);
+  });
+
+  test("since a deploy this morning, a week of the old version is compared a day at a time: stale tokens on idle vaults raise nothing", async () => {
+    const old = "2026-10-31t10:00:00z~aaaaaaaa";
+    const cur = "2026-11-07t09:00:00z~bbbbbbbb";
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 3; i++) {
+      for (const day of ["2026-11-01", "2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"]) {
+        rows.push(row({ vault: `v${i}`, day, version: old, subject: "http:mcp", outcome: "2xx", n: 3 }));
+      }
+      // The owner hasn't been back since the deploy; a connector polls with an expired token.
+      rows.push(row({ vault: `v${i}`, version: cur, subject: "http:mcp", outcome: "4xx:401", n: 4 }));
+    }
+    const r = await report(rows, { vault: cur });
+    expect(r.windows.deploy.map((w) => [w.before, w.after])).toEqual([[old, cur]]);
+    expect(r.worse).toEqual([]);
   });
 
   test("a thin outage on vaults that had no traffic the day before still counts at fleet level, and says so", async () => {

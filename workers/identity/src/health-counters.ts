@@ -410,7 +410,7 @@ export async function collectVaultHealth(
 export const HEALTH_SQL = {
   days: "SELECT day, source, version, vault, subject, outcome, n FROM health_counters WHERE day IN (?, ?)",
   versions:
-    "SELECT '' AS day, source, version, vault, subject, outcome, SUM(n) AS n FROM health_counters WHERE day >= ? GROUP BY source, version, vault, subject, outcome",
+    "SELECT '' AS day, source, version, vault, subject, outcome, SUM(n) AS n, COUNT(DISTINCT day) AS days FROM health_counters WHERE day >= ? GROUP BY source, version, vault, subject, outcome",
   // Oldest first: the last row per source wins, ties broken by the later label.
   live: "SELECT source, version FROM health_versions ORDER BY last_seen, version",
 };

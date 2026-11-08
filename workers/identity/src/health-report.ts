@@ -45,18 +45,21 @@
  *     traffic at all then (beyond those already reported one by one) — one
  *     new 500 on each of many vaults;
  *   - a client reason, 401 included, that rose on each vault by its own
- *     measure (≥ 3 of it, ≥ 5 requests before, share ×2 and +10 points; for a
- *     401/403 the vault also had ≥ 10 ok before and its ok count halved) —
- *     every vault's tokens failing at once;
+ *     measure (≥ 3 of it, ≥ 5 requests before, share ×2 and +10 points; for
+ *     what a stranger can make — 401, 403, 404 — the vault also had real use
+ *     before, FLEET_REAL_USE_OK, and its ok count halved) — every vault's
+ *     tokens failing at once;
  *   - vaults that stopped working by the per-vault bar (≥ 3 ok before, none
  *     now, ≥ 3 failures; a 401/403 counts as a failure only on a vault with
- *     ≥ 10 ok before).
+ *     real use before).
  * The last two need at least 3 vaults or a tenth of the vaults seen, so a
  * stranger flooding one vault, or poking a few small idle ones, makes no
  * finding. What stays open: a stranger who knows the names of 3+ vaults with
- * ≥ 10 ok the day before (or on the previous version, which in the deploy
- * window is a whole week) and none today can still raise one — the gate's
- * HEALTH_GATE=ack is the way past it.
+ * real use the day before and none today can still raise one — the gate's
+ * HEALTH_GATE=ack is the way past it. (Telling a refused genuine token from a
+ * missing or foreign one at the source would close it; not done here.)
+ * In the deploy window the earlier version's counts are scaled to a day's
+ * share when it served longer than the live one has.
  * Server errors below rule 1's bar, or present both times and not rising,
  * are listed as "other server errors" — shown, never counted as worse.
  *
@@ -72,6 +75,8 @@ export interface HealthRow {
   subject: string;
   outcome: string;
   n: number;
+  /** `versions` rows only: on how many distinct days this count was seen (the deploy window's per-day scale). */
+  days?: number;
 }
 
 /**
@@ -153,18 +158,17 @@ const FLEET_MIN_VAULTS = 3;
 /** Fleet level, per vault: at least this many of the outcome, on a vault with at least this many requests before. */
 const FLEET_VAULT_MIN = 3;
 const FLEET_VAULT_BASELINE = 5;
-const AUTH_REFUSALS = new Set(["4xx:401", "4xx:403"]);
 /**
- * Fleet level: a vault's 401/403s count (toward a rising refusal, or as the
- * failures of "stopped working") only on a vault with at least this many ok
- * before — real use a token outage would cut. A stranger can make 401/403s on
- * any vault whose name they know, and a small vault that is idle today has no
- * ok left to show the difference. The cost: a token outage only on vaults
- * lighter than this goes unseen here (the staging smoke's real OAuth flows are
- * what catch that at deploy time).
+ * Fleet level: what a stranger can make (STRANGER_REASONS) counts — toward a
+ * rising reason, or a 401/403 as a failure of "stopped working" — only on a
+ * vault with at least this many ok before: real use an outage would cut. A
+ * small vault that is idle today has no ok left to tell a stranger from an
+ * outage. The cost: an outage only on vaults lighter than this goes unseen
+ * here (the staging smoke's real OAuth flows catch a token break before a
+ * deploy).
  */
-const FLEET_AUTH_OK_BEFORE = 10;
-const realUse = (tb: Tally) => tb.ok >= FLEET_AUTH_OK_BEFORE;
+const FLEET_REAL_USE_OK = 10;
+const realUse = (tb: Tally) => tb.ok >= FLEET_REAL_USE_OK;
 const NOT_FOUND = new Set(["4xx:404"]);
 const FLEET_MIN_SHARE = 0.1;
 
@@ -206,6 +210,8 @@ function spread(vaults: number, vaultsSeen: number): boolean {
 
 const pct = (a: number, b: number) => (b === 0 ? 0 : a / b);
 const fmtPct = (x: number) => `${(x * 100).toFixed(x < 0.1 ? 1 : 0)}%`;
+/** A count; the deploy window's day-share of an earlier version can be fractional. */
+const fmtN = (x: number) => (Number.isInteger(x) ? String(x) : x.toFixed(1));
 
 function serverReasons(t: Tally): string {
   return [...t.byOutcome.entries()]
@@ -237,16 +243,21 @@ function sumOf(t: Tally, outcomes: Set<string>): number {
   return n;
 }
 
+/** Rule 4's failures: everything not ok, less a 404 always, and less a 401/403 unless `refusalsCount`. */
+function failures(t: Tally, refusalsCount: boolean): number {
+  return t.total - t.ok - sumOf(t, refusalsCount ? NOT_FOUND : STRANGER_REASONS);
+}
+
 /** Rules 1–4 on one cell (a vault, a connector, an identity route). */
 function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLabel: string, out: Compared): void {
   const rateA = pct(ta.server, ta.total);
   const rateB = pct(tb.server, tb.total);
   if (ta.server > 0 && tb.server === 0 && (ta.server >= NEW_SERVER_MIN || rateA >= NEW_SERVER_MIN_RATE)) {
-    out.worse.push({ ...base, kind: "new_server_errors", detail: `new server errors: ${serverReasons(ta)} of ${ta.total} (none ${beforeLabel}, of ${tb.total})` });
+    out.worse.push({ ...base, kind: "new_server_errors", detail: `new server errors: ${serverReasons(ta)} of ${ta.total} (none ${beforeLabel}, of ${fmtN(tb.total)})` });
   } else if (ta.server >= UP_MIN && rateA >= 2 * rateB && rateA - rateB >= UP_MIN_POINTS) {
     out.worse.push({ ...base, kind: "server_errors_up", detail: `server errors up: ${fmtPct(rateA)} now (${serverReasons(ta)}), ${fmtPct(rateB)} ${beforeLabel}` });
   } else if (ta.server > 0) {
-    out.other.push({ ...base, kind: "other_server_errors", detail: `${serverReasons(ta)} of ${ta.total} (${tb.server} of ${tb.total} ${beforeLabel})` });
+    out.other.push({ ...base, kind: "other_server_errors", detail: `${serverReasons(ta)} of ${ta.total} (${fmtN(tb.server)} of ${fmtN(tb.total)} ${beforeLabel})` });
   }
   if (tb.total >= CLIENT_BASELINE) {
     for (const [outcome, na] of ta.byOutcome) {
@@ -260,9 +271,8 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
     }
   }
   // Per vault, what a stranger can make (401, 403, 404) is never a failure; elsewhere only a 404 is left out.
-  const notFailures = sumOf(ta, perVault ? STRANGER_REASONS : NOT_FOUND);
-  if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && ta.total - ta.ok - notFailures >= STOPPED_FAILURES) {
-    out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${tb.ok} ok ${beforeLabel})` });
+  if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && failures(ta, !perVault) >= STOPPED_FAILURES) {
+    out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${fmtN(tb.ok)} ok ${beforeLabel})` });
   }
 }
 
@@ -277,6 +287,8 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
  *     included — the "tokens broke" signal);
  *   - vaults that worked before and have no ok at all now (rule 4; a 404 is
  *     never a failure, a 401/403 only on a vault with real use before).
+ * What a stranger can make (401, 403, 404) counts only on a vault with real
+ * use before (FLEET_REAL_USE_OK) whose oks fell.
  */
 function fleetRules(
   window: "day" | "deploy",
@@ -312,26 +324,27 @@ function fleetRules(
     }
     const reasons = new Set(cells.flatMap((c) => [...c.ta.byOutcome.keys()].filter((o) => outcomeClass(o) === "client")));
     for (const outcome of reasons) {
-      // A vault counts only when its own change looks real: a few of them, a
-      // vault that was in use, and — for a 401/403 — real use before
-      // (FLEET_AUTH_OK_BEFORE) and its ok count fell too (a token outage cuts
-      // the oks; expired tokens and a stranger don't).
+      // A vault counts only when its own change looks real: a few of them on
+      // a vault that was in use — and, for what a stranger can make (401, 403,
+      // 404), real use before and its ok count fell too (an outage cuts the
+      // oks; expired tokens and a stranger don't).
+      const strangerMade = STRANGER_REASONS.has(outcome);
+      const inUse = (tb: Tally) => (strangerMade ? realUse(tb) : tb.total >= FLEET_VAULT_BASELINE);
       const rose = cells.filter(
         (c) =>
           (c.ta.byOutcome.get(outcome) ?? 0) >= FLEET_VAULT_MIN &&
-          c.tb.total >= FLEET_VAULT_BASELINE &&
-          shareRose(c.ta, c.tb, outcome) &&
-          (!AUTH_REFUSALS.has(outcome) || (realUse(c.tb) && c.ta.ok <= c.tb.ok / 2)),
+          inUse(c.tb) &&
+          (!strangerMade || c.ta.ok <= c.tb.ok / 2) &&
+          shareRose(c.ta, c.tb, outcome),
       );
       const na = rose.reduce((s, c) => s + (c.ta.byOutcome.get(outcome) ?? 0), 0);
       if (enough(rose.length) && na >= CLIENT_MIN) {
         out.worse.push({ ...base, kind: "client_reason_up", reason: outcome, detail: `${outcome} up on ${rose.length} vaults (${na} in all, far fewer ${beforeLabel})` });
       }
     }
-    const stopped = cells.filter((c) => {
-      const failed = c.ta.total - c.ta.ok - sumOf(c.ta, realUse(c.tb) ? NOT_FOUND : STRANGER_REASONS);
-      return c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failed >= STOPPED_FAILURES;
-    });
+    const stopped = cells.filter(
+      (c) => c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failures(c.ta, realUse(c.tb)) >= STOPPED_FAILURES,
+    );
     if (enough(stopped.length)) {
       out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${stopped.length} vaults that worked ${beforeLabel}` });
     }
@@ -437,8 +450,14 @@ export async function buildHealthReport(data: HealthData, opts: { day: string; e
     if (!current || !previous) continue;
     const after = mine.filter((r) => r.version === current);
     const before = mine.filter((r) => r.version === previous);
-    const label = previous > current ? "on the version rolled back from" : "before the deploy";
-    addAll(result, compare("deploy", before, after, who, label));
+    // The earlier version may have served a week and the live one only since this morning: compare
+    // a day's share of it, so "ok before" and the baselines mean the same span on both sides.
+    const span = (rows: HealthRow[]) => rows.reduce((m, r) => Math.max(m, r.days ?? 1), 1);
+    const scale = Math.min(1, span(after) / span(before));
+    const beforeScaled = scale < 1 ? before.map((r) => ({ ...r, n: r.n * scale })) : before;
+    let label = previous > current ? "on the version rolled back from" : "before the deploy";
+    if (scale < 1) label += ` (a day's share of ${span(before)})`;
+    addAll(result, compare("deploy", beforeScaled, after, who, label));
     windows.deploy.push(summarize(`${source} deploy`, previous, current, before, after));
   }
 
