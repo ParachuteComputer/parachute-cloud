@@ -119,6 +119,12 @@ zone_name = "parachute.computer"
 enabled = true
 head_sampling_rate = 1
 
+# The deployed version, read by the health counters (src/health.ts, T-411) so
+# the daily report can compare a vault before and after a deploy. Like
+# [observability], NOT inherited by named envs: repeated under [env.staging].
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
 # Deploy-bundle mirror of the vitest `bun:sqlite` alias (vitest.config.ts). Core
 # value-imports `Database` from bun:sqlite only in type positions (erased at
 # transpile), so today this is a no-op — but if a future core change makes the
@@ -257,3 +263,6 @@ BILLING_MODE = "open_beta"
 [env.staging.observability]
 enabled = true
 head_sampling_rate = 1
+
+[env.staging.version_metadata]
+binding = "CF_VERSION_METADATA"

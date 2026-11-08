@@ -322,6 +322,24 @@ async function main() {
     assert(snap.status === 404, "PRODUCTION: /__test/snapshot-run does not exist (404)", `status ${snap.status}`);
     const daily = await fetch(`${IDENTITY}/__test/ops-daily-run`, { method: "POST" });
     assert(daily.status === 404, "PRODUCTION: /__test/ops-daily-run does not exist (404)", `status ${daily.status}`);
+    // The health report's staging hooks (T-411) likewise.
+    const hCollect = await fetch(`${IDENTITY}/__test/health-collect?vault=x`, { method: "POST" });
+    assert(hCollect.status === 404, "PRODUCTION: /__test/health-collect does not exist (404)", `status ${hCollect.status}`);
+    const hReport = await fetch(`${IDENTITY}/__test/health-report`);
+    assert(hReport.status === 404, "PRODUCTION: /__test/health-report does not exist (404)", `status ${hReport.status}`);
+    // And its operator doors never answer without their bearer.
+    const opsHealth = await fetch(`${IDENTITY}/ops/health`);
+    assert(
+      opsHealth.status === 404 || opsHealth.status === 401,
+      "PRODUCTION: /ops/health without a bearer is refused (404 unset / 401 set)",
+      `status ${opsHealth.status}`,
+    );
+    const opsCollect = await fetch(`${IDENTITY}/ops/health/collect`, { method: "POST" });
+    assert(
+      opsCollect.status === 404 || opsCollect.status === 401,
+      "PRODUCTION: /ops/health/collect without a bearer is refused (404 unset / 401 set)",
+      `status ${opsCollect.status}`,
+    );
     // The operator-agent read never answers without its bearer: 404 while
     // OPS_READ_TOKEN is unset, 401 once it is set. Either is a pass; 200 is not.
     const opsDaily = await fetch(`${IDENTITY}/ops/daily`);
@@ -463,6 +481,9 @@ async function main() {
     assert(embedRun.status === 404, "PRODUCTION: /vault/<name>/__test/embed-run does not exist (404)", `status ${embedRun.status}`);
     const purgeCheck = await fetch(`${VAULT}/vault/${VAULT_NAME}/__test/purge-check`);
     assert(purgeCheck.status === 404, "PRODUCTION: /vault/<name>/__test/purge-check does not exist (404)", `status ${purgeCheck.status}`);
+    // The planted-failure hook (T-411) must never exist in production.
+    const failNext = await fetch(`${VAULT}/vault/${VAULT_NAME}/__test/fail-next?n=1`, { method: "POST" });
+    assert(failNext.status === 404, "PRODUCTION: /vault/<name>/__test/fail-next does not exist (404)", `status ${failNext.status}`);
 
     // Attachment tickets (cloud#177's DO mirror): a bogus/unknown ticket id
     // answers the SAME uniform 404 as a spent/expired/wrong-vault/wrong-kind

@@ -27,6 +27,7 @@
  * {@link RECONCILE_RUN_CAP} (pushes); same injectable-clock shape as
  * ops.ts/drip.ts so the tests drive the exact code the cron does.
  */
+import { bumpHealth, parseVaultHealth, storeVaultHealth } from "./health-counters.ts";
 import type { Env } from "./env.ts";
 import type { EmailSender } from "./email.ts";
 import { type OAuthDeps, billingModeOf } from "./oauth-shared.ts";
@@ -41,6 +42,9 @@ import { getUserById } from "./users.ts";
  * across runs by name cursor (`WHERE name > ? ORDER BY name LIMIT ?`,
  * persisting the cursor) or fan out via a queue; one worker invocation
  * serially waking hundreds of DOs is the wrong shape at that scale.
+ * Per vault the run makes one vault call plus its D1 writes: the usage row and
+ * (T-411) ONE batch for the vault's health counters, which ride the same
+ * config response — count those too if subrequests become the bound.
  */
 export const USAGE_RUN_CAP = 500;
 
@@ -68,6 +72,7 @@ export const RECONCILE_RUN_CAP = 50;
 
 interface RollupVaultRow {
   name: string;
+  vault_id: string;
   owner_user_id: string;
   plan: string;
   pending_plan: string | null;
@@ -251,12 +256,12 @@ export async function runUsageRollup(
   // otherwise a deleted account's vault still wakes its DO every night.
   const res = opts.onlyVault
     ? await env.DB.prepare(
-        "SELECT v.name, v.owner_user_id, u.plan, u.pending_plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name = ? AND u.deleted_at IS NULL LIMIT 1",
+        "SELECT v.name, v.vault_id, v.owner_user_id, u.plan, u.pending_plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name = ? AND u.deleted_at IS NULL LIMIT 1",
       )
         .bind(opts.onlyVault)
         .all<RollupVaultRow>()
     : await env.DB.prepare(
-        "SELECT v.name, v.owner_user_id, u.plan, u.pending_plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE u.deleted_at IS NULL ORDER BY v.name LIMIT ?",
+        "SELECT v.name, v.vault_id, v.owner_user_id, u.plan, u.pending_plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE u.deleted_at IS NULL ORDER BY v.name LIMIT ?",
       )
         .bind(runCap + 1)
         .all<RollupVaultRow>();
@@ -285,6 +290,17 @@ export async function runUsageRollup(
         .bind(v.name, day, usage.dbBytes, usage.r2Bytes, usage.transcribeMinutes, usage.notesChanged24h)
         .run();
       recorded++;
+
+      // Health counters (T-411): the same response carries the DO's own
+      // counts; copy them into D1 under the vault's opaque id. Its own failure
+      // domain — a bad block must never cost the usage row written above.
+      try {
+        const parsed = parseVaultHealth(usage.health, v.vault_id);
+        if (parsed) await storeVaultHealth(env.DB, parsed, now);
+      } catch (err) {
+        console.error(`event=health_store_failed error=${err instanceof Error ? err.name : "error"}`);
+        await bumpHealth(env, [{ vault: v.vault_id, subject: "collect", outcome: "fail" }], now);
+      }
 
       // Reconciliation is its OWN failure domain, deliberately outside the
       // usage-recording try. It makes calls the usage read never made (a D1
@@ -321,6 +337,7 @@ export async function runUsageRollup(
     } catch (err) {
       // Skip + log + continue — one vault's bad day never starves the rest.
       failed++;
+      await bumpHealth(env, [{ vault: v.vault_id, subject: "collect", outcome: "fail" }], now);
       console.error(
         `event=usage_fetch_failed vault=${v.name} error=${JSON.stringify(err instanceof Error ? err.message : String(err))}`,
       );

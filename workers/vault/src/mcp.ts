@@ -39,6 +39,7 @@ import { buildVaultProjection, attachmentsInstructionBlock } from "@openparachut
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
+import { errorClass, toolErrorOutcome } from "./health.js";
 
 // Transcribed from the SDK's types.js so negotiation matches byte-for-byte.
 const LATEST_PROTOCOL_VERSION = "2025-11-25";
@@ -570,12 +571,21 @@ function visibleTools(
   return tools.filter((t) => hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)));
 }
 
+/**
+ * Adds one outcome to the vault's health counters (T-411, health.ts). The
+ * subject is always server-defined: a visible tool's own name, or a fixed
+ * label; the outcome never carries a message.
+ */
+export type HealthRecord = (subject: string, outcome: string) => Promise<void>;
+const noRecord: HealthRecord = async () => {};
+
 async function handleToolCall(
   id: JsonRpcId,
   params: Record<string, unknown> | undefined,
   tools: McpToolDef[],
   writeGate: McpWriteGate,
   attachmentMintGate: (declaredBytes: number) => Response | null,
+  record: HealthRecord = noRecord,
 ): Promise<JsonRpcMessage> {
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
@@ -583,8 +593,12 @@ async function handleToolCall(
   // Unknown / not-visible tool → in-band tool error (not a JSON-RPC error), so
   // callers can't distinguish "hidden admin tool" from "no such tool".
   if (!tool) {
+    // The caller's string is never stored: an unknown name counts as one subject.
+    await record("mcp:unknown-tool", "unknown_tool");
     return result(id, { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true });
   }
+  // From here `name` is one of this vault's own visible tools (server-defined).
+  const subject = `mcp:${name}`;
   if (name === ATTACHMENT_UPLOAD_MINT_TOOL) {
     // The attachment gate ladder, AT MINT, against the caller's DECLARED
     // size — an agent learns `plan_required`/`attachments_not_included`/
@@ -596,7 +610,10 @@ async function handleToolCall(
     const sizeBytes = args.size_bytes;
     if (typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > 0) {
       const blocked = attachmentMintGate(sizeBytes);
-      if (blocked) return gateError(id, blocked);
+      if (blocked) {
+        await record(subject, `gate:${blocked.status}`);
+        return gateError(id, blocked);
+      }
     }
   } else if (isGatedWrite(tool, args)) {
     // The paywall + cap gate — a forward-mutating verb (create/update/prune) gets
@@ -605,14 +622,20 @@ async function handleToolCall(
     // write door, so without this an expired (frozen) tenant's connected AI could
     // keep writing forever and a two-meter notes-cap-full vault could keep growing.
     const blocked = writeGate();
-    if (blocked) return gateError(id, blocked);
+    if (blocked) {
+      await record(subject, `gate:${blocked.status}`);
+      return gateError(id, blocked);
+    }
   }
   try {
     const out = await tool.execute(args);
+    await record(subject, "ok");
     return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
   } catch (err) {
     const domain = mapDomainError(err);
     const message = err instanceof Error ? err.message : "Unknown error";
+    // Never the message: the error's class decides (health.ts toolErrorOutcome).
+    await record(subject, domain ? `domain:${domain.code}` : toolErrorOutcome(err));
     if (domain) return rpcError(id, domain.code, message, domain.data);
     return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
   }
@@ -626,8 +649,10 @@ async function handleOne(
     description: string | null;
     writeGate: McpWriteGate;
     attachmentMintGate: (declaredBytes: number) => Response | null;
+    record?: HealthRecord;
   },
 ): Promise<JsonRpcMessage> {
+  const record = ctx.record ?? noRecord;
   const { id = null, method, params } = m;
   try {
     switch (method) {
@@ -636,6 +661,7 @@ async function handleOne(
         const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
           ? requested
           : LATEST_PROTOCOL_VERSION;
+        await record("mcp:initialize", "ok");
         return result(id, {
           protocolVersion,
           capabilities: { tools: {} },
@@ -644,17 +670,19 @@ async function handleOne(
         });
       }
       case "tools/list":
+        await record("mcp:tools/list", "ok");
         return result(id, {
           tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
         });
       case "tools/call":
-        return handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate);
+        return handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate, record);
       case "ping":
         return result(id, {});
       default:
         return rpcError(id, METHOD_NOT_FOUND, `Method not found: ${method}`);
     }
   } catch (err) {
+    await record("mcp:rpc", `exception:${errorClass(err)}`);
     return rpcError(id, INTERNAL_ERROR, err instanceof Error ? err.message : "Internal error");
   }
 }
@@ -843,6 +871,7 @@ export async function handleMcp(
    * to special-case an unwired seam on cloud.
    */
   tickets: { provider: AttachmentTicketProvider; mintGate: (declaredBytes: number) => Response | null },
+  record: HealthRecord = noRecord,
 ): Promise<Response> {
   if (req.method === "DELETE") return new Response(null, { status: 200 });
   if (req.method !== "POST") {
@@ -922,7 +951,7 @@ export async function handleMcp(
   // (core ships a placeholder execute — "must be configured by the server
   // layer"). Parity with bun's mcp-tools.ts overrideVaultInfo.
   overrideVaultInfo(tools, { vaultName, auth, description, origin, ctx: vaultInfo });
-  const ctx = { tools, vaultName, description, writeGate, attachmentMintGate: tickets.mintGate };
+  const ctx = { tools, vaultName, description, writeGate, attachmentMintGate: tickets.mintGate, record };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));

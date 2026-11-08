@@ -11,3 +11,6 @@ dist
 .env
 .env.local
 .DS_Store
+
+# local wrangler/miniflare state from health-report.ts --local runs (T-411)
+tmp/

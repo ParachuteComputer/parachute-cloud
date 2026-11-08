@@ -67,7 +67,7 @@ export const CEREMONY_PREFIXES = [
   "/unsubscribe", // onboarding-drip one-click unsubscribe (GET/POST)
   "/health", // liveness JSON — must return JSON, never the SPA shell
   "/__test", // staging-only test triggers (drip/usage/snapshot/ops-daily); 404 in production, but server-owned
-  "/ops", // operator-agent doors (/ops/daily, /ops/snapshot-run, /ops/account-delete, /ops/vault-import), each its own bearer secret; 404 when unset
+  "/ops", // operator-agent doors (/ops/daily, /ops/health, /ops/health/collect, /ops/snapshot-run, /ops/account-delete, /ops/vault-import), each behind a bearer secret; 404 when unset
 ] as const;
 
 /**

@@ -342,6 +342,9 @@ export interface VaultUsageReading {
   /** Notes written in the 24 h before the read (the daily ops line). null when
    *  the DO doesn't report it (an older vault worker) — never guessed as 0. */
   notesChanged24h: number | null;
+  /** The DO's health counters block (T-411), unparsed — health-counters.ts
+   *  `parseVaultHealth` validates it. undefined from an older vault worker. */
+  health?: unknown;
   /**
    * The DO's resolved entitlement, or null when the response didn't carry
    * the control-plane fields AT ALL — a vault-worker ROLLBACK to a
@@ -422,6 +425,7 @@ export async function readVaultUsage(
     transcribe_minutes?: unknown;
     notes_changed_24h?: unknown;
     closed?: unknown;
+    health?: unknown;
   };
   if (typeof body.db_bytes !== "number" || typeof body.r2_bytes !== "number") {
     throw new Error("internal config GET carried no usage split (db_bytes/r2_bytes)");
@@ -500,6 +504,7 @@ export async function readVaultUsage(
       typeof body.notes_changed_24h === "number" && Number.isFinite(body.notes_changed_24h)
         ? body.notes_changed_24h
         : null,
+    health: body.health,
     entitlement,
   };
 }

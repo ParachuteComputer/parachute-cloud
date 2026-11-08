@@ -46,6 +46,7 @@
  *     same-day retry, reuses) `<vault>-restored-<date>` and replays the
  *     tarball into THAT.
  */
+import { bumpHealth } from "./health-counters.ts";
 import type { BillingMode } from "./billing-config.ts";
 import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
@@ -132,26 +133,26 @@ export async function runSnapshotSweep(
   // deleted account's vault still gets snapshotted nightly.
   const res = opts.onlyVault
     ? await env.DB.prepare(
-        `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name = ? AND u.deleted_at IS NULL LIMIT 1`,
+        `SELECT v.name, v.vault_id, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name = ? AND u.deleted_at IS NULL LIMIT 1`,
       )
         .bind(opts.onlyVault)
-        .all<{ name: string; owner_user_id: string; plan: string }>()
+        .all<{ name: string; vault_id: string; owner_user_id: string; plan: string }>()
     : opts.onlyVaults
       ? set.length === 0
         ? { results: [] }
         : await env.DB.prepare(
-            `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name IN (${set
+            `SELECT v.name, v.vault_id, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE v.name IN (${set
               .slice(0, runCap)
               .map(() => "?")
               .join(", ")}) AND u.deleted_at IS NULL ORDER BY v.name`,
           )
             .bind(...set.slice(0, runCap))
-            .all<{ name: string; owner_user_id: string; plan: string }>()
+            .all<{ name: string; vault_id: string; owner_user_id: string; plan: string }>()
       : await env.DB.prepare(
-        `SELECT v.name, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE u.deleted_at IS NULL ORDER BY v.name LIMIT ?`,
+        `SELECT v.name, v.vault_id, v.owner_user_id, u.plan FROM vaults v JOIN users u ON u.id = v.owner_user_id WHERE u.deleted_at IS NULL ORDER BY v.name LIMIT ?`,
       )
         .bind(runCap + 1)
-        .all<{ name: string; owner_user_id: string; plan: string }>();
+        .all<{ name: string; vault_id: string; owner_user_id: string; plan: string }>();
   const rows = res.results ?? [];
   // A scoped set binds at most runCap names (D1 refuses over 100 bound
   // parameters), so it is capped when the SET was longer, not the rows.
@@ -163,6 +164,9 @@ export async function runSnapshotSweep(
   let skipped = 0;
   let failed = 0;
   let longPaths = 0;
+  // Health counters (T-411): one backup outcome per vault, written in one
+  // batch after the loop (not one D1 call per vault).
+  const healthItems: Array<{ vault: string; subject: string; outcome: string }> = [];
   for (const v of vaults) {
     try {
       const retention: SnapshotRetention = PLAN_SPECS[livePlan(coercePlanId(v.plan), billingModeOf(deps))].snapshot_retention;
@@ -180,6 +184,9 @@ export async function runSnapshotSweep(
         throw new Error("internal snapshot POST carried no run shape (skipped/manifest)");
       }
       body.skipped ? skipped++ : taken++;
+      // Health counters (T-411): one backup outcome per vault per night (a
+      // skip — nothing changed since the last one — is a healthy backup).
+      healthItems.push({ vault: v.vault_id, subject: "backup", outcome: "ok" });
       if (typeof body.long_paths === "number" && Number.isSafeInteger(body.long_paths)) longPaths += body.long_paths;
       // The D1 mirror is a render cache — a mirror-only failure is NOT a
       // snapshot failure (the tarball + R2 manifest landed; the console shows
@@ -195,11 +202,14 @@ export async function runSnapshotSweep(
     } catch (err) {
       // Skip + log + continue — one vault's bad night never starves the rest.
       failed++;
+      healthItems.push({ vault: v.vault_id, subject: "backup", outcome: "fail" });
       console.error(
         `event=snapshot_failed vault=${v.name} error=${JSON.stringify(err instanceof Error ? err.message : String(err))}`,
       );
     }
   }
+
+  await bumpHealth(env, healthItems, now);
 
   // The orphan backstop (cloud#227) — fleet-wide runs only.
   const orphansPruned = scoped ? 0 : await pruneOrphanSnapshotRows(env.DB);
