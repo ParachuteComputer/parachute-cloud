@@ -38,6 +38,9 @@ function die(msg: string): never {
   process.exit(1);
 }
 
+/** --public: a log anyone can read gets the verdict and plain errors, nothing echoed from wrangler or the data. */
+const PUBLIC = process.argv.includes("--public");
+
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const day = arg("--day") ?? new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
 if (!DAY_RE.test(day)) die("--day must be YYYY-MM-DD");
@@ -69,13 +72,19 @@ function dataFromD1(db: string): HealthData {
       process.exit(0);
     }
     if (out.status !== 0) {
-      die(`wrangler d1 execute failed (exit ${out.status ?? "timeout"}): ${(out.stderr || out.stdout).split("\n").filter((l) => /error|✘/i.test(l)).slice(0, 3).join(" | ")}`);
+      const why = PUBLIC ? "" : `: ${(out.stderr || out.stdout).split("\n").filter((l) => /error|✘/i.test(l)).slice(0, 3).join(" | ")}`;
+      die(`wrangler d1 execute failed (exit ${out.status ?? "timeout"})${why}`);
     }
     // wrangler --json prints the JSON array; anything before it (a banner, a
     // "[WARNING]" line) is skipped by starting at the line that opens it.
     const at = out.stdout.search(/^\[\s*$|^\[\s*\{/m);
     if (at < 0) die("wrangler printed no JSON result");
-    const parsed = JSON.parse(out.stdout.slice(at)) as Array<{ results?: Array<Record<string, unknown>>; success?: boolean }>;
+    let parsed: Array<{ results?: Array<Record<string, unknown>>; success?: boolean }>;
+    try {
+      parsed = JSON.parse(out.stdout.slice(at));
+    } catch {
+      die("wrangler printed JSON the report could not parse"); // never the parser's message: it can echo the data
+    }
     if (!parsed[0]?.success) die("a SELECT did not succeed");
     return parsed[0].results ?? [];
   };
@@ -95,8 +104,6 @@ async function fromUrl(base: string, tokenFile: string): Promise<HealthReport> {
   if (res.status !== 200) die(`GET /ops/health → ${res.status}`);
   return (await res.json()) as HealthReport;
 }
-
-const PUBLIC = process.argv.includes("--public");
 
 async function main(): Promise<void> {
   const d1 = arg("--d1");

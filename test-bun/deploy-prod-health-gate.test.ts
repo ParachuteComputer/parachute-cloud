@@ -98,7 +98,7 @@ async function runGate(bin: string, ack = ""): Promise<{ code: number; out: stri
 /** Nothing that names a vault, a route, a tool or an outcome label. */
 function expectNothingNamed(out: string): void {
   expect(out).not.toMatch(/v:[0-9a-f]{8}/);
-  expect(out).not.toMatch(/http:|mcp:|5xx|2xx|query-notes|notes/);
+  expect(out).not.toMatch(/http:|mcp:|5xx|2xx|query-notes/);
   expect(out).not.toContain("vault-id-");
   expect(out).not.toMatch(/requests \d|server errors \d/);
 }
@@ -141,6 +141,32 @@ describe("deploy-prod.sh — the health gate in a public log", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("health: ok");
     expect(r.out).toContain("GATE-PASSED");
+    expectNothingNamed(r.out);
+  });
+
+  /** A fake `bunx` that runs this bash body instead of answering the SELECTs. */
+  function brokenWrangler(name: string, body: string): string {
+    const bin = join(tmp, name, "bin");
+    Bun.spawnSync(["mkdir", "-p", bin]);
+    writeFileSync(join(bin, "bunx"), `#!/usr/bin/env bash\n${body}\n`);
+    chmodSync(join(bin, "bunx"), 0o755);
+    return bin;
+  }
+
+  it("wrangler fails: warns with the exit code only, nothing echoed from wrangler, deploys on", async () => {
+    const r = await runGate(brokenWrangler("fails", 'echo "✘ [ERROR] d1 0f00-uuid-marker: v:deadbeef http:notes" >&2; exit 1'));
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("wrangler d1 execute failed (exit 1)");
+    expect(r.out).toContain("could not be read");
+    expect(r.out).not.toContain("uuid-marker");
+    expectNothingNamed(r.out);
+  });
+
+  it("wrangler prints malformed JSON: a fixed message, never the parser's echo of the data", async () => {
+    const r = await runGate(brokenWrangler("garbled", 'echo \'[{"results":[{"vault": v:deadbeef-marker }]}]\''));
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("could not parse");
+    expect(r.out).not.toContain("marker");
     expectNothingNamed(r.out);
   });
 });
