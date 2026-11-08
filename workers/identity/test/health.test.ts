@@ -420,7 +420,7 @@ describe("the report rules", () => {
     expect(l.worse.filter((f) => f.who === "all vaults" && f.kind === "stopped_working")).toEqual([]);
     expect(l.worse.filter((f) => f.kind === "stopped_working")).toHaveLength(10);
     // A deploy that stops 11 vaults with 502s and 9 with 401s: the 9 are named (the 11 have their own lines,
-    // so they don't dilute the bar); a vault with two 502s and one 401 is not a refusal.
+    // so they don't dilute the bar), with a vault dark on two 502s and one 401 (it has no line of its own).
     const split: HealthRow[] = [];
     for (let i = 0; i < 20; i++) {
       split.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 50 }));
@@ -430,7 +430,24 @@ describe("the report rules", () => {
     split.push(row({ vault: "w", subject: "http:mcp", outcome: "5xx:502", n: 2 }));
     split.push(row({ vault: "w", subject: "http:mcp", outcome: "4xx:401", n: 1 }));
     const sp = await report(split);
-    expect(sp.worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working")?.detail).toContain("on 9 vaults");
+    expect(sp.worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working")?.detail).toContain("on 10 vaults");
+    // A vault dark on two 400s and two 401s is named somewhere.
+    const dark = [...split];
+    dark.push(row({ vault: "d", day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 50 }));
+    dark.push(row({ vault: "d", subject: "http:mcp", outcome: "4xx:400", n: 2 }));
+    dark.push(row({ vault: "d", subject: "http:mcp", outcome: "4xx:401", n: 2 }));
+    expect((await report(dark)).worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working")?.detail).toContain("on 11 vaults");
+  });
+
+  test("a deploy that breaks the token path with a mix of 502s and 401s on every vault still shows '401 up' fleet-wide", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 10; i++) {
+      rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 50 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "5xx:502", n: 3 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "4xx:401", n: 10 }));
+    }
+    const kinds = (await report(rows)).worse.filter((f) => f.who === "all vaults").map((f) => `${f.kind}:${f.reason ?? ""}`);
+    expect(kinds).toContain("client_reason_up:4xx:401");
   });
 
   test("a deploy that breaks tokens, or turns a route into 404s, on every vault is caught in the deploy window", async () => {

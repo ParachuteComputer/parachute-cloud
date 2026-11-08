@@ -48,7 +48,7 @@
  *     measure (≥ 3 of it, ≥ 5 requests before, its share ×2 and +10 points)
  *     — every vault's tokens failing at once;
  *   - vaults that stopped working only once 401/403 count as failures (≥ 3
- *     ok before, none now, ≥ 3 refusals) — those stopped by anything else
+ *     ok before, none now, ≥ 3 failures) — those stopped by anything else
  *     already have their own line, as with server errors, and don't count
  *     toward the bars below.
  * The last two need at least 3 vaults or a tenth of the vaults seen. What a
@@ -163,7 +163,6 @@ const FLEET_VAULT_BASELINE = 5;
  */
 const FLEET_STRANGER_SHARE = 0.5;
 const NOT_FOUND = new Set(["4xx:404"]);
-const REFUSALS = new Set(["4xx:401", "4xx:403"]);
 const FLEET_MIN_SHARE = 0.1;
 
 interface Tally {
@@ -287,8 +286,8 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
  *     beyond the vaults already reported one by one (rule 1 at fleet level);
  *   - a client reason whose share rose on each of those vaults (rule 3; 401s
  *     included — the "tokens broke" signal);
- *   - vaults that stopped only once 401/403 count as failures, with ≥ 3 of
- *     them (rule 4; a vault stopped otherwise has its own line).
+ *   - vaults dark only once 401/403 count as failures (rule 4; a vault
+ *     stopped otherwise has its own line, and is left out of the bars).
  * Each needs 3 vaults or a tenth of those seen ({@link spread}); what a
  * stranger can make (401, 403, 404) also needs {@link majority} of the vaults
  * that could show it, each with its oks at least halved.
@@ -319,17 +318,10 @@ function fleetRules(
     // vaults that could show it — those in use before (≥ 5 requests, ≥ 3 ok) that now either still
     // work or had the requests (≥ 3) to show a change; and, on each vault counted, its oks fell (an
     // outage cuts them; expired tokens being refreshed, and a stranger, don't).
-    // A vault already stopped by what no stranger can make has its own line, and can't show a
-    // refusal outage either way: it is left out.
     const couldShow = cells.filter(
-      (c) =>
-        c.tb.total >= FLEET_VAULT_BASELINE &&
-        c.tb.ok >= STOPPED_OK_BEFORE &&
-        (c.ta.ok > 0 || c.ta.total >= FLEET_VAULT_MIN) &&
-        !stoppedBy(c.ta, c.tb, STRANGER_REASONS),
+      (c) => c.tb.total >= FLEET_VAULT_BASELINE && c.tb.ok >= STOPPED_OK_BEFORE && (c.ta.ok > 0 || c.ta.total >= FLEET_VAULT_MIN),
     );
-    const inCouldShow = new Set(couldShow);
-    const strangerProof = (n: number) => enough(n) && majority(n, couldShow.length);
+    const strangerProof = (n: number, of: number) => enough(n) && majority(n, of);
     // A stranger can't cause server errors: 3 vaults are enough, at any fleet size. A vault with
     // no traffic before counts too (as a quiet day must not hide a thin outage); the line says how many.
     const fresh = cells.filter((c) => c.ta.server > 0 && c.tb.server === 0 && !flaggedServer.has(c.key));
@@ -347,7 +339,7 @@ function fleetRules(
       const inUse = strangerMade ? couldShow.filter((c) => c.ta.ok <= c.tb.ok / 2) : cells.filter((c) => c.tb.total >= FLEET_VAULT_BASELINE);
       const rose = inUse.filter((c) => (c.ta.byOutcome.get(outcome) ?? 0) >= FLEET_VAULT_MIN && shareRose(c.ta, c.tb, outcome));
       const na = rose.reduce((s, c) => s + (c.ta.byOutcome.get(outcome) ?? 0), 0);
-      const wide = strangerMade ? strangerProof(rose.length) : enough(rose.length);
+      const wide = strangerMade ? strangerProof(rose.length, couldShow.length) : enough(rose.length);
       if (wide && na >= CLIENT_MIN) {
         out.worse.push({
           ...base,
@@ -358,13 +350,14 @@ function fleetRules(
       }
     }
     // Stopped: a vault stopped by what no stranger can make has its own line (rule 4), so — as with
-    // new server errors — the fleet line is for the rest: vaults with no ok that stopped only once
-    // 401/403 count, with at least 3 of those refusals. Those among the vaults that could show it
-    // must clear the stranger bars; the line then names every such vault, light ones included.
-    const refusedOnly = cells.filter(
-      (c) => stoppedBy(c.ta, c.tb, NOT_FOUND) && !stoppedBy(c.ta, c.tb, STRANGER_REASONS) && sumOf(c.ta, REFUSALS) >= STOPPED_FAILURES,
-    );
-    if (strangerProof(refusedOnly.filter((c) => inCouldShow.has(c)).length)) {
+    // new server errors — the fleet line is for the rest: vaults dark only once 401/403 count as
+    // failures. The bars are judged on the vaults that could show it, less those with their own
+    // line; the line then names every such vault, light ones included.
+    const ownLine = new Set(cells.filter((c) => stoppedBy(c.ta, c.tb, STRANGER_REASONS)));
+    const refusedOnly = cells.filter((c) => !ownLine.has(c) && stoppedBy(c.ta, c.tb, NOT_FOUND));
+    const couldStop = couldShow.filter((c) => !ownLine.has(c));
+    const judged = new Set(couldStop);
+    if (strangerProof(refusedOnly.filter((c) => judged.has(c)).length, couldStop.length)) {
       out.worse.push({
         ...base,
         kind: "stopped_working",
