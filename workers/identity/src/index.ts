@@ -46,7 +46,7 @@ import { handleAdminGrowthGet } from "./admin-growth.ts";
 import { handleOpsDailyGet, handleOpsHealthGet, handleOpsSnapshotRunPost, healthReportResponse, opsBearerRefusal, runDailyLine } from "./ops-daily.ts";
 import { bumpOpsCounter } from "./ops-counters.ts";
 import { vaultHash } from "./health-report.ts";
-import { bumpHealth, collectVaultHealth, httpOutcome, identityRouteGroup, takeHealthNotes } from "./health-counters.ts";
+import { bufferHealth, bumpHealth, collectVaultHealth, flushHealthBuffer, httpOutcome, identityRouteGroup, takeHealthNotes } from "./health-counters.ts";
 import { handleAdminDeleteGet, handleAdminDeletePost } from "./admin-delete.ts";
 import { handleOpsAccountDeletePost } from "./ops-account-delete.ts";
 import {
@@ -762,16 +762,19 @@ async function fetchWithOpsCounters(req: Request, env?: Env | {}, ctx?: Executio
     if (ctx?.waitUntil) ctx.waitUntil(bump);
     else await bump;
   }
-  // Health counters (T-411, health-counters.ts): the route group and status
-  // class, plus whatever the handler noted (the token endpoint: grant and
-  // connector). After the response, never in its way.
+  // Health counters (T-411, health-counters.ts), after the response, never in
+  // its way: the route group and status class go to the per-isolate buffer
+  // (a few D1 writes a minute at most, whatever the traffic); what a handler
+  // noted (the token endpoint: grant and connector) is written now. The
+  // /vault + /mcp backstops' by-design 503 (countsAs5xx above) is named
+  // `backstop:<status>`, not counted as a server error.
   const group = identityRouteGroup(new URL(req.url).pathname);
   const healthNotes = takeHealthNotes(req);
   if (db && (group || healthNotes.length)) {
+    const outcome = res.status >= 500 && !countsAs5xx(req, res.status, e) ? `backstop:${res.status}` : httpOutcome(res.status);
+    const flush = group ? bufferHealth(e, [{ subject: `http:${group}`, outcome }]) : null;
     const write = (async () => {
-      const items: Array<{ vault?: string; subject: string; outcome: string }> = group
-        ? [{ subject: `http:${group}`, outcome: httpOutcome(res.status) }]
-        : [];
+      const items: Array<{ vault?: string; subject: string; outcome: string }> = [];
       for (const note of healthNotes) {
         try {
           items.push(...(await note(e as Env)));
@@ -779,7 +782,7 @@ async function fetchWithOpsCounters(req: Request, env?: Env | {}, ctx?: Executio
           /* a note that fails is dropped, never the response */
         }
       }
-      await bumpHealth(e, items);
+      await Promise.all([bumpHealth(e, items), flush]);
     })();
     if (ctx?.waitUntil) ctx.waitUntil(write);
     else await write;
@@ -798,6 +801,8 @@ async function fetchWithOpsCounters(req: Request, env?: Env | {}, ctx?: Executio
 export default {
   fetch: fetchWithOpsCounters,
   async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    // Whatever route-group counts this isolate still holds (health-counters.ts).
+    await flushHealthBuffer(env);
     await handleScheduled(controller.cron, env, senderFor(env));
   },
 };

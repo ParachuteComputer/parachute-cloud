@@ -58,11 +58,16 @@ bash "$ROOT/scripts/build-spa.sh"
 # doesn't warn that [env.staging] also exists.
 cd "$ROOT/workers/identity"
 # The health gate (T-411): before changing anything, read the health report
-# (one D1 SELECT; scripts/health-report.ts). If something already got worse for
-# a real user since yesterday or since the last deploy, stop: a new deploy on
-# top would hide which change did it. Deploying the FIX for that is the normal
-# way out — say so with HEALTH_GATE=ack. A report that cannot be read (first
-# deploy with the table, a D1 hiccup) warns and does not block.
+# (D1 SELECTs; scripts/health-report.ts). If something already got worse for a
+# real user since yesterday or since the last deploy, stop: a new deploy on top
+# would hide which change did it. Deploying the FIX for that is the normal way
+# out — say so with HEALTH_GATE=ack (the workflow's `health_gate_ack` input).
+# A report that cannot be read (first deploy with the tables, a D1 hiccup, a
+# 120 s timeout) warns and does not block. Freshness: identity's counts are
+# live (flushed within a minute); the vault workers' counts reach D1 with the
+# 03:30 UTC rollup, or sooner with POST /ops/health/collect (bearer
+# OPS_RUN_TOKEN) — so a vault problem from a deploy earlier today shows in
+# tomorrow's daily line, not necessarily here.
 set +e
 (cd "$ROOT" && bun scripts/health-report.ts --d1 parachute-identity --gate)
 HEALTH_RC=$?

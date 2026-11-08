@@ -13,7 +13,7 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
-import { HEALTH_KEEP_DAYS, HEALTH_MAX_KEYS, HealthSink, OVERFLOW_KEY, routeOf, routerFailureKind, utcDay } from "../src/health.ts";
+import { HEALTH_KEEP_DAYS, HEALTH_MAX_KEYS, HealthSink, OVERFLOW_KEY, OVERFLOW_SERVER_KEY, responseOutcome, routeOf, routerFailureKind, utcDay } from "../src/health.ts";
 import { base, createNote, freshVault, mintToken, op } from "./helpers.ts";
 
 type Days = Record<string, Record<string, Record<string, number>>>;
@@ -170,6 +170,35 @@ describe("health sink — bounds", () => {
     expect(c[OVERFLOW_KEY]).toBe(25);
   });
 
+  it("a full day still shows new server errors: they overflow into a server-class key", async () => {
+    const v = freshVault("ho");
+    const c = await runInDurableObject(doStub(v), async (_inst, state) => {
+      const sink = new HealthSink(state.storage, "v1");
+      for (let i = 0; i < HEALTH_MAX_KEYS; i++) await sink.record(`s${i}`, "ok");
+      await sink.record("http:notes", "5xx:500");
+      await sink.record("mcp:create-note", "exception:typeerror");
+      await sink.record("http:tags", "4xx:404");
+      return (await sink.read("2000-01-01"))[utcDay(new Date())]!["v1"]!;
+    });
+    expect(c[OVERFLOW_SERVER_KEY]).toBe(2);
+    expect(c[OVERFLOW_KEY]).toBe(1);
+  });
+
+  it("by-design 503s are named by their type; any other 503 stays a server error", async () => {
+    const j = (body: unknown, status = 503) => Response.json(body, { status });
+    expect(await responseOutcome(j({ error_type: "import_in_progress" }))).toBe("busy:import_in_progress");
+    expect(await responseOutcome(j({ error_type: "vault_busy" }))).toBe("busy:vault_busy");
+    expect(await responseOutcome(j({ code: "SUBSCRIPTION_CAP_REACHED" }))).toBe("busy:subscription_cap_reached");
+    expect(await responseOutcome(j({ error_type: "semantic_unavailable" }))).toBe("busy:semantic_unavailable");
+    expect(await responseOutcome(j({ error: "something else" }))).toBe("5xx:503");
+    expect(await responseOutcome(new Response("x", { status: 503 }))).toBe("5xx:503");
+    expect(await responseOutcome(j({ ok: true }, 200))).toBe("2xx");
+    // The response itself is still readable afterwards (a clone was read).
+    const r = j({ error_type: "vault_busy" });
+    await responseOutcome(r);
+    expect(((await r.json()) as { error_type: string }).error_type).toBe("vault_busy");
+  });
+
   it("prunes days older than the keep window on the first write of a new day", async () => {
     const v = freshVault("hr");
     const days = await runInDurableObject(doStub(v), async (_inst, state) => {
@@ -197,5 +226,8 @@ describe("health sink — bounds", () => {
     expect(routerFailureKind(new Error("Durable Object's isolate exceeded its CPU time limit and was reset."))).toBe("cpu_limit");
     expect(routerFailureKind(new Error("Durable Object reset because its code was updated."))).toBe("code_updated");
     expect(routerFailureKind(new TypeError("x is not a function"))).toBeNull();
+    expect(routerFailureKind(new Error("Network connection lost."))).toBe("connection_lost");
+    expect(routerFailureKind(new Error("internal error; reference = abc123"))).toBe("platform_error");
+    expect(routerFailureKind(new Error("my handler hit an internal error somewhere"))).toBeNull();
   });
 });

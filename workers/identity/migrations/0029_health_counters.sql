@@ -18,8 +18,9 @@
 --            `exception:<class>`, an OAuth error code, …
 --
 -- Read by src/health-report.ts (GET /ops/health, the daily line) and by
--- scripts/health-report.ts (a D1 SELECT from a sealed job). Pruned to 35 days
--- by the daily job. Size: vaults × a few dozen keys × 35 days.
+-- scripts/health-report.ts (D1 SELECTs from a sealed job). Pruned to 35 days
+-- by the daily job. Size: vaults × a few dozen keys × 35 days. WITHOUT ROWID:
+-- the primary key is the only index, so an upsert writes one b-tree, not two.
 CREATE TABLE health_counters (
   day      TEXT NOT NULL,
   source   TEXT NOT NULL,
@@ -29,4 +30,15 @@ CREATE TABLE health_counters (
   outcome  TEXT NOT NULL,
   n        INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, source, version, vault, subject, outcome)
-);
+) WITHOUT ROWID;
+
+-- The version of each worker last seen answering: identity's own on every
+-- write, the vault worker's from each collected block. The report's "since the
+-- last deploy" compares the LIVE version with the one before it — after a
+-- rollback the live one is older than the newest upload.
+CREATE TABLE health_versions (
+  source     TEXT NOT NULL,
+  version    TEXT NOT NULL,
+  last_seen  TEXT NOT NULL,   -- ISO-8601
+  PRIMARY KEY (source, version)
+) WITHOUT ROWID;

@@ -13,16 +13,17 @@
  *   bun scripts/health-report.ts --url https://cloud.parachute.computer --token-file FILE [--day …]
  *
  * Both paths run the same code (workers/identity/src/health-report.ts) over
- * the same rows. Prints the plain report. --json writes the full report
+ * the same three SELECTs (health-counters.ts HEALTH_SQL). Prints the plain report. --json writes the full report
  * (findings, windows) to FILE. --gate exits 3 when anything got worse, so a
  * deploy job can stop on it. Counts and vault hashes only: nothing here can
  * name a person or a vault.
  */
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildHealthReport, type HealthReport, type HealthRow } from "../workers/identity/src/health-report.ts";
+import { buildHealthReport, prevDay, type HealthData, type HealthReport, type HealthRow } from "../workers/identity/src/health-report.ts";
+import { HEALTH_SQL, weekStart } from "../workers/identity/src/health-counters.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -39,34 +40,47 @@ const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const day = arg("--day") ?? new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
 if (!DAY_RE.test(day)) die("--day must be YYYY-MM-DD");
 
-function shiftDay(d: string, by: number): string {
-  return new Date(Date.parse(`${d}T00:00:00Z`) + by * 86_400_000).toISOString().slice(0, 10);
-}
-
-/** Rows from D1 through wrangler: one SELECT, nothing else. */
-function rowsFromD1(db: string): HealthRow[] {
+/**
+ * The report's data from D1 through wrangler: the same three SELECTs the
+ * worker runs (HEALTH_SQL), nothing else. Day bounds are validated
+ * YYYY-MM-DD literals (wrangler's --command takes no bind parameters).
+ */
+function dataFromD1(db: string): HealthData {
   if (!/^[a-z0-9-]+$/.test(db)) die("--d1 takes a database name");
-  const from = shiftDay(day, -8);
-  const today = new Date().toISOString().slice(0, 10);
-  const to = today > day ? today : day;
-  // Both bounds are validated YYYY-MM-DD literals (wrangler's --command takes no bind parameters).
-  const sql = `SELECT day, source, version, vault, subject, outcome, n FROM health_counters WHERE day >= '${from}' AND day <= '${to}'`;
-  const envName = arg("--env");
-  const local = arg("--local");
-  const args = ["wrangler", "d1", "execute", db, "--json", "--command", sql];
-  if (local) args.push("--local", "--persist-to", local);
-  else args.push("--remote");
-  if (envName) args.push("--env", envName);
-  const out = spawnSync("bunx", args, { cwd: join(HERE, "..", "workers", "identity"), encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
-  if (out.status !== 0 && /no such table: health_counters/.test(out.stdout + out.stderr)) {
-    console.log("no health counters yet: the table arrives with this release's migration (nothing to compare)");
-    process.exit(0);
-  }
-  if (out.status !== 0) die(`wrangler d1 execute failed (exit ${out.status}): ${(out.stderr || out.stdout).split("\n").filter((l) => /error|✘/i.test(l)).slice(0, 3).join(" | ")}`);
-  const text = out.stdout;
-  const parsed = JSON.parse(text.slice(text.indexOf("["))) as Array<{ results?: HealthRow[]; success?: boolean }>;
-  if (!parsed[0]?.success) die("the SELECT did not succeed");
-  return parsed[0].results ?? [];
+  const lit = (d: string) => `'${d}'`;
+  const run = (sql: string): Array<Record<string, unknown>> => {
+    const envName = arg("--env");
+    // wrangler runs in workers/identity: a relative state dir must be made absolute first.
+    const local = arg("--local") ? resolve(arg("--local")!) : undefined;
+    const args = ["wrangler", "d1", "execute", db, "--json", "--command", sql];
+    if (local) args.push("--local", "--persist-to", local);
+    else args.push("--remote");
+    if (envName) args.push("--env", envName);
+    const out = spawnSync("bunx", args, {
+      cwd: join(HERE, "..", "workers", "identity"),
+      encoding: "utf8",
+      maxBuffer: 256 * 1024 * 1024,
+      timeout: 120_000,
+    });
+    if (out.status !== 0 && /no such table: health_/.test(out.stdout + out.stderr)) {
+      console.log("no health counters yet: the tables arrive with this release's migration (nothing to compare)");
+      process.exit(0);
+    }
+    if (out.status !== 0) {
+      die(`wrangler d1 execute failed (exit ${out.status ?? "timeout"}): ${(out.stderr || out.stdout).split("\n").filter((l) => /error|✘/i.test(l)).slice(0, 3).join(" | ")}`);
+    }
+    const parsed = JSON.parse(out.stdout.slice(out.stdout.indexOf("["))) as Array<{ results?: Array<Record<string, unknown>>; success?: boolean }>;
+    if (!parsed[0]?.success) die("a SELECT did not succeed");
+    return parsed[0].results ?? [];
+  };
+  const days = run(HEALTH_SQL.days.replace("?", lit(day)).replace("?", lit(prevDay(day))));
+  const versions = run(HEALTH_SQL.versions.replace("?", lit(weekStart(day))));
+  const live = run(HEALTH_SQL.live) as Array<{ source: string; version: string }>;
+  return {
+    days: days as unknown as HealthRow[],
+    versions: versions as unknown as HealthRow[],
+    live: Object.fromEntries(live.map((r) => [r.source, r.version])),
+  };
 }
 
 async function fromUrl(base: string, tokenFile: string): Promise<HealthReport> {
@@ -81,10 +95,10 @@ async function main(): Promise<void> {
   const url = arg("--url");
   let report: HealthReport;
   if (d1) {
-    const rows = rowsFromD1(d1);
+    const data = dataFromD1(d1);
     const environment = arg("--env") ?? (arg("--local") ? "local" : "production");
-    report = await buildHealthReport(rows, { day, environment });
-    console.error(`(${rows.length} counter rows, ${shiftDay(day, -8)} on)`);
+    report = await buildHealthReport(data, { day, environment });
+    console.error(`(${data.days.length} day rows, ${data.versions.length} version rows since ${weekStart(day)})`);
   } else if (url) {
     report = await fromUrl(url, arg("--token-file") ?? die("--url needs --token-file"));
   } else {

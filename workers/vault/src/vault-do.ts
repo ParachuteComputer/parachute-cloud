@@ -47,7 +47,7 @@ import {
 } from "./caps.js";
 import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./rest/storage-constants.js";
 import { handleMcp } from "./mcp.js";
-import { HealthSink, errorClass, httpOutcome, routeOf, utcDay, versionLabel } from "./health.js";
+import { HealthSink, errorClass, responseOutcome, routeOf, utcDay, versionLabel } from "./health.js";
 import { mcpWwwAuthenticate } from "./discovery.js";
 import { handleSubscribe } from "./live/subscribe.js";
 import { SubscriptionManager, WsSink, type SubscriptionHandle } from "./live/subscriptions.js";
@@ -734,7 +734,7 @@ export class VaultDO extends DurableObject {
       throw err;
     }
     const route = this.healthRoute(request);
-    if (route && this.stateLoaded && !this.destroyed) await this.health.record(`http:${route}`, httpOutcome(res.status));
+    if (route && this.stateLoaded && !this.destroyed) await this.health.record(`http:${route}`, await responseOutcome(res));
     return res;
   }
 
@@ -1587,8 +1587,9 @@ export class VaultDO extends DurableObject {
     if (request.method === "GET") {
       // The health counters (T-411, health.ts) ride the nightly usage read, so
       // collecting them costs the identity worker no extra wake or subrequest.
-      // The last two days plus today: the rollup runs at 03:30 UTC.
-      const since = utcDay(new Date(Date.now() - 2 * 86_400_000));
+      // Yesterday and today: the rollup runs at 03:30 UTC, so yesterday is
+      // complete; today's partial count is replaced by tomorrow's read.
+      const since = utcDay(new Date(Date.now() - 86_400_000));
       return json({
         ...shape(),
         health: { version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since) },

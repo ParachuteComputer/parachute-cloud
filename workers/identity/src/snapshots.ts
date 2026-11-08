@@ -164,6 +164,9 @@ export async function runSnapshotSweep(
   let skipped = 0;
   let failed = 0;
   let longPaths = 0;
+  // Health counters (T-411): one backup outcome per vault, written in one
+  // batch after the loop (not one D1 call per vault).
+  const healthItems: Array<{ vault: string; subject: string; outcome: string }> = [];
   for (const v of vaults) {
     try {
       const retention: SnapshotRetention = PLAN_SPECS[livePlan(coercePlanId(v.plan), billingModeOf(deps))].snapshot_retention;
@@ -183,7 +186,7 @@ export async function runSnapshotSweep(
       body.skipped ? skipped++ : taken++;
       // Health counters (T-411): one backup outcome per vault per night (a
       // skip — nothing changed since the last one — is a healthy backup).
-      await bumpHealth(env, [{ vault: v.vault_id, subject: "backup", outcome: "ok" }], now);
+      healthItems.push({ vault: v.vault_id, subject: "backup", outcome: "ok" });
       if (typeof body.long_paths === "number" && Number.isSafeInteger(body.long_paths)) longPaths += body.long_paths;
       // The D1 mirror is a render cache — a mirror-only failure is NOT a
       // snapshot failure (the tarball + R2 manifest landed; the console shows
@@ -199,12 +202,14 @@ export async function runSnapshotSweep(
     } catch (err) {
       // Skip + log + continue — one vault's bad night never starves the rest.
       failed++;
-      await bumpHealth(env, [{ vault: v.vault_id, subject: "backup", outcome: "fail" }], now);
+      healthItems.push({ vault: v.vault_id, subject: "backup", outcome: "fail" });
       console.error(
         `event=snapshot_failed vault=${v.name} error=${JSON.stringify(err instanceof Error ? err.message : String(err))}`,
       );
     }
   }
+
+  await bumpHealth(env, healthItems, now);
 
   // The orphan backstop (cloud#227) — fleet-wide runs only.
   const orphansPruned = scoped ? 0 : await pruneOrphanSnapshotRows(env.DB);

@@ -53,7 +53,7 @@ import { type BillingMode, billingMode } from "./billing-config.ts";
 import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
 import { type NotifyResult, notifyOperators, raiseOpsAlert } from "./ops-alerts.ts";
-import { loadHealthRows, pruneHealthCounters } from "./health-counters.ts";
+import { loadHealthData, pruneHealthCounters } from "./health-counters.ts";
 import { buildHealthReport, type HealthReport } from "./health-report.ts";
 import { pruneOpsCounters, sumOpsCounter } from "./ops-counters.ts";
 import { sha256Hex, timingSafeEqualString } from "./crypto.ts";
@@ -416,14 +416,12 @@ export async function handleOpsSnapshotRunPost(
 }
 
 /**
- * The health report for `day` (T-411): rows from 8 days before it (the deploy
- * window looks a week back for the previous version) through today, so
- * "since the last deploy" includes what was counted after the day closed.
+ * The health report for `day` (T-411): that day against the day before, and
+ * the live version against the one before it over the last week (aggregated
+ * in SQL, health-counters.ts loadHealthData).
  */
-export async function reportForDay(db: D1Database, day: string, environment: string, now = new Date()): Promise<HealthReport> {
-  const from = new Date(Date.parse(`${day}T00:00:00Z`) - 8 * 86_400_000).toISOString().slice(0, 10);
-  const to = now.toISOString().slice(0, 10) > day ? now.toISOString().slice(0, 10) : day;
-  return buildHealthReport(await loadHealthRows(db, from, to), { day, environment });
+export async function reportForDay(db: D1Database, day: string, environment: string): Promise<HealthReport> {
+  return buildHealthReport(await loadHealthData(db, day), { day, environment });
 }
 
 /**

@@ -1,34 +1,51 @@
 /**
  * The health report (T-411): "did anything get worse for any real user since
  * yesterday, or since the last deploy?" — computed from `health_counters`
- * rows (health-counters.ts). Pure: no D1, no Env, so the worker (GET
- * /ops/health, the daily line) and the sealed-job script
- * (scripts/health-report.ts, rows from a D1 SELECT) run the same code.
+ * (health-counters.ts). Pure: no D1, no Env, so the worker (GET /ops/health,
+ * the daily line) and the sealed-job script (scripts/health-report.ts, rows
+ * from D1 SELECTs) run the same code over the same {@link HealthData}.
  *
- * TWO COMPARISONS, each per (vault, subject) and per (connector, subject):
+ * TWO COMPARISONS:
  *   - day:    `day` (default yesterday) against the day before it;
- *   - deploy: per worker, rows counted by the newest version seen against the
- *             version before it (its last 7 days of rows).
+ *   - deploy: per worker, rows counted by the LIVE version (the one last seen
+ *             answering, `health_versions`) against the newest other version
+ *             in the last week. Live, not "newest upload": after a rollback
+ *             the bad version is newer but no longer serving.
  *
- * OUTCOME CLASSES: ok (2xx, 3xx, ok), server (5xx, exception:*, DO platform
- * failures, a failed backup or collection), client (everything else: 4xx by
- * status, tool_error, domain:*, gate:*, OAuth error codes, a DO reset by a
- * code update — that one is every deploy's normal blip).
+ * AT TWO LEVELS:
+ *   - per cell = (worker, vault or connector, subject) — a vault shows as
+ *     `v:<8 hex>` (SHA-256 of its opaque id), a connector as its class;
+ *   - fleet = the vault worker's cells summed over every vault, per subject —
+ *     what catches an outage spread thin (every vault's requests turning into
+ *     401s at once) that no single vault has the traffic to show.
  *
- * WHAT COUNTS AS WORSE (deliberately few, explainable rules):
- *   1. new server errors   — server > 0 now, none before;
- *   2. server errors up    — ≥ 3 now and the rate at least doubled and up ≥ 2
- *                            points;
- *   3. a client reason up  — only with a real baseline (≥ 20 before): ≥ 5 now,
- *                            and its rate ≥ 2× and ≥ +10 points (a 401 storm
- *                            after a deploy that broke tokens);
- *   4. stopped working     — ≥ 3 ok before, 0 ok now, ≥ 3 failures now (401
- *                            and 404 don't count as failures here).
- * Server errors present both times and not rising are "still failing", shown
- * but not counted as worse. Quiet = no row hit any rule.
+ * OUTCOME CLASSES: ok (2xx, 3xx, ok), server (5xx*, exception:*, the DO's CPU
+ * or memory limit, an overload, an opaque platform error, a failed backup or
+ * collection), client (everything else: 4xx by status, tool_error, domain:*,
+ * gate:*, OAuth error codes, by-design 503s named `busy:*` / `backstop:*`, a
+ * dropped connection or a reset while a deploy moves objects).
  *
- * PRIVACY: vaults appear as `v:<8 hex>` = SHA-256 of the opaque vault id;
- * connectors as their class. The text never names a person or a vault.
+ * WHAT COUNTS AS WORSE (few, explainable rules; thresholds are named below):
+ *   1. new server errors — none before; now at least 3, or at least 10% of
+ *      the cell's requests (one stray 500 in a thousand is listed, not alarmed);
+ *   2. server errors up  — at least 3 now, the rate at least doubled and up
+ *      at least 2 points;
+ *   3. a client reason up — only against a real baseline (≥ 20 before): at
+ *      least 5 now, its rate at least doubled and up at least 10 points. Per
+ *      vault, 401/403/404 are left out (a stranger can make those on any
+ *      vault whose name they know); at fleet level and for identity's own
+ *      routes and connectors they count — that is the "tokens broke" signal;
+ *   4. stopped working — ok before (≥ 3 per cell, ≥ 10 fleet-wide), none now,
+ *      and at least 3 failures now. A 404 is never a failure here; per vault
+ *      a 401 is not either, at fleet level it is.
+ * At fleet level, a 401/403/404 rise and "stopped working" must also be
+ * SPREAD: seen on at least 3 vaults, or a quarter of the vaults seen — so a
+ * stranger flooding one vault can't raise a fleet alert.
+ * Server errors below rule 1's bar, or present both times and not rising,
+ * are listed as "other server errors" — shown, never counted as worse.
+ *
+ * PRIVACY: counts, labels and hashes only; the text never names a person or
+ * a vault.
  */
 
 export interface HealthRow {
@@ -39,6 +56,19 @@ export interface HealthRow {
   subject: string;
   outcome: string;
   n: number;
+}
+
+/**
+ * What the report reads:
+ *   - `days`: the rows of `day` and the day before (per vault, version, key);
+ *   - `versions`: the last week summed per (source, version, vault, subject,
+ *     outcome) — `day` is "" there;
+ *   - `live`: per source, the version last seen answering.
+ */
+export interface HealthData {
+  days: HealthRow[];
+  versions: HealthRow[];
+  live: Record<string, string>;
 }
 
 export type OutcomeClass = "ok" | "client" | "server";
@@ -53,11 +83,11 @@ export function outcomeClass(outcome: string): OutcomeClass {
   return "client";
 }
 
-export type FindingKind = "new_server_errors" | "server_errors_up" | "client_reason_up" | "stopped_working" | "still_failing";
+export type FindingKind = "new_server_errors" | "server_errors_up" | "client_reason_up" | "stopped_working" | "other_server_errors";
 
 export interface Finding {
   window: "day" | "deploy";
-  /** `v:<hash>` for a vault, `connector <class>` / `identity` otherwise. */
+  /** `v:<hash>` for a vault, `all vaults` (fleet), `connector <class>` or `identity`. */
   who: string;
   source: string;
   subject: string;
@@ -83,29 +113,73 @@ export interface HealthReport {
   day: string;
   windows: { day: WindowSummary; deploy: WindowSummary[] };
   worse: Finding[];
-  stillFailing: Finding[];
+  /** Server errors shown but not counted as worse (rule 1's bar not reached, or not rising). */
+  otherServerErrors: Finding[];
   backups: { ok: number; failed: number };
   text: string;
 }
+
+// Thresholds, named once.
+const NEW_SERVER_MIN = 3;
+const NEW_SERVER_MIN_RATE = 0.1;
+const UP_MIN = 3;
+const UP_MIN_POINTS = 0.02;
+const CLIENT_BASELINE = 20;
+const CLIENT_MIN = 5;
+const CLIENT_MIN_POINTS = 0.1;
+const STOPPED_OK_BEFORE = 3;
+const STOPPED_OK_BEFORE_FLEET = 10;
+const STOPPED_FAILURES = 3;
+/** Left out per vault: a stranger can produce these on any vault whose name they know. */
+const STRANGER_REASONS = new Set(["4xx:401", "4xx:403", "4xx:404"]);
+const FLEET_MIN_VAULTS = 3;
+const FLEET_MIN_SHARE = 0.25;
 
 interface Tally {
   total: number;
   ok: number;
   server: number;
   byOutcome: Map<string, number>;
+  /** Fleet level: the vaults behind the cell, and behind each outcome. */
+  vaults: Set<string>;
+  vaultsByOutcome: Map<string, Set<string>>;
 }
 
-function tally(rows: HealthRow[]): Map<string, Tally> {
+function emptyTally(): Tally {
+  return { total: 0, ok: 0, server: 0, byOutcome: new Map(), vaults: new Set(), vaultsByOutcome: new Map() };
+}
+
+function add(t: Tally, outcome: string, n: number, vault: string): void {
+  t.total += n;
+  const cls = outcomeClass(outcome);
+  if (cls === "ok") t.ok += n;
+  if (cls === "server") t.server += n;
+  t.byOutcome.set(outcome, (t.byOutcome.get(outcome) ?? 0) + n);
+  t.vaults.add(vault);
+  let vs = t.vaultsByOutcome.get(outcome);
+  if (!vs) t.vaultsByOutcome.set(outcome, (vs = new Set()));
+  vs.add(vault);
+}
+
+/**
+ * Fleet level: a stranger can flood ONE vault they know the name of, so a
+ * fleet-wide 401/403/404 rise or a fleet-wide "stopped working" must show on
+ * several vaults — at least 3, or a quarter of the vaults seen, whichever is
+ * more (an outage of the token keys reaches every vault in use).
+ */
+function spread(vaultsWith: number, vaultsSeen: number): boolean {
+  return vaultsWith >= Math.max(FLEET_MIN_VAULTS, Math.ceil(FLEET_MIN_SHARE * vaultsSeen));
+}
+
+/** Cells keyed `source\0vault\0subject`; `fleet` sums the vault worker's cells over vaults. */
+function tally(rows: HealthRow[], fleet: boolean): Map<string, Tally> {
   const out = new Map<string, Tally>();
   for (const r of rows) {
-    const key = `${r.source}\u0000${r.vault}\u0000${r.subject}`;
+    if (fleet && (r.source !== "vault" || r.vault === "-")) continue;
+    const key = `${r.source}\u0000${fleet ? "*" : r.vault}\u0000${r.subject}`;
     let t = out.get(key);
-    if (!t) out.set(key, (t = { total: 0, ok: 0, server: 0, byOutcome: new Map() }));
-    t.total += r.n;
-    const cls = outcomeClass(r.outcome);
-    if (cls === "ok") t.ok += r.n;
-    if (cls === "server") t.server += r.n;
-    t.byOutcome.set(r.outcome, (t.byOutcome.get(r.outcome) ?? 0) + r.n);
+    if (!t) out.set(key, (t = emptyTally()));
+    add(t, r.outcome, r.n, r.vault);
   }
   return out;
 }
@@ -121,66 +195,86 @@ function serverReasons(t: Tally): string {
     .join(", ");
 }
 
-/** Apply the rules to one window. `who` maps a (source, vault) to its display name. */
+interface Compared {
+  worse: Finding[];
+  other: Finding[];
+}
+
+/** Apply the rules to one window at one level. */
 function compare(
   window: "day" | "deploy",
   before: HealthRow[],
   after: HealthRow[],
-  who: (source: string, vault: string, subject: string) => string,
+  level: "cell" | "fleet",
+  who: (vault: string, subject: string) => string,
   beforeLabel: string,
-): { worse: Finding[]; still: Finding[] } {
-  const b = tally(before);
-  const a = tally(after);
+): Compared {
+  const fleet = level === "fleet";
+  const b = tally(before, fleet);
+  const a = tally(after, fleet);
   const worse: Finding[] = [];
-  const still: Finding[] = [];
+  const other: Finding[] = [];
   for (const [key, ta] of a) {
     const [source, vault, subject] = key.split("\u0000") as [string, string, string];
-    const tb = b.get(key) ?? { total: 0, ok: 0, server: 0, byOutcome: new Map<string, number>() };
-    const base = { window, who: who(source, vault, subject), source, subject };
-    const rateA = pct(ta.server, ta.total);
-    const rateB = pct(tb.server, tb.total);
-    if (ta.server > 0 && tb.server === 0) {
-      worse.push({ ...base, kind: "new_server_errors", detail: `new server errors: ${serverReasons(ta)} of ${ta.total} (none ${beforeLabel}, of ${tb.total})` });
-    } else if (ta.server >= 3 && rateA >= 2 * rateB && rateA - rateB >= 0.02) {
-      worse.push({ ...base, kind: "server_errors_up", detail: `server errors up: ${fmtPct(rateA)} now (${serverReasons(ta)}), ${fmtPct(rateB)} ${beforeLabel}` });
-    } else if (ta.server > 0) {
-      still.push({ ...base, kind: "still_failing", detail: `still failing: ${serverReasons(ta)} of ${ta.total} (${tb.server} of ${tb.total} ${beforeLabel})` });
+    const tb = b.get(key) ?? emptyTally();
+    const base = { window, who: fleet ? "all vaults" : who(vault, subject), source, subject };
+    // A vault cell is the one place strangers can reach by name.
+    const perVault = !fleet && vault !== "-";
+
+    // Server rules: per cell only (the fleet sum of the same errors adds nothing).
+    if (!fleet) {
+      const rateA = pct(ta.server, ta.total);
+      const rateB = pct(tb.server, tb.total);
+      if (ta.server > 0 && tb.server === 0 && (ta.server >= NEW_SERVER_MIN || rateA >= NEW_SERVER_MIN_RATE)) {
+        worse.push({ ...base, kind: "new_server_errors", detail: `new server errors: ${serverReasons(ta)} of ${ta.total} (none ${beforeLabel}, of ${tb.total})` });
+      } else if (ta.server >= UP_MIN && rateA >= 2 * rateB && rateA - rateB >= UP_MIN_POINTS) {
+        worse.push({ ...base, kind: "server_errors_up", detail: `server errors up: ${fmtPct(rateA)} now (${serverReasons(ta)}), ${fmtPct(rateB)} ${beforeLabel}` });
+      } else if (ta.server > 0) {
+        other.push({ ...base, kind: "other_server_errors", detail: `${serverReasons(ta)} of ${ta.total} (${tb.server} of ${tb.total} ${beforeLabel})` });
+      }
     }
-    if (tb.total >= 20) {
+
+    // Rule 3: a client reason up, against a real baseline.
+    if (tb.total >= CLIENT_BASELINE) {
       for (const [outcome, na] of ta.byOutcome) {
-        if (outcomeClass(outcome) !== "client" || na < 5) continue;
+        if (outcomeClass(outcome) !== "client" || na < CLIENT_MIN) continue;
+        if (perVault && STRANGER_REASONS.has(outcome)) continue;
+        if (fleet && STRANGER_REASONS.has(outcome) && !spread(ta.vaultsByOutcome.get(outcome)?.size ?? 0, ta.vaults.size)) continue;
         const ra = pct(na, ta.total);
         const rb = pct(tb.byOutcome.get(outcome) ?? 0, tb.total);
-        if (ra >= 2 * rb && ra - rb >= 0.1) {
+        if (ra >= 2 * rb && ra - rb >= CLIENT_MIN_POINTS) {
           worse.push({ ...base, kind: "client_reason_up", detail: `${outcome} up: ${na} of ${ta.total} (${fmtPct(ra)}) vs ${fmtPct(rb)} ${beforeLabel}` });
         }
       }
     }
-    // 401 and 404 are not failures here: a client's first unauthenticated
-    // probe and a missing item are normal, and a stranger's few requests right
-    // after a deploy must not read as an outage. A real auth breakage shows
-    // as rule 3 (the 401 rate against a baseline).
-    const failedA = ta.total - ta.ok - (ta.byOutcome.get("4xx:401") ?? 0) - (ta.byOutcome.get("4xx:404") ?? 0);
-    if (tb.ok >= 3 && ta.ok === 0 && failedA >= 3) {
+
+    // Rule 4: stopped working.
+    const not404 = ta.byOutcome.get("4xx:404") ?? 0;
+    const not401 = perVault ? (ta.byOutcome.get("4xx:401") ?? 0) : 0;
+    const failedA = ta.total - ta.ok - not404 - not401;
+    const okBefore = fleet ? STOPPED_OK_BEFORE_FLEET : STOPPED_OK_BEFORE;
+    const failingVaults = fleet
+      ? new Set([...ta.vaultsByOutcome].filter(([o]) => outcomeClass(o) !== "ok" && o !== "4xx:404").flatMap(([, vs]) => [...vs])).size
+      : 1;
+    if (tb.ok >= okBefore && ta.ok === 0 && failedA >= STOPPED_FAILURES && (!fleet || spread(failingVaults, ta.vaults.size))) {
       worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${tb.ok} ok ${beforeLabel})` });
     }
   }
-  return { worse, still };
+  return { worse, other };
 }
 
 /** How a vault appears in the report: `v:` + 8 hex of SHA-256 over its opaque id. */
 export async function vaultHash(vaultId: string): Promise<string> {
-  return `v:${await sha8(vaultId)}`;
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`parachute-health:${vaultId}`));
+  return `v:${[...new Uint8Array(d)].slice(0, 4).map((x) => x.toString(16).padStart(2, "0")).join("")}`;
 }
 
-async function sha8(s: string): Promise<string> {
-  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`parachute-health:${s}`));
-  return [...new Uint8Array(d)].slice(0, 4).map((x) => x.toString(16).padStart(2, "0")).join("");
-}
-
-function prevDay(day: string): string {
+export function prevDay(day: string): string {
   return new Date(Date.parse(`${day}T00:00:00Z`) - 86_400_000).toISOString().slice(0, 10);
 }
+
+/** Labels that start with an upload timestamp can be put in deploy order. */
+const TIMESTAMPED = /^\d{4}-\d{2}-\d{2}t/;
 
 function summarize(label: string, beforeL: string, afterL: string, before: HealthRow[], after: HealthRow[]): WindowSummary {
   const req = (rows: HealthRow[]) => rows.filter((r) => r.subject.startsWith("http:")).reduce((s, r) => s + r.n, 0);
@@ -197,19 +291,32 @@ function summarize(label: string, beforeL: string, afterL: string, before: Healt
   };
 }
 
-/**
- * Build the report. `rows` should cover at least `day` minus 8 days through
- * the newest counted day (the deploy window looks back 7 days for the
- * previous version).
- */
-export async function buildHealthReport(
-  rows: HealthRow[],
-  opts: { day: string; environment: string },
-): Promise<HealthReport> {
+/** Merge, keeping one finding per (who, subject, kind, reason) across windows and levels. */
+function addAll(into: Compared, from: Compared): void {
+  const id = (f: Finding) => `${f.who}|${f.subject}|${f.kind}|${f.detail.split(":")[0]}`;
+  const seen = new Set(into.worse.map(id));
+  for (const f of from.worse) {
+    if (!seen.has(id(f))) {
+      seen.add(id(f));
+      into.worse.push(f);
+    }
+  }
+  const flagged = new Set(into.worse.map((f) => `${f.who}|${f.subject}`));
+  const seenOther = new Set(into.other.map((f) => `${f.who}|${f.subject}`));
+  for (const f of from.other) {
+    const k = `${f.who}|${f.subject}`;
+    if (!seenOther.has(k) && !flagged.has(k)) {
+      seenOther.add(k);
+      into.other.push(f);
+    }
+  }
+}
+
+export async function buildHealthReport(data: HealthData, opts: { day: string; environment: string }): Promise<HealthReport> {
   const day = opts.day;
   const hashes = new Map<string, string>();
-  for (const v of new Set(rows.map((r) => r.vault))) if (v !== "-") hashes.set(v, await vaultHash(v));
-  const who = (_source: string, vault: string, subject: string) => {
+  for (const v of new Set([...data.days, ...data.versions].map((r) => r.vault))) if (v !== "-") hashes.set(v, await vaultHash(v));
+  const who = (vault: string, subject: string) => {
     if (vault !== "-") return hashes.get(vault)!;
     const m = /^oauth:[a-z]+:(.+)$/.exec(subject);
     return m ? `connector ${m[1]}` : "identity";
@@ -217,30 +324,30 @@ export async function buildHealthReport(
 
   // 1. Day over day.
   const prior = prevDay(day);
-  const dayAfter = rows.filter((r) => r.day === day);
-  const dayBefore = rows.filter((r) => r.day === prior);
-  const d = compare("day", dayBefore, dayAfter, who, `on ${prior}`);
+  const dayAfter = data.days.filter((r) => r.day === day);
+  const dayBefore = data.days.filter((r) => r.day === prior);
+  const result: Compared = { worse: [], other: [] };
+  addAll(result, compare("day", dayBefore, dayAfter, "cell", who, `on ${prior}`));
+  addAll(result, compare("day", dayBefore, dayAfter, "fleet", who, `on ${prior}`));
   const windows: HealthReport["windows"] = { day: summarize("day", prior, day, dayBefore, dayAfter), deploy: [] };
-  const worse = [...d.worse];
-  const still = [...d.still];
 
-  // 2. Since the last deploy, per worker (source).
-  const weekAgo = new Date(Date.parse(`${day}T00:00:00Z`) - 7 * 86_400_000).toISOString().slice(0, 10);
+  // 2. Since the last deploy, per worker.
   for (const source of ["vault", "identity"]) {
-    // Only labels that start with an upload timestamp can be put in deploy
-    // order ("unversioned", or an id without a timestamp, cannot).
-    const mine = rows.filter((r) => r.source === source && /^\d{4}-\d{2}-\d{2}t/.test(r.version));
-    const versions = [...new Set(mine.map((r) => r.version))].sort();
-    const current = versions.at(-1);
-    const previous = versions.at(-2);
+    const mine = data.versions.filter((r) => r.source === source && TIMESTAMPED.test(r.version));
+    const labels = [...new Set(mine.map((r) => r.version))].sort();
+    const live = data.live[source];
+    const current = live && labels.includes(live) ? live : labels.at(-1);
+    const previous = labels.filter((l) => l !== current).at(-1);
     if (!current || !previous) continue;
     const after = mine.filter((r) => r.version === current);
-    const before = mine.filter((r) => r.version === previous && r.day >= weekAgo);
-    const dep = compare("deploy", before, after, who, `before the deploy`);
+    const before = mine.filter((r) => r.version === previous);
+    const label = previous > current ? "on the version rolled back from" : "before the deploy";
+    const cells = compare("deploy", before, after, "cell", who, label);
+    const fleetWide = compare("deploy", before, after, "fleet", who, label);
+    // Only the vault worker's deploy window carries vault cells; identity's carries its routes and connectors.
+    addAll(result, cells);
+    addAll(result, fleetWide);
     windows.deploy.push(summarize(`${source} deploy`, previous, current, before, after));
-    // A finding the day window already made for the same row is not repeated.
-    const seen = new Set(worse.map((f) => `${f.who}|${f.subject}|${f.kind}`));
-    for (const f of dep.worse) if (!seen.has(`${f.who}|${f.subject}|${f.kind}`)) worse.push(f);
   }
 
   const backupRows = dayAfter.filter((r) => r.subject === "backup");
@@ -249,7 +356,15 @@ export async function buildHealthReport(
     failed: backupRows.filter((r) => r.outcome === "fail").reduce((s, r) => s + r.n, 0),
   };
 
-  const report: HealthReport = { environment: opts.environment, day, windows, worse, stillFailing: still, backups, text: "" };
+  const report: HealthReport = {
+    environment: opts.environment,
+    day,
+    windows,
+    worse: result.worse,
+    otherServerErrors: result.other,
+    backups,
+    text: "",
+  };
   report.text = renderHealthText(report);
   return report;
 }
@@ -274,9 +389,9 @@ export function renderHealthText(r: HealthReport): string {
     lines.push("", "WORSE");
     for (const f of r.worse) lines.push(`- ${f.who} · ${f.subject} · ${f.detail} [${f.window}]`);
   }
-  if (r.stillFailing.length) {
-    lines.push("", "STILL FAILING (not counted as worse)");
-    for (const f of r.stillFailing) lines.push(`- ${f.who} · ${f.subject} · ${f.detail}`);
+  if (r.otherServerErrors.length) {
+    lines.push("", "OTHER SERVER ERRORS (listed, not counted as worse)");
+    for (const f of r.otherServerErrors) lines.push(`- ${f.who} · ${f.subject} · ${f.detail}`);
   }
   return lines.join("\n");
 }

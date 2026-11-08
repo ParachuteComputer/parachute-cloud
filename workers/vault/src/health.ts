@@ -35,6 +35,39 @@ export const HEALTH_KEEP_DAYS = 35;
 /** Distinct keys a single vault may hold for one day, across versions. */
 export const HEALTH_MAX_KEYS = 200;
 export const OVERFLOW_KEY = "overflow|dropped";
+/**
+ * Where a SERVER-class outcome goes once the day is full, so a cap reached by
+ * ordinary keys (e.g. a mid-day deploy re-creating them under a new version)
+ * can never hide new failures. The report reads `5xx:*` as a server error.
+ */
+export const OVERFLOW_SERVER_KEY = "overflow|5xx:overflow";
+
+/** Outcomes the report counts as server errors (mirrors identity's health-report.ts outcomeClass). */
+export function isServerOutcome(outcome: string): boolean {
+  return outcome.startsWith("5xx") || outcome.startsWith("exception") || PLATFORM_KINDS.has(outcome);
+}
+const PLATFORM_KINDS = new Set(["cpu_limit", "memory_limit", "overloaded", "platform_error"]);
+
+/**
+ * 503s the vault answers BY DESIGN — the import lock, a busy vault, the
+ * live-subscription cap, semantic search switched off. They are named
+ * (`busy:<type>`) instead of counted as server errors; any other 503 stays
+ * `5xx:503`.
+ */
+const BY_DESIGN_503 = new Set(["import_in_progress", "vault_busy", "subscription_cap_reached", "semantic_unavailable"]);
+
+/** {@link httpOutcome}, but a by-design 503 is named by its own error type (read from a clone). */
+export async function responseOutcome(res: Response): Promise<string> {
+  if (res.status !== 503 || !(res.headers.get("content-type") ?? "").includes("json")) return httpOutcome(res.status);
+  try {
+    const body = (await res.clone().json()) as { error_type?: unknown; code?: unknown };
+    const t = String(body.error_type ?? body.code ?? "").toLowerCase();
+    if (BY_DESIGN_503.has(t)) return `busy:${t}`;
+  } catch {
+    /* not JSON after all: the status class */
+  }
+  return httpOutcome(res.status);
+}
 
 /** version label → `subject|outcome` → count */
 export type DayCounters = Record<string, Record<string, number>>;
@@ -135,7 +168,11 @@ export function routerFailureKind(err: unknown): string | null {
   if (/exceeded its memory limit|memory limit/i.test(msg)) return "memory_limit";
   if (/code was updated|code has been updated/i.test(msg)) return "code_updated";
   if (/overloaded/i.test(msg)) return "overloaded";
-  if (/Network connection lost|internal error/i.test(msg)) return "platform_error";
+  // A dropped connection is the usual blip while a deploy moves objects: a
+  // named, non-server outcome. workerd's opaque "internal error; reference =
+  // …" is a real platform fault.
+  if (/Network connection lost/i.test(msg)) return "connection_lost";
+  if (/^internal error; reference/i.test(msg)) return "platform_error";
   return null;
 }
 
@@ -159,7 +196,9 @@ export class HealthSink {
       const counters = this.counters!;
       const v = (counters[this.version] ??= {});
       let key = `${clean(subject)}|${clean(outcome)}`;
-      if (v[key] === undefined && countKeys(counters) >= HEALTH_MAX_KEYS) key = OVERFLOW_KEY;
+      if (v[key] === undefined && countKeys(counters) >= HEALTH_MAX_KEYS) {
+        key = isServerOutcome(clean(outcome)) ? OVERFLOW_SERVER_KEY : OVERFLOW_KEY;
+      }
       v[key] = (v[key] ?? 0) + by;
       await this.storage.put(HEALTH_PREFIX + day, counters);
       if (this.prunedFor !== day) {

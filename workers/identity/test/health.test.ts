@@ -15,8 +15,8 @@
 import { createExecutionContext, env, fetchMock, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import worker from "../src/index.ts";
-import { buildHealthReport, outcomeClass, type HealthRow } from "../src/health-report.ts";
-import { connectorClass, identityRouteGroup, loadHealthRows, parseVaultHealth } from "../src/health-counters.ts";
+import { buildHealthReport, outcomeClass, type HealthData, type HealthRow } from "../src/health-report.ts";
+import { FLUSH_N, bufferHealth, connectorClass, flushHealthBuffer, identityRouteGroup, loadHealthData, parseVaultHealth } from "../src/health-counters.ts";
 import { runUsageRollup } from "../src/usage.ts";
 import { runDailyLine } from "../src/ops-daily.ts";
 import type { EmailSender, OpsEmail, SendResult } from "../src/email.ts";
@@ -52,6 +52,22 @@ function quietly<T>(fn: () => Promise<T>): Promise<T> {
   });
 }
 
+/**
+ * Rows → what the report reads: the two days as they are, the week summed per
+ * version (what HEALTH_SQL.versions does in D1), and the live versions.
+ */
+function data(rows: HealthRow[], live: Record<string, string> = {}): HealthData {
+  const sums = new Map<string, HealthRow>();
+  for (const r of rows) {
+    const k = [r.source, r.version, r.vault, r.subject, r.outcome].join("|");
+    const cur = sums.get(k);
+    if (cur) cur.n += r.n;
+    else sums.set(k, { ...r, day: "" });
+  }
+  return { days: rows.filter((r) => r.day === DAY || r.day === PRIOR), versions: [...sums.values()], live };
+}
+const report = (rows: HealthRow[], live: Record<string, string> = {}) => buildHealthReport(data(rows, live), { day: DAY, environment: "production" });
+
 describe("the report rules", () => {
   test("a planted 500 on one vault is caught; the other vault, same traffic, stays quiet", async () => {
     const rows = [
@@ -61,7 +77,7 @@ describe("the report rules", () => {
       ...normalDay("vault-id-b", DAY),
       row({ vault: "vault-id-a", subject: "http:notes", outcome: "5xx:500", n: 5 }),
     ];
-    const r = await buildHealthReport(rows, { day: DAY, environment: "production" });
+    const r = await report(rows);
     expect(r.worse).toHaveLength(1);
     expect(r.worse[0]).toMatchObject({ window: "day", subject: "http:notes", kind: "new_server_errors" });
     expect(r.worse[0]!.who).toMatch(/^v:[0-9a-f]{8}$/);
@@ -72,73 +88,101 @@ describe("the report rules", () => {
   });
 
   test("two normal days: nothing worse", async () => {
-    const rows = [...normalDay("vault-id-a", PRIOR), ...normalDay("vault-id-a", DAY)];
-    const r = await buildHealthReport(rows, { day: DAY, environment: "production" });
+    const r = await report([...normalDay("vault-id-a", PRIOR), ...normalDay("vault-id-a", DAY)]);
     expect(r.worse).toEqual([]);
-    expect(r.stillFailing).toEqual([]);
+    expect(r.otherServerErrors).toEqual([]);
     expect(r.text.split("\n")[0]).toBe(`parachute-cloud health ${DAY} (vs ${PRIOR}): nothing worse`);
   });
 
-  test("a 401 storm counts against a real baseline, and not without one", async () => {
-    const storm = row({ vault: "vault-id-a", subject: "http:mcp", outcome: "4xx:401", n: 50 });
-    const withBase = await buildHealthReport([...normalDay("vault-id-a", PRIOR), ...normalDay("vault-id-a", DAY), storm], {
-      day: DAY,
-      environment: "production",
-    });
-    expect(withBase.worse.map((f) => f.kind)).toContain("client_reason_up");
-    // A fresh vault: no day before, so 401s from a first connect are normal.
-    const fresh = await buildHealthReport([storm, row({ vault: "vault-id-a", subject: "http:mcp", outcome: "2xx", n: 3 })], {
-      day: DAY,
-      environment: "production",
-    });
-    expect(fresh.worse).toEqual([]);
+  test("one stray 500 in a thousand is listed, not alarmed", async () => {
+    const r = await report([
+      row({ day: PRIOR, subject: "http:notes", outcome: "2xx", n: 1000 }),
+      row({ subject: "http:notes", outcome: "2xx", n: 999 }),
+      row({ subject: "http:notes", outcome: "5xx:500", n: 1 }),
+    ]);
+    expect(r.worse).toEqual([]);
+    expect(r.otherServerErrors).toHaveLength(1);
+    expect(r.text).toContain("OTHER SERVER ERRORS");
   });
 
-  test("a tool that worked yesterday and only fails today has stopped working", async () => {
-    const rows = [
-      row({ day: PRIOR, subject: "mcp:create-note", outcome: "ok", n: 9 }),
-      row({ subject: "mcp:create-note", outcome: "tool_error", n: 6 }),
+  test("one 500 on a vault with almost no traffic is a real share of it, and counts", async () => {
+    const r = await report([row({ subject: "http:notes", outcome: "2xx", n: 4 }), row({ subject: "http:notes", outcome: "5xx:500", n: 1 })]);
+    expect(r.worse.map((f) => f.kind)).toEqual(["new_server_errors"]);
+  });
+
+  test("a stranger's 401s on one vault are never 'worse' — not by rate, not as 'stopped working'", async () => {
+    const light = [
+      row({ day: PRIOR, subject: "http:notes", outcome: "2xx", n: 35 }),
+      row({ day: PRIOR, subject: "http:notes", outcome: "4xx:401", n: 5 }),
+      row({ subject: "http:notes", outcome: "2xx", n: 24 }),
+      row({ subject: "http:notes", outcome: "4xx:401", n: 16 }),
     ];
-    const r = await buildHealthReport(rows, { day: DAY, environment: "production" });
-    expect(r.worse.map((f) => f.kind)).toEqual(["stopped_working"]);
-  });
-
-  test("a few strangers' 401s right after a deploy are not 'stopped working'", async () => {
+    expect((await report(light)).worse).toEqual([]);
     const old = "2026-11-06t10:00:00z~aaaaaaaa";
     const cur = "2026-11-07t09:00:00z~bbbbbbbb";
-    const rows = [
+    const afterDeploy = [
       row({ day: PRIOR, version: old, subject: "http:notes", outcome: "2xx", n: 4 }),
       row({ version: cur, subject: "http:notes", outcome: "4xx:401", n: 3 }),
       row({ version: cur, subject: "http:notes", outcome: "4xx:404", n: 1 }),
     ];
-    const r = await buildHealthReport(rows, { day: DAY, environment: "production" });
-    expect(r.worse).toEqual([]);
+    expect((await report(afterDeploy, { vault: cur })).worse).toEqual([]);
   });
 
-  test("server errors at the same low rate both days are still failing, not worse", async () => {
-    const rows = [
+  test("every vault's requests turning into 401s at once is caught at fleet level", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 10; i++) {
+      rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 15 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "4xx:401", n: 15 }));
+    }
+    const r = await report(rows);
+    const fleet = r.worse.filter((f) => f.who === "all vaults").map((f) => f.kind).sort();
+    expect(fleet).toEqual(["client_reason_up", "stopped_working"]);
+    // …and no single vault is blamed for it.
+    expect(r.worse.every((f) => f.who === "all vaults")).toBe(true);
+  });
+
+  test("a client reason on identity's own routes counts against a real baseline, and not without one", async () => {
+    const id = (p: Partial<HealthRow> & { subject: string; outcome: string; n: number }) => row({ source: "identity", vault: "-", ...p });
+    const withBase = await report([
+      id({ day: PRIOR, subject: "oauth:refresh:claude", outcome: "ok", n: 40 }),
+      id({ subject: "oauth:refresh:claude", outcome: "ok", n: 10 }),
+      id({ subject: "oauth:refresh:claude", outcome: "invalid_grant", n: 30 }),
+    ]);
+    expect(withBase.worse).toMatchObject([{ who: "connector claude", kind: "client_reason_up" }]);
+    const fresh = await report([id({ subject: "oauth:refresh:claude", outcome: "invalid_grant", n: 30 })]);
+    expect(fresh.worse).toEqual([]);
+  });
+
+  test("a tool that worked yesterday and only fails today has stopped working", async () => {
+    const r = await report([
+      row({ day: PRIOR, subject: "mcp:create-note", outcome: "ok", n: 9 }),
+      row({ subject: "mcp:create-note", outcome: "tool_error", n: 6 }),
+    ]);
+    expect(r.worse.map((f) => f.kind)).toEqual(["stopped_working"]);
+  });
+
+  test("server errors at the same rate both days are listed, not worse", async () => {
+    const r = await report([
       ...normalDay("vault-id-a", PRIOR),
-      row({ day: PRIOR, subject: "http:notes", outcome: "5xx:500", n: 2 }),
+      row({ day: PRIOR, subject: "http:notes", outcome: "5xx:500", n: 3 }),
       ...normalDay("vault-id-a", DAY),
-      row({ subject: "http:notes", outcome: "5xx:500", n: 2 }),
-    ];
-    const r = await buildHealthReport(rows, { day: DAY, environment: "production" });
+      row({ subject: "http:notes", outcome: "5xx:500", n: 3 }),
+    ]);
     expect(r.worse).toEqual([]);
-    expect(r.stillFailing).toHaveLength(1);
+    expect(r.otherServerErrors).toHaveLength(1);
   });
 
-  test("since the deploy: the newest version against the one before it", async () => {
+  test("since the deploy: the live version against the one before it", async () => {
     const old = "2026-11-05t10:00:00z~aaaaaaaa";
     const cur = "2026-11-07t09:00:00z~bbbbbbbb";
     const rows = [
       ...normalDay("vault-id-a", "2026-11-05", old),
       ...normalDay("vault-id-a", "2026-11-06", old),
-      // The deploy landed mid-morning on DAY: the day already mixes both.
       ...normalDay("vault-id-a", DAY, old),
       row({ version: cur, subject: "http:notes", outcome: "2xx", n: 30 }),
       row({ version: cur, subject: "do", outcome: "cpu_limit", n: 4 }),
     ];
-    const r = await buildHealthReport(rows, { day: DAY, environment: "production" });
+    const r = await report(rows, { vault: cur });
     expect(r.windows.deploy.map((w) => [w.before, w.after])).toEqual([[old, cur]]);
     const kinds = r.worse.map((f) => `${f.window}:${f.subject}:${f.kind}`);
     expect(kinds).toContain("day:do:new_server_errors");
@@ -146,13 +190,33 @@ describe("the report rules", () => {
     expect(kinds.filter((k) => k.includes("do:new_server_errors"))).toHaveLength(1);
   });
 
+  test("after a rollback the live (older) version is 'current', so the bad one stops alarming", async () => {
+    const good = "2026-11-05t10:00:00z~aaaaaaaa";
+    const bad = "2026-11-06t09:00:00z~bbbbbbbb";
+    const rows = [
+      row({ day: "2026-11-05", version: good, subject: "http:notes", outcome: "2xx", n: 100 }),
+      row({ day: PRIOR, version: bad, subject: "http:notes", outcome: "2xx", n: 50 }),
+      row({ day: PRIOR, version: bad, subject: "http:notes", outcome: "5xx:500", n: 50 }),
+      row({ day: PRIOR, version: good, subject: "http:notes", outcome: "2xx", n: 20 }),
+      row({ version: good, subject: "http:notes", outcome: "2xx", n: 100 }),
+    ];
+    const r = await report(rows, { vault: good });
+    expect(r.windows.deploy[0]).toMatchObject({ after: good, before: bad });
+    expect(r.worse).toEqual([]);
+    expect(r.text).toContain("vault deploy");
+  });
+
   test("outcome classes", () => {
     expect(outcomeClass("2xx")).toBe("ok");
     expect(outcomeClass("ok")).toBe("ok");
     expect(outcomeClass("5xx:503")).toBe("server");
+    expect(outcomeClass("5xx:overflow")).toBe("server");
     expect(outcomeClass("exception:typeerror")).toBe("server");
     expect(outcomeClass("cpu_limit")).toBe("server");
     expect(outcomeClass("fail")).toBe("server");
+    expect(outcomeClass("busy:import_in_progress")).toBe("client");
+    expect(outcomeClass("backstop:503")).toBe("client");
+    expect(outcomeClass("connection_lost")).toBe("client");
     expect(outcomeClass("code_updated")).toBe("client");
     expect(outcomeClass("invalid_grant")).toBe("client");
   });
@@ -179,7 +243,7 @@ describe("what gets counted, and as what", () => {
         },
       },
       "vid",
-    )!;
+    )!.rows;
     expect(rows.map((r) => `${r.subject}|${r.outcome}=${r.n}`).sort()).toEqual(["http:notes|2xx=3", "mixed_case|ok=2"]);
     expect(parseVaultHealth(undefined, "vid")).toBeNull();
   });
@@ -214,12 +278,41 @@ describe("what gets counted, and as what", () => {
     expect((await run(tokenReq({ grant_type: "refresh_token", refresh_token: pair.refresh_token, client_id: clientId }))).status).toBe(200);
     expect((await run(tokenReq({ grant_type: "refresh_token", refresh_token: "not-a-real-token", client_id: clientId }))).status).toBe(400);
 
+    await flushHealthBuffer(env);
     const today = new Date().toISOString().slice(0, 10);
-    const rows = await loadHealthRows(env.DB, today, today);
+    const rows = (await loadHealthData(env.DB, today)).days;
     const got = Object.fromEntries(rows.filter((r) => r.subject.startsWith("oauth:")).map((r) => [`${r.subject}|${r.outcome}`, r.n]));
     expect(got).toEqual({ "oauth:code:claude|ok": 1, "oauth:refresh:claude|ok": 1, "oauth:refresh:claude|invalid_grant": 1 });
     expect(rows.find((r) => r.subject === "http:oauth" && r.outcome === "2xx")?.n).toBe(2);
     expect(JSON.stringify(rows)).not.toContain("Zq7");
+  });
+});
+
+describe("identity's own request counts", () => {
+  test("a flood of requests is summed in memory and written as one row, not one write each", async () => {
+    await flushHealthBuffer(env);
+    const at = new Date("2026-11-07T12:00:00Z");
+    let flushes = 0;
+    for (let i = 0; i < FLUSH_N - 1; i++) if (bufferHealth(env, [{ subject: "http:other", outcome: "4xx:404" }], at)) flushes++;
+    expect(flushes).toBe(0);
+    const due = bufferHealth(env, [{ subject: "http:other", outcome: "4xx:404" }], at);
+    expect(due).not.toBeNull();
+    await due;
+    const got = (await loadHealthData(env.DB, DAY)).days.filter((r) => r.subject === "http:other");
+    expect(got.map((r) => r.n)).toEqual([FLUSH_N]);
+  });
+
+  test("the /vault and /mcp backstops' by-design 503 is named, not counted as a server error", async () => {
+    await flushHealthBuffer(env);
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(new Request(`${ISSUER}/vault/somebody/api/notes`), env, ctx);
+    await waitOnExecutionContext(ctx);
+    await flushHealthBuffer(env);
+    const today = new Date().toISOString().slice(0, 10);
+    const rows = (await loadHealthData(env.DB, today)).days.filter((r) => r.subject === "http:vault");
+    expect(res.status).toBe(503); // route_missing: /vault on the issuer host is a misrouted request, by design
+    expect(rows.map((r) => r.outcome)).toEqual(["backstop:503"]);
+    expect(rows.some((r) => outcomeClass(r.outcome) === "server")).toBe(false);
   });
 });
 
@@ -262,9 +355,11 @@ describe("collection and the daily line", () => {
     await quietly(() => runUsageRollup(env, d, { onlyVault: "hroll-zq7name" }));
     const vid = (await env.DB.prepare("SELECT vault_id FROM vaults WHERE name = ?").bind("hroll-zq7name").first<{ vault_id: string }>())!
       .vault_id;
-    const rows = (await loadHealthRows(env.DB, DAY, DAY)).filter((r) => r.vault === vid);
+    const loaded = await loadHealthData(env.DB, DAY);
+    const rows = loaded.days.filter((r) => r.vault === vid);
     expect(rows.map((r) => `${r.subject}|${r.outcome}=${r.n}`).sort()).toEqual(["http:notes|2xx=7", "http:notes|5xx:500=2"]);
-    const r = await buildHealthReport(rows, { day: DAY, environment: "production" });
+    expect(loaded.live.vault).toBe("v1");
+    const r = await buildHealthReport(loaded, { day: DAY, environment: "production" });
     expect(JSON.stringify(r)).not.toContain("zq7name");
     expect(JSON.stringify(r)).not.toContain(vid);
   });

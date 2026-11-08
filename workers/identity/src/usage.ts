@@ -42,6 +42,9 @@ import { getUserById } from "./users.ts";
  * across runs by name cursor (`WHERE name > ? ORDER BY name LIMIT ?`,
  * persisting the cursor) or fan out via a queue; one worker invocation
  * serially waking hundreds of DOs is the wrong shape at that scale.
+ * Per vault the run makes one vault call plus its D1 writes: the usage row and
+ * (T-411) ONE batch for the vault's health counters, which ride the same
+ * config response — count those too if subrequests become the bound.
  */
 export const USAGE_RUN_CAP = 500;
 
@@ -292,8 +295,8 @@ export async function runUsageRollup(
       // counts; copy them into D1 under the vault's opaque id. Its own failure
       // domain — a bad block must never cost the usage row written above.
       try {
-        const rows = parseVaultHealth(usage.health, v.vault_id);
-        if (rows) await storeVaultHealth(env.DB, rows);
+        const parsed = parseVaultHealth(usage.health, v.vault_id);
+        if (parsed) await storeVaultHealth(env.DB, parsed, now);
       } catch (err) {
         console.error(`event=health_store_failed error=${err instanceof Error ? err.name : "error"}`);
         await bumpHealth(env, [{ vault: v.vault_id, subject: "collect", outcome: "fail" }], now);
