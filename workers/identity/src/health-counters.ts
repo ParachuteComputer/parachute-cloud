@@ -17,8 +17,9 @@
  * written at most every {@link FLUSH_MS} (or every {@link FLUSH_N} requests) —
  * a flood of requests is a handful of D1 writes, not one per request; a count
  * still in memory when an isolate is evicted is lost, which is acceptable for
- * a trend. Token-endpoint outcomes, backups and failures are rare and written
- * as they happen.
+ * a trend. Token-endpoint outcomes, backups, server errors and failures are
+ * written as they happen: they are what the report is for, and the token
+ * endpoint already reads D1 on every call.
  *
  * NAMES AND COUNTS ONLY. Every subject is a server-defined label; a connector
  * is reduced to a small fixed set of classes (claude, chatgpt, …, other) from
@@ -37,8 +38,12 @@ import { type HealthData, prevDay } from "./health-report.ts";
 export const HEALTH_KEEP_DAYS = 35;
 /** Keys accepted from one vault for one day (the DO caps at 200 + 2 overflow keys; this is the backstop). */
 export const HEALTH_MAX_KEYS_PER_DAY = 300;
-/** Vaults one on-demand collection reads (the nightly path rides the rollup's own cap). */
-export const HEALTH_COLLECT_CAP = 500;
+/**
+ * Vaults one on-demand collection reads, one after another in one invocation
+ * (each a vault call + D1 work), well inside the subrequest budget. The
+ * nightly path rides the rollup's own read instead. Past it, `capped: true`.
+ */
+export const HEALTH_COLLECT_CAP = 200;
 /** Route-group counts are flushed from memory at most this often… */
 export const FLUSH_MS = 60_000;
 /** …or once this many requests are waiting. */
@@ -406,7 +411,8 @@ export const HEALTH_SQL = {
   days: "SELECT day, source, version, vault, subject, outcome, n FROM health_counters WHERE day IN (?, ?)",
   versions:
     "SELECT '' AS day, source, version, vault, subject, outcome, SUM(n) AS n FROM health_counters WHERE day >= ? GROUP BY source, version, vault, subject, outcome",
-  live: "SELECT source, version FROM health_versions v WHERE last_seen = (SELECT MAX(last_seen) FROM health_versions w WHERE w.source = v.source)",
+  // Oldest first: the last row per source wins, ties broken by the later label.
+  live: "SELECT source, version FROM health_versions ORDER BY last_seen, version",
 };
 
 /** The week the deploy window looks back over: `day` minus 7 through today. */

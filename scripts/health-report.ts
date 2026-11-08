@@ -3,7 +3,7 @@
  * The health report (T-411) from outside the worker: "did anything get worse
  * for any real user since yesterday, or since the last deploy?"
  *
- *   # From D1 directly — one SELECT, read-only (a sealed job's D1 key in
+ *   # From D1 directly — three SELECTs, read-only (a sealed job's D1 key in
  *   # CLOUDFLARE_API_TOKEN; works even when the identity worker is down):
  *   bun scripts/health-report.ts --d1 parachute-identity [--day YYYY-MM-DD] [--gate] [--json FILE]
  *   bun scripts/health-report.ts --d1 parachute-identity-staging --env staging
@@ -69,7 +69,11 @@ function dataFromD1(db: string): HealthData {
     if (out.status !== 0) {
       die(`wrangler d1 execute failed (exit ${out.status ?? "timeout"}): ${(out.stderr || out.stdout).split("\n").filter((l) => /error|✘/i.test(l)).slice(0, 3).join(" | ")}`);
     }
-    const parsed = JSON.parse(out.stdout.slice(out.stdout.indexOf("["))) as Array<{ results?: Array<Record<string, unknown>>; success?: boolean }>;
+    // wrangler --json prints the JSON array; anything before it (a banner, a
+    // "[WARNING]" line) is skipped by starting at the line that opens it.
+    const at = out.stdout.search(/^\[\s*$|^\[\s*\{/m);
+    if (at < 0) die("wrangler printed no JSON result");
+    const parsed = JSON.parse(out.stdout.slice(at)) as Array<{ results?: Array<Record<string, unknown>>; success?: boolean }>;
     if (!parsed[0]?.success) die("a SELECT did not succeed");
     return parsed[0].results ?? [];
   };

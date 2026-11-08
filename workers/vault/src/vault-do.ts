@@ -753,8 +753,17 @@ export class VaultDO extends DurableObject {
    * RPC, not a route: no request from the internet can reach it.
    */
   async recordRouterFailure(kind: string): Promise<void> {
-    if (this.destroyed) return;
+    // Usually a FRESH instance (the failing one was reset), so stateLoaded
+    // says nothing: count only for a vault that exists — a destroyed vault's
+    // storage was wiped, a never-created name has none — and must stay empty.
+    if (this.destroyed || !(await this.vaultExists())) return;
     await this.health.record("do", kind);
+  }
+
+  /** The vault has been materialized and not destroyed: its config is stored. */
+  private async vaultExists(): Promise<boolean> {
+    if (this.stateLoaded && this.config) return true;
+    return (await this.ctx.storage.get("config")) !== undefined;
   }
 
   /** The vault's health counter sink (T-411); see health.ts. */
@@ -1516,6 +1525,19 @@ export class VaultDO extends DurableObject {
   }
 
   /**
+   * GET /api/internal/health?since=YYYY-MM-DD (T-411) — this vault's health
+   * counters (health.ts) for each stored day from `since` on (default:
+   * yesterday), for the identity worker's on-demand collection (the nightly
+   * one rides GET /api/internal/config). Names and counts only.
+   */
+  private async handleInternalHealth(request: Request): Promise<Response> {
+    if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+    const since = new URL(request.url).searchParams.get("since") ?? utcDay(new Date(Date.now() - 86_400_000));
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) return json({ error: "since must be YYYY-MM-DD" }, 400);
+    return json({ version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since) });
+  }
+
+  /**
    * PUT/GET /api/internal/config — PLATFORM-owned per-vault config: the plan
    * entitlement the Identity Worker pushes on vault creation / plan change /
    * backfill. Fields (all OPTIONAL + independently applied):
@@ -1526,19 +1548,6 @@ export class VaultDO extends DurableObject {
    *   - `transcription: { enabled, minutes_limit }` — the voice entitlement.
    * Authorization: {@link internalForbidden} (already enforced by the dispatcher).
    */
-  /**
-   * GET /api/internal/health?since=YYYY-MM-DD (T-411) — this vault's health
-   * counters (health.ts) for each stored day from `since` on (default: two
-   * days back), for the identity worker's nightly collection. Names and
-   * counts only.
-   */
-  private async handleInternalHealth(request: Request): Promise<Response> {
-    if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
-    const since = new URL(request.url).searchParams.get("since") ?? utcDay(new Date(Date.now() - 2 * 86_400_000));
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) return json({ error: "since must be YYYY-MM-DD" }, 400);
-    return json({ version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since) });
-  }
-
   private async handleInternalConfig(request: Request): Promise<Response> {
     const shape = () => {
       const dbBytes = Number(this.raw().databaseSize);
@@ -3103,7 +3112,7 @@ export class VaultDO extends DurableObject {
       // An alarm that throws is retried by the platform; count each throw
       // (T-411). Successful wakes are not counted: they are frequent and the
       // report only needs the failures here.
-      if (!this.destroyed) await this.health.record("alarm", `exception:${errorClass(err)}`);
+      if (!this.destroyed && (await this.vaultExists())) await this.health.record("alarm", `exception:${errorClass(err)}`);
       throw err;
     }
   }

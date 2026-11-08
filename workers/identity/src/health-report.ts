@@ -15,9 +15,10 @@
  * AT TWO LEVELS:
  *   - per cell = (worker, vault or connector, subject) — a vault shows as
  *     `v:<8 hex>` (SHA-256 of its opaque id), a connector as its class;
- *   - fleet = the vault worker's cells summed over every vault, per subject —
- *     what catches an outage spread thin (every vault's requests turning into
- *     401s at once) that no single vault has the traffic to show.
+ *   - fleet = the vault worker's cells over every vault, per subject — what
+ *     catches an outage spread thin (every vault's requests turning into 401s
+ *     at once; one new 500 on each of many vaults) that no single vault has
+ *     the traffic to show.
  *
  * OUTCOME CLASSES: ok (2xx, 3xx, ok), server (5xx*, exception:*, the DO's CPU
  * or memory limit, an overload, an opaque platform error, a failed backup or
@@ -35,12 +36,15 @@
  *      vault, 401/403/404 are left out (a stranger can make those on any
  *      vault whose name they know); at fleet level and for identity's own
  *      routes and connectors they count — that is the "tokens broke" signal;
- *   4. stopped working — ok before (≥ 3 per cell, ≥ 10 fleet-wide), none now,
- *      and at least 3 failures now. A 404 is never a failure here; per vault
- *      a 401 is not either, at fleet level it is.
- * At fleet level, a 401/403/404 rise and "stopped working" must also be
- * SPREAD: seen on at least 3 vaults, or a quarter of the vaults seen — so a
- * stranger flooding one vault can't raise a fleet alert.
+ *   4. stopped working — ok before (≥ 3), none now, and at least 3 failures
+ *      now. A 404 is never a failure here; per vault a 401 is not either.
+ * At fleet level (the vault worker, per subject, over every vault) the same
+ * questions are asked of VAULTS, not of summed requests: new server errors on
+ * vaults that had none (beyond those already reported one by one), a client
+ * reason — 401 included — whose share rose on each vault, vaults that stopped
+ * working. Each needs at least 3 vaults or a tenth of the vaults seen, so a
+ * stranger flooding one vault never makes a fleet finding, and a breakage too
+ * thin for any one vault (one new 500 on each of 100 vaults) still does.
  * Server errors below rule 1's bar, or present both times and not rising,
  * are listed as "other server errors" — shown, never counted as worse.
  *
@@ -92,6 +96,8 @@ export interface Finding {
   source: string;
   subject: string;
   kind: FindingKind;
+  /** For a client reason: which outcome rose. Part of a finding's identity. */
+  reason?: string;
   /** One plain line: what changed, with the numbers. */
   detail: string;
 }
@@ -128,60 +134,46 @@ const CLIENT_BASELINE = 20;
 const CLIENT_MIN = 5;
 const CLIENT_MIN_POINTS = 0.1;
 const STOPPED_OK_BEFORE = 3;
-const STOPPED_OK_BEFORE_FLEET = 10;
 const STOPPED_FAILURES = 3;
 /** Left out per vault: a stranger can produce these on any vault whose name they know. */
 const STRANGER_REASONS = new Set(["4xx:401", "4xx:403", "4xx:404"]);
 const FLEET_MIN_VAULTS = 3;
-const FLEET_MIN_SHARE = 0.25;
+const FLEET_MIN_SHARE = 0.1;
 
 interface Tally {
   total: number;
   ok: number;
   server: number;
   byOutcome: Map<string, number>;
-  /** Fleet level: the vaults behind the cell, and behind each outcome. */
-  vaults: Set<string>;
-  vaultsByOutcome: Map<string, Set<string>>;
 }
 
 function emptyTally(): Tally {
-  return { total: 0, ok: 0, server: 0, byOutcome: new Map(), vaults: new Set(), vaultsByOutcome: new Map() };
+  return { total: 0, ok: 0, server: 0, byOutcome: new Map() };
 }
 
-function add(t: Tally, outcome: string, n: number, vault: string): void {
+function add(t: Tally, outcome: string, n: number): void {
   t.total += n;
   const cls = outcomeClass(outcome);
   if (cls === "ok") t.ok += n;
   if (cls === "server") t.server += n;
   t.byOutcome.set(outcome, (t.byOutcome.get(outcome) ?? 0) + n);
-  t.vaults.add(vault);
-  let vs = t.vaultsByOutcome.get(outcome);
-  if (!vs) t.vaultsByOutcome.set(outcome, (vs = new Set()));
-  vs.add(vault);
 }
 
-/**
- * Fleet level: a stranger can flood ONE vault they know the name of, so a
- * fleet-wide 401/403/404 rise or a fleet-wide "stopped working" must show on
- * several vaults — at least 3, or a quarter of the vaults seen, whichever is
- * more (an outage of the token keys reaches every vault in use).
- */
-function spread(vaultsWith: number, vaultsSeen: number): boolean {
-  return vaultsWith >= Math.max(FLEET_MIN_VAULTS, Math.ceil(FLEET_MIN_SHARE * vaultsSeen));
-}
-
-/** Cells keyed `source\0vault\0subject`; `fleet` sums the vault worker's cells over vaults. */
-function tally(rows: HealthRow[], fleet: boolean): Map<string, Tally> {
+/** Cells keyed `source\0vault\0subject`. */
+function tally(rows: HealthRow[]): Map<string, Tally> {
   const out = new Map<string, Tally>();
   for (const r of rows) {
-    if (fleet && (r.source !== "vault" || r.vault === "-")) continue;
-    const key = `${r.source}\u0000${fleet ? "*" : r.vault}\u0000${r.subject}`;
+    const key = `${r.source}\u0000${r.vault}\u0000${r.subject}`;
     let t = out.get(key);
     if (!t) out.set(key, (t = emptyTally()));
-    add(t, r.outcome, r.n, r.vault);
+    add(t, r.outcome, r.n);
   }
   return out;
+}
+
+/** Enough vaults for a fleet finding: at least 3, or a tenth of the vaults seen, whichever is more. */
+function spread(vaults: number, vaultsSeen: number): boolean {
+  return vaults >= Math.max(FLEET_MIN_VAULTS, Math.ceil(FLEET_MIN_SHARE * vaultsSeen));
 }
 
 const pct = (a: number, b: number) => (b === 0 ? 0 : a / b);
@@ -200,67 +192,122 @@ interface Compared {
   other: Finding[];
 }
 
-/** Apply the rules to one window at one level. */
+/** Did `outcome`'s share of this cell rise the way rule 3 means (≥ 2× and ≥ +10 points)? */
+function shareRose(ta: Tally, tb: Tally, outcome: string): boolean {
+  const na = ta.byOutcome.get(outcome) ?? 0;
+  if (na === 0) return false;
+  const ra = pct(na, ta.total);
+  const rb = pct(tb.byOutcome.get(outcome) ?? 0, tb.total);
+  return ra >= 2 * rb && ra - rb >= CLIENT_MIN_POINTS;
+}
+
+type Base = Omit<Finding, "kind" | "detail">;
+
+/** Rules 1–4 on one cell (a vault, a connector, an identity route). */
+function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLabel: string, out: Compared): void {
+  const rateA = pct(ta.server, ta.total);
+  const rateB = pct(tb.server, tb.total);
+  if (ta.server > 0 && tb.server === 0 && (ta.server >= NEW_SERVER_MIN || rateA >= NEW_SERVER_MIN_RATE)) {
+    out.worse.push({ ...base, kind: "new_server_errors", detail: `new server errors: ${serverReasons(ta)} of ${ta.total} (none ${beforeLabel}, of ${tb.total})` });
+  } else if (ta.server >= UP_MIN && rateA >= 2 * rateB && rateA - rateB >= UP_MIN_POINTS) {
+    out.worse.push({ ...base, kind: "server_errors_up", detail: `server errors up: ${fmtPct(rateA)} now (${serverReasons(ta)}), ${fmtPct(rateB)} ${beforeLabel}` });
+  } else if (ta.server > 0) {
+    out.other.push({ ...base, kind: "other_server_errors", detail: `${serverReasons(ta)} of ${ta.total} (${tb.server} of ${tb.total} ${beforeLabel})` });
+  }
+  if (tb.total >= CLIENT_BASELINE) {
+    for (const [outcome, na] of ta.byOutcome) {
+      if (outcomeClass(outcome) !== "client" || na < CLIENT_MIN) continue;
+      if (perVault && STRANGER_REASONS.has(outcome)) continue;
+      if (shareRose(ta, tb, outcome)) {
+        const ra = pct(na, ta.total);
+        const rb = pct(tb.byOutcome.get(outcome) ?? 0, tb.total);
+        out.worse.push({ ...base, kind: "client_reason_up", reason: outcome, detail: `${outcome} up: ${na} of ${ta.total} (${fmtPct(ra)}) vs ${fmtPct(rb)} ${beforeLabel}` });
+      }
+    }
+  }
+  const notFailures = (ta.byOutcome.get("4xx:404") ?? 0) + (perVault ? (ta.byOutcome.get("4xx:401") ?? 0) : 0);
+  if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && ta.total - ta.ok - notFailures >= STOPPED_FAILURES) {
+    out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${tb.ok} ok ${beforeLabel})` });
+  }
+}
+
+/**
+ * The fleet level: per (vault worker, subject), over every vault — for what is
+ * spread too thin for any one vault to show. Every fleet rule needs the change
+ * on several vaults ({@link spread}), counted from each vault's OWN cells, so
+ * a stranger flooding one vault never makes a fleet finding:
+ *   - new server errors on vaults that had none, beyond the vaults already
+ *     reported one by one (rule 1 at fleet level);
+ *   - a client reason whose share rose on each of those vaults (rule 3; 401s
+ *     included — the "tokens broke" signal);
+ *   - vaults that worked before and have no ok at all now (rule 4; a 401 is
+ *     a failure here, a 404 never).
+ */
+function fleetRules(
+  window: "day" | "deploy",
+  a: Map<string, Tally>,
+  b: Map<string, Tally>,
+  flaggedServer: Set<string>,
+  beforeLabel: string,
+  out: Compared,
+): void {
+  const groups = new Map<string, Array<{ key: string; ta: Tally; tb: Tally }>>();
+  const seenVaults = new Set<string>();
+  for (const [key, ta] of a) {
+    const [source, vault, subject] = key.split("\u0000") as [string, string, string];
+    if (source !== "vault" || vault === "-") continue;
+    seenVaults.add(vault);
+    const g = `${source}\u0000${subject}`;
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g)!.push({ key, ta, tb: b.get(key) ?? emptyTally() });
+  }
+  const enough = (n: number) => spread(n, seenVaults.size);
+  for (const [g, cells] of groups) {
+    const [source, subject] = g.split("\u0000") as [string, string];
+    const base = { window, who: "all vaults", source, subject };
+    const fresh = cells.filter((c) => c.ta.server > 0 && c.tb.server === 0 && !flaggedServer.has(c.key));
+    if (enough(fresh.length)) {
+      const n = fresh.reduce((s, c) => s + c.ta.server, 0);
+      out.worse.push({ ...base, kind: "new_server_errors", detail: `new server errors on ${fresh.length} vaults (${n} in all; none ${beforeLabel})` });
+    }
+    const reasons = new Set(cells.flatMap((c) => [...c.ta.byOutcome.keys()].filter((o) => outcomeClass(o) === "client")));
+    for (const outcome of reasons) {
+      const rose = cells.filter((c) => shareRose(c.ta, c.tb, outcome));
+      const na = rose.reduce((s, c) => s + (c.ta.byOutcome.get(outcome) ?? 0), 0);
+      if (enough(rose.length) && na >= CLIENT_MIN) {
+        out.worse.push({ ...base, kind: "client_reason_up", reason: outcome, detail: `${outcome} up on ${rose.length} vaults (${na} in all, far fewer ${beforeLabel})` });
+      }
+    }
+    const stopped = cells.filter((c) => {
+      const failed = c.ta.total - c.ta.ok - (c.ta.byOutcome.get("4xx:404") ?? 0);
+      return c.tb.ok > 0 && c.ta.ok === 0 && failed > 0;
+    });
+    if (enough(stopped.length)) {
+      out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${stopped.length} vaults that worked ${beforeLabel}` });
+    }
+  }
+}
+
+/** Apply every rule to one window: each cell, then the fleet. */
 function compare(
   window: "day" | "deploy",
   before: HealthRow[],
   after: HealthRow[],
-  level: "cell" | "fleet",
   who: (vault: string, subject: string) => string,
   beforeLabel: string,
 ): Compared {
-  const fleet = level === "fleet";
-  const b = tally(before, fleet);
-  const a = tally(after, fleet);
-  const worse: Finding[] = [];
-  const other: Finding[] = [];
+  const a = tally(after);
+  const b = tally(before);
+  const out: Compared = { worse: [], other: [] };
+  const flaggedServer = new Set<string>();
   for (const [key, ta] of a) {
     const [source, vault, subject] = key.split("\u0000") as [string, string, string];
-    const tb = b.get(key) ?? emptyTally();
-    const base = { window, who: fleet ? "all vaults" : who(vault, subject), source, subject };
-    // A vault cell is the one place strangers can reach by name.
-    const perVault = !fleet && vault !== "-";
-
-    // Server rules: per cell only (the fleet sum of the same errors adds nothing).
-    if (!fleet) {
-      const rateA = pct(ta.server, ta.total);
-      const rateB = pct(tb.server, tb.total);
-      if (ta.server > 0 && tb.server === 0 && (ta.server >= NEW_SERVER_MIN || rateA >= NEW_SERVER_MIN_RATE)) {
-        worse.push({ ...base, kind: "new_server_errors", detail: `new server errors: ${serverReasons(ta)} of ${ta.total} (none ${beforeLabel}, of ${tb.total})` });
-      } else if (ta.server >= UP_MIN && rateA >= 2 * rateB && rateA - rateB >= UP_MIN_POINTS) {
-        worse.push({ ...base, kind: "server_errors_up", detail: `server errors up: ${fmtPct(rateA)} now (${serverReasons(ta)}), ${fmtPct(rateB)} ${beforeLabel}` });
-      } else if (ta.server > 0) {
-        other.push({ ...base, kind: "other_server_errors", detail: `${serverReasons(ta)} of ${ta.total} (${tb.server} of ${tb.total} ${beforeLabel})` });
-      }
-    }
-
-    // Rule 3: a client reason up, against a real baseline.
-    if (tb.total >= CLIENT_BASELINE) {
-      for (const [outcome, na] of ta.byOutcome) {
-        if (outcomeClass(outcome) !== "client" || na < CLIENT_MIN) continue;
-        if (perVault && STRANGER_REASONS.has(outcome)) continue;
-        if (fleet && STRANGER_REASONS.has(outcome) && !spread(ta.vaultsByOutcome.get(outcome)?.size ?? 0, ta.vaults.size)) continue;
-        const ra = pct(na, ta.total);
-        const rb = pct(tb.byOutcome.get(outcome) ?? 0, tb.total);
-        if (ra >= 2 * rb && ra - rb >= CLIENT_MIN_POINTS) {
-          worse.push({ ...base, kind: "client_reason_up", detail: `${outcome} up: ${na} of ${ta.total} (${fmtPct(ra)}) vs ${fmtPct(rb)} ${beforeLabel}` });
-        }
-      }
-    }
-
-    // Rule 4: stopped working.
-    const not404 = ta.byOutcome.get("4xx:404") ?? 0;
-    const not401 = perVault ? (ta.byOutcome.get("4xx:401") ?? 0) : 0;
-    const failedA = ta.total - ta.ok - not404 - not401;
-    const okBefore = fleet ? STOPPED_OK_BEFORE_FLEET : STOPPED_OK_BEFORE;
-    const failingVaults = fleet
-      ? new Set([...ta.vaultsByOutcome].filter(([o]) => outcomeClass(o) !== "ok" && o !== "4xx:404").flatMap(([, vs]) => [...vs])).size
-      : 1;
-    if (tb.ok >= okBefore && ta.ok === 0 && failedA >= STOPPED_FAILURES && (!fleet || spread(failingVaults, ta.vaults.size))) {
-      worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${tb.ok} ok ${beforeLabel})` });
-    }
+    const n = out.worse.length;
+    cellRules({ window, who: who(vault, subject), source, subject }, ta, b.get(key) ?? emptyTally(), vault !== "-", beforeLabel, out);
+    if (out.worse.slice(n).some((f) => f.kind === "new_server_errors" || f.kind === "server_errors_up")) flaggedServer.add(key);
   }
-  return { worse, other };
+  fleetRules(window, a, b, flaggedServer, beforeLabel, out);
+  return out;
 }
 
 /** How a vault appears in the report: `v:` + 8 hex of SHA-256 over its opaque id. */
@@ -293,7 +340,7 @@ function summarize(label: string, beforeL: string, afterL: string, before: Healt
 
 /** Merge, keeping one finding per (who, subject, kind, reason) across windows and levels. */
 function addAll(into: Compared, from: Compared): void {
-  const id = (f: Finding) => `${f.who}|${f.subject}|${f.kind}|${f.detail.split(":")[0]}`;
+  const id = (f: Finding) => `${f.who}|${f.subject}|${f.kind}|${f.reason ?? ""}`;
   const seen = new Set(into.worse.map(id));
   for (const f of from.worse) {
     if (!seen.has(id(f))) {
@@ -327,8 +374,7 @@ export async function buildHealthReport(data: HealthData, opts: { day: string; e
   const dayAfter = data.days.filter((r) => r.day === day);
   const dayBefore = data.days.filter((r) => r.day === prior);
   const result: Compared = { worse: [], other: [] };
-  addAll(result, compare("day", dayBefore, dayAfter, "cell", who, `on ${prior}`));
-  addAll(result, compare("day", dayBefore, dayAfter, "fleet", who, `on ${prior}`));
+  addAll(result, compare("day", dayBefore, dayAfter, who, `on ${prior}`));
   const windows: HealthReport["windows"] = { day: summarize("day", prior, day, dayBefore, dayAfter), deploy: [] };
 
   // 2. Since the last deploy, per worker.
@@ -342,11 +388,7 @@ export async function buildHealthReport(data: HealthData, opts: { day: string; e
     const after = mine.filter((r) => r.version === current);
     const before = mine.filter((r) => r.version === previous);
     const label = previous > current ? "on the version rolled back from" : "before the deploy";
-    const cells = compare("deploy", before, after, "cell", who, label);
-    const fleetWide = compare("deploy", before, after, "fleet", who, label);
-    // Only the vault worker's deploy window carries vault cells; identity's carries its routes and connectors.
-    addAll(result, cells);
-    addAll(result, fleetWide);
+    addAll(result, compare("deploy", before, after, who, label));
     windows.deploy.push(summarize(`${source} deploy`, previous, current, before, after));
   }
 

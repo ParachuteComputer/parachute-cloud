@@ -39,7 +39,7 @@ import { buildVaultProjection, attachmentsInstructionBlock } from "@openparachut
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
-import { errorClass } from "./health.js";
+import { errorClass, toolErrorOutcome } from "./health.js";
 
 // Transcribed from the SDK's types.js so negotiation matches byte-for-byte.
 const LATEST_PROTOCOL_VERSION = "2025-11-25";
@@ -634,11 +634,8 @@ async function handleToolCall(
   } catch (err) {
     const domain = mapDomainError(err);
     const message = err instanceof Error ? err.message : "Unknown error";
-    // A plain Error is how the engine refuses a bad call (a validation
-    // message): `tool_error`. Any other class (TypeError, a SQLite error, …)
-    // is a bug or a platform fault: `exception:<class>`. Never the message.
-    const cls = errorClass(err);
-    await record(subject, domain ? `domain:${domain.code}` : cls === "error" ? "tool_error" : `exception:${cls}`);
+    // Never the message: the error's class decides (health.ts toolErrorOutcome).
+    await record(subject, domain ? `domain:${domain.code}` : toolErrorOutcome(err));
     if (domain) return rpcError(id, domain.code, message, domain.data);
     return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
   }

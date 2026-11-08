@@ -497,7 +497,7 @@ app.post("/__test/usage-run", async (c) => {
 app.post("/__test/health-collect", async (c) => {
   const deps = depsFor(c.env);
   if (!deps.exposeDevLinks) return c.notFound();
-  const only = c.req.queries("vault")?.slice(0, 100) ?? [];
+  const only = c.req.queries("vault")?.slice(0, 99) ?? [];
   if (only.length === 0) return c.json({ error: "name at least one ?vault=" }, 400);
   return c.json(await collectVaultHealth(c.env, deps, { onlyVaults: only }));
 });
@@ -554,12 +554,13 @@ app.get("/ops/health", async (c) => (await handleOpsHealthGet(c.env, c.req.raw))
 
 // Collect every vault's health counters NOW (normally the 03:30 rollup does
 // it), e.g. right after a deploy: bearer OPS_RUN_TOKEN. Optional repeated
-// ?vault=<name> narrows it (at most 100). Counts only in the answer.
+// ?vault=<name> narrows it (at most 99: with the LIMIT, D1's 100-parameter
+// cap). Counts only in the answer.
 app.post("/ops/health/collect", async (c) => {
   const refused = await opsBearerRefusal(c.env.OPS_RUN_TOKEN, c.req.raw);
   if (refused === null) return c.notFound();
   if (refused) return refused;
-  const only = c.req.queries("vault")?.slice(0, 100);
+  const only = c.req.queries("vault")?.slice(0, 99);
   return c.json(await collectVaultHealth(c.env, depsFor(c.env), only?.length ? { onlyVaults: only } : {}));
 });
 
@@ -772,9 +773,13 @@ async function fetchWithOpsCounters(req: Request, env?: Env | {}, ctx?: Executio
   const healthNotes = takeHealthNotes(req);
   if (db && (group || healthNotes.length)) {
     const outcome = res.status >= 500 && !countsAs5xx(req, res.status, e) ? `backstop:${res.status}` : httpOutcome(res.status);
-    const flush = group ? bufferHealth(e, [{ subject: `http:${group}`, outcome }]) : null;
+    // A server error is rare and must not wait in a buffer an evicted isolate
+    // could lose: it is written now, with the handler's notes.
+    const serverError = outcome.startsWith("5xx");
+    const flush = group && !serverError ? bufferHealth(e, [{ subject: `http:${group}`, outcome }]) : null;
     const write = (async () => {
-      const items: Array<{ vault?: string; subject: string; outcome: string }> = [];
+      const items: Array<{ vault?: string; subject: string; outcome: string }> =
+        group && serverError ? [{ subject: `http:${group}`, outcome }] : [];
       for (const note of healthNotes) {
         try {
           items.push(...(await note(e as Env)));

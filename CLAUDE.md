@@ -24,7 +24,7 @@ bun scripts/smoke-staging.ts        # FULL live smoke vs staging (creates test d
 bash scripts/deploy-prod.sh         # deploy both workers top-level + migrate (NO seed)
 bun scripts/smoke-prod.ts           # READ-ONLY live checks vs production
 bun scripts/smoke-health-staging.ts # health report proof vs staging: a planted 500 is caught, a healthy vault stays quiet
-bun scripts/health-report.ts --d1 parachute-identity [--gate]   # "did anything get worse?" (one D1 SELECT; deploy-prod.sh gates on it)
+bun scripts/health-report.ts --d1 parachute-identity [--gate]   # "did anything get worse?" (read-only D1 SELECTs; deploy-prod.sh gates on it)
 ```
 
 ## Load-bearing gotchas

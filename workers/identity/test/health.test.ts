@@ -141,6 +141,41 @@ describe("the report rules", () => {
     expect(r.worse.every((f) => f.who === "all vaults")).toBe(true);
   });
 
+  test("a stranger flooding one vault while every vault has its usual few 401s raises nothing", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 12; i++) {
+      for (const day of [PRIOR, DAY]) {
+        rows.push(row({ vault: `v${i}`, day, subject: "http:mcp", outcome: "2xx", n: 100 }));
+        rows.push(row({ vault: `v${i}`, day, subject: "http:mcp", outcome: "4xx:401", n: 3 }));
+      }
+    }
+    rows.push(row({ vault: "v0", subject: "http:mcp", outcome: "4xx:401", n: 300 }));
+    expect((await report(rows)).worse).toEqual([]);
+  });
+
+  test("one new 500 on each of 100 vaults is too thin for any vault, and caught at fleet level", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 100; i++) {
+      rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:notes", outcome: "2xx", n: 50 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:notes", outcome: "2xx", n: 49 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:notes", outcome: "5xx:500", n: 1 }));
+    }
+    const r = await report(rows);
+    expect(r.worse).toMatchObject([{ who: "all vaults", subject: "http:notes", kind: "new_server_errors" }]);
+    expect(r.worse[0]!.detail).toContain("on 100 vaults");
+  });
+
+  test("two different reasons rising in one cell are two findings", async () => {
+    const id = (p: Partial<HealthRow> & { subject: string; outcome: string; n: number }) => row({ source: "identity", vault: "-", ...p });
+    const r = await report([
+      id({ day: PRIOR, subject: "http:account", outcome: "2xx", n: 100 }),
+      id({ subject: "http:account", outcome: "2xx", n: 40 }),
+      id({ subject: "http:account", outcome: "4xx:400", n: 30 }),
+      id({ subject: "http:account", outcome: "4xx:429", n: 30 }),
+    ]);
+    expect(r.worse.map((f) => f.reason).sort()).toEqual(["4xx:400", "4xx:429"]);
+  });
+
   test("a client reason on identity's own routes counts against a real baseline, and not without one", async () => {
     const id = (p: Partial<HealthRow> & { subject: string; outcome: string; n: number }) => row({ source: "identity", vault: "-", ...p });
     const withBase = await report([
@@ -413,6 +448,17 @@ describe("the doors", () => {
     const body = (await ok.json()) as { day: string; text: string };
     expect(body.day).toBe(DAY);
     expect(body.text).toContain("health");
+  });
+
+  test("a full list of vault names stays inside D1's bound-parameter cap", async () => {
+    const names = Array.from({ length: 150 }, (_, i) => `vault=n${i}`).join("&");
+    const res = await worker.fetch(
+      new Request(`${ISSUER}/__test/health-collect?${names}`, { method: "POST" }),
+      { ...env, ENVIRONMENT: "staging" } as Env,
+      createExecutionContext(),
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { vaults: number }).vaults).toBe(0);
   });
 
   test("the staging hooks 404 in production", async () => {

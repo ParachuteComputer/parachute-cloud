@@ -13,7 +13,7 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
-import { HEALTH_KEEP_DAYS, HEALTH_MAX_KEYS, HealthSink, OVERFLOW_KEY, OVERFLOW_SERVER_KEY, responseOutcome, routeOf, routerFailureKind, utcDay } from "../src/health.ts";
+import { HEALTH_KEEP_DAYS, HEALTH_MAX_KEYS, HealthSink, OVERFLOW_KEY, OVERFLOW_SERVER_KEY, responseOutcome, routeOf, routerFailureKind, toolErrorOutcome, utcDay } from "../src/health.ts";
 import { base, createNote, freshVault, mintToken, op } from "./helpers.ts";
 
 type Days = Record<string, Record<string, Record<string, number>>>;
@@ -143,6 +143,17 @@ describe("health counters — what a vault's requests leave behind", () => {
     expect(body.health.days[utcDay(new Date())]![version]!["http:notes|2xx"]).toBe(1);
   });
 
+  it("a router-observed failure is counted on a vault that exists, and never creates storage for one that doesn't", async () => {
+    const v = freshVault("hx");
+    await createNote(v, { content: "x" });
+    await (doStub(v) as unknown as { recordRouterFailure(k: string): Promise<void> }).recordRouterFailure("cpu_limit");
+    expect((await counters(v))["do|cpu_limit"]).toBe(1);
+    const ghost = freshVault("hg");
+    await (doStub(ghost) as unknown as { recordRouterFailure(k: string): Promise<void> }).recordRouterFailure("cpu_limit");
+    const keys = await runInDurableObject(doStub(ghost), async (_inst, state) => [...(await state.storage.list()).keys()]);
+    expect(keys).toEqual([]);
+  });
+
   it("a destroyed vault keeps no counters, and later requests add none", async () => {
     const v = freshVault("hd");
     await createNote(v, { content: "x" });
@@ -184,12 +195,22 @@ describe("health sink — bounds", () => {
     expect(c[OVERFLOW_KEY]).toBe(1);
   });
 
+  it("a tool's thrown error is a client mistake unless it is a runtime, storage or infrastructure fault", () => {
+    class QueryError extends Error {}
+    class EmbeddingError extends Error {}
+    expect(toolErrorOutcome(new Error("bad arg"))).toBe("tool_error");
+    expect(toolErrorOutcome(new QueryError("bad query"))).toBe("error:queryerror");
+    expect(toolErrorOutcome(new TypeError("x is undefined"))).toBe("exception:typeerror");
+    expect(toolErrorOutcome(new EmbeddingError("ai down"))).toBe("exception:embeddingerror");
+  });
+
   it("by-design 503s are named by their type; any other 503 stays a server error", async () => {
     const j = (body: unknown, status = 503) => Response.json(body, { status });
     expect(await responseOutcome(j({ error_type: "import_in_progress" }))).toBe("busy:import_in_progress");
     expect(await responseOutcome(j({ error_type: "vault_busy" }))).toBe("busy:vault_busy");
     expect(await responseOutcome(j({ code: "SUBSCRIPTION_CAP_REACHED" }))).toBe("busy:subscription_cap_reached");
-    expect(await responseOutcome(j({ error_type: "semantic_unavailable" }))).toBe("busy:semantic_unavailable");
+    // With embeddings on, semantic_unavailable means the embed call failed: a server error.
+    expect(await responseOutcome(j({ error_type: "semantic_unavailable" }))).toBe("5xx:503");
     expect(await responseOutcome(j({ error: "something else" }))).toBe("5xx:503");
     expect(await responseOutcome(new Response("x", { status: 503 }))).toBe("5xx:503");
     expect(await responseOutcome(j({ ok: true }, 200))).toBe("2xx");

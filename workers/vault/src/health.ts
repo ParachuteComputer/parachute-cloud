@@ -31,7 +31,13 @@
  */
 
 export const HEALTH_PREFIX = "health:";
-export const HEALTH_KEEP_DAYS = 35;
+/**
+ * Days a vault keeps its own counts. They only wait here for the nightly copy
+ * into identity's D1 (which keeps 35 days), and DO key-value storage counts
+ * toward the vault's own databaseSize — the number its notes cap meters — so
+ * the vault keeps a week, a few KB, not a month.
+ */
+export const HEALTH_KEEP_DAYS = 7;
 /** Distinct keys a single vault may hold for one day, across versions. */
 export const HEALTH_MAX_KEYS = 200;
 export const OVERFLOW_KEY = "overflow|dropped";
@@ -54,7 +60,40 @@ const PLATFORM_KINDS = new Set(["cpu_limit", "memory_limit", "overloaded", "plat
  * (`busy:<type>`) instead of counted as server errors; any other 503 stays
  * `5xx:503`.
  */
-const BY_DESIGN_503 = new Set(["import_in_progress", "vault_busy", "subscription_cap_reached", "semantic_unavailable"]);
+// semantic_unavailable is NOT here: with embeddings on (both deployed configs),
+// it means the Workers AI embed call failed, which is a server-side fault.
+const BY_DESIGN_503 = new Set(["import_in_progress", "vault_busy", "subscription_cap_reached"]);
+
+/**
+ * How an MCP tool call that threw is counted. A plain Error is how the engine
+ * refuses a bad call (`tool_error`). The engine's own named refusals
+ * (QueryError, SchemaValidationError, PreconditionRequiredError, …) are the
+ * caller's mistake too: `error:<class>`, client class. JavaScript's own
+ * runtime errors, SQLite/D1 errors and the engine's infrastructure failures
+ * are faults: `exception:<class>`, server class.
+ */
+export function toolErrorOutcome(err: unknown): string {
+  const cls = errorClass(err);
+  if (cls === "error") return "tool_error";
+  if (SERVER_ERROR_CLASSES.has(cls) || /sqlite|d1/.test(cls)) return `exception:${cls}`;
+  return `error:${cls}`;
+}
+const SERVER_ERROR_CLASSES = new Set([
+  "typeerror",
+  "rangeerror",
+  "referenceerror",
+  "syntaxerror",
+  "evalerror",
+  "urierror",
+  "aggregateerror",
+  "internalerror",
+  "embeddingerror",
+  "transcriptionerror",
+  "historyunrecoverableerror",
+  "importedhistoryunrecoverableerror",
+  "historydeltaorphanerror",
+  "newerschemaerror",
+]);
 
 /** {@link httpOutcome}, but a by-design 503 is named by its own error type (read from a clone). */
 export async function responseOutcome(res: Response): Promise<string> {
@@ -200,7 +239,12 @@ export class HealthSink {
         key = isServerOutcome(clean(outcome)) ? OVERFLOW_SERVER_KEY : OVERFLOW_KEY;
       }
       v[key] = (v[key] ?? 0) + by;
-      await this.storage.put(HEALTH_PREFIX + day, counters);
+      // Not awaited: the object's output gate still holds the response until
+      // the write is durable, and puts made in the same turn (an MCP call's
+      // request + tool counts) coalesce into one write.
+      this.storage.put(HEALTH_PREFIX + day, counters).catch((err) => {
+        console.warn(`event=health_record_failed error=${errorClass(err)}`);
+      });
       if (this.prunedFor !== day) {
         this.prunedFor = day;
         await this.prune(day);
