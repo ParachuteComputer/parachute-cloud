@@ -68,12 +68,18 @@ cd "$ROOT/workers/identity"
 # 03:30 UTC rollup, or sooner with POST /ops/health/collect (bearer
 # OPS_RUN_TOKEN) — so a vault problem from a deploy earlier today shows in
 # tomorrow's daily line, not necessarily here.
+# --public: this repo and its workflow logs are public, so the gate prints only
+# the verdict and counts ("health: ok" / "health: worse: N vaults, M rules"),
+# never vault hashes, route or tool names, labels or traffic. To see what got
+# worse, run the full report where only we read it:
+#   bun scripts/health-report.ts --d1 parachute-identity
 set +e
-(cd "$ROOT" && bun scripts/health-report.ts --d1 parachute-identity --gate)
+(cd "$ROOT" && bun scripts/health-report.ts --d1 parachute-identity --gate --public)
 HEALTH_RC=$?
 set -e
 if [ "$HEALTH_RC" = 3 ] && [ "${HEALTH_GATE:-}" != "ack" ]; then
-  echo "STOP: the health report shows something worse for users (above). Look first;" \
+  echo "STOP: the health report shows something worse for users (above). Look first" \
+       "(bun scripts/health-report.ts --d1 parachute-identity, not in this public log);" \
        "if this deploy is the fix, re-run with HEALTH_GATE=ack." >&2
   exit 1
 elif [ "$HEALTH_RC" != 0 ] && [ "$HEALTH_RC" != 3 ]; then

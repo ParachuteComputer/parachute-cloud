@@ -5,7 +5,7 @@
  *
  *   # From D1 directly — three SELECTs, read-only (a sealed job's D1 key in
  *   # CLOUDFLARE_API_TOKEN; works even when the identity worker is down):
- *   bun scripts/health-report.ts --d1 parachute-identity [--day YYYY-MM-DD] [--gate] [--json FILE]
+ *   bun scripts/health-report.ts --d1 parachute-identity [--day YYYY-MM-DD] [--gate] [--public] [--json FILE]
  *   bun scripts/health-report.ts --d1 parachute-identity-staging --env staging
  *   bun scripts/health-report.ts --d1 parachute-identity-staging --env staging --local DIR   # wrangler dev state
  *
@@ -16,13 +16,15 @@
  * the same three SELECTs (health-counters.ts HEALTH_SQL). Prints the plain report. --json writes the full report
  * (findings, windows) to FILE. --gate exits 3 when anything got worse, so a
  * deploy job can stop on it. Counts and vault hashes only: nothing here can
- * name a person or a vault.
+ * name a person or a vault. --public prints only the verdict ("health: ok" or
+ * "health: worse: N vaults, M rules") for a log anyone can read (deploy-prod.sh
+ * in this public repo): no hashes, route or tool names, labels or traffic.
  */
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildHealthReport, prevDay, type HealthData, type HealthReport, type HealthRow } from "../workers/identity/src/health-report.ts";
+import { buildHealthReport, prevDay, publicVerdict, type HealthData, type HealthReport, type HealthRow } from "../workers/identity/src/health-report.ts";
 import { HEALTH_SQL, weekStart } from "../workers/identity/src/health-counters.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -94,6 +96,8 @@ async function fromUrl(base: string, tokenFile: string): Promise<HealthReport> {
   return (await res.json()) as HealthReport;
 }
 
+const PUBLIC = process.argv.includes("--public");
+
 async function main(): Promise<void> {
   const d1 = arg("--d1");
   const url = arg("--url");
@@ -102,13 +106,13 @@ async function main(): Promise<void> {
     const data = dataFromD1(d1);
     const environment = arg("--env") ?? (arg("--local") ? "local" : "production");
     report = await buildHealthReport(data, { day, environment });
-    console.error(`(${data.days.length} day rows, ${data.versions.length} version rows since ${weekStart(day)})`);
+    if (!PUBLIC) console.error(`(${data.days.length} day rows, ${data.versions.length} version rows since ${weekStart(day)})`);
   } else if (url) {
     report = await fromUrl(url, arg("--token-file") ?? die("--url needs --token-file"));
   } else {
-    die("usage: health-report.ts --d1 <database> [--env staging] [--local DIR] | --url <issuer> --token-file <file>  [--day YYYY-MM-DD] [--gate] [--json FILE]");
+    die("usage: health-report.ts --d1 <database> [--env staging] [--local DIR] | --url <issuer> --token-file <file>  [--day YYYY-MM-DD] [--gate] [--public] [--json FILE]");
   }
-  console.log(report.text);
+  console.log(PUBLIC ? publicVerdict(report) : report.text);
   const jsonOut = arg("--json");
   if (jsonOut) writeFileSync(jsonOut, JSON.stringify(report, null, 2));
   if (process.argv.includes("--gate") && report.worse.length > 0) process.exit(3);

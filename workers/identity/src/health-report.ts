@@ -490,6 +490,25 @@ export async function buildHealthReport(data: HealthData, opts: { day: string; e
   return report;
 }
 
+/**
+ * The verdict alone, for a PUBLIC log (deploy-prod.yml in this public repo):
+ * "ok", or how many vaults and rules got worse. No vault hash, route or tool
+ * name, outcome label or traffic number: the full report stays where only we
+ * read it (D1, scripts/health-report.ts run by hand or from a sealed job).
+ */
+export function publicVerdict(r: HealthReport): string {
+  if (r.worse.length === 0) return "health: ok";
+  const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+  const vaults = new Set(r.worse.filter((f) => f.who.startsWith("v:")).map((f) => f.who)).size;
+  const fleet = r.worse.filter((f) => f.who === "all vaults").length;
+  const other = r.worse.filter((f) => !f.who.startsWith("v:") && f.who !== "all vaults").length;
+  const parts = [plural(vaults, "vault")];
+  if (fleet) parts.push(`${fleet} fleet-wide`);
+  if (other) parts.push(`${other} identity/connector`);
+  parts.push(plural(new Set(r.worse.map((f) => f.kind)).size, "rule"));
+  return `health: worse: ${parts.join(", ")}`;
+}
+
 export function renderHealthText(r: HealthReport): string {
   const env = r.environment === "production" ? "" : ` ${r.environment}`;
   const w = r.windows.day;

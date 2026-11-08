@@ -15,7 +15,7 @@
 import { createExecutionContext, env, fetchMock, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import worker from "../src/index.ts";
-import { buildHealthReport, outcomeClass, type HealthData, type HealthRow } from "../src/health-report.ts";
+import { buildHealthReport, outcomeClass, publicVerdict, type HealthData, type HealthRow } from "../src/health-report.ts";
 import { FLUSH_N, bufferHealth, connectorClass, flushHealthBuffer, identityRouteGroup, loadHealthData, parseVaultHealth } from "../src/health-counters.ts";
 import { runUsageRollup } from "../src/usage.ts";
 import { runDailyLine } from "../src/ops-daily.ts";
@@ -139,6 +139,8 @@ describe("the report rules", () => {
     expect(fleet).toEqual(["client_reason_up", "stopped_working"]);
     // …and no single vault is blamed for it.
     expect(r.worse.every((f) => f.who === "all vaults")).toBe(true);
+    // The public gate line counts it as fleet-wide, not as vaults.
+    expect(publicVerdict(r)).toBe("health: worse: 0 vaults, 2 fleet-wide, 2 rules");
   });
 
   test("a stranger flooding one vault while every vault has its usual few 401s raises nothing", async () => {
