@@ -22,7 +22,8 @@
  *   3. a client reason up  — only with a real baseline (≥ 20 before): ≥ 5 now,
  *                            and its rate ≥ 2× and ≥ +10 points (a 401 storm
  *                            after a deploy that broke tokens);
- *   4. stopped working     — ≥ 3 ok before, 0 ok now, ≥ 3 failures now.
+ *   4. stopped working     — ≥ 3 ok before, 0 ok now, ≥ 3 failures now (401
+ *                            and 404 don't count as failures here).
  * Server errors present both times and not rising are "still failing", shown
  * but not counted as worse. Quiet = no row hit any rule.
  *
@@ -155,12 +156,21 @@ function compare(
         }
       }
     }
-    const failedA = ta.total - ta.ok;
+    // 401 and 404 are not failures here: a client's first unauthenticated
+    // probe and a missing item are normal, and a stranger's few requests right
+    // after a deploy must not read as an outage. A real auth breakage shows
+    // as rule 3 (the 401 rate against a baseline).
+    const failedA = ta.total - ta.ok - (ta.byOutcome.get("4xx:401") ?? 0) - (ta.byOutcome.get("4xx:404") ?? 0);
     if (tb.ok >= 3 && ta.ok === 0 && failedA >= 3) {
       worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${tb.ok} ok ${beforeLabel})` });
     }
   }
   return { worse, still };
+}
+
+/** How a vault appears in the report: `v:` + 8 hex of SHA-256 over its opaque id. */
+export async function vaultHash(vaultId: string): Promise<string> {
+  return `v:${await sha8(vaultId)}`;
 }
 
 async function sha8(s: string): Promise<string> {
@@ -198,7 +208,7 @@ export async function buildHealthReport(
 ): Promise<HealthReport> {
   const day = opts.day;
   const hashes = new Map<string, string>();
-  for (const v of new Set(rows.map((r) => r.vault))) if (v !== "-") hashes.set(v, `v:${await sha8(v)}`);
+  for (const v of new Set(rows.map((r) => r.vault))) if (v !== "-") hashes.set(v, await vaultHash(v));
   const who = (_source: string, vault: string, subject: string) => {
     if (vault !== "-") return hashes.get(vault)!;
     const m = /^oauth:[a-z]+:(.+)$/.exec(subject);

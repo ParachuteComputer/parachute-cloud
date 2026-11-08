@@ -57,6 +57,24 @@ bash "$ROOT/scripts/build-spa.sh"
 # `--env=""` targets the TOP-LEVEL (production) config explicitly, so wrangler
 # doesn't warn that [env.staging] also exists.
 cd "$ROOT/workers/identity"
+# The health gate (T-411): before changing anything, read the health report
+# (one D1 SELECT; scripts/health-report.ts). If something already got worse for
+# a real user since yesterday or since the last deploy, stop: a new deploy on
+# top would hide which change did it. Deploying the FIX for that is the normal
+# way out — say so with HEALTH_GATE=ack. A report that cannot be read (first
+# deploy with the table, a D1 hiccup) warns and does not block.
+set +e
+(cd "$ROOT" && bun scripts/health-report.ts --d1 parachute-identity --gate)
+HEALTH_RC=$?
+set -e
+if [ "$HEALTH_RC" = 3 ] && [ "${HEALTH_GATE:-}" != "ack" ]; then
+  echo "STOP: the health report shows something worse for users (above). Look first;" \
+       "if this deploy is the fix, re-run with HEALTH_GATE=ack." >&2
+  exit 1
+elif [ "$HEALTH_RC" != 0 ] && [ "$HEALTH_RC" != 3 ]; then
+  echo "WARNING: the health report could not be read (exit $HEALTH_RC); deploying without the gate." >&2
+fi
+
 bunx wrangler d1 migrations apply parachute-identity --remote --env=""
 # NO seed step (see the header: the operator login already exists in prod).
 

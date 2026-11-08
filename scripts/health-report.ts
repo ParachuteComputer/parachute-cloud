@@ -1,0 +1,99 @@
+#!/usr/bin/env bun
+/**
+ * The health report (T-411) from outside the worker: "did anything get worse
+ * for any real user since yesterday, or since the last deploy?"
+ *
+ *   # From D1 directly — one SELECT, read-only (a sealed job's D1 key in
+ *   # CLOUDFLARE_API_TOKEN; works even when the identity worker is down):
+ *   bun scripts/health-report.ts --d1 parachute-identity [--day YYYY-MM-DD] [--gate] [--json FILE]
+ *   bun scripts/health-report.ts --d1 parachute-identity-staging --env staging
+ *   bun scripts/health-report.ts --d1 parachute-identity-staging --env staging --local DIR   # wrangler dev state
+ *
+ *   # From the worker's own door (bearer OPS_READ_TOKEN, read from a file):
+ *   bun scripts/health-report.ts --url https://cloud.parachute.computer --token-file FILE [--day …]
+ *
+ * Both paths run the same code (workers/identity/src/health-report.ts) over
+ * the same rows. Prints the plain report. --json writes the full report
+ * (findings, windows) to FILE. --gate exits 3 when anything got worse, so a
+ * deploy job can stop on it. Counts and vault hashes only: nothing here can
+ * name a person or a vault.
+ */
+import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { buildHealthReport, type HealthReport, type HealthRow } from "../workers/identity/src/health-report.ts";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+function arg(name: string): string | undefined {
+  const i = process.argv.indexOf(name);
+  return i > 0 ? process.argv[i + 1] : undefined;
+}
+function die(msg: string): never {
+  console.error(msg);
+  process.exit(1);
+}
+
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const day = arg("--day") ?? new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+if (!DAY_RE.test(day)) die("--day must be YYYY-MM-DD");
+
+function shiftDay(d: string, by: number): string {
+  return new Date(Date.parse(`${d}T00:00:00Z`) + by * 86_400_000).toISOString().slice(0, 10);
+}
+
+/** Rows from D1 through wrangler: one SELECT, nothing else. */
+function rowsFromD1(db: string): HealthRow[] {
+  if (!/^[a-z0-9-]+$/.test(db)) die("--d1 takes a database name");
+  const from = shiftDay(day, -8);
+  const today = new Date().toISOString().slice(0, 10);
+  const to = today > day ? today : day;
+  // Both bounds are validated YYYY-MM-DD literals (wrangler's --command takes no bind parameters).
+  const sql = `SELECT day, source, version, vault, subject, outcome, n FROM health_counters WHERE day >= '${from}' AND day <= '${to}'`;
+  const envName = arg("--env");
+  const local = arg("--local");
+  const args = ["wrangler", "d1", "execute", db, "--json", "--command", sql];
+  if (local) args.push("--local", "--persist-to", local);
+  else args.push("--remote");
+  if (envName) args.push("--env", envName);
+  const out = spawnSync("bunx", args, { cwd: join(HERE, "..", "workers", "identity"), encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  if (out.status !== 0 && /no such table: health_counters/.test(out.stdout + out.stderr)) {
+    console.log("no health counters yet: the table arrives with this release's migration (nothing to compare)");
+    process.exit(0);
+  }
+  if (out.status !== 0) die(`wrangler d1 execute failed (exit ${out.status}): ${(out.stderr || out.stdout).split("\n").filter((l) => /error|✘/i.test(l)).slice(0, 3).join(" | ")}`);
+  const text = out.stdout;
+  const parsed = JSON.parse(text.slice(text.indexOf("["))) as Array<{ results?: HealthRow[]; success?: boolean }>;
+  if (!parsed[0]?.success) die("the SELECT did not succeed");
+  return parsed[0].results ?? [];
+}
+
+async function fromUrl(base: string, tokenFile: string): Promise<HealthReport> {
+  const token = readFileSync(tokenFile, "utf8").trim();
+  const res = await fetch(`${base.replace(/\/$/, "")}/ops/health?day=${day}`, { headers: { authorization: `Bearer ${token}` } });
+  if (res.status !== 200) die(`GET /ops/health → ${res.status}`);
+  return (await res.json()) as HealthReport;
+}
+
+async function main(): Promise<void> {
+  const d1 = arg("--d1");
+  const url = arg("--url");
+  let report: HealthReport;
+  if (d1) {
+    const rows = rowsFromD1(d1);
+    const environment = arg("--env") ?? (arg("--local") ? "local" : "production");
+    report = await buildHealthReport(rows, { day, environment });
+    console.error(`(${rows.length} counter rows, ${shiftDay(day, -8)} on)`);
+  } else if (url) {
+    report = await fromUrl(url, arg("--token-file") ?? die("--url needs --token-file"));
+  } else {
+    die("usage: health-report.ts --d1 <database> [--env staging] [--local DIR] | --url <issuer> --token-file <file>  [--day YYYY-MM-DD] [--gate] [--json FILE]");
+  }
+  console.log(report.text);
+  const jsonOut = arg("--json");
+  if (jsonOut) writeFileSync(jsonOut, JSON.stringify(report, null, 2));
+  if (process.argv.includes("--gate") && report.worse.length > 0) process.exit(3);
+}
+
+await main();

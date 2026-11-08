@@ -103,6 +103,18 @@ describe("the report rules", () => {
     expect(r.worse.map((f) => f.kind)).toEqual(["stopped_working"]);
   });
 
+  test("a few strangers' 401s right after a deploy are not 'stopped working'", async () => {
+    const old = "2026-11-06t10:00:00z~aaaaaaaa";
+    const cur = "2026-11-07t09:00:00z~bbbbbbbb";
+    const rows = [
+      row({ day: PRIOR, version: old, subject: "http:notes", outcome: "2xx", n: 4 }),
+      row({ version: cur, subject: "http:notes", outcome: "4xx:401", n: 3 }),
+      row({ version: cur, subject: "http:notes", outcome: "4xx:404", n: 1 }),
+    ];
+    const r = await buildHealthReport(rows, { day: DAY, environment: "production" });
+    expect(r.worse).toEqual([]);
+  });
+
   test("server errors at the same low rate both days are still failing, not worse", async () => {
     const rows = [
       ...normalDay("vault-id-a", PRIOR),

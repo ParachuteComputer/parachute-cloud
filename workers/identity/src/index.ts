@@ -45,6 +45,7 @@ import {
 import { handleAdminGrowthGet } from "./admin-growth.ts";
 import { handleOpsDailyGet, handleOpsHealthGet, handleOpsSnapshotRunPost, healthReportResponse, opsBearerRefusal, runDailyLine } from "./ops-daily.ts";
 import { bumpOpsCounter } from "./ops-counters.ts";
+import { vaultHash } from "./health-report.ts";
 import { bumpHealth, collectVaultHealth, httpOutcome, identityRouteGroup, takeHealthNotes } from "./health-counters.ts";
 import { handleAdminDeleteGet, handleAdminDeletePost } from "./admin-delete.ts";
 import { handleOpsAccountDeletePost } from "./ops-account-delete.ts";
@@ -502,7 +503,17 @@ app.post("/__test/health-collect", async (c) => {
 });
 app.get("/__test/health-report", async (c) => {
   if (!depsFor(c.env).exposeDevLinks) return c.notFound();
-  return healthReportResponse(c.env, c.req.raw);
+  const res = await healthReportResponse(c.env, c.req.raw);
+  // Staging only: ?vault=<name> (repeatable) adds each named vault's report
+  // hash, so the staging proof can find its own test vaults in the findings.
+  const names = c.req.queries("vault")?.slice(0, 20) ?? [];
+  if (!res.ok || names.length === 0) return res;
+  const hashes: Record<string, string> = {};
+  for (const name of names) {
+    const row = await c.env.DB.prepare("SELECT vault_id FROM vaults WHERE name = ?").bind(name).first<{ vault_id: string }>();
+    if (row) hashes[name] = await vaultHash(row.vault_id);
+  }
+  return c.json({ ...((await res.json()) as object), hashes });
 });
 
 // Staging/dev-only snapshot-sweep trigger — same gate + rationale (404 off
