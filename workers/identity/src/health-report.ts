@@ -41,8 +41,8 @@
  *      either.
  * At fleet level (the vault worker, per subject, over every vault) the same
  * questions are asked of VAULTS, not of summed requests:
- *   - new server errors on at least 3 vaults that had rows before and no
- *     server error in them (beyond those already reported one by one) — one
+ *   - new server errors on at least 3 vaults that had none before, or no
+ *     traffic at all then (beyond those already reported one by one) — one
  *     new 500 on each of many vaults;
  *   - a client reason, 401 included, that rose on each vault by its own
  *     measure (≥ 3 of it, ≥ 5 requests before, share ×2 and +10 points; for a
@@ -52,7 +52,11 @@
  *     now, ≥ 3 failures; a 401/403 counts as a failure only on a vault with
  *     ≥ 10 ok before).
  * The last two need at least 3 vaults or a tenth of the vaults seen, so a
- * stranger flooding one vault, or poking a few idle ones, makes no finding.
+ * stranger flooding one vault, or poking a few small idle ones, makes no
+ * finding. What stays open: a stranger who knows the names of 3+ vaults with
+ * ≥ 10 ok the day before (or on the previous version, which in the deploy
+ * window is a whole week) and none today can still raise one — the gate's
+ * HEALTH_GATE=ack is the way past it.
  * Server errors below rule 1's bar, or present both times and not rising,
  * are listed as "other server errors" — shown, never counted as worse.
  *
@@ -155,9 +159,13 @@ const AUTH_REFUSALS = new Set(["4xx:401", "4xx:403"]);
  * failures of "stopped working") only on a vault with at least this many ok
  * before — real use a token outage would cut. A stranger can make 401/403s on
  * any vault whose name they know, and a small vault that is idle today has no
- * ok left to show the difference.
+ * ok left to show the difference. The cost: a token outage only on vaults
+ * lighter than this goes unseen here (the staging smoke's real OAuth flows are
+ * what catch that at deploy time).
  */
 const FLEET_AUTH_OK_BEFORE = 10;
+const realUse = (tb: Tally) => tb.ok >= FLEET_AUTH_OK_BEFORE;
+const NOT_FOUND = new Set(["4xx:404"]);
 const FLEET_MIN_SHARE = 0.1;
 
 interface Tally {
@@ -252,7 +260,7 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
     }
   }
   // Per vault, what a stranger can make (401, 403, 404) is never a failure; elsewhere only a 404 is left out.
-  const notFailures = perVault ? sumOf(ta, STRANGER_REASONS) : (ta.byOutcome.get("4xx:404") ?? 0);
+  const notFailures = sumOf(ta, perVault ? STRANGER_REASONS : NOT_FOUND);
   if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && ta.total - ta.ok - notFailures >= STOPPED_FAILURES) {
     out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${tb.ok} ok ${beforeLabel})` });
   }
@@ -263,7 +271,7 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
  * spread too thin for any one vault to show. Every fleet rule needs the change
  * on several vaults ({@link spread}), counted from each vault's OWN cells, so
  * a stranger flooding one vault never makes a fleet finding:
- *   - new server errors on vaults that had rows before and none in them,
+ *   - new server errors on vaults that had none (or no traffic) before,
  *     beyond the vaults already reported one by one (rule 1 at fleet level);
  *   - a client reason whose share rose on each of those vaults (rule 3; 401s
  *     included — the "tokens broke" signal);
@@ -292,12 +300,15 @@ function fleetRules(
   for (const [g, cells] of groups) {
     const [source, subject] = g.split("\u0000") as [string, string];
     const base = { window, who: "all vaults", source, subject };
-    // A stranger without credentials can't cause server errors: 3 vaults are enough, at any fleet size.
-    // "None before" needs a before: a vault with no row in the earlier window is not counted here.
-    const fresh = cells.filter((c) => c.ta.server > 0 && c.tb.total > 0 && c.tb.server === 0 && !flaggedServer.has(c.key));
+    // A stranger can't cause server errors: 3 vaults are enough, at any fleet size. A vault with
+    // no traffic before counts too (a quiet Sunday, or a short-lived previous version, must not hide
+    // a thin outage); the line says how many of them there were.
+    const fresh = cells.filter((c) => c.ta.server > 0 && c.tb.server === 0 && !flaggedServer.has(c.key));
     if (fresh.length >= FLEET_MIN_VAULTS) {
       const n = fresh.reduce((s, c) => s + c.ta.server, 0);
-      out.worse.push({ ...base, kind: "new_server_errors", detail: `new server errors on ${fresh.length} vaults (${n} in all; none ${beforeLabel})` });
+      const idle = fresh.filter((c) => c.tb.total === 0).length;
+      const idleNote = idle ? `; ${idle} of them had no traffic then` : "";
+      out.worse.push({ ...base, kind: "new_server_errors", detail: `new server errors on ${fresh.length} vaults (${n} in all; none ${beforeLabel}${idleNote})` });
     }
     const reasons = new Set(cells.flatMap((c) => [...c.ta.byOutcome.keys()].filter((o) => outcomeClass(o) === "client")));
     for (const outcome of reasons) {
@@ -310,7 +321,7 @@ function fleetRules(
           (c.ta.byOutcome.get(outcome) ?? 0) >= FLEET_VAULT_MIN &&
           c.tb.total >= FLEET_VAULT_BASELINE &&
           shareRose(c.ta, c.tb, outcome) &&
-          (!AUTH_REFUSALS.has(outcome) || (c.tb.ok >= FLEET_AUTH_OK_BEFORE && c.ta.ok <= c.tb.ok / 2)),
+          (!AUTH_REFUSALS.has(outcome) || (realUse(c.tb) && c.ta.ok <= c.tb.ok / 2)),
       );
       const na = rose.reduce((s, c) => s + (c.ta.byOutcome.get(outcome) ?? 0), 0);
       if (enough(rose.length) && na >= CLIENT_MIN) {
@@ -318,8 +329,7 @@ function fleetRules(
       }
     }
     const stopped = cells.filter((c) => {
-      const refusalsCount = c.tb.ok >= FLEET_AUTH_OK_BEFORE;
-      const failed = c.ta.total - c.ta.ok - (c.ta.byOutcome.get("4xx:404") ?? 0) - (refusalsCount ? 0 : sumOf(c.ta, AUTH_REFUSALS));
+      const failed = c.ta.total - c.ta.ok - sumOf(c.ta, realUse(c.tb) ? NOT_FOUND : STRANGER_REASONS);
       return c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failed >= STOPPED_FAILURES;
     });
     if (enough(stopped.length)) {

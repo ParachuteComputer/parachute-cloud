@@ -206,7 +206,7 @@ describe("the report rules", () => {
     expect((await report(rows)).worse).toEqual([]);
   });
 
-  test("three vaults with no row the day before don't count as 'had no server errors before' at fleet level", async () => {
+  test("a thin outage on vaults that had no traffic the day before still counts at fleet level, and says so", async () => {
     const rows: HealthRow[] = [];
     for (let i = 0; i < 27; i++) {
       for (const day of [PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, subject: "http:notes", outcome: "2xx", n: 100 }));
@@ -215,10 +215,10 @@ describe("the report rules", () => {
       rows.push(row({ vault: `n${i}`, subject: "http:notes", outcome: "2xx", n: 50 }));
       rows.push(row({ vault: `n${i}`, subject: "http:notes", outcome: "5xx:500", n: 1 }));
     }
+    // Strangers can't make 500s, and a quiet Sunday (or a short-lived previous version) must not hide them.
     const r = await report(rows);
-    expect(r.worse).toEqual([]);
-    // Still shown, one by one.
-    expect(r.otherServerErrors).toHaveLength(3);
+    expect(r.worse).toMatchObject([{ who: "all vaults", subject: "http:notes", kind: "new_server_errors" }]);
+    expect(r.worse[0]!.detail).toContain("3 of them had no traffic then");
   });
 
   test("a thin server outage on 15 of 200 vaults is caught (strangers can't make server errors)", async () => {
