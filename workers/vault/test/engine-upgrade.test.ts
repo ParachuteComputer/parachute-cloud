@@ -97,7 +97,19 @@ describe("engine upgrade on an existing vault DO", () => {
       // Cloud-owned objects and the platform's own tables are not the engine's.
       const cloudOwned = new Set(["attachment_tickets"]);
       const engine = master(sql).filter((o: any) => !String(o.name).startsWith("_cf_") && !String(o.name).startsWith("sqlite_") && !cloudOwned.has(String(o.name)));
-      expect(engine).toEqual(ROLLBACK_ENGINE_DDL.objects);
+      // T-412's rollback story: the current engine adds exactly one index, idx_notes_path_nocase (case-insensitive
+      // path lookups), and keeps SCHEMA_VERSION, so the rollback engine still opens the vault (no NewerSchemaError)
+      // and SQLite keeps the extra index current under its writes. Nothing else may differ.
+      const additive = new Set(["idx_notes_path_nocase"]);
+      expect(engine.filter((o: any) => !additive.has(String(o.name)))).toEqual(ROLLBACK_ENGINE_DDL.objects);
+      expect(engine.filter((o: any) => additive.has(String(o.name)))).toEqual([
+        {
+          type: "index",
+          name: "idx_notes_path_nocase",
+          tbl_name: "notes",
+          sql: "CREATE INDEX idx_notes_path_nocase ON notes(path COLLATE NOCASE) WHERE path IS NOT NULL",
+        },
+      ]);
     });
   });
 });

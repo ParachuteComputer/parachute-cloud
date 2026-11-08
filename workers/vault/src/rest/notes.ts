@@ -29,7 +29,7 @@ import {
   IF_UPDATED_AT_HINT,
 } from "@openparachute/core/src/notes.js";
 import { applyContentRange } from "@openparachute/core/src/content-range.js";
-import { attachValidationStatus, enforceStrictWrite } from "@openparachute/core/src/mcp.js";
+import { attachValidationStatus, enforceStrictWrite, resolveNoteExact } from "@openparachute/core/src/mcp.js";
 import { expandContent } from "@openparachute/core/src/expand.js";
 import { transactionAsync } from "@openparachute/core/src/txn.js";
 import { normalizePath } from "@openparachute/core/src/paths.js";
@@ -1286,7 +1286,15 @@ async function handleNotesInner(
   const verMatch = sub.match(/^\/versions\/([^/]+)$/);
   const importMatch = sub.match(/^\/imports\/([^/]+)$/);
   if (sub === "/versions" || verMatch || importMatch || sub === "/restore") {
-    const note = await resolveNote(store, idOrPath);
+    // Erasing a live note's history takes only an exact id or path (T-412); reading and restoring keep the usual lookup.
+    let note: Note | null;
+    if (sub === "/versions" && method === "DELETE") {
+      const found = resolveForErase(store, idOrPath);
+      if (found instanceof Response) return found;
+      note = found.note;
+    } else {
+      note = await resolveNote(store, idOrPath);
+    }
     if (note && !noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (!note && (tagScope.raw !== null || !isNoteIdShape(idOrPath) ||
       !(await store.listNoteVersions(idOrPath, { limit: 1 })).length)) {
@@ -1742,14 +1750,59 @@ async function handleNotesInner(
 
   // DELETE /notes/:idOrPath
   if (method === "DELETE") {
-    const note = await resolveNote(store, idOrPath);
+    // T-412: `?erase_history=true` also erases every version (no tombstone); the DO gate already required admin for
+    // any value but false. Erasing can't be undone, so it takes only an exact id or path (core's resolveNoteExact:
+    // no case folding, no H1 title). Same shape as the bun door.
+    const erase = new URL(req.url).searchParams.get("erase_history");
+    if (erase !== null && erase !== "true" && erase !== "false") {
+      return json({ error: "erase_history must be true or false", error_type: "invalid_request", field: "erase_history" }, 400);
+    }
+    let note: Note | null;
+    if (erase === "true") {
+      const found = resolveForErase(store, idOrPath);
+      if (found instanceof Response) return found;
+      note = found.note;
+    } else {
+      try {
+        note = await resolveNote(store, idOrPath);
+      } catch (e) {
+        const r = ambiguousPathResponse(e);
+        if (r) return r;
+        throw e;
+      }
+    }
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
+    if (erase === "true") {
+      const r = await store.forgetNote(note.id);
+      return json({ deleted: true, id: note.id, history_erased: { versions_deleted: r.versionsDeleted, blobs_deleted: r.blobsDeleted } });
+    }
     await store.deleteNote(note.id);
     return json({ deleted: true, id: note.id });
   }
 
   return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+}
+
+/**
+ * The note an erase names (T-412), exactly: core's resolveNoteExact (id, or case-sensitive path). A name that fits two
+ * notes is a 409 that says how to name one. Same as the bun door's resolveForErase.
+ */
+function resolveForErase(store: Store, idOrPath: string): { note: Note | null } | Response {
+  try {
+    return { note: resolveNoteExact(store.db, idOrPath) };
+  } catch (e: any) {
+    if (e?.code === "AMBIGUOUS_PATH") {
+      return json({
+        error: "ambiguous_path",
+        error_type: "ambiguous_path",
+        message: `"${idOrPath}" names more than one note; name the one to erase by its id, or add its .extension`,
+        path: idOrPath,
+        candidates: e.candidates,
+      }, 409);
+    }
+    throw e;
+  }
 }
 
 /** R2 object key for an attachment's vault-relative path (`<date>/<file>`). */
