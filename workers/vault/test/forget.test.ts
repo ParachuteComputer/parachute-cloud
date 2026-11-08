@@ -44,11 +44,15 @@ describe("deleting can forget (T-412)", () => {
     expect(listed.notes.find((n: any) => n.id === plain)).toMatchObject({ id: plain, path: "f/plain" });
 
     const gone = await withHistory(v, "f/gone");
+    await op(v, `/api/notes/${gone}`, { method: "PATCH", ...json({ content: "made up three", force: true }) });
+    const total = ((await (await op(v, `/api/notes/${gone}/versions`)).json()) as any).total;
+    expect(total).toBe(2);
     const r = await op(v, `/api/notes/${gone}?erase_history=true`, { method: "DELETE" });
     expect(r.status).toBe(200);
     const body = (await r.json()) as any;
     expect(body).toMatchObject({ deleted: true, id: gone });
-    expect(body.history_erased.versions_deleted).toBeGreaterThanOrEqual(1);
+    // Exactly what was there.
+    expect(body.history_erased.versions_deleted).toBe(total);
     expect((await op(v, `/api/notes/${gone}/versions`)).status).toBe(404);
     expect(await deletedIds(v)).not.toContain(gone);
     const odd = await withHistory(v, "f/odd");
