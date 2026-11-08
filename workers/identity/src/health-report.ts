@@ -48,8 +48,9 @@
  *     measure (≥ 3 of it, ≥ 5 requests before, its share ×2 and +10 points)
  *     — every vault's tokens failing at once;
  *   - vaults that stopped working only once 401/403 count as failures (≥ 3
- *     ok before, none now, ≥ 3 failures) — those stopped by anything else
- *     already have their own line, as with server errors.
+ *     ok before, none now, ≥ 3 refusals) — those stopped by anything else
+ *     already have their own line, as with server errors, and don't count
+ *     toward the bars below.
  * The last two need at least 3 vaults or a tenth of the vaults seen. What a
  * stranger can make (401, 403, 404) also needs at least half of the vaults
  * that could show it in that subject (in use before, and now still working
@@ -162,6 +163,7 @@ const FLEET_VAULT_BASELINE = 5;
  */
 const FLEET_STRANGER_SHARE = 0.5;
 const NOT_FOUND = new Set(["4xx:404"]);
+const REFUSALS = new Set(["4xx:401", "4xx:403"]);
 const FLEET_MIN_SHARE = 0.1;
 
 interface Tally {
@@ -285,8 +287,8 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
  *     beyond the vaults already reported one by one (rule 1 at fleet level);
  *   - a client reason whose share rose on each of those vaults (rule 3; 401s
  *     included — the "tokens broke" signal);
- *   - vaults that worked before and are now refused on every request (rule 4
- *     with 401/403 as failures; a vault stopped otherwise has its own line).
+ *   - vaults that stopped only once 401/403 count as failures, with ≥ 3 of
+ *     them (rule 4; a vault stopped otherwise has its own line).
  * Each needs 3 vaults or a tenth of those seen ({@link spread}); what a
  * stranger can make (401, 403, 404) also needs {@link majority} of the vaults
  * that could show it, each with its oks at least halved.
@@ -317,9 +319,16 @@ function fleetRules(
     // vaults that could show it — those in use before (≥ 5 requests, ≥ 3 ok) that now either still
     // work or had the requests (≥ 3) to show a change; and, on each vault counted, its oks fell (an
     // outage cuts them; expired tokens being refreshed, and a stranger, don't).
+    // A vault already stopped by what no stranger can make has its own line, and can't show a
+    // refusal outage either way: it is left out.
     const couldShow = cells.filter(
-      (c) => c.tb.total >= FLEET_VAULT_BASELINE && c.tb.ok >= STOPPED_OK_BEFORE && (c.ta.ok > 0 || c.ta.total >= FLEET_VAULT_MIN),
+      (c) =>
+        c.tb.total >= FLEET_VAULT_BASELINE &&
+        c.tb.ok >= STOPPED_OK_BEFORE &&
+        (c.ta.ok > 0 || c.ta.total >= FLEET_VAULT_MIN) &&
+        !stoppedBy(c.ta, c.tb, STRANGER_REASONS),
     );
+    const inCouldShow = new Set(couldShow);
     const strangerProof = (n: number) => enough(n) && majority(n, couldShow.length);
     // A stranger can't cause server errors: 3 vaults are enough, at any fleet size. A vault with
     // no traffic before counts too (as a quiet day must not hide a thin outage); the line says how many.
@@ -349,11 +358,13 @@ function fleetRules(
       }
     }
     // Stopped: a vault stopped by what no stranger can make has its own line (rule 4), so — as with
-    // new server errors — the fleet line is for the rest: vaults stopped only because every request
-    // was refused (401/403). Those among the vaults that could show it must clear the stranger bars;
-    // the line then names every such vault, light ones included.
-    const refusedOnly = cells.filter((c) => stoppedBy(c.ta, c.tb, NOT_FOUND) && !stoppedBy(c.ta, c.tb, STRANGER_REASONS));
-    if (strangerProof(refusedOnly.filter((c) => couldShow.includes(c)).length)) {
+    // new server errors — the fleet line is for the rest: vaults with no ok that stopped only once
+    // 401/403 count, with at least 3 of those refusals. Those among the vaults that could show it
+    // must clear the stranger bars; the line then names every such vault, light ones included.
+    const refusedOnly = cells.filter(
+      (c) => stoppedBy(c.ta, c.tb, NOT_FOUND) && !stoppedBy(c.ta, c.tb, STRANGER_REASONS) && sumOf(c.ta, REFUSALS) >= STOPPED_FAILURES,
+    );
+    if (strangerProof(refusedOnly.filter((c) => inCouldShow.has(c)).length)) {
       out.worse.push({
         ...base,
         kind: "stopped_working",

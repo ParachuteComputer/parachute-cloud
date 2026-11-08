@@ -419,6 +419,18 @@ describe("the report rules", () => {
     const l = await report(lone);
     expect(l.worse.filter((f) => f.who === "all vaults" && f.kind === "stopped_working")).toEqual([]);
     expect(l.worse.filter((f) => f.kind === "stopped_working")).toHaveLength(10);
+    // A deploy that stops 11 vaults with 502s and 9 with 401s: the 9 are named (the 11 have their own lines,
+    // so they don't dilute the bar); a vault with two 502s and one 401 is not a refusal.
+    const split: HealthRow[] = [];
+    for (let i = 0; i < 20; i++) {
+      split.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 50 }));
+      split.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: i < 11 ? "5xx:502" : "4xx:401", n: 20 }));
+    }
+    split.push(row({ vault: "w", day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 50 }));
+    split.push(row({ vault: "w", subject: "http:mcp", outcome: "5xx:502", n: 2 }));
+    split.push(row({ vault: "w", subject: "http:mcp", outcome: "4xx:401", n: 1 }));
+    const sp = await report(split);
+    expect(sp.worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working")?.detail).toContain("on 9 vaults");
   });
 
   test("a deploy that breaks tokens, or turns a route into 404s, on every vault is caught in the deploy window", async () => {
