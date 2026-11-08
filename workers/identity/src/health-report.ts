@@ -39,12 +39,16 @@
  *   4. stopped working — ok before (≥ 3), none now, and at least 3 failures
  *      now. A 404 is never a failure here; per vault a 401 is not either.
  * At fleet level (the vault worker, per subject, over every vault) the same
- * questions are asked of VAULTS, not of summed requests: new server errors on
- * vaults that had none (beyond those already reported one by one), a client
- * reason — 401 included — whose share rose on each vault, vaults that stopped
- * working. Each needs at least 3 vaults or a tenth of the vaults seen, so a
- * stranger flooding one vault never makes a fleet finding, and a breakage too
- * thin for any one vault (one new 500 on each of 100 vaults) still does.
+ * questions are asked of VAULTS, not of summed requests:
+ *   - new server errors on at least 3 vaults that had none (beyond those
+ *     already reported one by one) — one new 500 on each of many vaults;
+ *   - a client reason, 401 included, that rose on each vault by its own
+ *     measure (≥ 3 of it, ≥ 5 requests before, share ×2 and +10 points; for a
+ *     401/403 its ok count also halved) — every vault's tokens failing at once;
+ *   - vaults that stopped working by the per-vault bar (≥ 3 ok before, none
+ *     now, ≥ 3 failures, a 401 counted).
+ * The last two need at least 3 vaults or a tenth of the vaults seen, so a
+ * stranger flooding one vault, or poking a few idle ones, makes no finding.
  * Server errors below rule 1's bar, or present both times and not rising,
  * are listed as "other server errors" — shown, never counted as worse.
  *
@@ -138,6 +142,10 @@ const STOPPED_FAILURES = 3;
 /** Left out per vault: a stranger can produce these on any vault whose name they know. */
 const STRANGER_REASONS = new Set(["4xx:401", "4xx:403", "4xx:404"]);
 const FLEET_MIN_VAULTS = 3;
+/** Fleet level, per vault: at least this many of the outcome, on a vault with at least this many requests before. */
+const FLEET_VAULT_MIN = 3;
+const FLEET_VAULT_BASELINE = 5;
+const AUTH_REFUSALS = new Set(["4xx:401", "4xx:403"]);
 const FLEET_MIN_SHARE = 0.1;
 
 interface Tally {
@@ -265,14 +273,24 @@ function fleetRules(
   for (const [g, cells] of groups) {
     const [source, subject] = g.split("\u0000") as [string, string];
     const base = { window, who: "all vaults", source, subject };
+    // A stranger without credentials can't cause server errors: 3 vaults are enough, at any fleet size.
     const fresh = cells.filter((c) => c.ta.server > 0 && c.tb.server === 0 && !flaggedServer.has(c.key));
-    if (enough(fresh.length)) {
+    if (fresh.length >= FLEET_MIN_VAULTS) {
       const n = fresh.reduce((s, c) => s + c.ta.server, 0);
       out.worse.push({ ...base, kind: "new_server_errors", detail: `new server errors on ${fresh.length} vaults (${n} in all; none ${beforeLabel})` });
     }
     const reasons = new Set(cells.flatMap((c) => [...c.ta.byOutcome.keys()].filter((o) => outcomeClass(o) === "client")));
     for (const outcome of reasons) {
-      const rose = cells.filter((c) => shareRose(c.ta, c.tb, outcome));
+      // A vault counts only when its own change looks real: a few of them, a
+      // vault that was in use, and — for a 401/403 — its ok count fell too
+      // (a token outage cuts the oks; expired tokens and a stranger don't).
+      const rose = cells.filter(
+        (c) =>
+          (c.ta.byOutcome.get(outcome) ?? 0) >= FLEET_VAULT_MIN &&
+          c.tb.total >= FLEET_VAULT_BASELINE &&
+          shareRose(c.ta, c.tb, outcome) &&
+          (!AUTH_REFUSALS.has(outcome) || c.ta.ok <= c.tb.ok / 2),
+      );
       const na = rose.reduce((s, c) => s + (c.ta.byOutcome.get(outcome) ?? 0), 0);
       if (enough(rose.length) && na >= CLIENT_MIN) {
         out.worse.push({ ...base, kind: "client_reason_up", reason: outcome, detail: `${outcome} up on ${rose.length} vaults (${na} in all, far fewer ${beforeLabel})` });
@@ -280,7 +298,7 @@ function fleetRules(
     }
     const stopped = cells.filter((c) => {
       const failed = c.ta.total - c.ta.ok - (c.ta.byOutcome.get("4xx:404") ?? 0);
-      return c.tb.ok > 0 && c.ta.ok === 0 && failed > 0;
+      return c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failed >= STOPPED_FAILURES;
     });
     if (enough(stopped.length)) {
       out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${stopped.length} vaults that worked ${beforeLabel}` });

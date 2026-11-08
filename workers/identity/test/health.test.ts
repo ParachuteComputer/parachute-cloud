@@ -165,6 +165,44 @@ describe("the report rules", () => {
     expect(r.worse[0]!.detail).toContain("on 100 vaults");
   });
 
+  test("tokens expiring on a few small vaults is normal, not a fleet 401 alert", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 30; i++) {
+      rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 10 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "2xx", n: 10 }));
+      if (i < 4) rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "4xx:401", n: 2 }));
+    }
+    expect((await report(rows)).worse).toEqual([]);
+  });
+
+  test("a stranger poking three busy vaults, or three idle ones, raises no fleet finding", async () => {
+    const busy: HealthRow[] = [];
+    for (let i = 0; i < 30; i++) {
+      for (const day of [PRIOR, DAY]) {
+        busy.push(row({ vault: `v${i}`, day, subject: "http:mcp", outcome: "2xx", n: 100 }));
+        busy.push(row({ vault: `v${i}`, day, subject: "http:mcp", outcome: "4xx:401", n: 3 }));
+      }
+      if (i < 3) busy.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "4xx:401", n: 15 }));
+    }
+    expect((await report(busy)).worse).toEqual([]);
+    const idle: HealthRow[] = [];
+    for (let i = 0; i < 3; i++) {
+      idle.push(row({ vault: `i${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 4 }));
+      idle.push(row({ vault: `i${i}`, subject: "http:mcp", outcome: "4xx:401", n: 1 }));
+    }
+    expect((await report(idle)).worse).toEqual([]);
+  });
+
+  test("a thin server outage on 15 of 200 vaults is caught (strangers can't make server errors)", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 200; i++) {
+      rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:notes", outcome: "2xx", n: 50 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:notes", outcome: "2xx", n: 50 }));
+      if (i < 15) rows.push(row({ vault: `v${i}`, subject: "http:notes", outcome: "5xx:500", n: 1 }));
+    }
+    expect((await report(rows)).worse).toMatchObject([{ who: "all vaults", kind: "new_server_errors" }]);
+  });
+
   test("two different reasons rising in one cell are two findings", async () => {
     const id = (p: Partial<HealthRow> & { subject: string; outcome: string; n: number }) => row({ source: "identity", vault: "-", ...p });
     const r = await report([
