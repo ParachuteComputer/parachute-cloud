@@ -273,6 +273,43 @@ describe("the report rules", () => {
     expect(fleet).toEqual(["all vaults:client_reason_up", "all vaults:stopped_working"]);
   });
 
+  test("a token outage on busy and light vaults alike is caught: vaults too light to show it don't raise the bar", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 4; i++) {
+      rows.push(row({ vault: `b${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 100 }));
+      rows.push(row({ vault: `b${i}`, subject: "http:mcp", outcome: "4xx:401", n: 30 }));
+    }
+    for (let i = 0; i < 10; i++) {
+      rows.push(row({ vault: `l${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 4 }));
+      rows.push(row({ vault: `l${i}`, subject: "http:mcp", outcome: "4xx:401", n: 2 }));
+    }
+    const fleet = (await report(rows)).worse.map((f) => `${f.who}:${f.kind}`).sort();
+    expect(fleet).toEqual(["all vaults:client_reason_up", "all vaults:stopped_working"]);
+  });
+
+  test("401s on 10 of the 20 vaults using a route, in a fleet of 200, also need the usual spread (a tenth of the fleet)", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 200; i++) {
+      for (const day of [PRIOR, DAY]) rows.push(row({ vault: `v${i}`, day, subject: "http:notes", outcome: "2xx", n: 50 }));
+      if (i < 20) {
+        rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:export", outcome: "2xx", n: 10 }));
+        rows.push(row({ vault: `v${i}`, subject: "http:export", outcome: "2xx", n: 10 }));
+        if (i < 10) rows.push(row({ vault: `v${i}`, subject: "http:export", outcome: "4xx:401", n: 5 }));
+      }
+    }
+    expect((await report(rows)).worse).toEqual([]);
+  });
+
+  test("the fleet 'stopped working' line counts every vault that stopped, 401s included", async () => {
+    const rows: HealthRow[] = [];
+    for (let i = 0; i < 20; i++) {
+      rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 50 }));
+      rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: i < 3 ? "5xx:502" : "4xx:401", n: 20 }));
+    }
+    const stopped = (await report(rows)).worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working");
+    expect(stopped?.detail).toContain("on 20 vaults");
+  });
+
   test("a deploy that breaks tokens, or turns a route into 404s, on every vault is caught in the deploy window", async () => {
     const old = "2026-11-01t10:00:00z~aaaaaaaa";
     const cur = "2026-11-08t09:00:00z~bbbbbbbb";
