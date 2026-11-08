@@ -130,6 +130,19 @@ describe("health counters — what a vault's requests leave behind", () => {
     expect(Object.keys(body.days)).toContain(utcDay(new Date()));
   });
 
+  it("the nightly usage read (GET /api/internal/config) carries the counters, so collecting costs no extra call", async () => {
+    const v = freshVault("hn");
+    await createNote(v, { content: "x" });
+    const res = await op(v, "/api/internal/config");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { db_bytes: number; health: { version: string; days: Days } };
+    expect(typeof body.db_bytes).toBe("number");
+    // The test pool binds version metadata with an id and no timestamp.
+    const version = body.health.version;
+    expect(version === "unversioned" || /~[0-9a-f]{8}$/.test(version)).toBe(true);
+    expect(body.health.days[utcDay(new Date())]![version]!["http:notes|2xx"]).toBe(1);
+  });
+
   it("a destroyed vault keeps no counters, and later requests add none", async () => {
     const v = freshVault("hd");
     await createNote(v, { content: "x" });

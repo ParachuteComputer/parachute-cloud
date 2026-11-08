@@ -1584,7 +1584,16 @@ export class VaultDO extends DurableObject {
       };
     };
 
-    if (request.method === "GET") return json(shape());
+    if (request.method === "GET") {
+      // The health counters (T-411, health.ts) ride the nightly usage read, so
+      // collecting them costs the identity worker no extra wake or subrequest.
+      // The last two days plus today: the rollup runs at 03:30 UTC.
+      const since = utcDay(new Date(Date.now() - 2 * 86_400_000));
+      return json({
+        ...shape(),
+        health: { version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since) },
+      });
+    }
     if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
 
     let body: { cap_bytes?: unknown; caps?: unknown; frozen?: unknown; transcription?: unknown; closed?: unknown };

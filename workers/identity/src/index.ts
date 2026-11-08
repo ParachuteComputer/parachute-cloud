@@ -43,8 +43,9 @@ import {
   handleAdminVaultsGet,
 } from "./admin.ts";
 import { handleAdminGrowthGet } from "./admin-growth.ts";
-import { handleOpsDailyGet, handleOpsSnapshotRunPost, runDailyLine } from "./ops-daily.ts";
+import { handleOpsDailyGet, handleOpsHealthGet, handleOpsSnapshotRunPost, healthReportResponse, opsBearerRefusal, runDailyLine } from "./ops-daily.ts";
 import { bumpOpsCounter } from "./ops-counters.ts";
+import { bumpHealth, collectVaultHealth, httpOutcome, identityRouteGroup, takeHealthNotes } from "./health-counters.ts";
 import { handleAdminDeleteGet, handleAdminDeletePost } from "./admin-delete.ts";
 import { handleOpsAccountDeletePost } from "./ops-account-delete.ts";
 import {
@@ -489,6 +490,21 @@ app.post("/__test/usage-run", async (c) => {
   return c.json(await runUsageRollup(c.env, deps, { sender: senderFor(c.env), ...(onlyVault ? { onlyVault } : {}) }));
 });
 
+// Staging/dev-only health hooks (T-411) — same gate (404 off the allowlist,
+// pinned by smoke-prod): collect the named vaults' counters now, and read the
+// report without a bearer. scripts/smoke-health-staging.ts drives both.
+app.post("/__test/health-collect", async (c) => {
+  const deps = depsFor(c.env);
+  if (!deps.exposeDevLinks) return c.notFound();
+  const only = c.req.queries("vault")?.slice(0, 100) ?? [];
+  if (only.length === 0) return c.json({ error: "name at least one ?vault=" }, 400);
+  return c.json(await collectVaultHealth(c.env, deps, { onlyVaults: only }));
+});
+app.get("/__test/health-report", async (c) => {
+  if (!depsFor(c.env).exposeDevLinks) return c.notFound();
+  return healthReportResponse(c.env, c.req.raw);
+});
+
 // Staging/dev-only snapshot-sweep trigger — same gate + rationale (404 off
 // the allowlist, pinned by smoke-prod). A stray staging caller can only take
 // policy-conformant snapshots; the GFS skip/prune bounds the work.
@@ -519,6 +535,22 @@ app.post("/__test/ops-daily-run", async (c) => {
 // The daily ops lines for an operator AGENT (Uni) without a browser: bearer
 // OPS_READ_TOKEN (a secret). Unset secret → the router's plain 404.
 app.get("/ops/daily", async (c) => (await handleOpsDailyGet(c.env, c.req.raw)) ?? c.notFound());
+
+// The health report (T-411, health-report.ts): did anything get worse for any
+// real user since yesterday or since the last deploy? Bearer OPS_READ_TOKEN
+// (the /ops/daily read secret). Unset → 404.
+app.get("/ops/health", async (c) => (await handleOpsHealthGet(c.env, c.req.raw)) ?? c.notFound());
+
+// Collect every vault's health counters NOW (normally the 03:30 rollup does
+// it), e.g. right after a deploy: bearer OPS_RUN_TOKEN. Optional repeated
+// ?vault=<name> narrows it (at most 100). Counts only in the answer.
+app.post("/ops/health/collect", async (c) => {
+  const refused = await opsBearerRefusal(c.env.OPS_RUN_TOKEN, c.req.raw);
+  if (refused === null) return c.notFound();
+  if (refused) return refused;
+  const only = c.req.queries("vault")?.slice(0, 100);
+  return c.json(await collectVaultHealth(c.env, depsFor(c.env), only?.length ? { onlyVaults: only } : {}));
+});
 
 // Re-run the backups of the vaults whose backups are stale (T-318): bearer
 // OPS_RUN_TOKEN (a secret, separate from the read token). Unset → 404.
@@ -718,6 +750,28 @@ async function fetchWithOpsCounters(req: Request, env?: Env | {}, ctx?: Executio
     const bump = bumpOpsCounter(db, "http_5xx", new Date());
     if (ctx?.waitUntil) ctx.waitUntil(bump);
     else await bump;
+  }
+  // Health counters (T-411, health-counters.ts): the route group and status
+  // class, plus whatever the handler noted (the token endpoint: grant and
+  // connector). After the response, never in its way.
+  const group = identityRouteGroup(new URL(req.url).pathname);
+  const healthNotes = takeHealthNotes(req);
+  if (db && (group || healthNotes.length)) {
+    const write = (async () => {
+      const items: Array<{ vault?: string; subject: string; outcome: string }> = group
+        ? [{ subject: `http:${group}`, outcome: httpOutcome(res.status) }]
+        : [];
+      for (const note of healthNotes) {
+        try {
+          items.push(...(await note(e as Env)));
+        } catch {
+          /* a note that fails is dropped, never the response */
+        }
+      }
+      await bumpHealth(e, items);
+    })();
+    if (ctx?.waitUntil) ctx.waitUntil(write);
+    else await write;
   }
   return res;
 }

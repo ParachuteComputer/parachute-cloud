@@ -13,6 +13,7 @@
  * one issuer — so the claim is emitted for wire-shape parity but carries no
  * per-user pin. `aud` + `scope` remain the real gates.
  */
+import { noteTokenOutcome } from "./health-counters.ts";
 import {
   AuthCodeExpiredError,
   AuthCodeNotFoundError,
@@ -286,8 +287,16 @@ export async function handleToken(db: D1Database, req: Request, deps: OAuthDeps)
     );
   }
   const grantType = String(form.get("grant_type") ?? "");
-  if (grantType === "authorization_code") return handleTokenAuthorizationCode(db, req, form, deps);
-  if (grantType === "refresh_token") return handleTokenRefresh(db, req, form, deps);
+  if (grantType === "authorization_code" || grantType === "refresh_token") {
+    const res =
+      grantType === "authorization_code"
+        ? await handleTokenAuthorizationCode(db, req, form, deps)
+        : await handleTokenRefresh(db, req, form, deps);
+    // Health counters (T-411): grant, connector class and outcome, written by
+    // the fetch wrapper after the response (health-counters.ts).
+    noteTokenOutcome(req, grantType, String(form.get("client_id") ?? ""), res);
+    return res;
+  }
   return jsonResponse(
     { error: "unsupported_grant_type", error_description: `grant_type "${grantType}" is not supported` },
     400,

@@ -52,7 +52,9 @@
 import { type BillingMode, billingMode } from "./billing-config.ts";
 import type { EmailSender } from "./email.ts";
 import type { Env } from "./env.ts";
-import { type NotifyResult, notifyOperators } from "./ops-alerts.ts";
+import { type NotifyResult, notifyOperators, raiseOpsAlert } from "./ops-alerts.ts";
+import { loadHealthRows, pruneHealthCounters } from "./health-counters.ts";
+import { buildHealthReport, type HealthReport } from "./health-report.ts";
 import { pruneOpsCounters, sumOpsCounter } from "./ops-counters.ts";
 import { sha256Hex, timingSafeEqualString } from "./crypto.ts";
 import { billingModeOf, type OAuthDeps } from "./oauth-shared.ts";
@@ -90,6 +92,12 @@ export interface DailyStats {
   errors5xx: number;
   healthOk: number;
   healthRuns: number;
+  /**
+   * Things that got worse for users (T-411, health-report.ts): findings for
+   * the day against the day before, and since the last deploy. Absent on
+   * lines stored before the health report existed.
+   */
+  healthWorse?: number;
 }
 
 /** The UTC day before `now`, "YYYY-MM-DD". */
@@ -230,6 +238,7 @@ export function renderDailyLine(s: DailyStats): string {
     `alerts ${s.alerts}`,
     `5xx ${s.errors5xx}`,
     `health ok ${s.healthOk}/${HEALTH_RUNS_PER_DAY}`,
+    ...(s.healthWorse === undefined ? [] : [`worse ${s.healthWorse}`]),
   ].join(" · ");
 }
 
@@ -253,6 +262,15 @@ export async function runDailyLine(
   const day = opts.day ?? previousUtcDay(now);
   const environment = env.ENVIRONMENT ?? "unknown";
   const stats = await collectDailyStats(env.DB, day, environment, { now, billingMode: billingMode(env) });
+  // The health report (T-411) for the same day. Its own failure domain: a
+  // broken report leaves the rest of the line intact (and says so).
+  let health: HealthReport | null = null;
+  try {
+    health = await reportForDay(env.DB, day, environment);
+    stats.healthWorse = health.worse.length;
+  } catch (err) {
+    console.error(`event=health_report_failed error=${err instanceof Error ? err.name : "error"}`);
+  }
   const line = renderDailyLine(stats);
 
   await env.DB.prepare(
@@ -268,8 +286,10 @@ export async function runDailyLine(
     text: [
       line,
       "",
+      ...(health ? [health.text, ""] : ["health report: unavailable (see event=health_report_failed)", ""]),
       "Counts only — no personal data. The last 14 days are at the top of /admin;",
-      "machine-readable at /admin/daily.json (operator session) and /ops/daily (bearer).",
+      "machine-readable at /admin/daily.json (operator session) and /ops/daily (bearer);",
+      "the health report at /ops/health (bearer).",
     ].join("\n"),
     key: `daily:${day}`,
     severity: "info",
@@ -279,7 +299,20 @@ export async function runDailyLine(
     fetchFn: opts.fetchFn,
   });
 
+  if (health && health.worse.length > 0) {
+    // Something got worse for a real user: an alert of its own, not only a
+    // number in the info line. raiseOpsAlert dedupes per key and never throws.
+    await raiseOpsAlert(env, sender, {
+      key: `health:worse:${day}`,
+      subject: `${health.worse.length} thing${health.worse.length === 1 ? "" : "s"} got worse for users (${day})`,
+      text: health.text,
+      now,
+      fetchFn: opts.fetchFn,
+    });
+  }
+
   await pruneOpsCounters(env.DB, now);
+  await pruneHealthCounters(env.DB, now);
   return { day, line, stats, notified };
 }
 
@@ -380,4 +413,36 @@ export async function handleOpsSnapshotRunPost(
     { stale_before: before.names.length, run, stale_after: after.stale, vaults: after.vaults },
     { headers: { "cache-control": "no-store" } },
   );
+}
+
+/**
+ * The health report for `day` (T-411): rows from 8 days before it (the deploy
+ * window looks a week back for the previous version) through today, so
+ * "since the last deploy" includes what was counted after the day closed.
+ */
+export async function reportForDay(db: D1Database, day: string, environment: string, now = new Date()): Promise<HealthReport> {
+  const from = new Date(Date.parse(`${day}T00:00:00Z`) - 8 * 86_400_000).toISOString().slice(0, 10);
+  const to = now.toISOString().slice(0, 10) > day ? now.toISOString().slice(0, 10) : day;
+  return buildHealthReport(await loadHealthRows(db, from, to), { day, environment });
+}
+
+/**
+ * GET /ops/health[?day=YYYY-MM-DD] — the health report for an operator agent:
+ * bearer OPS_READ_TOKEN (the same read secret as /ops/daily). Default day:
+ * yesterday (UTC). JSON with the findings and the plain text. Counts and
+ * hashes only. Unset secret → null (404).
+ */
+export async function handleOpsHealthGet(env: Env, req: Request): Promise<Response | null> {
+  const refused = await opsBearerRefusal(env.OPS_READ_TOKEN, req);
+  if (refused !== undefined) return refused;
+  return healthReportResponse(env, req);
+}
+
+/** The shared body of GET /ops/health and the staging hook. */
+export async function healthReportResponse(env: Env, req: Request): Promise<Response> {
+  const q = new URL(req.url).searchParams.get("day");
+  if (q !== null && !/^\d{4}-\d{2}-\d{2}$/.test(q)) return Response.json({ error: "day must be YYYY-MM-DD" }, { status: 400 });
+  const day = q ?? previousUtcDay(new Date());
+  const report = await reportForDay(env.DB, day, env.ENVIRONMENT ?? "unknown");
+  return Response.json(report, { headers: { "cache-control": "no-store" } });
 }

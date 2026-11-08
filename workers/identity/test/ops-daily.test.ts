@@ -135,7 +135,7 @@ describe("daily ops line", () => {
 
     const expected =
       "parachute-cloud 2026-10-27 · users 4 (+3) · active vaults 2 · notes changed 210 · storage 1.2 GB · " +
-      "voice 34 min this month · sign-ins 25 · deletions pending 1 · stale backups 1 · alerts 0 · 5xx 2 · health ok 143/144";
+      "voice 34 min this month · sign-ins 25 · deletions pending 1 · stale backups 1 · alerts 0 · 5xx 2 · health ok 143/144 · worse 0";
     expect(r.day).toBe(DAY);
     expect(r.line).toBe(expected);
 
