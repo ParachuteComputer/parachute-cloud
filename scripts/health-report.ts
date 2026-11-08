@@ -17,8 +17,9 @@
  * (findings, windows) to FILE. --gate exits 3 when anything got worse, so a
  * deploy job can stop on it. Counts and vault hashes only: nothing here can
  * name a person or a vault. --public prints only the verdict ("health: ok" or
- * "health: worse: N vaults, M rules") for a log anyone can read (deploy-prod.sh
- * in this public repo): no hashes, route or tool names, labels or traffic.
+ * "health: worse: N vaults, M rules", see publicVerdict) for a log anyone can
+ * read (deploy-prod.sh in this public repo): no hashes, route or tool names,
+ * labels or traffic, and plain errors only. It refuses --json.
  */
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -40,6 +41,8 @@ function die(msg: string): never {
 
 /** --public: a log anyone can read gets the verdict and plain errors, nothing echoed from wrangler or the data. */
 const PUBLIC = process.argv.includes("--public");
+// The full report never leaves through a side door of a public run.
+if (PUBLIC && arg("--json")) die("--public and --json don't mix: --json writes the full report");
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const day = arg("--day") ?? new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
@@ -73,7 +76,10 @@ function dataFromD1(db: string): HealthData {
     }
     if (out.status !== 0) {
       const why = PUBLIC ? "" : `: ${(out.stderr || out.stdout).split("\n").filter((l) => /error|✘/i.test(l)).slice(0, 3).join(" | ")}`;
-      die(`wrangler d1 execute failed (exit ${out.status ?? "timeout"})${why}`);
+      const how = out.error
+        ? (out.error as NodeJS.ErrnoException).code === "ETIMEDOUT" ? "timeout" : `could not run bunx (${(out.error as NodeJS.ErrnoException).code ?? "error"})`
+        : out.status !== null ? `exit ${out.status}` : `signal ${out.signal}`;
+      die(`wrangler d1 execute failed (${how})${why}`);
     }
     // wrangler --json prints the JSON array; anything before it (a banner, a
     // "[WARNING]" line) is skipped by starting at the line that opens it.
@@ -125,4 +131,12 @@ async function main(): Promise<void> {
   if (process.argv.includes("--gate") && report.worse.length > 0) process.exit(3);
 }
 
-await main();
+try {
+  await main();
+} catch (e) {
+  // Anything unexpected (a row of the wrong shape, a body that isn't JSON):
+  // under --public a fixed line, never the error's message or stack, which can
+  // quote the data.
+  if (PUBLIC) die("the health report failed on data it could not read");
+  throw e;
+}

@@ -69,7 +69,8 @@ cd "$ROOT/workers/identity"
 # OPS_RUN_TOKEN) — so a vault problem from a deploy earlier today shows in
 # tomorrow's daily line, not necessarily here.
 # --public: this repo and its workflow logs are public, so the gate prints only
-# the verdict and counts ("health: ok" / "health: worse: N vaults, M rules"),
+# the verdict and counts ("health: ok" / "health: worse: N vaults, M rules",
+# plus fleet-wide and identity/connector counts when those got worse),
 # never vault hashes, route or tool names, labels or traffic. To see what got
 # worse, run the full report where only we read it:
 #   bun scripts/health-report.ts --d1 parachute-identity

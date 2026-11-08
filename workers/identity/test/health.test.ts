@@ -140,7 +140,7 @@ describe("the report rules", () => {
     // …and no single vault is blamed for it.
     expect(r.worse.every((f) => f.who === "all vaults")).toBe(true);
     // The public gate line counts it as fleet-wide, not as vaults.
-    expect(publicVerdict(r)).toBe("health: worse: 0 vaults, 2 fleet-wide, 2 rules");
+    expect(publicVerdict(r)).toBe("health: worse: 1 fleet-wide, 2 rules");
   });
 
   test("a stranger flooding one vault while every vault has its usual few 401s raises nothing", async () => {

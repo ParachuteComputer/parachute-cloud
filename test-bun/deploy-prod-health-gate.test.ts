@@ -4,8 +4,8 @@
  * This repo is PUBLIC, and so are the logs of deploy-prod.yml. The full health
  * report (vault hashes, route and tool names, outcome labels, traffic numbers)
  * stays where only we read it (D1, `scripts/health-report.ts` run by hand or
- * from a sealed job). The gate in the public log says "ok" or "worse: N
- * vaults, M rules" and nothing else.
+ * from a sealed job). The gate in the public log says "health: ok" or
+ * "health: worse: N vaults, M rules" (see publicVerdict) and nothing else.
  *
  * The test runs the SHIPPED gate block from deploy-prod.sh, which runs the
  * real scripts/health-report.ts. Only wrangler (`bunx wrangler d1 execute`)
@@ -19,9 +19,11 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PROD = readFileSync(join(ROOT, "scripts", "deploy-prod.sh"), "utf8");
-// The gate reads "yesterday" (UTC) by the wall clock, as in a real deploy.
-const DAY = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-const PRIOR = new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
+// The gate reads "yesterday" (UTC) by the script's own clock, as in a real
+// deploy. Rows carry these placeholders; the fake wrangler fills in the two
+// days the script actually asked for, so a run across midnight still agrees.
+const DAY = "@DAY@";
+const PRIOR = "@PRIOR@";
 
 const tmp = mkdtempSync(join(tmpdir(), "health-gate-"));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -75,7 +77,7 @@ function fakeWrangler(name: string, rows: Row[]): string {
       `case "$sql" in`,
       `  *"FROM health_versions"*) cat '${dir}/live.json' ;;`,
       `  *"GROUP BY"*) cat '${dir}/versions.json' ;;`,
-      `  *) cat '${dir}/days.json' ;;`,
+      `  *) d=($(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$sql")); sed -e "s/@DAY@/\${d[0]}/g" -e "s/@PRIOR@/\${d[1]}/g" '${dir}/days.json' ;;`,
       "esac",
     ].join("\n"),
   );
@@ -167,6 +169,15 @@ describe("deploy-prod.sh — the health gate in a public log", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("could not parse");
     expect(r.out).not.toContain("marker");
+    expectNothingNamed(r.out);
+  });
+
+  it("well-formed JSON of the wrong shape: a fixed message, never the error or its stack", async () => {
+    const r = await runGate(brokenWrangler("shape", 'echo \'[{"results":{"vault":"v:deadbeef-marker"},"success":true}]\''));
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("could not read");
+    expect(r.out).not.toContain("marker");
+    expect(r.out).not.toMatch(/TypeError|\bat .*\.ts:\d+/);
     expectNothingNamed(r.out);
   });
 });
