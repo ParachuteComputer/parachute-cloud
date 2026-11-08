@@ -391,24 +391,25 @@ describe("the report rules", () => {
     expect(fleet).toEqual(["client_reason_up", "stopped_working"]);
   });
 
-  test("the fleet 'stopped working' line counts every vault that stopped, 401s included", async () => {
+  test("the fleet 'stopped working' line names the vaults refused on every request; vaults stopped by 5xx have their own lines", async () => {
     const rows: HealthRow[] = [];
     for (let i = 0; i < 20; i++) {
       rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 50 }));
       rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: i < 3 ? "5xx:502" : "4xx:401", n: 20 }));
     }
-    const stopped = (await report(rows)).worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working");
-    expect(stopped?.detail).toContain("on 20 vaults");
-    // Light vaults stopped by 5xx (below the 401 rule's baseline) are still in the count.
+    const r = await report(rows);
+    expect(r.worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working")?.detail).toContain("on 17 vaults");
+    expect(r.worse.filter((f) => f.who !== "all vaults" && f.kind === "stopped_working")).toHaveLength(3);
+    // Light vaults refused on every request are in the count too, once the busy ones clear the bars.
     const mixed: HealthRow[] = [];
     for (let i = 0; i < 10; i++) {
       mixed.push(row({ vault: `l${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 4 }));
-      mixed.push(row({ vault: `l${i}`, subject: "http:mcp", outcome: "5xx:502", n: 5 }));
+      mixed.push(row({ vault: `l${i}`, subject: "http:mcp", outcome: "4xx:401", n: 5 }));
       mixed.push(row({ vault: `b${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 50 }));
       mixed.push(row({ vault: `b${i}`, subject: "http:mcp", outcome: "4xx:401", n: 20 }));
     }
-    const both = (await report(mixed)).worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working");
-    expect(both?.detail).toContain("on 20 vaults");
+    const m = await report(mixed);
+    expect(m.worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working")?.detail).toContain("on 20 vaults");
   });
 
   test("a deploy that breaks tokens, or turns a route into 404s, on every vault is caught in the deploy window", async () => {

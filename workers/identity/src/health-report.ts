@@ -47,10 +47,9 @@
  *   - a client reason, 401 included, that rose on each vault by its own
  *     measure (≥ 3 of it, ≥ 5 requests before, its share ×2 and +10 points)
  *     — every vault's tokens failing at once;
- *   - vaults that stopped working by the per-vault bar (≥ 3 ok before, none
- *     now, ≥ 3 failures): by what no stranger can make, or with 401/403 as
- *     failures when that set clears the bars below; the line counts every
- *     vault that stopped by either measure (each once).
+ *   - vaults that stopped working because every request was refused
+ *     (401/403; ≥ 3 ok before, none now, ≥ 3 refusals) — those stopped by
+ *     anything else already have their own line, as with server errors.
  * The last two need at least 3 vaults or a tenth of the vaults seen. What a
  * stranger can make (401, 403, 404) also needs at least half of the vaults
  * that could show it in that subject (in use before, and now still working
@@ -281,8 +280,8 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
  *     beyond the vaults already reported one by one (rule 1 at fleet level);
  *   - a client reason whose share rose on each of those vaults (rule 3; 401s
  *     included — the "tokens broke" signal);
- *   - vaults that worked before and have no ok at all now (rule 4; a 404 is
- *     never a failure).
+ *   - vaults that worked before and are now refused on every request (rule 4
+ *     with 401/403 as failures; a vault stopped otherwise has its own line).
  * Each needs 3 vaults or a tenth of those seen ({@link spread}); what a
  * stranger can make (401, 403, 404) also needs {@link majority} of the vaults
  * that could show it, each with its oks at least halved.
@@ -344,20 +343,16 @@ function fleetRules(
         });
       }
     }
-    // Stopped: by what no stranger can make, on 3 vaults or a tenth; with 401/403 counted, on most of
-    // the vaults that could show it.
+    // Stopped: a vault stopped by what no stranger can make has its own line (rule 4), so — as with
+    // new server errors — the fleet line is for the rest: vaults stopped only because every request
+    // was refused (401/403). It needs the vaults that could show it, stopped with 401/403 counted, to
+    // clear the stranger bars; it then names every refused-only vault, light ones included.
     const stopped = (c: { ta: Tally; tb: Tally }, excluded: Set<string>) =>
       c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failures(c.ta, excluded) >= STOPPED_FAILURES;
-    const stoppedReal = cells.filter((c) => stopped(c, STRANGER_REASONS));
-    const stoppedRefused = couldShow.filter((c) => stopped(c, NOT_FOUND));
-    // When the 401/403 set clears its bars, the line counts every vault that stopped by either
-    // measure, each once (a light vault stopped by 5xx is in the second set only).
-    const n = strangerProof(stoppedRefused.length)
-      ? new Set([...stoppedReal, ...stoppedRefused].map((c) => c.key)).size
-      : enough(stoppedReal.length)
-        ? stoppedReal.length
-        : 0;
-    if (n > 0) out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${n} vaults that worked ${beforeLabel}` });
+    const refusedOnly = cells.filter((c) => stopped(c, NOT_FOUND) && !stopped(c, STRANGER_REASONS));
+    if (refusedOnly.length > 0 && strangerProof(couldShow.filter((c) => stopped(c, NOT_FOUND)).length)) {
+      out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${refusedOnly.length} vaults that worked ${beforeLabel}: every request refused (401/403)` });
+    }
   }
 }
 
