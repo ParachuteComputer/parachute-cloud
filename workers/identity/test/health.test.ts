@@ -266,21 +266,6 @@ describe("the report rules", () => {
     expect(r.worse).toEqual([]);
   });
 
-  test("a live version that replaced a short-lived one days ago is the day window's to judge: its scattered 500s aren't 'new'", async () => {
-    const brief = "2026-11-04t08:00:00z~aaaaaaaa";
-    const cur = "2026-11-04t10:00:00z~bbbbbbbb";
-    const rows: HealthRow[] = [
-      row({ day: "2026-11-04", version: brief, subject: "http:notes", outcome: "2xx", n: 10 }),
-      row({ day: "2026-11-05", version: cur, subject: "http:notes", outcome: "2xx", n: 100 }),
-      row({ day: "2026-11-05", version: cur, subject: "http:notes", outcome: "5xx:500", n: 3 }),
-      row({ day: PRIOR, version: cur, subject: "http:notes", outcome: "2xx", n: 100 }),
-      row({ version: cur, subject: "http:notes", outcome: "2xx", n: 100 }),
-    ];
-    const r = await report(rows, { vault: cur });
-    expect(r.windows.deploy[0]).toMatchObject({ after: cur, before: brief });
-    expect(r.worse).toEqual([]);
-  });
-
   test("after a rollback, the old version's own week of scattered 500s is not 'new' against the bad version's one day", async () => {
     const good = "2026-11-01t10:00:00z~aaaaaaaa";
     const bad = "2026-11-06t09:00:00z~bbbbbbbb";
@@ -393,6 +378,31 @@ describe("the report rules", () => {
     expect(r.worse).toMatchObject([{ window: "deploy", subject: "http:notes", kind: "new_server_errors" }]);
   });
 
+  test("a steady regression since Monday's deploy still stops Thursday's gate (the day window sees the same rate both days)", async () => {
+    const old = "2026-10-30t10:00:00z~aaaaaaaa";
+    const cur = "2026-11-03t09:00:00z~bbbbbbbb";
+    const rows: HealthRow[] = [];
+    for (const day of ["2026-11-01", "2026-11-02"]) rows.push(row({ day, version: old, subject: "http:notes", outcome: "2xx", n: 100 }));
+    for (const day of ["2026-11-03", "2026-11-04", "2026-11-05", PRIOR, DAY]) {
+      rows.push(row({ day, version: cur, subject: "http:notes", outcome: "2xx", n: 95 }));
+      rows.push(row({ day, version: cur, subject: "http:notes", outcome: "5xx:500", n: 5 }));
+    }
+    const r = await report(rows, { vault: cur });
+    expect(r.worse).toMatchObject([{ window: "deploy", subject: "http:notes", kind: "new_server_errors" }]);
+  });
+
+  test("since this morning's deploy, expired tokens on an identity route are not 'stopped working' against the old version's week", async () => {
+    const old = "2026-11-01t10:00:00z~aaaaaaaa";
+    const cur = "2026-11-08t09:00:00z~bbbbbbbb";
+    const id = (p: Partial<HealthRow> & { subject: string; outcome: string; n: number }) => row({ source: "identity", vault: "-", ...p });
+    const rows: HealthRow[] = [];
+    for (const day of ["2026-11-02", "2026-11-04", PRIOR, DAY]) rows.push(id({ day, version: old, subject: "http:account", outcome: "2xx", n: 2 }));
+    rows.push(id({ day: "2026-11-08", version: cur, subject: "http:account", outcome: "4xx:401", n: 3 }));
+    const r = await report(rows, { identity: cur });
+    expect(r.windows.deploy.map((w) => w.label)).toEqual(["identity deploy"]);
+    expect(r.worse).toEqual([]);
+  });
+
   test("after a rollback the live (older) version is 'current', so the bad one stops alarming", async () => {
     const good = "2026-11-05t10:00:00z~aaaaaaaa";
     const bad = "2026-11-06t09:00:00z~bbbbbbbb";
@@ -406,7 +416,7 @@ describe("the report rules", () => {
     const r = await report(rows, { vault: good });
     expect(r.windows.deploy[0]).toMatchObject({ after: good, before: bad });
     expect(r.worse).toEqual([]);
-    expect(r.text).toContain("vault deploy");
+    expect(r.text).toContain("vault deploy (rolled back, not judged)");
   });
 
   test("outcome classes", () => {

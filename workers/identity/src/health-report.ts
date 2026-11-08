@@ -10,8 +10,8 @@
  *   - deploy: per worker, rows counted by the LIVE version (the one last seen
  *             answering, `health_versions`) against the newest other version
  *             in the last week. Live, not "newest upload": after a rollback
- *             the bad version is newer but no longer serving. It makes
- *             findings only while the live version is young (see below).
+ *             the bad version is newer but no longer serving (a rollback is
+ *             shown, not judged).
  *
  * AT TWO LEVELS:
  *   - per cell = (worker, vault or connector, subject) — a vault shows as
@@ -38,8 +38,8 @@
  *      vault whose name they know); at fleet level and for identity's own
  *      routes and connectors they count — that is the "tokens broke" signal;
  *   4. stopped working — ok before (≥ 3), none now, and at least 3 failures
- *      now. A 404 is never a failure here; per vault a 401 or 403 is not
- *      either.
+ *      now. A 404 is never a failure here; per vault, and anywhere in the
+ *      deploy window, a 401 or 403 is not either.
  * At fleet level (the vault worker, per subject, over every vault) the same
  * questions are asked of VAULTS, not of summed requests:
  *   - new server errors on at least 3 vaults that had none before, or no
@@ -51,19 +51,19 @@
  *     before, FLEET_REAL_USE_OK, and its ok count halved) — every vault's
  *     tokens failing at once;
  *   - vaults that stopped working by the per-vault bar (≥ 3 ok before, none
- *     now, ≥ 3 failures; a 401/403 counts as a failure only on a vault with
- *     real use before).
+ *     now, ≥ 3 failures; a 401/403 counts as a failure only in the day window,
+ *     on a vault with real use before).
  * The last two need at least 3 vaults or a tenth of the vaults seen, so a
  * stranger flooding one vault, or poking a few small idle ones, makes no
  * finding. What stays open: a stranger who knows the names of 3+ vaults with
  * real use the day before and none today can still raise one — the gate's
  * HEALTH_GATE=ack is the way past it. (Telling a refused genuine token from a
  * missing or foreign one at the source would close it; not done here.)
- * The deploy window makes findings only while the live version is young
- * (uploaded since the day before `day`), and there 401/403/404 are no fleet
- * signal: a week of the earlier version against hours of the live one can't
- * show whether a vault's oks fell. A token outage right after a deploy is the
- * staging smoke's (real OAuth) to catch first, and the next day window's.
+ * In the deploy window 401/403/404 are no fleet signal and never a "stopped
+ * working" failure: a week of the earlier version against hours of the live
+ * one can't show whether a vault's oks fell. A token outage right after a
+ * deploy is the staging smoke's (real OAuth) to catch first, and the next day
+ * window's.
  * Server errors below rule 1's bar, or present both times and not rising,
  * are listed as "other server errors" — shown, never counted as worse.
  *
@@ -154,7 +154,7 @@ const CLIENT_MIN = 5;
 const CLIENT_MIN_POINTS = 0.1;
 const STOPPED_OK_BEFORE = 3;
 const STOPPED_FAILURES = 3;
-/** Left out per vault: a stranger can produce these on any vault whose name they know. */
+/** What a stranger can produce on any vault whose name they know: left out per vault, and gated at fleet level. */
 const STRANGER_REASONS = new Set(["4xx:401", "4xx:403", "4xx:404"]);
 const FLEET_MIN_VAULTS = 3;
 /** Fleet level, per vault: at least this many of the outcome, on a vault with at least this many requests before. */
@@ -244,13 +244,13 @@ function sumOf(t: Tally, outcomes: Set<string>): number {
   return n;
 }
 
-/** Rule 4's failures: everything not ok, less what is `excluded` (a 404 always; per vault 401/403 too). */
+/** Rule 4's failures: everything not ok, less what is `excluded` (a 404 always; 401/403 too where a stranger or a few expired tokens could be all there is). */
 function failures(t: Tally, excluded: Set<string>): number {
   return t.total - t.ok - sumOf(t, excluded);
 }
 
 /** Rules 1–4 on one cell (a vault, a connector, an identity route). */
-function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLabel: string, out: Compared): void {
+function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, notFailures: Set<string>, beforeLabel: string, out: Compared): void {
   const rateA = pct(ta.server, ta.total);
   const rateB = pct(tb.server, tb.total);
   if (ta.server > 0 && tb.server === 0 && (ta.server >= NEW_SERVER_MIN || rateA >= NEW_SERVER_MIN_RATE)) {
@@ -271,8 +271,7 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
       }
     }
   }
-  // Per vault, what a stranger can make (401, 403, 404) is never a failure; elsewhere only a 404 is left out.
-  if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && failures(ta, perVault ? STRANGER_REASONS : NOT_FOUND) >= STOPPED_FAILURES) {
+  if (tb.ok >= STOPPED_OK_BEFORE && ta.ok === 0 && failures(ta, notFailures) >= STOPPED_FAILURES) {
     out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working: 0 ok of ${ta.total} (${tb.ok} ok ${beforeLabel})` });
   }
 }
@@ -297,10 +296,10 @@ function fleetRules(
   b: Map<string, Tally>,
   flaggedServer: Set<string>,
   beforeLabel: string,
-  /** Both sides cover a day each. Only then can "its oks fell" tell an outage from a stranger. */
-  sameSpan: boolean,
   out: Compared,
 ): void {
+  // Both sides cover a day each only in the day window; only then can "its oks fell" tell an outage from a stranger.
+  const sameSpan = window === "day";
   const groups = new Map<string, Array<{ key: string; ta: Tally; tb: Tally }>>();
   const seenVaults = new Set<string>();
   for (const [key, ta] of a) {
@@ -349,7 +348,7 @@ function fleetRules(
       (c) =>
         c.tb.ok >= STOPPED_OK_BEFORE &&
         c.ta.ok === 0 &&
-        failures(c.ta, sameSpan && strangerSignal(c) ? NOT_FOUND : STRANGER_REASONS) >= STOPPED_FAILURES,
+        failures(c.ta, sameSpan && c.tb.ok >= FLEET_REAL_USE_OK ? NOT_FOUND : STRANGER_REASONS) >= STOPPED_FAILURES,
     );
     if (enough(stopped.length)) {
       out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${stopped.length} vaults that worked ${beforeLabel}` });
@@ -372,10 +371,14 @@ function compare(
   for (const [key, ta] of a) {
     const [source, vault, subject] = key.split("\u0000") as [string, string, string];
     const n = out.worse.length;
-    cellRules({ window, who: who(vault, subject), source, subject }, ta, b.get(key) ?? emptyTally(), vault !== "-", beforeLabel, out);
+    // Rule 4's non-failures: per vault, and anywhere in the deploy window (a week of the earlier version against
+    // hours of the live one, when a few expired tokens can be all there is), what a stranger can make; else a 404.
+    const perVault = vault !== "-";
+    const notFailures = perVault || window === "deploy" ? STRANGER_REASONS : NOT_FOUND;
+    cellRules({ window, who: who(vault, subject), source, subject }, ta, b.get(key) ?? emptyTally(), perVault, notFailures, beforeLabel, out);
     if (out.worse.slice(n).some((f) => f.kind === "new_server_errors" || f.kind === "server_errors_up")) flaggedServer.add(key);
   }
-  fleetRules(window, a, b, flaggedServer, beforeLabel, window === "day", out);
+  fleetRules(window, a, b, flaggedServer, beforeLabel, out);
   return out;
 }
 
@@ -456,14 +459,12 @@ export async function buildHealthReport(data: HealthData, opts: { day: string; e
     if (!current || !previous) continue;
     const after = mine.filter((r) => r.version === current);
     const before = mine.filter((r) => r.version === previous);
+    // After a rollback the live version is the older, good one: judging it against the bad
+    // version's short run says nothing (and its own week of strays would look "new"), so the
+    // window is shown, not judged.
     const rolledBack = previous > current;
-    windows.deploy.push(summarize(`${source} deploy${rolledBack ? " (rolled back)" : ""}`, previous, current, before, after));
-    // Findings only while the live version is young — uploaded since the start of the day before
-    // `day` — which is what the day window can't see yet (a deploy today, the report day being
-    // yesterday). An older live version is the day window's to judge: its span and the earlier
-    // one's differ too much (a week against hours) for absolute bars.
-    if (current < prior) continue;
-    addAll(result, compare("deploy", before, after, who, rolledBack ? "on the version rolled back from" : "before the deploy"));
+    windows.deploy.push(summarize(`${source} deploy${rolledBack ? " (rolled back, not judged)" : ""}`, previous, current, before, after));
+    if (!rolledBack) addAll(result, compare("deploy", before, after, who, "before the deploy"));
   }
 
   const backupRows = dayAfter.filter((r) => r.subject === "backup");
