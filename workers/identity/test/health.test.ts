@@ -502,6 +502,20 @@ describe("the report rules", () => {
     expect(r.worse.map((f) => f.reason).sort()).toEqual(["4xx:400", "4xx:429"]);
   });
 
+  test("the public gate line counts identity once, however many of its subjects got worse", async () => {
+    const id = (p: Partial<HealthRow> & { subject: string; outcome: string; n: number }) => row({ source: "identity", vault: "-", ...p });
+    const r = await report([
+      id({ day: PRIOR, subject: "http:account", outcome: "2xx", n: 100 }),
+      id({ day: PRIOR, subject: "http:token", outcome: "2xx", n: 100 }),
+      id({ subject: "http:account", outcome: "2xx", n: 90 }),
+      id({ subject: "http:account", outcome: "5xx:500", n: 10 }),
+      id({ subject: "http:token", outcome: "2xx", n: 90 }),
+      id({ subject: "http:token", outcome: "5xx:500", n: 10 }),
+    ]);
+    expect(r.worse.map((f) => f.subject).sort()).toEqual(["http:account", "http:token"]);
+    expect(publicVerdict(r)).toBe("health: worse: 1 identity/connector, 1 rule");
+  });
+
   test("a client reason on identity's own routes counts against a real baseline, and not without one", async () => {
     const id = (p: Partial<HealthRow> & { subject: string; outcome: string; n: number }) => row({ source: "identity", vault: "-", ...p });
     const withBase = await report([

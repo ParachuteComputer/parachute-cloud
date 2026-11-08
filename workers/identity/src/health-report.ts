@@ -492,20 +492,20 @@ export async function buildHealthReport(data: HealthData, opts: { day: string; e
 
 /**
  * The verdict alone, for a PUBLIC log (deploy-prod.yml in this public repo):
- * "health: ok", or "health: worse: N vaults, M rules", with "K fleet-wide" and
- * "K identity/connector" added when those got worse (each counts the distinct
- * things that did: a vault, a subject across vaults, a connector or identity
- * subject). No vault hash, route or tool name, outcome label or traffic
- * number: the full report stays where only we read it (D1, the daily mail,
+ * "health: ok", or what got worse, counted, with zero parts left out:
+ * "health: worse: 2 vaults, 1 fleet-wide, 1 identity/connector, 3 rules".
+ * Vaults are distinct vaults; fleet-wide is distinct subjects failing across
+ * vaults; identity/connector is distinct places (identity, each connector
+ * class); rules are distinct rule kinds. No vault hash, route or tool
+ * name, outcome label or traffic number: the full report stays where only we read it (D1, the daily mail,
  * scripts/health-report.ts run by hand or from a sealed job).
  */
 export function publicVerdict(r: HealthReport): string {
   if (r.worse.length === 0) return "health: ok";
   const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
-  const distinct = (fs: Finding[]) => new Set(fs.map((f) => `${f.who}|${f.subject}`)).size;
   const vaults = new Set(r.worse.filter((f) => f.who.startsWith("v:")).map((f) => f.who)).size;
-  const fleet = distinct(r.worse.filter((f) => f.who === "all vaults"));
-  const other = distinct(r.worse.filter((f) => !f.who.startsWith("v:") && f.who !== "all vaults"));
+  const fleet = new Set(r.worse.filter((f) => f.who === "all vaults").map((f) => f.subject)).size;
+  const other = new Set(r.worse.filter((f) => !f.who.startsWith("v:") && f.who !== "all vaults").map((f) => f.who)).size;
   const parts: string[] = [];
   if (vaults) parts.push(plural(vaults, "vault"));
   if (fleet) parts.push(`${fleet} fleet-wide`);

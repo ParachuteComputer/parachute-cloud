@@ -17,7 +17,7 @@
  * (findings, windows) to FILE. --gate exits 3 when anything got worse, so a
  * deploy job can stop on it. Counts and vault hashes only: nothing here can
  * name a person or a vault. --public prints only the verdict ("health: ok" or
- * "health: worse: N vaults, M rules", see publicVerdict) for a log anyone can
+ * e.g. "health: worse: 2 vaults, 1 rule", see publicVerdict) for a log anyone can
  * read (deploy-prod.sh in this public repo): no hashes, route or tool names,
  * labels or traffic, and plain errors only. It refuses --json.
  */
@@ -42,7 +42,7 @@ function die(msg: string): never {
 /** --public: a log anyone can read gets the verdict and plain errors, nothing echoed from wrangler or the data. */
 const PUBLIC = process.argv.includes("--public");
 // The full report never leaves through a side door of a public run.
-if (PUBLIC && arg("--json")) die("--public and --json don't mix: --json writes the full report");
+if (PUBLIC && process.argv.includes("--json")) die("--public and --json don't mix: --json writes the full report");
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const day = arg("--day") ?? new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
@@ -70,24 +70,32 @@ function dataFromD1(db: string): HealthData {
       maxBuffer: 256 * 1024 * 1024,
       timeout: 120_000,
     });
-    if (out.status !== 0 && /no such table: health_/.test(out.stdout + out.stderr)) {
+    // Null when bunx could not start at all (ENOENT): read them as empty.
+    const stdout = out.stdout ?? "";
+    const stderr = out.stderr ?? "";
+    if (out.status !== 0 && /no such table: health_/.test(stdout + stderr)) {
       console.log("no health counters yet: the tables arrive with this release's migration (nothing to compare)");
       process.exit(0);
     }
     if (out.status !== 0) {
-      const why = PUBLIC ? "" : `: ${(out.stderr || out.stdout).split("\n").filter((l) => /error|✘/i.test(l)).slice(0, 3).join(" | ")}`;
-      const how = out.error
-        ? (out.error as NodeJS.ErrnoException).code === "ETIMEDOUT" ? "timeout" : `could not run bunx (${(out.error as NodeJS.ErrnoException).code ?? "error"})`
-        : out.status !== null ? `exit ${out.status}` : `signal ${out.signal}`;
+      const lines = PUBLIC ? [] : (stderr || stdout).split("\n").filter((l) => /error|✘/i.test(l)).slice(0, 3);
+      const why = lines.length ? `: ${lines.join(" | ")}` : "";
+      const code = (out.error as NodeJS.ErrnoException | undefined)?.code;
+      let how: string;
+      if (code === "ETIMEDOUT") how = "timeout";
+      else if (code === "ENOENT" || code === "EACCES") how = `could not run bunx: ${code}`;
+      else if (code) how = code; // e.g. ENOBUFS: wrangler ran, its output was too big
+      else if (out.status !== null) how = `exit ${out.status}`;
+      else how = `signal ${out.signal}`;
       die(`wrangler d1 execute failed (${how})${why}`);
     }
     // wrangler --json prints the JSON array; anything before it (a banner, a
     // "[WARNING]" line) is skipped by starting at the line that opens it.
-    const at = out.stdout.search(/^\[\s*$|^\[\s*\{/m);
+    const at = stdout.search(/^\[\s*$|^\[\s*\{/m);
     if (at < 0) die("wrangler printed no JSON result");
     let parsed: Array<{ results?: Array<Record<string, unknown>>; success?: boolean }>;
     try {
-      parsed = JSON.parse(out.stdout.slice(at));
+      parsed = JSON.parse(stdout.slice(at));
     } catch {
       die("wrangler printed JSON the report could not parse"); // never the parser's message: it can echo the data
     }
@@ -134,9 +142,10 @@ async function main(): Promise<void> {
 try {
   await main();
 } catch (e) {
-  // Anything unexpected (a row of the wrong shape, a body that isn't JSON):
-  // under --public a fixed line, never the error's message or stack, which can
-  // quote the data.
-  if (PUBLIC) die("the health report failed on data it could not read");
+  // Anything unexpected (a row of the wrong shape, a body that isn't JSON, a
+  // bug): under --public a fixed line with the error's class only, never its
+  // message or stack, which can quote the data. The class tells a crash
+  // (TypeError …) from bad input (SyntaxError) without reading the data.
+  if (PUBLIC) die(`the health report failed (${e instanceof Error && /^[A-Za-z]{1,40}$/.test(e.name) ? e.name : "error"}): run it in full where only we read it`);
   throw e;
 }

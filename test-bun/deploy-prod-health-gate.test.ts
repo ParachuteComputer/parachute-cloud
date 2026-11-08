@@ -4,8 +4,8 @@
  * This repo is PUBLIC, and so are the logs of deploy-prod.yml. The full health
  * report (vault hashes, route and tool names, outcome labels, traffic numbers)
  * stays where only we read it (D1, `scripts/health-report.ts` run by hand or
- * from a sealed job). The gate in the public log says "health: ok" or
- * "health: worse: N vaults, M rules" (see publicVerdict) and nothing else.
+ * from a sealed job). The gate in the public log says "health: ok" or counts
+ * only, e.g. "health: worse: 1 vault, 1 rule" (see publicVerdict).
  *
  * The test runs the SHIPPED gate block from deploy-prod.sh, which runs the
  * real scripts/health-report.ts. Only wrangler (`bunx wrangler d1 execute`)
@@ -77,7 +77,8 @@ function fakeWrangler(name: string, rows: Row[]): string {
       `case "$sql" in`,
       `  *"FROM health_versions"*) cat '${dir}/live.json' ;;`,
       `  *"GROUP BY"*) cat '${dir}/versions.json' ;;`,
-      `  *) d=($(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$sql")); sed -e "s/@DAY@/\${d[0]}/g" -e "s/@PRIOR@/\${d[1]}/g" '${dir}/days.json' ;;`,
+      // The later of the two dates is the day, whichever order the SQL names them in.
+      `  *) d=($(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$sql" | sort -r)); sed -e "s/@DAY@/\${d[0]}/g" -e "s/@PRIOR@/\${d[1]}/g" '${dir}/days.json' ;;`,
       "esac",
     ].join("\n"),
   );
@@ -175,9 +176,10 @@ describe("deploy-prod.sh — the health gate in a public log", () => {
   it("well-formed JSON of the wrong shape: a fixed message, never the error or its stack", async () => {
     const r = await runGate(brokenWrangler("shape", 'echo \'[{"results":{"vault":"v:deadbeef-marker"},"success":true}]\''));
     expect(r.code).toBe(0);
-    expect(r.out).toContain("could not read");
+    expect(r.out).toContain("the health report failed (TypeError)");
     expect(r.out).not.toContain("marker");
-    expect(r.out).not.toMatch(/TypeError|\bat .*\.ts:\d+/);
+    // The class name is fine; its message ("… is not a function") and the stack are not.
+    expect(r.out).not.toMatch(/is not|undefined|\bat .*\.ts:\d+/);
     expectNothingNamed(r.out);
   });
 });
