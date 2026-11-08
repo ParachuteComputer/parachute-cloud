@@ -48,8 +48,9 @@
  *     measure (≥ 3 of it, ≥ 5 requests before, its share ×2 and +10 points)
  *     — every vault's tokens failing at once;
  *   - vaults that stopped working by the per-vault bar (≥ 3 ok before, none
- *     now, ≥ 3 failures): counted with 401/403 as failures when that set
- *     clears the bars below, else without them.
+ *     now, ≥ 3 failures): by what no stranger can make, or with 401/403 as
+ *     failures when that set clears the bars below; the line counts every
+ *     vault that stopped by either measure (each once).
  * The last two need at least 3 vaults or a tenth of the vaults seen. What a
  * stranger can make (401, 403, 404) also needs at least half of the vaults
  * that could show it in that subject (in use before, and now still working
@@ -349,12 +350,13 @@ function fleetRules(
       c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failures(c.ta, excluded) >= STOPPED_FAILURES;
     const stoppedReal = cells.filter((c) => stopped(c, STRANGER_REASONS));
     const stoppedRefused = couldShow.filter((c) => stopped(c, NOT_FOUND));
-    // The line counts the set that passed its bars: with 401/403 counted when that holds (it then
-    // includes the others in use), else by what no stranger can make. Each vault in the latter also
-    // has its own per-vault line.
-    let n = 0;
-    if (strangerProof(stoppedRefused.length)) n = stoppedRefused.length;
-    else if (enough(stoppedReal.length)) n = stoppedReal.length;
+    // When the 401/403 set clears its bars, the line counts every vault that stopped by either
+    // measure, each once (a light vault stopped by 5xx is in the second set only).
+    const n = strangerProof(stoppedRefused.length)
+      ? new Set([...stoppedReal, ...stoppedRefused].map((c) => c.key)).size
+      : enough(stoppedReal.length)
+        ? stoppedReal.length
+        : 0;
     if (n > 0) out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${n} vaults that worked ${beforeLabel}` });
   }
 }

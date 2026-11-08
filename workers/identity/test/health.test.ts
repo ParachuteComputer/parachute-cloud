@@ -399,6 +399,16 @@ describe("the report rules", () => {
     }
     const stopped = (await report(rows)).worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working");
     expect(stopped?.detail).toContain("on 20 vaults");
+    // Light vaults stopped by 5xx (below the 401 rule's baseline) are still in the count.
+    const mixed: HealthRow[] = [];
+    for (let i = 0; i < 10; i++) {
+      mixed.push(row({ vault: `l${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 4 }));
+      mixed.push(row({ vault: `l${i}`, subject: "http:mcp", outcome: "5xx:502", n: 5 }));
+      mixed.push(row({ vault: `b${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 50 }));
+      mixed.push(row({ vault: `b${i}`, subject: "http:mcp", outcome: "4xx:401", n: 20 }));
+    }
+    const both = (await report(mixed)).worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working");
+    expect(both?.detail).toContain("on 20 vaults");
   });
 
   test("a deploy that breaks tokens, or turns a route into 404s, on every vault is caught in the deploy window", async () => {
