@@ -29,7 +29,7 @@ import {
   IF_UPDATED_AT_HINT,
 } from "@openparachute/core/src/notes.js";
 import { applyContentRange } from "@openparachute/core/src/content-range.js";
-import { attachValidationStatus, enforceStrictWrite } from "@openparachute/core/src/mcp.js";
+import { attachValidationStatus, enforceStrictWrite, resolveNoteExact } from "@openparachute/core/src/mcp.js";
 import { expandContent } from "@openparachute/core/src/expand.js";
 import { transactionAsync } from "@openparachute/core/src/txn.js";
 import { normalizePath } from "@openparachute/core/src/paths.js";
@@ -1742,15 +1742,23 @@ async function handleNotesInner(
 
   // DELETE /notes/:idOrPath
   if (method === "DELETE") {
-    const note = await resolveNote(store, idOrPath);
-    if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
-    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
     // T-412: `?erase_history=true` also erases every version (no tombstone); the DO gate already required admin for
-    // any value but false. Same shape as the bun door.
+    // any value but false. Erasing can't be undone, so it takes only an exact id or path (core's resolveNoteExact:
+    // no case folding, no H1 title). Same shape as the bun door.
     const erase = new URL(req.url).searchParams.get("erase_history");
     if (erase !== null && erase !== "true" && erase !== "false") {
       return json({ error: "erase_history must be true or false", error_type: "invalid_request", field: "erase_history" }, 400);
     }
+    let note: Note | null;
+    try {
+      note = erase === "true" ? resolveNoteExact(store.db, idOrPath) : await resolveNote(store, idOrPath);
+    } catch (e) {
+      const r = ambiguousPathResponse(e);
+      if (r) return r;
+      throw e;
+    }
+    if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
+    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (erase === "true") {
       const r = await store.forgetNote(note.id);
       return json({ deleted: true, id: note.id, history_erased: { versions_deleted: r.versionsDeleted, blobs_deleted: r.blobsDeleted } });

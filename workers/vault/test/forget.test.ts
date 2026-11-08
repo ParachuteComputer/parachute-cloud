@@ -56,6 +56,24 @@ describe("deleting can forget (T-412)", () => {
     expect((await op(v, `/api/notes/${odd}`)).status).toBe(200);
   });
 
+  it("erases only the note named exactly: no case folding, no H1 title", async () => {
+    const v = freshVault("forgetx");
+    const upper = await withHistory(v, "x/Today");
+    const lower = await withHistory(v, "x/today");
+    const solo = await withHistory(v, "x/Solo");
+    expect((await op(v, `/api/notes/${encodeURIComponent("x/solo")}?erase_history=true`, { method: "DELETE" })).status).toBe(404);
+    expect((await op(v, `/api/notes/${solo}`)).status).toBe(200);
+    const r = await op(v, `/api/notes/${encodeURIComponent("x/today")}?erase_history=true`, { method: "DELETE" });
+    expect(r.status).toBe(200);
+    expect(((await r.json()) as any).id).toBe(lower);
+    expect((await op(v, `/api/notes/${upper}`)).status).toBe(200);
+    const admin = await mintToken({ vault: v, scopes: `vault:${v}:read vault:${v}:write vault:${v}:admin` });
+    const titled = await createNote(v, { path: "x/titled", content: "# Quarterly made-up plan\nbody" });
+    const byTitle = await deleteNoteTool(v, admin, { ids: ["Quarterly made-up plan"], erase_history: true });
+    expect(() => toolResult(byTitle)).toThrow(/not found|not_found/i);
+    expect((await op(v, `/api/notes/${titled.id}`)).status).toBe(200);
+  });
+
   it("needs admin: a write pass is refused on REST and MCP, and the notes stay", async () => {
     const v = freshVault("forgetw");
     const id = await withHistory(v, "f/kept");
