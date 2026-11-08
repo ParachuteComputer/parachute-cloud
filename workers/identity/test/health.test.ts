@@ -66,10 +66,7 @@ function data(rows: HealthRow[], live: Record<string, string> = {}): HealthData 
   }
   return { days: rows.filter((r) => r.day === DAY || r.day === PRIOR), versions: [...sums.values()], live };
 }
-/** The report as run at 21:00 UTC on DAY (the deploy window's hours count to "now"). */
-const NOW = Date.parse(`${DAY}T21:00:00Z`);
-const report = (rows: HealthRow[], live: Record<string, string> = {}) =>
-  buildHealthReport(data(rows, live), { day: DAY, environment: "production", now: NOW });
+const report = (rows: HealthRow[], live: Record<string, string> = {}) => buildHealthReport(data(rows, live), { day: DAY, environment: "production" });
 
 describe("the report rules", () => {
   test("a planted 500 on one vault is caught; the other vault, same traffic, stays quiet", async () => {
@@ -236,7 +233,7 @@ describe("the report rules", () => {
     expect(fleet).toEqual(["all vaults:client_reason_up:4xx:403", "all vaults:stopped_working:"]);
   });
 
-  test("since a deploy this morning, the old version's week is scaled to the same hours: stale tokens on idle vaults raise nothing", async () => {
+  test("since a deploy this morning, a week of the old version is no 'before' for 401s: stale tokens on idle vaults raise nothing", async () => {
     const old = "2026-10-31t10:00:00z~aaaaaaaa";
     const cur = "2026-11-07t09:00:00z~bbbbbbbb";
     const rows: HealthRow[] = [];
@@ -252,7 +249,7 @@ describe("the report rules", () => {
     expect(r.worse).toEqual([]);
   });
 
-  test("a deploy at 15:00, read at 21:00: six hours of busy vaults' oks are not 'halved' against a whole day, so a stranger's 401s raise nothing", async () => {
+  test("a deploy at 15:00: hours of busy vaults' oks are not 'halved' against a week, so a stranger's 401s raise nothing", async () => {
     const old = "2026-11-01t10:00:00z~aaaaaaaa";
     const cur = "2026-11-07t15:00:00z~bbbbbbbb";
     const rows: HealthRow[] = [];
@@ -269,7 +266,7 @@ describe("the report rules", () => {
     expect(r.worse).toEqual([]);
   });
 
-  test("a version that replaced a short-lived one days ago: its days are scaled to that one's hours, so scattered 500s aren't 'new'", async () => {
+  test("a live version that replaced a short-lived one days ago is the day window's to judge: its scattered 500s aren't 'new'", async () => {
     const brief = "2026-11-04t08:00:00z~aaaaaaaa";
     const cur = "2026-11-04t10:00:00z~bbbbbbbb";
     const rows: HealthRow[] = [
@@ -282,7 +279,6 @@ describe("the report rules", () => {
     const r = await report(rows, { vault: cur });
     expect(r.windows.deploy[0]).toMatchObject({ after: cur, before: brief });
     expect(r.worse).toEqual([]);
-    expect(r.otherServerErrors).toHaveLength(1);
   });
 
   test("after a rollback, the old version's own week of scattered 500s is not 'new' against the bad version's one day", async () => {
@@ -384,6 +380,17 @@ describe("the report rules", () => {
     expect(kinds).toContain("day:do:new_server_errors");
     // The same finding is not repeated for the deploy window.
     expect(kinds.filter((k) => k.includes("do:new_server_errors"))).toHaveLength(1);
+  });
+
+  test("a deploy this morning that breaks a route is caught the same day, before the day window can see it", async () => {
+    const old = "2026-11-01t10:00:00z~aaaaaaaa";
+    const cur = "2026-11-08t09:00:00z~bbbbbbbb";
+    const rows: HealthRow[] = [];
+    for (const day of ["2026-11-05", PRIOR, DAY]) rows.push(...normalDay("vault-id-a", day, old));
+    rows.push(row({ day: "2026-11-08", version: cur, subject: "http:notes", outcome: "2xx", n: 20 }));
+    rows.push(row({ day: "2026-11-08", version: cur, subject: "http:notes", outcome: "5xx:500", n: 8 }));
+    const r = await report(rows, { vault: cur });
+    expect(r.worse).toMatchObject([{ window: "deploy", subject: "http:notes", kind: "new_server_errors" }]);
   });
 
   test("after a rollback the live (older) version is 'current', so the bad one stops alarming", async () => {
