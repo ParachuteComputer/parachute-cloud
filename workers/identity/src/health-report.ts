@@ -328,9 +328,9 @@ function fleetRules(
     for (const outcome of reasons) {
       // A vault counts when its own change looks real: a few of it, on a vault that was in use.
       const strangerMade = STRANGER_REASONS.has(outcome);
-      const rose = (strangerMade ? couldShow.filter((c) => c.ta.ok <= c.tb.ok / 2) : cells).filter(
-        (c) => (c.ta.byOutcome.get(outcome) ?? 0) >= FLEET_VAULT_MIN && c.tb.total >= FLEET_VAULT_BASELINE && shareRose(c.ta, c.tb, outcome),
-      );
+      // (couldShow already holds the ≥ 5-requests-before baseline.)
+      const inUse = strangerMade ? couldShow.filter((c) => c.ta.ok <= c.tb.ok / 2) : cells.filter((c) => c.tb.total >= FLEET_VAULT_BASELINE);
+      const rose = inUse.filter((c) => (c.ta.byOutcome.get(outcome) ?? 0) >= FLEET_VAULT_MIN && shareRose(c.ta, c.tb, outcome));
       const na = rose.reduce((s, c) => s + (c.ta.byOutcome.get(outcome) ?? 0), 0);
       const wide = strangerMade ? strangerProof(rose.length) : enough(rose.length);
       if (wide && na >= CLIENT_MIN) {
@@ -346,9 +346,14 @@ function fleetRules(
     // the vaults that could show it.
     const stopped = (c: { ta: Tally; tb: Tally }, excluded: Set<string>) =>
       c.tb.ok >= STOPPED_OK_BEFORE && c.ta.ok === 0 && failures(c.ta, excluded) >= STOPPED_FAILURES;
-    const real = cells.filter((c) => stopped(c, STRANGER_REASONS)).length;
-    const any = couldShow.filter((c) => stopped(c, NOT_FOUND)).length;
-    const n = strangerProof(any) ? any : enough(real) ? real : 0;
+    const stoppedReal = cells.filter((c) => stopped(c, STRANGER_REASONS));
+    const stoppedRefused = couldShow.filter((c) => stopped(c, NOT_FOUND));
+    // When the 401/403 count holds, report every vault that stopped, by either measure.
+    const n = strangerProof(stoppedRefused.length)
+      ? new Set([...stoppedReal, ...stoppedRefused].map((c) => c.key)).size
+      : enough(stoppedReal.length)
+        ? stoppedReal.length
+        : 0;
     if (n > 0) out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${n} vaults that worked ${beforeLabel}` });
   }
 }

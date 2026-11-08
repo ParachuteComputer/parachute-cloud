@@ -364,6 +364,20 @@ describe("the report rules", () => {
     expect((await report(rows)).worse).toEqual([]);
   });
 
+  test("tool errors on brand-new vaults (no use before) are not a fleet rise; on vaults in use they are", async () => {
+    const build = (before: number) => {
+      const rows: HealthRow[] = [];
+      for (let i = 0; i < 5; i++) {
+        if (before) rows.push(row({ vault: `v${i}`, day: PRIOR, subject: "mcp:create-note", outcome: "ok", n: before }));
+        rows.push(row({ vault: `v${i}`, subject: "mcp:create-note", outcome: "ok", n: 2 }));
+        rows.push(row({ vault: `v${i}`, subject: "mcp:create-note", outcome: "tool_error", n: 3 }));
+      }
+      return rows;
+    };
+    expect((await report(build(0))).worse).toEqual([]);
+    expect((await report(build(10))).worse.map((f) => `${f.who}:${f.kind}`)).toEqual(["all vaults:client_reason_up"]);
+  });
+
   test("vaults that only ever see stale tokens (no ok before) don't dilute a real token outage", async () => {
     const rows: HealthRow[] = [];
     for (let i = 0; i < 12; i++) {
@@ -385,6 +399,16 @@ describe("the report rules", () => {
     }
     const stopped = (await report(rows)).worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working");
     expect(stopped?.detail).toContain("on 20 vaults");
+    // Light vaults stopped by 5xx (below the 401 rule's baseline) are still in the count.
+    const mixed: HealthRow[] = [];
+    for (let i = 0; i < 10; i++) {
+      mixed.push(row({ vault: `l${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 4 }));
+      mixed.push(row({ vault: `l${i}`, subject: "http:mcp", outcome: "5xx:502", n: 5 }));
+      mixed.push(row({ vault: `b${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 50 }));
+      mixed.push(row({ vault: `b${i}`, subject: "http:mcp", outcome: "4xx:401", n: 20 }));
+    }
+    const both = (await report(mixed)).worse.find((f) => f.who === "all vaults" && f.kind === "stopped_working");
+    expect(both?.detail).toContain("on 20 vaults");
   });
 
   test("a deploy that breaks tokens, or turns a route into 404s, on every vault is caught in the deploy window", async () => {
