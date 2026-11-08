@@ -78,16 +78,16 @@ function dataFromD1(db: string): HealthData {
       process.exit(0);
     }
     if (out.status !== 0) {
-      const lines = PUBLIC ? [] : (stderr || stdout).split("\n").filter((l) => /error|✘/i.test(l)).slice(0, 3);
+      const lines = PUBLIC ? [] : `${stderr}\n${stdout}`.split("\n").filter((l) => /error|✘/i.test(l)).slice(0, 3);
       const why = lines.length ? `: ${lines.join(" | ")}` : "";
       const code = (out.error as NodeJS.ErrnoException | undefined)?.code;
-      let how: string;
-      if (code === "ETIMEDOUT") how = "timeout";
-      else if (code === "ENOENT" || code === "EACCES") how = `could not run bunx: ${code}`;
-      else if (code) how = code; // e.g. ENOBUFS: wrangler ran, its output was too big
-      else if (out.status !== null) how = `exit ${out.status}`;
-      else how = `signal ${out.signal}`;
-      die(`wrangler d1 execute failed (${how})${why}`);
+      const how: string[] = [];
+      if (typeof out.status === "number") how.push(`exit ${out.status}`);
+      else if (out.signal && code !== "ETIMEDOUT") how.push(`signal ${out.signal}`);
+      if (code === "ETIMEDOUT") how.push("timeout");
+      else if (code === "ENOENT" || code === "EACCES") how.push(`could not run bunx: ${code}`);
+      else if (code) how.push(code); // e.g. ENOBUFS: wrangler ran, its output was too big
+      die(`wrangler d1 execute failed (${how.join(", ") || "unknown"})${why}`);
     }
     // wrangler --json prints the JSON array; anything before it (a banner, a
     // "[WARNING]" line) is skipped by starting at the line that opens it.
@@ -114,7 +114,12 @@ function dataFromD1(db: string): HealthData {
 
 async function fromUrl(base: string, tokenFile: string): Promise<HealthReport> {
   const token = readFileSync(tokenFile, "utf8").trim();
-  const res = await fetch(`${base.replace(/\/$/, "")}/ops/health?day=${day}`, { headers: { authorization: `Bearer ${token}` } });
+  let res: Response;
+  try {
+    res = await fetch(`${base.replace(/\/$/, "")}/ops/health?day=${day}`, { headers: { authorization: `Bearer ${token}` } });
+  } catch {
+    die("GET /ops/health failed (network)"); // its own line: a fetch failure is a TypeError too
+  }
   if (res.status !== 200) die(`GET /ops/health → ${res.status}`);
   return (await res.json()) as HealthReport;
 }

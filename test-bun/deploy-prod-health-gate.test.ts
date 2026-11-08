@@ -178,8 +178,14 @@ describe("deploy-prod.sh — the health gate in a public log", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("the health report failed (TypeError)");
     expect(r.out).not.toContain("marker");
-    // The class name is fine; its message ("… is not a function") and the stack are not.
-    expect(r.out).not.toMatch(/is not|undefined|\bat .*\.ts:\d+/);
+    // Exactly the fixed line, the gate's warning and the test's marker: no message, no stack.
+    expect(r.out.trim().split("\n").sort()).toEqual(
+      [
+        "GATE-PASSED",
+        "the health report failed (TypeError): run it in full where only we read it",
+        "WARNING: the health report could not be read (exit 1); deploying without the gate.",
+      ].sort(),
+    );
     expectNothingNamed(r.out);
   });
 });
