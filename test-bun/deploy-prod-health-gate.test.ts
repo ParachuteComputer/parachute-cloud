@@ -188,4 +188,26 @@ describe("deploy-prod.sh — the health gate in a public log", () => {
     );
     expectNothingNamed(r.out);
   });
+
+  it("no bunx at all: says so, not 'exit undefined'", async () => {
+    // A PATH holding only bun: the script's spawn of bunx fails with ENOENT.
+    const bin = join(tmp, "nobunx");
+    Bun.spawnSync(["mkdir", "-p", bin]);
+    Bun.spawnSync(["ln", "-sf", process.execPath, join(bin, "bun")]);
+    const p = Bun.spawnSync([process.execPath, "scripts/health-report.ts", "--d1", "parachute-identity", "--gate", "--public"], {
+      cwd: ROOT,
+      env: { ...process.env, PATH: `${bin}:/usr/bin:/bin` },
+    });
+    const out = p.stdout.toString() + p.stderr.toString();
+    expect(p.exitCode).toBe(1);
+    expect(out.trim()).toBe("wrangler d1 execute failed (could not run bunx: ENOENT)");
+  });
+
+  it("--url that can't connect: a network failure, named as one, nothing else in public", async () => {
+    const tok = join(tmp, "token");
+    writeFileSync(tok, "not-a-real-token\n");
+    const p = Bun.spawnSync([process.execPath, "scripts/health-report.ts", "--url", "http://127.0.0.1:1", "--token-file", tok, "--gate", "--public"], { cwd: ROOT });
+    expect(p.exitCode).toBe(1);
+    expect((p.stdout.toString() + p.stderr.toString()).trim()).toBe("GET /ops/health failed (network)");
+  });
 });

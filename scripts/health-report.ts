@@ -83,7 +83,7 @@ function dataFromD1(db: string): HealthData {
       const code = (out.error as NodeJS.ErrnoException | undefined)?.code;
       const how: string[] = [];
       if (typeof out.status === "number") how.push(`exit ${out.status}`);
-      else if (out.signal && code !== "ETIMEDOUT") how.push(`signal ${out.signal}`);
+      else if (out.signal && !code) how.push(`signal ${out.signal}`); // with a code, spawnSync killed it itself
       if (code === "ETIMEDOUT") how.push("timeout");
       else if (code === "ENOENT" || code === "EACCES") how.push(`could not run bunx: ${code}`);
       else if (code) how.push(code); // e.g. ENOBUFS: wrangler ran, its output was too big
@@ -114,11 +114,13 @@ function dataFromD1(db: string): HealthData {
 
 async function fromUrl(base: string, tokenFile: string): Promise<HealthReport> {
   const token = readFileSync(tokenFile, "utf8").trim();
+  if (!URL.canParse(base) || !/^https?:$/.test(new URL(base).protocol)) die("--url takes an http(s) origin");
   let res: Response;
   try {
     res = await fetch(`${base.replace(/\/$/, "")}/ops/health?day=${day}`, { headers: { authorization: `Bearer ${token}` } });
-  } catch {
-    die("GET /ops/health failed (network)"); // its own line: a fetch failure is a TypeError too
+  } catch (e) {
+    // Its own line: a fetch failure is a TypeError too. The cause only where we read it.
+    die(`GET /ops/health failed (network)${PUBLIC ? "" : `: ${(e as Error).message}`}`);
   }
   if (res.status !== 200) die(`GET /ops/health → ${res.status}`);
   return (await res.json()) as HealthReport;
