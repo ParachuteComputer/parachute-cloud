@@ -249,8 +249,12 @@ describe("the report rules", () => {
       working.push(row({ vault: `w${i}`, version: cur, subject: "http:mcp", outcome: "2xx", n: 25 }));
     }
     expect((await report([...stale, ...working], { vault: cur })).worse).toEqual([]);
-    // If those three are every vault seen since the deploy, nothing tells them from an outage: flagged.
-    expect((await report(stale, { vault: cur })).worse.map((f) => `${f.who}:${f.kind}`)).toContain("all vaults:client_reason_up");
+    // If those three are every vault seen since a deploy made today (after the report day, so only the
+    // deploy window sees it), nothing tells them from an outage: flagged there.
+    const today = "2026-11-08t09:00:00z~cccccccc";
+    const outage = stale.map((r) => (r.version === cur ? { ...r, day: "2026-11-08", version: today } : r));
+    const kinds = (await report(outage, { vault: today })).worse.map((f) => `${f.who}:${f.window}:${f.kind}`);
+    expect(kinds).toContain("all vaults:deploy:client_reason_up");
   });
 
   test("a quiet day (oks halve everywhere) plus a stranger's 401s on three vaults raises nothing", async () => {
@@ -311,6 +315,24 @@ describe("the report rules", () => {
       rows.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: i < 3 ? "4xx:401" : "2xx", n: i < 3 ? 5 : 2 }));
     }
     expect((await report(rows)).worse).toEqual([]);
+  });
+
+  test("one routine 401 a day on many light vaults, on a quieter day, is not a fleet alert; nor a stranger's single 401 on a few", async () => {
+    const quiet: HealthRow[] = [];
+    for (let i = 0; i < 20; i++) {
+      quiet.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 6 }));
+      quiet.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "4xx:401", n: 1 }));
+      quiet.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "2xx", n: 2 }));
+      quiet.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "4xx:401", n: 1 }));
+    }
+    expect((await report(quiet)).worse).toEqual([]);
+    const poked: HealthRow[] = [];
+    for (let i = 0; i < 10; i++) {
+      poked.push(row({ vault: `v${i}`, day: PRIOR, subject: "http:mcp", outcome: "2xx", n: 20 }));
+      if (i < 2) poked.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "2xx", n: 20 }));
+      else if (i < 7) poked.push(row({ vault: `v${i}`, subject: "http:mcp", outcome: "4xx:401", n: 1 }));
+    }
+    expect((await report(poked)).worse).toEqual([]);
   });
 
   test("vaults that only ever see stale tokens (no ok before) don't dilute a real token outage", async () => {

@@ -45,14 +45,14 @@
  *     traffic at all then (beyond those already reported one by one) — one
  *     new 500 on each of many vaults;
  *   - a client reason, 401 included, that rose on each vault by its own
- *     measure (≥ 3 of it, ≥ 5 requests before, share ×2 and +10 points) —
- *     every vault's tokens failing at once;
+ *     measure (≥ 3 of it, ≥ 5 requests before, its share ×2 and +10 points)
+ *     — every vault's tokens failing at once;
  *   - vaults that stopped working by the per-vault bar (≥ 3 ok before, none
  *     now, ≥ 3 failures; a 401/403 counted).
  * The last two need at least 3 vaults or a tenth of the vaults seen — except
  * for what a stranger can make (401, 403, 404): that needs at least half of
- * the vaults that worked before (≥ 3 ok) and are seen now in that subject,
- * and 3. A stranger reaches only the vaults whose names they know; a token
+ * the vaults that could show it, and 3 — those that worked before (≥ 3 ok)
+ * and now either still work or had ≥ 3 requests in that subject. A stranger reaches only the vaults whose names they know; a token
  * outage or a broken route reaches nearly all of them, in either window,
  * whatever the spans. To raise one, a stranger must poke as many previously-
  * used vaults as are in use now (with only a few vaults seen, 3); the gate's
@@ -155,7 +155,7 @@ const FLEET_VAULT_MIN = 3;
 const FLEET_VAULT_BASELINE = 5;
 /**
  * Fleet level, for what a stranger can make (STRANGER_REASONS): the change must
- * be on at least this share of the vaults that worked before and are seen now.
+ * be on at least this share of the vaults that could show it ({@link majority}).
  * A stranger reaches only the vaults whose names they know; a token outage or a
  * broken route reaches nearly every vault in use. Whatever the window's spans.
  */
@@ -192,6 +192,11 @@ function tally(rows: HealthRow[]): Map<string, Tally> {
     add(t, r.outcome, r.n);
   }
   return out;
+}
+
+/** Enough vaults for a fleet finding on what a stranger can make: at least 3, and at least half of those that could show it. */
+function majority(vaults: number, couldShow: number): boolean {
+  return vaults >= Math.max(FLEET_MIN_VAULTS, Math.ceil(FLEET_STRANGER_SHARE * couldShow));
 }
 
 /** Enough vaults for a fleet finding: at least 3, or a tenth of the vaults seen, whichever is more. */
@@ -277,8 +282,8 @@ function cellRules(base: Base, ta: Tally, tb: Tally, perVault: boolean, beforeLa
  *   - vaults that worked before and have no ok at all now (rule 4; a 404 is
  *     never a failure).
  * Each needs 3 vaults or a tenth of those seen ({@link spread}), except what a
- * stranger can make (401, 403, 404): that needs at least half of the vaults
- * that worked before and are seen now ({@link FLEET_STRANGER_SHARE}), and 3.
+ * stranger can make (401, 403, 404): that needs {@link majority} — at least
+ * half of the vaults that could show it, and 3.
  */
 function fleetRules(
   window: "day" | "deploy",
@@ -299,13 +304,13 @@ function fleetRules(
     groups.get(g)!.push({ key, ta, tb: b.get(key) ?? emptyTally() });
   }
   const enough = (n: number) => spread(n, seenVaults.size);
-  // For what a stranger can make: on most of the vaults that worked before and are seen now.
-  const most = (n: number, of: number) => n >= Math.max(FLEET_MIN_VAULTS, Math.ceil(FLEET_STRANGER_SHARE * of));
   for (const [g, cells] of groups) {
     const [source, subject] = g.split("\u0000") as [string, string];
     const base = { window, who: "all vaults", source, subject };
-    // The vaults that worked before and are seen now: a stranger-made change must be on most of them.
-    const worked = cells.filter((c) => c.tb.ok >= STOPPED_OK_BEFORE);
+    // What a stranger can make must be on most of the vaults that could show it: those that worked
+    // before (≥ 3 ok) and now either still work or had the requests (≥ 3) to show a change. A light
+    // vault that is still fine counts against an outage; one too thin to show anything is left out.
+    const couldShow = cells.filter((c) => c.tb.ok >= STOPPED_OK_BEFORE && (c.ta.ok > 0 || c.ta.total >= FLEET_VAULT_MIN)).length;
     // A stranger can't cause server errors: 3 vaults are enough, at any fleet size. A vault with
     // no traffic before counts too (as a quiet day must not hide a thin outage); the line says how many.
     const fresh = cells.filter((c) => c.ta.server > 0 && c.tb.server === 0 && !flaggedServer.has(c.key));
@@ -317,33 +322,31 @@ function fleetRules(
     }
     const reasons = new Set(cells.flatMap((c) => [...c.ta.byOutcome.keys()].filter((o) => outcomeClass(o) === "client")));
     for (const outcome of reasons) {
-      // 401/403/404: any of it on a vault that worked, its share risen; the majority does the rest.
-      // Anything else: a vault counts when its own change looks real (a few of it, on a vault in use).
-      const strangerMade = STRANGER_REASONS.has(outcome);
-      const rose = strangerMade
-        ? worked.filter((c) => shareRose(c.ta, c.tb, outcome))
-        : cells.filter((c) => (c.ta.byOutcome.get(outcome) ?? 0) >= FLEET_VAULT_MIN && c.tb.total >= FLEET_VAULT_BASELINE && shareRose(c.ta, c.tb, outcome));
+      // A vault counts when its own change looks real: a few of it, on a vault that was in use.
+      const rose = cells.filter(
+        (c) => (c.ta.byOutcome.get(outcome) ?? 0) >= FLEET_VAULT_MIN && c.tb.total >= FLEET_VAULT_BASELINE && shareRose(c.ta, c.tb, outcome),
+      );
       const na = rose.reduce((s, c) => s + (c.ta.byOutcome.get(outcome) ?? 0), 0);
-      const wide = strangerMade ? most(rose.length, worked.length) : enough(rose.length);
+      const wide = STRANGER_REASONS.has(outcome) ? majority(rose.length, couldShow) : enough(rose.length);
       if (wide && na >= CLIENT_MIN) {
-        out.worse.push({ ...base, kind: "client_reason_up", reason: outcome, detail: `${outcome} up on ${rose.length} vaults (${na} in all, far fewer ${beforeLabel})` });
+        out.worse.push({
+          ...base,
+          kind: "client_reason_up",
+          reason: outcome,
+          detail: `${outcome} up on ${rose.length} vaults (${na} in all; a far larger share of each vault's requests than ${beforeLabel})`,
+        });
       }
     }
-    // Stopped: by what no stranger can make, on 3 vaults or a tenth; with 401/403 counted, on most
-    // of the vaults that worked and now either still work or had the requests to show they stopped.
-    let couldStop = 0;
+    // Stopped: by what no stranger can make, on 3 vaults or a tenth; with 401/403 counted, on most of
+    // the vaults that could show it.
     let real = 0;
     let any = 0;
-    for (const c of worked) {
-      if (c.ta.ok > 0) {
-        couldStop++;
-        continue;
-      }
-      if (c.ta.total >= STOPPED_FAILURES) couldStop++;
+    for (const c of cells) {
+      if (c.tb.ok < STOPPED_OK_BEFORE || c.ta.ok > 0) continue;
       if (failures(c.ta, NOT_FOUND) >= STOPPED_FAILURES) any++;
       if (failures(c.ta, STRANGER_REASONS) >= STOPPED_FAILURES) real++;
     }
-    const n = most(any, couldStop) ? any : enough(real) ? real : 0;
+    const n = majority(any, couldShow) ? any : enough(real) ? real : 0;
     if (n > 0) out.worse.push({ ...base, kind: "stopped_working", detail: `stopped working on ${n} vaults that worked ${beforeLabel}` });
   }
 }
