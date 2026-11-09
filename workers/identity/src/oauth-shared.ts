@@ -8,6 +8,7 @@
  * conformance corpus can inject `now` for the rotation-grace timing tests while
  * the Worker (index.ts) calls them with the request-time deps.
  */
+import { decodeNpub } from "./nip19.ts";
 import { isRequestableAccountScope } from "@openparachute/door-contract";
 import { VAULT_VERBS } from "./audience.ts";
 import { type BillingMode, billingConfig, billingMode, mockBillingEnabled } from "./billing-config.ts";
@@ -95,6 +96,11 @@ export interface OAuthDeps {
    * {@link billingModeOf}, never `deps.billingMode` directly.
    */
   billingMode?: BillingMode;
+  /**
+   * The single-owner deploy's owner key (env OWNER_PUBKEY, decoded to 64 lowercase hex), or undefined. Only read
+   * by the NIP-98 sign-in's first-owner bootstrap (nostr-auth.ts).
+   */
+  ownerPubkey?: string;
 }
 
 /** The deps' money switch — unset is open_beta, like BILLING_MODE itself. */
@@ -240,7 +246,16 @@ export function depsForEnv(env: Env): OAuthDeps {
     // Service binding when bound (staging — workers.dev origins aren't valid
     // subrequest targets); else the handlers fall back to global fetch.
     ...(env.VAULT_SERVICE ? { vaultFetch: env.VAULT_SERVICE.fetch.bind(env.VAULT_SERVICE) } : {}),
+    ...(parseOwnerPubkey(env.OWNER_PUBKEY) ? { ownerPubkey: parseOwnerPubkey(env.OWNER_PUBKEY)! } : {}),
   };
+}
+
+/** OWNER_PUBKEY as 64 lowercase hex: hex as given, or a checksum-valid `npub1…`; anything else is no owner key. */
+export function parseOwnerPubkey(raw: string | undefined): string | null {
+  const v = raw?.trim();
+  if (!v) return null;
+  if (/^[0-9a-f]{64}$/.test(v)) return v;
+  return decodeNpub(v);
 }
 
 /**

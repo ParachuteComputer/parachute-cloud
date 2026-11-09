@@ -76,7 +76,7 @@ import {
   validateHandle,
 } from "./handles.ts";
 import { type User, getUserById } from "./users.ts";
-import { callVaultDestroy, pushVaultCap, readDestroyOutcome } from "./vault-call.ts";
+import { callVaultDestroy, markVaultBare, pushVaultCap, readDestroyOutcome } from "./vault-call.ts";
 import {
   VaultNameInvalidError,
   VaultNameTakenError,
@@ -486,6 +486,11 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
 
   const body = await readJsonBody(req);
   const rawName = typeof body.name === "string" ? body.name : "";
+  // `bare: true` (T-414, 0.9.1): no welcome or guide notes — an app's vault (Taste Arcade) brings its own types.
+  if (body.bare !== undefined && typeof body.bare !== "boolean") {
+    return restError(400, "invalid_request", '"bare" must be true or false');
+  }
+  const bare = body.bare === true;
   let name: string;
   let vaultId: string | null;
   try {
@@ -506,6 +511,14 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
       return restError(409, "vault_taken", "That vault name is already taken.");
     }
     throw err;
+  }
+
+  // Bare: the marker must be the vault's FIRST Durable Object request, since the DO seeds the welcome notes on
+  // whatever request first materializes it. If the vault can't be told, the create is undone rather than handing
+  // back a seeded vault that was asked to be bare.
+  if (bare && !(await markVaultBare(db, deps, user.id, name))) {
+    await deleteVaultD1Rows(db, user.id, name, deps.now?.() ?? new Date());
+    return restError(503, "vault_unavailable", "Couldn't set up a bare vault just now; nothing was created. Try again.");
   }
 
   // Push the plan's storage cap + voice entitlement into the new vault's DO —

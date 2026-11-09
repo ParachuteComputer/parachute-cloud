@@ -1,0 +1,331 @@
+/**
+ * T-414 (Parachute 0.9.1): owner keys on the cloud door — the twin of parachute-core's
+ * contracts/suites/safety/owner-keys.test.ts, through the whole router (`worker.fetch`), as a client would call it.
+ *
+ *   1. NIP-98 owner sign-in on POST /account/token: a linked key gets the account token; a replayed event, an event
+ *      for another URL or method, a stale event, a body the event doesn't name, and an unlinked key are refused,
+ *      and an unlinked key never becomes an account. On a single-owner deploy (OWNER_PUBKEY), the first sign-in of
+ *      that key on an empty instance makes the key-only owner; once an account exists it does nothing.
+ *   2. Linking a key (POST /account/pubkeys) needs the account's bearer AND a signature by the key for this request.
+ *   3. App keys (/account/keys): named, one vault, read or write, never admin; long-lived; listed with last use (read
+ *      from the vault); revoked by name — the registry row and the public revocation list name it at once, and the
+ *      vault's Durable Object is told; a retired signing key stays in JWKS while a live app key needs it.
+ *   4. Bare create: the vault's first request is the bare marker; if it can't land, nothing is created.
+ */
+import { env } from "cloudflare:test";
+import { describe, expect, test } from "vitest";
+import { schnorr } from "@noble/curves/secp256k1.js";
+import worker from "../src/index.ts";
+import { getAllPublicKeys, rotateSigningKey } from "../src/signing-keys.ts";
+import { ISSUER, decodeJwtPayload, seedUser, seedVault } from "./helpers.ts";
+
+const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+const fromHex = (h: string) => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
+
+function nostrKey() {
+  const secret = schnorr.utils.randomSecretKey();
+  return { secret, pubkey: hex(schnorr.getPublicKey(secret)) };
+}
+type Key = ReturnType<typeof nostrKey>;
+
+async function sha256Hex(s: string) {
+  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s))));
+}
+
+async function signEvent(key: Key, tags: string[][], createdAt = Math.floor(Date.now() / 1000)) {
+  const unsigned = { pubkey: key.pubkey, created_at: createdAt, kind: 27235, tags, content: "" };
+  // NIP-01 id, computed here (not imported) so the test stands apart from the code it checks.
+  const id = await sha256Hex(JSON.stringify([0, unsigned.pubkey, unsigned.created_at, unsigned.kind, unsigned.tags, unsigned.content]));
+  return { ...unsigned, id, sig: hex(schnorr.sign(fromHex(id), key.secret)) };
+}
+
+async function nip98(key: Key, url: string, method: string, body?: string, createdAt?: number) {
+  // A random nonce, as real signers add (core's contracts/suites/compat/_lib.ts nip98): two requests signed in the
+  // same second would otherwise be the same event, and the second a replay.
+  const tags = [["u", url], ["method", method], ["nonce", hex(crypto.getRandomValues(new Uint8Array(16)))]];
+  if (body) tags.push(["payload", await sha256Hex(body)]);
+  const ev = await signEvent(key, tags, createdAt);
+  return `Nostr ${btoa(JSON.stringify(ev)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}`;
+}
+
+type Calls = { method: string; url: string; body: string }[];
+/** The worker with a stubbed vault (identity → vault calls go through VAULT_SERVICE). */
+function app(opts: { ownerPubkey?: string; vault?: (req: Request) => Response | Promise<Response> } = {}) {
+  const calls: Calls = [];
+  const vault = opts.vault ?? (() => Response.json({}));
+  const e = {
+    ...env,
+    ...(opts.ownerPubkey ? { OWNER_PUBKEY: opts.ownerPubkey } : {}),
+    VAULT_SERVICE: {
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const req = new Request(input, init);
+        calls.push({ method: req.method, url: req.url, body: await req.clone().text() });
+        return vault(req);
+      },
+    },
+  };
+  const call = async (path: string, init: { method?: string; auth?: string; body?: unknown } = {}) => {
+    const body = init.body === undefined ? undefined : typeof init.body === "string" ? init.body : JSON.stringify(init.body);
+    const res = await worker.fetch(
+      new Request(`${ISSUER}${path}`, {
+        method: init.method ?? "GET",
+        headers: { ...(init.auth ? { authorization: init.auth } : {}), ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+        body,
+      }),
+      e as never,
+    );
+    const text = await res.text();
+    let json: any = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {}
+    return { status: res.status, json, text };
+  };
+  return { call, calls };
+}
+
+async function linkedOwner(email = "owner@example.com") {
+  const key = nostrKey();
+  const { id } = await seedUser(email);
+  await env.DB.prepare("INSERT INTO user_pubkeys (pubkey, user_id, label, created_at) VALUES (?, ?, 'test', ?)")
+    .bind(key.pubkey, id, new Date().toISOString())
+    .run();
+  return { key, id };
+}
+
+async function signIn(a: ReturnType<typeof app>, key: Key) {
+  return a.call("/account/token", { method: "POST", auth: await nip98(key, `${ISSUER}/account/token`, "POST") });
+}
+
+const userCount = () => env.DB.prepare("SELECT COUNT(*) AS n FROM users").first<number>("n");
+
+describe("NIP-98 owner sign-in (POST /account/token)", () => {
+  test("a linked key gets the account token, which drives /account/*", async () => {
+    const a = app();
+    const { key, id } = await linkedOwner();
+    const r = await signIn(a, key);
+    expect(r.status).toBe(200);
+    const claims = decodeJwtPayload(r.json.token);
+    expect(claims.aud).toBe("account");
+    expect(claims.sub).toBe(id);
+    expect(claims.scope).toBe(`account:${id}:admin`);
+    expect((await a.call("/account/vaults", { auth: `Bearer ${r.json.token}` })).status).toBe(200);
+  });
+
+  test("a replayed event, another URL, another method, a stale event, or an unnamed body is refused", async () => {
+    const a = app();
+    const { key } = await linkedOwner();
+    const auth = await nip98(key, `${ISSUER}/account/token`, "POST");
+    expect((await a.call("/account/token", { method: "POST", auth })).status).toBe(200);
+    expect((await a.call("/account/token", { method: "POST", auth })).status).toBe(401);
+    const other = await a.call("/account/token", { method: "POST", auth: await nip98(key, `${ISSUER}/account/vaults`, "POST") });
+    const method = await a.call("/account/token", { method: "POST", auth: await nip98(key, `${ISSUER}/account/token`, "GET") });
+    const stale = await a.call("/account/token", {
+      method: "POST",
+      auth: await nip98(key, `${ISSUER}/account/token`, "POST", undefined, Math.floor(Date.now() / 1000) - 120),
+    });
+    const body = await a.call("/account/token", {
+      method: "POST",
+      auth: await nip98(key, `${ISSUER}/account/token`, "POST", JSON.stringify({ a: 1 })),
+      body: { a: 2 },
+    });
+    expect([other.status, method.status, stale.status, body.status]).toEqual([401, 401, 401, 401]);
+  });
+
+  test("an unlinked key is refused and never becomes an account", async () => {
+    const a = app();
+    await seedUser();
+    const before = await userCount();
+    const r = await signIn(a, nostrKey());
+    expect(r.status).toBe(401);
+    expect(await userCount()).toBe(before);
+  });
+
+  test("OWNER_PUBKEY: the first sign-in on an empty instance makes the key-only owner; later, nothing new", async () => {
+    const owner = nostrKey();
+    const a = app({ ownerPubkey: owner.pubkey });
+    expect(await userCount()).toBe(0);
+    const first = await signIn(a, owner);
+    expect(first.status).toBe(200);
+    const again = await signIn(a, owner);
+    expect(decodeJwtPayload(again.json.token).sub).toBe(decodeJwtPayload(first.json.token).sub);
+    expect(await userCount()).toBe(1);
+    const row = await env.DB.prepare("SELECT password_hash FROM users").first<{ password_hash: string }>();
+    expect(row?.password_hash).toBe(""); // no password: the key is the only way in
+    // Another key is not the owner, even on a single-owner deploy.
+    expect((await signIn(a, nostrKey())).status).toBe(401);
+  });
+
+  test("OWNER_PUBKEY does nothing once any account exists", async () => {
+    const owner = nostrKey();
+    await seedUser("someone@example.com");
+    const r = await signIn(app({ ownerPubkey: owner.pubkey }), owner);
+    expect(r.status).toBe(401);
+    expect(await userCount()).toBe(1);
+  });
+});
+
+describe("linking a key (/account/pubkeys)", () => {
+  async function emailOwnerToken(a: ReturnType<typeof app>) {
+    const { key } = await linkedOwner();
+    return (await signIn(a, key)).json.token as string;
+  }
+
+  test("needs the account bearer and the key's own signature for this request; then the key signs in", async () => {
+    const a = app();
+    const token = await emailOwnerToken(a);
+    const k = nostrKey();
+    const good = await signEvent(k, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"]]);
+    const wrongUrl = await signEvent(k, [["u", `${ISSUER}/account/token`], ["method", "POST"]]);
+    expect((await a.call("/account/pubkeys", { method: "POST", body: { event: good } })).status).toBe(401); // no bearer
+    expect((await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${token}`, body: { event: wrongUrl } })).status).toBe(401);
+    const linked = await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${token}`, body: { event: good } });
+    expect(linked.status).toBe(201);
+    expect(linked.json.pubkey).toBe(k.pubkey);
+    expect((await signIn(a, k)).status).toBe(200);
+    const list = await a.call("/account/pubkeys", { auth: `Bearer ${token}` });
+    expect(list.json.pubkeys.map((p: any) => p.pubkey)).toContain(k.pubkey);
+  });
+
+  test("a key linked to another account is refused; a key-only owner can't unlink their last key", async () => {
+    const owner = nostrKey();
+    const a = app({ ownerPubkey: owner.pubkey });
+    const ownerToken = (await signIn(a, owner)).json.token as string;
+    const { key: other } = await linkedOwner("other@example.com");
+    const steal = await signEvent(other, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"]]);
+    expect((await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${ownerToken}`, body: { event: steal } })).status).toBe(409);
+    expect((await a.call(`/account/pubkeys/${owner.pubkey}`, { method: "DELETE", auth: `Bearer ${ownerToken}` })).status).toBe(409);
+  });
+});
+
+describe("app keys (/account/keys)", () => {
+  async function owner(a: ReturnType<typeof app>, vault = "arcade") {
+    const { key, id } = await linkedOwner();
+    await seedVault(vault, id);
+    const token = (await signIn(a, key)).json.token as string;
+    return { id, bearer: `Bearer ${token}` };
+  }
+
+  test("a write key: named, one vault at read+write, never admin, long-lived, not first-party", async () => {
+    const a = app();
+    const { id, bearer } = await owner(a);
+    const r = await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "arcade-worker", vault: "arcade", can: "write" } });
+    expect(r.status).toBe(201);
+    expect(r.json).toMatchObject({ name: "arcade-worker", vault: "arcade", can: "write", status: "active", last_used_at: null });
+    const c = decodeJwtPayload(r.json.token) as { scope: string; exp: number; iat: number; aud: string; sub: string; client_id: string; vault_scope: string[] };
+    expect(c.scope.split(" ").sort()).toEqual(["vault:arcade:read", "vault:arcade:write"]);
+    expect([c.aud, c.sub, c.client_id, c.vault_scope]).toEqual(["vault.arcade", id, "parachute-app-key", ["arcade"]]);
+    expect(c.exp - c.iat).toBeGreaterThan(300 * 86400);
+    const listed = await a.call("/account/keys", { auth: bearer });
+    expect(listed.json.keys).toHaveLength(1);
+    expect(listed.json.keys[0].token).toBeUndefined();
+  });
+
+  test("admin is never mintable, by `can` or smuggled scopes; names, vaults and ownership are checked", async () => {
+    const a = app();
+    const { bearer } = await owner(a);
+    const { id: otherId } = await seedUser("other@example.com");
+    await seedVault("theirs", otherId);
+    const mint = (body: unknown) => a.call("/account/keys", { method: "POST", auth: bearer, body });
+    expect((await mint({ name: "a1", vault: "arcade", can: "admin" })).status).toBe(400);
+    expect((await mint({ name: "a2", vault: "arcade", can: "write", scopes: ["vault:arcade:admin"] })).status).toBe(400);
+    expect((await mint({ name: "has space", vault: "arcade", can: "read" })).status).toBe(400);
+    expect((await mint({ name: "nv", can: "read" })).status).toBe(400);
+    expect((await mint({ name: "x1", vault: "theirs", can: "read" })).status).toBe(404); // not yours
+    expect((await mint({ name: "x2", vault: "nowhere", can: "read" })).status).toBe(404);
+    expect((await mint({ name: "dup", vault: "arcade", can: "read" })).status).toBe(201);
+    expect((await mint({ name: "dup", vault: "arcade", can: "read" })).status).toBe(409);
+    expect((await a.call("/account/keys", { auth: bearer })).json.keys.map((k: any) => k.name)).toEqual(["dup"]);
+  });
+
+  test("an app key can't use the account door", async () => {
+    const a = app();
+    const { bearer } = await owner(a);
+    const key = (await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "k", vault: "arcade", can: "write" } })).json.token;
+    expect([401, 403]).toContain((await a.call("/account/keys", { auth: `Bearer ${key}` })).status);
+    expect([401, 403]).toContain(
+      (await a.call("/account/keys", { method: "POST", auth: `Bearer ${key}`, body: { name: "k2", vault: "arcade", can: "write" } })).status,
+    );
+  });
+
+  test("revoke: the registry and the public revocation list name it at once, the vault is told, the name stays taken", async () => {
+    const a = app();
+    const { bearer } = await owner(a);
+    const key = (await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "rev", vault: "arcade", can: "write" } })).json.token;
+    const jti = decodeJwtPayload(key).jti as string;
+    const r = await a.call("/account/keys/rev", { method: "DELETE", auth: bearer });
+    expect(r.status).toBe(200);
+    expect(r.json).toMatchObject({ name: "rev", refused_now: true });
+    const push = a.calls.find((c) => c.url.endsWith("/vault/arcade/api/internal/keys/revoke"));
+    expect(push?.method).toBe("POST");
+    expect(JSON.parse(push!.body).jti).toBe(jti);
+    const list = await a.call("/.well-known/parachute-revocation.json");
+    expect(list.json.jtis).toContain(jti);
+    expect((await a.call("/account/keys", { auth: bearer })).json.keys[0].status).toBe("revoked");
+    expect((await a.call("/account/keys/rev", { method: "DELETE", auth: bearer })).status).toBe(200);
+    expect((await a.call("/account/keys/nope", { method: "DELETE", auth: bearer })).status).toBe(404);
+    expect((await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "rev", vault: "arcade", can: "write" } })).status).toBe(409);
+  });
+
+  test("one account's keys are invisible and unrevocable to another", async () => {
+    const a = app();
+    const { bearer } = await owner(a);
+    await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "mine", vault: "arcade", can: "read" } });
+    const k2 = nostrKey();
+    const { id: id2 } = await seedUser("two@example.com");
+    await env.DB.prepare("INSERT INTO user_pubkeys (pubkey, user_id, created_at) VALUES (?, ?, ?)").bind(k2.pubkey, id2, new Date().toISOString()).run();
+    const bearer2 = `Bearer ${(await signIn(a, k2)).json.token}`;
+    expect((await a.call("/account/keys", { auth: bearer2 })).json.keys).toEqual([]);
+    expect((await a.call("/account/keys/mine", { method: "DELETE", auth: bearer2 })).status).toBe(404);
+  });
+
+  test("the list shows last use as the vault saw it", async () => {
+    let jti = "";
+    const seenAt = "2026-11-08T12:00:00.000Z";
+    const a = app({ vault: (req) => (new URL(req.url).pathname.endsWith("/api/internal/keys/used") ? Response.json({ used: { [jti]: seenAt } }) : Response.json({})) });
+    const { bearer } = await owner(a);
+    jti = decodeJwtPayload((await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "u", vault: "arcade", can: "write" } })).json.token).jti as string;
+    expect((await a.call("/account/keys", { auth: bearer })).json.keys[0].last_used_at).toBe(seenAt);
+  });
+
+  test("a rotated-out signing key stays in JWKS while a live app key needs it, and goes once it's revoked", async () => {
+    const a = app();
+    const { bearer } = await owner(a);
+    const key = (await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "long", vault: "arcade", can: "read" } })).json.token;
+    const kid = JSON.parse(atob(key.split(".")[0]!.replace(/-/g, "+").replace(/_/g, "/"))).kid as string;
+    await rotateSigningKey(env.DB);
+    const later = () => new Date(Date.now() + 2 * 86400_000); // past the 24 h retention
+    expect((await getAllPublicKeys(env.DB, later)).map((k) => k.kid)).toContain(kid);
+    await a.call("/account/keys/long", { method: "DELETE", auth: bearer });
+    expect((await getAllPublicKeys(env.DB, later)).map((k) => k.kid)).not.toContain(kid);
+  });
+});
+
+describe("bare create (POST /account/vaults {bare: true})", () => {
+  async function bearerFor(a: ReturnType<typeof app>) {
+    const { key } = await linkedOwner();
+    return `Bearer ${(await signIn(a, key)).json.token}`;
+  }
+
+  test("the bare marker is the vault's first request; without bare, no marker", async () => {
+    const a = app();
+    const bearer = await bearerFor(a);
+    const r = await a.call("/account/vaults", { method: "POST", auth: bearer, body: { name: "app-data", bare: true } });
+    expect(r.status).toBe(201);
+    const first = a.calls.find((c) => c.url.includes("/vault/app-data/"));
+    expect(new URL(first!.url).pathname).toBe("/vault/app-data/api/internal/bare");
+    expect(first!.method).toBe("POST");
+    const plain = await a.call("/account/vaults", { method: "POST", auth: bearer, body: { name: "notes-two" } });
+    expect(plain.status).toBe(201);
+    expect(a.calls.some((c) => c.url.includes("/vault/notes-two/api/internal/bare"))).toBe(false);
+  });
+
+  test("if the vault can't be told, nothing is created; bare must be a boolean", async () => {
+    const a = app({ vault: (req) => (new URL(req.url).pathname.endsWith("/internal/bare") ? new Response("no", { status: 409 }) : Response.json({})) });
+    const bearer = await bearerFor(a);
+    const r = await a.call("/account/vaults", { method: "POST", auth: bearer, body: { name: "app-data", bare: true } });
+    expect(r.status).toBe(503);
+    expect(await env.DB.prepare("SELECT 1 AS x FROM vaults WHERE name = 'app-data'").first("x")).toBeNull();
+    expect((await a.call("/account/vaults", { method: "POST", auth: bearer, body: { name: "app-data", bare: "yes" } })).status).toBe(400);
+  });
+});

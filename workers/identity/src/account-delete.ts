@@ -954,6 +954,10 @@ async function purgeAccountRows(
   await db.batch([
     db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM tokens WHERE user_id = ?").bind(userId),
+    // T-414: the account's app keys (named rows of the tokens above) and its linked Nostr keys, so a key it
+    // linked can't sign in as whoever claims a reused id, and a freed npub can own another account.
+    db.prepare("DELETE FROM app_keys WHERE user_id = ?").bind(userId),
+    db.prepare("DELETE FROM user_pubkeys WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM grants WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM auth_codes WHERE user_id = ?").bind(userId),
     // T-318: by EMAIL too. A sign-up link is minted before the account exists,

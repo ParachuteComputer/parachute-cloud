@@ -95,6 +95,8 @@ export interface SignedAccessToken {
   token: string;
   jti: string;
   expiresAt: string;
+  /** The signing key's id (JWT header `kid`). App keys record it so JWKS keeps that key while they live. */
+  kid: string;
 }
 
 export async function signAccessToken(db: D1Database, opts: SignAccessTokenOpts): Promise<SignedAccessToken> {
@@ -119,7 +121,7 @@ export async function signAccessToken(db: D1Database, opts: SignAccessTokenOpts)
     .setAudience(opts.audience)
     .setJti(jti)
     .sign(priv);
-  return { token, jti, expiresAt: new Date(exp * 1000).toISOString() };
+  return { token, jti, expiresAt: new Date(exp * 1000).toISOString(), kid: key.kid };
 }
 
 export class RefreshTokenInsertError extends Error {

@@ -552,6 +552,25 @@ function isRetryableStatus(status: number): boolean {
  * non-2xx fails fast on the first attempt. Only after retries are exhausted
  * (or a fast-fail) does the existing `event=plan_cap_push_failed` warning fire.
  */
+/**
+ * Tell a just-created vault's Durable Object to skip its welcome seed (T-414, `bare: true` on create): the
+ * first-party `POST /api/internal/bare`, which the DO handles before it materializes, so it must be the vault's
+ * first request. Retried like the cap push. True when the DO answered that the vault is bare.
+ */
+export async function markVaultBare(db: D1Database, deps: OAuthDeps, userId: string, vaultName: string): Promise<boolean> {
+  for (let attempt = 1; attempt <= CAP_PUSH_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await callVaultApi(db, deps, { userId, vaultName, method: "POST", apiPath: "/api/internal/bare", verb: "admin" });
+      await res.body?.cancel().catch(() => {});
+      if (res.ok) return true;
+      if (!isRetryableStatus(res.status)) return false;
+    } catch {
+      // network: retry
+    }
+  }
+  return false;
+}
+
 export async function pushVaultCap(
   db: D1Database,
   deps: OAuthDeps,

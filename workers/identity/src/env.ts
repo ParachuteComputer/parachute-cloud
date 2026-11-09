@@ -29,6 +29,14 @@ export interface Env {
   /** Issuer origin — the `iss` claim + discovery-doc base. No trailing slash. */
   ISSUER: string;
   /**
+   * OPTIONAL — single-owner deploys (your own Cloudflare; T-414). The owner's Nostr key, as 64-hex or `npub1…`.
+   * On an instance with NO accounts yet, the first NIP-98 sign-in (`POST /account/token`) signed by exactly this
+   * key creates the owner: a key-only account (no password, no mail) with the key linked. Once any account
+   * exists it does nothing; more keys are linked from a signed-in account (`POST /account/pubkeys`). Unset on
+   * Parachute Cloud. A malformed value is ignored (no bootstrap), never widened.
+   */
+  OWNER_PUBKEY?: string;
+  /**
    * Extra origins the same-origin gate accepts, comma-separated (P0.5). The
    * cookie-authed console/account POSTs gate on `isSameOriginRequest` against the
    * bound-origin set; `ISSUER` is ALWAYS in that set, and any origin listed here

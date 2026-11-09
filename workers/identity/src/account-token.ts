@@ -55,6 +55,8 @@ import { isSameOriginRequest, jsonResponse, resolveBoundOrigins, type OAuthDeps 
 import { sessionUser } from "./session-user.ts";
 import { parseSessionCookie } from "./sessions.ts";
 import { signAccessToken } from "./tokens.ts";
+import { NostrAuthError, authenticateNostrRequest, isNostrAuthorization } from "./nostr-auth.ts";
+import type { User } from "./users.ts";
 
 /** Short TTL — a page-snapshot threat can't carry the token for long. Matches
  * the hub twin's 10-min window; the app re-mints when it's about to lapse. */
@@ -74,6 +76,49 @@ export const ACCOUNT_TOKEN_CLIENT_ID = "parachute-account";
 /** The account scope for a given owner: `account:<owner-id>:admin`. */
 export function accountAdminScope(ownerId: string): string {
   return `account:${ownerId}:admin`;
+}
+
+/**
+ * `POST /account/token` signed with NIP-98 (T-414; the box's twin is parachute-core account-token.ts): the account's
+ * owner proves possession of a linked Nostr key and gets the same account token the session path mints, with no
+ * cookie and no password. One npub can own every hub this way (box, cloud, your own Cloudflare), each hub its own
+ * issuer. `nostr-auth.ts` does the checks (signature, kind, ±60 s, u, method, payload, single-use id) and the
+ * account lookup (a linked key, or the single-owner OWNER_PUBKEY bootstrap on an empty instance).
+ *
+ * No CSRF or Origin gate: an Authorization header is not ambient, so no cross-site page can make a browser send
+ * one. The same account chokepoints as the session path: a suspended or deleted account is refused.
+ */
+async function handleNostrAccountToken(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  let user: User;
+  try {
+    ({ user } = await authenticateNostrRequest(db, req, {
+      ...(deps.ownerPubkey ? { ownerPubkey: deps.ownerPubkey } : {}),
+      now: deps.now?.() ?? new Date(),
+    }));
+  } catch (err) {
+    if (err instanceof NostrAuthError) return jsonError(401, "invalid_nostr_auth", `${err.code}: ${err.message}`);
+    throw err;
+  }
+  if (user.deletedAt !== null || user.suspendedAt !== null) {
+    return jsonError(401, "unauthenticated", "this account can't sign in");
+  }
+  const scopes = [accountAdminScope(user.id)];
+  const minted = await signAccessToken(db, {
+    sub: user.id,
+    scopes,
+    audience: ACCOUNT_TOKEN_AUDIENCE,
+    clientId: ACCOUNT_TOKEN_CLIENT_ID,
+    issuer: deps.issuer,
+    vaultScope: [],
+    ttlSeconds: ACCOUNT_TOKEN_TTL_SECONDS,
+    now: deps.now,
+    emailVerified: user.emailVerified,
+  });
+  return jsonResponse(
+    { token: minted.token, expires_at: minted.expiresAt, scopes, aud: ACCOUNT_TOKEN_AUDIENCE },
+    200,
+    { "cache-control": "no-store" },
+  );
 }
 
 /**
@@ -99,6 +144,9 @@ function jsonError(status: number, error: string, description: string): Response
 }
 
 export async function handleAccountToken(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  // The owner's key door (T-414): `Authorization: Nostr <event>` instead of a session.
+  if (isNostrAuthorization(req)) return handleNostrAccountToken(db, req, deps);
+
   // Gate 1 — session. `sessionUser` refuses a missing cookie AND a suspended
   // or deleted owner (findActiveSession's suspended_at/deleted_at JOIN) —
   // the mint chokepoint.

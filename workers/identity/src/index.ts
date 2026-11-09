@@ -6,6 +6,8 @@
  * Deps come from config (env.ISSUER / env.VAULT_BASE_DOMAIN), not the request
  * origin — the cloud issuer is a fixed configured origin.
  */
+import { handleAccountKeyMint, handleAccountKeyRevoke, handleAccountKeysList } from "./account-keys.ts";
+import { handleAccountPubkeyLink, handleAccountPubkeyUnlink, handleAccountPubkeysList } from "./account-pubkeys.ts";
 import { Hono } from "hono";
 import type { Env } from "./env.ts";
 import {
@@ -342,6 +344,13 @@ app.post("/account/token", (c) => handleAccountToken(c.env.DB, c.req.raw, depsFo
 // then the vault worker's destroy, then the identity D1 sweep). account-api.ts.
 app.get("/account/session", (c) => handleAccountSession(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/summary", (c) => handleAccountSummary(c.env.DB, c.req.raw, depsFor(c.env)));
+// T-414 (0.9.1): named app keys and linked Nostr keys (account-keys.ts, account-pubkeys.ts).
+app.get("/account/keys", (c) => handleAccountKeysList(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/keys", (c) => handleAccountKeyMint(c.env.DB, c.req.raw, depsFor(c.env)));
+app.delete("/account/keys/:name", (c) => handleAccountKeyRevoke(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/account/pubkeys", (c) => handleAccountPubkeysList(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/pubkeys", (c) => handleAccountPubkeyLink(c.env.DB, c.req.raw, depsFor(c.env)));
+app.delete("/account/pubkeys/:pubkey", (c) => handleAccountPubkeyUnlink(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));

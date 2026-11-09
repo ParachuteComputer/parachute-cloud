@@ -100,7 +100,9 @@ export async function getActiveSigningKey(
 /**
  * Public keys to advertise on `/.well-known/jwks.json`: every active key plus
  * any retired key within `JWKS_RETENTION_MS`. Older retired rows stay for audit
- * but drop out of JWKS.
+ * but drop out of JWKS — except a retired key that still signs a live app key
+ * (migration 0030, T-414): an app key lives up to a year, so a rotation must not
+ * silently end it. Revoking or expiring the app key lets its signing key go.
  */
 export async function getAllPublicKeys(
   db: D1Database,
@@ -111,9 +113,10 @@ export async function getAllPublicKeys(
     .prepare(
       `SELECT * FROM signing_keys
        WHERE retired_at IS NULL OR retired_at >= ?
+          OR kid IN (SELECT kid FROM app_keys WHERE revoked_at IS NULL AND expires_at > ?)
        ORDER BY created_at DESC`,
     )
-    .bind(cutoff)
+    .bind(cutoff, now().toISOString())
     .all<Row>();
   return (res.results ?? []).map(rowToKey);
 }
