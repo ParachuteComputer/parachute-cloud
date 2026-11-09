@@ -107,6 +107,29 @@ export async function getActiveSigningKey(
 }
 
 /**
+ * Mark a signing key compromised, by kid (T-414): it leaves JWKS at once, even if it was retired long ago and app
+ * keys it signed are still live (they stop verifying and must be minted again). If it is the active key, a fresh
+ * one replaces it in the same step. Returns false for an unknown kid.
+ */
+export async function markSigningKeyCompromised(
+  db: D1Database,
+  kid: string,
+  now: () => Date = () => new Date(),
+): Promise<boolean> {
+  const row = await db.prepare("SELECT retired_at FROM signing_keys WHERE kid = ?").bind(kid).first<{ retired_at: string | null }>();
+  if (!row) return false;
+  if (row.retired_at === null) {
+    await rotateSigningKey(db, now, { compromised: true });
+    return true;
+  }
+  await db
+    .prepare("UPDATE signing_keys SET compromised_at = COALESCE(compromised_at, ?) WHERE kid = ?")
+    .bind(now().toISOString(), kid)
+    .run();
+  return true;
+}
+
+/**
  * Public keys to advertise on `/.well-known/jwks.json`: every active key plus
  * any retired key within `JWKS_RETENTION_MS`. Older retired rows stay for audit
  * but drop out of JWKS — except a retired key that still signs a live app key

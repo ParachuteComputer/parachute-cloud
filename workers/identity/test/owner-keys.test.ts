@@ -16,7 +16,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import worker from "../src/index.ts";
-import { getAllPublicKeys, rotateSigningKey } from "../src/signing-keys.ts";
+import { getAllPublicKeys, markSigningKeyCompromised, rotateSigningKey } from "../src/signing-keys.ts";
 import { signAccessToken } from "../src/tokens.ts";
 import { createUser, getUserById } from "../src/users.ts";
 import { ISSUER, decodeJwtPayload, seedUser, seedVault } from "./helpers.ts";
@@ -364,6 +364,18 @@ describe("app keys (/account/keys)", () => {
     const kid = JSON.parse(atob(key.split(".")[0]!.replace(/-/g, "+").replace(/_/g, "/"))).kid as string;
     await rotateSigningKey(env.DB, () => new Date(), { compromised: true });
     expect((await getAllPublicKeys(env.DB)).map((k) => k.kid)).not.toContain(kid);
+  });
+
+  test("a key retired earlier and found compromised later can be dropped from JWKS by kid", async () => {
+    const a = app();
+    const { bearer } = await owner(a);
+    const key = (await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "later", vault: "arcade", can: "read" } })).json.token;
+    const kid = JSON.parse(atob(key.split(".")[0]!.replace(/-/g, "+").replace(/_/g, "/"))).kid as string;
+    await rotateSigningKey(env.DB); // an ordinary rotation: the old key stays, an app key needs it
+    expect((await getAllPublicKeys(env.DB)).map((k) => k.kid)).toContain(kid);
+    expect(await markSigningKeyCompromised(env.DB, kid)).toBe(true);
+    expect((await getAllPublicKeys(env.DB)).map((k) => k.kid)).not.toContain(kid);
+    expect(await markSigningKeyCompromised(env.DB, "no-such-kid")).toBe(false);
   });
 
   test("a rotated-out signing key stays in JWKS while a live app key needs it, and goes once it's revoked", async () => {

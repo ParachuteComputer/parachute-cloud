@@ -956,6 +956,8 @@ async function purgeAccountRows(
     // T-414: an app key lives up to a year, and the vault knows it only by vault name, which a later account can
     // reuse. So its registry row is NOT deleted: it is revoked and detached from the account (user_id NULL), and
     // its jti stays on the public revocation list until the key would have expired anyway.
+    // NEVER delete an unexpired, revoked app-key row anywhere else (a cleanup job, a retention sweep): the vault
+    // knows the key only by vault name, and that row is what keeps it refused if the name is reused.
     db
       .prepare(
         `UPDATE tokens SET revoked_at = COALESCE(revoked_at, ?), user_id = NULL

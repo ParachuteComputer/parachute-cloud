@@ -93,7 +93,7 @@ export async function handleAccountPubkeyLink(db: D1Database, req: Request, deps
 }
 
 export async function handleAccountPubkeyUnlink(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
-  const auth = await requireAccount(db, req, deps, "admin");
+  const auth = await ownerGate(db, req, deps);
   if (!auth.ok) return auth.response;
   const pubkey = /^\/account\/pubkeys\/([0-9a-f]{64})\/?$/.exec(new URL(req.url).pathname)?.[1];
   if (!pubkey) return err(404, "pubkey_not_found", "no such key on this account");
