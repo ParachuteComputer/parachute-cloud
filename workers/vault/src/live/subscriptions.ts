@@ -43,7 +43,7 @@
 import type { Note, Store } from "@openparachute/core/src/types.js";
 import type { DeletedNoteRef, HookEvent, HookRegistry, NoteHookPayload } from "@openparachute/core/src/hooks.js";
 import { noteWithinTagScope } from "../rest/tag-scope.js";
-import type { LiveMatcher } from "./live-match.js";
+import type { LiveMatcher } from "@openparachute/core/src/live-match.js";
 
 /** Default per-vault concurrent-subscription cap. Over it → 503. */
 export const DEFAULT_MAX_SUBSCRIPTIONS_PER_VAULT = 100;
