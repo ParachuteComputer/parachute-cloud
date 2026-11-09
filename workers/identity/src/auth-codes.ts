@@ -204,10 +204,16 @@ export async function redeemAuthCode(db: D1Database, opts: RedeemAuthCodeOpts): 
   if (!(await verifyPkce(code.codeChallenge, code.codeChallengeMethod, opts.codeVerifier))) {
     throw new AuthCodePkceMismatchError();
   }
-  // Single-use: stamp used_at. D1 serializes writes; the SELECT..stamp is
-  // effectively atomic under the single-database-connection model — a
-  // concurrent redemption sees used_at set and throws AuthCodeUsedError.
-  await db.prepare("UPDATE auth_codes SET used_at = ? WHERE code = ?").bind(now.toISOString(), opts.code).run();
+  // Single-use: stamp used_at only if nobody has, and require that THIS call
+  // was the one that did. The read above is not a lock — parallel
+  // redemptions all read used_at NULL and, with an unconditional stamp, each
+  // got its own token pair (T-419, audit L3-03 F3: 8 parallel → 8 × 200). D1
+  // serializes the conditional UPDATE, so exactly one caller changes the row.
+  const stamped = await db
+    .prepare("UPDATE auth_codes SET used_at = ? WHERE code = ? AND used_at IS NULL")
+    .bind(now.toISOString(), opts.code)
+    .run();
+  if ((stamped.meta.changes ?? 0) !== 1) throw new AuthCodeUsedError();
   return { ...code, usedAt: now.toISOString() };
 }
 

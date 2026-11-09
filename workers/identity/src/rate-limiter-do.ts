@@ -10,8 +10,10 @@
  *
  * POLICY (windows/limits) lives in rate-limit.ts — unchanged from the D1
  * fences this replaces. This class is a generic sliding-window counter:
- * `windowMs`/`max` arrive per call. Callers fail OPEN on any error reaching
- * the DO (availability over strictness — see rate-limit.ts).
+ * `windowMs`/`max` arrive per call. Every fence — signup, magic-link send and
+ * the sign-in guess lockouts — checks and records in ONE call
+ * (`checkAndBump`), so a parallel burst can't slip past the limit between a
+ * check and a record (T-419). Callers choose the outage posture (rate-limit.ts).
  *
  * Cleanup: every write re-arms a purge alarm at REAL-now + window (+ slack).
  * When it fires, every recorded event is at least a full window old (the alarm
@@ -19,7 +21,7 @@
  * so the table empties and the idle DO's storage returns to ~zero.
  */
 import { DurableObject } from "cloudflare:workers";
-import type { BumpOutcome, LockOutcome } from "./rate-limit.ts";
+import type { BumpOutcome } from "./rate-limit.ts";
 
 const PURGE_SLACK_MS = 60_000;
 
@@ -34,8 +36,8 @@ export class RateLimiterDO extends DurableObject<unknown> {
   }
 
   /**
-   * Register an event (signup attempt, magic-link send) and report whether it
-   * is allowed under `max` events per sliding `windowMs`. A denied call
+   * Register an event (signup attempt, magic-link send, sign-in guess) and
+   * report whether it is allowed under `max` events per sliding `windowMs`. A denied call
    * records NOTHING (being blocked never extends the block — same as the D1
    * fences). `nowMs` comes from the caller so tests can inject a clock.
    */
@@ -46,21 +48,6 @@ export class RateLimiterDO extends DurableObject<unknown> {
     this.sql.exec("INSERT INTO events (ts) VALUES (?)", nowMs);
     await this.armPurgeAlarm(windowMs);
     return { allowed: true, retryAfterSeconds: 0 };
-  }
-
-  /** Is this key locked (≥ `max` recorded failures within the sliding window)? Read-only. */
-  async isLocked(windowMs: number, max: number, nowMs: number): Promise<LockOutcome> {
-    this.prune(nowMs, windowMs);
-    const lift = this.liftTs(max);
-    if (lift === null) return { locked: false, retryAfterSeconds: 0 };
-    return { locked: true, retryAfterSeconds: retryAfter(lift, windowMs, nowMs) };
-  }
-
-  /** Record a failure event (login/2FA mismatch). Unconditional insert. */
-  async recordFailure(windowMs: number, nowMs: number): Promise<void> {
-    this.prune(nowMs, windowMs);
-    this.sql.exec("INSERT INTO events (ts) VALUES (?)", nowMs);
-    await this.armPurgeAlarm(windowMs);
   }
 
   /** Clear every event for this key (successful login clears the fence). */

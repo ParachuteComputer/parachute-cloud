@@ -36,7 +36,7 @@ import {
 import { getUserByEmail, getUserById, needsRehash, rehashPasswordIfUnchanged, verifyPassword } from "./users.ts";
 import { isTotpEnrolled } from "./two-factor.ts";
 import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
-import { clearLoginFailures, clientIp, isLoginLocked, loginKey, recordLoginFailure } from "./rate-limit.ts";
+import { attemptLogin, clearLoginFailures, clientIp, loginKey } from "./rate-limit.ts";
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { type AuthorizeParams, type ReplacesNote, describeScopes, renderConsent, renderError, renderLogin, renderRedirectBridge } from "./ui.ts";
 import {
@@ -652,9 +652,10 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   // Keep naming the connecting app on an error re-render.
   const clientName = (await getClient(db, params.clientId))?.clientName ?? null;
   // Same brute-force fence as the console /login (this is the other public
-  // login-submit path). Check lockout BEFORE the expensive password verify.
+  // login-submit path): reserve the guess atomically BEFORE the expensive
+  // password verify; refused when locked or the limiter is down (T-419).
   const key = loginKey(clientIp(req), email);
-  if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
+  if ((await attemptLogin(deps.rateLimiter, key, now)).locked) {
     return renderLoginPage(req, params, "Too many attempts. Please wait a few minutes and try again.", clientName);
   }
   const user = email ? await getUserByEmail(db, email) : null;
@@ -662,7 +663,6 @@ async function handleLoginSubmit(db: D1Database, req: Request, form: FormData, d
   // too (this is the other public login-submit path) — never a session,
   // never an oracle.
   if (!user || !(await verifyPassword(user, password)) || user.suspendedAt || user.deletedAt) {
-    await recordLoginFailure(deps.rateLimiter, key, now);
     return renderLoginPage(req, params, "Incorrect email or password.", clientName);
   }
   await clearLoginFailures(deps.rateLimiter, key);

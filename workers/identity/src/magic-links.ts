@@ -166,12 +166,13 @@ export async function consumeMagicLink(
  * NOT globally unique — only unique enough within one email's live rows to make
  * a collision astronomically unlikely).
  *
- * A miss bumps `code_attempts` on EVERY live row for this email (not just the
- * one being guessed) — this bounds the total guess budget even against an
+ * A guess counts as a miss on EVERY live row of this email it doesn't match
+ * (not just one link) — this bounds the total guess budget even against an
  * attacker who requests several links to accumulate separate attempt counters
  * — and nulls `code_hash` on any row that just reached
  * {@link MAGIC_CODE_MAX_ATTEMPTS}; the LINK on that row stays valid, only its
- * code spelling dies.
+ * code spelling dies. Match, count and null-out are one statement, so the cap
+ * holds under a parallel burst.
  *
  * Returns null for every failure shape (unknown email, no live row,
  * wrong/expired code, a code already past its attempt cap) — deliberately
@@ -186,38 +187,30 @@ export async function verifyMagicCode(
   const normalized = email.trim().toLowerCase();
   const nowIso = now.toISOString();
   const codeHash = await sha256Hex(code);
-  const updated = await db
+  // ONE statement checks the guess, counts it and spends it (T-419, audit
+  // L3-03 F5). It used to be three (match, then count, then null-out), and a
+  // parallel burst slipped extra guesses in between: ~10 per link instead of 5.
+  // Per live row of this email, in one write D1 serializes:
+  //   - the row whose code matches is consumed (count unchanged);
+  //   - every other row counts a miss, and its code dies on reaching the cap.
+  // `code_attempts < cap` in the WHERE means a row already at the cap can never
+  // match, whatever order a burst lands in. RETURNING hands back the consumed
+  // row (the only one with consumed_at set) — so two identical guesses in the
+  // same millisecond can't both read it as theirs.
+  const touched = await db
     .prepare(
-      `UPDATE magic_links SET consumed_at = ?
-       WHERE email = ? AND code_hash = ? AND consumed_at IS NULL AND expires_at > ?`,
+      `UPDATE magic_links SET
+         consumed_at = CASE WHEN code_hash = ?1 THEN ?2 ELSE consumed_at END,
+         code_attempts = CASE WHEN code_hash = ?1 THEN code_attempts ELSE code_attempts + 1 END,
+         code_hash = CASE WHEN code_hash = ?1 OR code_attempts + 1 < ?3 THEN code_hash ELSE NULL END
+       WHERE email = ?4 AND consumed_at IS NULL AND expires_at > ?2
+         AND code_hash IS NOT NULL AND code_attempts < ?3
+       RETURNING ${CONSUMED_COLUMNS}, consumed_at`,
     )
-    .bind(nowIso, normalized, codeHash, nowIso)
-    .run();
-  if (updated.meta.changes > 0) {
-    const row = await db
-      .prepare(`SELECT ${CONSUMED_COLUMNS} FROM magic_links WHERE email = ? AND code_hash = ? AND consumed_at = ?`)
-      .bind(normalized, codeHash, nowIso)
-      .first<ConsumedRow>();
-    if (row) return finishConsume(db, row);
-  }
-  // Miss: bump every live row for this email, then null the code on any that
-  // just hit the cap. Two statements rather than an UPDATE...RETURNING chain
-  // (D1/SQLite has none) — both are unconditionally safe even when there is
-  // no live row at all (0 rows affected, no error), so this never leaks
-  // whether the email exists via a thrown error or a timing divergence
-  // beyond ordinary DB latency.
-  await db
-    .prepare(
-      `UPDATE magic_links SET code_attempts = code_attempts + 1
-       WHERE email = ? AND consumed_at IS NULL AND expires_at > ? AND code_hash IS NOT NULL`,
-    )
-    .bind(normalized, nowIso)
-    .run();
-  await db
-    .prepare(`UPDATE magic_links SET code_hash = NULL WHERE email = ? AND consumed_at IS NULL AND code_attempts >= ?`)
-    .bind(normalized, MAGIC_CODE_MAX_ATTEMPTS)
-    .run();
-  return null;
+    .bind(codeHash, nowIso, MAGIC_CODE_MAX_ATTEMPTS, normalized)
+    .all<ConsumedRow & { consumed_at: string | null }>();
+  const hit = touched.results.find((r) => r.consumed_at !== null);
+  return hit ? finishConsume(db, hit) : null;
 }
 
 /**
