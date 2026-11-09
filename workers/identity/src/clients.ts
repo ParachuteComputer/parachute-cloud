@@ -174,17 +174,19 @@ export function isNativeAppRedirect(uri: string): boolean {
 }
 
 /**
- * Paths on a bound origin that are NOT Parachute pages: my.parachute.computer
- * routes `/vault/*` (and its `/.well-known/oauth-protected-resource/vault/*`)
- * to the vault worker, which serves tenants' own vault surfaces and files.
+ * The one callback path a Parachute page uses: the Notes app's PKCE return
+ * (parachute-app `src/lib/vault/oauth.ts` REDIRECT_PATH, served at the root of
+ * app./my.). An allowlist, not a denylist: bound origins also carry the vault
+ * worker's tenant routes (my.parachute.computer `/vault/*`, `/mcp*`), and any
+ * other path — encoded, doubled slashes, a future route — is simply not it.
  */
-const NON_FIRST_PARTY_PATH = /^\/(vault|\.well-known)(\/|$)/;
+const FIRST_PARTY_CALLBACK_PATH = "/oauth/callback";
 
 /**
- * True when every redirect URI lands on a first-party Parachute page: an
- * http(s) URL on the issuer or a BOUND_ORIGINS member (`firstPartyOrigins`),
- * outside the vault worker's paths. A private-use scheme has no web origin, so
- * never counts. Used to decide whether a registration may carry a
+ * True when every redirect URI is a first-party Parachute page: an http(s)
+ * URL on the issuer or a BOUND_ORIGINS member (`firstPartyOrigins`) at exactly
+ * {@link FIRST_PARTY_CALLBACK_PATH}. A private-use scheme has no web origin,
+ * so never counts. Used to decide whether a registration may carry a
  * Parachute-like name (oauth-register.ts) and whether consent labels the app
  * unverified (oauth-connections.ts `isVouchedClient`).
  */
@@ -196,7 +198,7 @@ export function redirectsAreFirstParty(redirectUris: readonly string[], firstPar
       return (
         (u.protocol === "https:" || u.protocol === "http:") &&
         firstPartyOrigins.includes(u.origin) &&
-        !NON_FIRST_PARTY_PATH.test(u.pathname)
+        u.pathname === FIRST_PARTY_CALLBACK_PATH
       );
     } catch {
       return false;

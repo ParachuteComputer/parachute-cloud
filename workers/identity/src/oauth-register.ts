@@ -23,8 +23,13 @@ import {
 import { findActiveSession, parseSessionCookie } from "./sessions.ts";
 import { type OAuthDeps, isSameOriginRequest, jsonResponse, resolveBoundOrigins } from "./oauth-shared.ts";
 
-/** Control characters and bidi embeddings/overrides/isolates/marks. */
-const UNSAFE_NAME_CHARS = /[\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+/**
+ * Characters that change how a name SHOWS without being visible letters:
+ * controls, format characters (bidi overrides and isolates, zero-width
+ * joiners/spaces, BOM), line/paragraph separators and the Hangul fillers that
+ * render blank.
+ */
+const UNSAFE_NAME_CHARS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u115f\u1160\u3164\uffa0]/u;
 
 /** Longest `client_name` accepted (it is shown on the Allow screen and in Connections). */
 export const MAX_CLIENT_NAME_LENGTH = 100;
@@ -54,8 +59,8 @@ const LOOKALIKES: Record<string, string> = {
   "\u0420": "p", "\u0440": "p", "\u0410": "a", "\u0430": "a", "\u0433": "r", "\u0421": "c", "\u0441": "c",
   "\u041d": "h", "\u04bb": "h", "\u04ba": "h", "\u0422": "t", "\u0442": "t", "\u0415": "e", "\u0435": "e",
   "\u0454": "e", "\u0404": "e",
-  // Greek (NFKD has already turned lunate sigma ϲ into ς)
-  "\u03a1": "p", "\u03c1": "p", "\u0391": "a", "\u03b1": "a", "\u03c2": "c", "\u0397": "h", "\u03c5": "u",
+  // Greek (lunate sigma ϲ/Ϲ is mapped before NFKD turns it into ς/Σ)
+  "\u03f2": "c", "\u03f9": "c", "\u03a1": "p", "\u03c1": "p", "\u0391": "a", "\u03b1": "a", "\u03c2": "c", "\u0397": "h", "\u03c5": "u",
   "\u03a4": "t", "\u03c4": "t", "\u0395": "e", "\u03b5": "e",
   // Latin and Armenian extras
   "\u0251": "a", "\u0570": "h", "\u057d": "u",
@@ -69,10 +74,12 @@ const LOOKALIKES: Record<string, string> = {
  * "parachute").
  */
 export function looksLikeParachute(name: string): boolean {
-  // Map look-alikes before AND after lowercasing: a capital look-alike (Greek
-  // Η) lowercases to a different letter (η) than the one it imitates.
+  // Map look-alikes before NFKD (which rewrites some, e.g. ϲ → ς) and before
+  // AND after lowercasing (a capital look-alike, Greek Η, lowercases to a
+  // different letter, η, than the one it imitates).
   const fold = (ch: string) => LOOKALIKES[ch] ?? ch;
   const folded = name
+    .replace(/./gu, fold)
     .normalize("NFKD")
     .replace(/./gu, fold)
     .toLowerCase()
@@ -143,11 +150,11 @@ export async function handleRegister(db: D1Database, req: Request, deps: OAuthDe
     if (clientName.length > MAX_CLIENT_NAME_LENGTH) {
       return invalid(`client_name must be at most ${MAX_CLIENT_NAME_LENGTH} characters`);
     }
-    // Control and direction-override characters can make a name SHOW as
-    // something its characters don't spell ("\u202Eetuhcarap" displays as
+    // Control, format and direction-override characters can make a name SHOW
+    // as something its characters don't spell ("\u202Eetuhcarap" displays as
     // "parachute").
     if (UNSAFE_NAME_CHARS.test(clientName)) {
-      return invalid("client_name must not contain control or text-direction characters");
+      return invalid("client_name must not contain control, format or text-direction characters");
     }
     const firstParty = redirectsAreFirstParty(redirectUris, boundOrigins);
     if (!firstParty && looksLikeParachute(clientName) && !SELF_HOSTED_PARACHUTE_NAMES.has(clientName)) {
