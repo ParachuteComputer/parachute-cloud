@@ -12,7 +12,8 @@
  *     vault liveness = GET <VAULT_ORIGIN>/health, the router-level endpoint that
  *     never wakes a DO; and, when CANARY_VAULT_NAME is set, the canary vault
  *     read the way a client reads it (ops-canary.ts: REST note + MCP
- *     tools/list, which DOES wake that vault's DO). Failures alert every OPERATOR_ALERT_EMAIL recipient
+ *     tools/list, which DOES wake that vault's DO). Failures alert every
+ *     OPERATOR_ALERT_EMAIL recipient
  *     (+ the optional OPS_ALERT_WEBHOOK_URL) with a 1-hour per-check dedupe
  *     persisted in D1 (`ops_alerts`). Each run's outcome is counted
  *     (`ops_counters` health_ok/health_fail) for the daily line, and the same
@@ -224,14 +225,19 @@ export async function checkVaultHealth(vaultOrigin: string, fetchFn: typeof fetc
 /**
  * The canary vault, through the vault worker the way a client reaches it
  * (ops-canary.ts). Transport: the VAULT_SERVICE binding when bound (staging),
- * else `fetchFn`, else global fetch to VAULT_ORIGIN (production).
+ * else `fetchFn`, else global fetch to VAULT_ORIGIN (production). Never
+ * throws: a broken canary is a failure to report, not a lost health tick.
  */
 export async function checkVaultCanary(env: Env, cfg: CanaryConfig, deps: OpsDeps = {}): Promise<HealthFailure | null> {
-  const oauth = depsForEnv(env);
-  if (deps.now) oauth.now = deps.now;
-  if (!oauth.vaultFetch && deps.fetchFn) oauth.vaultFetch = deps.fetchFn;
-  const detail = await runCanaryCheck(env.DB, oauth, cfg);
-  return detail === null ? null : { check: "vault-canary", detail };
+  try {
+    const oauth = depsForEnv(env);
+    if (deps.now) oauth.now = deps.now;
+    if (!oauth.vaultFetch && deps.fetchFn) oauth.vaultFetch = deps.fetchFn;
+    const detail = await runCanaryCheck(env.DB, oauth, cfg);
+    return detail === null ? null : { check: "vault-canary", detail };
+  } catch (err) {
+    return { check: "vault-canary", detail: err instanceof Error ? `${err.name}: ${err.message}` : String(err) };
+  }
 }
 
 /**
