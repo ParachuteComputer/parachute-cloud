@@ -48,6 +48,7 @@ import {
 import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./rest/storage-constants.js";
 import { handleMcp } from "./mcp.js";
 import { HealthSink, errorClass, responseOutcome, routeOf, utcDay, versionLabel } from "./health.js";
+import { logServerError } from "./error-log.js";
 import { mcpWwwAuthenticate } from "./discovery.js";
 import { handleSubscribe } from "./live/subscribe.js";
 import { SubscriptionManager, WsSink, type SubscriptionHandle } from "./live/subscriptions.js";
@@ -684,6 +685,7 @@ export class VaultDO extends DurableObject {
       });
     } catch (e) {
       this.bootError = errText(e);
+      this.noteBootError(e);
     }
 
     // Client-driven WS liveness: the runtime answers a literal `ping` with
@@ -758,6 +760,27 @@ export class VaultDO extends DurableObject {
     // storage was wiped, a never-created name has none — and must stay empty.
     if (this.destroyed || !(await this.vaultExists())) return;
     await this.health.record("do", kind);
+  }
+
+  /**
+   * The engine refused to boot this instance (e.g. NewerSchemaError after a
+   * rollback past a schema bump): every request will answer 500, so leave the
+   * cause once per instance — one `event=do_boot_error` line and a
+   * `do:boot|exception:<class>` count (server class in the health report).
+   * Counted only for a vault that exists, like a router failure. The count
+   * goes to DO key-value storage, outside the engine's tables, so it lands
+   * (and the platform can read it, see handleFetch) while the vault is down.
+   */
+  private noteBootError(e: unknown): void {
+    logServerError("do_boot_error", e, { version: versionLabel(this.env.CF_VERSION_METADATA), vaultId: this.ctx.id.toString() });
+    // Before the first request is served; a throw here would reset the object, so none escapes.
+    void this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        if (await this.vaultExists()) await this.health.record("do:boot", `exception:${errorClass(e)}`);
+      } catch (err) {
+        console.warn(`event=health_record_failed error=${errorClass(err)}`);
+      }
+    });
   }
 
   /** The vault has been materialized and not destroyed: its config is stored. */
@@ -850,7 +873,20 @@ export class VaultDO extends DurableObject {
   }
 
   private async handleFetch(request: Request): Promise<Response> {
-    if (this.bootError) return json({ error: "Internal server error", detail: this.bootError }, 500);
+    if (this.bootError) {
+      // The platform's health read still answers: its counters live outside
+      // the engine, and they carry this instance's `do:boot` count.
+      const hm = /^\/vault\/([^/]+)\/api\/internal\/health$/.exec(new URL(request.url).pathname);
+      if (hm) {
+        const vaultName = decodeURIComponent(hm[1]!);
+        const auth = await authenticateVaultRequest(request, this.env, vaultName);
+        if ("error" in auth) return auth.error;
+        const forbidden = this.internalForbidden(auth, vaultName);
+        if (forbidden) return forbidden;
+        return this.handleInternalHealth(request);
+      }
+      return json({ error: "Internal server error", detail: this.bootError }, 500);
+    }
 
     const url = new URL(request.url);
     const m = /^\/vault\/([^/]+)(\/.*)?$/.exec(url.pathname);
@@ -1085,6 +1121,12 @@ export class VaultDO extends DurableObject {
           mintGate: (declaredBytes) => this.attachmentMintGate(declaredBytes),
         },
         (subject, outcome) => this.health.record(subject, outcome),
+        (tool, err) =>
+          logServerError("mcp_tool_error", err, {
+            tool,
+            version: versionLabel(this.env.CF_VERSION_METADATA),
+            vaultId: this.ctx.id.toString(),
+          }),
       );
     }
 

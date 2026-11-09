@@ -5,7 +5,8 @@
  * WHAT IS STORED: names and counts only. A key is `<subject>|<outcome>`:
  *   - subject: a server-defined label — the route group (`http:notes`), a tool
  *     name from this vault's own visible tool list (`mcp:create-note`),
- *     `alarm`, or `do` for router-observed Durable Object failures;
+ *     `alarm`, `do` for router-observed Durable Object failures, or
+ *     `do:boot` for an instance whose engine refused to boot (vault-do.ts);
  *   - outcome: `2xx`, `4xx:404`, `5xx:500`, `ok`, `tool_error`,
  *     `domain:<json-rpc code>`, `gate:<status>`, `exception:<ErrorClass>`,
  *     or a router failure kind (`cpu_limit`, …).
