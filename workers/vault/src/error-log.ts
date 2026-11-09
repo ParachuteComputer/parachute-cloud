@@ -23,18 +23,28 @@ import { errorClassName } from "./health.js";
 const MSG_MAX = 200;
 const MAX_FRAMES = 10;
 
+const QUOTE = /['"`“”‘’«»]/;
+
 /**
- * err.message with every quoted span ('…', "…", `…`) replaced by `…`, one line,
+ * err.message with every quoted span ('…', "…", `…`, and typographic “…” ‘…’ «…»)
+ * replaced by `…`, one line,
  * at most 200 chars. Quotes are not paired: everything from the first quote
  * character to the last goes (a lone one takes the rest), so a span with the
  * same quote inside it (`"{"key": 1}"`) or an apostrophe cannot let input
- * through. Over-redacting ("Can't …" → "Can…") is the safe side.
+ * through. Over-redacting ("Can't …" → "Can…") is the safe side. The same
+ * rule as core's packages/vault/core/src/mcp-error-log.ts.
  */
 export function redactMessage(message: string): string {
-  const first = message.search(/['"`]/);
+  const first = message.search(QUOTE);
   let out = message;
   if (first >= 0) {
-    const last = Math.max(message.lastIndexOf("'"), message.lastIndexOf('"'), message.lastIndexOf("`"));
+    let last = first;
+    for (let i = message.length - 1; i > first; i--) {
+      if (QUOTE.test(message[i]!)) {
+        last = i;
+        break;
+      }
+    }
     out = message.slice(0, first) + "…" + (last > first ? message.slice(last + 1) : "");
   }
   return out.replace(/\s+/g, " ").trim().slice(0, MSG_MAX);

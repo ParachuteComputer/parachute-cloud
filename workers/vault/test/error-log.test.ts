@@ -15,7 +15,8 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 import { redactMessage, serverErrorLine, stackFrames } from "../src/error-log.ts";
-import { createNote, freshVault, op } from "./helpers.ts";
+import { createNote, freshVault, mintToken, op } from "./helpers.ts";
+import { SELF } from "cloudflare:test";
 
 type Days = Record<string, Record<string, Record<string, number>>>;
 
@@ -154,6 +155,12 @@ describe("a vault DO that cannot boot", () => {
     expect(c["do:boot|exception:newerschemaerror"]).toBe(1);
     // A tenant still gets the 500, not the counters.
     expect((await op(v, "/api/tags")).status).toBe(500);
+    // The health read on a broken vault is still platform-only: no token → 401,
+    // a tenant's own admin token (not the first-party client) → 403.
+    const healthUrl = `https://vault.test/vault/${v}/api/internal/health?since=2000-01-01`;
+    expect((await SELF.fetch(healthUrl)).status).toBe(401);
+    const tenant = await mintToken({ vault: v, scopes: `vault:${v}:admin`, clientId: "tenant-app" });
+    expect((await SELF.fetch(healthUrl, { headers: { Authorization: `Bearer ${tenant}` } })).status).toBe(403);
   });
 
   it("a vault that boots logs no do_boot_error and counts no do:boot", async () => {
@@ -178,6 +185,7 @@ describe("the log line's message and frames", () => {
     expect(redactMessage("bad token 'MARKER")).toBe("bad token …");
     expect(redactMessage("Can't update note 'p/MARKER-secret'")).toBe("Can…");
     expect(redactMessage("on string'MARKER'")).toBe("on string…");
+    expect(redactMessage("name: ‘MARKER’ “MARKER” «MARKER»")).toBe("name: …");
   });
 
   it("never takes a frame from the message, even a message line that looks like one", () => {

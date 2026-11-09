@@ -782,8 +782,10 @@ export class VaultDO extends DurableObject {
    * goes to DO key-value storage, outside the engine's tables, so it lands
    * while the vault is down, and GET /api/internal/health (the on-demand
    * collect) still reads it (see handleFetch). The nightly rollup's config GET
-   * still 500s, which it records as `collect|fail`; the `do:boot` cell reaches
-   * the nightly copy once the vault boots again (days are kept a week).
+   * still 500s, which it records as `collect|fail`. The nightly copy and the
+   * on-demand collect read only yesterday and today, so a `do:boot` count
+   * older than that never reaches D1; while the vault is down, collect it on
+   * demand.
    */
   private noteBootError(e: unknown): void {
     logServerError("do_boot_error", e, this.logFields);
