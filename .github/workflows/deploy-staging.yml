@@ -45,7 +45,7 @@ concurrency:
 
 jobs:
   # Nothing deploys until ci.yml's three jobs have passed on this exact commit. The same push starts CI, so this
-  # waits for it (CI's jobs time out at 20 minutes) and fails at the first red job. A manual run is gated the same way.
+  # waits for it (CI's jobs time out at 20 minutes) and fails at the first red job. A manual run is gated too.
   ci-green:
     name: CI passed on this commit
     runs-on: ubuntu-latest
@@ -56,7 +56,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       SHA: ${{ github.sha }}
       WAIT_MINUTES: 40
-      WAIT_FOR_MISSING: true
+      # A push started CI on this commit too, so wait for its checks to appear. A manual run of a commit CI never ran
+      # on is refused at once.
+      WAIT_FOR_MISSING: ${{ github.event_name == 'push' }}
       # The job names in ci.yml, as GitHub shows them. Rename a job there, rename it here.
       REQUIRED: |
         identity worker (typecheck + vitest/workerd)
