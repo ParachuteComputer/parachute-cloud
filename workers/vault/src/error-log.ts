@@ -9,32 +9,44 @@
  * The same shape as the self-hosted vault's line (parachute-core), so one query
  * finds both. The arguments, headers, tokens and the vault's name are never
  * passed in; `vault_id` is the Durable Object's id. The message is the one
- * place input could ride along, so `msg` drops every quoted span (engine and
- * JSON.parse messages quote the input) and `stack` never reads the message's
- * lines. Input a message carries WITHOUT quotes would still show; the lines are
+ * place input could ride along, so `msg` drops everything from its first quote
+ * to its last (engine and JSON.parse messages quote the input, and quoted JSON
+ * has quotes inside) and `stack` keeps only real frame lines. Input a message carries WITHOUT quotes would still show; the lines are
  * written only for runtime faults (TypeError and kin, health.ts
  * toolErrorOutcome), whose messages the runtime words.
  */
 
+import { errorClassName } from "./health.js";
+
 const MSG_MAX = 200;
 const MAX_FRAMES = 10;
 
-/** err.message with every quoted span ('…', "…", `…`) replaced by `…`, one line, at most 200 chars. */
+/**
+ * err.message with every quoted span ('…', "…", `…`) replaced by `…`, one line,
+ * at most 200 chars. Quotes are not paired: everything from the first quote
+ * character to the last goes (a lone one takes the rest), so a span with the
+ * same quote inside it (`"{"key": 1}"`) or an apostrophe cannot let input
+ * through. Over-redacting ("Can't …" → "Can…") is the safe side.
+ */
 export function redactMessage(message: string): string {
-  return message
-    // An apostrophe inside a word ("can't") opens no span.
-    .replace(/(?<![A-Za-z0-9])'[^']*'|"[^"]*"|`[^`]*`/g, "…")
-    .replace(/["`]/g, "'") // an unbalanced quote must not end the line's own msg="…"
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, MSG_MAX);
+  const first = message.search(/['"`]/);
+  let out = message;
+  if (first >= 0) {
+    const last = Math.max(message.lastIndexOf("'"), message.lastIndexOf('"'), message.lastIndexOf("`"));
+    out = message.slice(0, first) + "…" + (last > first ? message.slice(last + 1) : "");
+  }
+  return out.replace(/\s+/g, " ").trim().slice(0, MSG_MAX);
 }
 
 /**
  * Only the `at …` frame lines of a stack, at most 10, joined with " | ". The
  * stack opens with the message, which may span lines (one could even start
- * with "at "), so everything up to the end of `message` is skipped first.
+ * with "at "), so everything up to the end of `message` is skipped first, and
+ * a line counts only in a V8 frame's shape: ending in `:line:col`, `<anonymous>`
+ * or `native` (in parentheses or not) — in case the message changed after the
+ * stack was taken.
  */
+const FRAME = /^at .*(?::\d+:\d+|<anonymous>|native)\)?$/;
 export function stackFrames(stack: string | undefined, message?: string): string {
   if (!stack) return "";
   const at = message ? stack.indexOf(message) : -1;
@@ -42,15 +54,10 @@ export function stackFrames(stack: string | undefined, message?: string): string
   return frames
     .split("\n")
     .map((l) => l.trim())
-    .filter((l) => l.startsWith("at "))
+    .filter((l) => FRAME.test(l))
     .slice(0, MAX_FRAMES)
     .join(" | ")
     .replace(/"/g, "'");
-}
-
-function className(err: unknown): string {
-  const name = err instanceof Error ? err.constructor?.name || err.name : typeof err;
-  return /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : "unknown";
 }
 
 /** A server-defined token (tool name, version label, DO id): anything outside a small alphabet becomes `_`. */
@@ -74,7 +81,7 @@ export function serverErrorLine(event: string, err: unknown, f: ErrorLogFields):
   return [
     `event=${token(event)}`,
     ...(f.tool !== undefined ? [`tool=${token(f.tool)}`] : []),
-    `class=${className(err)}`,
+    `class=${errorClassName(err)}`,
     `msg="${redactMessage(message)}"`,
     `stack="${stackFrames(stack, message)}"`,
     `version=${token(f.version)}`,

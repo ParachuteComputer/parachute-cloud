@@ -167,21 +167,26 @@ describe("a vault DO that cannot boot", () => {
 });
 
 describe("the log line's message and frames", () => {
-  it("replaces every quoted span, collapses newlines, caps at 200 chars", () => {
-    expect(redactMessage(`Unexpected token 'M', "MARKER {" is not valid JSON`)).toBe("Unexpected token …, … is not valid JSON");
+  it("drops everything from the first quote to the last, collapses newlines, caps at 200 chars", () => {
+    expect(redactMessage(`Unexpected token 'M', "MARKER {" is not valid JSON`)).toBe("Unexpected token … is not valid JSON");
+    // Quoted input with the same quote inside it (JSON keys): nothing of it survives.
+    expect(redactMessage(`Unexpected token 'x', "{"secret": x}" is not valid JSON`)).toBe("Unexpected token … is not valid JSON");
     expect(redactMessage("Note not found: `MARKER`")).toBe("Note not found: …");
     expect(redactMessage("line one\n  line two\r\nthree")).toBe("line one line two three");
     expect(redactMessage("x".repeat(500))).toHaveLength(200);
-    // An unbalanced quote cannot break the line's own quoting.
-    expect(redactMessage(`it's "open`)).not.toContain('"');
-    // An apostrophe inside a word does not open a span, so the real quote is still dropped.
-    expect(redactMessage("Can't update note 'p/MARKER-secret'")).toBe("Can't update note …");
+    // A lone quote drops the rest; an apostrophe counts as a quote (over-redacting is the safe side).
+    expect(redactMessage("bad token 'MARKER")).toBe("bad token …");
+    expect(redactMessage("Can't update note 'p/MARKER-secret'")).toBe("Can…");
+    expect(redactMessage("on string'MARKER'")).toBe("on string…");
   });
 
   it("never takes a frame from the message, even a message line that looks like one", () => {
     const err = new TypeError("bad input\n    at MARKER-user-text");
     expect(stackFrames(err.stack, err.message)).not.toContain("MARKER");
     expect(stackFrames(err.stack, err.message)).toMatch(/^at /);
+    // The message changed after the stack was captured: still no message line.
+    err.message = "rewritten";
+    expect(stackFrames(err.stack, err.message)).not.toContain("MARKER");
   });
 
   it("keeps only the 'at …' frames of a stack, at most 10, joined with ' | '", () => {

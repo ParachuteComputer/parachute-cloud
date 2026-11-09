@@ -144,8 +144,13 @@ export function httpOutcome(status: number): string {
 
 /** The error's class name, never its message (messages can carry user data). */
 export function errorClass(err: unknown): string {
+  return errorClassName(err).toLowerCase();
+}
+
+/** {@link errorClass} as written (`TypeError`), for log lines (error-log.ts): the same name the counter keys on. */
+export function errorClassName(err: unknown): string {
   const name = err instanceof Error ? err.constructor?.name || err.name : typeof err;
-  return /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(name) ? name.toLowerCase() : "error";
+  return /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(name) ? name : "Error";
 }
 
 const INTERNAL_ROUTES = new Set([

@@ -630,8 +630,9 @@ export class VaultDO extends DurableObject {
     super(ctx, env);
     this.env = env;
     this.attachmentTickets = new DoAttachmentTicketProvider(ctx.storage);
-    this.health = new HealthSink(ctx.storage, versionLabel(env.CF_VERSION_METADATA));
-    this.logFields = { version: versionLabel(env.CF_VERSION_METADATA), vaultId: ctx.id.toString() };
+    const version = versionLabel(env.CF_VERSION_METADATA);
+    this.health = new HealthSink(ctx.storage, version);
+    this.logFields = { version, vaultId: ctx.id.toString() };
     // The shim carries `ctx.storage` (not just `.sql`) so its `transactionSync`
     // can delegate to the real DO transaction primitive — the free
     // `transaction(db, fn)` path (incl. boot migrations) prefers it (vault#523).
@@ -770,7 +771,10 @@ export class VaultDO extends DurableObject {
    * `do:boot|exception:<class>` count (server class in the health report).
    * Counted only for a vault that exists, like a router failure. The count
    * goes to DO key-value storage, outside the engine's tables, so it lands
-   * (and the platform can read it, see handleFetch) while the vault is down.
+   * while the vault is down, and GET /api/internal/health (the on-demand
+   * collect) still reads it (see handleFetch). The nightly rollup's config GET
+   * still 500s, which it records as `collect|fail`; the `do:boot` cell reaches
+   * the nightly copy once the vault boots again (days are kept a week).
    */
   private noteBootError(e: unknown): void {
     logServerError("do_boot_error", e, this.logFields);
