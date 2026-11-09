@@ -50,6 +50,27 @@ export class RateLimiterDO extends DurableObject<unknown> {
     return { allowed: true, retryAfterSeconds: 0 };
   }
 
+  /**
+   * DEPRECATED (T-419) — the previous worker version's separate check and
+   * record calls. Kept for ONE release so isolates still on that version during
+   * deploy propagation keep a working fence instead of erroring (their client
+   * failed open on errors). Nothing in this version calls them; remove next
+   * release.
+   */
+  async isLocked(windowMs: number, max: number, nowMs: number): Promise<{ locked: boolean; retryAfterSeconds: number }> {
+    this.prune(nowMs, windowMs);
+    const lift = this.liftTs(max);
+    if (lift === null) return { locked: false, retryAfterSeconds: 0 };
+    return { locked: true, retryAfterSeconds: retryAfter(lift, windowMs, nowMs) };
+  }
+
+  /** DEPRECATED (T-419) — see {@link isLocked}; remove next release. */
+  async recordFailure(windowMs: number, nowMs: number): Promise<void> {
+    this.prune(nowMs, windowMs);
+    this.sql.exec("INSERT INTO events (ts) VALUES (?)", nowMs);
+    await this.armPurgeAlarm(windowMs);
+  }
+
   /** Clear every event for this key (successful login clears the fence). */
   async clear(): Promise<void> {
     this.sql.exec("DELETE FROM events");

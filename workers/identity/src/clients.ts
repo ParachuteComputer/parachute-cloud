@@ -193,13 +193,16 @@ export function redirectsAreFirstParty(redirectUris: readonly string[], firstPar
 }
 
 /**
- * Whether Parachute can vouch for this client on the Allow screen: it was
- * registered by a signed-in Parachute page (bound-origin auto-approve,
- * `sameHub`), or it can only send you back to Parachute's own origins.
- * Everything else registered itself (RFC 7591 DCR) and is shown as unverified.
+ * Whether Parachute can vouch for this client on the Allow screen: it can only
+ * send you back to Parachute's own origins. Everything else registered itself
+ * (RFC 7591 DCR) and is shown as unverified. NOT `sameHub`: that flag only
+ * proves "some signed-in account sent an Origin header naming a bound origin",
+ * and outside a browser anyone with an account can send that header.
+ * (Operator-seeded reserved ids are vouched for by the caller,
+ * oauth-connections.ts `isFirstPartyClientId`.)
  */
 export function isVouchedClient(client: OAuthClient, firstPartyOrigins: readonly string[]): boolean {
-  return client.sameHub || redirectsAreFirstParty(client.redirectUris, firstPartyOrigins);
+  return redirectsAreFirstParty(client.redirectUris, firstPartyOrigins);
 }
 
 /**

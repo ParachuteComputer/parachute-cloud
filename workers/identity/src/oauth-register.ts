@@ -42,16 +42,30 @@ export const MAX_CLIENT_NAME_LENGTH = 100;
 const SELF_HOSTED_PARACHUTE_NAMES = new Set(["Parachute Hub (agent connector)", "Parachute Notes"]);
 
 /**
- * Does a self-chosen name read as Parachute? Case-, width- and
- * punctuation-blind: NFKC folds fullwidth/compatibility letters, then every
- * non-letter/digit is dropped ("P.a.r.a chute" → "parachute").
+ * Common look-alikes of the letters in "parachute" (Cyrillic, Greek, a few
+ * Latin extensions) folded to ASCII. Not the full Unicode confusables table
+ * (UTS #39); enough that a one-letter swap doesn't slip through.
+ */
+const LOOKALIKES: Record<string, string> = {
+  "\u0440": "p", "\u03c1": "p", "\u0430": "a", "\u03b1": "a", "\u0251": "a", "\u0433": "r",
+  "\u0441": "c", "\u03f2": "c", "\u04bb": "h", "\u0570": "h", "\u03c5": "u", "\u057d": "u",
+  "\u0442": "t", "\u03c4": "t", "\u0435": "e", "\u03b5": "e", "\u0454": "e",
+};
+
+/**
+ * Does a self-chosen name read as Parachute? Case-, width-, accent- and
+ * punctuation-blind, with common look-alike letters folded: NFKD splits
+ * fullwidth/compatibility letters and splits accents off their letters, then
+ * every non-letter/digit is dropped — accents included ("P.a.r.a chuté" →
+ * "parachute").
  */
 export function looksLikeParachute(name: string): boolean {
-  return name
-    .normalize("NFKC")
+  const folded = name
+    .normalize("NFKD")
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}]/gu, "")
-    .includes("parachute");
+    .replace(/./gu, (ch) => LOOKALIKES[ch] ?? ch)
+    .replace(/[^\p{L}\p{N}]/gu, "");
+  return folded.includes("parachute");
 }
 
 interface RegisterRequestBody {
@@ -97,24 +111,26 @@ export async function handleRegister(db: D1Database, req: Request, deps: OAuthDe
 
   let status: ClientStatus = "pending";
   let sameHub = false;
+  const boundOrigins = resolveBoundOrigins(deps);
   const sessionId = parseSessionCookie(req.headers.get("cookie"));
   const session = sessionId ? await findActiveSession(db, sessionId, deps.now?.() ?? new Date()) : null;
-  if (session && isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+  if (session && isSameOriginRequest(req, boundOrigins)) {
     status = "approved";
     sameHub = true;
   }
 
   // Reserve Parachute's name (T-419, audit L3-03 F2): a stranger could register
   // "Parachute Console (official)" and the Allow screen would say so. Only a
-  // first-party registration may use it — a signed-in Parachute page (the
-  // auto-approve above) or one whose every redirect is a Parachute origin.
-  // Clients registered before this rule are not touched.
+  // registration whose every redirect is a Parachute origin may use it. Not the
+  // auto-approve above: its session + Origin check is a browser fence, and any
+  // account holder can send that Origin header from curl. Clients registered
+  // before this rule are not touched.
   const clientName = body.client_name;
   if (clientName !== undefined) {
     if (clientName.length > MAX_CLIENT_NAME_LENGTH) {
       return invalid(`client_name must be at most ${MAX_CLIENT_NAME_LENGTH} characters`);
     }
-    const firstParty = sameHub || redirectsAreFirstParty(redirectUris, resolveBoundOrigins(deps));
+    const firstParty = redirectsAreFirstParty(redirectUris, boundOrigins);
     if (!firstParty && looksLikeParachute(clientName) && !SELF_HOSTED_PARACHUTE_NAMES.has(clientName)) {
       return invalid("client_name is reserved: an app registered here can't be named Parachute");
     }

@@ -47,6 +47,15 @@ import { userOwnsVault } from "./vaults.ts";
 /** Parachute's own clients — never shown as a "connected app". */
 const FIRST_PARTY_CLIENTS = new Set([CONSOLE_CLIENT_ID, APP_CLIENT_ID, ACCOUNT_TOKEN_CLIENT_ID]);
 
+/**
+ * One of Parachute's own reserved client ids (operator-seeded, e.g. the native
+ * app's pinned `parachute-app`). DCR always mints a random UUID, so no
+ * registration can claim one.
+ */
+export function isFirstPartyClientId(clientId: string): boolean {
+  return FIRST_PARTY_CLIENTS.has(clientId);
+}
+
 const VERB_RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };
 
 export type ConnectionCoverage = "vault" | "account";

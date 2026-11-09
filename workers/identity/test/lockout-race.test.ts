@@ -289,6 +289,27 @@ describe("F5: the per-link sign-in code cap holds under a parallel burst", () =>
   });
 });
 
+describe("F5: a right code is not a wrong guess on the user's other links", () => {
+  test("signing in with the newest link's code leaves the older link's attempt count alone", async () => {
+    const now = new Date("2026-07-02T12:00:00Z");
+    const { id } = await seedUser("two-links@example.com", "correct horse");
+    const older = await createMagicLink(env.DB, "two-links@example.com", id, now);
+    const newer = await createMagicLink(env.DB, "two-links@example.com", id, now);
+    // One miss counts on both live links.
+    const miss = String((Number(older.code) + 1) % 1_000_000).padStart(6, "0");
+    const missOk = miss !== newer.code;
+    if (missOk) expect(await verifyMagicCode(env.DB, "two-links@example.com", miss, now)).toBeNull();
+    expect((await verifyMagicCode(env.DB, "two-links@example.com", newer.code, now))?.email).toBe("two-links@example.com");
+    const rows = await env.DB.prepare("SELECT code_attempts, consumed_at FROM magic_links WHERE email = ? ORDER BY consumed_at IS NULL")
+      .bind("two-links@example.com")
+      .all<{ code_attempts: number; consumed_at: string | null }>();
+    const [spent, other] = rows.results;
+    expect(spent!.consumed_at).not.toBeNull();
+    expect(other!.consumed_at).toBeNull();
+    expect(other!.code_attempts).toBe(missOk ? 1 : 0);
+  });
+});
+
 describe("F3: an authorization code redeems exactly once under parallel redemption", () => {
   test("8 parallel /oauth/token calls with one code and verifier yield exactly one 200", async () => {
     const { id } = await seedUser("code-race@example.com", "correct horse");

@@ -23,7 +23,12 @@ import {
   widenUnnamedVaultVerb,
 } from "./audience.ts";
 import { type OAuthClient, approveClient, getClient, isVouchedClient, requireRegisteredRedirectUri } from "./clients.ts";
-import { earlierSameAppReach, findSupersededConnections, retireSupersededConnections } from "./oauth-connections.ts";
+import {
+  earlierSameAppReach,
+  findSupersededConnections,
+  isFirstPartyClientId,
+  retireSupersededConnections,
+} from "./oauth-connections.ts";
 import { GrantWriteConflictError, isCoveredByGrant, recordGrant } from "./grants.ts";
 import { listVaultsForOwner, unownedNamedVaults, userOwnsVault } from "./vaults.ts";
 import {
@@ -391,7 +396,7 @@ async function authorizeCore(
 
   if (!session) return renderLoginPage(req, params, undefined, client.clientName);
   // Both consent surfaces below label an app Parachute can't vouch for (T-419).
-  const unverified = !isVouchedClient(client, resolveBoundOrigins(deps));
+  const unverified = !isFirstPartyClientId(client.clientId) && !isVouchedClient(client, resolveBoundOrigins(deps));
 
   // Account-vaults (Wave A) — a wholly separate consent surface from the vault
   // picker. Refuse a mixed/foreign-id request, then ALWAYS render consent (never

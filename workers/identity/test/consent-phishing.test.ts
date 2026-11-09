@@ -115,6 +115,9 @@ describe("F2: /oauth/register reserves Parachute's name for first-party registra
     "p.a.r.a.c.h.u.t.e",
     "Ｐａｒａｃｈｕｔｅ", // fullwidth letters
     "My Parachute-Sync",
+    "P\u0430rachute Console", // Cyrillic а
+    "Parachut\u00e9", // é
+    "Parachute\u0301 Notes", // combining accent
   ]) {
     test(`refused for a third-party redirect: ${JSON.stringify(name)}`, async () => {
       const res = await register({ client_name: name, redirect_uris: [EVIL] });
@@ -148,15 +151,19 @@ describe("F2: /oauth/register reserves Parachute's name for first-party registra
     }
   });
 
-  test("first-party: a signed-in registration from a bound origin (auto-approve) may use the name, any redirect", async () => {
+  test("a session plus a bound Origin header is NOT first-party: any account holder can send both from curl", async () => {
     const { id } = await seedUser("bound-reg@example.com");
     const sessionId = await seedSession(id);
-    const res = await register(
-      { client_name: "Parachute Notes", redirect_uris: ["https://hub.example/surface/parachute/oauth/callback"] },
-      { origin: APP_ORIGIN, cookie: `${SESSION_COOKIE}=${sessionId}` },
-    );
-    expect(res.status).toBe(201);
-    expect(((await res.json()) as { same_hub: boolean }).same_hub).toBe(true);
+    const headers = { origin: APP_ORIGIN, cookie: `${SESSION_COOKIE}=${sessionId}` };
+    const named = await register({ client_name: "Parachute Console (official)", redirect_uris: [EVIL] }, headers);
+    expect(named.status).toBe(400);
+    // Auto-approve itself is unchanged, and such a client is still labelled unverified.
+    const plain = await register({ client_name: "Helper", redirect_uris: [EVIL] }, headers);
+    expect(plain.status).toBe(201);
+    const reg = (await plain.json()) as { client_id: string; same_hub: boolean };
+    expect(reg.same_hub).toBe(true);
+    const html = await consentHtml(reg.client_id, EVIL, "same-hub-user@example.com");
+    expect(html).toContain('data-testid="consent-unverified"');
   });
 
   test("a bound Origin header WITHOUT a session is not first-party (any curl can send one)", async () => {
@@ -185,6 +192,14 @@ describe("F2: /oauth/register reserves Parachute's name for first-party registra
     const html = await consentHtml(reg.client_id, "https://myhub.example/oauth/agent-grant/callback", "hub-user@example.com");
     expect(html).toContain('data-testid="consent-unverified"');
     expect(returnsTo(html)).toContain("<code>https://myhub.example</code>");
+  });
+
+  test("Parachute's own reserved client ids (operator-seeded, e.g. the native app) are not labelled unverified", async () => {
+    const uri = "computer.parachute.app:/oauth/callback";
+    await registerClient(env.DB, { clientId: "parachute-app", redirectUris: [uri], clientName: "Parachute", status: "approved" });
+    const html = await consentHtml("parachute-app", uri, "native-first-party@example.com");
+    expect(html).not.toContain('data-testid="consent-unverified"');
+    expect(returnsTo(html)).toContain("an app on this device");
   });
 
   test("clients already registered under a Parachute-like name are untouched", async () => {
