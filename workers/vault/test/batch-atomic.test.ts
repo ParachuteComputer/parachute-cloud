@@ -82,12 +82,50 @@ describe("batch writes are all or nothing (L2-05)", () => {
     expect(read.content).toBe("before");
   });
 
-  it("a batch that succeeds still writes every note and fires its live events once committed", async () => {
+  it("a batch that succeeds still writes every note", async () => {
     const v = freshVault();
     const res = await op(v, "/api/notes", json({ notes: [{ path: "ok/a", content: "a" }, { path: "ok/b", content: "b" }] }));
     expect(res.status).toBe(201);
     expect(((await res.json()) as any[]).map((n) => n.path)).toEqual(["ok/a", "ok/b"]);
     expect(await exists(v, "ok/a")).toBe(true);
     expect(await exists(v, "ok/b")).toBe(true);
+  });
+
+  it("a rolled-back batch sends no live event; a committed one does", async () => {
+    const v = freshVault();
+    expect((await op(v, "/api/notes", json({ path: "live/taken", content: "x" }))).status).toBe(201);
+    const stream = await SELF.fetch(`${base(v)}/api/subscribe?tag=bt`, { headers: { Authorization: `Bearer ${OP}` } });
+    const reader = stream.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    const nextEvent = async (): Promise<{ event: string; data: any }> => {
+      for (;;) {
+        const i = buf.indexOf("\n\n");
+        if (i !== -1) {
+          const raw = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          const data = raw.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).join("\n");
+          if (!data) continue;
+          return { event: /^event:\s*(\S+)/m.exec(raw)?.[1] ?? "message", data: JSON.parse(data) };
+        }
+        const { done, value } = await reader.read();
+        if (done) throw new Error("stream closed");
+        buf += decoder.decode(value, { stream: true });
+      }
+    };
+    expect((await nextEvent()).event).toBe("snapshot");
+
+    const failed = await op(v, "/api/notes", json({ notes: [
+      { path: "live/one", content: "rolled back", tags: ["bt"] },
+      { path: "live/taken", content: "collides", tags: ["bt"] },
+    ] }));
+    expect(failed.status).toBe(409);
+    await failed.body?.cancel();
+    expect((await op(v, "/api/notes", json({ path: "live/kept", content: "committed", tags: ["bt"] }))).status).toBe(201);
+
+    const first = await nextEvent();
+    expect(first.event).toBe("upsert");
+    expect(first.data.note.path).toBe("live/kept"); // nothing from the rolled-back batch came first
+    await reader.cancel().catch(() => {});
   });
 });
