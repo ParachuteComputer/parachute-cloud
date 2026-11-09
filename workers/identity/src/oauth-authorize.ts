@@ -22,7 +22,7 @@ import {
   unnamedVaultVerbs,
   widenUnnamedVaultVerb,
 } from "./audience.ts";
-import { type OAuthClient, approveClient, getClient, requireRegisteredRedirectUri } from "./clients.ts";
+import { type OAuthClient, approveClient, getClient, isVouchedClient, requireRegisteredRedirectUri } from "./clients.ts";
 import { earlierSameAppReach, findSupersededConnections, retireSupersededConnections } from "./oauth-connections.ts";
 import { GrantWriteConflictError, isCoveredByGrant, recordGrant } from "./grants.ts";
 import { listVaultsForOwner, unownedNamedVaults, userOwnsVault } from "./vaults.ts";
@@ -390,6 +390,8 @@ async function authorizeCore(
   }
 
   if (!session) return renderLoginPage(req, params, undefined, client.clientName);
+  // Both consent surfaces below label an app Parachute can't vouch for (T-419).
+  const unverified = !isVouchedClient(client, resolveBoundOrigins(deps));
 
   // Account-vaults (Wave A) — a wholly separate consent surface from the vault
   // picker. Refuse a mixed/foreign-id request, then ALWAYS render consent (never
@@ -423,6 +425,7 @@ async function authorizeCore(
         issuerHost: consentIssuedByHost(req, params.resource, deps),
         email: consentUser?.email ?? "",
         notYouNext: authorizeResumePath(params),
+        unverified,
       }),
       200,
       extra,
@@ -506,6 +509,7 @@ async function authorizeCore(
       // and the connector request resumes without any new machinery.
       email: consentUser?.email ?? "",
       notYouNext: authorizeResumePath(params),
+      unverified,
     }),
     200,
     extra,

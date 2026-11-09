@@ -157,8 +157,11 @@ describe("F1: the login lockout holds under a parallel burst", () => {
     const valid = new Set(
       await Promise.all([-30_000, 0, 30_000].map((d) => totpCodeAt(secret, new Date(now.getTime() + d)))),
     );
+    // Fewer than the other bursts: every wrong code also runs 10 backup-code
+    // PBKDF2 checks. Still twice the limit.
+    const burst = 2 * LOGIN_MAX_FAILURES;
     const wrong: string[] = [];
-    for (let n = 0; wrong.length < WRONG; n++) {
+    for (let n = 0; wrong.length < burst; n++) {
       const c = String(n).padStart(6, "0");
       if (!valid.has(c)) wrong.push(c);
     }
@@ -167,9 +170,9 @@ describe("F1: the login lockout holds under a parallel burst", () => {
     const cookie = `parachute_id_pending=${pending}`;
     const reqs = [...wrong, right].map((c) => postForm("/login/2fa", { code: c }, ip, cookie));
     const res = await Promise.all(reqs.map((r) => handleLogin2faPost(env.DB, r, deps(() => now))));
-    const { checked } = await tally(res.slice(0, WRONG), "didn't match");
+    const { checked } = await tally(res.slice(0, burst), "didn't match");
     expect(checked).toBeLessThanOrEqual(LOGIN_MAX_FAILURES);
-    expect(hasSession(res[WRONG]!)).toBe(false);
+    expect(hasSession(res[burst]!)).toBe(false);
   });
 
   test("a different IP is still its own (ip,email) bucket: the owner on their own IP signs in", async () => {

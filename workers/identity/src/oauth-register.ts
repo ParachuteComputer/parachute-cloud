@@ -13,9 +13,46 @@
  * has no operator token of its own and no install wizard, so those paths are
  * omitted; the session path + single-consent authorize cover approval.
  */
-import { type ClientStatus, type RegisteredClient, isValidRedirectUri, registerClient } from "./clients.ts";
+import {
+  type ClientStatus,
+  type RegisteredClient,
+  isValidRedirectUri,
+  redirectsAreFirstParty,
+  registerClient,
+} from "./clients.ts";
 import { findActiveSession, parseSessionCookie } from "./sessions.ts";
 import { type OAuthDeps, isSameOriginRequest, jsonResponse, resolveBoundOrigins } from "./oauth-shared.ts";
+
+/** Longest `client_name` accepted (it is shown on the Allow screen and in Connections). */
+export const MAX_CLIENT_NAME_LENGTH = 100;
+
+/**
+ * Exact names of Parachute software that people run THEMSELVES and that
+ * registers from its own origin, so it can't pass the first-party test:
+ *   - "Parachute Hub (agent connector)": a self-hosted hub connecting an agent
+ *     to a cloud vault (parachute-core packages/hub/src/oauth-client.ts),
+ *     redirect `<hub origin>/oauth/agent-grant/callback`;
+ *   - "Parachute Notes": the Notes app mounted on a self-hosted hub adding a
+ *     cloud vault (parachute-app src/lib/vault/discovery.ts), redirect
+ *     `<hub origin>/…/oauth/callback`.
+ * Exact match only, so a look-alike ("Parachute Notes (official)") is still
+ * refused. These still show as unverified, with their origin, on the Allow
+ * screen: that line, not the name, is what a person checks.
+ */
+const SELF_HOSTED_PARACHUTE_NAMES = new Set(["Parachute Hub (agent connector)", "Parachute Notes"]);
+
+/**
+ * Does a self-chosen name read as Parachute? Case-, width- and
+ * punctuation-blind: NFKC folds fullwidth/compatibility letters, then every
+ * non-letter/digit is dropped ("P.a.r.a chute" → "parachute").
+ */
+export function looksLikeParachute(name: string): boolean {
+  return name
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, "")
+    .includes("parachute");
+}
 
 interface RegisterRequestBody {
   redirect_uris?: string[];
@@ -65,6 +102,22 @@ export async function handleRegister(db: D1Database, req: Request, deps: OAuthDe
   if (session && isSameOriginRequest(req, resolveBoundOrigins(deps))) {
     status = "approved";
     sameHub = true;
+  }
+
+  // Reserve Parachute's name (T-419, audit L3-03 F2): a stranger could register
+  // "Parachute Console (official)" and the Allow screen would say so. Only a
+  // first-party registration may use it — a signed-in Parachute page (the
+  // auto-approve above) or one whose every redirect is a Parachute origin.
+  // Clients registered before this rule are not touched.
+  const clientName = body.client_name;
+  if (clientName !== undefined) {
+    if (clientName.length > MAX_CLIENT_NAME_LENGTH) {
+      return invalid(`client_name must be at most ${MAX_CLIENT_NAME_LENGTH} characters`);
+    }
+    const firstParty = sameHub || redirectsAreFirstParty(redirectUris, resolveBoundOrigins(deps));
+    if (!firstParty && looksLikeParachute(clientName) && !SELF_HOSTED_PARACHUTE_NAMES.has(clientName)) {
+      return invalid("client_name is reserved: an app registered here can't be named Parachute");
+    }
   }
 
   const confidential = body.token_endpoint_auth_method === "client_secret_post";

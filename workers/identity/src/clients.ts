@@ -174,6 +174,35 @@ export function isNativeAppRedirect(uri: string): boolean {
 }
 
 /**
+ * True when every redirect URI lands on a first-party origin (the issuer or a
+ * BOUND_ORIGINS member, as `firstPartyOrigins`): the token can only go back to
+ * a Parachute page. A private-use scheme has no web origin, so never counts.
+ * Used to decide whether a registration may carry a Parachute-like name
+ * (oauth-register.ts) and whether consent labels the app unverified.
+ */
+export function redirectsAreFirstParty(redirectUris: readonly string[], firstPartyOrigins: readonly string[]): boolean {
+  if (redirectUris.length === 0) return false;
+  return redirectUris.every((uri) => {
+    try {
+      const u = new URL(uri);
+      return (u.protocol === "https:" || u.protocol === "http:") && firstPartyOrigins.includes(u.origin);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * Whether Parachute can vouch for this client on the Allow screen: it was
+ * registered by a signed-in Parachute page (bound-origin auto-approve,
+ * `sameHub`), or it can only send you back to Parachute's own origins.
+ * Everything else registered itself (RFC 7591 DCR) and is shown as unverified.
+ */
+export function isVouchedClient(client: OAuthClient, firstPartyOrigins: readonly string[]): boolean {
+  return client.sameHub || redirectsAreFirstParty(client.redirectUris, firstPartyOrigins);
+}
+
+/**
  * Light validation — refuses obviously-wrong shapes (relative paths,
  * javascript:/data: URIs, embedded control chars, userinfo). http(s), or a
  * native app's private-use scheme ({@link isPrivateUseRedirect}).
