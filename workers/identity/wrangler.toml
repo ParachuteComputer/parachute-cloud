@@ -125,7 +125,8 @@ binding = "CF_VERSION_METADATA"
 # The rate-limiter DO (#30): one instance per rate key (signup:<ip>,
 # login:<ip>|<email>, magic:<ip>|<email>) — atomic sliding-window counters the
 # best-effort D1 fences couldn't provide. POLICY (windows/limits) lives in
-# src/rate-limit.ts; the client there fails OPEN on DO errors.
+# src/rate-limit.ts; on DO errors the send fences (signup, magic) fail OPEN and
+# the sign-in guess fences (password, 2FA, sign-in code) fail CLOSED.
 [[durable_objects.bindings]]
 name = "RATE_LIMITER"
 class_name = "RateLimiterDO"

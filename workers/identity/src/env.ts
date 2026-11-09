@@ -23,7 +23,8 @@ export interface Env {
   CF_VERSION_METADATA?: { id: string; tag: string; timestamp: string };
   /**
    * The RateLimiterDO namespace (#30) — the login/signup/magic abuse fences.
-   * One DO per rate key; the client (rate-limit.ts) fails OPEN on DO errors.
+   * One DO per rate key; on DO errors the client (rate-limit.ts) fails OPEN
+   * for signup/magic sends and CLOSED for sign-in guesses.
    */
   RATE_LIMITER: RateLimiterNamespace;
   /** Issuer origin — the `iss` claim + discovery-doc base. No trailing slash. */

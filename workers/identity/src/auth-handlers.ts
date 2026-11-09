@@ -33,12 +33,11 @@ import {
   parsePendingLoginCookie,
 } from "./pending-login.ts";
 import {
+  attemptLogin,
   checkAndBumpMagic,
   clearLoginFailures,
   clientIp,
-  isLoginLocked,
   loginKey,
-  recordLoginFailure,
 } from "./rate-limit.ts";
 import {
   buildSessionCookie,
@@ -470,21 +469,21 @@ export async function handleCodeVerifyPost(db: D1Database, req: Request, deps: O
 
   // Brute-force fence BEFORE the lookup, same shape as the 2FA/login paths —
   // keyed per (ip, code:email) so it can't be weaponized to lock another
-  // account's fence, and shared with nothing else.
+  // account's fence, and shared with nothing else. One atomic reserve-or-refuse
+  // call; refused while the limiter is down (T-419).
   const key = loginKey(clientIp(req), `code:${email}`);
-  if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
+  if ((await attemptLogin(deps.rateLimiter, key, now)).locked) {
     return codeError(req, authorizeParams, "Too many attempts. Please wait a few minutes and try again.", email);
   }
 
   const consumed = await verifyMagicCode(db, email, code, now);
   if (!consumed) {
-    await recordLoginFailure(deps.rateLimiter, key, now);
     return codeError(req, authorizeParams, neutralMsg, email);
   }
   const resolved = await resolveVerifiedUser(db, consumed, now, deps, req);
   if (!resolved) {
-    // SUSPENDED — same neutral failure as a wrong/expired code, never a mint.
-    await recordLoginFailure(deps.rateLimiter, key, now);
+    // SUSPENDED — same neutral failure as a wrong/expired code, never a mint
+    // (its reserved guess stays counted).
     return codeError(req, authorizeParams, neutralMsg, email);
   }
   await clearLoginFailures(deps.rateLimiter, key);
@@ -571,13 +570,13 @@ export async function handleLogin2faPost(db: D1Database, req: Request, deps: OAu
 
   // Brute-force fence on the second factor (a caller here already passed primary
   // auth). Keyed per (ip, 2fa:<userId>) so it can't lock out another account.
+  // One atomic reserve-or-refuse call; refused while the limiter is down (T-419).
   const key = loginKey(clientIp(req), `2fa:${pending.userId}`);
-  if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
+  if ((await attemptLogin(deps.rateLimiter, key, now)).locked) {
     return login2faError(req, "Too many attempts. Please wait a few minutes and try again.", email, notYouNext);
   }
   const result = await verifySecondFactor(db, pending.userId, String(form.get("code") ?? ""), now);
   if (!result.ok) {
-    await recordLoginFailure(deps.rateLimiter, key, now);
     return login2faError(req, "That code didn't match. Try again.", email, notYouNext);
   }
   await clearLoginFailures(deps.rateLimiter, key);
@@ -652,6 +651,12 @@ export async function handleSecurityPost(db: D1Database, req: Request, deps: OAu
   const now = deps.now?.() ?? new Date();
   const action = String(form.get("action") ?? "");
 
+  // Enrolling over an existing second factor would let a session holder swap in their own secret without knowing
+  // the current one, which also walks around the fence on turning it off (T-419 review). Turn it off first.
+  if ((action === "start" || action === "confirm") && (await getTotpState(db, user.id)).secret) {
+    return securityOverview(db, req, user, { error: "Two-factor is already on. Turn it off first to set up a new authenticator." });
+  }
+
   if (action === "start") {
     const secret = generateTotpSecret();
     return renderEnrolling(req, user, secret);
@@ -670,8 +675,16 @@ export async function handleSecurityPost(db: D1Database, req: Request, deps: OAu
   if (action === "disable") {
     const state = await getTotpState(db, user.id);
     if (!state.secret) return securityOverview(db, req, user, { notice: "Two-factor is already off." });
+    // Fenced like /login/2fa (T-419 review): a stolen session must not get unlimited guesses at the code that turns
+    // two-factor off. Keyed by user alone, not IP: the session already names the user, and a thief rotating
+    // addresses shouldn't get fresh buckets. Only the session holder can fill it.
+    const fence = `2fa-disable:${user.id}`;
+    if ((await attemptLogin(deps.rateLimiter, fence, now)).locked) {
+      return securityOverview(db, req, user, { error: "Too many attempts. Please wait a few minutes and try again." });
+    }
     const r = await verifySecondFactor(db, user.id, String(form.get("code") ?? ""), now);
     if (!r.ok) return securityOverview(db, req, user, { error: "That code didn't match — two-factor is still on." });
+    await clearLoginFailures(deps.rateLimiter, fence);
     await clearEnrollment(db, user.id);
     return securityOverview(db, req, user, { notice: "Two-factor authentication is now off." });
   }
