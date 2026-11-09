@@ -52,7 +52,7 @@ import { logServerError } from "./error-log.js";
 import { mcpWwwAuthenticate } from "./discovery.js";
 import { handleSubscribe } from "./live/subscribe.js";
 import { SubscriptionManager, WsSink, type SubscriptionHandle } from "./live/subscriptions.js";
-import { buildLiveMatcher, type LiveMatcher } from "./live/live-match.js";
+import { buildLiveMatcher, type LiveMatcher } from "@openparachute/core/src/live-match.js";
 import {
   MAX_WS_SUBSCRIPTIONS,
   WS_AUTH_DEADLINE_MS,
