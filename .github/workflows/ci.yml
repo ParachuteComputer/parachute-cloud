@@ -28,13 +28,17 @@
 
 name: CI
 
+# The three jobs are required checks on main and next, and the deploy workflows check them on the commit they ship,
+# so no job may carry a path filter (a required check that never runs blocks the merge).
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, next]
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # A newer push to a PR cancels its stale run. Every push to main or next gets its own run that nothing cancels:
+  # deploy-staging.yml and deploy-prod.yml ship a commit only once these jobs have passed on it.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
