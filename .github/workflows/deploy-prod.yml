@@ -14,6 +14,10 @@
 # (prod's smoke only reads DEV_USER_EMAIL from it, to exercise the operator
 # magic-link path; deploy-prod.sh itself never seeds). When any secret is
 # missing the workflow warns and skips, exiting green.
+#
+# CI GATE: the `ci-green` job runs before the approval and refuses a commit
+# that lacks a green run of all three ci.yml jobs (they run on every PR and on
+# every push to main and next).
 
 name: Deploy production
 
@@ -35,8 +39,64 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A commit deploys to production only if ci.yml's three jobs passed on it. A commit CI never ran on is refused at
+  # once; one whose CI is still running is waited for (up to 30 minutes). The approval is asked only after this.
+  ci-green:
+    name: CI passed on this commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      checks: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.sha }}
+      WAIT_MINUTES: 30
+      WAIT_FOR_MISSING: false
+      # The job names in ci.yml, as GitHub shows them. Rename a job there, rename it here.
+      REQUIRED: |
+        identity worker (typecheck + vitest/workerd)
+        vault worker (typecheck + vitest/workerd)
+        control plane (root bun test)
+    steps:
+      - name: refuse a commit without green CI
+        run: |
+          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+          while :; do
+            waiting=""
+            while IFS= read -r name; do
+              [ -n "$name" ] || continue
+              # The newest attempt of the job with that name on this commit, from GitHub Actions (app 15368).
+              state=$(gh api -X GET "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs" \
+                -f check_name="$name" -f app_id=15368 -f filter=all -f per_page=100 \
+                --jq '.check_runs | max_by(.id) | if . == null then "missing" else "\(.status)/\(.conclusion)" end') \
+                || state="unreadable (retrying)"
+              echo "$state  $name"
+              case "$state" in
+                completed/success) ;;
+                completed/*)
+                  echo "::error::\"$name\" is $state on $SHA. Fix it or re-run it, then re-run this job."
+                  exit 1 ;;
+                missing)
+                  if [ "$WAIT_FOR_MISSING" != true ]; then
+                    echo "::error::$SHA has no \"$name\" check. CI runs on pull requests and on pushes to main and next."
+                    exit 1
+                  fi
+                  waiting=1 ;;
+                *) waiting=1 ;;
+              esac
+            done <<< "$REQUIRED"
+            if [ -z "$waiting" ]; then echo "Every required check passed on $SHA."; exit 0; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::The required checks on $SHA did not all finish within $WAIT_MINUTES minutes."
+              exit 1
+            fi
+            echo "--- waiting"
+            sleep 60
+          done
+
   deploy:
     name: deploy + smoke (production)
+    needs: ci-green
     runs-on: ubuntu-latest
     # Deploy credentials live in the `production` GitHub Environment, which is
     # protected by a required-reviewer rule: every run PAUSES until the owner
