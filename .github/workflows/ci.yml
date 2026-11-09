@@ -28,7 +28,8 @@
 
 name: CI
 
-# The three jobs are required checks on main and next, and the deploy workflows check them on the commit they ship,
+# The three jobs are meant to be required checks on main and next (branch protection, T-420), and the deploy
+# workflows already check them on the commit they ship,
 # so no job may carry a path filter (a required check that never runs blocks the merge).
 on:
   pull_request:
