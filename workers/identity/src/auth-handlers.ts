@@ -651,6 +651,12 @@ export async function handleSecurityPost(db: D1Database, req: Request, deps: OAu
   const now = deps.now?.() ?? new Date();
   const action = String(form.get("action") ?? "");
 
+  // Enrolling over an existing second factor would let a session holder swap in their own secret without knowing
+  // the current one, which also walks around the fence on turning it off (T-419 review). Turn it off first.
+  if ((action === "start" || action === "confirm") && (await getTotpState(db, user.id)).secret) {
+    return securityOverview(db, req, user, { error: "Two-factor is already on. Turn it off first to set up a new authenticator." });
+  }
+
   if (action === "start") {
     const secret = generateTotpSecret();
     return renderEnrolling(req, user, secret);

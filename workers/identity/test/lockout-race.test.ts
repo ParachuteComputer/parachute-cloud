@@ -222,6 +222,25 @@ describe("F1: turning two-factor off is fenced too (T-419 review)", () => {
   });
 });
 
+describe("a session can't swap out an existing second factor (T-419 review)", () => {
+  test("action=confirm with the thief's own secret leaves the owner's secret in place", async () => {
+    const now = new Date("2026-07-02T12:00:00Z");
+    const { id } = await seedUser("swap-2fa@example.com", "correct horse");
+    const owners = generateTotpSecret();
+    await persistEnrollment(env.DB, id, owners, now);
+    const session = await createSession(env.DB, id, now);
+    const thiefs = generateTotpSecret();
+    const code = await totpCodeAt(thiefs, now);
+    const res = await handleSecurityPost(
+      env.DB,
+      postForm("/console/security", { action: "confirm", secret: thiefs, code }, "198.51.100.90", `parachute_id_session=${session.id}`),
+      deps(() => now),
+    );
+    expect(await res.text()).toContain("already on");
+    expect((await getTotpState(env.DB, id)).secret).toBe(owners);
+  });
+});
+
 describe("F1: the limiter fails CLOSED on the login, 2FA and sign-in-code doors", () => {
   test("console /login refuses even the right password while the limiter is down", async () => {
     await seedUser("closed-login@example.com", "correct horse");
