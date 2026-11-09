@@ -313,9 +313,9 @@ export interface ConsentProps {
   /** The authenticated account approving this grant — the "Signed in as" line. */
   email: string;
   /**
-   * The app registered itself (RFC 7591) and Parachute can't vouch for it:
-   * not registered by a signed-in Parachute page and not returning to a
-   * Parachute origin (clients.ts `isVouchedClient`). Shows the unverified label.
+   * The app registered itself (RFC 7591) and Parachute can't vouch for it: not
+   * a reserved Parachute client id and not returning only to Parachute's own
+   * pages (oauth-connections.ts `isVouchedClient`). Shows the unverified label.
    */
   unverified: boolean;
   /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `authorizeResumePath`). */

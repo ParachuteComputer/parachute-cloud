@@ -38,7 +38,7 @@ import { parseComposedAccountScope } from "@openparachute/door-contract";
 import { requireAccount } from "./account-api.ts";
 import { APP_CLIENT_ID } from "./account-descriptor.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
-import type { OAuthClient } from "./clients.ts";
+import { type OAuthClient, redirectsAreFirstParty } from "./clients.ts";
 import { CONSOLE_CLIENT_ID } from "./drip.ts";
 import { type OAuthDeps, jsonResponse } from "./oauth-shared.ts";
 import { prepareRevokeClientTokens } from "./tokens.ts";
@@ -48,12 +48,17 @@ import { userOwnsVault } from "./vaults.ts";
 const FIRST_PARTY_CLIENTS = new Set([CONSOLE_CLIENT_ID, APP_CLIENT_ID, ACCOUNT_TOKEN_CLIENT_ID]);
 
 /**
- * One of Parachute's own reserved client ids (operator-seeded, e.g. the native
- * app's pinned `parachute-app`). DCR always mints a random UUID, so no
- * registration can claim one.
+ * Whether Parachute can vouch for this client on the Allow screen (T-419,
+ * audit L3-03 F2): one of Parachute's own reserved client ids (operator-
+ * seeded, e.g. the native app's pinned `parachute-app`; DCR always mints a
+ * random UUID, so no registration can claim one), or a client that can only
+ * send you back to Parachute's own pages. Everything else registered itself
+ * (RFC 7591 DCR) and is labelled unverified. NOT `sameHub`: that flag only
+ * proves "some signed-in account sent an Origin header naming a bound
+ * origin", and outside a browser anyone with an account can send that header.
  */
-export function isFirstPartyClientId(clientId: string): boolean {
-  return FIRST_PARTY_CLIENTS.has(clientId);
+export function isVouchedClient(client: OAuthClient, firstPartyOrigins: readonly string[]): boolean {
+  return FIRST_PARTY_CLIENTS.has(client.clientId) || redirectsAreFirstParty(client.redirectUris, firstPartyOrigins);
 }
 
 const VERB_RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };

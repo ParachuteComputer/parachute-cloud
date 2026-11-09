@@ -118,6 +118,9 @@ describe("F2: /oauth/register reserves Parachute's name for first-party registra
     "P\u0430rachute Console", // Cyrillic а
     "Parachut\u00e9", // é
     "Parachute\u0301 Notes", // combining accent
+    "PARAC\u0397UTE", // Greek capital Eta
+    "PARAC\u041dUTE", // Cyrillic capital En
+    "Para\u03f2hute", // Greek lunate sigma
   ]) {
     test(`refused for a third-party redirect: ${JSON.stringify(name)}`, async () => {
       const res = await register({ client_name: name, redirect_uris: [EVIL] });
@@ -129,6 +132,22 @@ describe("F2: /oauth/register reserves Parachute's name for first-party registra
   test("refused when only SOME redirects are first-party", async () => {
     const res = await register({ client_name: "Parachute Console", redirect_uris: [`${APP_ORIGIN}/oauth/callback`, EVIL] });
     expect(res.status).toBe(400);
+  });
+
+  test("a name with text-direction or control characters is refused (\\u202E makes \"etuhcarap\" show as \"parachute\")", async () => {
+    for (const name of ["\u202Eetuhcarap", "Helper\u2066x\u2069", "Tab\there"]) {
+      const res = await register({ client_name: name, redirect_uris: [EVIL] });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("invalid_client_metadata");
+    }
+  });
+
+  test("a redirect into the vault worker's paths on my. is not a Parachute page", async () => {
+    const uri = "https://my.parachute.computer/vault/attacker/cb";
+    expect((await register({ client_name: "Parachute Console", redirect_uris: [uri] })).status).toBe(400);
+    const reg = (await (await register({ client_name: "Vault Thing", redirect_uris: [uri] })).json()) as { client_id: string };
+    const html = await consentHtml(reg.client_id, uri, "vault-path-user@example.com");
+    expect(html).toContain('data-testid="consent-unverified"');
   });
 
   test("a client_name over 100 characters is refused", async () => {

@@ -174,35 +174,34 @@ export function isNativeAppRedirect(uri: string): boolean {
 }
 
 /**
- * True when every redirect URI lands on a first-party origin (the issuer or a
- * BOUND_ORIGINS member, as `firstPartyOrigins`): the token can only go back to
- * a Parachute page. A private-use scheme has no web origin, so never counts.
- * Used to decide whether a registration may carry a Parachute-like name
- * (oauth-register.ts) and whether consent labels the app unverified.
+ * Paths on a bound origin that are NOT Parachute pages: my.parachute.computer
+ * routes `/vault/*` (and its `/.well-known/oauth-protected-resource/vault/*`)
+ * to the vault worker, which serves tenants' own vault surfaces and files.
+ */
+const NON_FIRST_PARTY_PATH = /^\/(vault|\.well-known)(\/|$)/;
+
+/**
+ * True when every redirect URI lands on a first-party Parachute page: an
+ * http(s) URL on the issuer or a BOUND_ORIGINS member (`firstPartyOrigins`),
+ * outside the vault worker's paths. A private-use scheme has no web origin, so
+ * never counts. Used to decide whether a registration may carry a
+ * Parachute-like name (oauth-register.ts) and whether consent labels the app
+ * unverified (oauth-connections.ts `isVouchedClient`).
  */
 export function redirectsAreFirstParty(redirectUris: readonly string[], firstPartyOrigins: readonly string[]): boolean {
   if (redirectUris.length === 0) return false;
   return redirectUris.every((uri) => {
     try {
       const u = new URL(uri);
-      return (u.protocol === "https:" || u.protocol === "http:") && firstPartyOrigins.includes(u.origin);
+      return (
+        (u.protocol === "https:" || u.protocol === "http:") &&
+        firstPartyOrigins.includes(u.origin) &&
+        !NON_FIRST_PARTY_PATH.test(u.pathname)
+      );
     } catch {
       return false;
     }
   });
-}
-
-/**
- * Whether Parachute can vouch for this client on the Allow screen: it can only
- * send you back to Parachute's own origins. Everything else registered itself
- * (RFC 7591 DCR) and is shown as unverified. NOT `sameHub`: that flag only
- * proves "some signed-in account sent an Origin header naming a bound origin",
- * and outside a browser anyone with an account can send that header.
- * (Operator-seeded reserved ids are vouched for by the caller,
- * oauth-connections.ts `isFirstPartyClientId`.)
- */
-export function isVouchedClient(client: OAuthClient, firstPartyOrigins: readonly string[]): boolean {
-  return redirectsAreFirstParty(client.redirectUris, firstPartyOrigins);
 }
 
 /**

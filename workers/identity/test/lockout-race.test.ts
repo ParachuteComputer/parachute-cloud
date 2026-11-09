@@ -153,13 +153,15 @@ describe("F1: the login lockout holds under a parallel burst", () => {
     const { id } = await seedUser("burst-2fa@example.com", "correct horse");
     const secret = generateTotpSecret();
     await persistEnrollment(env.DB, id, secret, now);
+    // No backup codes: each wrong code would otherwise run 10 PBKDF2 checks,
+    // which under a loaded full-suite run starves the test runtime. The fence
+    // under test runs before either factor is checked.
+    await env.DB.prepare("UPDATE users SET totp_backup_codes = '[]' WHERE id = ?").bind(id).run();
     const pending = await createPendingLogin(env.DB, id, "/console", now);
     const valid = new Set(
       await Promise.all([-30_000, 0, 30_000].map((d) => totpCodeAt(secret, new Date(now.getTime() + d)))),
     );
-    // Fewer than the other bursts: every wrong code also runs 10 backup-code
-    // PBKDF2 checks. Still twice the limit.
-    const burst = 2 * LOGIN_MAX_FAILURES;
+    const burst = WRONG;
     const wrong: string[] = [];
     for (let n = 0; wrong.length < burst; n++) {
       const c = String(n).padStart(6, "0");
