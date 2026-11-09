@@ -1167,7 +1167,17 @@ export class VaultDO extends DurableObject {
       (eraseParam !== null && eraseParam !== "false");
     const isHistoryCompact = request.method === "POST" && apiPath === "/history/compact";
     const isDeletedList = request.method === "GET" && apiPath === "/history/deleted";
-    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDeletedList
+    // The description is what every connected AI reads as its instructions (MCP initialize), so writing it is
+    // curation: admin, as MCP vault-info already required (T-419, audit L3-01; same rule as the bun vault). A PATCH
+    // with only `config` stays at write: the Notes app connects with vault:read vault:write and sets audio retention
+    // there. The gate reads a clone of the body with the same Request.json() the handler uses; a body that doesn't
+    // parse isn't a description write (the handler then fails on it, as before).
+    const isDescriptionWrite = request.method === "PATCH" && apiPath === "/vault" &&
+      await request.clone().json().then(
+        (b: unknown) => b !== null && typeof b === "object" && !Array.isArray(b) && "description" in b,
+        () => false,
+      );
+    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDeletedList || isDescriptionWrite
       ? "admin"
       : verbForMethod(request.method);
     if (requiredVerb !== "read" && !hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
@@ -1266,28 +1276,21 @@ export class VaultDO extends DurableObject {
       return this.handleApplyPack(request, apiPath.slice(7));
     }
     if (apiPath === "/vault") {
-      // The description is what every connected AI reads as its instructions (MCP initialize), so writing it is
-      // curation: admin, as MCP vault-info already required (T-419, audit L3-01; same rule as the bun vault).
-      // A PATCH with only `config` stays at write: the Notes app connects with vault:read vault:write and sets
-      // audio retention here. The body is read from a clone; an unreadable body falls through to the handler's 400.
-      if (request.method === "PATCH" && !hasScopeForVault(auth.scopes, vaultName, "admin")) {
-        const peek = await request.clone().json().catch(() => null) as Record<string, unknown> | null;
-        if (peek && typeof peek === "object" && "description" in peek) {
-          return insufficientScope("admin", vaultName, auth.scopes);
-        }
-      }
       const cfg: VaultConfigLike = {
         name: this.config!.name,
         description: this.config!.description ?? undefined,
         audio_retention: this.config!.audio_retention,
         auto_transcribe: this.config!.auto_transcribe,
       };
+      const descriptionBefore = cfg.description;
       const res = await handleVault(
         request,
         this.store,
         cfg,
         () => {
-          this.config!.description = cfg.description ?? null;
+          // Write the description back only when this PATCH changed it: a config-only PATCH that overlapped an admin's
+          // description change must not restore the old text (T-419 review).
+          if (cfg.description !== descriptionBefore) this.config!.description = cfg.description ?? null;
           this.config!.audio_retention = cfg.audio_retention ?? "keep";
           this.config!.auto_transcribe = { enabled: cfg.auto_transcribe?.enabled ?? false };
           void this.ctx.storage.put("config", this.config);
