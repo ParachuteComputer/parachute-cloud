@@ -1049,11 +1049,15 @@ async function main() {
       );
       const rVerify = await fetch(rLink!, { redirect: "manual" });
       const rSession = cookieVal(rVerify.headers.getSetCookie(), "parachute_id_session");
-      const rLoc = rVerify.headers.get("location") ?? "";
+      // The worker answers with a same-origin RELATIVE Location since the safeNext fix (1a613c7, auth.test.ts pins
+      // it): resolve it against the issuer, as a browser does, and check it stays on the issuer.
+      const rLocRaw = rVerify.headers.get("location") ?? "";
+      const rLoc = rLocRaw ? new URL(rLocRaw, IDENTITY).toString() : "";
       let locOk = false;
       try {
         const u = new URL(rLoc);
         locOk =
+          u.origin === new URL(IDENTITY).origin &&
           u.pathname === "/oauth/authorize" &&
           u.searchParams.get("client_id") === clientId &&
           u.searchParams.get("state") === rState &&
@@ -1066,6 +1070,8 @@ async function main() {
         "magic verify → 302 RESUMES the exact authorize request (params round-trip)",
         `loc ${rLoc.slice(0, 100)}`,
       );
+      // The consent page is "Connect <client>" with the request's state; a newcomer with no vault yet sees no Allow
+      // (nothing to pick, ui.ts renderConsent), so the words Allow/Approve are not the test.
       // Guard: a blank rLoc (the previous assertion already failed and
       // recorded it) must not crash the WHOLE remaining suite with
       // `fetch() URL must not be a blank string` — one failed step stays one
@@ -1077,7 +1083,7 @@ async function main() {
         });
         const rConsent = await rResumed.text();
         assert(
-          rResumed.status === 200 && /Authorize|Approve|Allow/.test(rConsent) && rConsent.includes(rState),
+          rResumed.status === 200 && rConsent.includes("<h1>Connect ") && rConsent.includes(`name="state" value="${rState}"`),
           "resumed authorize renders consent for the pending request",
           `status ${rResumed.status}`,
         );
@@ -1131,11 +1137,13 @@ async function main() {
         body: form({ __csrf: rcCsrf!, email: resumeEmail2, code: rcCode! }),
       });
       const rcSession = cookieVal(rcVerify.headers.getSetCookie(), "parachute_id_session");
-      const rcLoc = rcVerify.headers.get("location") ?? "";
+      const rcLocRaw = rcVerify.headers.get("location") ?? "";  // relative since 1a613c7, like the link's resume
+      const rcLoc = rcLocRaw ? new URL(rcLocRaw, IDENTITY).toString() : "";
       let rcLocOk = false;
       try {
         const u = new URL(rcLoc);
         rcLocOk =
+          u.origin === new URL(IDENTITY).origin &&
           u.pathname === "/oauth/authorize" &&
           u.searchParams.get("client_id") === clientId &&
           u.searchParams.get("state") === rcState &&
@@ -1158,7 +1166,7 @@ async function main() {
         });
         const rcConsent = await rcResumed.text();
         assert(
-          rcResumed.status === 200 && /Authorize|Approve|Allow/.test(rcConsent) && rcConsent.includes(rcState),
+          rcResumed.status === 200 && rcConsent.includes("<h1>Connect ") && rcConsent.includes(`name="state" value="${rcState}"`),
           "resumed-by-code authorize renders consent for the pending request",
           `status ${rcResumed.status}`,
         );
@@ -2505,17 +2513,11 @@ async function main() {
     const uniqA = `acctuniqa${stamp}`;
     const uniqB = `acctuniqb${stamp}`;
 
-    // Signup a fresh throwaway account.
-    const suGet = await fetch(`${IDENTITY}/signup`, { redirect: "manual" });
-    const suCsrf = cookieVal(suGet.headers.getSetCookie(), "parachute_id_csrf");
-    const suRes = await fetch(`${IDENTITY}/signup`, {
-      method: "POST",
-      headers: { ...FORM, origin: IDENTITY, cookie: `parachute_id_csrf=${suCsrf}` },
-      redirect: "manual",
-      body: form({ __csrf: suCsrf!, email: amEmail, password: amPassword }),
-    });
-    const amSession = cookieVal(suRes.headers.getSetCookie(), "parachute_id_session");
-    assert(suRes.status === 302 && !!amSession, "account-mcp: throwaway account signed up", `status ${suRes.status}`);
+    // Signup a fresh throwaway account, the way a person does since T-318 night (the address is proven first).
+    const su = await passwordSignup(amEmail, amPassword);
+    const suCsrf = su.csrf;
+    const amSession = su.session;
+    assert(!!amSession, "account-mcp: throwaway account signed up", su.detail);
 
     // Create TWO vaults (the trial includes 5, so both succeed).
     const conGet = await fetch(`${IDENTITY}/console`, { headers: { cookie: `parachute_id_session=${amSession}` }, redirect: "manual" });
