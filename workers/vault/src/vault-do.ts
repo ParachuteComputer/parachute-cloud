@@ -1266,6 +1266,16 @@ export class VaultDO extends DurableObject {
       return this.handleApplyPack(request, apiPath.slice(7));
     }
     if (apiPath === "/vault") {
+      // The description is what every connected AI reads as its instructions (MCP initialize), so writing it is
+      // curation: admin, as MCP vault-info already required (T-419, audit L3-01; same rule as the bun vault).
+      // A PATCH with only `config` stays at write: the Notes app connects with vault:read vault:write and sets
+      // audio retention here. The body is read from a clone; an unreadable body falls through to the handler's 400.
+      if (request.method === "PATCH" && !hasScopeForVault(auth.scopes, vaultName, "admin")) {
+        const peek = await request.clone().json().catch(() => null) as Record<string, unknown> | null;
+        if (peek && typeof peek === "object" && "description" in peek) {
+          return insufficientScope("admin", vaultName, auth.scopes);
+        }
+      }
       const cfg: VaultConfigLike = {
         name: this.config!.name,
         description: this.config!.description ?? undefined,
