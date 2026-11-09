@@ -30,6 +30,7 @@
  * Long-lived: one year by default and at most; `expires_in` (seconds) can shorten it.
  */
 import { requireAccount, readJsonBody } from "./account-api.ts";
+import { isUniqueViolation } from "./nostr-auth.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { jsonResponse, type OAuthDeps } from "./oauth-shared.ts";
 import { signAccessToken } from "./tokens.ts";
@@ -160,9 +161,11 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
         )
         .bind(userId, name, signed.jti, vault, can, signed.kid, createdAt, signed.expiresAt),
     ]);
-  } catch {
+  } catch (e) {
     // The batch is one transaction: a racing mint of the same name lost the PRIMARY KEY, and nothing was written.
-    return err(409, "name_taken", `a key called "${name}" already exists; pick another`);
+    // Any other failure is not about the name.
+    if (isUniqueViolation(e)) return err(409, "name_taken", `a key called "${name}" already exists; pick another`);
+    throw e;
   }
   const row: AppKeyRow = {
     name,

@@ -18,7 +18,7 @@
  */
 import { requireAccount, readJsonBody } from "./account-api.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
-import { NostrAuthError, parseNostrEvent, verifyNostrRequest } from "./nostr-auth.ts";
+import { NostrAuthError, isUniqueViolation, parseNostrEvent, verifyNostrRequest } from "./nostr-auth.ts";
 import { jsonResponse, type OAuthDeps } from "./oauth-shared.ts";
 import { getUserById } from "./users.ts";
 
@@ -86,8 +86,9 @@ export async function handleAccountPubkeyLink(db: D1Database, req: Request, deps
       .prepare("INSERT INTO user_pubkeys (pubkey, user_id, label, created_at) VALUES (?, ?, ?, ?)")
       .bind(event.pubkey, auth.accountId, label, createdAt)
       .run();
-  } catch {
-    return err(409, "pubkey_taken", "this key already signs in as another account");
+  } catch (e) {
+    if (isUniqueViolation(e)) return err(409, "pubkey_taken", "this key already signs in as another account");
+    throw e;
   }
   return ok({ pubkey: event.pubkey, label, created_at: createdAt }, 201);
 }

@@ -63,6 +63,11 @@ export class NostrAuthError extends Error {
   }
 }
 
+/** A D1/SQLite uniqueness violation (PRIMARY KEY or UNIQUE), as opposed to any other failure. */
+export function isUniqueViolation(err: unknown): boolean {
+  return /UNIQUE constraint failed|SQLITE_CONSTRAINT_(PRIMARYKEY|UNIQUE)/i.test(err instanceof Error ? err.message : String(err));
+}
+
 export function isNostrAuthorization(req: Request): boolean {
   return /^Nostr\s+/i.test(req.headers.get("authorization") ?? "");
 }
@@ -187,8 +192,9 @@ export async function verifyNostrRequest(
       .prepare("INSERT INTO nostr_events_seen (event_id, expires_at) VALUES (?, ?)")
       .bind(event.id, new Date(now.getTime() + NIP98_REPLAY_TTL_MS).toISOString())
       .run();
-  } catch {
-    throw new NostrAuthError("replayed", "Nostr event id has already been used");
+  } catch (err) {
+    if (isUniqueViolation(err)) throw new NostrAuthError("replayed", "Nostr event id has already been used");
+    throw err;
   }
 }
 
