@@ -10,7 +10,9 @@
  *     (a self-HTTP-fetch would be near-tautological — this worker is obviously
  *     running if the cron fired — and Workers can't fetch their own routes);
  *     vault liveness = GET <VAULT_ORIGIN>/health, the router-level endpoint that
- *     never wakes a DO. Failures alert every OPERATOR_ALERT_EMAIL recipient
+ *     never wakes a DO; and, when CANARY_VAULT_NAME is set, the canary vault
+ *     read the way a client reads it (ops-canary.ts: REST note + MCP
+ *     tools/list, which DOES wake that vault's DO). Failures alert every OPERATOR_ALERT_EMAIL recipient
  *     (+ the optional OPS_ALERT_WEBHOOK_URL) with a 1-hour per-check dedupe
  *     persisted in D1 (`ops_alerts`). Each run's outcome is counted
  *     (`ops_counters` health_ok/health_fail) for the daily line, and the same
@@ -47,6 +49,7 @@ import { OPS_BUCKET_MS, bumpOpsCounter, opsBucket, sumOpsCounter } from "./ops-c
 import { runDailyLine } from "./ops-daily.ts";
 import { purgeStaleAuthArtifacts } from "./magic-links.ts";
 import { runBillingSweep } from "./billing-lifecycle.ts";
+import { type CanaryConfig, canaryConfig, runCanaryCheck } from "./ops-canary.ts";
 import { runDrip } from "./drip.ts";
 import { depsForEnv } from "./oauth-shared.ts";
 import { runSnapshotSweep } from "./snapshots.ts";
@@ -71,7 +74,7 @@ const HEALTH_FETCH_TIMEOUT_MS = 10_000;
 
 export interface OpsDeps {
   now?: () => Date;
-  /** The vault /health probe's fetch. */
+  /** The vault worker fetch: the /health probe, and the canary's when no VAULT_SERVICE binding is bound. */
   fetchFn?: typeof fetch;
   /** The operator webhook's fetch (ops-alerts.ts postOpsWebhook); default global fetch. */
   webhookFetchFn?: typeof fetch;
@@ -189,7 +192,7 @@ export async function handleScheduled(cron: string, env: Env, sender: EmailSende
 
 export interface HealthFailure {
   /** Stable check identifier — also the dedupe key suffix. */
-  check: "identity-d1" | "vault-health";
+  check: "identity-d1" | "vault-health" | "vault-canary";
   detail: string;
 }
 
@@ -219,6 +222,19 @@ export async function checkVaultHealth(vaultOrigin: string, fetchFn: typeof fetc
 }
 
 /**
+ * The canary vault, through the vault worker the way a client reaches it
+ * (ops-canary.ts). Transport: the VAULT_SERVICE binding when bound (staging),
+ * else `fetchFn`, else global fetch to VAULT_ORIGIN (production).
+ */
+export async function checkVaultCanary(env: Env, cfg: CanaryConfig, deps: OpsDeps = {}): Promise<HealthFailure | null> {
+  const oauth = depsForEnv(env);
+  if (deps.now) oauth.now = deps.now;
+  if (!oauth.vaultFetch && deps.fetchFn) oauth.vaultFetch = deps.fetchFn;
+  const detail = await runCanaryCheck(env.DB, oauth, cfg);
+  return detail === null ? null : { check: "vault-canary", detail };
+}
+
+/**
  * Has this alert key been quiet for the dedupe window? FAIL-OPEN: if D1 itself
  * is down we can't read the dedupe row — better to alert every 10 minutes for
  * the duration of a D1 outage than to suppress the one email that matters.
@@ -236,12 +252,16 @@ export async function runHealthCheck(
 ): Promise<{ failures: HealthFailure[]; alerted: HealthFailure[]; errors5xx: number }> {
   const now = deps.now?.() ?? new Date();
   const fetchFn = deps.fetchFn ?? fetch;
+  // Not configured is a choice, not a failure: one line per tick, no alert.
+  const canary = canaryConfig(env);
+  if (!canary) console.log("event=health_canary_skipped reason=not_configured");
 
   const results = await Promise.all([
     checkIdentityHealth(env.DB),
     env.VAULT_ORIGIN
       ? checkVaultHealth(env.VAULT_ORIGIN, fetchFn)
       : Promise.resolve<HealthFailure>({ check: "vault-health", detail: "VAULT_ORIGIN unset — cannot check" }),
+    canary ? checkVaultCanary(env, canary, deps) : Promise.resolve(null),
   ]);
   const failures = results.filter((r): r is HealthFailure => r !== null);
   // Record every run's outcome — the daily line's "health ok N/144". A run

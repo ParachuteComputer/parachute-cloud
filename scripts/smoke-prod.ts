@@ -380,6 +380,13 @@ async function main() {
         `status ${r.status}`,
       );
     }
+    // The canary token door (L6-03) mints a read token: never without its bearer.
+    const opsCanary = await fetch(`${IDENTITY}/ops/canary-token`, { method: "POST" });
+    assert(
+      opsCanary.status === 404 || opsCanary.status === 401,
+      "PRODUCTION: /ops/canary-token without a bearer is refused (404 unset / 401 set)",
+      `status ${opsCanary.status}`,
+    );
     // T-318 deletion-proof hooks: a scoped purge fast-forward and a footprint
     // report — both must not exist in production.
     for (const hook of ["/__test/account-delete/sweep", "/__test/account-delete/report"]) {

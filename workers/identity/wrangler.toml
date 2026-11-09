@@ -71,7 +71,9 @@ head_sampling_rate = 1
 
 # Ops cron (src/ops.ts, routed by the matched pattern in controller.cron):
 #   */10 * * * *  → health check: identity D1 self-check + vault /health via
-#                   VAULT_ORIGIN; failures alert every OPERATOR_ALERT_EMAIL
+#                   VAULT_ORIGIN + the canary vault (CANARY_VAULT_NAME below:
+#                   REST note read + MCP tools/list, wakes its DO; L6-03,
+#                   src/ops-canary.ts); failures alert every OPERATOR_ALERT_EMAIL
 #                   recipient (+ the optional OPS_ALERT_WEBHOOK_URL secret) with
 #                   a 1-hour per-check dedupe (ops_alerts, D1). Each run's
 #                   outcome is counted (ops_counters) and the same tick alerts
@@ -300,7 +302,15 @@ EMAIL_FROM = "noreply@parachute.computer"
 #   OPS_DELETE_TOKEN      — bearer for POST /ops/account-delete (erase ONE account
 #                           on its holder's written request). Set only for the
 #                           job that needs it, deleted after. Unset → 404.
+#   OPS_CANARY_TOKEN      — bearer for POST /ops/canary-token (a 5-minute
+#                           read-only token for the canary vault only, for the
+#                           external uptime check). Unset → 404.
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
+# The canary vault the health cron reads every 10 minutes through the vault
+# worker (L6-03, src/ops-canary.ts). Empty = no canary (one skip line per tick).
+# Must be owned by an operator account; its note is CANARY_NOTE (default
+# "canary"). Setup: docs/UPTIME.md.
+CANARY_VAULT_NAME = ""
 # --- money switch (T-318, Aaron 10-29: "Parachute open beta") -----------------
 # BILLING_MODE = "open_beta" | "paid" (src/billing-config.ts billingMode). UNSET
 # means open_beta, and so does any unknown value (the safe direction: nobody is
@@ -480,6 +490,7 @@ EMAIL_FROM = "noreply@parachute.computer"
 # Same operator address as production — but staging has no send_email binding,
 # so ops alerts/digests land in the worker log (devlog sender), never an inbox.
 OPERATOR_ALERT_EMAIL = "ag@unforced.org"
+CANARY_VAULT_NAME = ""  # the canary vault; see the production [vars] note
 # Money switch — restated per env (named envs don't inherit [vars]); see the
 # production [vars] note. Staging walks the open beta too.
 BILLING_MODE = "open_beta"

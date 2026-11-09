@@ -57,6 +57,7 @@ import {
   handleOpsVaultImportReadToken,
   handleOpsVaultImportStatus,
 } from "./ops-vault-import.ts";
+import { handleOpsCanaryToken } from "./ops-canary.ts";
 import { handleTestAccountDeleteReport, handleTestAccountDeleteSweep } from "./account-delete-hooks.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
 import { accountDescriptor } from "./account-descriptor.ts";
@@ -584,6 +585,11 @@ app.post("/ops/vault-import/status", async (c) => (await handleOpsVaultImportSta
 app.post("/ops/vault-import/read-token", async (c) => (await handleOpsVaultImportReadToken(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
 app.post("/ops/vault-import/finish", async (c) => (await handleOpsVaultImportFinish(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
 app.post("/ops/vault-import/abort", async (c) => (await handleOpsVaultImportAbort(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+
+// A 5-minute read-only token for the canary vault, for an external uptime
+// checker (L6-03, ops-canary.ts; scripts/uptime-check.sh): bearer
+// OPS_CANARY_TOKEN (its own secret). Unset → 404.
+app.post("/ops/canary-token", async (c) => (await handleOpsCanaryToken(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
 
 // Staging/dev-only deletion-proof hooks (T-318, account-delete-hooks.ts) —
 // same allowlist gate as the triggers above (404 off staging|development|test,
