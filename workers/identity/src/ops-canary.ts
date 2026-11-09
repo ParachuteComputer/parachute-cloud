@@ -18,8 +18,9 @@
  *
  * Config: CANARY_VAULT_NAME ([vars]; unset or blank = no canary, the cron logs
  * one skip line), CANARY_NOTE (the note's path or id; default "canary").
- * The canary vault must be owned by an operator account (users.role): a typo
- * that names someone's real vault is refused, never read. There is no stored
+ * The canary vault's name must contain "canary" and an operator account must
+ * own it (users.role). Operator accounts own real vaults too, so the name
+ * marker is what keeps a typo from pointing the check at one of them. There is no stored
  * vault credential: cloud vaults accept only issuer-signed JWTs, and this
  * worker is the issuer. Setup and the uptime plan: docs/UPTIME.md.
  */
@@ -52,6 +53,9 @@ export function canaryConfig(env: Pick<Env, "CANARY_VAULT_NAME" | "CANARY_NOTE">
 
 /** The canary's D1 row, if it exists and an operator owns it; else why not. */
 async function canaryVault(db: D1Database, cfg: CanaryConfig): Promise<{ vault: Vault } | { refused: string }> {
+  if (!cfg.vault.includes("canary")) {
+    return { refused: `CANARY_VAULT_NAME "${cfg.vault}" must contain "canary" (a dedicated vault); refusing to read it` };
+  }
   const vault = await getVault(db, cfg.vault);
   if (!vault) return { refused: `canary vault "${cfg.vault}" has no row in identity D1 (CANARY_VAULT_NAME)` };
   const owner = await getUserById(db, vault.ownerUserId);

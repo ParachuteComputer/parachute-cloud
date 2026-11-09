@@ -184,6 +184,16 @@ describe("the health cron's canary vault check", () => {
     expect(vault.calls).toEqual([]);
   });
 
+  test("a canary vault name without 'canary' is refused before any lookup or read", async () => {
+    const c = await canaryEnv({ operator: true });
+    const vault = fakeVaultWorker();
+    captured = captureLogs();
+    const r = await runHealthCheck({ ...c.env, CANARY_VAULT_NAME: "journal" }, opsSender(), { now: () => T0, fetchFn: vault.fetchFn });
+    expect(r.failures.map((f) => f.check)).toEqual(["vault-canary"]);
+    expect(r.failures[0]!.detail).toContain('must contain "canary"');
+    expect(vault.calls).toEqual([]);
+  });
+
   test("no canary configured: skipped with one log line, no vault call, no failure, no alert", async () => {
     const vault = fakeVaultWorker();
     const sender = opsSender();

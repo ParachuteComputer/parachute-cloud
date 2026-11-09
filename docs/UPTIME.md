@@ -50,8 +50,9 @@ heartbeat later (e.g. a self-hosted healthchecks.io ping on each run).
 
 1. **Canary vault.** Under an operator account (one of the accounts in `scripts/set-operator-role.ts`), create a vault
    for this and nothing else, e.g. `staff-canary`. Create one note at path `canary` with made-up text, e.g. "Canary
-   note. Read every 10 minutes by the uptime check. Do not edit or delete." The checks refuse a vault whose owner is
-   not an operator, so a typo cannot point them at a person's vault. Do the same on staging with its own vault.
+   note. Read every 10 minutes by the uptime check. Do not edit or delete." The checks refuse a vault whose name lacks
+   `canary` or whose owner is not an operator, so a typo cannot point them at a real vault (operators own real
+   vaults too; the name marker covers those). Do the same on staging with its own vault.
 2. **Name it.** In `workers/identity/wrangler.toml`, set `CANARY_VAULT_NAME` in `[vars]` (production) and in
    `[env.staging.vars]` (staging). Add `CANARY_NOTE` only if the note is not at `canary`. This goes out with a normal
    reviewed deploy. From then on the identity cron reads it every 10 minutes.
@@ -61,8 +62,10 @@ heartbeat later (e.g. a self-hosted healthchecks.io ping on each run).
    scope `vault:<canary>:read`, `aud` `vault.<canary>`, `client_id` `parachute-canary` (never first-party, so the
    vault's internal seam refuses it). The vault is chosen by `[vars]`, never by the caller. The cron needs no secret:
    the identity worker is the token issuer and mints its own 60-second token of the same shape.
-4. **Monitor box.** On a box outside Cloudflare (uni works: the check goes out over the public internet), check out
-   `parachute-cloud` and write `~/.config/parachute-uptime/env` (mode 0600):
+4. **Monitor box.** On a box outside Cloudflare (uni works: the check goes out over the public internet), make a
+   checkout used for nothing else, kept on `main` (`git clone -b main https://github.com/ParachuteComputer/parachute-cloud
+   ~/Code/parachute-cloud-monitor`; update it with `git pull --ff-only` when the scripts change), so whatever branch a
+   working checkout has out never becomes the monitor. Then write `~/.config/parachute-uptime/env` (mode 0600):
 
    ```sh
    CANARY_TOKEN_URL=https://my.parachute.computer/ops/canary-token
@@ -81,8 +84,10 @@ heartbeat later (e.g. a self-hosted healthchecks.io ping on each run).
    [Service]
    Type=oneshot
    EnvironmentFile=%h/.config/parachute-uptime/env
-   ExecStart=/bin/bash %h/Code/parachute-cloud/scripts/uptime-run.sh
-   TimeoutStartSec=300
+   ExecStart=/bin/bash %h/Code/parachute-cloud-monitor/scripts/uptime-run.sh
+   # Worst case at the script defaults (ATTEMPTS=3, TIMEOUT=15, RETRY_DELAY=20): 85 s per hanging check, 3 health
+   # URLs + canary token + canary reads ≈ 430 s. Leave room so a hang is reported, not killed.
+   TimeoutStartSec=600
    ```
 
    `~/.config/systemd/user/parachute-uptime.timer`:
