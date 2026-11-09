@@ -647,7 +647,8 @@ async function handleToolCall(
   }
 }
 
-const KNOWN_METHODS = new Set(["initialize", "tools/list", "tools/call", "ping"]);
+/** The methods whose own code can throw into handleOne's catch (tools/call returns its promise un-awaited). */
+const CATCHABLE_METHODS = new Set(["initialize", "tools/list"]);
 
 async function handleOne(
   m: JsonRpcMessage,
@@ -692,10 +693,10 @@ async function handleOne(
         return rpcError(id, METHOD_NOT_FOUND, `Method not found: ${method}`);
     }
   } catch (err) {
-    // Outside a tool's execute (initialize, tools/list): always a fault. Named
-    // by the fixed method, never the caller's string. (A tools/call rejection
-    // is not caught here: it is returned un-awaited and the router logs it.)
-    logCrash(KNOWN_METHODS.has(method ?? "") ? `rpc:${method}` : "rpc", err);
+    // initialize / tools/list threw: always a fault. Named by the fixed method,
+    // never the caller's string. (A tools/call rejection outside its tool's
+    // execute is not caught here; it propagates to the router's own log.)
+    logCrash(CATCHABLE_METHODS.has(method ?? "") ? `rpc:${method}` : "rpc", err);
     await record("mcp:rpc", `exception:${errorClass(err)}`);
     return rpcError(id, INTERNAL_ERROR, err instanceof Error ? err.message : "Internal error");
   }

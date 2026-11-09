@@ -7,9 +7,13 @@
  *   event=mcp_tool_error tool=<name> class=<Class> msg="<redacted>" stack="<frames>" version=<label> vault_id=<id>
  *
  * The same shape as the self-hosted vault's line (parachute-core), so one query
- * finds both. NEVER the tool's arguments, note content, tokens, headers or the
- * vault's name: `msg` drops every quoted span (engine and JSON.parse messages
- * quote the input), and `vault_id` is the Durable Object's id, not the name.
+ * finds both. The arguments, headers, tokens and the vault's name are never
+ * passed in; `vault_id` is the Durable Object's id. The message is the one
+ * place input could ride along, so `msg` drops every quoted span (engine and
+ * JSON.parse messages quote the input) and `stack` never reads the message's
+ * lines. Input a message carries WITHOUT quotes would still show; the lines are
+ * written only for runtime faults (TypeError and kin, health.ts
+ * toolErrorOutcome), whose messages the runtime words.
  */
 
 const MSG_MAX = 200;
@@ -18,17 +22,24 @@ const MAX_FRAMES = 10;
 /** err.message with every quoted span ('…', "…", `…`) replaced by `…`, one line, at most 200 chars. */
 export function redactMessage(message: string): string {
   return message
-    .replace(/'[^']*'|"[^"]*"|`[^`]*`/g, "…")
+    // An apostrophe inside a word ("can't") opens no span.
+    .replace(/(?<![A-Za-z0-9])'[^']*'|"[^"]*"|`[^`]*`/g, "…")
     .replace(/["`]/g, "'") // an unbalanced quote must not end the line's own msg="…"
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, MSG_MAX);
 }
 
-/** Only the `at …` frame lines of a stack (never its message line), at most 10, joined with " | ". */
-export function stackFrames(stack: string | undefined): string {
+/**
+ * Only the `at …` frame lines of a stack, at most 10, joined with " | ". The
+ * stack opens with the message, which may span lines (one could even start
+ * with "at "), so everything up to the end of `message` is skipped first.
+ */
+export function stackFrames(stack: string | undefined, message?: string): string {
   if (!stack) return "";
-  return stack
+  const at = message ? stack.indexOf(message) : -1;
+  const frames = at >= 0 ? stack.slice(at + message!.length) : stack;
+  return frames
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l.startsWith("at "))
@@ -65,7 +76,7 @@ export function serverErrorLine(event: string, err: unknown, f: ErrorLogFields):
     ...(f.tool !== undefined ? [`tool=${token(f.tool)}`] : []),
     `class=${className(err)}`,
     `msg="${redactMessage(message)}"`,
-    `stack="${stackFrames(stack)}"`,
+    `stack="${stackFrames(stack, message)}"`,
     `version=${token(f.version)}`,
     `vault_id=${token(f.vaultId)}`,
   ].join(" ");

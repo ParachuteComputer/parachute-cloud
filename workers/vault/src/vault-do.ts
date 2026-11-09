@@ -631,6 +631,7 @@ export class VaultDO extends DurableObject {
     this.env = env;
     this.attachmentTickets = new DoAttachmentTicketProvider(ctx.storage);
     this.health = new HealthSink(ctx.storage, versionLabel(env.CF_VERSION_METADATA));
+    this.logFields = { version: versionLabel(env.CF_VERSION_METADATA), vaultId: ctx.id.toString() };
     // The shim carries `ctx.storage` (not just `.sql`) so its `transactionSync`
     // can delegate to the real DO transaction primitive — the free
     // `transaction(db, fn)` path (incl. boot migrations) prefers it (vault#523).
@@ -772,7 +773,7 @@ export class VaultDO extends DurableObject {
    * (and the platform can read it, see handleFetch) while the vault is down.
    */
   private noteBootError(e: unknown): void {
-    logServerError("do_boot_error", e, { version: versionLabel(this.env.CF_VERSION_METADATA), vaultId: this.ctx.id.toString() });
+    logServerError("do_boot_error", e, this.logFields);
     // Before the first request is served; a throw here would reset the object, so none escapes.
     void this.ctx.blockConcurrencyWhile(async () => {
       try {
@@ -791,6 +792,9 @@ export class VaultDO extends DurableObject {
 
   /** The vault's health counter sink (T-411); see health.ts. */
   private readonly health: HealthSink;
+
+  /** What every server-side error line names (error-log.ts): the worker version and the DO's id, never the vault's name. */
+  private readonly logFields: { version: string; vaultId: string };
 
   /**
    * STAGING/DEV-ONLY planted failure (T-411 report proof): the next N
@@ -1121,12 +1125,7 @@ export class VaultDO extends DurableObject {
           mintGate: (declaredBytes) => this.attachmentMintGate(declaredBytes),
         },
         (subject, outcome) => this.health.record(subject, outcome),
-        (tool, err) =>
-          logServerError("mcp_tool_error", err, {
-            tool,
-            version: versionLabel(this.env.CF_VERSION_METADATA),
-            vaultId: this.ctx.id.toString(),
-          }),
+        (tool, err) => logServerError("mcp_tool_error", err, { ...this.logFields, tool }),
       );
     }
 
