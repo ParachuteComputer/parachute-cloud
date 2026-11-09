@@ -163,3 +163,8 @@ jobs:
 
       - name: Test control plane (root bun test)
         run: bun run test
+
+      # CLAUDE.md is a prompt every agent run follows; a path it names that
+      # moved is a wrong instruction (T-420, audit L7-02).
+      - name: CLAUDE.md names only paths that exist
+        run: bun scripts/check-doc-paths.ts
