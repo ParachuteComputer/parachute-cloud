@@ -116,6 +116,14 @@ describe("bare create at the vault", () => {
     expect(notes.length).toBeGreaterThan(0);
   });
 
+  it("after a destroy, the bare marker answers 410 like every other request", async () => {
+    const v = freshVault("gone");
+    const t = await internal(v);
+    const d = await call(v, "/api/internal/destroy", t, { method: "POST", body: JSON.stringify({ confirm: v }) });
+    expect(d.status).toBe(200);
+    expect((await call(v, "/api/internal/bare", t, { method: "POST" })).status).toBe(410);
+  });
+
   it("a tenant token can't mark a vault bare", async () => {
     const v = freshVault("bare");
     const tenant = await mintToken({ vault: v, scopes: `vault:${v}:admin`, vaultScope: [v], clientId: "parachute-account" });

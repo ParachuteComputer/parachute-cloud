@@ -518,12 +518,20 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   // whatever request first materializes it. If the vault can't be told, the create is undone rather than handing
   // back a seeded vault that was asked to be bare.
   if (bare && !(await markVaultBare(db, deps, user.id, name))) {
-    // Best-effort: clear anything the bare call did land in the DO, so the name's next owner starts clean.
-    await callVaultDestroy(db, deps, user.id, name, { ifUnwritten: true })
-      .then((r) => r.body?.cancel())
-      .catch(() => {});
-    await deleteVaultD1Rows(db, user.id, name, deps.now?.() ?? new Date());
-    return restError(503, "vault_unavailable", "Couldn't set up a bare vault just now; nothing was created. Try again.");
+    // Undo the create, but only drop the D1 rows (the only record of who owns this name's storage) once the DO
+    // confirms it is destroyed — the rule every other delete follows. Otherwise the vault stays the caller's.
+    const destroyed = await callVaultDestroy(db, deps, user.id, name, { ifUnwritten: true })
+      .then(readDestroyOutcome)
+      .catch(() => ({ ok: false as const }));
+    if (destroyed.ok) {
+      await deleteVaultD1Rows(db, user.id, name, deps.now?.() ?? new Date());
+      return restError(503, "vault_unavailable", "Couldn't set up a bare vault just now; nothing was created. Try again.");
+    }
+    return restError(
+      503,
+      "vault_unavailable",
+      `Couldn't set up "${name}" as a bare vault, and it couldn't be removed; it is yours but may not be bare. Delete it and try again.`,
+    );
   }
 
   // Push the plan's storage cap + voice entitlement into the new vault's DO —

@@ -235,18 +235,20 @@ export async function handleAccountKeyRevoke(db: D1Database, req: Request, deps:
   const row = await db.prepare(`${ROWS_SQL} AND a.name = ?`).bind(auth.accountId, name).first<AppKeyRow>();
   if (!row) return err(404, "key_not_found", `you have no app key called "${name}"`);
   const stamp = (deps.now?.() ?? new Date()).toISOString();
-  // Push to the vault only when this call is what revoked it and the vault is still this account's: a key already
-  // revoked (by its vault's delete, say) needs no push, and a first-party call must never wake a destroyed vault or
-  // reach a vault name another account has since taken.
-  const wasLive = !row.revoked_at && row.expires_at > stamp;
-  const stillOwned = wasLive && (await userOwnsVault(db, auth.accountId, row.vault_name));
+  // Push to the vault only while the key is unexpired and the vault is still this account's: a first-party call must
+  // never wake a destroyed vault or reach a vault name another account has since taken (that vault never knew the
+  // key; the revocation list covers the rest).
+  // The push is idempotent, so a retried revoke (whose first push failed) pushes again.
+  const unexpired = row.expires_at > stamp;
+  const stillOwned = unexpired && (await userOwnsVault(db, auth.accountId, row.vault_name));
   await db.batch([
     db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL").bind(stamp, row.jti),
     db.prepare("UPDATE app_keys SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL").bind(stamp, row.jti),
   ]);
   const after = await db.prepare(`${ROWS_SQL} AND a.name = ?`).bind(auth.accountId, name).first<AppKeyRow>();
   // Tell the vault now, so the next request is refused rather than the one after its revocation cache refreshes.
-  let refusedNow = !wasLive; // nothing left to refuse
+  // Nothing to tell when it expired or its vault is gone; otherwise refused_now is what the vault said.
+  let refusedNow = !stillOwned;
   if (stillOwned) try {
     const res = await callVaultApi(db, deps, {
       userId: auth.accountId,
@@ -262,6 +264,6 @@ export async function handleAccountKeyRevoke(db: D1Database, req: Request, deps:
   } catch {
     refusedNow = false;
   }
-  if (wasLive && !refusedNow) console.warn(`event=app_key_revoke_push_failed vault=${row.vault_name}`);
+  if (stillOwned && !refusedNow) console.warn(`event=app_key_revoke_push_failed vault=${row.vault_name}`);
   return ok({ name, revoked_at: after?.revoked_at ?? stamp, refused_now: refusedNow });
 }

@@ -168,12 +168,13 @@ describe("NIP-98 owner sign-in (POST /account/token)", () => {
 
   test("sign-in attempts are fenced per IP before any signature work", async () => {
     const a = app();
-    const stranger = nostrKey();
+    // Malformed events are enough: the fence counts attempts before anything is parsed or verified.
     const statuses: number[] = [];
-    for (let i = 0; i < 61; i++) statuses.push((await signIn(a, stranger)).status);
-    expect(statuses.slice(0, 60).every((s) => s === 401)).toBe(true);
-    expect(statuses[60]).toBe(429);
-  });
+    for (let i = 0; i < 60; i++) statuses.push((await a.call("/account/token", { method: "POST", auth: `Nostr not-an-event-${i}` })).status);
+    expect(statuses.every((s) => s === 401)).toBe(true);
+    const owner = await linkedOwner();
+    expect((await signIn(a, owner.key)).status).toBe(429); // even a good signature, once the IP is over the fence
+  }, 30_000);
 
   test("OWNER_PUBKEY does nothing once any account exists", async () => {
     const owner = nostrKey();
@@ -382,6 +383,19 @@ describe("app keys (/account/keys)", () => {
     expect(unset.status).toBe(404); // no secret configured → no route
   });
 
+  test("a revoke retried after its push failed pushes again, and says whether the vault was told", async () => {
+    let fail = true;
+    const a = app({ vault: (req) => (new URL(req.url).pathname.endsWith("/internal/keys/revoke") && fail ? new Response("down", { status: 503 }) : Response.json({})) });
+    const { bearer } = await owner(a);
+    await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "retry", vault: "arcade", can: "write" } });
+    const first = await a.call("/account/keys/retry", { method: "DELETE", auth: bearer });
+    expect(first.json.refused_now).toBe(false);
+    fail = false;
+    const second = await a.call("/account/keys/retry", { method: "DELETE", auth: bearer });
+    expect(second.json.refused_now).toBe(true);
+    expect(a.calls.filter((c) => c.url.endsWith("/internal/keys/revoke"))).toHaveLength(2);
+  });
+
   test("one account's keys are invisible and unrevocable to another", async () => {
     const a = app();
     const { bearer } = await owner(a);
@@ -456,12 +470,25 @@ describe("bare create (POST /account/vaults {bare: true})", () => {
     expect(a.calls.some((c) => c.url.includes("/vault/notes-two/api/internal/bare"))).toBe(false);
   });
 
-  test("if the vault can't be told, nothing is created; bare must be a boolean", async () => {
-    const a = app({ vault: (req) => (new URL(req.url).pathname.endsWith("/internal/bare") ? new Response("no", { status: 409 }) : Response.json({})) });
+  test("if the vault can't be told, the create is undone once the vault confirms it's destroyed; bare must be a boolean", async () => {
+    const stub = (destroyOk: boolean) => (req: Request) => {
+      const path = new URL(req.url).pathname;
+      if (path.endsWith("/internal/bare")) return new Response("no", { status: 409 });
+      if (path.endsWith("/internal/destroy")) return destroyOk ? Response.json({ destroyed: true, r2_objects_deleted: 0 }) : new Response("busy", { status: 503 });
+      return Response.json({});
+    };
+    const a = app({ vault: stub(true) });
     const bearer = await bearerFor(a);
     const r = await a.call("/account/vaults", { method: "POST", auth: bearer, body: { name: "app-data", bare: true } });
     expect(r.status).toBe(503);
+    expect(r.json.message).toContain("nothing was created");
     expect(await env.DB.prepare("SELECT 1 AS x FROM vaults WHERE name = 'app-data'").first("x")).toBeNull();
+    // The destroy isn't confirmed: the rows stay (they are the only record of who owns that storage), and it says so.
+    const b = app({ vault: stub(false) });
+    const kept = await b.call("/account/vaults", { method: "POST", auth: bearer, body: { name: "app-two", bare: true } });
+    expect(kept.status).toBe(503);
+    expect(kept.json.message).toContain("may not be bare");
+    expect(await env.DB.prepare("SELECT 1 AS x FROM vaults WHERE name = 'app-two'").first("x")).not.toBeNull();
     expect((await a.call("/account/vaults", { method: "POST", auth: bearer, body: { name: "app-data", bare: "yes" } })).status).toBe(400);
   });
 });

@@ -887,6 +887,8 @@ export class VaultDO extends DurableObject {
       const bareForbidden = this.internalForbidden(bareAuth, vaultName);
       if (bareForbidden) return bareForbidden;
       if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+      // A destroyed instance (e.g. a failed bare create's undo, then a quick retry) stays gone, as everywhere else.
+      if (this.destroyed) return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
       // Bare is allowed while nothing has been seeded: a vault never woken, or one only woken (seed pending,
       // e.g. by a stranger's request). A vault that was seeded, or written to, is refused and left as it is.
       const hasConfig = (await this.ctx.storage.get("config")) !== undefined;
