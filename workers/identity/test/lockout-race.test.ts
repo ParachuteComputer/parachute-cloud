@@ -19,7 +19,9 @@
 import { env } from "cloudflare:test";
 import { describe, expect, test, vi } from "vitest";
 import { handleLoginPost } from "../src/console.ts";
-import { handleCodeVerifyPost, handleLogin2faPost } from "../src/auth-handlers.ts";
+import { handleCodeVerifyPost, handleLogin2faPost, handleSecurityPost } from "../src/auth-handlers.ts";
+import { createSession } from "../src/sessions.ts";
+import { getTotpState } from "../src/two-factor.ts";
 import { handleAuthorizePost } from "../src/oauth-authorize.ts";
 import { handleToken } from "../src/oauth-token.ts";
 import { issueAuthCode } from "../src/auth-codes.ts";
@@ -189,6 +191,34 @@ describe("F1: the login lockout holds under a parallel burst", () => {
       deps(),
     );
     expect(hasSession(owner)).toBe(true);
+  });
+});
+
+describe("F1: turning two-factor off is fenced too (T-419 review)", () => {
+  test("a session holder guessing codes to disable 2FA is checked at most the limit; the right code sent last leaves 2FA on", async () => {
+    const now = new Date("2026-07-02T12:00:00Z");
+    const { id } = await seedUser("burst-2fa-off@example.com", "correct horse");
+    const secret = generateTotpSecret();
+    await persistEnrollment(env.DB, id, secret, now);
+    await env.DB.prepare("UPDATE users SET totp_backup_codes = '[]' WHERE id = ?").bind(id).run();
+    const session = await createSession(env.DB, id, now);
+    const valid = new Set(
+      await Promise.all([-30_000, 0, 30_000].map((d) => totpCodeAt(secret, new Date(now.getTime() + d)))),
+    );
+    const wrong: string[] = [];
+    for (let n = 0; wrong.length < WRONG; n++) {
+      const c = String(n).padStart(6, "0");
+      if (!valid.has(c)) wrong.push(c);
+    }
+    const right = await totpCodeAt(secret, now);
+    const cookie = `parachute_id_session=${session.id}`;
+    // A stolen session can come from any address: each guess from a different IP.
+    const reqs = [...wrong, right].map((c, i) => postForm("/console/security", { action: "disable", code: c }, `198.51.100.${100 + i}`, cookie));
+    const res = await Promise.all(reqs.map((r) => handleSecurityPost(env.DB, r, deps(() => now))));
+    const { checked, locked } = await tally(res.slice(0, WRONG), "two-factor is still on");
+    expect(checked).toBeLessThanOrEqual(LOGIN_MAX_FAILURES);
+    expect(checked + locked).toBe(WRONG);
+    expect((await getTotpState(env.DB, id)).secret).toBeTruthy();
   });
 });
 

@@ -669,8 +669,16 @@ export async function handleSecurityPost(db: D1Database, req: Request, deps: OAu
   if (action === "disable") {
     const state = await getTotpState(db, user.id);
     if (!state.secret) return securityOverview(db, req, user, { notice: "Two-factor is already off." });
+    // Fenced like /login/2fa (T-419 review): a stolen session must not get unlimited guesses at the code that turns
+    // two-factor off. Keyed by user alone, not IP: the session already names the user, and a thief rotating
+    // addresses shouldn't get fresh buckets. Only the session holder can fill it.
+    const fence = `2fa-disable:${user.id}`;
+    if ((await attemptLogin(deps.rateLimiter, fence, now)).locked) {
+      return securityOverview(db, req, user, { error: "Too many attempts. Please wait a few minutes and try again." });
+    }
     const r = await verifySecondFactor(db, user.id, String(form.get("code") ?? ""), now);
     if (!r.ok) return securityOverview(db, req, user, { error: "That code didn't match — two-factor is still on." });
+    await clearLoginFailures(deps.rateLimiter, fence);
     await clearEnrollment(db, user.id);
     return securityOverview(db, req, user, { notice: "Two-factor authentication is now off." });
   }

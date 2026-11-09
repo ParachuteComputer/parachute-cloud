@@ -122,6 +122,8 @@ describe("F2: /oauth/register reserves Parachute's name for first-party registra
     "PARAC\u041dUTE", // Cyrillic capital En
     "Para\u03f2hute", // Greek lunate sigma
     "PARA\u03f9HUTE", // Greek capital lunate sigma
+    // T-419 review: symbols, letters outside the table, small capitals, Lisu, syllabics, mixed Cyrillic
+    "P@rachute", "Pa r@chute", "Parachut\u20ac", "Parac\u041dute", "\u03a1\u0391R\u0391C\u0397UT\u0395", "Parachut\u025b", "Parachu\u0288e", "Pa\u0433achute", "\u1d18\u1d00\u0280\u1d00\u1d04\u029c\u1d1c\u1d1b\u1d07", "\ua4d1arachute", "\u146darachute", "\u0420\u0430\u0433\u0430\u0441\u04bb\u0438te",
   ]) {
     test(`refused for a third-party redirect: ${JSON.stringify(name)}`, async () => {
       const res = await register({ client_name: name, redirect_uris: [EVIL] });

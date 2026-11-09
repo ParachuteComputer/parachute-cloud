@@ -64,7 +64,31 @@ const LOOKALIKES: Record<string, string> = {
   "\u03a4": "t", "\u03c4": "t", "\u0395": "e", "\u03b5": "e",
   // Latin and Armenian extras
   "\u0251": "a", "\u0570": "h", "\u057d": "u",
+  // T-419 review: more Cyrillic (и), Greek η, Latin ɛ ʈ ʋ, small capitals, Lisu, Canadian syllabics, symbols
+  "\u0438": "u", "\u03b7": "h", "\u025b": "e", "\u0288": "t", "\u028b": "u",
+  "\u1d00": "a", "\u1d04": "c", "\u1d07": "e", "\u029c": "h", "\u1d18": "p", "\u0280": "r", "\u1d1b": "t", "\u1d1c": "u",
+  "\ua4d1": "p", "\u146d": "p", "@": "a", "\u20ac": "e",
 };
+
+/**
+ * "parachute" with some letters swapped for ones the table doesn't know: at least five of the nine must be the real
+ * ASCII letter, the rest any other letter. Catches a look-alike from a script the table lacks. A name with no ASCII
+ * letters isn't caught; the consent page's redirect origin and "Unverified" label are the defence there.
+ */
+function nearParachute(folded: string[]): boolean {
+  const target = "parachute";
+  for (let i = 0; i + target.length <= folded.length; i++) {
+    let real = 0;
+    let ok = true;
+    for (let j = 0; j < target.length; j++) {
+      const c = folded[i + j]!;
+      if (c === target[j]) real++;
+      else if (/[a-z0-9]/.test(c)) { ok = false; break; }
+    }
+    if (ok && real >= 5) return true;
+  }
+  return false;
+}
 
 /**
  * Does a self-chosen name read as Parachute? Case-, width-, accent- and
@@ -85,7 +109,7 @@ export function looksLikeParachute(name: string): boolean {
     .toLowerCase()
     .replace(/./gu, fold)
     .replace(/[^\p{L}\p{N}]/gu, "");
-  return folded.includes("parachute");
+  return folded.includes("parachute") || nearParachute(Array.from(folded));
 }
 
 interface RegisterRequestBody {
