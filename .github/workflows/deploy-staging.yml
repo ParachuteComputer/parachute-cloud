@@ -25,8 +25,8 @@
 # secrets land doesn't have to wait for a qualifying push.
 #
 # CI GATE: the `ci-green` job runs first and waits until ci.yml's three jobs
-# have passed on the commit being deployed (push or manual run alike); a red
-# or cancelled CI job fails it and nothing deploys.
+# have passed on the commit being deployed; a red or cancelled CI job fails it
+# and nothing deploys. A manual run of a commit CI never ran on is refused.
 
 name: Deploy staging
 
