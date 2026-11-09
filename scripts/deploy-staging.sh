@@ -71,7 +71,16 @@ bunx wrangler deploy --env staging
 cd "$ROOT/workers/identity"
 bunx wrangler d1 migrations apply parachute-identity-staging --remote --env staging
 bun scripts/seed-dev-user.ts                                    # .dev-secrets -> scripts/seed-dev-user.sql (also grandfathers vault "demo")
-bunx wrangler d1 execute parachute-identity-staging --remote --env staging --file=./scripts/seed-dev-user.sql
+# The seed goes through `--command`, NOT `--file`: wrangler sends a remote
+# `--file` to D1's /import API (init -> R2 upload -> ingest), which the scoped
+# deploy key refuses (401 "Authentication error [code: 10000]", T-413 staging
+# train). `--command` uses D1's /query API, the same path `d1 migrations apply`
+# just used above with the same key (wrangler sends each migration file's full
+# text as one command). The SQL is the file's bytes, unchanged; it is two small
+# statements, far below any argv limit.
+SEED_SQL="$(cat ./scripts/seed-dev-user.sql)"
+bunx wrangler d1 execute parachute-identity-staging --remote --env staging --command="$SEED_SQL"
+unset SEED_SQL
 
 # --- propagation guard (cloud#174 fix, the rc.92 incident) -------------------
 # `wrangler deploy` returning success means the upload was ACCEPTED — it does

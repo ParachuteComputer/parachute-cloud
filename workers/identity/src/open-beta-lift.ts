@@ -116,7 +116,7 @@ function sqlString(v: string | null): string {
 
 /**
  * Rollback statements from a backup — one guarded UPDATE per row. Literal SQL
- * (wrangler `d1 execute --file` takes no bind params), so every value is
+ * (wrangler `d1 execute --command` takes no bind params), so every value is
  * validated to its shape first and anything odd throws instead of being
  * written. The guard `plan = 'trial'` means a row that converted to a paid
  * plan after the lift is never overwritten.
