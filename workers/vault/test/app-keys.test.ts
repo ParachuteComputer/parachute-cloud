@@ -11,6 +11,7 @@
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { base, freshVault, mintToken, op } from "./helpers.ts";
+import { AppKeyLedger } from "../src/app-keys.ts";
 
 const FIRST_PARTY = "parachute-console";
 const APP_KEY = "parachute-app-key";
@@ -83,6 +84,14 @@ describe("bare create at the vault", () => {
     expect(Array.isArray(tags) ? tags : (tags as { tags?: unknown[] }).tags ?? []).toEqual([]);
   });
 
+  it("the bare marker is idempotent: a retry after a lost answer gets the same answer", async () => {
+    const v = freshVault("bare");
+    const t = await internal(v);
+    expect((await call(v, "/api/internal/bare", t, { method: "POST" })).status).toBe(200);
+    expect((await call(v, "/api/internal/bare", t, { method: "POST" })).status).toBe(200);
+    expect((await (await op(v, "/api/notes?limit=50")).json()) as unknown[]).toEqual([]);
+  });
+
   it("on a vault that already exists it is refused and changes nothing; a plain vault is seeded", async () => {
     const v = freshVault("seed");
     const seeded = (await (await op(v, "/api/notes?limit=50")).json()) as unknown[];
@@ -111,5 +120,20 @@ describe("bare create at the vault", () => {
     const v = freshVault("bare");
     const tenant = await mintToken({ vault: v, scopes: `vault:${v}:admin`, vaultScope: [v], clientId: "parachute-account" });
     expect((await call(v, "/api/internal/bare", tenant, { method: "POST" })).status).toBe(403);
+  });
+});
+
+describe("the last-use map", () => {
+  it("drops keys that have expired, so it holds live keys only", async () => {
+    const kv = new Map<string, unknown>();
+    const storage = { get: async (k: string) => kv.get(k), put: async (k: string, v: unknown) => void kv.set(k, structuredClone(v)) };
+    const ledger = new AppKeyLedger(storage as unknown as DurableObjectStorage);
+    const t0 = new Date("2026-11-08T12:00:00.000Z");
+    const sec = t0.getTime() / 1000;
+    await ledger.noteUse("short", sec + 60, t0);
+    await ledger.noteUse("long", sec + 86400, t0);
+    expect(Object.keys(await ledger.lastUsed()).sort()).toEqual(["long", "short"]);
+    await ledger.noteUse("long", sec + 86400, new Date(t0.getTime() + 120_000)); // "short" has expired by now
+    expect(Object.keys(await ledger.lastUsed())).toEqual(["long"]);
   });
 });

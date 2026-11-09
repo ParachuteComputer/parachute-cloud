@@ -27,7 +27,7 @@ const USED_KEY = "app_keys_used";
 
 export class AppKeyLedger {
   private revoked: Record<string, string> | null = null; // jti → expires_at (ISO)
-  private used: Record<string, string> | null = null; // jti → last used (ISO)
+  private used: Record<string, { at: string; exp: number | null }> | null = null; // jti → last use, key's exp (s)
 
   constructor(private readonly storage: DurableObjectStorage) {}
 
@@ -36,8 +36,8 @@ export class AppKeyLedger {
     return this.revoked;
   }
 
-  private async usedMap(): Promise<Record<string, string>> {
-    this.used ??= (await this.storage.get<Record<string, string>>(USED_KEY)) ?? {};
+  private async usedMap(): Promise<Record<string, { at: string; exp: number | null }>> {
+    this.used ??= (await this.storage.get<Record<string, { at: string; exp: number | null }>>(USED_KEY)) ?? {};
     return this.used;
   }
 
@@ -59,16 +59,22 @@ export class AppKeyLedger {
     }
   }
 
-  /** Note that `jti` was just used; one storage write per key per minute at most. */
-  async noteUse(jti: string, now: Date = new Date()): Promise<void> {
+  /**
+   * Note that `jti` (expiring at `exp`, epoch seconds) was just used; one storage write per key per minute at most.
+   * Each write drops the entries of keys that have expired, so the map holds live keys only.
+   */
+  async noteUse(jti: string, exp: number | null, now: Date = new Date()): Promise<void> {
     const used = await this.usedMap();
     const last = used[jti];
-    if (last && now.getTime() - Date.parse(last) < KEY_USE_INTERVAL_MS) return;
-    used[jti] = now.toISOString();
+    if (last && now.getTime() - Date.parse(last.at) < KEY_USE_INTERVAL_MS) return;
+    const nowSec = now.getTime() / 1000;
+    for (const [k, v] of Object.entries(used)) if (v.exp !== null && v.exp <= nowSec) delete used[k];
+    used[jti] = { at: now.toISOString(), exp };
     await this.storage.put(USED_KEY, used);
   }
 
+  /** jti → last use (ISO), for identity's key list. */
   async lastUsed(): Promise<Record<string, string>> {
-    return { ...(await this.usedMap()) };
+    return Object.fromEntries(Object.entries(await this.usedMap()).map(([k, v]) => [k, v.at]));
   }
 }

@@ -6,6 +6,7 @@
  * Deps come from config (env.ISSUER / env.VAULT_BASE_DOMAIN), not the request
  * origin — the cloud issuer is a fixed configured origin.
  */
+import { markSigningKeyCompromised } from "./signing-keys.ts";
 import { handleAccountKeyMint, handleAccountKeyRevoke, handleAccountKeysList } from "./account-keys.ts";
 import { handleAccountPubkeyLink, handleAccountPubkeyUnlink, handleAccountPubkeysList } from "./account-pubkeys.ts";
 import { Hono } from "hono";
@@ -571,6 +572,19 @@ app.post("/ops/health/collect", async (c) => {
   if (refused) return refused;
   const only = c.req.queries("vault")?.slice(0, 99);
   return c.json(await collectVaultHealth(c.env, depsFor(c.env), only?.length ? { onlyVaults: only } : {}));
+});
+
+// Mark a signing key compromised (T-414, signing-keys.ts markSigningKeyCompromised): body {kid}. It leaves JWKS at
+// once, even while app keys it signed are live (an ordinary rotation keeps it for them); if it was the active key a
+// fresh one replaces it. Bearer OPS_RUN_TOKEN. Unset → 404.
+app.post("/ops/signing-key-compromised", async (c) => {
+  const refused = await opsBearerRefusal(c.env.OPS_RUN_TOKEN, c.req.raw);
+  if (refused === null) return c.notFound();
+  if (refused) return refused;
+  const body = (await c.req.json().catch(() => ({}))) as { kid?: unknown };
+  if (typeof body.kid !== "string" || !body.kid) return c.json({ error: "invalid_request", message: "send {kid}" }, 400);
+  const found = await markSigningKeyCompromised(c.env.DB, body.kid);
+  return found ? c.json({ kid: body.kid, compromised: true }) : c.json({ error: "not_found" }, 404);
 });
 
 // Re-run the backups of the vaults whose backups are stale (T-318): bearer

@@ -82,6 +82,27 @@ export async function checkAndBumpSignup(
   }
 }
 
+// --- NIP-98 sign-in fence (T-414) -------------------------------------------
+
+export const NOSTR_SIGNIN_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+// A real owner signs in a few times an hour (one account token per 10 minutes, per hub). Every attempt costs a
+// signature check and a D1 write (the spent event id) before the key is looked up, so a flood of events from
+// throwaway keys is fenced per IP before any of that.
+export const NOSTR_SIGNIN_MAX_PER_WINDOW = 60;
+
+export async function checkAndBumpNostrSignin(
+  limiter: RateLimiterNamespace,
+  ip: string,
+  now: Date = new Date(),
+): Promise<BumpOutcome> {
+  try {
+    return await stubFor(limiter, `nostr-signin:${ip}`).checkAndBump(NOSTR_SIGNIN_WINDOW_MS, NOSTR_SIGNIN_MAX_PER_WINDOW, now.getTime());
+  } catch (err) {
+    failOpen("nostr_signin", err);
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+}
+
 // --- login brute-force fence ----------------------------------------------
 
 export const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes

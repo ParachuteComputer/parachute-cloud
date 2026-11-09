@@ -892,6 +892,9 @@ export class VaultDO extends DurableObject {
       const hasConfig = (await this.ctx.storage.get("config")) !== undefined;
       const pending = (await this.ctx.storage.get<boolean>(SEED_PENDING_KEY)) === true;
       const seeded = (await this.ctx.storage.get<boolean>(WELCOME_SEEDED_KEY)) === true;
+      // Idempotent: a repeat call (identity retrying after a lost response) on a vault that is bare and still
+      // unmaterialized answers as the first did.
+      if (seeded && !hasConfig) return json({ bare: true });
       if (seeded || (hasConfig && !pending)) {
         return json({ error: "Conflict", error_type: "already_materialized", message: "this vault already exists; bare applies only at create" }, 409);
       }
@@ -1539,21 +1542,6 @@ export class VaultDO extends DurableObject {
   }
 
   /**
-   * The shared authorization gate for every /api/internal/* seam (the honest
-   * seam, chosen with cloud#55): the general auth + verb gates have already
-   * run, but they are NOT sufficient here — a vault owner can mint
-   * `vault:<name>:admin` through the public OAuth flow, and these endpoints
-   * are the PLATFORM's controls, not the tenant's. So they additionally
-   * require the ISSUER'S OWN first-party mint: `client_id ===
-   * FIRST_PARTY_CLIENT_ID` (unforgeable — DCR ids are server-generated UUIDs;
-   * the claim rides a signature-checked JWT) AND the admin verb for this
-   * vault; or the VAULT_AUTH_TOKEN operator bearer (the pre-existing
-   * control-plane seam). Everything else → 403.
-   *
-   * NOT part of the shared wire contract (the bun vault has no such surface);
-   * the cloud conformance suite pins it as cloud-runtime surface.
-   */
-  /**
    * Every tenant door's authentication (REST, MCP, the landing, the import gate): the token checks of
    * `authenticateVaultRequest`, then the app-key door (T-414) — a key revoked HERE is refused at once, and an app
    * key's use is noted for "last used" (app-keys.ts).
@@ -1565,7 +1553,7 @@ export class VaultDO extends DurableObject {
     if (auth.jti && (await this.appKeys.isRevoked(auth.jti))) {
       return { error: json({ error: "Unauthorized", message: "this key has been revoked" }, 401) };
     }
-    if (auth.jti && auth.clientId === APP_KEY_CLIENT_ID) await this.appKeys.noteUse(auth.jti);
+    if (auth.jti && auth.clientId === APP_KEY_CLIENT_ID) await this.appKeys.noteUse(auth.jti, auth.exp);
     return auth;
   }
 
@@ -1598,6 +1586,21 @@ export class VaultDO extends DurableObject {
     return json({ revoked: true });
   }
 
+  /**
+   * The shared authorization gate for every /api/internal/* seam (the honest
+   * seam, chosen with cloud#55): the general auth + verb gates have already
+   * run, but they are NOT sufficient here — a vault owner can mint
+   * `vault:<name>:admin` through the public OAuth flow, and these endpoints
+   * are the PLATFORM's controls, not the tenant's. So they additionally
+   * require the ISSUER'S OWN first-party mint: `client_id ===
+   * FIRST_PARTY_CLIENT_ID` (unforgeable — DCR ids are server-generated UUIDs;
+   * the claim rides a signature-checked JWT) AND the admin verb for this
+   * vault; or the VAULT_AUTH_TOKEN operator bearer (the pre-existing
+   * control-plane seam). Everything else → 403.
+   *
+   * NOT part of the shared wire contract (the bun vault has no such surface);
+   * the cloud conformance suite pins it as cloud-runtime surface.
+   */
   private internalForbidden(auth: AuthResult, vaultName: string): Response | null {
     const firstParty =
       auth.via === "operator" ||

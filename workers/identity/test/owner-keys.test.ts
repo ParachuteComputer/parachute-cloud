@@ -18,6 +18,7 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import worker from "../src/index.ts";
 import { getAllPublicKeys, markSigningKeyCompromised, rotateSigningKey } from "../src/signing-keys.ts";
 import { signAccessToken } from "../src/tokens.ts";
+import { eligibleFor } from "../src/drip.ts";
 import { createUser, getUserById } from "../src/users.ts";
 import { ISSUER, decodeJwtPayload, seedUser, seedVault } from "./helpers.ts";
 
@@ -156,6 +157,22 @@ describe("NIP-98 owner sign-in (POST /account/token)", () => {
     expect(row?.password_hash).toBe(""); // no password: the key is the only way in
     // Another key is not the owner, even on a single-owner deploy.
     expect((await signIn(a, nostrKey())).status).toBe(401);
+  });
+
+  test("the key-only owner is never picked for mail (its address is a placeholder no mail reaches)", async () => {
+    const owner = nostrKey();
+    expect((await signIn(app({ ownerPubkey: owner.pubkey }), owner)).status).toBe(200);
+    const welcome = await eligibleFor(env.DB, "welcome", new Date(), 50);
+    expect(welcome.map((u) => u.email)).not.toContain(`${owner.pubkey}@nostr.invalid`);
+  });
+
+  test("sign-in attempts are fenced per IP before any signature work", async () => {
+    const a = app();
+    const stranger = nostrKey();
+    const statuses: number[] = [];
+    for (let i = 0; i < 61; i++) statuses.push((await signIn(a, stranger)).status);
+    expect(statuses.slice(0, 60).every((s) => s === 401)).toBe(true);
+    expect(statuses[60]).toBe(429);
   });
 
   test("OWNER_PUBKEY does nothing once any account exists", async () => {
@@ -334,6 +351,35 @@ describe("app keys (/account/keys)", () => {
     expect((await a.call("/account/keys/rev", { method: "DELETE", auth: bearer })).status).toBe(200);
     expect((await a.call("/account/keys/nope", { method: "DELETE", auth: bearer })).status).toBe(404);
     expect((await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "rev", vault: "arcade", can: "write" } })).status).toBe(409);
+  });
+
+  test("revoking a key whose vault is gone (or taken by someone else) pushes nothing to that vault name", async () => {
+    const a = app();
+    const { bearer } = await owner(a);
+    await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "gone", vault: "arcade", can: "write" } });
+    // The vault leaves this account (deleted; its name now another account's).
+    const { id: otherId } = await seedUser("next-owner@example.com");
+    await env.DB.prepare("UPDATE vaults SET owner_user_id = ? WHERE name = 'arcade'").bind(otherId).run();
+    const before = a.calls.length;
+    const r = await a.call("/account/keys/gone", { method: "DELETE", auth: bearer });
+    expect(r.status).toBe(200);
+    expect(a.calls.slice(before).filter((c) => c.url.includes("/internal/keys/revoke"))).toEqual([]);
+  });
+
+  test("ops can mark a signing key compromised by kid (OPS_RUN_TOKEN)", async () => {
+    const ops = (kid: string) =>
+      worker.fetch(
+        new Request(`${ISSUER}/ops/signing-key-compromised`, { method: "POST", headers: { authorization: "Bearer ops-run-test", "content-type": "application/json" }, body: JSON.stringify({ kid }) }),
+        { ...env, OPS_RUN_TOKEN: "ops-run-test" } as never,
+      );
+    const active = await rotateSigningKey(env.DB);
+    const r = await ops(active.kid);
+    expect(r.status).toBe(200);
+    expect((await getAllPublicKeys(env.DB)).map((k) => k.kid)).not.toContain(active.kid);
+    expect((await getAllPublicKeys(env.DB)).length).toBeGreaterThan(0); // a fresh key replaced it
+    expect((await ops("no-such-kid")).status).toBe(404);
+    const unset = await worker.fetch(new Request(`${ISSUER}/ops/signing-key-compromised`, { method: "POST", body: "{}" }), env as never);
+    expect(unset.status).toBe(404); // no secret configured → no route
   });
 
   test("one account's keys are invisible and unrevocable to another", async () => {

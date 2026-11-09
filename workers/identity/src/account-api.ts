@@ -518,6 +518,10 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   // whatever request first materializes it. If the vault can't be told, the create is undone rather than handing
   // back a seeded vault that was asked to be bare.
   if (bare && !(await markVaultBare(db, deps, user.id, name))) {
+    // Best-effort: clear anything the bare call did land in the DO, so the name's next owner starts clean.
+    await callVaultDestroy(db, deps, user.id, name, { ifUnwritten: true })
+      .then((r) => r.body?.cancel())
+      .catch(() => {});
     await deleteVaultD1Rows(db, user.id, name, deps.now?.() ?? new Date());
     return restError(503, "vault_unavailable", "Couldn't set up a bare vault just now; nothing was created. Try again.");
   }

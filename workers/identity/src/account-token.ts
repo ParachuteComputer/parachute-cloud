@@ -57,6 +57,7 @@ import { parseSessionCookie } from "./sessions.ts";
 import { signAccessToken } from "./tokens.ts";
 import { NostrAuthError, authenticateNostrRequest, isNostrAuthorization } from "./nostr-auth.ts";
 import type { User } from "./users.ts";
+import { checkAndBumpNostrSignin, clientIp } from "./rate-limit.ts";
 
 /** Short TTL — a page-snapshot threat can't carry the token for long. Matches
  * the hub twin's 10-min window; the app re-mints when it's about to lapse. */
@@ -89,6 +90,13 @@ export function accountAdminScope(ownerId: string): string {
  * one. The same account chokepoints as the session path: a suspended or deleted account is refused.
  */
 async function handleNostrAccountToken(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const fence = await checkAndBumpNostrSignin(deps.rateLimiter, clientIp(req), deps.now?.() ?? new Date());
+  if (!fence.allowed) {
+    return jsonResponse({ error: "rate_limited", error_description: "too many sign-in attempts; try again later" }, 429, {
+      "cache-control": "no-store",
+      "retry-after": String(fence.retryAfterSeconds),
+    });
+  }
   let user: User;
   try {
     ({ user } = await authenticateNostrRequest(db, req, {

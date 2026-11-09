@@ -95,6 +95,9 @@ interface EligibleUser {
   email: string;
 }
 
+// T-414: a key-only owner (the OWNER_PUBKEY bootstrap, nostr-auth.ts) has a placeholder address on the reserved
+// `.invalid` domain, which no mail reaches: never mail it. substr, not LIKE (D1 caps LIKE pattern length).
+const HAS_MAILBOX = "substr(u.email, -14) <> '@nostr.invalid'";
 const NO_LEDGER_ROW = "NOT EXISTS (SELECT 1 FROM drip_sends d WHERE d.user_id = u.id AND d.email_kind = ?1)";
 
 /**
@@ -123,14 +126,14 @@ export async function eligibleFor(
   switch (kind) {
     case "welcome":
       sql = `SELECT u.id, u.email FROM users u
-             WHERE u.created_at > ?2 AND u.drip_unsubscribed IS NULL AND u.deleted_at IS NULL AND ${NO_LEDGER_ROW}
+             WHERE u.created_at > ?2 AND u.drip_unsubscribed IS NULL AND u.deleted_at IS NULL AND ${NO_LEDGER_ROW} AND ${HAS_MAILBOX}
              ORDER BY u.created_at LIMIT ?3`;
       binds = [kind, t(WELCOME_WINDOW_MS), limit];
       break;
     case "connect-nudge":
       sql = `SELECT u.id, u.email FROM users u
              WHERE u.created_at <= ?2 AND u.created_at > ?3
-               AND u.drip_unsubscribed IS NULL AND u.deleted_at IS NULL AND ${NO_LEDGER_ROW}
+               AND u.drip_unsubscribed IS NULL AND u.deleted_at IS NULL AND ${NO_LEDGER_ROW} AND ${HAS_MAILBOX}
                AND NOT EXISTS (SELECT 1 FROM tokens t WHERE t.user_id = u.id AND t.client_id <> ?4)
                AND NOT EXISTS (SELECT 1 FROM grants g WHERE g.user_id = u.id AND g.client_id <> ?4)
              ORDER BY u.created_at LIMIT ?5`;
@@ -139,7 +142,7 @@ export async function eligibleFor(
     case "feedback":
       sql = `SELECT u.id, u.email FROM users u
              WHERE u.created_at <= ?2 AND u.created_at > ?3
-               AND u.drip_unsubscribed IS NULL AND u.deleted_at IS NULL AND ${NO_LEDGER_ROW}
+               AND u.drip_unsubscribed IS NULL AND u.deleted_at IS NULL AND ${NO_LEDGER_ROW} AND ${HAS_MAILBOX}
              ORDER BY u.created_at LIMIT ?4`;
       binds = [kind, t(FEEDBACK_MIN_AGE_MS), t(FEEDBACK_MAX_AGE_MS), limit];
       break;

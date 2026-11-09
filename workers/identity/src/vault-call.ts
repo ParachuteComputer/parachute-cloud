@@ -536,23 +536,6 @@ function isRetryableStatus(status: number): boolean {
 }
 
 /**
- * Push a per-vault ENTITLEMENT into the vault DO's config via the internal seam
- * (`PUT /api/internal/config`, first-party admin token — see the module note):
- * the TWO-METER caps `{ notes_bytes, attachment_bytes }`, the voice entitlement,
- * and the `frozen` flag (the expired floor — the DO returns 402 plan_required
- * on writes when true, reads/export untouched).
- *
- * NO-THROW by contract: callers ride user-facing flows (vault creation) where a
- * push hiccup must never fail the operation. A missed push leaves the DO on
- * whatever it already had (a fresh vault → the more-generous env default; an
- * existing vault → its prior caps) — the safe direction; `applyPlanToVaults` /
- * the backfill script are the reconcilers. A bounded retry loop absorbs the
- * short transport/DO blips that are common at this seam — but only for
- * {@link isRetryableStatus} outcomes and transport errors; a deterministic
- * non-2xx fails fast on the first attempt. Only after retries are exhausted
- * (or a fast-fail) does the existing `event=plan_cap_push_failed` warning fire.
- */
-/**
  * Tell a just-created vault's Durable Object to skip its welcome seed (T-414, `bare: true` on create): the
  * first-party `POST /api/internal/bare`, which the DO handles before it materializes, so it must be the vault's
  * first request. Retried like the cap push. True when the DO answered that the vault is bare.
@@ -571,6 +554,23 @@ export async function markVaultBare(db: D1Database, deps: OAuthDeps, userId: str
   return false;
 }
 
+/**
+ * Push a per-vault ENTITLEMENT into the vault DO's config via the internal seam
+ * (`PUT /api/internal/config`, first-party admin token — see the module note):
+ * the TWO-METER caps `{ notes_bytes, attachment_bytes }`, the voice entitlement,
+ * and the `frozen` flag (the expired floor — the DO returns 402 plan_required
+ * on writes when true, reads/export untouched).
+ *
+ * NO-THROW by contract: callers ride user-facing flows (vault creation) where a
+ * push hiccup must never fail the operation. A missed push leaves the DO on
+ * whatever it already had (a fresh vault → the more-generous env default; an
+ * existing vault → its prior caps) — the safe direction; `applyPlanToVaults` /
+ * the backfill script are the reconcilers. A bounded retry loop absorbs the
+ * short transport/DO blips that are common at this seam — but only for
+ * {@link isRetryableStatus} outcomes and transport errors; a deterministic
+ * non-2xx fails fast on the first attempt. Only after retries are exhausted
+ * (or a fast-fail) does the existing `event=plan_cap_push_failed` warning fire.
+ */
 export async function pushVaultCap(
   db: D1Database,
   deps: OAuthDeps,
