@@ -11,9 +11,11 @@
  * passed in; `vault_id` is the Durable Object's id. The message is the one
  * place input could ride along, so `msg` drops everything from its first quote
  * to its last (engine and JSON.parse messages quote the input, and quoted JSON
- * has quotes inside) and `stack` keeps only real frame lines. Input a message carries WITHOUT quotes would still show; the lines are
- * written only for runtime faults (TypeError and kin, health.ts
- * toolErrorOutcome), whose messages the runtime words.
+ * has quotes inside) and `stack` keeps only real frame lines. Input a message
+ * carries WITHOUT quotes would still show. The lines are written only for
+ * server-class faults (health.ts toolErrorOutcome): mostly
+ * the runtime's own TypeError and kin, whose messages the runtime words; an
+ * EmbeddingError or TranscriptionError wraps the provider's error text.
  */
 
 import { errorClassName } from "./health.js";
@@ -56,8 +58,7 @@ export function stackFrames(stack: string | undefined, message?: string): string
     .map((l) => l.trim())
     .filter((l) => FRAME.test(l))
     .slice(0, MAX_FRAMES)
-    .join(" | ")
-    .replace(/"/g, "'");
+    .join(" | ");
 }
 
 /** A server-defined token (tool name, version label, DO id): anything outside a small alphabet becomes `_`. */
@@ -74,6 +75,11 @@ export interface ErrorLogFields {
   vaultId: string;
 }
 
+/** A backslash is escaped so it cannot swallow the closing quote. (No `"` is left by then.) */
+function quoted(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/"/g, "'");
+}
+
 /** The line itself (exported for tests); {@link logServerError} writes it. */
 export function serverErrorLine(event: string, err: unknown, f: ErrorLogFields): string {
   const message = err instanceof Error ? err.message : String(err);
@@ -82,8 +88,8 @@ export function serverErrorLine(event: string, err: unknown, f: ErrorLogFields):
     `event=${token(event)}`,
     ...(f.tool !== undefined ? [`tool=${token(f.tool)}`] : []),
     `class=${errorClassName(err)}`,
-    `msg="${redactMessage(message)}"`,
-    `stack="${stackFrames(stack, message)}"`,
+    `msg="${quoted(redactMessage(message))}"`,
+    `stack="${quoted(stackFrames(stack, message))}"`,
     `version=${token(f.version)}`,
     `vault_id=${token(f.vaultId)}`,
   ].join(" ");

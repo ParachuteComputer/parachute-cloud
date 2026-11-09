@@ -145,6 +145,15 @@ function errText(e: unknown): string {
   return String(e);
 }
 
+/** decodeURIComponent, or null for a malformed escape. */
+function safeDecode(s: string): string | null {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return null;
+  }
+}
+
 function json(data: unknown, status = 200): Response {
   return Response.json(data, { status });
 }
@@ -885,8 +894,8 @@ export class VaultDO extends DurableObject {
       // The platform's health read still answers: its counters live outside
       // the engine, and they carry this instance's `do:boot` count.
       const hm = /^\/vault\/([^/]+)\/api\/internal\/health$/.exec(new URL(request.url).pathname);
-      if (hm) {
-        const vaultName = decodeURIComponent(hm[1]!);
+      const vaultName = hm ? safeDecode(hm[1]!) : null;
+      if (vaultName !== null) {
         const auth = await authenticateVaultRequest(request, this.env, vaultName);
         if ("error" in auth) return auth.error;
         const forbidden = this.internalForbidden(auth, vaultName);

@@ -14,7 +14,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
-import { redactMessage, stackFrames } from "../src/error-log.ts";
+import { redactMessage, serverErrorLine, stackFrames } from "../src/error-log.ts";
 import { createNote, freshVault, op } from "./helpers.ts";
 
 type Days = Record<string, Record<string, Record<string, number>>>;
@@ -187,6 +187,11 @@ describe("the log line's message and frames", () => {
     // The message changed after the stack was captured: still no message line.
     err.message = "rewritten";
     expect(stackFrames(err.stack, err.message)).not.toContain("MARKER");
+  });
+
+  it("a backslash cannot end a quoted value early", () => {
+    const line = serverErrorLine("mcp_tool_error", new TypeError("ends in a\\"), { tool: "t", version: "v", vaultId: "id" });
+    expect(line).toContain('msg="ends in a\\\\" stack=');
   });
 
   it("keeps only the 'at …' frames of a stack, at most 10, joined with ' | '", () => {
