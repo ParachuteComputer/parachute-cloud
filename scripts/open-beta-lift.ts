@@ -94,39 +94,53 @@ function query<T>(sql: string): T[] {
 
 /** Run statements through `--command` (D1's /query API), in order. NOT
  *  `--file`: wrangler sends a remote `--file` to D1's /import API, which the
- *  scoped deploy key refuses (401, code 10000; T-413) — /query is the path
+ *  scoped deploy key refuses (401, code 10000; T-413); /query is the path
  *  `d1 migrations apply` uses. Statements are packed into commands of at most
- *  MAX_COMMAND_BYTES (one argv string must stay under Linux's 128 KiB limit),
- *  so a large rollback runs as several commands: every statement here is
- *  guarded and idempotent, so a failed run is safe to re-run. Row-change
- *  counts are NOT read from wrangler's output (local D1 doesn't report them);
- *  the before/after COUNTS are the audit trail. */
-const MAX_COMMAND_BYTES = 60_000;
-function packStatements(statements: readonly string[], max = MAX_COMMAND_BYTES): string[] {
+ *  MAX_COMMAND_BYTES and MAX_COMMAND_STATEMENTS (well under Linux's 128 KiB
+ *  argv-string limit and D1's 100 KB SQL limit), so a large rollback runs as
+ *  several commands. Unlike the old /import, the run is NOT all-or-nothing:
+ *  every statement here is guarded and idempotent, so a failed run is safe to
+ *  re-run, and a failure names how many commands had already committed.
+ *  Row-change counts are NOT read from wrangler's output (local D1 doesn't
+ *  report them); the before/after COUNTS are the audit trail. */
+const MAX_COMMAND_BYTES = 30_000;
+const MAX_COMMAND_STATEMENTS = 50;
+function packStatements(statements: readonly string[]): string[] {
   const out: string[] = [];
-  let cur = "";
+  let cur: string[] = [];
+  let curBytes = 0;
   for (const raw of statements) {
     const s = raw.trim().endsWith(";") ? raw.trim() : `${raw.trim()};`;
-    if (Buffer.byteLength(s) > max) throw new Error(`a statement is over ${max} bytes`);
-    if (cur && Buffer.byteLength(cur) + 1 + Buffer.byteLength(s) > max) {
-      out.push(cur);
-      cur = "";
+    const bytes = Buffer.byteLength(s) + 1;
+    if (bytes > MAX_COMMAND_BYTES) throw new Error(`a statement is over ${MAX_COMMAND_BYTES} bytes`);
+    if (cur.length && (curBytes + bytes > MAX_COMMAND_BYTES || cur.length >= MAX_COMMAND_STATEMENTS)) {
+      out.push(cur.join("\n"));
+      cur = [];
+      curBytes = 0;
     }
-    cur = cur ? `${cur}\n${s}` : s;
+    cur.push(s);
+    curBytes += bytes;
   }
-  if (cur) out.push(cur);
+  if (cur.length) out.push(cur.join("\n"));
   return out;
 }
 
 function execStatements(statements: readonly string[]): number {
   const commands = packStatements(statements);
-  for (const command of commands) {
-    const stdout = wrangler(["--command", command]);
-    const parsed = JSON.parse(stdout.slice(stdout.indexOf("["), stdout.lastIndexOf("]") + 1)) as Array<{
-      success?: boolean;
-    }>;
-    if (parsed.some((e) => e.success === false)) throw new Error("a statement reported success=false");
-  }
+  commands.forEach((command, i) => {
+    try {
+      const stdout = wrangler(["--command", command]);
+      const parsed = JSON.parse(stdout.slice(stdout.indexOf("["), stdout.lastIndexOf("]") + 1)) as Array<{
+        success?: boolean;
+      }>;
+      if (parsed.some((e) => e.success === false)) throw new Error("a statement reported success=false");
+    } catch (err) {
+      throw new Error(
+        `command ${i + 1} of ${commands.length} failed; the ${i} before it committed. Every statement is guarded, ` +
+          `so re-run the same command (keep any backup file already written).\n${(err as Error).message}`,
+      );
+    }
+  });
   return commands.length;
 }
 

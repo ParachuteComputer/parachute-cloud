@@ -5,7 +5,8 @@
  * train failed its dev-user seed on it). `d1 migrations apply` already uses
  * /query, so that is the path the key is proven on.
  *
- * 1. No script under scripts/ passes `--file` to wrangler (comments aside).
+ * 1. No script under scripts/ passes `--file` to wrangler (comments aside),
+ *    and no workflow or package.json script runs a remote `--file`.
  * 2. scripts/open-beta-lift.ts, run for real through wrangler against a LOCAL
  *    D1 built from the real migrations (never Cloudflare): --apply then
  *    --rollback over enough rows that the rollback is packed into several
@@ -21,7 +22,7 @@ const ROOT = join(import.meta.dir, "..");
 const IDENTITY_DIR = join(ROOT, "workers", "identity");
 const SCRIPTS = join(ROOT, "scripts");
 const LIFT = join(SCRIPTS, "open-beta-lift.ts");
-const ROWS = 600; // ~250 bytes per rollback statement -> ~150 KB -> 3 commands
+const ROWS = 600; // ~250 bytes per rollback statement: several packed commands
 
 let persist = "";
 let work = "";
@@ -73,8 +74,10 @@ afterAll(() => {
 });
 
 describe("remote D1 writes avoid the /import path", () => {
-  test("no script under scripts/ passes --file to wrangler", () => {
+  test("no script under scripts/ passes --file to wrangler, and no workflow or package script runs a remote --file", () => {
     const offenders: string[] = [];
+    const rel = (p: string) => p.slice(ROOT.length + 1);
+    const FILE_FLAG = /--file(?![-\w])/;
     const walk = (dir: string) => {
       for (const e of readdirSync(dir, { withFileTypes: true })) {
         const p = join(dir, e.name);
@@ -84,12 +87,27 @@ describe("remote D1 writes avoid the /import path", () => {
             .split("\n")
             .forEach((line, i) => {
               const code = line.replace(/^\s*(#|\/\/|\*|\/\*\*?).*$/, "").replace(/\s(#|\/\/)\s.*$/, "");
-              if (/--file\b/.test(code)) offenders.push(`${p.slice(ROOT.length + 1)}:${i + 1}: ${line.trim()}`);
+              if (FILE_FLAG.test(code)) offenders.push(`${rel(p)}:${i + 1}: ${line.trim()}`);
             });
         }
       }
     };
     walk(SCRIPTS);
+    // Workflows and package scripts may seed a LOCAL D1 from a file; never a remote one.
+    const wf = join(ROOT, ".github", "workflows");
+    const others = [
+      ...readdirSync(wf).filter((f) => /\.ya?ml$/.test(f)).map((f) => join(wf, f)),
+      join(ROOT, "package.json"),
+      join(IDENTITY_DIR, "package.json"),
+      join(ROOT, "workers", "vault", "package.json"),
+    ];
+    for (const p of others) {
+      readFileSync(p, "utf8")
+        .split("\n")
+        .forEach((line, i) => {
+          if (FILE_FLAG.test(line) && /--remote\b/.test(line)) offenders.push(`${rel(p)}:${i + 1}: ${line.trim()}`);
+        });
+    }
     expect(offenders).toEqual([]);
   });
 
@@ -108,7 +126,8 @@ describe("remote D1 writes avoid the /import path", () => {
     expect(rolled.err).toBe("");
     expect(rolled.code).toBe(0);
     // More than one command, or the packing went untested.
-    expect(rolled.out).toMatch(new RegExp(`Ran ${ROWS} guarded restores in [2-9] wrangler command`));
+    const used = Number(rolled.out.match(new RegExp(`Ran ${ROWS} guarded restores in (\\d+) wrangler command`))?.[1]);
+    expect(used).toBeGreaterThan(1);
     expect(plans()).toEqual({ expired: ROWS, standard: 1 });
   }, 240_000);
 });
