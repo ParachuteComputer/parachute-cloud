@@ -394,6 +394,8 @@ async function claimUnverifiedAccount(db: D1Database, userId: string, now: Date)
       .prepare(`UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL AND ${unverified}`)
       .bind(nowIso, userId, userId),
     db.prepare(`DELETE FROM grants WHERE user_id = ? AND ${unverified}`).bind(userId, userId),
+    // T-414: a Nostr key the old holder linked would otherwise still sign in as the account after the claim.
+    db.prepare(`DELETE FROM user_pubkeys WHERE user_id = ? AND ${unverified}`).bind(userId, userId),
     // An unredeemed authorization code would otherwise still trade for fresh
     // tokens after the claim (redemption checks the code, not the grant).
     db.prepare(`DELETE FROM auth_codes WHERE user_id = ? AND ${unverified}`).bind(userId, userId),

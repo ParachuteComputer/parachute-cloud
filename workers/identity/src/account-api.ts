@@ -165,7 +165,7 @@ export async function requireAccount(
   req: Request,
   deps: OAuthDeps,
   verb: AccountVerb,
-): Promise<{ ok: true; accountId: string; user: User } | { ok: false; response: Response }> {
+): Promise<{ ok: true; accountId: string; user: User; clientId: string | null } | { ok: false; response: Response }> {
   const token = bearerToken(req);
   if (!token) {
     return { ok: false, response: authError(401, "invalid_token", "missing bearer token") };
@@ -201,7 +201,8 @@ export async function requireAccount(
       response: authError(403, "insufficient_scope", `account:${accountId}:${verb} required`),
     };
   }
-  return { ok: true, accountId, user };
+  const clientId = typeof result.token.payload.client_id === "string" ? result.token.payload.client_id : null;
+  return { ok: true, accountId, user, clientId };
 }
 
 /** The vault name segment from `/account/vaults/<name>[/token]`, lowercased, or

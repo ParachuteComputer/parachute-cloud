@@ -953,6 +953,15 @@ async function purgeAccountRows(
   const email = user.email.trim().toLowerCase();
   await db.batch([
     db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId),
+    // T-414: an app key lives up to a year, and the vault knows it only by vault name, which a later account can
+    // reuse. So its registry row is NOT deleted: it is revoked and detached from the account (user_id NULL), and
+    // its jti stays on the public revocation list until the key would have expired anyway.
+    db
+      .prepare(
+        `UPDATE tokens SET revoked_at = COALESCE(revoked_at, ?), user_id = NULL
+          WHERE user_id = ? AND created_via = 'app_key' AND expires_at > ?`,
+      )
+      .bind(new Date().toISOString(), userId, new Date().toISOString()),
     db.prepare("DELETE FROM tokens WHERE user_id = ?").bind(userId),
     // T-414: the account's app keys (named rows of the tokens above) and its linked Nostr keys, so a key it
     // linked can't sign in as whoever claims a reused id, and a freed npub can own another account.

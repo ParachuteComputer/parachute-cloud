@@ -96,7 +96,7 @@ import {
   restoreFromTar,
 } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
-import { APP_KEY_CLIENT_ID, AppKeyLedger } from "./app-keys.js";
+import { APP_KEY_CLIENT_ID, AppKeyLedger, SEED_PENDING_KEY } from "./app-keys.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, withCloudGuideText, type WelcomeSeedResult } from "./welcome.js";
 import {
   SEED_PACK_NAMES,
@@ -533,6 +533,8 @@ export class VaultDO extends DurableObject {
   private config: VaultConfigState | null = null;
   /** App keys revoked here and their last use (app-keys.ts; T-414). */
   private appKeys: AppKeyLedger;
+  /** Whether the pending welcome seed has been looked at in this warm instance (seedIfPending). */
+  private seedChecked = false;
   private r2Bytes = 0;
   private stateLoaded = false;
 
@@ -885,10 +887,17 @@ export class VaultDO extends DurableObject {
       const bareForbidden = this.internalForbidden(bareAuth, vaultName);
       if (bareForbidden) return bareForbidden;
       if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
-      if (this.stateLoaded || (await this.ctx.storage.get("config")) !== undefined) {
+      // Bare is allowed while nothing has been seeded: a vault never woken, or one only woken (seed pending,
+      // e.g. by a stranger's request). A vault that was seeded, or written to, is refused and left as it is.
+      const hasConfig = (await this.ctx.storage.get("config")) !== undefined;
+      const pending = (await this.ctx.storage.get<boolean>(SEED_PENDING_KEY)) === true;
+      const seeded = (await this.ctx.storage.get<boolean>(WELCOME_SEEDED_KEY)) === true;
+      if (seeded || (hasConfig && !pending)) {
         return json({ error: "Conflict", error_type: "already_materialized", message: "this vault already exists; bare applies only at create" }, 409);
       }
       await this.ctx.storage.put(WELCOME_SEEDED_KEY, true);
+      await this.ctx.storage.delete(SEED_PENDING_KEY);
+      this.seedChecked = true;
       return json({ bare: true });
     }
     if (rest === "/api/internal/destroy") {
@@ -1369,7 +1378,10 @@ export class VaultDO extends DurableObject {
       // claim ("the DO comes into existence on first access"), so the vault-as-
       // data first exists HERE, and this DO is the single writer for it.
       // Existing vaults are untouched — they all carry a stored config already.
-      await this.maybeSeedWelcome();
+      // T-414: the seed waits for the first AUTHENTICATED request (`authenticate` → seedIfPending), not this
+      // wake: any request wakes a DO, a stranger's included, and a wake that seeded would let anyone who guesses
+      // a name fill it with the guides before its owner's `bare` create could say no. Until then it is pending.
+      await this.ctx.storage.put(SEED_PENDING_KEY, true);
     }
     this.r2Bytes = (await this.ctx.storage.get<number>(R2_METER_KEY)) ?? 0;
     this.transcribeMinutes = (await this.ctx.storage.get<number>(TRANSCRIBE_MINUTES_KEY)) ?? 0;
@@ -1549,11 +1561,25 @@ export class VaultDO extends DurableObject {
   private async authenticate(request: Request, vaultName: string): Promise<{ error: Response } | AuthResult> {
     const auth = await authenticateVaultRequest(request, this.env, vaultName);
     if ("error" in auth) return auth;
+    await this.seedIfPending();
     if (auth.jti && (await this.appKeys.isRevoked(auth.jti))) {
       return { error: json({ error: "Unauthorized", message: "this key has been revoked" }, 401) };
     }
     if (auth.jti && auth.clientId === APP_KEY_CLIENT_ID) await this.appKeys.noteUse(auth.jti);
     return auth;
+  }
+
+  /**
+   * The welcome seed for a vault first woken by any request (T-414): runs on the first request that authenticates
+   * (so a stranger's wake can't seed it, and a bare create can still follow), then never again.
+   */
+  private async seedIfPending(): Promise<void> {
+    if (this.seedChecked) return;
+    if ((await this.ctx.storage.get<boolean>(SEED_PENDING_KEY)) === true) {
+      await this.maybeSeedWelcome();
+      await this.ctx.storage.delete(SEED_PENDING_KEY);
+    }
+    this.seedChecked = true;
   }
 
   /** POST /api/internal/keys/revoke {jti, expires_at} — identity's push when the owner revokes an app key (T-414). */

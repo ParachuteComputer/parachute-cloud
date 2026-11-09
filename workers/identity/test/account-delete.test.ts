@@ -52,6 +52,7 @@ import { findActiveSession } from "../src/sessions.ts";
 import { signAccessToken } from "../src/tokens.ts";
 import { getUserById } from "../src/users.ts";
 import { ISSUER, db, decodeJwtPayload, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
+import app from "../src/index.ts";
 
 type VaultFetch = NonNullable<OAuthDeps["vaultFetch"]>;
 
@@ -763,6 +764,34 @@ describe("A-3 — undo inside the window restores the account", () => {
 // --- 4. convergence ----------------------------------------------------------
 
 describe("A-4 — past the window the sweep really deletes", () => {
+  test("an app key outlives its account's purge on the revocation list (T-414: vault names are reusable)", async () => {
+    const acct = await seedAccount("purge-appkey@example.com", { vaults: ["arcade"] });
+    const jti = "appkey-purge-jti";
+    const now = new Date().toISOString();
+    const exp = new Date(Date.now() + 300 * 86400_000).toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO tokens (jti, user_id, subject, client_id, scopes, expires_at, created_at, created_via)
+         VALUES (?, ?, 'arcade-worker', 'parachute-app-key', 'vault:arcade:read vault:arcade:write', ?, ?, 'app_key')`,
+      ).bind(jti, acct.userId, exp, now),
+      env.DB.prepare(
+        `INSERT INTO app_keys (user_id, name, jti, vault_name, can, kid, created_at, expires_at)
+         VALUES (?, 'arcade-worker', ?, 'arcade', 'write', 'kid-x', ?, ?)`,
+      ).bind(acct.userId, jti, now, exp),
+    ]);
+    const { stripe } = makeStripeStub();
+    await handleAccountDelete(env, deleteReq(acct.token, acct.email), accountDeps(clock(T0)), undefined, billing(stripe));
+    const { vaultFetch } = recordingVaultFetch();
+    const summary = await runAccountDeleteSweep(env, accountDeps(undefined, vaultFetch), plus(DELETE_UNDO_WINDOW_MS), billing(stripe));
+    expect(summary.purged).toBe(1);
+    const row = await env.DB.prepare("SELECT user_id, revoked_at FROM tokens WHERE jti = ?").bind(jti).first<{ user_id: string | null; revoked_at: string | null }>();
+    expect(row?.user_id).toBeNull(); // detached from the purged account
+    expect(row?.revoked_at).not.toBeNull();
+    const list = (await (await app.fetch(new Request(`${ISSUER}/.well-known/parachute-revocation.json`), env)).json()) as { jtis: string[] };
+    expect(list.jtis).toContain(jti);
+    expect(await countRows("app_keys", "user_id", acct.userId)).toBe(0);
+  });
+
   test("tears down billing, destroys every owned vault, and purges the account", async () => {
     const acct = await seedAccount("purge-happy@example.com", {
       vaults: ["alpha", "beta"],

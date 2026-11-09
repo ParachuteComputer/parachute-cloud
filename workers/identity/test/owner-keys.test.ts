@@ -17,6 +17,8 @@ import { describe, expect, test } from "vitest";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import worker from "../src/index.ts";
 import { getAllPublicKeys, rotateSigningKey } from "../src/signing-keys.ts";
+import { signAccessToken } from "../src/tokens.ts";
+import { createUser, getUserById } from "../src/users.ts";
 import { ISSUER, decodeJwtPayload, seedUser, seedVault } from "./helpers.ts";
 
 const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -167,16 +169,20 @@ describe("NIP-98 owner sign-in (POST /account/token)", () => {
 
 describe("linking a key (/account/pubkeys)", () => {
   async function emailOwnerToken(a: ReturnType<typeof app>) {
-    const { key } = await linkedOwner();
-    return (await signIn(a, key)).json.token as string;
+    const { key, id } = await linkedOwner();
+    return { token: (await signIn(a, key)).json.token as string, id };
   }
 
   test("needs the account bearer and the key's own signature for this request; then the key signs in", async () => {
     const a = app();
-    const token = await emailOwnerToken(a);
+    const { token, id } = await emailOwnerToken(a);
     const k = nostrKey();
-    const good = await signEvent(k, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"]]);
-    const wrongUrl = await signEvent(k, [["u", `${ISSUER}/account/token`], ["method", "POST"]]);
+    const good = await signEvent(k, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"], ["account", id]]);
+    const wrongUrl = await signEvent(k, [["u", `${ISSUER}/account/token`], ["method", "POST"], ["account", id]]);
+    const otherAccount = await signEvent(k, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"], ["account", "someone-else"]]);
+    const noAccount = await signEvent(k, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"]]);
+    expect((await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${token}`, body: { event: otherAccount } })).status).toBe(401);
+    expect((await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${token}`, body: { event: noAccount } })).status).toBe(401);
     expect((await a.call("/account/pubkeys", { method: "POST", body: { event: good } })).status).toBe(401); // no bearer
     expect((await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${token}`, body: { event: wrongUrl } })).status).toBe(401);
     const linked = await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${token}`, body: { event: good } });
@@ -191,10 +197,73 @@ describe("linking a key (/account/pubkeys)", () => {
     const owner = nostrKey();
     const a = app({ ownerPubkey: owner.pubkey });
     const ownerToken = (await signIn(a, owner)).json.token as string;
+    const ownerId = decodeJwtPayload(ownerToken).sub as string;
     const { key: other } = await linkedOwner("other@example.com");
-    const steal = await signEvent(other, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"]]);
+    const steal = await signEvent(other, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"], ["account", ownerId]]);
     expect((await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${ownerToken}`, body: { event: steal } })).status).toBe(409);
     expect((await a.call(`/account/pubkeys/${owner.pubkey}`, { method: "DELETE", auth: `Bearer ${ownerToken}` })).status).toBe(409);
+  });
+});
+
+describe("who may manage keys", () => {
+  test("an OAuth app's account token (not the first-party one) can't mint, list or revoke app keys or link keys", async () => {
+    const a = app();
+    const { id } = await linkedOwner();
+    await seedVault("arcade", id);
+    const oauthApp = (
+      await signAccessToken(env.DB, {
+        sub: id,
+        scopes: [`account:${id}:admin`],
+        audience: "account",
+        clientId: "some-third-party-app",
+        issuer: ISSUER,
+        vaultScope: [],
+        ttlSeconds: 600,
+        emailVerified: true,
+      })
+    ).token;
+    const auth = `Bearer ${oauthApp}`;
+    expect((await a.call("/account/vaults", { auth })).status).toBe(200); // the token is otherwise good
+    expect((await a.call("/account/keys", { method: "POST", auth, body: { name: "sneaky", vault: "arcade", can: "write" } })).status).toBe(403);
+    expect((await a.call("/account/keys", { auth })).status).toBe(403);
+    expect((await a.call("/account/pubkeys", { auth })).status).toBe(403);
+  });
+
+  test("an unverified account can't mint app keys or link a key", async () => {
+    const a = app();
+    const user = await createUser(env.DB, "unproven@example.com", "pw-unproven-1", new Date(), { emailVerified: false });
+    await seedVault("arcade", user.id);
+    const t = (
+      await signAccessToken(env.DB, {
+        sub: user.id, scopes: [`account:${user.id}:admin`], audience: "account", clientId: "parachute-account",
+        issuer: ISSUER, vaultScope: [], ttlSeconds: 600, emailVerified: false,
+      })
+    ).token;
+    const k = nostrKey();
+    const ev = await signEvent(k, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"], ["account", user.id]]);
+    expect((await a.call("/account/keys", { method: "POST", auth: `Bearer ${t}`, body: { name: "k", vault: "arcade", can: "write" } })).status).toBe(403);
+    expect((await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${t}`, body: { event: ev } })).status).toBe(403);
+  });
+
+  test("claiming an unverified account drops Nostr keys its old holder linked", async () => {
+    const a = app();
+    const user = await createUser(env.DB, "claimed@example.com", "planted-pw-1", new Date(), { emailVerified: false });
+    const planted = nostrKey();
+    await env.DB.prepare("INSERT INTO user_pubkeys (pubkey, user_id, created_at) VALUES (?, ?, ?)").bind(planted.pubkey, user.id, new Date().toISOString()).run();
+    // The address's owner proves it with a sign-in link (auth-handlers.ts claimUnverifiedAccount).
+    const send = await worker.fetch(
+      new Request(`${ISSUER}/auth/magic`, {
+        method: "POST",
+        body: new URLSearchParams({ __csrf: "test-csrf-token", email: "claimed@example.com" }),
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: ISSUER, "cf-connecting-ip": "203.0.113.9", cookie: "parachute_id_csrf=test-csrf-token" },
+      }),
+      env as never,
+    );
+    const link = send.headers.get("x-parachute-dev-magic-link");
+    expect(link).toContain("/auth/verify?token=");
+    await worker.fetch(new Request(link!), env as never);
+    expect((await getUserById(env.DB, user.id))?.emailVerified).toBe(true);
+    expect((await signIn(a, planted)).status).toBe(401);
   });
 });
 
@@ -286,6 +355,15 @@ describe("app keys (/account/keys)", () => {
     const { bearer } = await owner(a);
     jti = decodeJwtPayload((await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "u", vault: "arcade", can: "write" } })).json.token).jti as string;
     expect((await a.call("/account/keys", { auth: bearer })).json.keys[0].last_used_at).toBe(seenAt);
+  });
+
+  test("a rotation marked compromised drops the signing key from JWKS even while app keys it signed live", async () => {
+    const a = app();
+    const { bearer } = await owner(a);
+    const key = (await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "doomed", vault: "arcade", can: "read" } })).json.token;
+    const kid = JSON.parse(atob(key.split(".")[0]!.replace(/-/g, "+").replace(/_/g, "/"))).kid as string;
+    await rotateSigningKey(env.DB, () => new Date(), { compromised: true });
+    expect((await getAllPublicKeys(env.DB)).map((k) => k.kid)).not.toContain(kid);
   });
 
   test("a rotated-out signing key stays in JWKS while a live app key needs it, and goes once it's revoked", async () => {

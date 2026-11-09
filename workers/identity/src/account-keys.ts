@@ -12,8 +12,9 @@
  *   - **Never admin.** `can` is read or write and the body may carry nothing else; the scopes are built here
  *     (`vault:<v>:read`, plus `:write`), `vault_scope=[v]`, `aud=vault.<v>`, `client_id=parachute-app-key` — not
  *     the first-party `parachute-console`, so a key can never reach the vault's `/api/internal/*` seams.
- *   - **Only the account mints, and only for its own vaults.** `requireAccount(…, "admin")`, the one `/account/*`
- *     gate; the vault must be owned by the bearer's account (404 otherwise, the same answer as no such vault).
+ *   - **Only the owner mints, and only for their own vaults.** `requireAccount(…, "admin")` plus the first-party
+ *     account token (never an OAuth app's), a verified account to mint, and a vault owned by the bearer's account
+ *     (404 otherwise, the same answer as no such vault).
  *   - **A name is one key per account, forever** (app_keys PRIMARY KEY (user_id, name)); the D1 batch writes the
  *     registry row and the key row together, so a racing mint of the same name fails whole.
  *   - **Revocation.** The `tokens` row is revoked, so the public revocation list carries the jti and every vault
@@ -29,6 +30,7 @@
  * Long-lived: one year by default and at most; `expires_in` (seconds) can shorten it.
  */
 import { requireAccount, readJsonBody } from "./account-api.ts";
+import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { jsonResponse, type OAuthDeps } from "./oauth-shared.ts";
 import { signAccessToken } from "./tokens.ts";
 import { callVaultApi } from "./vault-call.ts";
@@ -78,8 +80,26 @@ const ROWS_SQL = `SELECT a.name, a.jti, a.vault_name, a.can, a.created_at, a.exp
     FROM app_keys a LEFT JOIN tokens t ON t.jti = a.jti
    WHERE a.user_id = ?`;
 
-export async function handleAccountKeyMint(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+/**
+ * The gate for every `/account/keys` route: `requireAccount(…, "admin")` AND the first-party account token
+ * (`client_id=parachute-account`, minted by `/account/token` from a session or a NIP-98 sign-in). An OAuth app that
+ * was granted `account:<id>:admin` must not mint year-long keys that outlive its own grant. Minting also needs a
+ * verified account: a pre-claim holder of an unverified account must not leave keys behind.
+ */
+async function ownerGate(db: D1Database, req: Request, deps: OAuthDeps, opts: { mint?: boolean } = {}) {
   const auth = await requireAccount(db, req, deps, "admin");
+  if (!auth.ok) return auth;
+  if (auth.clientId !== ACCOUNT_TOKEN_CLIENT_ID) {
+    return { ok: false as const, response: err(403, "insufficient_scope", "app keys are managed with your own account token, not an app's") };
+  }
+  if (opts.mint && !auth.user.emailVerified) {
+    return { ok: false as const, response: err(403, "unverified_account", "verify your address before minting app keys") };
+  }
+  return auth;
+}
+
+export async function handleAccountKeyMint(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const auth = await ownerGate(db, req, deps, { mint: true });
   if (!auth.ok) return auth.response;
   const userId = auth.accountId;
   const body = await readJsonBody(req);
@@ -193,7 +213,7 @@ async function refreshLastUsed(db: D1Database, deps: OAuthDeps, userId: string, 
 }
 
 export async function handleAccountKeysList(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
-  const auth = await requireAccount(db, req, deps, "admin");
+  const auth = await ownerGate(db, req, deps);
   if (!auth.ok) return auth.response;
   const now = deps.now?.() ?? new Date();
   const res = await db.prepare(`${ROWS_SQL} ORDER BY a.created_at, a.name`).bind(auth.accountId).all<AppKeyRow>();
@@ -203,7 +223,7 @@ export async function handleAccountKeysList(db: D1Database, req: Request, deps: 
 }
 
 export async function handleAccountKeyRevoke(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
-  const auth = await requireAccount(db, req, deps, "admin");
+  const auth = await ownerGate(db, req, deps);
   if (!auth.ok) return auth.response;
   const m = /^\/account\/keys\/([^/]+)\/?$/.exec(new URL(req.url).pathname);
   let name: string;

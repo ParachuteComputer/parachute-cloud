@@ -44,3 +44,7 @@ CREATE TABLE IF NOT EXISTS app_keys (
 );
 CREATE INDEX IF NOT EXISTS app_keys_vault ON app_keys (vault_name);
 CREATE INDEX IF NOT EXISTS app_keys_kid ON app_keys (kid);
+
+-- A signing key retired because it was compromised leaves JWKS at once, even while app keys it signed are live
+-- (an ordinary rotation keeps it while they live; signing-keys.ts getAllPublicKeys).
+ALTER TABLE signing_keys ADD COLUMN compromised_at TEXT;

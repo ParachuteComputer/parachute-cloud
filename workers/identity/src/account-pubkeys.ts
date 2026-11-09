@@ -6,15 +6,18 @@
  *
  *   GET    /account/pubkeys            → 200 {pubkeys: [{pubkey, label, created_at}]}
  *   POST   /account/pubkeys            {event, label?} → 201 {pubkey, label, created_at}  (200 if already yours)
+ *                                      event: kind 27235, tags u=<this URL>, method=POST, account=<your account id>
  *   DELETE /account/pubkeys/<hex>      → 200 {pubkey}; 404 if it isn't yours; 409 if it is a key-only account's last key
  *
  * Linking needs both halves: the account's own bearer (`requireAccount(…, "admin")`), and proof of the key — `event`
- * is a NIP-98 event signed by the key for THIS request (`u` = this URL, `method` POST, no `payload`), checked by the
- * same verifier as sign-in (signature, kind, ±60 s, single-use id). So a stolen account token can't link a key its
+ * is a NIP-98 event signed by the key for THIS request (`u` = this URL, `method` POST, no `payload`) that also names
+ * the account it links to (`["account", <id>]`), checked by the same verifier as sign-in (signature, kind, ±60 s,
+ * single-use id). Only the account's own first-party token, on a verified account. So a stolen account token can't link a key its
  * holder doesn't have, and a signature captured elsewhere can't link a key to the wrong account.
  * A key already linked to another account is refused (409): one key signs in as one account.
  */
 import { requireAccount, readJsonBody } from "./account-api.ts";
+import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { NostrAuthError, parseNostrEvent, verifyNostrRequest } from "./nostr-auth.ts";
 import { jsonResponse, type OAuthDeps } from "./oauth-shared.ts";
 import { getUserById } from "./users.ts";
@@ -23,8 +26,18 @@ const err = (status: number, error: string, message: string) =>
   jsonResponse({ error, message }, status, { "cache-control": "no-store" });
 const ok = (body: unknown, status = 200) => jsonResponse(body, status, { "cache-control": "no-store" });
 
-export async function handleAccountPubkeysList(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+/** The account's own first-party token (never an OAuth app's, which may hold `account:<id>:admin`). */
+async function ownerGate(db: D1Database, req: Request, deps: OAuthDeps) {
   const auth = await requireAccount(db, req, deps, "admin");
+  if (!auth.ok) return auth;
+  if (auth.clientId !== ACCOUNT_TOKEN_CLIENT_ID) {
+    return { ok: false as const, response: err(403, "insufficient_scope", "sign-in keys are managed with your own account token") };
+  }
+  return auth;
+}
+
+export async function handleAccountPubkeysList(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const auth = await ownerGate(db, req, deps);
   if (!auth.ok) return auth.response;
   const res = await db
     .prepare("SELECT pubkey, label, created_at FROM user_pubkeys WHERE user_id = ? ORDER BY created_at, pubkey")
@@ -34,11 +47,19 @@ export async function handleAccountPubkeysList(db: D1Database, req: Request, dep
 }
 
 export async function handleAccountPubkeyLink(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
-  const auth = await requireAccount(db, req, deps, "admin");
+  const auth = await ownerGate(db, req, deps);
   if (!auth.ok) return auth.response;
+  // An unverified account may be claimed later by its address's owner (auth-handlers.ts claimUnverifiedAccount);
+  // a key linked before that would be a way back in. Link after proving the address.
+  if (!auth.user.emailVerified) return err(403, "unverified_account", "verify your address before linking a sign-in key");
   const body = await readJsonBody(req);
   const event = parseNostrEvent(body.event);
   if (!event) return err(400, "invalid_request", "event: a NIP-98 event (kind 27235) signed by the key, for this request");
+  // The proof names the account it links to, so a signature captured or phished for someone else's link can't
+  // tie the signer's key to the wrong account.
+  if (!event.tags.some((t) => t[0] === "account" && t[1] === auth.accountId)) {
+    return err(401, "invalid_nostr_proof", `the event must carry the tag ["account", "${auth.accountId}"]`);
+  }
   const label = body.label === undefined ? null : body.label;
   if (label !== null && (typeof label !== "string" || label.length > 80)) {
     return err(400, "invalid_request", "label: a string, up to 80 characters");
@@ -81,12 +102,17 @@ export async function handleAccountPubkeyUnlink(db: D1Database, req: Request, de
     .bind(pubkey, auth.accountId)
     .first<number>("x");
   if (mine === null) return err(404, "pubkey_not_found", "no such key on this account");
-  // A key-only account (no password; the OWNER_PUBKEY bootstrap) would lock itself out by removing its last key.
+  // A key-only account (the OWNER_PUBKEY bootstrap: no password, a placeholder address no mail reaches) would lock
+  // itself out by removing its last key. One conditional DELETE, so two racing unlinks can't remove the last two.
   const user = await getUserById(db, auth.accountId);
-  const count = await db.prepare("SELECT COUNT(*) AS n FROM user_pubkeys WHERE user_id = ?").bind(auth.accountId).first<number>("n");
-  if (user && user.passwordHash === "" && (count ?? 0) <= 1) {
-    return err(409, "last_sign_in", "this is the account's only way to sign in; link another key first");
-  }
-  await db.prepare("DELETE FROM user_pubkeys WHERE pubkey = ? AND user_id = ?").bind(pubkey, auth.accountId).run();
+  const keyOnly = !!user && user.passwordHash === "" && user.email.endsWith("@nostr.invalid");
+  const res = await db
+    .prepare(
+      `DELETE FROM user_pubkeys WHERE pubkey = ? AND user_id = ?
+         AND (? = 0 OR (SELECT COUNT(*) FROM user_pubkeys WHERE user_id = ?) > 1)`,
+    )
+    .bind(pubkey, auth.accountId, keyOnly ? 1 : 0, auth.accountId)
+    .run();
+  if (!res.meta.changes) return err(409, "last_sign_in", "this is the account's only way to sign in; link another key first");
   return ok({ pubkey });
 }

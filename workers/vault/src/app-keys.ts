@@ -16,6 +16,11 @@
  * exports don't change (the health-counter rule).
  */
 export const APP_KEY_CLIENT_ID = "parachute-app-key";
+/**
+ * DO key: this vault materialized but its welcome seed hasn't run yet; it runs on the first authenticated request
+ * (vault-do.ts seedIfPending), or never if a bare create lands first. Lives here beside the other T-414 keys.
+ */
+export const SEED_PENDING_KEY = "welcome_seed_pending";
 export const KEY_USE_INTERVAL_MS = 60_000;
 const REVOKED_KEY = "app_keys_revoked";
 const USED_KEY = "app_keys_used";

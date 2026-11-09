@@ -92,6 +92,21 @@ describe("bare create at the vault", () => {
     expect(((await (await op(v, "/api/notes?limit=50")).json()) as unknown[]).length).toBe(seeded.length);
   });
 
+  it("a stranger's request wakes the vault but neither seeds it nor blocks a bare create", async () => {
+    const v = freshVault("squat");
+    expect((await SELF.fetch(`${base(v)}/api/notes`)).status).toBe(401); // anonymous: wakes the DO
+    const r = await call(v, "/api/internal/bare", await internal(v), { method: "POST" });
+    expect(r.status).toBe(200);
+    expect((await (await op(v, "/api/notes?limit=50")).json()) as unknown[]).toEqual([]);
+  });
+
+  it("a vault woken anonymously is seeded on its first authenticated request", async () => {
+    const v = freshVault("wake");
+    expect((await SELF.fetch(`${base(v)}/api/notes`)).status).toBe(401);
+    const notes = (await (await op(v, "/api/notes?limit=50")).json()) as unknown[];
+    expect(notes.length).toBeGreaterThan(0);
+  });
+
   it("a tenant token can't mark a vault bare", async () => {
     const v = freshVault("bare");
     const tenant = await mintToken({ vault: v, scopes: `vault:${v}:admin`, vaultScope: [v], clientId: "parachute-account" });
