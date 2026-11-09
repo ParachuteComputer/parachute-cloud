@@ -8,7 +8,12 @@
 # when everything is green again. GitHub notifies watchers of the repo on the
 # issue, which is a channel independent of Cloudflare email.
 #
-# Read-only GETs, no secrets. GITHUB_TOKEN only needs issues: write.
+# Read-only requests. GITHUB_TOKEN only needs issues: write. The canary step
+# (a vault DO read the way a client reads it) runs only when the repo secrets
+# CANARY_TOKEN_URL and CANARY_OPS_TOKEN are set; otherwise it is skipped.
+# GitHub's scheduler drops most */15 runs (L6-03: 44 runs in 10 days), so the
+# plan is to run scripts/uptime-check.sh from a scheduler that keeps time:
+# docs/UPTIME.md.
 # NOTE: scheduled workflows run only from the DEFAULT branch, so this starts
 # after the release reaches main; GitHub may also delay scheduled runs by a few
 # minutes and disables them after 60 days without repository activity.
@@ -37,8 +42,11 @@ jobs:
           sparse-checkout: scripts
           persist-credentials: false
 
-      - name: GET production /health (3 tries each)
+      - name: GET production /health + the canary vault (3 tries each)
         id: check
+        env:
+          CANARY_TOKEN_URL: ${{ secrets.CANARY_TOKEN_URL }}
+          CANARY_OPS_TOKEN: ${{ secrets.CANARY_OPS_TOKEN }}
         run: |
           set +e
           bash scripts/uptime-check.sh > "$RUNNER_TEMP/uptime-report.md"

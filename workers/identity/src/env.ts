@@ -150,6 +150,23 @@ export interface Env {
    */
   OPS_DELETE_TOKEN?: string;
   /**
+   * The canary vault's name ([vars]), optional (L6-03, ops-canary.ts): the
+   * health cron reads it every 10 minutes through the vault worker (one REST
+   * note read + MCP tools/list) and alerts as `vault-canary` when its DO
+   * fails. Must be owned by an operator account. Unset or blank → skipped
+   * with one `event=health_canary_skipped` line. Setup: docs/UPTIME.md.
+   */
+  CANARY_VAULT_NAME?: string;
+  /** The canary note's path or id ([vars]), optional; default "canary". */
+  CANARY_NOTE?: string;
+  /**
+   * SECRET (`wrangler secret put OPS_CANARY_TOKEN`), optional: the bearer for
+   * `POST /ops/canary-token`, which returns a 5-minute read-only token for the
+   * canary vault (only) to an external checker (scripts/uptime-check.sh).
+   * Unset → 404.
+   */
+  OPS_CANARY_TOKEN?: string;
+  /**
    * 5xx responses in one 10-minute window at or above which the health cron
    * raises an `errors:5xx` alert. Optional var; default 25 (ops.ts).
    */
