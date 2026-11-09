@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# scripts/release/bunx: a bunx shim (T-413). First on PATH while a sealed job runs the repo's own deploy scripts (deploy-staging.sh, deploy-prod.sh)
+# and health-report.ts unchanged. Every `bunx wrangler ...` gets its own short-lived child key on fd $UNI_SEALED_FD
+# from the sealed job, in that one process only:
+#   wrangler d1 ...      -> d1-write   (migrations, the dev-user seed on staging, the health gate's SELECTs)
+#   anything else        -> workers-scripts-write
+# and `wrangler deploy` becomes `wrangler versions upload` + `wrangler versions deploy <id>@100%`: the same code,
+# bindings and assets go live, but wrangler does not re-PUT the custom domains and cron triggers, which the
+# workers-scripts-write key may not do (10-29: 403 on the u. custom domain re-PUT after the version was already live).
+# Refused: a deploy whose wrangler.toml routes/triggers differ from what is live is not this shim's to make
+# (scripts/release/check-triggers.sh, run by the jobs before they deploy). Anything not `bunx wrangler` goes to the real bunx.
+# Nothing secret printed. Retries a call that fails up to SHIM_TRIES (6) times, 10 s apart: a fresh child key can take a
+# few seconds. Every retried call is idempotent (an upload makes one more unused version; deploy/migrate/select repeat).
+set -uo pipefail
+REAL="${REAL_BUNX:-$HOME/.bun/bin/bunx}"
+[ "${1:-}" = wrangler ] || exec "$REAL" "$@"
+PY="${PY:-$HOME/REPOS/hermes-agent/.venv/bin/python}"; SEALED="${SEALED:-$HOME/Code/uni-ops/sealed/cli.py}"
+LOG="${SHIM_LOG:-/dev/null}"
+shift
+case "${1:-}" in d1) TPL=d1-write ;; *) TPL=workers-scripts-write ;; esac
+
+# One wrangler call, with a child key, retried. stdout is wrangler's own (health-report.ts parses it); stderr too.
+call() {
+  local i rc out err here="$PWD"   # the caller's folder (wrangler reads wrangler.toml there), before the cd below
+  out="$(mktemp)"; err="$(mktemp)"
+  local tries="${SHIM_TRIES:-6}"
+  for i in $(seq 1 "$tries"); do
+    (cd "$HOME/Code/uni-ops" && "$PY" -I "$SEALED" job-child "$TPL" -- \
+      bash -c 'cd "$0"; CLOUDFLARE_API_TOKEN="$(cat <&"$UNI_SEALED_FD")" exec "$1" wrangler "${@:2}"' "$here" "$REAL" "$@") >"$out" 2>"$err"
+    rc=$?
+    [ $rc = 0 ] && break
+    echo "shim: wrangler $1 try $i/$tries failed (exit $rc)" >&2
+    # stderr only: stdout may carry query rows (health-report.ts), which stay out of logs.
+    grep -E "ERROR|✘|Authentication|refused" "$err" 2>/dev/null | head -3 >&2
+    [ "$i" -lt "$tries" ] && sleep "${SHIM_RETRY_S:-10}"
+  done
+  cat "$out"; cat "$err" >&2; rm -f "$out" "$err"
+  echo "$(date -u +%H:%M:%S) $TPL wrangler $1 $2 -> $rc" >> "$LOG"
+  return $rc
+}
+
+[ "${1:-}" = deploy ] || { call "$@"; exit $?; }
+
+# --- `wrangler deploy [--env X|--env=X]` as versions upload + versions deploy ---
+shift; ENV=""; while [ $# -gt 0 ]; do
+  case "$1" in
+    --env=*) ENV="${1#--env=}" ;;
+    --env|-e) ENV="${2:-}"; shift ;;
+    *) echo "shim: refused: wrangler deploy $1 is not a flag this shim knows" >&2; exit 2 ;;
+  esac; shift
+done
+BASE="$(awk -F'"' '/^name *=/{print $2; exit}' wrangler.toml)"
+case "$ENV" in "") NAME="$BASE" ;; staging) NAME="$BASE-staging" ;; *) echo "shim: refused: env $ENV" >&2; exit 2 ;; esac
+case "$NAME" in parachute-vault-do|parachute-identity|parachute-vault-do-staging|parachute-identity-staging) ;;
+  *) echo "shim: refused: worker $NAME is not one of the four cloud workers" >&2; exit 2 ;; esac
+MSG="${DEPLOY_MESSAGE:-cloud ${WANT_SHA:-?}}"
+up="$(call versions upload --env="$ENV" --message "$MSG" 2>&1)" || { echo "$up" | grep -E "ERROR|✘" | head -5 >&2; echo "shim: versions upload failed for $NAME" >&2; exit 1; }
+v="$(echo "$up" | grep -oE "Version ID: [0-9a-f-]{36}" | head -1 | cut -d" " -f3)"
+[ -n "$v" ] || { echo "shim: versions upload gave no version id for $NAME" >&2; exit 1; }
+echo "Uploaded $NAME: Version ID: $v"
+dep="$(call versions deploy "$v@100%" --name "$NAME" --message "$MSG" -y 2>&1)" || { echo "$dep" | tail -5 >&2; echo "shim: versions deploy failed for $NAME" >&2; exit 1; }
+echo "Deployed $NAME: Current Version ID: $v"
+[ -n "${DEPLOYED_LOG:-}" ] && echo "$NAME $v" >> "$DEPLOYED_LOG"
+exit 0
