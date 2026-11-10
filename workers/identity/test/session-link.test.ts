@@ -15,7 +15,6 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import worker from "../src/index.ts";
 import { findActiveSession, SESSION_COOKIE } from "../src/sessions.ts";
 import { signAccessToken, validateAccessToken } from "../src/tokens.ts";
-import { createUser } from "../src/users.ts";
 import { CANONICAL_ORIGIN, ISSUER, decodeJwtPayload, makePkce, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 const ORIGIN = ISSUER.replace(/\/$/, "");
@@ -416,16 +415,31 @@ describe("only the owner's own account token mints a link", () => {
     expect((await mint(d.e, `Bearer ${token}`, { next: "/console" })).status).toBe(200);
   });
 
-  test("an unverified account can't mint (opening it would claim the account)", async () => {
+  test("the owner keeps the way in when OWNER_PUBKEY is pointed at the new key too", async () => {
     const d = await door();
-    const user = await createUser(env.DB, "unproven@example.com", "pw-unproven-1", new Date(), { emailVerified: false });
+    const fresh = nostrKey();
+    await env.DB.prepare("INSERT INTO user_pubkeys (pubkey, user_id, label, created_at) VALUES (?, ?, 'new', ?)")
+      .bind(fresh.pubkey, d.id, new Date().toISOString())
+      .run();
+    await env.DB.prepare("DELETE FROM user_pubkeys WHERE pubkey = ?").bind(d.key.pubkey).run();
+    const rotated = doorEnv(fresh.pubkey);
+    const { token } = await ownerSignIn(rotated, fresh);
+    expect((await mint(rotated, `Bearer ${token}`, { next: "/console" })).status).toBe(200);
+  });
+
+  test("an unverified owner can't mint (opening it would claim the account)", async () => {
+    const d = await door();
+    // The bootstrap makes the owner verified; this is the belt if that ever changes.
     const t = (
       await signAccessToken(env.DB, {
-        sub: user.id, scopes: [`account:${user.id}:admin`], audience: "account", clientId: "parachute-account",
+        sub: d.id, scopes: [`account:${d.id}:admin`], audience: "account", clientId: "parachute-account",
         issuer: ISSUER, vaultScope: [], ttlSeconds: 600, emailVerified: false,
       })
     ).token;
-    expect((await mint(d.e, `Bearer ${t}`, { next: "/console" })).status).toBe(403);
+    await env.DB.prepare("UPDATE users SET email_verified = 0 WHERE id = ?").bind(d.id).run();
+    const r = await mint(d.e, `Bearer ${t}`, { next: "/console" });
+    expect(r.status).toBe(403);
+    expect(r.json.error).toBe("unverified_account");
     expect(await linkRows()).toBe(0);
   });
 });
