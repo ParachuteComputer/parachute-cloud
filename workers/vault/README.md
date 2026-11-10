@@ -65,12 +65,13 @@ Fly-fallback conversation needed.
 
 Phase 2+ shipped the production DO (REST + MCP + SSE + export) — the spike RPC
 methods above are retained so `test/spike.test.ts` stays green. The worker
-deploys to the **new Parachute** CF account (`d5d7c864…`; moved from Unforced
-Development in the 2026-07-05 migration) in two environments:
-**production** is the top-level wrangler.toml config (custom domain
-`u.parachute.computer`, `scripts/deploy-prod.sh` at the repo root) and
-**staging** is `[env.staging]` (workers.dev only, own R2 + fresh DOs,
-`scripts/deploy-staging.sh`). `TRYIT-2026-07-02.md` is the original
+has two environments on two Cloudflare accounts:
+**production** is the top-level wrangler.toml config on the Open Parachute
+account (`d5d7c864…`; moved from Unforced Development in the 2026-07-05
+migration; custom domain `u.parachute.computer`, `scripts/deploy-prod.sh` at the
+repo root) and **staging** is `[env.staging]` on its own account, Parachute
+Staging (T-432; `scripts/staging-account.env`; workers.dev only, own R2 + fresh
+DOs, `scripts/staging-bootstrap.sh` once, then `scripts/deploy-staging.sh`). `TRYIT-2026-07-02.md` is the original
 live-deploy report.
 
 **How the bundle works.** `wrangler deploy` bundles with its built-in esbuild.

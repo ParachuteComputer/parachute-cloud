@@ -27,8 +27,9 @@
  *   IDENTITY=http://localhost:8787 VAULT=http://localhost:8788 bun scripts/smoke-delete-staging.ts
  */
 
-const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.openparachute.workers.dev").replace(/\/$/, "");
-const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.openparachute.workers.dev").replace(/\/$/, "");
+import { STAGING_IDENTITY, STAGING_VAULT } from "./staging-origins.ts";
+const IDENTITY = (process.env.IDENTITY ?? STAGING_IDENTITY).replace(/\/$/, "");
+const VAULT = (process.env.VAULT ?? STAGING_VAULT).replace(/\/$/, "");
 const REDIRECT_URI = "http://localhost:8976/callback";
 const STAMP = `${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`;
 const EMAIL = `delete-smoke+${STAMP}@example.com`;

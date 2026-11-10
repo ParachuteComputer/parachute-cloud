@@ -3,10 +3,14 @@
 # and health-report.ts unchanged. Every `bunx wrangler ...` gets its own short-lived child key on fd $UNI_SEALED_FD
 # from the sealed job, in that one process only:
 #   wrangler d1 ...      -> d1-write   (migrations, the dev-user seed on staging, the health gate's SELECTs)
+#   wrangler r2 ...      -> r2-admin   (staging-bootstrap.sh's one bucket create, under its own card)
 #   anything else        -> workers-scripts-write
 # and `wrangler deploy` becomes `wrangler versions upload` + `wrangler versions deploy <id>@100%`: the same code,
 # bindings and assets go live, but wrangler does not re-PUT the custom domains and cron triggers, which the
 # workers-scripts-write key may not do (10-29: 403 on the u. custom domain re-PUT after the version was already live).
+# Except on the STAGING account (T-432, scripts/staging-account.env): `wrangler deploy --env staging` there stays a
+# plain deploy. That account has no zone, so no custom domain to re-PUT; its first deploy has no worker for
+# `versions upload` to add to; and a plain deploy sets staging's cron triggers and workers.dev route.
 # Refused: a deploy whose wrangler.toml routes/triggers differ from what is live is not this shim's to make
 # (scripts/release/check-triggers.sh, run by the jobs before they deploy). Anything not `bunx wrangler` goes to the real bunx.
 # Nothing secret printed. Retries a call that fails up to SHIM_TRIES (6) times, 10 s apart: a fresh child key can take a
@@ -17,7 +21,7 @@ REAL="${REAL_BUNX:-$HOME/.bun/bin/bunx}"
 PY="${PY:-$HOME/REPOS/hermes-agent/.venv/bin/python}"; SEALED="${SEALED:-$HOME/Code/uni-ops/sealed/cli.py}"
 LOG="${SHIM_LOG:-/dev/null}"
 shift
-case "${1:-}" in d1) TPL=d1-write ;; *) TPL=workers-scripts-write ;; esac
+case "${1:-}" in d1) TPL=d1-write ;; r2) TPL=r2-admin ;; *) TPL=workers-scripts-write ;; esac
 
 # One wrangler call, with a child key, retried. stdout is wrangler's own (health-report.ts parses it); stderr too.
 call() {
@@ -40,6 +44,20 @@ call() {
 }
 
 [ "${1:-}" = deploy ] || { call "$@"; exit $?; }
+
+# --- on the staging account, `wrangler deploy --env staging` as itself ---
+STAGING_ACCOUNT_ID="$(sed -n 's/^STAGING_ACCOUNT_ID=\([0-9a-f]\{32\}\)$/\1/p' "$(dirname "${BASH_SOURCE[0]}")/../staging-account.env")"
+if [ -n "$STAGING_ACCOUNT_ID" ] && [ "${UNI_SEALED_ACCOUNT_ID:-}" = "$STAGING_ACCOUNT_ID" ]; then
+  case " $* " in *" --env staging "*|*" --env=staging "*|*" -e staging "*) ;;
+    *) echo "shim: refused: on the staging account only \`wrangler deploy --env staging\` deploys" >&2; exit 2 ;; esac
+  out="$(call "$@" 2>&1)"; rc=$?
+  echo "$out" | grep -E "Uploaded|Deployed|workers\.dev|Current Version ID|ERROR|✘" | head -12
+  [ $rc = 0 ] || { echo "shim: deploy failed (exit $rc)" >&2; exit $rc; }
+  BASE="$(awk -F'"' '/^name *=/{print $2; exit}' wrangler.toml)"
+  v="$(echo "$out" | grep -oE "Current Version ID: [0-9a-f-]{36}" | head -1 | cut -d" " -f4)"
+  [ -n "${DEPLOYED_LOG:-}" ] && [ -n "$v" ] && echo "$BASE-staging $v" >> "$DEPLOYED_LOG"
+  exit 0
+fi
 
 # --- `wrangler deploy [--env X|--env=X]` as versions upload + versions deploy ---
 shift; ENV=""; while [ $# -gt 0 ]; do

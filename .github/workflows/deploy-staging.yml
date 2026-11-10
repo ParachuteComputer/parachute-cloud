@@ -3,19 +3,20 @@
 # (scripts/smoke-staging.ts — creates throwaway accounts/vaults, which is what
 # staging is for).
 #
-# SECRET GATE: this workflow needs three secrets. When any is missing it warns
+# SECRET GATE: this workflow needs two secrets. When either is missing it warns
 # loudly and SKIPS the deploy, exiting green — merges to main must not be
 # red-gated on a pending ops step.
 #
-#   CLOUDFLARE_API_TOKEN   ENVIRONMENT secret (`staging`/`production` — the
-#                          prod environment adds a required-reviewer approval
-#                          gate). API token in the Parachute CF account (d5d7c864…):
-#                          Account → Workers Scripts: Edit; Account → D1: Edit;
-#                          Account → Workers R2 Storage: Edit;
-#                          Zone (parachute.computer) → Workers Routes: Edit.
-#   CLOUDFLARE_ACCOUNT_ID  d5d7c8646c3b69ce9f16bfd12ecbe98a (the deploy scripts
-#                          also hardcode this — the secret is belt+suspenders
-#                          and future-proofs the scripts dropping the hardcode).
+#   CLOUDFLARE_API_TOKEN   ENVIRONMENT secret of the `staging` environment. Since
+#                          T-432 staging lives on its OWN account, "Parachute
+#                          Staging" (5b543fa4…, scripts/staging-account.env), so
+#                          this is a token on THAT account only: Account → Workers
+#                          Scripts: Edit; Account → D1: Edit. No zone rights (the
+#                          account has no zone). A token on the production account
+#                          gets 403 here: [env.staging] pins account_id.
+#                          The account comes from scripts/staging-account.env, not
+#                          a secret (the repo-level CLOUDFLARE_ACCOUNT_ID is
+#                          production's and is not passed to this workflow).
 #   DEV_SECRETS            The literal contents of workers/identity/.dev-secrets
 #                          (gitignored locally): two lines, DEV_USER_EMAIL=…
 #                          and DEV_USER_PASSWORD=…. Needed by the staging seed
@@ -114,12 +115,10 @@ jobs:
         id: gate
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DEV_SECRETS: ${{ secrets.DEV_SECRETS }}
         run: |
           missing=""
           if [ -z "$CLOUDFLARE_API_TOKEN" ]; then missing="$missing CLOUDFLARE_API_TOKEN"; fi
-          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then missing="$missing CLOUDFLARE_ACCOUNT_ID"; fi
           if [ -z "$DEV_SECRETS" ]; then missing="$missing DEV_SECRETS"; fi
           if [ -n "$missing" ]; then
             echo "::notice title=Staging deploy skipped::Missing deploy secret(s):$missing. Deploy + smoke skipped (green by design). See the header of .github/workflows/deploy-staging.yml for what to set."
@@ -128,7 +127,7 @@ jobs:
               echo ""
               echo "Missing deploy secret(s): \`$missing\`"
               echo ""
-              echo "Set CLOUDFLARE_API_TOKEN under Settings → Environments (production/staging) and the rest under Settings → Secrets and variables → Actions, then re-run via workflow_dispatch. Token permissions and the DEV_SECRETS format are documented in the workflow file header."
+              echo "Set CLOUDFLARE_API_TOKEN (a Parachute Staging account token) under Settings → Environments → staging and DEV_SECRETS under Settings → Secrets and variables → Actions, then re-run via workflow_dispatch. Token permissions and the DEV_SECRETS format are documented in the workflow file header."
             } >> "$GITHUB_STEP_SUMMARY"
             echo "ready=false" >> "$GITHUB_OUTPUT"
           else
@@ -188,7 +187,6 @@ jobs:
         if: steps.gate.outputs.ready == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: bash scripts/deploy-staging.sh
 
       - name: Live smoke (full, staging-only — creates throwaway debris)
