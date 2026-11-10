@@ -38,6 +38,16 @@ for w in identity vault; do
   [ -f "$ROOT/workers/$w/node_modules/wrangler/bin/wrangler.js" ] || { echo "error: workers/$w has no wrangler: run bun install first" >&2; exit 1; }
 done
 
+# The identity worker's config names an assets folder (the app's built files). A door run needs none of them, and the
+# contracts' harness would put a bare placeholder there when it is missing. Put the worker tests' own stub there
+# first (workers/identity/vitest.config.ts makes the same file), so a run of this script never leaves a checkout
+# whose identity tests then fail on an index.html without the app's root element. A real build is left alone.
+ASSETS="$ROOT/workers/identity/dist-assets"
+if [ ! -f "$ASSETS/index.html" ]; then
+  mkdir -p "$ASSETS"
+  printf '%s\n' '<!doctype html><html><head><meta charset="utf-8"><title>Parachute</title><meta name="parachute-spa-stub" content="test"></head><body><div id="root"></div></body></html>' > "$ASSETS/index.html"
+fi
+
 mkdir -p "$RESULTS"
 cd "$SUITE/contracts"
 bun install --frozen-lockfile >/dev/null
