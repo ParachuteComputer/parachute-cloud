@@ -363,7 +363,7 @@ describe("app keys (/account/keys)", () => {
     const r = await a.call("/account/keys", { method: "POST", auth: bearer, body: { name: "arcade-worker", vault: "arcade", can: "write" } });
     expect(r.status).toBe(201);
     expect(r.json).toMatchObject({ name: "arcade-worker", vault: "arcade", can: "write", status: "active", last_used_at: null });
-    const c = decodeJwtPayload(r.json.token) as { scope: string; exp: number; iat: number; aud: string; sub: string; client_id: string; vault_scope: string[] };
+    const c = decodeJwtPayload(r.json.token) as { scope: string; exp: number; iat: number; aud: string; sub: string; client_id: string; vault_scope: string[]; permissions?: unknown };
     expect(c.scope.split(" ").sort()).toEqual(["vault:arcade:read", "vault:arcade:write"]);
     expect([c.aud, c.sub, c.client_id, c.vault_scope]).toEqual(["vault.arcade", id, "parachute-app-key", ["arcade"]]);
     expect(c.permissions).toEqual({ app_key: "arcade-worker" }); // the vault names its writes key:arcade-worker (T-430)
