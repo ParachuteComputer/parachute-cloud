@@ -1,10 +1,12 @@
 // The personal door's live smoke (door/0.9, T-430). Keyless (HTTP only), against a deployed profile:
 //   bun deploy/personal/smoke.ts <deployed.env> <private dir> <summary file>
-// <private dir> holds owner.key and admin.key (a rehearsal profile's made-up keys) and ops-run-token. Every check
+// <private dir> holds admin.key, ops-run-token and, for a rehearsal (made-up keys), owner.key. Without owner.key (a
+// real deploy: the owner's key never leaves the owner) the owner sign-in is reported as not run and the admin's token
+// stands in for the owner's. SMOKE_CLEANUP=1 deletes the vaults it made at the end (a real deploy). Every check
 // appends one "PASS name (detail)" or "FAIL name (detail)" line to <summary file>; exit 0 only if all pass. Made-up
 // data only; no token or key is printed. The vault it makes is named smoke-<time> and kept (the export and the
 // restored copy are the evidence); the app key is revoked at the end.
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pubkeyOf, readSecret, signIn } from "./nip98.ts";
 
@@ -18,8 +20,9 @@ const deployed = Object.fromEntries(
 );
 const ID = deployed.IDENTITY!.replace(/\/$/, "");
 const VAULT = deployed.VAULT!.replace(/\/$/, "");
-const owner = readSecret(join(privateDir, "owner.key"));
-const admin = readSecret(join(privateDir, "admin.key"));
+const owner = existsSync(join(privateDir, "owner.key")) ? readSecret(join(privateDir, "owner.key")) : null;
+// ADMIN_KEY_FILE: the admin's own key file where it lives (a real deploy: never copied into the private dir).
+const admin = readSecret(process.env.ADMIN_KEY_FILE || join(privateDir, "admin.key"));
 const opsToken = readFileSync(join(privateDir, "ops-run-token"), "utf8").trim();
 const stamp = new Date().toISOString().replace(/[-:T.Z]/g, "").slice(0, 12);
 const vaultName = `smoke-${stamp}`;
@@ -70,16 +73,20 @@ async function tool(vault: string, token: string, name: string, args: Record<str
 }
 
 // 2. owner and admin sign in with their Nostr keys (NIP-98); a stranger can't
-const o = await signIn(ID, owner);
 const a = await signIn(ID, admin);
+const o = owner ? await signIn(ID, owner) : null;
 const stranger = await signIn(ID, crypto.getRandomValues(new Uint8Array(32)));
-const ownerToken = o.token!;
 const adminToken = a.token!;
-res(
-  !!o.token && !!a.token && sub(o.token) === sub(a.token) && stranger.status === 401,
-  "nostr-sign-in",
-  `owner ${o.status}, admin ${a.status} (same account: ${o.token && a.token ? sub(o.token) === sub(a.token) : "?"}), stranger ${stranger.status}; owner ${pubkeyOf(owner).slice(0, 8)}…, admin ${pubkeyOf(admin).slice(0, 8)}…`,
-);
+const ownerToken = o ? o.token! : adminToken;
+if (owner && o) {
+  res(
+    !!o.token && !!a.token && sub(o.token) === sub(a.token) && stranger.status === 401,
+    "nostr-sign-in",
+    `owner ${o.status}, admin ${a.status} (same account: ${o.token && a.token ? sub(o.token) === sub(a.token) : "?"}), stranger ${stranger.status}; owner ${pubkeyOf(owner).slice(0, 8)}…, admin ${pubkeyOf(admin).slice(0, 8)}…`,
+  );
+} else {
+  res(!!a.token && stranger.status === 401, "nostr-sign-in", `admin ${a.status}, stranger ${stranger.status}; admin ${pubkeyOf(admin).slice(0, 8)}…; owner not run here (the owner's key stays with the owner)`);
+}
 if (!ownerToken || !adminToken) {
   res(false, "stopping", "no account token: nothing below can run");
   process.exit(1);
@@ -174,6 +181,15 @@ res(!!vaultToken, "vault-token", `mint ${vt.status}`);
     "snapshot-restore",
     `snapshot-run ${run.status} (taken ${run.body?.run?.taken}), ${n} snapshot(s), restore ${r.status} → ${restored || "none"} with ${count} episode(s)`,
   );
+}
+
+if (process.env.SMOKE_CLEANUP === "1") {
+  const mine = ((await j(`${ID}/account/vaults`, { token: adminToken })).body?.vaults ?? [])
+    .map((v: any) => v.name ?? v)
+    .filter((n: string) => n === vaultName || n.startsWith(`${vaultName}-restored-`));
+  const gone: number[] = [];
+  for (const n of mine) gone.push((await j(`${ID}/account/vaults/${n}`, { method: "DELETE", token: adminToken, body: JSON.stringify({ confirm: n }) })).status);
+  res(gone.length > 0 && gone.every((s) => s < 300), "cleanup", `deleted ${mine.length} smoke vault(s): ${gone.join(", ")}`);
 }
 
 console.log(failed ? `SMOKE FAILED: ${failed}` : "SMOKE PASSED");
