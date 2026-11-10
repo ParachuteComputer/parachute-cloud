@@ -54,6 +54,7 @@ The engine is `@openparachute/core` (parachute-core `packages/vault/core`; it mo
 ## Governance / CI
 
 - **Branches.** `next` is the trunk: branch from it, open a PR against it, never push to `next` or `main`. `main` lags `next` and feeds staging.
+- **`door/0.9`** (T-430) is a long-lived side branch, never merged into `next`: the own-Cloudflare single-owner door on the 0.9 engine (`deploy/personal/README.md`). Its `deploy-staging.sh`/`deploy-prod.sh` refuse its 0.9 pin, so it never reaches Parachute Cloud. CI runs on it; its vault suite runs in four shards (workerd runs out of heap with the 0.9 engine in one).
 - **Review.** Every PR gets a fresh Claude reviewer (an agent that didn't write the code), recorded in a `## Review` section of the PR body with its verdict (round cap 3). GitHub approvals aren't used: Uni opens PRs and merges them into `next` as `unforcedagi` after the review says ship, so the review section is the record. A `next`→`main` promotion feeds staging, so Aaron (`unforced`) merges it; an agent never merges into `main`.
 - **CI** (`.github/workflows/ci.yml`: identity worker, vault worker, control plane) runs on every PR and every push to `main` and `next`, and must be green before merge.
 - **Version.** Every code-touching PR bumps rc.N in `package.json` (the package is never published; the bump is for history legibility). Workflow- or docs-only PRs don't.
