@@ -14,3 +14,7 @@ dist
 
 # local wrangler/miniflare state from health-report.ts --local runs (T-411)
 tmp/
+
+# door-parity.sh: results of a local run, and the config the door contracts run the workers from
+.door-parity/
+workers/*/wrangler.door.gen.toml

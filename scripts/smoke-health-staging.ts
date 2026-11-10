@@ -21,8 +21,9 @@
  * debris (two accounts, two vaults), like smoke-staging.ts. Never production:
  * the hooks it uses 404 there (smoke-prod pins them).
  */
-const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.openparachute.workers.dev").replace(/\/$/, "");
-const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.openparachute.workers.dev").replace(/\/$/, "");
+import { STAGING_IDENTITY, STAGING_VAULT } from "./staging-origins.ts";
+const IDENTITY = (process.env.IDENTITY ?? STAGING_IDENTITY).replace(/\/$/, "");
+const VAULT = (process.env.VAULT ?? STAGING_VAULT).replace(/\/$/, "");
 const REDIRECT_URI = "http://localhost:8976/callback";
 const FORM = { "content-type": "application/x-www-form-urlencoded" };
 const STAMP = Date.now().toString(36);

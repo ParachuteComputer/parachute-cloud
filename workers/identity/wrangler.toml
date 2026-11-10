@@ -388,6 +388,11 @@ name = "EMAIL"
 # Deploy via scripts/deploy-staging.sh; smoke via bun scripts/smoke-staging.ts.
 # =============================================================================
 [env.staging]
+# Staging runs on its OWN Cloudflare account, "Parachute Staging" (T-432), never on production's: an env-level
+# account_id beats CLOUDFLARE_ACCOUNT_ID in wrangler, so `-e staging` can only reach this account, and a key minted for
+# it gets 403 anywhere else. The top level (production) has no account_id and keeps taking CLOUDFLARE_ACCOUNT_ID from
+# scripts/deploy-prod.sh. Mirrors scripts/staging-account.env (test-bun/staging-account.test.ts holds them equal).
+account_id = "5b543fa4332a619203356ae1418af504"
 workers_dev = true
 # `routes` IS inheritable — without this override a staging deploy would adopt
 # the production [[routes]] custom domain (Custom Domains attach to exactly one
@@ -395,13 +400,14 @@ workers_dev = true
 # from production). An explicit empty list keeps staging on workers.dev only.
 routes = []
 
-# Staging's own control-plane D1 (created 2026-07-02 via
-# `wrangler d1 create parachute-identity-staging`). Same migrations dir; the
-# deploy script applies migrations + seeds the dev user here.
+# Staging's own control-plane D1 on the staging account. scripts/staging-bootstrap.sh
+# creates it once and writes its id here (and into scripts/staging-account.env);
+# until then the id is the all-zero placeholder and deploy-staging.sh refuses.
+# Same migrations dir; the deploy script applies migrations + seeds the dev user here.
 [[env.staging.d1_databases]]
 binding = "DB"
 database_name = "parachute-identity-staging"
-database_id = "6930c39f-36a0-463c-b3b6-d6213d647891"
+database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
 # Non-inheritable, restated: version metadata — the propagation-poll signal
@@ -466,7 +472,7 @@ run_worker_first = [
 # workers.dev origins. ISSUER is staging's own origin (tokens minted here carry
 # iss=<staging identity>, and the staging vault worker's ISSUER_ORIGIN matches).
 [env.staging.vars]
-ISSUER = "https://parachute-identity-staging.openparachute.workers.dev"
+ISSUER = "https://parachute-identity-staging.parachute-staging.workers.dev"
 # CONSOLE_REDIRECT_HOST (P1.1) is DELIBERATELY UNSET on staging — the omission is
 # the point: with no console-redirect host, `/` serves the SPA shell at the
 # staging workers.dev origin, so the Static-Assets serving is provable here
@@ -482,9 +488,9 @@ ISSUER = "https://parachute-identity-staging.openparachute.workers.dev"
 # HOST unset), so the post-create arrival + card/checklist deep-links + the drip
 # link all point back to this same origin (`<issuer>/?add=…`) — zero cross-origin
 # hops, exactly the production shape rehearsed on one origin.
-APP_ORIGIN = "https://parachute-identity-staging.openparachute.workers.dev"
-VAULT_BASE_DOMAIN = "parachute-vault-do-staging.openparachute.workers.dev"
-VAULT_ORIGIN = "https://parachute-vault-do-staging.openparachute.workers.dev"
+APP_ORIGIN = "https://parachute-identity-staging.parachute-staging.workers.dev"
+VAULT_BASE_DOMAIN = "parachute-vault-do-staging.parachute-staging.workers.dev"
+VAULT_ORIGIN = "https://parachute-vault-do-staging.parachute-staging.workers.dev"
 # VAULT_PUBLIC_ORIGIN is DELIBERATELY UNSET on staging — there is no my. there,
 # so `vaultAdvertisedUrl` falls back to VAULT_ORIGIN above and staging keeps
 # advertising its own workers.dev vault origin unchanged (A3 URL coherence;

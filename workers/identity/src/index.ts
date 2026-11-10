@@ -60,6 +60,7 @@ import {
   handleOpsVaultImportReadToken,
   handleOpsVaultImportStatus,
 } from "./ops-vault-import.ts";
+import { handleAccountVaultImport, handleAccountVaultImportCheck, handleAccountVaultImportFile } from "./account-import.ts";
 import { handleOpsCanaryToken } from "./ops-canary.ts";
 import { handleTestAccountDeleteReport, handleTestAccountDeleteSweep } from "./account-delete-hooks.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
@@ -355,6 +356,11 @@ app.post("/account/pubkeys", (c) => handleAccountPubkeyLink(c.env.DB, c.req.raw,
 app.delete("/account/pubkeys/:pubkey", (c) => handleAccountPubkeyUnlink(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
+// The account door's import (T-431, account-import.ts): an owner brings a vault in with one credential. No other
+// POST route is `/account/vaults/<one segment>`, so a vault that happens to be named "import" is not shadowed.
+app.post("/account/vaults/import", (c) => handleAccountVaultImport(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/vaults/:name/import-file", (c) => handleAccountVaultImportFile(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/account/vaults/:name/import-check", (c) => handleAccountVaultImportCheck(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/vaults/:name", (c) => handleAccountVaultDelete(c.env.DB, c.req.raw, depsFor(c.env)));
 // Connected apps (T-318): list + disconnect the OAuth clients reaching a vault.
