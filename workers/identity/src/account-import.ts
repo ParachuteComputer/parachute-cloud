@@ -20,6 +20,8 @@
  *     only at a path an attachment row of that vault already names, only when the sha256 given matches the bytes,
  *     and never over different bytes already there (409). Owner-gated: one 403 for "not yours" and "no such vault".
  *   - **Sizes**: the tar and each file are refused over 50 MiB before they are read, as on the console.
+ *   - **A name deleted a moment ago** answers 409 `name_just_deleted` until the old vault's storage object has
+ *     unloaded: the row is the caller's, and the same request again lands. Never a half-made vault.
  */
 import { requireAccount } from "./account-api.ts";
 import { importAsOwner } from "./import-door.ts";
@@ -85,6 +87,11 @@ export async function handleAccountVaultImport(db: D1Database, req: Request, dep
     case "too_large":
       return tooLarge("That export");
     case "refused":
+      // A vault of this name was deleted moments ago and its storage object hasn't let go yet (it answers 410 until
+      // it is unloaded, well under a minute). The name is this account's now; the same call again will land.
+      if (r.errorType === "vault_destroyed") {
+        return refuse(409, "name_just_deleted", "A vault with this name was deleted a moment ago. The name is yours: send the same request again in a minute.", { name: r.vaultName, retry_after_seconds: 30 });
+      }
       // The vault read the tar and said no: the name stays this account's, and the same call may be made again.
       return refuse(400, r.errorType ?? "import_unreadable", "That file isn't a Parachute export this door can read.", { name: r.vaultName });
     case "failed":

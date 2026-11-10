@@ -124,6 +124,19 @@ describe("POST /account/vaults/import", () => {
     expect((await getVault(db(), "second-try"))?.ownerUserId).toBe(u.id);
   }, 120_000);
 
+  test("a name deleted a moment ago says so, keeps the name for the caller, and the same call lands once it is free", async () => {
+    const u = await seedUser("again@example.com");
+    let gone = true;
+    const v = fakeVault({ import: () => (gone ? j({ error: "Gone", error_type: "vault_destroyed" }, 410) : j({ imported: true, notes: 5, stats: { skipped_attachments: 0 } })) });
+    const first = await handleAccountVaultImport(db(), importReq(await accountToken(u.id), "came-back"), withVault(v));
+    expect(first.status).toBe(409);
+    expect((await first.json()) as Record<string, unknown>).toMatchObject({ error: "name_just_deleted", name: "came-back" });
+    expect(isImportPending((await getVault(db(), "came-back"))!)).toBe(true);
+    gone = false;
+    const again = await handleAccountVaultImport(db(), importReq(await accountToken(u.id), "came-back"), withVault(v));
+    expect(again.status).toBe(201);
+  }, 120_000);
+
   test("the plan's vault count applies, as on create", async () => {
     const u = await seedUser("full@example.com");
     const most = Math.max(...Object.values(PLAN_SPECS).map((p) => p.vault_count));
