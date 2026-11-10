@@ -178,13 +178,14 @@ describe("served SPA source", () => {
 
   test("ordinary CI uses the same pinned contract helper before every install", () => {
     const source = read(".github/workflows/ci.yml");
-    expect(source.match(/bash scripts\/materialize-door-contract\.sh/g)).toHaveLength(3);
-    expect(source.match(/run: bun install/g)).toHaveLength(3);
+    // The two workers, the door contracts (which run both workers) and the control plane.
+    expect(source.match(/bash scripts\/materialize-door-contract\.sh/g)).toHaveLength(4);
+    expect(source.match(/run: bun install/g)).toHaveLength(4);
 
     const installJobs = source
       .split(/^  (?=[a-z].*:$)/m)
       .filter((job) => job.includes("run: bun install"));
-    expect(installJobs).toHaveLength(3);
+    expect(installJobs).toHaveLength(4);
     for (const job of installJobs) {
       const helper = job.indexOf("bash scripts/materialize-door-contract.sh");
       const install = job.indexOf("run: bun install");

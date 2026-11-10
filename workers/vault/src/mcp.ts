@@ -38,6 +38,7 @@ import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.j
 import { buildVaultProjection, attachmentsInstructionBlock } from "@openparachute/core/src/vault-projection.js";
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
+import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
 import { errorClass, toolErrorOutcome } from "./health.js";
 
@@ -547,6 +548,7 @@ function visibleTools(
   vaultName: string,
   auth: AuthResult,
   attachmentTickets: { provider: AttachmentTicketProvider; urlBase: string },
+  attachmentBytes?: AttachmentBytesProvider,
 ): McpToolDef[] {
   // Write-attribution: refine the credential class to the `mcp` channel, but
   // keep `operator` and `nostr:<pubkey>` — each names something more specific
@@ -558,6 +560,9 @@ function visibleTools(
   const tools = generateMcpTools(store, {
     writeContext,
     attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
+    // read-attachment (the engine adds the tool only when a door wires bytes): ranged R2 reads. Without it an AI
+    // app on this door could list a note's files but not look at one, which it can on a box.
+    ...(attachmentBytes ? { attachmentBytes: { provider: attachmentBytes } } : {}),
     // T-412: delete-note's erase_history is admin-only, like DELETE /notes/:id/versions. Core refuses it unless this
     // is set. Cloud has no tag-scoped passes, so an admin may also name a note already deleted.
     ...(hasScopeForVault(auth.scopes, vaultName, "admin") ? { eraseHistory: "all" as const } : {}),
@@ -633,7 +638,10 @@ async function handleToolCall(
   try {
     const out = await tool.execute(args);
     await record(subject, "ok");
-    return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
+    // A tool may shape its own content blocks (read-attachment returns a real image block); every other tool's
+    // result is one text block of JSON. The same rule as the box's MCP layer (parachute-core src/mcp-http.ts).
+    const content = tool.resultContent ? tool.resultContent(out) : [{ type: "text" as const, text: JSON.stringify(out, null, 2) }];
+    return result(id, { content });
   } catch (err) {
     const domain = mapDomainError(err);
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -885,7 +893,12 @@ export async function handleMcp(
    * provider); no optionality here keeps `visibleTools` from ever needing
    * to special-case an unwired seam on cloud.
    */
-  tickets: { provider: AttachmentTicketProvider; mintGate: (declaredBytes: number) => Response | null },
+  tickets: {
+    provider: AttachmentTicketProvider;
+    mintGate: (declaredBytes: number) => Response | null;
+    /** Ranged reads of a stored file, for `read-attachment`. Absent in tests that wire no bucket. */
+    bytes?: AttachmentBytesProvider;
+  },
   record: HealthRecord = noRecord,
   logCrash: ToolCrashLog = noLog,
 ): Promise<Response> {
@@ -962,7 +975,7 @@ export async function handleMcp(
   // calls for; bun derives it the same way, `mcp-tools.ts`'s `ticketUrlBase`).
   const origin = publicOrigin(req);
   const ticketUrlBase = `${origin.replace(/\/$/, "")}/vault/${vaultName}`;
-  const tools = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase });
+  const tools = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes);
   // Wire the server-layer vault-info override onto the caller-visible tool set
   // (core ships a placeholder execute — "must be configured by the server
   // layer"). Parity with bun's mcp-tools.ts overrideVaultInfo.

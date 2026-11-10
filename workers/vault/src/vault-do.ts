@@ -12,6 +12,7 @@
  * fts) so the spike conformance suite (test/spike.test.ts) keeps passing — they
  * exercise the shim + the four DO SQLite unknowns and are cheap to keep.
  */
+import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
 import { DurableObject } from "cloudflare:workers";
 import { SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 import { DatabaseShim } from "./shim.js";
@@ -724,9 +725,17 @@ export class VaultDO extends DurableObject {
     // in flight: a refused request must not hold up the import's drain.
     if (this.importRun) {
       const refused = await this.answerDuringImport(request);
-      if (refused) return refused;
+      if (refused) {
+        await dropUnreadBody(request);
+        return refused;
+      }
     }
-    return this.counted(() => this.countedFetch(request));
+    try {
+      return await this.counted(() => this.countedFetch(request));
+    } finally {
+      // Also when the handler threw: the 500 the router then answers must not be followed by the pipe failing.
+      await dropUnreadBody(request);
+    }
   }
 
   /**
@@ -1138,6 +1147,7 @@ export class VaultDO extends DurableObject {
         {
           provider: this.attachmentTickets,
           mintGate: (declaredBytes) => this.attachmentMintGate(declaredBytes),
+          bytes: r2AttachmentBytes(this.env.ATTACHMENTS, vaultName),
         },
         (subject, outcome) => this.health.record(subject, outcome),
         (tool, err) => logServerError("mcp_tool_error", err, { ...this.logFields, tool }),
@@ -3902,15 +3912,37 @@ export class VaultDO extends DurableObject {
   /** POST /api/storage/upload · GET /api/storage/<date>/<file> — R2-backed. */
   private async handleStorage(req: Request, subpath: string, vaultName: string): Promise<Response> {
     if (req.method === "POST" && subpath === "/upload") {
-      const form = await req.formData();
+      // Refusal bodies carry the same `error_type` (and fields) as the box's (parachute-core routes.ts
+      // handleStorage), so a client branches on one vocabulary at every door.
+      let form: Awaited<ReturnType<Request["formData"]>>;
+      try {
+        form = await req.formData();
+      } catch {
+        return json(
+          {
+            error: "Request body must be valid multipart/form-data",
+            error_type: "invalid_request",
+            hint: "expected a multipart/form-data body with a `file` field",
+          },
+          400,
+        );
+      }
       const file = form.get("file");
-      if (!(file instanceof File)) return json({ error: "file is required" }, 400);
+      if (!(file instanceof File)) return json({ error: "file is required", error_type: "missing_required_field", field: "file" }, 400);
       if (file.size > MAX_UPLOAD_BYTES) {
-        return json({ error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB` }, 413);
+        return json(
+          {
+            error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB`,
+            error_type: "file_too_large",
+            limit: MAX_UPLOAD_BYTES,
+            got: file.size,
+          },
+          413,
+        );
       }
       const ext = extLower(file.name);
       if (BLOCKED_EXTENSIONS.has(ext)) {
-        return json({ error: `File type ${ext} not allowed (active/executable content)` }, 400);
+        return json({ error: `File type ${ext} not allowed (active/executable content)`, error_type: "blocked_upload_extension", extension: ext }, 400);
       }
       // The attachment write gate — shared with the ticket mint/spend paths;
       // see {@link attachmentMintGate}'s doc comment for the exact ladder.
@@ -3937,15 +3969,33 @@ export class VaultDO extends DurableObject {
     try {
       decodedPath = decodeURIComponent(subpath);
     } catch {
-      return json({ error: "Not found" }, 404);
+      return json({ error: "Not found", error_type: "not_found" }, 404);
     }
     const fileMatch = decodedPath.match(/^\/([^/]+)\/(.+)$/);
     if (req.method === "GET" && fileMatch) {
       const reqPath = `${fileMatch[1]}/${fileMatch[2]}`;
       // Traversal guard (R2 keys are flat, but reject `..` segments for parity).
-      if (reqPath.split("/").some((seg) => seg === "..")) return json({ error: "Invalid path" }, 403);
-      const obj = await this.env.ATTACHMENTS.get(r2Key(vaultName, reqPath));
-      if (!obj) return json({ error: "Not found" }, 404);
+      if (reqPath.split("/").some((seg) => seg === "..")) return json({ error: "Invalid path", error_type: "invalid_path" }, 403);
+      const key = r2Key(vaultName, reqPath);
+      // A single `Range: bytes=a-b` gets that part (206), as on a box: a client reads the head of a large file, or
+      // seeks in audio, without pulling all of it. Anything else (no header, malformed, several ranges, a start
+      // past the end) gets the whole file, the box's rule (parachute-core routes.ts parseByteRangeHeader).
+      const rangeHeader = req.headers.get("range");
+      const head = rangeHeader ? await this.env.ATTACHMENTS.head(key) : null;
+      let range = head ? parseByteRangeHeader(rangeHeader, head.size) : null;
+      let obj: R2ObjectBody | null = null;
+      if (range) {
+        // The object can be replaced or removed between the size read and this one. Anything but the same object
+        // (its size and its etag) falls back to the whole file rather than answering with lengths, or bytes, that
+        // belong to something else.
+        obj = await this.env.ATTACHMENTS.get(key, { range: { offset: range.start, length: range.end - range.start + 1 } }).catch(() => null);
+        if (!obj || obj.size !== head!.size || obj.etag !== head!.etag) {
+          range = null;
+          obj = null;
+        }
+      }
+      if (!obj) obj = await this.env.ATTACHMENTS.get(key);
+      if (!obj) return json({ error: "Not found", error_type: "not_found" }, 404);
       const ext = extLower(reqPath);
       // Extension ONLY, never R2 httpMetadata — the same rule as the ticket
       // download spend and bun's GET /storage/ (vault#617). Pre-#255 ticket
@@ -3957,16 +4007,29 @@ export class VaultDO extends DurableObject {
       // the owner's tokens. Every current writer stamps exactly this value,
       // so honest objects serve unchanged.
       const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
+      if (range) {
+        return new Response(obj.body, {
+          status: 206,
+          headers: {
+            "Content-Type": contentType,
+            "Content-Length": String(range.end - range.start + 1),
+            "Content-Range": `bytes ${range.start}-${range.end}/${obj.size}`,
+            "Accept-Ranges": "bytes",
+            "X-Content-Type-Options": "nosniff",
+          },
+        });
+      }
       return new Response(obj.body, {
         headers: {
           "Content-Type": contentType,
           "Content-Length": String(obj.size),
+          "Accept-Ranges": "bytes",
           "X-Content-Type-Options": "nosniff",
         },
       });
     }
 
-    return json({ error: "Not found" }, 404);
+    return json({ error: "Not found", error_type: "not_found" }, 404);
   }
 
   // -------------------------------------------------------------------------
@@ -4349,4 +4412,98 @@ export class VaultDO extends DurableObject {
       txnInterceptCount: this.shim.txnIntercepts.length,
     };
   }
+}
+
+/**
+ * A request answered before its body was read (a refusal: 401, 403, 404, a cap) still has the router piping that
+ * body in. Once the answer is out the pipe fails with "Can't read from request stream after response has been
+ * sent", uncaught: under local workerd that restarts the worker and the next requests get 503, and a client sees
+ * its connection drop instead of the refusal. So a small unread body is read to its end and thrown away first.
+ *
+ * Bounded on purpose, because this runs for requests that were never signed in: only a body that says how long it
+ * is and is at most {@link DRAIN_LIMIT_BYTES}, and for at most {@link DRAIN_LIMIT_MS}. Anything else (no
+ * Content-Length, a large upload, a sender that trickles) is cancelled, so a refusal is never held open by whoever
+ * is being refused. What this changes in production: a refusal for a small body now waits for that body to arrive
+ * (at most two seconds) where it used to go out at once.
+ */
+export const DRAIN_LIMIT_BYTES = 1024 * 1024;
+export const DRAIN_LIMIT_MS = 2000;
+export async function dropUnreadBody(request: Request, limits: { bytes?: number; ms?: number } = {}): Promise<"none" | "drained" | "cancelled"> {
+  if (!request.body || request.bodyUsed) return "none";
+  const maxBytes = limits.bytes ?? DRAIN_LIMIT_BYTES;
+  const declared = Number(request.headers.get("content-length") ?? "");
+  // Only the two calls used here; the platform's own reader type differs between the runtime and the test pool.
+  let reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<void> };
+  try {
+    reader = request.body.getReader() as unknown as typeof reader;
+  } catch {
+    return "none"; // already locked: someone else is reading it
+  }
+  const cancel = async (): Promise<"cancelled"> => {
+    await reader.cancel().catch(() => {});
+    return "cancelled";
+  };
+  if (!Number.isFinite(declared) || declared <= 0 || declared > maxBytes) return cancel();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<"late">((resolve) => {
+    timer = setTimeout(() => resolve("late"), limits.ms ?? DRAIN_LIMIT_MS);
+  });
+  try {
+    let seen = 0;
+    for (;;) {
+      const step = await Promise.race([reader.read(), late]);
+      if (step === "late") return cancel();
+      if (step.done) return "drained";
+      seen += step.value?.byteLength ?? 0;
+      if (seen > declared) return cancel(); // more than it said it would send
+    }
+  } catch {
+    return "cancelled";
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * One `Range: bytes=a-b` header as inclusive offsets, or null for "send the whole file": no header, a malformed
+ * value, another unit, several ranges, or a start past the end. The box's rule, kept exact (parachute-core
+ * `packages/vault/src/routes.ts` parseByteRangeHeader); the door contracts read the first eight bytes of a file at
+ * every door.
+ */
+export function parseByteRangeHeader(header: string | null, total: number): { start: number; end: number } | null {
+  if (!header || total <= 0) return null;
+  const match = header.match(/^bytes=(\d*)-(\d*)$/);
+  if (!match) return null;
+  const [, startRaw, endRaw] = match;
+  if (startRaw === "" && endRaw === "") return null;
+  if (startRaw === "") {
+    const suffixLength = Number(endRaw);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return null;
+    return { start: Math.max(0, total - suffixLength), end: total - 1 };
+  }
+  const start = Number(startRaw);
+  if (!Number.isSafeInteger(start) || start < 0 || start >= total) return null;
+  const end = endRaw === "" ? total - 1 : Math.min(Number(endRaw), total - 1);
+  if (!Number.isSafeInteger(end) || end < start) return null;
+  return { start, end };
+}
+
+/**
+ * The engine's attachment-bytes seam over R2 (`read-attachment`, parachute-core `core/src/attachment/
+ * bytes-provider.ts`): a size from `head`, and one ranged `get` per read, so a text window or a capped image never
+ * pulls a whole large object into the Durable Object. No transcript hook: on this door a transcript lives in the
+ * owning note's body, so the engine points at the note.
+ */
+export function r2AttachmentBytes(bucket: R2Bucket, vaultName: string): AttachmentBytesProvider {
+  return {
+    async stat(attachment) {
+      const head = await bucket.head(r2Key(vaultName, attachment.path));
+      return head ? { size: head.size } : null;
+    },
+    async readRange(attachment, start, end) {
+      if (end <= start) return new Uint8Array(0);
+      const obj = await bucket.get(r2Key(vaultName, attachment.path), { range: { offset: start, length: end - start } });
+      return obj ? new Uint8Array(await obj.arrayBuffer()) : new Uint8Array(0);
+    },
+  };
 }

@@ -15,6 +15,16 @@ import { isNoteIdShape } from "@openparachute/core/src/ulid.js";
 import { getImportedVersion, importStorageIndex, parseHistorySelector, projectHistoryRow, ImportedHistoryUnrecoverableError } from "@openparachute/core/src/history-import.js";
 import { latestTombstone } from "@openparachute/core/src/history.js";
 import { historyBody } from "./history.js";
+import {
+  HINT_CONFLICT,
+  HINT_HISTORY_OVERFLOW,
+  HINT_PATH_CONFLICT,
+  HINT_PATH_CONFLICT_ON_CREATE,
+  HINT_PRECONDITION,
+  HINT_SCHEMA_VALIDATION,
+  HINT_TRANSITION_CONFLICT,
+  hintHistoryUnrecoverable,
+} from "./refusal-hints.js";
 import { projectHistoryProvenance } from "@openparachute/core/src/history-visibility.js";
 import {
   getNotes,
@@ -288,20 +298,22 @@ export async function handleNotes(
     if (e?.code === "HISTORY_NOT_FOUND") return json({ error: e.message, error_type: "not_found" }, 404);
     if (e?.code === "HISTORY_OVERFLOW") return json({
       error_type: "history_overflow", note_id: e.note_id, byte_size: e.byte_size, limit: e.limit, message: e.message,
+      hint: HINT_HISTORY_OVERFLOW,
     }, 413);
     if (e?.code === "HISTORY_UNRECOVERABLE") return json({
       error_type: "history_unrecoverable", note_id: e.note_id,
       ...(e.origin === "git-import" ? { origin: e.origin, import_ix: e.import_ix } : { version_ix: e.version_ix }),
       message: e.message,
+      hint: hintHistoryUnrecoverable(e.reason),
     }, 409);
     if (e?.code === "PRECONDITION_REQUIRED") return json({ error_type: "precondition_required", note_id: e.note_id, message: e.message }, 428);
     if (e?.code === "CONFLICT") return json({
       error_type: "conflict", error: "conflict", current_updated_at: e.current_updated_at ?? null,
       your_updated_at: e.expected_updated_at, expected_updated_at: e.expected_updated_at,
-      path: e.note_path ?? null, note_id: e.note_id, message: e.message,
+      path: e.note_path ?? null, note_id: e.note_id, message: e.message, hint: HINT_CONFLICT,
     }, 409);
-    if (e?.code === "SCHEMA_VALIDATION") return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message }, 422);
-    if (e?.code === "PATH_CONFLICT") return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message }, 409);
+    if (e?.code === "SCHEMA_VALIDATION") return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message, hint: HINT_SCHEMA_VALIDATION }, 422);
+    if (e?.code === "PATH_CONFLICT") return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message, hint: HINT_PATH_CONFLICT }, 409);
     const ambig = ambiguousPathResponse(e);
     if (ambig) return ambig;
     throw e;
@@ -1124,10 +1136,10 @@ async function handleNotesInner(
         await (batched ? transactionAsync(db, runBatch) : runBatch());
       } catch (e: any) {
         if (e && e.code === "PATH_CONFLICT") {
-          return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message }, 409);
+          return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message, hint: HINT_PATH_CONFLICT_ON_CREATE }, 409);
         }
         if (e && e.code === "SCHEMA_VALIDATION") {
-          return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message }, 422);
+          return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message, hint: HINT_SCHEMA_VALIDATION }, 422);
         }
         if (e && e.code === "INVALID_EXTENSION") {
           return json({ error_type: "invalid_extension", error: "invalid_extension", extension: e.extension, reason: e.reason, message: e.message }, 400);
@@ -1505,6 +1517,7 @@ async function handleNotesInner(
             message: "update requires `if_updated_at` (the note's last-seen updated_at) or `force: true`.",
             note_id: note.id,
             path: note.path ?? null,
+            hint: HINT_PRECONDITION,
           },
           428,
         );
@@ -1713,6 +1726,7 @@ async function handleNotesInner(
             path: e.note_path ?? null,
             note_id: e.note_id,
             message: e.message,
+            hint: HINT_CONFLICT,
             error: "conflict",
             expected_updated_at: e.expected_updated_at,
           },
@@ -1731,15 +1745,16 @@ async function handleNotesInner(
             to: e.to,
             current: e.current ?? null,
             message: e.message,
+            hint: HINT_TRANSITION_CONFLICT,
           },
           409,
         );
       }
       if (e && e.code === "SCHEMA_VALIDATION") {
-        return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message }, 422);
+        return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message, hint: HINT_SCHEMA_VALIDATION }, 422);
       }
       if (e && e.code === "PATH_CONFLICT") {
-        return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message }, 409);
+        return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message, hint: HINT_PATH_CONFLICT }, 409);
       }
       if (e && e.code === "INVALID_EXTENSION") {
         return json({ error_type: "invalid_extension", error: "invalid_extension", extension: e.extension, reason: e.reason, message: e.message }, 400);
