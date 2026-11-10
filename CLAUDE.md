@@ -9,7 +9,7 @@
 - `workers/vault/` — the Vault DO + edge router: REST wire contract, MCP endpoint, SSE live queries, R2 attachments + export. Conformance suite runs under real workerd (`@cloudflare/vitest-pool-workers`).
 - `workers/identity/` — OAuth issuer (hub-contract-exact) + self-serve console + `/account/*` API + ops crons + Stripe billing + operator admin. The feature list lives in the git/PR history + the `src/` filenames — read those, it is not restated here.
 - `src/` — the OLD control plane. Dormant; harvest material only.
-- `scripts/` — deploy + smoke: `deploy-staging.sh`/`smoke-staging.ts` (full live smoke, creates test debris) for staging; `deploy-prod.sh`/`smoke-prod.ts` (read-only checks) for production. Deploys also build + embed the app SPA from the commit pinned in `scripts/spa-source.env` — promote the app by bumping the pin.
+- `scripts/` — deploy + smoke: `deploy-staging.sh`/`smoke-staging.ts` (full live smoke, creates test debris) for staging (its own account; `scripts/staging-account.env` + `scripts/staging-bootstrap.sh`); `deploy-prod.sh`/`smoke-prod.ts` (read-only checks) for production. Deploys also build + embed the app SPA from the commit pinned in `scripts/spa-source.env` — promote the app by bumping the pin.
 
 ## Commands
 
@@ -20,6 +20,7 @@ bun run typecheck                   # root tsc
 cd workers/vault && bun run typecheck && bun x vitest run     # conformance under workerd
 cd workers/identity && bun run typecheck && bun x vitest run
 bash scripts/door-parity.sh         # the door contracts a box runs (parachute-core, pinned), against both workers under local workerd, compared with the box
+bash scripts/staging-bootstrap.sh --local DIR   # rehearse a fresh staging account (miniflare; no Cloudflare call)
 bash scripts/deploy-staging.sh      # deploy both workers -e staging + migrate + seed
 bun scripts/smoke-staging.ts        # FULL live smoke vs staging (creates test debris)
 bash scripts/deploy-prod.sh         # deploy both workers top-level + migrate (NO seed)
@@ -40,6 +41,7 @@ bun scripts/health-report.ts --d1 parachute-identity [--gate]   # "did anything 
 - **`[observability]` is NOT inherited by named envs** — needed in BOTH scopes of both wrangler.tomls (top-level AND `[env.staging.observability]`).
 - **PRODUCTION = the TOP-LEVEL wrangler config, and can NEVER move into an `[env.production]`.** Named envs re-suffix worker names; a renamed worker detaches the Custom Domains (`cloud.` / `u.parachute.computer`) and orphans every existing vault DO. Staging is `[env.staging]` (`wrangler deploy -e staging`, workers.dev origins only).
 - **Staging's `routes = []` override is load-bearing** — without it staging inherits prod's custom-domain route.
+- **Staging is its own Cloudflare account** (Parachute Staging, T-432): `[env.staging] account_id` pins it (wrangler prefers it over `CLOUDFLARE_ACCOUNT_ID`), and the top level has NO `account_id`, so production keeps the account `deploy-prod.sh` exports. Account id, workers.dev subdomain, D1 id and bucket live in `scripts/staging-account.env` (`test-bun/staging-account.test.ts` holds the tomls to it); staging URLs are `https://<worker>.<subdomain>.workers.dev`. A fresh account: `scripts/staging-bootstrap.sh`. Locally, `wrangler dev --env staging` needs `--local`: with the account pinned, wrangler otherwise opens a remote session for the vault's AI binding and fails without a login there.
 - **The first-party `client_id` (`parachute-console`) is the vault-side platform-vs-tenant gate** (`workers/vault/src/auth.ts` `FIRST_PARTY_CLIENT_ID`) — scope/verb alone can't distinguish, because a vault owner can mint `vault:<name>:admin` via public OAuth.
 - **`__test/*` + mock-billing endpoints must 404 in production** — smoke-prod-pinned; keep them pinned.
 - **Stripe dep pinned EXACT** (`22.1.0`) — caret drift broke types on fresh installs (bun.lock committed since #104; the exact pin is defense-in-depth).

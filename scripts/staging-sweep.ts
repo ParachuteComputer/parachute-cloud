@@ -57,10 +57,10 @@
  */
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { STAGING_ACCOUNT_ID } from "./staging-origins.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY_DIR = join(HERE, "..", "workers", "identity");
-const ACCOUNT_ID = "d5d7c8646c3b69ce9f16bfd12ecbe98a"; // new Parachute account (same as deploy scripts)
 
 // Hardcoded to STAGING — no env-var override. This IS the guard: the script
 // is structurally incapable of naming production's D1 database.
@@ -94,7 +94,7 @@ const APPLY = process.argv.includes("--yes");
 function d1<T>(sql: string): T[] {
   const proc = Bun.spawnSync(
     ["bunx", "wrangler", "d1", "execute", STAGING_DB, "--remote", ...STAGING_ENV_FLAGS, "--json", "--command", sql],
-    { cwd: IDENTITY_DIR, env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: ACCOUNT_ID } },
+    { cwd: IDENTITY_DIR, env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: STAGING_ACCOUNT_ID } },
   );
   const stdout = proc.stdout.toString();
   if (proc.exitCode !== 0) {

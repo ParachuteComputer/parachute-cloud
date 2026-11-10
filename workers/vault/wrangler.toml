@@ -213,6 +213,11 @@ cpu_ms = 300000
 # Deploy via scripts/deploy-staging.sh; smoke via bun scripts/smoke-staging.ts.
 # =============================================================================
 [env.staging]
+# Staging runs on its OWN Cloudflare account, "Parachute Staging" (T-432), never on production's: an env-level
+# account_id beats CLOUDFLARE_ACCOUNT_ID in wrangler, so `-e staging` can only reach this account, and a key minted for
+# it gets 403 anywhere else. The top level (production) has no account_id and keeps taking CLOUDFLARE_ACCOUNT_ID from
+# scripts/deploy-prod.sh. Mirrors scripts/staging-account.env (test-bun/staging-account.test.ts holds them equal).
+account_id = "5b543fa4332a619203356ae1418af504"
 workers_dev = true
 # `routes` IS inheritable — without this override a staging deploy would adopt
 # the production [[routes]] custom domain (Custom Domains attach to exactly one
@@ -226,8 +231,8 @@ routes = []
 name = "VAULT"
 class_name = "VaultDO"
 
-# Staging's own attachment/export bucket (created 2026-07-02 via
-# `wrangler r2 bucket create parachute-vault-staging`).
+# Staging's own attachment/export bucket on the staging account (created once by
+# scripts/staging-bootstrap.sh: `wrangler r2 bucket create parachute-vault-staging`).
 [[env.staging.r2_buckets]]
 binding = "ATTACHMENTS"
 bucket_name = "parachute-vault-staging"
@@ -242,14 +247,14 @@ binding = "AI"
 # staging identity worker's ISSUER ([env.staging.vars] in
 # workers/identity/wrangler.toml) — staging vaults trust the STAGING issuer.
 [env.staging.vars]
-ISSUER_ORIGIN = "https://parachute-identity-staging.openparachute.workers.dev"
-CONSOLE_PUBLIC_ORIGIN = "https://parachute-identity-staging.openparachute.workers.dev"
+ISSUER_ORIGIN = "https://parachute-identity-staging.parachute-staging.workers.dev"
+CONSOLE_PUBLIC_ORIGIN = "https://parachute-identity-staging.parachute-staging.workers.dev"
 # ADDITIVE extra-`iss` set (see the top-level [vars] note). UNSET = today's
 # single-ISSUER_ORIGIN match. The staging soak first runs it unset (behavior
 # unchanged), then sets a synthetic second value pointing at the SAME staging
 # JWKS to prove both are accepted before P1.3 wires the real second origin.
 # ALLOWED_ISSUERS = ""
-VAULT_BASE_DOMAIN = "parachute-vault-do-staging.openparachute.workers.dev"
+VAULT_BASE_DOMAIN = "parachute-vault-do-staging.parachute-staging.workers.dev"
 CAP_BYTES = "1073741824"
 # "staging" ≠ "test": the TEST_JWKS double-gate stays closed here too.
 ENVIRONMENT = "staging"

@@ -29,14 +29,14 @@
  */
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { PROD_ACCOUNT_ID, STAGING_ACCOUNT_ID } from "./staging-origins.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY_DIR = join(HERE, "..", "workers", "identity");
-const ACCOUNT_ID = "d5d7c8646c3b69ce9f16bfd12ecbe98a"; // same account as the deploy scripts
 
 const TARGETS = {
-  staging: { db: "parachute-identity-staging", envFlags: ["--env", "staging"] },
-  prod: { db: "parachute-identity", envFlags: ["--env", ""] },
+  staging: { db: "parachute-identity-staging", envFlags: ["--env", "staging"], account: STAGING_ACCOUNT_ID },
+  prod: { db: "parachute-identity", envFlags: ["--env", ""], account: PROD_ACCOUNT_ID },
 } as const;
 
 /** The one definition of "paying subscriber" (plans.ts isExistingSubscriber). */
@@ -97,7 +97,7 @@ function d1Rows(targetName: keyof typeof TARGETS): Row[] {
       "--command",
       PAYING_SUBSCRIBERS_SQL.replace(/\s+/g, " "),
     ],
-    { cwd: IDENTITY_DIR, env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: ACCOUNT_ID } },
+    { cwd: IDENTITY_DIR, env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: target.account } },
   );
   const stdout = proc.stdout.toString();
   // stderr only on failure — never echo row data.
