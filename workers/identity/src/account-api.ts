@@ -167,7 +167,7 @@ export async function requireAccount(
   req: Request,
   deps: OAuthDeps,
   verb: AccountVerb,
-): Promise<{ ok: true; accountId: string; user: User; clientId: string | null } | { ok: false; response: Response }> {
+): Promise<{ ok: true; accountId: string; user: User; clientId: string | null; adminPubkey: string | null } | { ok: false; response: Response }> {
   const token = bearerToken(req);
   if (!token) {
     return { ok: false, response: authError(401, "invalid_token", "missing bearer token") };
@@ -204,7 +204,10 @@ export async function requireAccount(
     };
   }
   const clientId = typeof result.token.payload.client_id === "string" ? result.token.payload.client_id : null;
-  return { ok: true, accountId, user, clientId };
+  // Signed in with an ADMIN_PUBKEYS key (account-token.ts), not the owner's own.
+  const perms = result.token.payload.permissions as { admin_pubkey?: unknown } | undefined;
+  const adminPubkey = typeof perms?.admin_pubkey === "string" ? perms.admin_pubkey : null;
+  return { ok: true, accountId, user, clientId, adminPubkey };
 }
 
 /** The vault name segment from `/account/vaults/<name>[/token]`, lowercased, or

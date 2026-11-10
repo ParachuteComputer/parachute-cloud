@@ -27,17 +27,21 @@ const err = (status: number, error: string, message: string) =>
 const ok = (body: unknown, status = 200) => jsonResponse(body, status, { "cache-control": "no-store" });
 
 /** The account's own first-party token (never an OAuth app's, which may hold `account:<id>:admin`). */
-async function ownerGate(db: D1Database, req: Request, deps: OAuthDeps) {
+async function ownerGate(db: D1Database, req: Request, deps: OAuthDeps, change = true) {
   const auth = await requireAccount(db, req, deps, "admin");
   if (!auth.ok) return auth;
   if (auth.clientId !== ACCOUNT_TOKEN_CLIENT_ID) {
     return { ok: false as const, response: err(403, "insufficient_scope", "sign-in keys are managed with your own account token") };
   }
+  // An admin key (ADMIN_PUBKEYS) may list them, never change them: the owner's keys are the owner's.
+  if (change && auth.adminPubkey) {
+    return { ok: false as const, response: err(403, "admin_key", "an admin key can't change the account's sign-in keys; the owner does") };
+  }
   return auth;
 }
 
 export async function handleAccountPubkeysList(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
-  const auth = await ownerGate(db, req, deps);
+  const auth = await ownerGate(db, req, deps, false);
   if (!auth.ok) return auth.response;
   const res = await db
     .prepare("SELECT pubkey, label, created_at FROM user_pubkeys WHERE user_id = ? ORDER BY created_at, pubkey")

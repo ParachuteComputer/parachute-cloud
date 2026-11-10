@@ -36,7 +36,8 @@ import { normalizePath } from "@openparachute/core/src/paths.js";
 import * as linkOps from "@openparachute/core/src/links.js";
 import { getUnresolvedLinksForNote, getUnresolvedLinksForNotes, getAmbiguousLinksForNote, getAmbiguousLinksForNotes, resolveOrQueueLink, resolveStructuredLinkNote, unresolvedLinkWarning, ambiguousLinkWarning, getContentWikilinkWarnings } from "@openparachute/core/src/wikilinks.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
-import { holdTypes, markTypes, prepareCallTypes, refreshTypes } from "@openparachute/core/src/tag-kind.js";
+import { foldTypeFilter, holdTypes, markTypes, prepareCallTypes, refreshTypes } from "@openparachute/core/src/tag-kind.js";
+import { RECORDS_REQUESTS } from "./records.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
 import { embeddingsPendingWarning, ignoredParamWarning, collectUnknownTagWarnings, computeSearchDidYouMean, searchDidYouMeanWarning, truncatedResultsWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
 import {
@@ -284,6 +285,21 @@ export async function handleNotes(
   writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
   try {
+    // door/0.9: `?type=` on /api/records is query-records' `type`, folded by the engine (subtypes, and with ?tag all of
+    // them; a plain tag refused). /api/notes gains nothing new (SPEC §5.1).
+    if (req.method === "GET" && RECORDS_REQUESTS.has(req) && new URL(req.url).searchParams.has("type")) {
+      const url = new URL(req.url);
+      const params: Record<string, unknown> = { type: parseQueryList(url, "type") ?? [] };
+      const tag = parseQueryList(url, "tag");
+      if (tag) params.tag = tag;
+      if (url.searchParams.has("tag_match")) params.tag_match = url.searchParams.get("tag_match");
+      if (url.searchParams.has("expand")) params.expand = url.searchParams.get("expand");
+      const f = foldTypeFilter(store.db as any, params) as { tag: string[]; tag_match: string };
+      for (const k of ["type", "tag", "tag_match", "expand"]) url.searchParams.delete(k);
+      url.searchParams.set("tag", f.tag.join(","));
+      url.searchParams.set("tag_match", f.tag_match);
+      req = new Request(url.toString(), req);
+    }
     // door/0.9 (T-318 §8a, "writes accept both"): a body's `types` land in the one membership store with its tags.
     const folded = await foldRestTypes(req, store, subpath);
     if (folded instanceof Response) return folded;

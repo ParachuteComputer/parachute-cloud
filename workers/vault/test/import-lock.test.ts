@@ -19,7 +19,7 @@ import type { EmbeddingProvider, EmbedInput, EmbedResult } from "@openparachute/
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { toTar } from "../src/export.ts";
 import { snapshotPrefix } from "../src/snapshots.ts";
-import { base, freshVault, mintToken, op } from "./helpers.ts";
+import { base, freshVault, mintToken, op, OP } from "./helpers.ts";
 
 /** Enough notes for a few checkpoints (every 200). */
 const NOTES = 450;
@@ -155,6 +155,43 @@ describe("import lock (T-318)", () => {
     const after = await op(v, "/api/notes?limit=1");
     expect(after.status).toBe(200);
     // The refused write and the refused second import left no trace.
+    const stats = (await (await op(v, "")).json()) as { stats: { totalNotes: number } };
+    expect(stats.stats.totalNotes).toBe(NOTES);
+  }, 120_000);
+
+  it("door/0.9: a /api/records write whose body is still arriving holds the import off (it is counted first)", async () => {
+    const v = freshVault("ilockrec");
+    expect((await op(v, "")).status).toBe(200);
+    let finish!: () => void;
+    const go = new Promise<void>((r) => (finish = r));
+    const enc = new TextEncoder();
+    const body = new ReadableStream({
+      async start(c) {
+        c.enqueue(enc.encode('{"path":"race/one",'));
+        await go;
+        c.enqueue(enc.encode('"body":"arrived late"}'));
+        c.close();
+      },
+    });
+    // Straight to the vault's object (the edge router would buffer the body first): the records door is still
+    // reading this body when the import arrives.
+    const writing = doStub(v).fetch(
+      new Request(`${base(v)}/api/records`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${OP}` }, body }),
+    );
+    await new Promise((r) => setTimeout(r, 300));
+    const hold = await holdImportAtCheckpoint(v);
+    let reached = false;
+    void hold.paused.then(() => (reached = true));
+    const importing = startImport(v, bigExportTar(NOTES), "attempt-rec");
+    await new Promise((r) => setTimeout(r, 1500));
+    // The import is waiting for the write still in flight: it hasn't begun its replay.
+    expect(reached).toBe(false);
+    finish();
+    expect([201, 503]).toContain((await writing).status);
+    await hold.paused;
+    hold.release();
+    expect((await importing).status).toBe(200);
+    // The import ran after the write (it waited for it), so its wipe took it: nothing landed mid-import.
     const stats = (await (await op(v, "")).json()) as { stats: { totalNotes: number } };
     expect(stats.stats.totalNotes).toBe(NOTES);
   }, 120_000);

@@ -9,7 +9,8 @@
  * the edge of the request, never a second implementation.
  *
  *   /api/records[/<id or path>[/<sub>]]   → /api/notes…   (list, get, create, patch, delete, versions, restore…)
- *   ?type=<name>                         → ?tag=<name>    (the type filter; a type is a tag of kind `type`)
+ *   ?type=<name>                         the engine's query-records `type` (foldTypeFilter, in rest/notes.ts):
+ *                                         a type and its subtypes; with ?tag, records carrying all of them
  *   ?include_body / ?include_fields      → ?include_content / ?include_metadata
  *   /api/types[/<name>]                  → /api/tags…     (writes need admin, as /api/tags)
  *
@@ -22,7 +23,6 @@
 import { paramsIn, resultOut } from "@openparachute/core/src/mcp-records.js";
 
 const QUERY_RENAMES: Record<string, string> = {
-  type: "tag",
   include_body: "include_content",
   include_fields: "include_metadata",
   body_offset: "content_offset",
@@ -49,6 +49,9 @@ function toolFor(method: string): string {
  * Run a `/api/records` or `/api/types` request through `inner` (the DO's own fetch) as its `/api/notes` /
  * `/api/tags` twin, and answer in record words.
  */
+/** The /api/notes requests that are /api/records twins (only these take `?type=`). Set here, read by handleNotes. */
+export const RECORDS_REQUESTS = new WeakSet<Request>();
+
 export async function recordsDoor(request: Request, route: { kind: "records" | "types"; notesPath: string }, inner: (req: Request) => Promise<Response>): Promise<Response> {
   const url = new URL(request.url);
   const out = new URL(url);
@@ -67,18 +70,14 @@ export async function recordsDoor(request: Request, route: { kind: "records" | "
     if (route.kind === "records" && !/^(multipart\/|application\/octet-stream|audio\/|video\/|image\/)/.test(ct)) {
       const text = await request.text();
       if (text.trim()) {
-        let parsed: unknown;
+        // A body that isn't JSON, or whose words conflict, goes on as it came: the handler answers it after auth,
+        // exactly as /api/notes would (an unauthenticated caller gets 401 first, never a parse answer).
         try {
-          parsed = JSON.parse(text);
-        } catch {
-          return Response.json({ error: "body is not JSON", error_type: "invalid_json" }, { status: 400 });
-        }
-        headers.set("content-type", "application/json");
-        try {
+          const parsed: unknown = JSON.parse(text);
+          headers.set("content-type", "application/json");
           body = JSON.stringify(parsed && typeof parsed === "object" && !Array.isArray(parsed) ? paramsIn(tool, parsed as Record<string, unknown>) : parsed);
-        } catch (err) {
-          const e = err as { message?: string; error_type?: string; field?: string; hint?: string };
-          return Response.json({ error: e.message ?? "invalid parameters", error_type: e.error_type ?? "invalid_query", field: e.field, hint: e.hint }, { status: 400 });
+        } catch {
+          body = text;
         }
         headers.delete("content-length");
       }
@@ -86,7 +85,9 @@ export async function recordsDoor(request: Request, route: { kind: "records" | "
       body = await request.arrayBuffer();
     }
   }
-  const res = await inner(new Request(out.toString(), { method: request.method, headers, body }));
+  const twin = new Request(out.toString(), { method: request.method, headers, body });
+  if (route.kind === "records") RECORDS_REQUESTS.add(twin);
+  const res = await inner(twin);
   if (route.kind === "types") return res;
   if (!(res.headers.get("content-type") ?? "").includes("application/json")) return res;
   const answer = resultOut(tool, await res.json());

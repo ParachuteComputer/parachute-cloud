@@ -236,6 +236,27 @@ describe("ADMIN_PUBKEYS: a second principal on a single-owner deploy (door/0.9, 
     expect((await env.DB.prepare("SELECT plan FROM users").first<any>()).plan).toBe("trial");
   });
 
+  test("an admin's token lists the sign-in keys but can't add or remove one (it can't stay on, or lock the owner out)", async () => {
+    const owner = nostrKey();
+    const admin = nostrKey();
+    const a = app({ ownerPubkey: owner.pubkey, adminPubkeys: admin.pubkey });
+    const t = (await signIn(a, admin)).json.token as string;
+    const id = decodeJwtPayload(t).sub as string;
+    expect((decodeJwtPayload(t) as any).permissions).toEqual({ admin_pubkey: admin.pubkey });
+    expect((await a.call("/account/pubkeys", { auth: `Bearer ${t}` })).status).toBe(200);
+    const spare = nostrKey();
+    const proof = await signEvent(spare, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"], ["account", id]]);
+    const link = await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${t}`, body: { event: proof } });
+    expect([link.status, link.json.error]).toEqual([403, "admin_key"]);
+    const unlink = await a.call(`/account/pubkeys/${owner.pubkey}`, { method: "DELETE", auth: `Bearer ${t}` });
+    expect([unlink.status, unlink.json.error]).toEqual([403, "admin_key"]);
+    // The owner's own token is not marked and may.
+    const ot = (await signIn(a, owner)).json.token as string;
+    expect((decodeJwtPayload(ot) as any).permissions).toBeUndefined();
+    const proof2 = await signEvent(spare, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"], ["account", id]]);
+    expect((await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${ot}`, body: { event: proof2 } })).status).toBe(201);
+  });
+
   test("an admin key can't be linked (the config is its one switch)", async () => {
     const owner = nostrKey();
     const admin = nostrKey();

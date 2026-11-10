@@ -297,7 +297,7 @@ function overrideVaultInfo(
 
   vaultInfo.execute = async (params) => {
     // `help` (0.9): a tool's full reference, which the short tools/list descriptions point to.
-    if (params.help !== undefined) return toolHelp(String(params.help), tools.map((t) => t.name));
+    if (params.help !== undefined) return toolHelp(String(params.help));
     let description = opts.description;
 
     if (params.description !== undefined) {
@@ -620,6 +620,13 @@ async function handleToolCall(
   }
   // From here `name` is one of this vault's own visible tools (server-defined).
   const subject = `mcp:${name}`;
+  // attachment-url is listed for readers (download); its upload needs write, checked before the gate answers anything.
+  // The visible set is already scope-filtered: a caller with write on this vault sees the old upload mint.
+  const writeAllowed = tools.some((t) => t.name === ATTACHMENT_UPLOAD_MINT_TOOL);
+  if (name === "attachment-url" && args.action === "upload" && !writeAllowed) {
+    await record(subject, "forbidden");
+    return result(id, { content: [{ type: "text", text: "Error: Forbidden: attachment-url {action: \"upload\"} needs write on this vault." }], isError: true });
+  }
   if (isAttachmentUploadMint(name, args)) {
     // The attachment gate ladder, AT MINT, against the caller's DECLARED
     // size — an agent learns `plan_required`/`attachments_not_included`/

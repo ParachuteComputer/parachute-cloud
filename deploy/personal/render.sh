@@ -15,6 +15,9 @@ case "$PREFIX" in parachute|parachute-*|arcade-parachute*|*-staging) echo "refus
 key_ok() { [[ "$1" =~ ^[0-9a-f]{64}$ || "$1" =~ ^npub1[02-9ac-hj-np-z]{58}$ ]]; }
 key_ok "$OWNER_PUBKEY" || { echo "refused: OWNER_PUBKEY is not 64 hex or an npub" >&2; exit 2; }
 for k in ${ADMIN_PUBKEYS//,/ }; do key_ok "$k" || { echo "refused: an ADMIN_PUBKEYS entry is not 64 hex or an npub" >&2; exit 2; }; done
+for d in "${VAULT_DOMAIN:-}" "${IDENTITY_DOMAIN:-}"; do
+  [ -z "$d" ] || [[ "$d" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || { echo "refused: a custom domain must be a plain host name" >&2; exit 2; }
+done
 PLAN="${OWNER_PLAN:-power}"; case "$PLAN" in entry|standard|plus|power) ;; *) echo "refused: OWNER_PLAN" >&2; exit 2 ;; esac
 VAULT_HOST="${VAULT_DOMAIN:-$PREFIX-vault.$SUB.workers.dev}"
 ID_ORIGIN="https://${IDENTITY_DOMAIN:-$PREFIX-identity.$SUB.workers.dev}"

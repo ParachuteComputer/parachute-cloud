@@ -13,14 +13,29 @@ const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "
 const fromHex = (s: string) => Uint8Array.from(s.match(/../g)!.map((x) => parseInt(x, 16)));
 
 const BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+function polymod(values: number[]): number {
+  const G = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let chk = 1;
+  for (const v of values) {
+    const top = chk >>> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) if ((top >>> i) & 1) chk ^= G[i]!;
+  }
+  return chk;
+}
+
 function bech32Bytes(s: string, prefix: string): Uint8Array {
   const lower = s.toLowerCase();
   if (!lower.startsWith(`${prefix}1`)) throw new Error(`not an ${prefix}`);
-  const data = [...lower.slice(prefix.length + 1, -6)].map((c) => {
+  const all = [...lower.slice(prefix.length + 1)].map((c) => {
     const v = BECH32.indexOf(c);
     if (v < 0) throw new Error(`bad ${prefix}`);
     return v;
   });
+  // A mistyped key must fail here, not quietly become another key.
+  const hrp = [...prefix].map((c) => c.charCodeAt(0));
+  if (polymod([...hrp.map((c) => c >> 5), 0, ...hrp.map((c) => c & 31), ...all]) !== 1) throw new Error(`${prefix} checksum doesn't match`);
+  const data = all.slice(0, -6);
   let acc = 0, bits = 0;
   const out: number[] = [];
   for (const v of data) {

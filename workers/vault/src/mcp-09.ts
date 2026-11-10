@@ -58,7 +58,7 @@ export function shape09(tools: McpToolDef[], vaultName: string, auth: AuthResult
  * parameter), which the short tools/list descriptions point to. The new tools
  * answer with each action's own reference.
  */
-export function toolHelp(name: string, listed: readonly string[]): Record<string, unknown> {
+export function toolHelp(name: string): Record<string, unknown> {
   const spec = NEW_TOOLS[name];
   if (spec) {
     return {
@@ -72,7 +72,7 @@ export function toolHelp(name: string, listed: readonly string[]): Record<string
   }
   const ref = MCP_TOOL_REFERENCE.find((e) => e.name === name);
   if (!ref) {
-    throw Object.assign(new Error(`No tool named "${name}". Tools: ${listed.join(", ")}.`), {
+    throw Object.assign(new Error(`No tool named "${name}": tools/list names the tools this key can use.`), {
       error_type: "unknown_tool",
       field: "help",
       hint: "pass one of the tool names",

@@ -146,6 +146,24 @@ describe("door/0.9 MCP: the record door", () => {
   });
 });
 
+describe("door/0.9: a reader and attachment-url upload", () => {
+  it("is refused for its verb before the attachment gate answers anything", async () => {
+    const v = freshVault("d9rdgate");
+    await call(v, "create-record", { path: "R/1", body: "x" });
+    const admin = await mintToken({ vault: v, scopes: `vault:${v}:admin`, vaultScope: [v], clientId: FIRST_PARTY_CLIENT_ID });
+    await SELF.fetch(`${base(v)}/api/internal/config`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${admin}`, "content-type": "application/json" },
+      body: JSON.stringify({ caps: { notes_bytes: 100 * 1024 * 1024, attachment_bytes: 0 } }),
+    });
+    const reader = await mintToken({ vault: v, scopes: `vault:${v}:read`, vaultScope: [v] });
+    const up = await call(v, "attachment-url", { action: "upload", record: "R/1", filename: "a.mp3", size_bytes: 3 }, reader);
+    expect(up.ok).toBe(false);
+    expect(JSON.stringify(up.out)).toContain("Forbidden");
+    expect(JSON.stringify(up.out)).not.toContain("attachments_not_included");
+  });
+});
+
 describe("door/0.9 REST: /api/records and /api/types", () => {
   it("create, read, filter by type, patch types, delete: the record door's shapes", async () => {
     const v = freshVault("d9rest");
@@ -190,6 +208,29 @@ describe("door/0.9 REST: /api/records and /api/types", () => {
     expect(rec).toMatchObject({ body: "plain curl", types: ["episode"], fields: { guest: "Robin" } });
     const bare = await op(v, "/api/notes", { method: "POST", body: JSON.stringify({ path: "C/2", content: "x", types: ["meeting"] }) });
     expect(((await bare.json()) as any).tags).toContain("meeting");
+  });
+
+  it("?type= is query-records' type: with ?tag, records carrying both; a plain tag is refused", async () => {
+    const v = freshVault("d9tq");
+    await op(v, "/api/types/task", json({ fields: { due: { type: "string" } } }, "PUT"));
+    await op(v, "/api/records", json({ path: "A/1", body: "a", types: ["task"], tags: ["urgent"] }));
+    await op(v, "/api/records", json({ path: "A/2", body: "b", types: ["task"] }));
+    await op(v, "/api/records", json({ path: "A/3", body: "c", tags: ["urgent"] }));
+    const both = (await (await op(v, "/api/records?type=task&tag=urgent")).json()) as any;
+    expect((Array.isArray(both) ? both : both.records).map((r: any) => r.path)).toEqual(["A/1"]);
+    const typed = (await (await op(v, "/api/records?type=task")).json()) as any;
+    expect((Array.isArray(typed) ? typed : typed.records).map((r: any) => r.path).sort()).toEqual(["A/1", "A/2"]);
+    const plain = await op(v, "/api/records?type=urgent");
+    expect(plain.status).toBe(422);
+    expect(((await plain.json()) as any).error_type).toBe("tag_kind");
+  });
+
+  it("without a credential, /api/records answers 401 before looking at the body", async () => {
+    const v = freshVault("d9anon");
+    const bad = await SELF.fetch(`${base(v)}/api/records`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{not json" });
+    expect(bad.status).toBe(401);
+    const clash = await SELF.fetch(`${base(v)}/api/records`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ body: "a", content: "b" }) });
+    expect(clash.status).toBe(401);
   });
 
   it("a batch is `records`, and a bad type is a 422 that makes nothing", async () => {

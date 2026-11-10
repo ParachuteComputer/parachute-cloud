@@ -736,10 +736,11 @@ export class VaultDO extends DurableObject {
     // door/0.9: /api/records and /api/types run as their /api/notes and /api/tags twins, in record words
     // (rest/records.ts); a direct /api/notes answer says it is leaving.
     const path = new URL(request.url).pathname;
-    const run = (r: Request) => this.counted(() => this.countedFetch(r));
     const records = recordsRoute(path);
-    if (records) return recordsDoor(request, records, run);
-    return withNotesDeprecation(path, await run(request));
+    // Counted BEFORE the records door reads the body: the import lock checked above must not see a request that is
+    // already past it but not yet in flight.
+    if (records) return this.counted(() => recordsDoor(request, records, (r) => this.countedFetch(r)));
+    return withNotesDeprecation(path, await this.counted(() => this.countedFetch(request)));
   }
 
   /**

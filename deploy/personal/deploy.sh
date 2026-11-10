@@ -25,7 +25,8 @@ fail() { echo "failed: $*" >&2; exit 1; }
 : "${ACCOUNT_ID:?profile: ACCOUNT_ID}" "${PREFIX:?profile: PREFIX}" "${OWNER_PUBKEY:?profile: OWNER_PUBKEY}"
 
 # --- 1 refusals ---
-[ "${UNI_SEALED_ACCOUNT_ID:-}" = "$ACCOUNT_ID" ] || die "the job's account is not the profile's ACCOUNT_ID"
+ACCOUNT_ID="$(tr 'A-F' 'a-f' <<<"$ACCOUNT_ID")"
+[ "$(tr 'A-F' 'a-f' <<<"${UNI_SEALED_ACCOUNT_ID:-}")" = "$ACCOUNT_ID" ] || die "the job's account is not the profile's ACCOUNT_ID"
 case "$ACCOUNT_ID" in
   d5d7c8646c3b69ce9f16bfd12ecbe98a|5b543fa4332a619203356ae1418af504) die "a Parachute Cloud account: the personal door never deploys there" ;;
 esac
@@ -76,7 +77,7 @@ run deploy -c wrangler.personal.gen.toml --x-provision=false || fail "vault depl
 cd "$ROOT/workers/identity"
 run d1 migrations apply "$PREFIX-identity" --remote -c wrangler.personal.gen.toml || fail "identity D1 migrations"
 run deploy -c wrangler.personal.gen.toml --x-provision=false || fail "identity deploy"
-"$WR" secret put OPS_RUN_TOKEN -c wrangler.personal.gen.toml < "$PRIVATE/ops-run-token" >/dev/null 2>&1 || fail "OPS_RUN_TOKEN"
+WR_STDIN_FILE="$PRIVATE/ops-run-token" "$WR" secret put OPS_RUN_TOKEN -c wrangler.personal.gen.toml >/dev/null 2>&1 || fail "OPS_RUN_TOKEN"
 step "deployed"
 
 # --- 6 health ---

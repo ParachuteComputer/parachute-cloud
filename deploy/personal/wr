@@ -3,6 +3,7 @@
 #   wrangler d1 ...    -> d1-write
 #   wrangler r2 ...    -> r2-admin
 #   anything else      -> workers-scripts-write
+#   WR_STDIN_FILE=f wr ...  feeds f to wrangler's stdin on every try (a retry must not get an empty stdin)
 #   wr --api PATH      -> GET https://api.cloudflare.com/client/v4/accounts/<account>/PATH with a workers-scripts-write
 #                         child (the workers.dev subdomain lookup); prints the JSON result only
 # Runs only inside `sealed job` (UNI_SEALED_ACCOUNT_ID set). Retries a failed call (a fresh child can take a few
@@ -22,7 +23,7 @@ for i in $(seq 1 "$tries"); do
       'curl -fsS -H "Authorization: Bearer $(cat <&"$UNI_SEALED_FD")" "https://api.cloudflare.com/client/v4/accounts/$UNI_SEALED_ACCOUNT_ID/$0"' "$2") >"$out" 2>"$err"
   else
     (cd "$HOME/Code/uni-ops" && "$PY" -I "$SEALED" job-child "$TPL" -- \
-      bash -c 'cd "$0"; CLOUDFLARE_ACCOUNT_ID="$UNI_SEALED_ACCOUNT_ID" CLOUDFLARE_API_TOKEN="$(cat <&"$UNI_SEALED_FD")" CI=1 WRANGLER_SEND_METRICS=false exec "$1" wrangler "${@:2}"' "$here" "$REAL" "$@") >"$out" 2>"$err"
+      bash -c 'cd "$0"; CLOUDFLARE_ACCOUNT_ID="$UNI_SEALED_ACCOUNT_ID" CLOUDFLARE_API_TOKEN="$(cat <&"$UNI_SEALED_FD")" CI=1 WRANGLER_SEND_METRICS=false exec "$1" wrangler "${@:2}"' "$here" "$REAL" "$@") >"$out" 2>"$err" < "${WR_STDIN_FILE:-/dev/null}"
   fi
   rc=$?
   [ $rc = 0 ] && break

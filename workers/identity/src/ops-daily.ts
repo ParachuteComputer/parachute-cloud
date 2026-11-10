@@ -390,7 +390,7 @@ export async function opsBearerRefusal(secretRaw: string | undefined, req: Reque
  * fix, instead of waiting for the 04:00 sweep. Bearer `OPS_RUN_TOKEN` (its own
  * secret: this one writes, /ops/daily only reads); unset → null (404).
  *
- * Takes no vault name and returns none — counts only: stale before, the run's
+ * Takes an optional `{vault}` (snapshot that one now) and returns no name — counts only: stale before, the run's
  * summary, stale after. It can only do what the nightly sweep does, to the
  * vaults the sweep already failed; the GFS ranks + retention bound the work.
  */

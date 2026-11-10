@@ -98,8 +98,9 @@ async function handleNostrAccountToken(db: D1Database, req: Request, deps: OAuth
     });
   }
   let user: User;
+  let pubkey: string;
   try {
-    ({ user } = await authenticateNostrRequest(db, req, {
+    ({ user, pubkey } = await authenticateNostrRequest(db, req, {
       ...(deps.ownerPubkey ? { ownerPubkey: deps.ownerPubkey } : {}),
       ...(deps.adminPubkeys?.length ? { adminPubkeys: deps.adminPubkeys } : {}),
       ...(deps.ownerPlan ? { ownerPlan: deps.ownerPlan } : {}),
@@ -113,6 +114,9 @@ async function handleNostrAccountToken(db: D1Database, req: Request, deps: OAuth
     return jsonError(401, "unauthenticated", "this account can't sign in");
   }
   const scopes = [accountAdminScope(user.id)];
+  // An ADMIN_PUBKEYS key's token says so: /account/pubkeys refuses it, so an admin can't add or remove the account's
+  // own sign-in keys (it can't stay on after it is dropped from the list, nor lock the owner out).
+  const viaAdmin = !!deps.adminPubkeys?.includes(pubkey) && pubkey !== deps.ownerPubkey;
   const minted = await signAccessToken(db, {
     sub: user.id,
     scopes,
@@ -123,6 +127,7 @@ async function handleNostrAccountToken(db: D1Database, req: Request, deps: OAuth
     ttlSeconds: ACCOUNT_TOKEN_TTL_SECONDS,
     now: deps.now,
     emailVerified: user.emailVerified,
+    ...(viaAdmin ? { permissions: { admin_pubkey: pubkey } } : {}),
   });
   return jsonResponse(
     { token: minted.token, expires_at: minted.expiresAt, scopes, aud: ACCOUNT_TOKEN_AUDIENCE },
