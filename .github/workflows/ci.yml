@@ -114,7 +114,9 @@ jobs:
 
       - name: Test workers/vault (vitest under workerd)
         working-directory: workers/vault
-        run: bun x vitest run
+        # door/0.9: the 0.9 engine is larger, and one workerd running all 64 files runs out of V8 heap (CI and
+        # locally). Four shards, run one after another, each start a fresh workerd; every file still runs once.
+        run: for s in 1 2 3 4; do bun x vitest run --shard=$s/4 || exit 1; done
 
   control-plane:
     name: control plane (root bun test)

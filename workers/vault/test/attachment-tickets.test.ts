@@ -68,8 +68,9 @@ describe("attachment tickets — discoverability", () => {
       params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } },
     });
     const instructions = ((await init.json()) as any).result.instructions as string;
-    expect(instructions).toContain("request-attachment-upload");
-    expect(instructions).toContain("request-attachment-download");
+    // door/0.9: the brief teaches 0.9's one tool for both, as the box door does (ticketTool: "attachment-url").
+    expect(instructions).toContain("attachment-url");
+    expect(names).toContain("attachment-url");
   });
 
   it("a read-only token still sees the download mint (read-verb) but NOT the upload mint (write-verb)", async () => {
