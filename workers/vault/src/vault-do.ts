@@ -32,6 +32,7 @@ import {
 import { NO_TAG_SCOPE } from "./rest/parse.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
+import { recordsDoor, recordsRoute, withNotesDeprecation } from "./rest/records.js";
 import { handleDeletedNotes, handleHistoryCompact } from "./rest/history.js";
 import { handleTags, handleFindPath } from "./rest/tags.js";
 import { handleDoctor } from "./rest/doctor.js";
@@ -732,7 +733,13 @@ export class VaultDO extends DurableObject {
       const refused = await this.answerDuringImport(request);
       if (refused) return refused;
     }
-    return this.counted(() => this.countedFetch(request));
+    // door/0.9: /api/records and /api/types run as their /api/notes and /api/tags twins, in record words
+    // (rest/records.ts); a direct /api/notes answer says it is leaving.
+    const path = new URL(request.url).pathname;
+    const run = (r: Request) => this.counted(() => this.countedFetch(r));
+    const records = recordsRoute(path);
+    if (records) return recordsDoor(request, records, run);
+    return withNotesDeprecation(path, await run(request));
   }
 
   /**

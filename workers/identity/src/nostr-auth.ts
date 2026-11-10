@@ -214,8 +214,17 @@ export async function findPubkeyUser(db: D1Database, pubkey: string): Promise<Us
 export async function resolvePubkeyAccount(
   db: D1Database,
   pubkey: string,
-  opts: { ownerPubkey?: string; now?: Date },
+  opts: { ownerPubkey?: string; adminPubkeys?: readonly string[]; now?: Date },
 ): Promise<User> {
+  // An admin key (env ADMIN_PUBKEYS, single-owner deploys only) signs in as the owner's account while it is listed.
+  // It is read from the config at every sign-in and never stored as a link, so dropping it from ADMIN_PUBKEYS is
+  // the whole revocation: the owner's own key and account are untouched. The owner signs in first (the bootstrap
+  // stays the owner key's alone).
+  if (opts.ownerPubkey && opts.adminPubkeys?.includes(pubkey) && pubkey !== opts.ownerPubkey) {
+    const owner = await findPubkeyUser(db, opts.ownerPubkey);
+    if (!owner) throw new NostrAuthError("unknown_pubkey", "an admin key signs in once the owner has (the owner's key signs in first)");
+    return owner;
+  }
   const linked = await findPubkeyUser(db, pubkey);
   if (linked) return linked;
   if (!opts.ownerPubkey || opts.ownerPubkey !== pubkey) {
@@ -256,7 +265,7 @@ export async function resolvePubkeyAccount(
 export async function authenticateNostrRequest(
   db: D1Database,
   req: Request,
-  opts: { ownerPubkey?: string; now?: Date },
+  opts: { ownerPubkey?: string; adminPubkeys?: readonly string[]; now?: Date },
 ): Promise<{ user: User; pubkey: string }> {
   const event = extractNostrEvent(req);
   const body = new Uint8Array(await req.arrayBuffer());

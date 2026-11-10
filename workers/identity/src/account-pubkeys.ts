@@ -72,6 +72,10 @@ export async function handleAccountPubkeyLink(db: D1Database, req: Request, deps
     if (e instanceof NostrAuthError) return err(401, "invalid_nostr_proof", `${e.code}: ${e.message}`);
     throw e;
   }
+  // An ADMIN_PUBKEYS key is never linked: the config is its one switch, so removing it there revokes it.
+  if (deps.adminPubkeys?.includes(event.pubkey)) {
+    return err(409, "admin_pubkey", "this key signs in through ADMIN_PUBKEYS; remove it there to revoke it, not here");
+  }
   const existing = await db
     .prepare("SELECT user_id, label, created_at FROM user_pubkeys WHERE pubkey = ?")
     .bind(event.pubkey)

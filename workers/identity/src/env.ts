@@ -38,6 +38,13 @@ export interface Env {
    */
   OWNER_PUBKEY?: string;
   /**
+   * Single-owner deploys only (door/0.9 deploy/personal, T-430): more keys that sign in as the OWNER_PUBKEY
+   * account, comma- or space-separated (hex or npub), e.g. an agent's own key beside the owner's. Read at every
+   * sign-in and never stored as a link, so removing a key from this list revokes it without touching the owner.
+   * Ignored without OWNER_PUBKEY. Unset on Parachute Cloud.
+   */
+  ADMIN_PUBKEYS?: string;
+  /**
    * Extra origins the same-origin gate accepts, comma-separated (P0.5). The
    * cookie-authed console/account POSTs gate on `isSameOriginRequest` against the
    * bound-origin set; `ISSUER` is ALWAYS in that set, and any origin listed here

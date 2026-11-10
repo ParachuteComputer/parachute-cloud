@@ -101,7 +101,14 @@ describe("engine upgrade on an existing vault DO", () => {
       // path lookups), and keeps SCHEMA_VERSION, so the rollback engine still opens the vault (no NewerSchemaError)
       // and SQLite keeps the extra index current under its writes. Nothing else may differ.
       const additive = new Set(["idx_notes_path_nocase"]);
-      expect(engine.filter((o: any) => !additive.has(String(o.name)))).toEqual(ROLLBACK_ENGINE_DDL.objects);
+      // door/0.9 (T-318 §8a): 0.9's engine adds one column, tags.kind, with no SCHEMA_VERSION bump (core schema.ts
+      // ensureTagKinds). The rollback engines name every column they write, so they still open and write the vault;
+      // a row they add has no kind and is read by the same rule (tag-kind.ts KIND_SQL). Nothing else may differ.
+      const withoutKind = (o: any) =>
+        o.name === "tags" ? { ...o, sql: String(o.sql).replace(/,\s*(?:--[^\n]*\n\s*)*kind TEXT/, "") } : o;
+      const tags = engine.find((o: any) => o.name === "tags") as any;
+      expect(String(tags.sql)).toMatch(/\bkind TEXT\n\)$/);
+      expect(engine.filter((o: any) => !additive.has(String(o.name))).map(withoutKind)).toEqual(ROLLBACK_ENGINE_DDL.objects);
       expect(engine.filter((o: any) => additive.has(String(o.name)))).toEqual([
         {
           type: "index",

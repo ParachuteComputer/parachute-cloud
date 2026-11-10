@@ -53,12 +53,13 @@ async function nip98(key: Key, url: string, method: string, body?: string, creat
 
 type Calls = { method: string; url: string; body: string }[];
 /** The worker with a stubbed vault (identity → vault calls go through VAULT_SERVICE). */
-function app(opts: { ownerPubkey?: string; vault?: (req: Request) => Response | Promise<Response> } = {}) {
+function app(opts: { ownerPubkey?: string; adminPubkeys?: string; vault?: (req: Request) => Response | Promise<Response> } = {}) {
   const calls: Calls = [];
   const vault = opts.vault ?? (() => Response.json({}));
   const e = {
     ...env,
     ...(opts.ownerPubkey ? { OWNER_PUBKEY: opts.ownerPubkey } : {}),
+    ...(opts.adminPubkeys !== undefined ? { ADMIN_PUBKEYS: opts.adminPubkeys } : {}),
     VAULT_SERVICE: {
       fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
         const req = new Request(input, init);
@@ -182,6 +183,55 @@ describe("NIP-98 owner sign-in (POST /account/token)", () => {
     const r = await signIn(app({ ownerPubkey: owner.pubkey }), owner);
     expect(r.status).toBe(401);
     expect(await userCount()).toBe(1);
+  });
+});
+
+describe("ADMIN_PUBKEYS: a second principal on a single-owner deploy (door/0.9, T-430)", () => {
+  test("an admin key signs in as the owner's account once the owner has, and only while it is listed", async () => {
+    const owner = nostrKey();
+    const admin = nostrKey();
+    const both = app({ ownerPubkey: owner.pubkey, adminPubkeys: `${admin.pubkey}, ` });
+    // The owner's key makes the account; the admin key can't be first.
+    expect((await signIn(both, admin)).status).toBe(401);
+    expect(await userCount()).toBe(0);
+    const o = await signIn(both, owner);
+    expect(o.status).toBe(200);
+    const a = await signIn(both, admin);
+    expect(a.status).toBe(200);
+    const ownerId = decodeJwtPayload(o.json.token).sub;
+    expect(decodeJwtPayload(a.json.token).sub).toBe(ownerId);
+    expect(decodeJwtPayload(a.json.token).scope).toBe(`account:${ownerId}:admin`);
+    // The admin's token drives /account/* like the owner's: it can make a vault.
+    expect((await both.call("/account/vaults", { auth: `Bearer ${a.json.token}` })).status).toBe(200);
+    // Never stored as a link: the owner's account lists only the owner's key.
+    const keys = await env.DB.prepare("SELECT pubkey FROM user_pubkeys").all<{ pubkey: string }>();
+    expect(keys.results.map((r) => r.pubkey)).toEqual([owner.pubkey]);
+
+    // Revoked: the deploy drops it from ADMIN_PUBKEYS. The admin is refused; the owner is untouched.
+    const revoked = app({ ownerPubkey: owner.pubkey, adminPubkeys: "" });
+    expect((await signIn(revoked, admin)).status).toBe(401);
+    const still = await signIn(revoked, owner);
+    expect(still.status).toBe(200);
+    expect(decodeJwtPayload(still.json.token).sub).toBe(ownerId);
+  });
+
+  test("without OWNER_PUBKEY the list does nothing, and a malformed entry is dropped", async () => {
+    const admin = nostrKey();
+    const { key } = await linkedOwner();
+    expect((await signIn(app({ adminPubkeys: admin.pubkey }), admin)).status).toBe(401);
+    expect((await signIn(app({ adminPubkeys: "not-a-key" }), key)).status).toBe(200);
+  });
+
+  test("an admin key can't be linked (the config is its one switch)", async () => {
+    const owner = nostrKey();
+    const admin = nostrKey();
+    const a = app({ ownerPubkey: owner.pubkey, adminPubkeys: admin.pubkey });
+    const t = (await signIn(a, owner)).json.token as string;
+    const id = decodeJwtPayload(t).sub as string;
+    const proof = await signEvent(admin, [["u", `${ISSUER}/account/pubkeys`], ["method", "POST"], ["account", id]]);
+    const r = await a.call("/account/pubkeys", { method: "POST", auth: `Bearer ${t}`, body: { event: proof } });
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("admin_pubkey");
   });
 });
 

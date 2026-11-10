@@ -101,6 +101,11 @@ export interface OAuthDeps {
    * by the NIP-98 sign-in's first-owner bootstrap (nostr-auth.ts).
    */
   ownerPubkey?: string;
+  /**
+   * The single-owner deploy's admin keys (env ADMIN_PUBKEYS, each 64 lowercase hex), signing in as the owner's
+   * account while listed (nostr-auth.ts resolvePubkeyAccount). Empty without an owner key.
+   */
+  adminPubkeys?: string[];
 }
 
 /** The deps' money switch — unset is open_beta, like BILLING_MODE itself. */
@@ -247,7 +252,13 @@ export function depsForEnv(env: Env): OAuthDeps {
     // subrequest targets); else the handlers fall back to global fetch.
     ...(env.VAULT_SERVICE ? { vaultFetch: env.VAULT_SERVICE.fetch.bind(env.VAULT_SERVICE) } : {}),
     ...(parseOwnerPubkey(env.OWNER_PUBKEY) ? { ownerPubkey: parseOwnerPubkey(env.OWNER_PUBKEY)! } : {}),
+    ...(parseOwnerPubkey(env.OWNER_PUBKEY) && parseAdminPubkeys(env.ADMIN_PUBKEYS).length ? { adminPubkeys: parseAdminPubkeys(env.ADMIN_PUBKEYS) } : {}),
   };
+}
+
+/** ADMIN_PUBKEYS: hex or npub keys separated by commas or spaces; a malformed one is dropped, never widened. */
+export function parseAdminPubkeys(raw: string | undefined): string[] {
+  return [...new Set((raw ?? "").split(/[\s,]+/).map((k) => parseOwnerPubkey(k)).filter((k): k is string => k !== null))];
 }
 
 /** OWNER_PUBKEY as 64 lowercase hex: hex as given, or a checksum-valid `npub1…`; anything else is no owner key. */

@@ -39,6 +39,7 @@ import { buildVaultProjection, attachmentsInstructionBlock } from "@openparachut
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
+import { recordWords, shape09, toolHelp } from "./mcp-09.js";
 import { errorClass, toolErrorOutcome } from "./health.js";
 
 // Transcribed from the SDK's types.js so negotiation matches byte-for-byte.
@@ -136,7 +137,8 @@ export type McpWriteGate = () => Response | null;
  * looser than REST: read-class tools AND these delete-class tools pass through
  * the gate; every other forward-mutating write/admin tool is gated.
  */
-const DELETE_CLASS_TOOLS = new Set(["delete-note", "delete-tag"]);
+// door/0.9: delete-record is delete-note under its record name; manage-types {action: "delete"} is delete-tag's.
+const DELETE_CLASS_TOOLS = new Set(["delete-note", "delete-tag", "delete-record"]);
 
 /**
  * The attachment-ticket upload mint (`core/src/mcp.ts`'s
@@ -149,6 +151,11 @@ const DELETE_CLASS_TOOLS = new Set(["delete-note", "delete-tag"]);
  * `attachment-tickets.ts`). See `handleToolCall`'s dedicated branch.
  */
 const ATTACHMENT_UPLOAD_MINT_TOOL = "request-attachment-upload";
+
+/** The upload mint under either name: the old tool, or 0.9's `attachment-url {action: "upload"}` (door/0.9). */
+function isAttachmentUploadMint(name: string, args: Record<string, unknown>): boolean {
+  return name === ATTACHMENT_UPLOAD_MINT_TOOL || (name === "attachment-url" && args.action === "upload");
+}
 
 /** A forward-mutating tool (create/update/prune) — the class the REST
  *  POST/PATCH/PUT cap+frozen gate covers. Read tools, DELETE-class tools, and
@@ -165,7 +172,11 @@ const ATTACHMENT_UPLOAD_MINT_TOOL = "request-attachment-upload";
  *  402, cap-full → 413), mirroring the REST write path. */
 function isGatedWrite(tool: McpToolDef, args: Record<string, unknown>): boolean {
   if (tool.name === "vault-info") return args.description !== undefined;
-  if (tool.name === ATTACHMENT_UPLOAD_MINT_TOOL) return false;
+  if (isAttachmentUploadMint(tool.name, args)) return false;
+  // attachment-url {download} is a read; manage-types {delete} is delete-tag (exempt like REST DELETE).
+  if (tool.name === "attachment-url") return false;
+  if (tool.name === "manage-types" && args.action === "delete") return false;
+  if (tool.name === "manage-types") return true;
   return requiredVerbForTool(tool) !== "read" && !DELETE_CLASS_TOOLS.has(tool.name);
 }
 
@@ -200,9 +211,9 @@ async function gateError(id: JsonRpcId, blocked: Response): Promise<JsonRpcMessa
  */
 export function serverInstruction(vaultName: string, description: string | null): string {
   const base =
-    `Parachute vault "${vaultName}" — an agent-native knowledge graph of notes, tags, and links. ` +
-    `Read with query-notes; write with create-note / update-note; manage schema with list-tags / update-tag; ` +
-    `traverse with find-path; orient with vault-info.`;
+    `Parachute vault "${vaultName}" — an agent-native knowledge graph of records, types, tags, and links. ` +
+    `Read with query-records; write with create-record / update-record; see and change types with list-types / ` +
+    `manage-types; orient with vault-info (vault-info {help: "<tool>"} gives any tool's every parameter).`;
   // cloud#87 — defensive `typeof`, not decoration: this is the DETONATION site
   // for a non-string description. `description?.trim()` on a number throws, and
   // `initialize` catches every throw into a -32603 INTERNAL_ERROR, so a poisoned
@@ -216,7 +227,7 @@ export function serverInstruction(vaultName: string, description: string | null)
   // brief instead of refusing the session.
   const d = typeof description === "string" ? description.trim() : undefined;
   const head = d ? `${d}\n\n${base}` : base;
-  return `${head}\n\n${attachmentsInstructionBlock({ ticketsEnabled: true })}`;
+  return `${head}\n\n${recordWords(attachmentsInstructionBlock({ ticketsEnabled: true, ticketTool: "attachment-url" }))}`;
 }
 
 /**
@@ -285,6 +296,8 @@ function overrideVaultInfo(
   if (!vaultInfo) return;
 
   vaultInfo.execute = async (params) => {
+    // `help` (0.9): a tool's full reference, which the short tools/list descriptions point to.
+    if (params.help !== undefined) return toolHelp(String(params.help), tools.map((t) => t.name));
     let description = opts.description;
 
     if (params.description !== undefined) {
@@ -562,7 +575,12 @@ function visibleTools(
     // is set. Cloud has no tag-scoped passes, so an admin may also name a note already deleted.
     ...(hasScopeForVault(auth.scopes, vaultName, "admin") ? { eraseHistory: "all" as const } : {}),
   });
-  return tools.filter((t) => hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)));
+  return tools;
+}
+
+/** The caller's tools: the 0.9 surface (mcp-09.ts), filtered to what its scopes permit for THIS vault. */
+function scopedTools(tools: McpToolDef[], vaultName: string, auth: AuthResult): McpToolDef[] {
+  return shape09(tools, vaultName, auth).filter((t) => hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)));
 }
 
 /**
@@ -602,7 +620,7 @@ async function handleToolCall(
   }
   // From here `name` is one of this vault's own visible tools (server-defined).
   const subject = `mcp:${name}`;
-  if (name === ATTACHMENT_UPLOAD_MINT_TOOL) {
+  if (isAttachmentUploadMint(name, args)) {
     // The attachment gate ladder, AT MINT, against the caller's DECLARED
     // size — an agent learns `plan_required`/`attachments_not_included`/
     // `storage_cap_exceeded` before ever curling (D7 of the design). Only
@@ -962,11 +980,13 @@ export async function handleMcp(
   // calls for; bun derives it the same way, `mcp-tools.ts`'s `ticketUrlBase`).
   const origin = publicOrigin(req);
   const ticketUrlBase = `${origin.replace(/\/$/, "")}/vault/${vaultName}`;
-  const tools = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase });
-  // Wire the server-layer vault-info override onto the caller-visible tool set
-  // (core ships a placeholder execute — "must be configured by the server
-  // layer"). Parity with bun's mcp-tools.ts overrideVaultInfo.
-  overrideVaultInfo(tools, { vaultName, auth, description, origin, ctx: vaultInfo });
+  const all = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase });
+  // Wire the server-layer vault-info override onto core's tools (core ships a
+  // placeholder execute — "must be configured by the server layer"), then the
+  // 0.9 shape and the scope filter. Parity with bun's mcp-tools.ts: override
+  // first, so the record surface wraps the real vault-info.
+  overrideVaultInfo(all, { vaultName, auth, description, origin, ctx: vaultInfo });
+  const tools = scopedTools(all, vaultName, auth);
   const ctx = { tools, vaultName, description, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];

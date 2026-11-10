@@ -251,6 +251,8 @@ BOUND_ORIGINS = "https://app.parachute.computer,https://my.parachute.computer"
 # deploy on someone's own Cloudflare sets it (64-hex or npub1…): on an instance with NO accounts, the first NIP-98
 # sign-in (POST /account/token) signed by that key creates the key-only owner. Once any account exists it does
 # nothing. See src/nostr-auth.ts.
+# ADMIN_PUBKEYS (T-430, door/0.9) — DELIBERATELY UNSET on Parachute Cloud. A single-owner deploy may list more keys
+# (comma- or space-separated) that sign in as the OWNER_PUBKEY account while listed; removing one revokes it.
 # APP_ORIGIN (#116; my.-canonical Phase 1) — where a new arrival lands: the app
 # deep-link target for the post-create 303, the vault cards' "Open your notes"
 # door, the checklist doors, and the day-0 welcome email link. Re-pointed from

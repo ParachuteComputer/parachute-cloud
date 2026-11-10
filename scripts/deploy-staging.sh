@@ -21,6 +21,12 @@
 # After deploying:  bun scripts/smoke-staging.ts   (the FULL smoke — it creates
 # throwaway accounts/vaults, which is exactly what staging is for)
 set -euo pipefail
+# door/0.9 (T-430): Parachute Cloud stays on the 0.8 engine. A checkout pinned to a 0.9 engine deploys only through
+# deploy/personal/ (its own worker names on its own account), never to parachute-* workers.
+case "$(. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/core-source.env"; echo "$PARACHUTE_CORE_VERSION")" in
+  0.8.*) ;;
+  *) echo "refused: this checkout pins a non-0.8 engine; Parachute Cloud deploys from next (deploy/personal/ for door/0.9)" >&2; exit 2 ;;
+esac
 
 export CLOUDFLARE_ACCOUNT_ID=d5d7c8646c3b69ce9f16bfd12ecbe98a   # new Parachute account
 

@@ -379,8 +379,13 @@ export async function handleTags(
         ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
         ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
         ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
+        // door/0.9 (T-318 §8a): an explicit kind, `type` or `tag`.
+        ...((body as { kind?: "type" | "tag" }).kind !== undefined ? { kind: (body as { kind?: "type" | "tag" }).kind } : {}),
       });
     } catch (err) {
+      if ((err as { error_type?: string })?.error_type === "tag_kind") {
+        return json({ error: (err as Error).message, error_type: "tag_kind", field: (err as { field?: string }).field }, 422);
+      }
       if (err instanceof IndexedFieldError) {
         return json({ error: err.message, error_type: "invalid_indexed_field" }, 400);
       }

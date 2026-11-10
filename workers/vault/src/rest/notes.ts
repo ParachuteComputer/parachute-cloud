@@ -36,6 +36,7 @@ import { normalizePath } from "@openparachute/core/src/paths.js";
 import * as linkOps from "@openparachute/core/src/links.js";
 import { getUnresolvedLinksForNote, getUnresolvedLinksForNotes, getAmbiguousLinksForNote, getAmbiguousLinksForNotes, resolveOrQueueLink, resolveStructuredLinkNote, unresolvedLinkWarning, ambiguousLinkWarning, getContentWikilinkWarnings } from "@openparachute/core/src/wikilinks.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
+import { holdTypes, markTypes, prepareCallTypes, refreshTypes } from "@openparachute/core/src/tag-kind.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
 import { embeddingsPendingWarning, ignoredParamWarning, collectUnknownTagWarnings, computeSearchDidYouMean, searchDidYouMeanWarning, truncatedResultsWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
 import {
@@ -283,8 +284,26 @@ export async function handleNotes(
   writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
   try {
-    return await handleNotesInner(req, store, subpath, deps, tagScope, writeCtx);
+    // door/0.9 (T-318 §8a, "writes accept both"): a body's `types` land in the one membership store with its tags.
+    const folded = await foldRestTypes(req, store, subpath);
+    if (folded instanceof Response) return folded;
+    if (!folded) return await handleNotesInner(req, store, subpath, deps, tagScope, writeCtx);
+    let res: Response;
+    try {
+      res = await handleNotesInner(folded.req, store, subpath, deps, tagScope, writeCtx);
+    } finally {
+      folded.release();
+    }
+    if (res.status >= 300 || !folded.types.length) return res;
+    markTypes(store.db as any, folded.types);
+    // The body was built before the marking: read its notes' types again.
+    if (!(res.headers.get("content-type") ?? "").includes("application/json")) return res;
+    const body = refreshTypes(store.db as any, await res.json());
+    const headers = new Headers(res.headers);
+    headers.delete("content-length");
+    return new Response(JSON.stringify(body), { status: res.status, headers });
   } catch (e: any) {
+    if (e?.error_type === "tag_kind") return json({ error: e.message, error_type: "tag_kind", field: e.field ?? "types", hint: e.hint }, 422);
     if (e?.code === "HISTORY_NOT_FOUND") return json({ error: e.message, error_type: "not_found" }, 404);
     if (e?.code === "HISTORY_OVERFLOW") return json({
       error_type: "history_overflow", note_id: e.note_id, byte_size: e.byte_size, limit: e.limit, message: e.message,
@@ -306,6 +325,47 @@ export async function handleNotes(
     if (ambig) return ambig;
     throw e;
   }
+}
+
+/**
+ * The REST half of "writes accept both" (box: packages/vault/src/routes.ts foldRestTypes): a POST or PATCH body's
+ * `types` (and each batch item's) folded into its tags, validated now and held so a refused write makes nothing;
+ * marked as types once the write succeeds. `null`: nothing to fold (no JSON body, or no `types` anywhere).
+ */
+async function foldRestTypes(
+  req: Request,
+  store: Store,
+  subpath: string,
+): Promise<{ req: Request; types: string[]; release: () => void } | Response | null> {
+  const mode = req.method === "POST" && (subpath === "" || subpath === "/") ? "create" : req.method === "PATCH" && /^\/[^/]+$/.test(subpath) ? "update" : null;
+  if (!mode || !(req.headers.get("content-type") ?? "").includes("application/json")) return null;
+  const text = await req.clone().text();
+  if (!text.includes('"types"')) return null;
+  let body: any;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return null; // the handler answers the bad JSON as it always has
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  // A tags array on PATCH is ignored on an existing note, so types go with tags: {add, remove}, or alone.
+  if (mode === "update" && body.types !== undefined && Array.isArray(body.tags)) {
+    return json({ error: "send types with tags: {add, remove}, or alone", error_type: "tag_kind", field: "types", hint: "tags: {add: [...]}, types: {add: [...]}" }, 400);
+  }
+  const hasTypes = body.types !== undefined || (Array.isArray(body.notes) && body.notes.some((n: any) => n && typeof n === "object" && n.types !== undefined));
+  if (!hasTypes) return null;
+  const db = store.db as any;
+  let prepared: { params: Record<string, unknown>; types: string[] };
+  try {
+    prepared = prepareCallTypes(db, body, mode, { named: mode === "update" });
+  } catch (err: any) {
+    if (err?.error_type !== "tag_kind") throw err;
+    return json({ error: err.message, error_type: "tag_kind", field: "types", hint: err.hint }, 422);
+  }
+  const release = prepared.types.length ? holdTypes(db, prepared.types) : () => {};
+  const headers = new Headers(req.headers);
+  headers.delete("content-length");
+  return { req: new Request(req.url, { method: req.method, headers, body: JSON.stringify(prepared.params) }), types: prepared.types, release };
 }
 
 async function handleNotesInner(

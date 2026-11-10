@@ -103,7 +103,7 @@ export async function checkAndBumpNostrSignin(
   try {
     return await stubFor(limiter, `nostr-signin:${ip}`).checkAndBump(NOSTR_SIGNIN_WINDOW_MS, NOSTR_SIGNIN_MAX_PER_WINDOW, now.getTime());
   } catch (err) {
-    failOpen("nostr_signin", err);
+    limiterDown("nostr_signin", err);
     return { allowed: true, retryAfterSeconds: 0 };
   }
 }

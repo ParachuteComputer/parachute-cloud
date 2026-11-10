@@ -34,7 +34,8 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main, next]
+    # door/0.9 (T-430): the long-lived own-Cloudflare door on the 0.9 engine; never merged into next.
+    branches: [main, next, door/0.9]
 
 concurrency:
   # A newer push to a PR cancels its stale run. Every push to main or next gets its own run that nothing cancels:
