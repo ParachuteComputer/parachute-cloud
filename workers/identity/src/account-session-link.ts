@@ -12,8 +12,9 @@
  *   → 200 {url, expires_at, next}   cache-control: no-store
  *
  * The link is a full account session, so read as an attacker would:
- *   - **Only on a single-owner door.** Without OWNER_PUBKEY (Parachute Cloud) the route is the router's 404, the same
- *     answer as an unknown path (index.ts). Hosted accounts have mail; they sign in with a link or code.
+ *   - **Only on a single-owner door, only for its owner.** Without OWNER_PUBKEY (Parachute Cloud) the route is the
+ *     router's 404, the same answer as an unknown path (index.ts). With it, only the account OWNER_PUBKEY is linked
+ *     to may mint. Hosted accounts have mail; they sign in with a link or code.
  *   - **Only the account's own top-level credential mints.** `requireAccount(…, "admin")` (a live, unsuspended,
  *     undeleted account; aud=account, so an app key, a vault token or an OAuth app's vault token is a 401), then the
  *     first-party client id `parachute-account` (an OAuth app that holds `account:<id>:admin` is a 403), then no
@@ -29,9 +30,18 @@
  *     parachute-cloud#366 needs a stranger to mint the link, which this route never lets them do), so it adds no
  *     path for that chain; it does not fix #366 either.
  *   - **Fenced per account** (10 per 15 minutes, fail closed: rate-limit.ts checkAndBumpSessionLink).
- *   - **No mail, `no-store`, an audit row and an ops line** naming the account and `next`'s path only (never the
- *     token, never the query, which carries the app's state).
+ *   - **No mail, `no-store`, an audit row and an ops line** naming the account and where the link lands as a fixed
+ *     label (`authorize`, `console`, `other`), never the token or the caller's `next` itself.
  *   - Minting touches no other session: the owner's other browsers stay signed in.
+ *
+ * Why the account token and not a NIP-98 signature on this request: a stolen 10-minute account token is already
+ * lasting control of the account on this base (it can link the thief's own Nostr key at /account/pubkeys, or mint
+ * year-long app keys), so a session adds no reach; and the owner already holds a token tool. A NIP-98 header here is
+ * a 401 (no bearer).
+ *
+ * The link is built on ISSUER and `next` is checked against ISSUER's origin. The personal door sets
+ * APP_ORIGIN = ISSUER, so `/oauth/authorize` is served right there; a door with a separate app origin would need
+ * the one-pass redirect (oauth-authorize.ts) to find this session, which it can't (cookies are host-only).
  *
  * What a session born from the link can do: everything any session can (it is the same `sessions` row the verify
  * path makes): consent to OAuth apps, the console, `/console/security` (enrol 2FA, set a password), mint an account
@@ -39,11 +49,12 @@
  * an emailed link does. No consent or console page checks session age, so there is no freshness rule to meet or skip.
  */
 import { decodeJwt } from "jose";
-import { requireAccount } from "./account-api.ts";
+import { bearerToken, requireAccount } from "./account-api.ts";
 import { auditStatement } from "./account-audit.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { safeNext } from "./auth-handlers.ts";
 import { createSessionLink } from "./magic-links.ts";
+import { findPubkeyUser } from "./nostr-auth.ts";
 import { jsonResponse, type OAuthDeps } from "./oauth-shared.ts";
 import { checkAndBumpSessionLink } from "./rate-limit.ts";
 
@@ -59,7 +70,8 @@ const err = (status: number, error: string, message: string, headers: Record<str
  * `requireAccount`'s `adminPubkey` is the same fact; this check needs no change there.
  */
 function carriesDelegatedPrincipal(req: Request): boolean {
-  const token = /^Bearer\s+(.+)$/i.exec((req.headers.get("authorization") ?? "").trim())?.[1]?.trim();
+  // The same bearer `requireAccount` just validated (one parser), read again for this claim only.
+  const token = bearerToken(req);
   if (!token) return true;
   try {
     return decodeJwt(token).permissions !== undefined;
@@ -68,9 +80,16 @@ function carriesDelegatedPrincipal(req: Request): boolean {
   }
 }
 
+/** A `next` is a path plus an authorize query; nothing legitimate comes near this. */
+const MAX_NEXT_LENGTH = 4096;
+const MAX_BODY_BYTES = 8192;
+
 /** The body: nothing, or `{"next": "<same-origin path or URL>"}`. Anything else is a 400. */
 async function readNext(req: Request): Promise<{ ok: true; next: string | null } | { ok: false }> {
-  const text = await req.text();
+  if (Number(req.headers.get("content-length") ?? 0) > MAX_BODY_BYTES) return { ok: false };
+  const bytes = await req.arrayBuffer();
+  if (bytes.byteLength > MAX_BODY_BYTES) return { ok: false };
+  const text = new TextDecoder().decode(bytes);
   if (text.trim() === "") return { ok: true, next: null };
   let body: unknown;
   try {
@@ -83,7 +102,15 @@ async function readNext(req: Request): Promise<{ ok: true; next: string | null }
   if (keys.some((k) => k !== "next")) return { ok: false };
   const next = (body as { next?: unknown }).next;
   if (next === undefined) return { ok: true, next: null };
-  return typeof next === "string" ? { ok: true, next } : { ok: false };
+  return typeof next === "string" && next.length <= MAX_NEXT_LENGTH ? { ok: true, next } : { ok: false };
+}
+
+/** Where the link lands, as a fixed label for the audit row and the ops line: never the caller's own string. */
+function nextLabel(next: string, issuer: string): "authorize" | "console" | "other" {
+  const path = new URL(next, issuer).pathname;
+  if (path === "/oauth/authorize") return "authorize";
+  if (path === "/console" || path.startsWith("/console/")) return "console";
+  return "other";
 }
 
 export async function handleAccountSessionLink(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
@@ -91,6 +118,12 @@ export async function handleAccountSessionLink(db: D1Database, req: Request, dep
   if (!auth.ok) return auth.response;
   if (auth.clientId !== ACCOUNT_TOKEN_CLIENT_ID || carriesDelegatedPrincipal(req)) {
     return err(403, "insufficient_scope", "a session link is minted with the owner's own account token, not an app's or an admin's");
+  }
+  // The door's owner: the account OWNER_PUBKEY signs in as. A single-owner door has one account, but if another
+  // ever exists (a linked mail sender, an operator import) it gets no browser session this way.
+  const owner = deps.ownerPubkey ? await findPubkeyUser(db, deps.ownerPubkey) : null;
+  if (!owner || owner.id !== auth.accountId) {
+    return err(403, "not_owner", "only this door's owner opens a browser session this way");
   }
   if (!auth.user.emailVerified) {
     return err(403, "unverified_account", "this account can't open a browser session this way");
@@ -109,11 +142,13 @@ export async function handleAccountSessionLink(db: D1Database, req: Request, dep
     return err(429, "rate_limited", "too many session links; try again later", { "retry-after": String(fence.retryAfterSeconds) });
   }
 
-  const { rawToken, expiresAt } = await createSessionLink(db, auth.user, next, now);
-  // The path only: the query of an authorize request carries the app's state and PKCE challenge.
-  const nextPath = new URL(next, deps.issuer).pathname;
-  await (await auditStatement(db, { actor: "self", action: "session_link_minted", userId: auth.accountId, note: { next: nextPath }, now })).run();
-  console.log(`event=session_link_minted user=${auth.accountId} next=${nextPath} expires_at=${expiresAt}`);
+  // A fixed label, not the path: the audit table outlives the account and holds no names (a path can carry a
+  // vault's), and the query of an authorize request carries the app's state and PKCE challenge.
+  const label = nextLabel(next, deps.issuer);
+  const audit = await auditStatement(db, { actor: "self", action: "session_link_minted", userId: auth.accountId, note: { next: label }, now });
+  // The link and its audit row land together or not at all.
+  const { rawToken, expiresAt } = await createSessionLink(db, auth.user, next, now, audit);
+  console.log(`event=session_link_minted user=${auth.accountId} next=${label} expires_at=${expiresAt}`);
 
   // The issuer's own origin: on a single-owner door ISSUER == APP_ORIGIN, and `/oauth/authorize` is served there.
   const url = `${deps.issuer.replace(/\/$/, "")}/auth/verify?token=${encodeURIComponent(rawToken)}`;

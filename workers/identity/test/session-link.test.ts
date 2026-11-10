@@ -296,13 +296,18 @@ describe("the link is one sign-in, once, for minutes", () => {
     const raw = new URL(json.url).searchParams.get("token")!;
     const line = logs.find((l) => l.includes("event=session_link_minted"));
     expect(line).toBeTruthy();
-    expect(line).toContain("next=/oauth/authorize");
+    expect(line).toContain("next=authorize");
     expect(line).not.toContain(raw);
     expect(line).not.toContain("state=y");
     const audit = await env.DB.prepare("SELECT action, actor, note FROM account_audit WHERE action = 'session_link_minted'").all<any>();
     expect(audit.results).toHaveLength(1);
     expect(audit.results[0].actor).toBe("self");
-    expect(String(audit.results[0].note)).not.toContain(raw);
+    expect(JSON.parse(audit.results[0].note)).toEqual({ next: "authorize" }); // a fixed label, never the caller's path
+    // A path that names a vault leaves no name behind in the audit table (it outlives the account).
+    await mint(d.e, d.bearer, { next: `/console/vaults/${d.vault}` });
+    const notes = await env.DB.prepare("SELECT note FROM account_audit WHERE action = 'session_link_minted'").all<any>();
+    expect(notes.results.map((r: any) => JSON.parse(r.note).next).sort()).toEqual(["authorize", "console"]);
+    expect(JSON.stringify(notes.results)).not.toContain(d.vault);
   });
 
   test("an owner with 2FA still answers the second factor after the link", async () => {
@@ -381,6 +386,21 @@ describe("only the owner's own account token mints a link", () => {
     expect(await linkRows()).toBe(0);
   });
 
+  test("another account on the door (not the one OWNER_PUBKEY signs in as) can't mint", async () => {
+    const d = await door();
+    const { id } = await seedUser("second@example.com");
+    const t = (
+      await signAccessToken(env.DB, {
+        sub: id, scopes: [`account:${id}:admin`], audience: "account", clientId: "parachute-account",
+        issuer: ISSUER, vaultScope: [], ttlSeconds: 600, emailVerified: true,
+      })
+    ).token;
+    const r = await mint(d.e, `Bearer ${t}`, { next: "/console" });
+    expect(r.status).toBe(403);
+    expect(r.json.error).toBe("not_owner");
+    expect(await linkRows()).toBe(0);
+  });
+
   test("an unverified account can't mint (opening it would claim the account)", async () => {
     const d = await door();
     const user = await createUser(env.DB, "unproven@example.com", "pw-unproven-1", new Date(), { emailVerified: false });
@@ -414,6 +434,7 @@ describe("next stays on this door", () => {
     expect((await mint(d.e, d.bearer, { next: 42 })).status).toBe(400);
     expect((await mint(d.e, d.bearer, { next: "/console", extra: 1 })).status).toBe(400);
     expect((await mint(d.e, d.bearer, "not json")).status).toBe(400);
+    expect((await mint(d.e, d.bearer, { next: `/console?${"a".repeat(5000)}` })).status).toBe(400); // past the length cap
     expect(await linkRows()).toBe(0);
     // An absolute URL on this door is the same place, and allowed.
     expect((await mint(d.e, d.bearer, { next: `${ORIGIN}/console` })).status).toBe(200);
@@ -430,6 +451,62 @@ describe("fenced", () => {
     expect(statuses[10]).toBe(429);
     expect(await linkRows()).toBe(10);
   }, 30_000);
+});
+
+describe("fenced closed", () => {
+  test("while the rate limiter is down, no link is minted", async () => {
+    const d = await door();
+    const down = {
+      ...d.e,
+      RATE_LIMITER: {
+        idFromName: (n: string) => ({ toString: () => n }),
+        get: () => {
+          throw new Error("limiter unavailable (test)");
+        },
+      },
+    } as unknown as Env;
+    const r = await mint(down, d.bearer, { next: "/console" });
+    expect(r.status).toBe(429);
+    expect(await linkRows()).toBe(0);
+  });
+});
+
+describe("the owner's placeholder address gets no sign-in link or code", () => {
+  async function askForLink(e: Env, path: "/auth/magic" | "/signup", email: string) {
+    const fields: Record<string, string> = { __csrf: "test-csrf-token", email };
+    if (path === "/signup") fields.password = "a-long-enough-password-1";
+    return worker.fetch(
+      new Request(`${ORIGIN}${path}`, {
+        method: "POST",
+        body: new URLSearchParams(fields),
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: ORIGIN,
+          "cf-connecting-ip": "203.0.113.77",
+          cookie: "parachute_id_csrf=test-csrf-token",
+        },
+      }),
+      e as never,
+    );
+  }
+
+  test("on the door, /auth/magic and /signup for <pubkey>@nostr.invalid mint nothing (same neutral page)", async () => {
+    const d = await door();
+    const placeholder = `${d.key.pubkey}@nostr.invalid`;
+    for (const path of ["/auth/magic", "/signup"] as const) {
+      const r = await askForLink(d.e, path, placeholder);
+      expect(r.status).toBe(200);
+    }
+    expect(await linkRows()).toBe(0);
+    // A real address still gets its link on the door (the guard is the placeholder only).
+    expect((await askForLink(d.e, "/auth/magic", "mara@example.com")).status).toBe(200);
+    expect(await linkRows()).toBe(1);
+  });
+
+  test("without OWNER_PUBKEY nothing changes: the same request mints as before", async () => {
+    expect((await askForLink(env, "/auth/magic", `${"ab".repeat(32)}@nostr.invalid`)).status).toBe(200);
+    expect(await linkRows()).toBe(1);
+  });
 });
 
 describe("Parachute Cloud (no OWNER_PUBKEY): the route does not exist", () => {

@@ -107,17 +107,21 @@ export async function createSessionLink(
   db: D1Database,
   user: { id: string; email: string },
   next: string,
-  now: Date = new Date(),
+  now: Date,
+  /** Written in the same D1 batch (one transaction) as the link: the audit row. */
+  alongside: D1PreparedStatement,
 ): Promise<{ rawToken: string; expiresAt: string }> {
   const rawToken = randomBase64url(32);
   const expiresAt = new Date(now.getTime() + SESSION_LINK_TTL_MS).toISOString();
-  await db
-    .prepare(
-      `INSERT INTO magic_links (token_hash, email, user_id, created_at, expires_at, next, code_hash)
-       VALUES (?, ?, ?, ?, ?, ?, NULL)`,
-    )
-    .bind(await sha256Hex(rawToken), user.email.trim().toLowerCase(), user.id, now.toISOString(), expiresAt, next)
-    .run();
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO magic_links (token_hash, email, user_id, created_at, expires_at, next, code_hash)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+      )
+      .bind(await sha256Hex(rawToken), user.email.trim().toLowerCase(), user.id, now.toISOString(), expiresAt, next),
+    alongside,
+  ]);
   return { rawToken, expiresAt };
 }
 
