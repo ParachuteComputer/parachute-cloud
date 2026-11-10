@@ -91,6 +91,36 @@ export async function createMagicLink(
   return { rawToken, code };
 }
 
+/**
+ * A session link's life (T-442, account-session-link.ts): long enough to paste into a browser, short enough that a
+ * link left in a terminal's scrollback or a shell history is dead soon after.
+ */
+export const SESSION_LINK_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Mint a session link: a `magic_links` row for an existing account, spent by the same `GET /auth/verify` as an
+ * emailed sign-in link (single use, hashed token, `next` re-checked by safeNext on the way out). Unlike a sign-in
+ * link it carries NO 6-digit code (`code_hash` NULL): the owner's address on a single-owner door is a public
+ * placeholder (`<pubkey>@nostr.invalid`), so a code would be a guessable second way into the same session.
+ */
+export async function createSessionLink(
+  db: D1Database,
+  user: { id: string; email: string },
+  next: string,
+  now: Date = new Date(),
+): Promise<{ rawToken: string; expiresAt: string }> {
+  const rawToken = randomBase64url(32);
+  const expiresAt = new Date(now.getTime() + SESSION_LINK_TTL_MS).toISOString();
+  await db
+    .prepare(
+      `INSERT INTO magic_links (token_hash, email, user_id, created_at, expires_at, next, code_hash)
+       VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+    )
+    .bind(await sha256Hex(rawToken), user.email.trim().toLowerCase(), user.id, now.toISOString(), expiresAt, next)
+    .run();
+  return { rawToken, expiresAt };
+}
+
 export interface ConsumedMagicLink {
   email: string;
   /** The user this link was minted for, or null for a pending signup. */
