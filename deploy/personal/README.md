@@ -7,7 +7,10 @@ pilot (`arcade-parachute-*`, T-335).
 - **One owner**, signed in with a Nostr key (NIP-98 on `POST /account/token`). `OWNER_PUBKEY` is the owner;
   `ADMIN_PUBKEYS` are more keys that sign in **as the owner's account** while they are listed (an agent's own key,
   say). An admin may sign in first: it makes the owner's account, linked to the owner's key, never its own. An admin
-  can't add or remove the account's sign-in keys (so it can't keep itself on) and can't delete the account. **Revoking an admin**: remove it from the
+  can't add or remove the account's sign-in keys (so it can't keep itself on) and can't delete the account. Everything
+  else is the admin's to do, as the owner's: make, restore and **delete vaults**, mint and revoke app keys, claim the
+  handle. List only a key you'd trust with that; nightly snapshots are the net for a deleted vault only while its
+  snapshots remain (a vault's delete takes its restore points with it). **Revoking an admin**: remove it from the
   list and deploy again; it can't sign in from then on, and its last 10-minute account token runs out. App keys it
   made stay until revoked by name (`DELETE /account/keys/<name>`; name them for the admin, e.g. `uni-*`). The owner
   is untouched.

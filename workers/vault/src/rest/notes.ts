@@ -300,7 +300,7 @@ export async function handleNotes(
       if (url.searchParams.has("expand")) params.expand = url.searchParams.get("expand");
       const f = foldTypeFilter(store.db as any, params) as { tag: string[]; tag_match: string };
       // Full-text search filters tags as "any of them": a type with a tag and a search would quietly widen.
-      if (url.searchParams.has("search") && f.tag.length > 1) {
+      if ((url.searchParams.get("search") ?? "") !== "" && f.tag_match === "all" && f.tag.length > 1) {
         return json({ error: "type with tag and search isn't one query yet: drop the tag, or search inside the type and filter", error_type: "invalid_query", field: "type" }, 422);
       }
       for (const k of ["type", "tag", "tag_match", "expand"]) url.searchParams.delete(k);

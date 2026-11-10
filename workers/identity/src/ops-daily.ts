@@ -415,10 +415,11 @@ export async function handleOpsSnapshotRunPost(
     // no body, or not JSON: the stale run
   }
   let run: SnapshotSweepSummary | null = null;
-  if (only && !(await env.DB.prepare("SELECT 1 AS x FROM vaults WHERE name = ?").bind(only).first<number>("x"))) {
-    return Response.json({ error: "no such vault", error_type: "not_found" }, { status: 404, headers: { "cache-control": "no-store" } });
+  if (only) {
+    run = await runSnapshotSweep(env, deps, { onlyVaults: [only], sender });
+    // The sweep's own reading of "a live vault of a live owner": none matched, so nothing was backed up. Say so.
+    if (run.vaults === 0) return Response.json({ error: "no such vault", error_type: "not_found" }, { status: 404, headers: { "cache-control": "no-store" } });
   }
-  if (only) run = await runSnapshotSweep(env, deps, { onlyVaults: [only], sender });
   else if (before.names.length > 0) run = await runSnapshotSweep(env, deps, { onlyVaults: before.names, sender });
   const after = await countStaleSnapshots(env.DB, deps.now?.() ?? new Date(), mode);
   console.log(`event=ops_snapshot_run stale_before=${before.names.length} stale_after=${after.stale}`);

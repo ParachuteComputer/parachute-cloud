@@ -113,6 +113,9 @@ describe("door/0.9 MCP: the record door", () => {
     expect(JSON.stringify(help.out.parameters)).toContain('"body"');
     const both = await call(v, "vault-info", { help: "query-records", description: "x" });
     expect(both.ok).toBe(false);
+    expect(both.out.data?.error_type).toBe("invalid_query");
+    expect(both.out.message).toContain("help or description");
+    expect((await call(v, "vault-info", { help: "query-records", description: null })).ok).toBe(true);
     const mt = await call(v, "vault-info", { help: "manage-types" });
     expect(Object.keys(mt.out.actions)).toEqual(["update", "rename", "merge", "delete", "prune"]);
   });
@@ -226,6 +229,9 @@ describe("door/0.9 REST: /api/records and /api/types", () => {
     const blanks = (await (await op(v, "/api/records?type=task,%20")).json()) as any;
     expect((Array.isArray(blanks) ? blanks : blanks.records).map((r: any) => r.path).sort()).toEqual(["A/1", "A/2"]);
     expect((await op(v, "/api/records?type=task&tag=urgent&search=a")).status).toBe(422);
+    expect((await op(v, "/api/records?type=task&tag=urgent&search=")).status).toBe(200); // an empty search is no search
+    await op(v, "/api/types/bug", json({ fields: { sev: { type: "string" } } }, "PUT"));
+    expect((await op(v, "/api/records?type=task,bug&search=a")).status).toBe(200); // several types: any of them, as search filters
     const plain = await op(v, "/api/records?type=urgent");
     expect(plain.status).toBe(422);
     expect(((await plain.json()) as any).error_type).toBe("tag_kind");

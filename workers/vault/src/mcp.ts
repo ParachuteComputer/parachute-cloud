@@ -298,7 +298,7 @@ function overrideVaultInfo(
   vaultInfo.execute = async (params) => {
     // `help` (0.9): a tool's full reference, which the short tools/list descriptions point to.
     if (params.help !== undefined) {
-      if (params.description !== undefined) {
+      if (params.description !== undefined && params.description !== null) {
         throw Object.assign(new Error("vault-info: pass help or description, not both."), { error_type: "invalid_query", field: "help", hint: "two calls" });
       }
       return toolHelp(String(params.help));
