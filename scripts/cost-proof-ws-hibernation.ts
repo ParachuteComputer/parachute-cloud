@@ -17,8 +17,9 @@
  *
  *   IDENTITY=<url> VAULT=<url> WINDOW_SECONDS=60 bun scripts/cost-proof-ws-hibernation.ts
  */
-const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.openparachute.workers.dev").replace(/\/$/, "");
-const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.openparachute.workers.dev").replace(/\/$/, "");
+import { STAGING_IDENTITY, STAGING_VAULT } from "./staging-origins.ts";
+const IDENTITY = (process.env.IDENTITY ?? STAGING_IDENTITY).replace(/\/$/, "");
+const VAULT = (process.env.VAULT ?? STAGING_VAULT).replace(/\/$/, "");
 const VAULT_WS = VAULT.replace(/^https:/, "wss:");
 const REDIRECT_URI = "http://localhost:8976/callback";
 const WINDOW_SECONDS = Number(process.env.WINDOW_SECONDS ?? 60);

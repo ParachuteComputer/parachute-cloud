@@ -26,17 +26,17 @@
  */
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { PROD_ACCOUNT_ID, STAGING_ACCOUNT_ID } from "./staging-origins.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY_DIR = join(HERE, "..", "workers", "identity");
-const ACCOUNT_ID = "d5d7c8646c3b69ce9f16bfd12ecbe98a"; // new Parachute account (same as deploy scripts)
 
 /** The operator accounts (Aaron's own) — everyone else stays role='user'. */
 const OPERATOR_EMAILS = ["dev@parachute.computer", "ag@unforced.org"];
 
 const TARGETS = {
-  staging: { db: "parachute-identity-staging", envFlags: ["--env", "staging"] },
-  prod: { db: "parachute-identity", envFlags: ["--env", ""] },
+  staging: { db: "parachute-identity-staging", envFlags: ["--env", "staging"], account: STAGING_ACCOUNT_ID },
+  prod: { db: "parachute-identity", envFlags: ["--env", ""], account: PROD_ACCOUNT_ID },
 } as const;
 
 const targetName = (process.env.TARGET ?? "staging") as keyof typeof TARGETS;
@@ -50,7 +50,7 @@ const DRY = process.argv.includes("--dry-run");
 function d1<T>(sql: string): T[] {
   const proc = Bun.spawnSync(
     ["bunx", "wrangler", "d1", "execute", target.db, "--remote", ...target.envFlags, "--json", "--command", sql],
-    { cwd: IDENTITY_DIR, env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: ACCOUNT_ID } },
+    { cwd: IDENTITY_DIR, env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: target.account } },
   );
   const stdout = proc.stdout.toString();
   if (proc.exitCode !== 0) {

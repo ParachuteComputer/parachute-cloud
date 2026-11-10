@@ -33,10 +33,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { coercePlanId, planTotalBytes, type PlanId } from "../workers/identity/src/plans.ts";
 import { signInternalAdminToken } from "../workers/identity/scripts/sign-internal-token.ts";
+import { PROD_ACCOUNT_ID, STAGING_ACCOUNT_ID, STAGING_IDENTITY, STAGING_VAULT } from "./staging-origins.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const IDENTITY_DIR = join(HERE, "..", "workers", "identity");
-const ACCOUNT_ID = "d5d7c8646c3b69ce9f16bfd12ecbe98a"; // new Parachute account (same as deploy scripts)
 
 /** Comp accounts (Aaron's own) — everyone else stays on 'free'. */
 const COMP_EMAILS = ["dev@parachute.computer", "ag@unforced.org"];
@@ -45,12 +45,14 @@ const TARGETS = {
   staging: {
     db: "parachute-identity-staging",
     envFlags: ["--env", "staging"],
-    issuer: "https://parachute-identity-staging.openparachute.workers.dev",
-    vaultOrigin: "https://parachute-vault-do-staging.openparachute.workers.dev",
+    account: STAGING_ACCOUNT_ID,
+    issuer: STAGING_IDENTITY,
+    vaultOrigin: STAGING_VAULT,
   },
   prod: {
     db: "parachute-identity",
     envFlags: ["--env", ""],
+    account: PROD_ACCOUNT_ID,
     issuer: "https://cloud.parachute.computer",
     vaultOrigin: "https://u.parachute.computer",
   },
@@ -67,7 +69,7 @@ const DRY = process.argv.includes("--dry-run");
 function d1<T>(sql: string): T[] {
   const proc = Bun.spawnSync(
     ["bunx", "wrangler", "d1", "execute", target.db, "--remote", ...target.envFlags, "--json", "--command", sql],
-    { cwd: IDENTITY_DIR, env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: ACCOUNT_ID } },
+    { cwd: IDENTITY_DIR, env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: target.account } },
   );
   const stdout = proc.stdout.toString();
   if (proc.exitCode !== 0) {
