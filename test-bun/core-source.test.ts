@@ -94,8 +94,9 @@ describe("engine pin (parachute-core)", () => {
 
   test("every CI install and both deploy scripts materialize the engine before installing", () => {
     const ci = read(".github/workflows/ci.yml");
+    // The two workers, the door contracts (which run both workers) and the control plane.
     const installJobs = ci.split(/^  (?=[a-z].*:$)/m).filter((job) => job.includes("run: bun install"));
-    expect(installJobs).toHaveLength(3);
+    expect(installJobs).toHaveLength(4);
     for (const job of installJobs) {
       const materialize = job.indexOf("bash scripts/materialize-vault-core.sh");
       expect(materialize).toBeGreaterThan(-1);

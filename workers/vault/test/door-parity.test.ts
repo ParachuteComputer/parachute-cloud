@@ -9,7 +9,8 @@
  */
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { parseByteRangeHeader } from "../src/vault-do.ts";
+import { env } from "cloudflare:test";
+import { dropUnreadBody, parseByteRangeHeader } from "../src/vault-do.ts";
 import { HINT_CONFLICT, HINT_PATH_CONFLICT, HINT_PATH_CONFLICT_ON_CREATE, HINT_PRECONDITION, HINT_SCHEMA_VALIDATION } from "../src/rest/refusal-hints.ts";
 import { OP, base, freshVault, mintToken, op } from "./helpers.ts";
 
@@ -144,8 +145,66 @@ describe("a model can look at a file (read-attachment)", () => {
     expect(window.content).toBe("line one\nline two");
     expect(window.content_total_length).toBe(360);
 
-    // The row outlived its bytes: said plainly, not an empty image.
-    const lost = (await (await mcpPost(v, OP, { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "read-attachment", arguments: { attachment_id: "no-such-attachment" } } })).json()) as any;
-    expect(lost.error ?? lost.result?.isError).toBeTruthy();
+    // The row outlived its bytes (the stored file is gone): said plainly, not an empty image.
+    await (env as unknown as { ATTACHMENTS: R2Bucket }).ATTACHMENTS.delete(`vault-${v}/attachments/${img.path}`);
+    const lost = (await (await mcpPost(v, reader, { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "read-attachment", arguments: { attachment_id: att.id } } })).json()) as any;
+    expect(JSON.stringify(lost)).toContain("attachment_binary_missing");
+  });
+});
+
+describe("a file that arrives by import is held to the upload door's list", () => {
+  it("an import-file for a path with a blocked extension is refused before anything is stored", async () => {
+    const v = freshVault();
+    const firstParty = await mintToken({ vault: v, scopes: `vault:${v}:read vault:${v}:write vault:${v}:admin`, clientId: "parachute-console" });
+    const f = new FormData();
+    f.set("path", "2026-01-02/page.html");
+    f.set("sha256", "ab".repeat(32));
+    f.set("file", new File(["<html></html>"], "page.html", { type: "text/html" }));
+    const res = await SELF.fetch(`${base(v)}/api/internal/import-file`, { method: "POST", headers: { Authorization: `Bearer ${firstParty}` }, body: f });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error_type: "blocked_upload_extension", extension: ".html" });
+  });
+});
+
+describe("an unread request body is dropped without holding the answer", () => {
+  const body = (chunks: (Uint8Array | "wait")[], waitMs = 5000) =>
+    new ReadableStream<Uint8Array>({
+      async pull(c) {
+        const next = chunks.shift();
+        if (next === undefined) return c.close();
+        if (next === "wait") return new Promise((r) => setTimeout(r, waitMs));
+        c.enqueue(next);
+      },
+    });
+  const post = (stream: ReadableStream<Uint8Array> | null, length?: number) =>
+    new Request("https://vault.test/x", { method: "POST", body: stream, headers: length === undefined ? {} : { "content-length": String(length) }, ...(stream ? { duplex: "half" } : {}) } as RequestInit);
+
+  it("a small body that says its length is read to the end", async () => {
+    expect(await dropUnreadBody(post(body([new Uint8Array(10), new Uint8Array(10)]), 20))).toBe("drained");
+  });
+
+  it("no body, or one already read, is left alone", async () => {
+    expect(await dropUnreadBody(new Request("https://vault.test/x"))).toBe("none");
+    const used = post(body([new Uint8Array(4)]), 4);
+    await used.arrayBuffer();
+    expect(await dropUnreadBody(used)).toBe("none");
+  });
+
+  it("a body with no length, or a large one, is cancelled at once, never read", async () => {
+    let pulled = 0;
+    const counting = () => new ReadableStream<Uint8Array>({ pull(c) { pulled++; c.enqueue(new Uint8Array(1024)); } }, { highWaterMark: 0 });
+    expect(await dropUnreadBody(post(counting()))).toBe("cancelled");
+    expect(await dropUnreadBody(post(counting(), 50 * 1024 * 1024))).toBe("cancelled");
+    expect(pulled).toBe(0);
+  });
+
+  it("a sender that trickles is cut off at the time limit, so the refusal is not held open", async () => {
+    const t0 = Date.now();
+    expect(await dropUnreadBody(post(body([new Uint8Array(4), "wait"]), 1000), { ms: 150 })).toBe("cancelled");
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+
+  it("a body longer than it declared is cancelled", async () => {
+    expect(await dropUnreadBody(post(body([new Uint8Array(600), new Uint8Array(600)]), 100), { bytes: 1000 })).toBe("cancelled");
   });
 });

@@ -4,7 +4,7 @@
  *   POST /account/vaults/import               multipart: vault_name, tarball (a Parachute export, ≤ 50 MiB)
  *        → 201 {name, url, notes, skipped_attachments, missing_files}
  *   POST /account/vaults/<name>/import-file   multipart: path, sha256, file (≤ 50 MiB): one file the tar left out
- *        → 200 {stored | already}             (the vault's own answer)
+ *        → 201 {written: true, size} | 200 {written: false, already: true}   (the vault's own answer)
  *   GET  /account/vaults/<name>/import-check  → 200 {notes, attachments, files_stored, missing_files}
  *
  * Before this the only ways in were the console's Import button (a browser session) and the operator's
@@ -19,7 +19,8 @@
  *   - **A file only fills a hole.** `import-file` reaches the vault's `/api/internal/import-file`, which stores bytes
  *     only at a path an attachment row of that vault already names, only when the sha256 given matches the bytes,
  *     and never over different bytes already there (409). Owner-gated: one 403 for "not yours" and "no such vault".
- *   - **Sizes**: the tar and each file are refused over 50 MiB before they are read, as on the console.
+ *   - **Sizes**: the tar and each file are refused over 50 MiB before they are read, as on the console, and a body
+ *     that doesn't say how long it is (no Content-Length) is refused with 411: nothing is buffered on faith.
  *   - **A name deleted a moment ago** answers 409 `name_just_deleted` until the old vault's storage object has
  *     unloaded: the row is the caller's, and the same request again lands. Never a half-made vault.
  */
@@ -36,6 +37,15 @@ const FORM_OVERHEAD = 64 * 1024;
 
 const refuse = (status: number, error: string, message: string, extra: Record<string, unknown> = {}) =>
   jsonResponse({ error, message, ...extra }, status, NO_STORE);
+
+/** The declared length of an upload, or a refusal: these routes buffer the body, so it must say how big it is. */
+function declaredLength(req: Request, what: string): number | Response {
+  const raw = req.headers.get("content-length");
+  const n = Number(raw ?? "");
+  if (raw === null || !Number.isFinite(n) || n < 0) return refuse(411, "length_required", "Send a Content-Length: this door reads the upload into memory and needs to know its size first.");
+  if (n > MAX_IMPORT_BYTES + FORM_OVERHEAD) return tooLarge(what);
+  return n;
+}
 
 function tooLarge(what: string): Response {
   return refuse(413, "import_too_large", `${what} is over ${MAX_IMPORT_MIB} MiB. Send attached files one at a time with import-file.`, { limit: MAX_IMPORT_BYTES });
@@ -58,8 +68,8 @@ export async function handleAccountVaultImport(db: D1Database, req: Request, dep
   const startedMs = Date.now();
   const auth = await requireAccount(db, req, deps, "admin");
   if (!auth.ok) return auth.response;
-  const declared = Number(req.headers.get("content-length") ?? "");
-  if (Number.isFinite(declared) && declared > MAX_IMPORT_BYTES + FORM_OVERHEAD) return tooLarge("That export");
+  const declared = declaredLength(req, "That export");
+  if (declared instanceof Response) return declared;
   let form: FormData;
   try {
     form = await req.formData();
@@ -87,6 +97,11 @@ export async function handleAccountVaultImport(db: D1Database, req: Request, dep
     case "too_large":
       return tooLarge("That export");
     case "refused":
+      // The hop to the vault was refused for a reason that isn't about the file (its credential, the vault's
+      // state): the caller can't fix that by sending another file. The name stays theirs; the same call may land.
+      if (r.errorType === null || r.errorType === "Unauthorized" || r.errorType === "Forbidden") {
+        return refuse(502, "import_failed", "The import didn't finish. The name is still yours: send the same request again.", { name: r.vaultName });
+      }
       // A vault of this name was deleted moments ago and its storage object hasn't let go yet (it answers 410 until
       // it is unloaded, well under a minute). The name is this account's now; the same call again will land.
       if (r.errorType === "vault_destroyed") {
@@ -109,7 +124,12 @@ export async function handleAccountVaultImport(db: D1Database, req: Request, dep
 
 function ownedVaultName(req: Request, suffix: string): string | null {
   const m = new RegExp(`^/account/vaults/([^/]+)${suffix}/?$`).exec(new URL(req.url).pathname);
-  return m ? decodeURIComponent(m[1]!).toLowerCase() : null;
+  if (!m) return null;
+  try {
+    return decodeURIComponent(m[1]!).toLowerCase();
+  } catch {
+    return null; // a broken escape names no vault
+  }
 }
 
 /** The owner's vault named in the path, or the one refusal that fits both "not yours" and "no such vault". */
@@ -123,10 +143,10 @@ async function owned(db: D1Database, req: Request, deps: OAuthDeps, suffix: stri
 }
 
 export async function handleAccountVaultImportFile(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
-  const declared = Number(req.headers.get("content-length") ?? "");
   const who = await owned(db, req, deps, "/import-file");
   if (who instanceof Response) return who;
-  if (Number.isFinite(declared) && declared > MAX_IMPORT_BYTES + FORM_OVERHEAD) return tooLarge("That file");
+  const declared = declaredLength(req, "That file");
+  if (declared instanceof Response) return declared;
   let form: FormData;
   try {
     form = await req.formData();
@@ -139,7 +159,8 @@ export async function handleAccountVaultImportFile(db: D1Database, req: Request,
     if (v === null) return refuse(400, "invalid_request", `${k} is required.`);
     out.set(k, v);
   }
-  const res = await callVaultApi(db, deps, { userId: who.accountId, vaultName: who.name, method: "POST", apiPath: "/api/internal/import-file", verb: "admin", rawBody: out });
+  const res = await callVaultApi(db, deps, { userId: who.accountId, vaultName: who.name, method: "POST", apiPath: "/api/internal/import-file", verb: "admin", rawBody: out }).catch(() => null);
+  if (!res) return refuse(502, "vault_unreachable", "The vault didn't answer. Send the file again.");
   return new Response(res.body, { status: res.status, headers: { "content-type": "application/json", ...NO_STORE } });
 }
 

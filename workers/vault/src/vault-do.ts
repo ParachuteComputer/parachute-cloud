@@ -2171,6 +2171,11 @@ export class VaultDO extends DurableObject {
       return json({ error: "path, sha256 (hex) and file are required", error_type: "import_file_invalid" }, 400);
     }
     if (file.size > MAX_IMPORT_BYTES) return this.importTooLargeResponse();
+    // The upload door refuses these (active content served from this origin). A file that arrives by import is
+    // held to the same list, so that guarantee never rests on what the served content type happens to be.
+    if (BLOCKED_EXTENSIONS.has(extLower(path))) {
+      return json({ error: `File type ${extLower(path)} not allowed (active/executable content)`, error_type: "blocked_upload_extension", extension: extLower(path) }, 400);
+    }
     const known = this.raw().exec("SELECT 1 FROM attachments WHERE path = ? LIMIT 1", path).toArray().length > 0;
     if (!known) return json({ error: "No attachment row has this path", error_type: "import_file_unknown" }, 404);
 
@@ -3979,8 +3984,18 @@ export class VaultDO extends DurableObject {
       // past the end) gets the whole file, the box's rule (parachute-core routes.ts parseByteRangeHeader).
       const rangeHeader = req.headers.get("range");
       const head = rangeHeader ? await this.env.ATTACHMENTS.head(key) : null;
-      const range = head ? parseByteRangeHeader(rangeHeader, head.size) : null;
-      const obj = await this.env.ATTACHMENTS.get(key, range ? { range: { offset: range.start, length: range.end - range.start + 1 } } : undefined);
+      let range = head ? parseByteRangeHeader(rangeHeader, head.size) : null;
+      let obj: R2ObjectBody | null = null;
+      if (range) {
+        // The object can be replaced or removed between the size read and this one. A range it no longer holds
+        // falls back to the whole file rather than answering with lengths that describe something else.
+        obj = await this.env.ATTACHMENTS.get(key, { range: { offset: range.start, length: range.end - range.start + 1 } }).catch(() => null);
+        if (!obj || obj.size !== head!.size) {
+          range = null;
+          obj = null;
+        }
+      }
+      if (!obj) obj = await this.env.ATTACHMENTS.get(key);
       if (!obj) return json({ error: "Not found", error_type: "not_found" }, 404);
       const ext = extLower(reqPath);
       // Extension ONLY, never R2 httpMetadata — the same rule as the ticket
@@ -4404,26 +4419,48 @@ export class VaultDO extends DurableObject {
  * A request answered before its body was read (a refusal: 401, 403, 404, a cap) still has the router piping that
  * body in. Once the answer is out the pipe fails with "Can't read from request stream after response has been
  * sent", uncaught: under local workerd that restarts the worker and the next requests get 503, and a client sees
- * its connection drop instead of the refusal. So the unread body is read to its end and thrown away first, up to
- * DRAIN_LIMIT_BYTES; past that (a refused large upload) it is cancelled, as before.
+ * its connection drop instead of the refusal. So a small unread body is read to its end and thrown away first.
+ *
+ * Bounded on purpose, because this runs for requests that were never signed in: only a body that says how long it
+ * is and is at most {@link DRAIN_LIMIT_BYTES}, and for at most {@link DRAIN_LIMIT_MS}. Anything else (no
+ * Content-Length, a large upload, a sender that trickles) is cancelled as before, so a refusal is never held open
+ * by whoever is being refused.
  */
-const DRAIN_LIMIT_BYTES = 8 * 1024 * 1024;
-async function dropUnreadBody(request: Request): Promise<void> {
-  if (!request.body || request.bodyUsed) return;
+export const DRAIN_LIMIT_BYTES = 1024 * 1024;
+export const DRAIN_LIMIT_MS = 2000;
+export async function dropUnreadBody(request: Request, limits: { bytes?: number; ms?: number } = {}): Promise<"none" | "drained" | "cancelled"> {
+  if (!request.body || request.bodyUsed) return "none";
+  const maxBytes = limits.bytes ?? DRAIN_LIMIT_BYTES;
+  const declared = Number(request.headers.get("content-length") ?? "");
+  // Only the two calls used here; the platform's own reader type differs between the runtime and the test pool.
+  let reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<void> };
   try {
-    const reader = request.body.getReader();
+    reader = request.body.getReader() as unknown as typeof reader;
+  } catch {
+    return "none"; // already locked: someone else is reading it
+  }
+  const cancel = async (): Promise<"cancelled"> => {
+    await reader.cancel().catch(() => {});
+    return "cancelled";
+  };
+  if (!Number.isFinite(declared) || declared <= 0 || declared > maxBytes) return cancel();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<"late">((resolve) => {
+    timer = setTimeout(() => resolve("late"), limits.ms ?? DRAIN_LIMIT_MS);
+  });
+  try {
     let seen = 0;
     for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      seen += value?.byteLength ?? 0;
-      if (seen > DRAIN_LIMIT_BYTES) {
-        await reader.cancel();
-        return;
-      }
+      const step = await Promise.race([reader.read(), late]);
+      if (step === "late") return cancel();
+      if (step.done) return "drained";
+      seen += step.value?.byteLength ?? 0;
+      if (seen > maxBytes) return cancel(); // more than it declared
     }
   } catch {
-    // Already locked or closed: nothing left to drop.
+    return "cancelled";
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
