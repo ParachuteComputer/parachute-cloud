@@ -5,10 +5,14 @@
 # step looks before it makes, so a re-run after a failure picks up where it stopped. Run it once per fresh account;
 # after that scripts/deploy-staging.sh is the whole deploy.
 #
-#   bash scripts/staging-bootstrap.sh [--steps r2,d1,deploy,secrets] [--secrets-dir DIR]
+#   bash scripts/staging-bootstrap.sh [--steps subdomain,r2,d1,deploy,secrets] [--secrets-dir DIR]
 #   bash scripts/staging-bootstrap.sh --local STATE_DIR [--secrets-dir DIR]     # rehearsal: no Cloudflare call
 #
-# Steps, in order (default: all four):
+# Steps, in order (default: all five):
+#   subdomain the account's workers.dev subdomain is STAGING_WORKERS_SUBDOMAIN: registered if the account has none,
+#            refused if it has another. A direct API call (wrangler has no command for it), so it needs
+#            CLOUDFLARE_API_TOKEN in the environment (Workers Scripts Edit on this account); without one it is skipped
+#            with a note, and the deploy step's /health check catches a wrong name.
 #   r2       the bucket STAGING_R2_BUCKET, unless the account has it. Its own card under the sealed broker: bucket
 #            create needs r2-admin, which a staging window never holds (uni-ops sealed/policy.py).
 #   d1       the database STAGING_D1_NAME, unless the account has it; its id is then written into
@@ -42,17 +46,17 @@ VAULT_HOST="parachute-vault-do-staging.${STAGING_WORKERS_SUBDOMAIN}.workers.dev"
 IDENTITY_SECRETS="OPS_RUN_TOKEN OPS_READ_TOKEN OPS_DELETE_TOKEN OPS_CANARY_TOKEN OPS_ALERT_WEBHOOK_URL STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET"
 VAULT_SECRETS="VAULT_AUTH_TOKEN"
 
-STEPS="r2,d1,deploy,secrets"; SECRETS_DIR=""; LOCAL=""
+STEPS="subdomain,r2,d1,deploy,secrets"; SECRETS_DIR=""; LOCAL=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --steps) STEPS="${2:?--steps r2,d1,deploy,secrets}"; shift ;;
+    --steps) STEPS="${2:?--steps subdomain,r2,d1,deploy,secrets}"; shift ;;
     --secrets-dir) SECRETS_DIR="$(cd "${2:?--secrets-dir DIR}" && pwd)"; shift ;;
     --local) LOCAL="$(mkdir -p "${2:?--local STATE_DIR}" && cd "$2" && pwd)"; shift ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac; shift
 done
-for s in ${STEPS//,/ }; do case "$s" in r2|d1|deploy|secrets) ;; *) echo "unknown step: $s" >&2; exit 2 ;; esac; done
+for s in ${STEPS//,/ }; do case "$s" in subdomain|r2|d1|deploy|secrets) ;; *) echo "unknown step: $s" >&2; exit 2 ;; esac; done
 want() { case ",$STEPS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 say() { echo "== $*"; }
 die() { echo "refused: $*" >&2; exit 2; }
@@ -80,6 +84,34 @@ write_d1_id() {
   sed -i "s/^STAGING_D1_ID=.*/STAGING_D1_ID=$id/" "$ENV_FILE"
   STAGING_D1_ID="$id"
 }
+
+# --- subdomain ----------------------------------------------------------------------------------------------------
+# The token goes to curl as a header file on a pipe, never on argv. The response holds no secret.
+cf_subdomain() {   # cf_subdomain GET|PUT: prints the account's workers.dev subdomain after the call, or nothing
+  local body=()
+  [ "$1" = PUT ] && body=(-H "content-type: application/json" --data "{\"subdomain\":\"$STAGING_WORKERS_SUBDOMAIN\"}")
+  curl -s -X "$1" "${CF_API:-https://api.cloudflare.com/client/v4}/accounts/$STAGING_ACCOUNT_ID/workers/subdomain" \
+    -H @<(printf 'authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN") "${body[@]}" \
+    | bun -e 'const t = await Bun.stdin.text(); let j; try { j = JSON.parse(t); } catch { process.exit(3); }
+              if (j.success && j.result?.subdomain) { console.log(j.result.subdomain); process.exit(0); }
+              const codes = (j.errors ?? []).map((e) => e.code); console.error("cloudflare:", JSON.stringify(j.errors ?? []).slice(0, 200));
+              process.exit(codes.includes(10007) ? 0 : 4);'
+}
+if want subdomain && [ -z "$LOCAL" ]; then
+  say "subdomain: $STAGING_WORKERS_SUBDOMAIN.workers.dev on Parachute Staging"
+  if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+    echo "   skipped: no CLOUDFLARE_API_TOKEN here (set the name in the dashboard; deploy's /health check proves it)"
+  else
+    have="$(cf_subdomain GET)" || die "could not read the account's workers.dev subdomain"
+    if [ "$have" = "$STAGING_WORKERS_SUBDOMAIN" ]; then echo "   already set"
+    elif [ -n "$have" ]; then die "the account's workers.dev subdomain is '$have', not '$STAGING_WORKERS_SUBDOMAIN': set STAGING_WORKERS_SUBDOMAIN and the [env.staging.vars] URLs to it (or rename it in the dashboard)"
+    else
+      have="$(cf_subdomain PUT)" || die "could not register $STAGING_WORKERS_SUBDOMAIN.workers.dev (taken, or the key lacks Workers Scripts Edit)"
+      [ "$have" = "$STAGING_WORKERS_SUBDOMAIN" ] || die "registered '$have', not '$STAGING_WORKERS_SUBDOMAIN'"
+      echo "   registered"
+    fi
+  fi
+fi
 
 # --- r2 ---------------------------------------------------------------------------------------------------------
 if want r2 && [ -z "$LOCAL" ]; then

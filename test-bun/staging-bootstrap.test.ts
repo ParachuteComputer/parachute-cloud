@@ -127,6 +127,62 @@ describe("staging-bootstrap.sh against a fake Cloudflare", () => {
   });
 });
 
+describe("staging-bootstrap.sh subdomain step against a fake Cloudflare API", () => {
+  // A stand-in curl: answers the workers/subdomain endpoint from $FAKE_CF/subdomain, logs its argv, and reads the
+  // header file it was given (so the test sees the token arrived without it ever being on argv).
+  const FAKE_CURL = `#!/usr/bin/env bash
+echo "$*" >> "$FAKE_CF/curl-argv"
+m=GET; prev=""; for a in "$@"; do
+  [ "$prev" = -X ] && m="$a"
+  case "$a" in @*) cat "\${a#@}" >> "$FAKE_CF/curl-headers" ;; esac
+  prev="$a"
+done
+case "$m" in
+  GET) if [ -s "$FAKE_CF/subdomain" ]; then printf '{"success":true,"result":{"subdomain":"%s"}}' "$(cat "$FAKE_CF/subdomain")"
+       else printf '{"success":false,"errors":[{"code":10007,"message":"no subdomain"}]}'; fi ;;
+  PUT) echo parachute-staging > "$FAKE_CF/subdomain"; printf '{"success":true,"result":{"subdomain":"parachute-staging"}}' ;;
+esac
+`;
+  function withCurl() {
+    const fx = fixture();
+    writeFileSync(join(fx.bin, "curl"), FAKE_CURL);
+    chmodSync(join(fx.bin, "curl"), 0o755);
+    return fx;
+  }
+  const TOKEN = "made-up-token-0123456789";
+
+  test("an account with no subdomain gets the configured one; the token is never on argv", () => {
+    const fx = withCurl();
+    const r = run(fx, ["--steps", "subdomain"], { CLOUDFLARE_API_TOKEN: TOKEN });
+    expect(r.code, r.out).toBe(0);
+    expect(r.out).toContain("registered");
+    const argv = readFileSync(join(fx.cf, "curl-argv"), "utf8");
+    expect(argv).toContain(`/accounts/${STAGING}/workers/subdomain`);
+    expect(argv).not.toContain(TOKEN);
+    expect(readFileSync(join(fx.cf, "curl-headers"), "utf8")).toContain(`authorization: Bearer ${TOKEN}`);
+    expect(r.out).not.toContain(TOKEN);
+    expect(run(fx, ["--steps", "subdomain"], { CLOUDFLARE_API_TOKEN: TOKEN }).out).toContain("already set");
+  });
+
+  test("an account with another subdomain is refused, not renamed", () => {
+    const fx = withCurl();
+    writeFileSync(join(fx.cf, "subdomain"), "someone-else\n");
+    const r = run(fx, ["--steps", "subdomain"], { CLOUDFLARE_API_TOKEN: TOKEN });
+    expect(r.code).toBe(2);
+    expect(r.out).toContain("'someone-else'");
+    expect(readFileSync(join(fx.cf, "curl-argv"), "utf8")).not.toContain("PUT");
+  });
+
+  test("without a token the step is skipped and nothing is called", () => {
+    const fx = withCurl();
+    const env = { CLOUDFLARE_API_TOKEN: "" };
+    const r = run(fx, ["--steps", "subdomain"], env);
+    expect(r.code, r.out).toBe(0);
+    expect(r.out).toContain("skipped");
+    expect(existsSync(join(fx.cf, "curl-argv"))).toBe(false);
+  });
+});
+
 describe("scripts/release/bunx on the staging account", () => {
   // The sealed CLI stand-in: logs the template asked for, hands a made-up key on a fd, runs the command.
   const FAKE_SEALED = `#!/usr/bin/env bash
