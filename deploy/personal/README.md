@@ -51,10 +51,10 @@ Parachute Cloud account and any `parachute-*` or `arcade-parachute*` prefix.
 ## Sign in, and point an app at it
 
 ```bash
-bun deploy/personal/nip98.ts token https://<PREFIX>-identity.<sub>.workers.dev <your secret key file> /tmp/acct
-# then, with that 10-minute account token:
-curl -H "Authorization: Bearer $(cat /tmp/acct)" -X POST .../account/vaults -d '{"name":"podcast"}'
-curl -H "Authorization: Bearer $(cat /tmp/acct)" -X POST .../account/keys -d '{"name":"podcast-studio","vault":"podcast","can":"write"}'
+bun deploy/personal/nip98.ts token https://<PREFIX>-identity.<sub>.workers.dev <your secret key file> acct.curl
+# then, with that 10-minute account pass (a curl config holding it):
+curl -K acct.curl https://<identity>/account/vaults -d '{"name":"podcast"}'
+curl -K acct.curl https://<identity>/account/keys -d '{"name":"podcast-studio","vault":"podcast","can":"write"}'
 ```
 
 The app keeps that key (a year, one vault, read or write, never admin) and calls
@@ -64,7 +64,7 @@ The app keeps that key (a year, one vault, read or write, never admin) and calls
 ## Restore (one line)
 
 ```bash
-curl -H "Authorization: Bearer $(cat /tmp/acct)" -X POST https://<identity>/account/vaults/<vault>/restore -d '{}'
+curl -K acct.curl -X POST https://<identity>/account/vaults/<vault>/restore -d '{}'
 ```
 
 The newest snapshot (or `{"key": "..."}` from `GET /account/vaults/<vault>/snapshots`) becomes a new vault,

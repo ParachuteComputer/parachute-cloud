@@ -291,7 +291,7 @@ export async function handleNotes(
     // door/0.9: `?type=` on /api/records is query-records' `type`, folded by the engine (subtypes, and with ?tag all of
     // them; a plain tag refused). /api/notes gains nothing new (SPEC §5.1).
     // An empty ?type= is no type filter at all (as an absent one), never "every record".
-    if (req.method === "GET" && RECORDS_REQUESTS.has(req) && (new URL(req.url).searchParams.get("type") ?? "").trim() !== "") {
+    if (req.method === "GET" && RECORDS_REQUESTS.has(req) && (parseQueryList(new URL(req.url), "type") ?? []).some((t) => t.trim() !== "")) {
       const url = new URL(req.url);
       const params: Record<string, unknown> = { type: parseQueryList(url, "type") ?? [] };
       const tag = parseQueryList(url, "tag");

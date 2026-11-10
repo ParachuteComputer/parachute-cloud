@@ -3,7 +3,8 @@
 //   bun deploy/personal/nip98.ts pubkey <secret-file>             the key's pubkey (hex)
 //   bun deploy/personal/nip98.ts token <identity-origin> <secret-file> [out-file]
 //                                                                 sign in (POST /account/token); the 10-minute account
-//                                                                 token goes to out-file (0600), never to stdout
+//                                                                 token goes to out-file (0600), never to stdout; an
+//                                                                 out-file ending in .curl is a curl config: curl -K it
 // A secret file holds 64 hex characters, or an nsec1… (bech32). Nothing secret is printed.
 // The identity worker's own Schnorr (its NIP-98 verifier uses the same package): no second copy to install.
 import { schnorr } from "../../workers/identity/node_modules/@noble/curves/secp256k1.js";
@@ -99,7 +100,9 @@ if (import.meta.main) {
       process.exit(1);
     }
     if (c) {
-      writeFileSync(c, r.token, { mode: 0o600 });
+      // out-file ending in .curl: a curl config (`curl -K acct.curl …`) carrying the pass and a JSON content-type.
+      const text = c.endsWith(".curl") ? `header = "Authorization: Bearer ${r.token}"\nheader = "Content-Type: application/json"\n` : r.token;
+      writeFileSync(c, text, { mode: 0o600 });
       console.log(`account token (10 min) in ${c}`);
     } else console.log("signed in (pass an out-file to keep the token)");
   } else {
