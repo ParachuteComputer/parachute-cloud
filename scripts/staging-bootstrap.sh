@@ -41,8 +41,8 @@ IDENTITY_TOML="$ROOT/workers/identity/wrangler.toml"
 IDENTITY_HOST="parachute-identity-staging.${STAGING_WORKERS_SUBDOMAIN}.workers.dev"
 VAULT_HOST="parachute-vault-do-staging.${STAGING_WORKERS_SUBDOMAIN}.workers.dev"
 
-# Secrets by worker. Names only; every one is optional in the code (workers/*/src/env.ts). Stripe is absent on purpose:
-# staging walks the open beta (BILLING_MODE), where checkout is dormant even with keys.
+# Secrets by worker. Names only; every one is optional in the code (workers/*/src/env.ts). The Stripe pair is set only if
+# the dir has it (staging walks the open beta, where checkout is dormant even with keys) and only in test mode.
 IDENTITY_SECRETS="OPS_RUN_TOKEN OPS_READ_TOKEN OPS_DELETE_TOKEN OPS_CANARY_TOKEN OPS_ALERT_WEBHOOK_URL STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET"
 VAULT_SECRETS="VAULT_AUTH_TOKEN"
 
@@ -178,7 +178,7 @@ secrets_json() {
 health_200() {   # health_200 URL: waits up to 90 s for a 200 (a new workers.dev host takes a moment)
   local i code
   for i in $(seq 1 30); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' "$1" || true)"
+    code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$1" || true)"
     [ "$code" = 200 ] && return 0
     sleep 3
   done
@@ -188,7 +188,8 @@ if [ -z "$LOCAL" ]; then
   if want deploy; then
     say "deploy: scripts/deploy-staging.sh on Parachute Staging"
     [ -s "$ROOT/workers/identity/.dev-secrets" ] || die "no workers/identity/.dev-secrets (the made-up dev user deploy-staging.sh seeds)"
-    bash "$ROOT/scripts/deploy-staging.sh"
+    bash "$ROOT/scripts/deploy-staging.sh" \
+      || die "deploy-staging.sh failed. If wrangler named the CPU limit ([limits] cpu_ms, inherited from production), the account needs Workers Paid"
     for h in "$VAULT_HOST" "$IDENTITY_HOST"; do
       health_200 "https://$h/health" || die "https://$h/health is not 200: is the account's workers.dev subdomain '$STAGING_WORKERS_SUBDOMAIN'?"
       echo "   https://$h/health 200"
@@ -217,15 +218,21 @@ fi
 # --- local rehearsal ----------------------------------------------------------------------------------------------
 export CI=1   # wrangler never prompts here
 LOGS="$LOCAL/logs"; mkdir -p "$LOGS"
-PIDS=""; cleanup() { for p in $PIDS; do kill "$p" 2>/dev/null || true; done; rm -f "$LOCAL"/*.vars; }
+# Local secrets are proven only by the running workers (the deploy step), so they never run alone.
+if want secrets && ! want deploy; then die "--local proves secrets only together with the deploy step"; fi
+# Each wrangler dev runs in its own process group (setsid): cleanup ends the whole group, workerd included.
+PIDS=""; cleanup() { for p in $PIDS; do kill -- "-$p" 2>/dev/null || true; done; rm -f "$LOCAL"/*.vars; }
 trap cleanup EXIT
 if want deploy; then
   say "deploy (local): migrations, seed, both staging configs bundled"
   (cd "$ROOT/workers/identity" && bunx wrangler d1 migrations apply "$STAGING_D1_NAME" --local --env staging --persist-to "$LOCAL") > "$LOGS/migrate.txt" 2>&1 \
     || { tail -5 "$LOGS/migrate.txt" >&2; die "local migrations failed"; }
   applied="$(cd "$ROOT/workers/identity" && bunx wrangler d1 execute "$STAGING_D1_NAME" --local --env staging --persist-to "$LOCAL" --json \
-    --command "SELECT COUNT(*) AS n FROM d1_migrations" 2>/dev/null | bun -e 'const t=await Bun.stdin.text(); console.log(JSON.parse(t.slice(t.indexOf("[")))[0].results[0].n)')"
-  echo "   migrations applied: $applied of $(ls "$ROOT/workers/identity/migrations"/*.sql | wc -l)"
+    --command "SELECT COUNT(*) AS n FROM d1_migrations" 2>/dev/null | bun -e 'const t=await Bun.stdin.text(); console.log(JSON.parse(t.slice(t.indexOf("[")))[0].results[0].n)')" \
+    || die "could not count the applied migrations"
+  total="$(ls "$ROOT/workers/identity/migrations"/*.sql | wc -l)"
+  echo "   migrations applied: $applied of $total"
+  [ "$applied" = "$total" ] || die "only $applied of $total migrations applied"
   if [ -s "$ROOT/workers/identity/.dev-secrets" ]; then
     (cd "$ROOT/workers/identity" && bun scripts/seed-dev-user.ts >/dev/null \
       && bunx wrangler d1 execute "$STAGING_D1_NAME" --local --env staging --persist-to "$LOCAL" --command="$(cat scripts/seed-dev-user.sql)" > "$LOGS/seed.txt" 2>&1 \
@@ -260,22 +267,22 @@ if want deploy; then
   for w in vault identity; do
     port="$VP"; [ $w = identity ] && port="$IP"
     envf=(); [ -f "$LOCAL/$w.vars" ] && envf=(--env-file "$LOCAL/$w.vars")
-    (cd "$ROOT/workers/$w" && exec bunx wrangler dev --env staging --local --persist-to "$LOCAL" --ip 127.0.0.1 --port "$port" \
+    (cd "$ROOT/workers/$w" && exec setsid bunx wrangler dev --env staging --local --persist-to "$LOCAL" --ip 127.0.0.1 --port "$port" \
       --inspector-port 0 "${envf[@]}" --show-interactive-dev-session=false) > "$LOGS/dev-$w.txt" 2>&1 &
     PIDS="$PIDS $!"
   done
   for pair in "vault $VP" "identity $IP"; do
     set -- $pair
     for i in $(seq 1 60); do
-      code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$2/health" || true)"; [ "$code" = 200 ] && break; sleep 2
+      code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$2/health" || true)"; [ "$code" = 200 ] && break; sleep 2
     done
     [ "$code" = 200 ] || { tail -8 "$LOGS/dev-$1.txt" >&2; die "local $1 /health is ${code:-silent}"; }
     echo "   $1 /health 200 (port $2)"
   done
   if want secrets && [ -s "$SECRETS_DIR/OPS_READ_TOKEN" ]; then
     # The secret reached the worker: the ops door answers its bearer and refuses a wrong one.
-    good="$(curl -s -o /dev/null -w '%{http_code}' -H @<(printf 'authorization: Bearer %s\n' "$(cat "$SECRETS_DIR/OPS_READ_TOKEN")") "http://127.0.0.1:$IP/ops/health")"
-    bad="$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer wrong" "http://127.0.0.1:$IP/ops/health")"
+    good="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H @<(printf 'authorization: Bearer %s\n' "$(cat "$SECRETS_DIR/OPS_READ_TOKEN")") "http://127.0.0.1:$IP/ops/health")"
+    bad="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "authorization: Bearer wrong" "http://127.0.0.1:$IP/ops/health")"
     echo "   ops door with OPS_READ_TOKEN: $good; with a wrong bearer: $bad"
     [ "$good" = 200 ] && [ "$bad" = 401 ] || die "the identity worker did not take OPS_READ_TOKEN"
   fi

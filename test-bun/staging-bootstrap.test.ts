@@ -217,7 +217,7 @@ case "$2" in
   *) echo ok ;;
 esac
 `;
-  function shim(account: string, args: string[]) {
+  function shim(account: string, args: string[], shimPath = join(ROOT, "scripts/release/bunx")) {
     const t = mkdtempSync(join(tmpdir(), "shim-"));
     temps.push(t);
     for (const [n, body] of [["py", FAKE_SEALED], ["real", FAKE_REAL]] as const) {
@@ -228,7 +228,7 @@ esac
     mkdirSync(join(t, "Code", "uni-ops"), { recursive: true }); // the shim runs the sealed CLI from ~/Code/uni-ops
     const log = join(t, "log");
     const deployed = join(t, "deployed");
-    const p = Bun.spawnSync(["bash", join(ROOT, "scripts/release/bunx"), "wrangler", ...args], {
+    const p = Bun.spawnSync(["bash", shimPath, "wrangler", ...args], {
       cwd: t,
       env: { ...(process.env as Record<string, string>), PY: join(t, "py"), SEALED: "unused", REAL_BUNX: join(t, "real"),
         SHIM_TEST_LOG: log, DEPLOYED_LOG: deployed, UNI_SEALED_ACCOUNT_ID: account, SHIM_TRIES: "1", HOME: t },
@@ -269,6 +269,18 @@ esac
     const r = shim(STAGING, ["deploy"]);
     expect(r.code).toBe(2);
     expect(r.log).toBe("");
+  });
+
+  test("the shim reads staging-account.env as bash does: a trailing comment does not drop the plain deploy", () => {
+    const t = mkdtempSync(join(tmpdir(), "shim-env-"));
+    temps.push(t);
+    mkdirSync(join(t, "scripts", "release"), { recursive: true });
+    cpSync(join(ROOT, "scripts/release/bunx"), join(t, "scripts/release/bunx"));
+    const env = readFileSync(join(ROOT, "scripts/staging-account.env"), "utf8");
+    writeFileSync(join(t, "scripts/staging-account.env"), env.replace(/^STAGING_ACCOUNT_ID=(\w+)$/m, "STAGING_ACCOUNT_ID=$1   # Parachute Staging"));
+    const r = shim(STAGING, ["deploy", "--env", "staging"], join(t, "scripts/release/bunx"));
+    expect(r.code, r.err).toBe(0);
+    expect(r.log).toContain("real key=set wrangler deploy --env staging");
   });
 
   test("r2 calls ask for r2-admin", () => {

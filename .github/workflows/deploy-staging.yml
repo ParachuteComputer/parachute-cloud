@@ -143,8 +143,11 @@ jobs:
         id: boot
         if: steps.gate.outputs.ready == 'true'
         run: |
-          if grep -q '^STAGING_D1_ID=00000000-0000-0000-0000-000000000000$' scripts/staging-account.env; then
-            echo "::notice title=Staging deploy skipped::The staging D1 id is still the placeholder: run scripts/staging-bootstrap.sh on the Parachute Staging account and commit the id it writes."
+          # The same check deploy-staging.sh refuses on: a real id, written in both files.
+          . scripts/staging-account.env
+          if [ "$STAGING_D1_ID" = 00000000-0000-0000-0000-000000000000 ] \
+             || ! grep -q "database_id = \"$STAGING_D1_ID\"" workers/identity/wrangler.toml; then
+            echo "::notice title=Staging deploy skipped::The staging D1 id is the placeholder or not in both scripts/staging-account.env and workers/identity/wrangler.toml: run scripts/staging-bootstrap.sh on the Parachute Staging account and commit both files."
             echo "ready=false" >> "$GITHUB_OUTPUT"
           else
             echo "ready=true" >> "$GITHUB_OUTPUT"
@@ -154,7 +157,7 @@ jobs:
         # scripts/spa-source.env is the single source pin. Fetching the exact
         # commit makes a Cloud release reproduce the same browser artifact even
         # after parachute-app/main advances.
-        if: steps.gate.outputs.ready == 'true' && steps.boot.outputs.ready == 'true'
+        if: steps.boot.outputs.ready == 'true'
         run: |
           source scripts/spa-source.env
           APP_REPO="$GITHUB_WORKSPACE/../parachute-app"
@@ -165,7 +168,7 @@ jobs:
           echo "parachute-app v$SPA_APP_VERSION @ $(git -C "$APP_REPO" rev-parse HEAD)"
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        if: steps.gate.outputs.ready == 'true' && steps.boot.outputs.ready == 'true'
+        if: steps.boot.outputs.ready == 'true'
         with:
           bun-version: 1.4 # floor: Bun 1.4
 
@@ -174,15 +177,15 @@ jobs:
         # sibling checkout outside this repo. Deploys materialize the exact
         # commit pinned in scripts/core-source.env (the deploy script's own
         # `bun install` refreshes the copied dep from this checkout).
-        if: steps.gate.outputs.ready == 'true' && steps.boot.outputs.ready == 'true'
+        if: steps.boot.outputs.ready == 'true'
         run: bash scripts/materialize-vault-core.sh
 
       - name: Materialize pinned Hub door-contract dependency
-        if: steps.gate.outputs.ready == 'true' && steps.boot.outputs.ready == 'true'
+        if: steps.boot.outputs.ready == 'true'
         run: bash scripts/materialize-door-contract.sh
 
       - name: Cache bun download cache
-        if: steps.gate.outputs.ready == 'true' && steps.boot.outputs.ready == 'true'
+        if: steps.boot.outputs.ready == 'true'
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.bun/install/cache
@@ -191,21 +194,21 @@ jobs:
             ${{ runner.os }}-bun-
 
       - name: Materialize workers/identity/.dev-secrets
-        if: steps.gate.outputs.ready == 'true' && steps.boot.outputs.ready == 'true'
+        if: steps.boot.outputs.ready == 'true'
         env:
           DEV_SECRETS: ${{ secrets.DEV_SECRETS }}
         run: printf '%s\n' "$DEV_SECRETS" > workers/identity/.dev-secrets
 
       - name: Deploy staging (migrations + seed + both workers)
-        if: steps.gate.outputs.ready == 'true' && steps.boot.outputs.ready == 'true'
+        if: steps.boot.outputs.ready == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: bash scripts/deploy-staging.sh
 
       - name: Live smoke (full, staging-only — creates throwaway debris)
-        if: steps.gate.outputs.ready == 'true' && steps.boot.outputs.ready == 'true'
+        if: steps.boot.outputs.ready == 'true'
         run: bun scripts/smoke-staging.ts
 
       - name: Deletion proof (T-318 — every store purged; blocking)
-        if: steps.gate.outputs.ready == 'true' && steps.boot.outputs.ready == 'true'
+        if: steps.boot.outputs.ready == 'true'
         run: bun scripts/smoke-delete-staging.ts

@@ -46,7 +46,7 @@ call() {
 [ "${1:-}" = deploy ] || { call "$@"; exit $?; }
 
 # --- on the staging account, `wrangler deploy --env staging` as itself ---
-STAGING_ACCOUNT_ID="$(sed -n 's/^STAGING_ACCOUNT_ID=\([0-9a-f]\{32\}\)$/\1/p' "$(dirname "${BASH_SOURCE[0]}")/../staging-account.env")"
+STAGING_ACCOUNT_ID="$( . "$(dirname "${BASH_SOURCE[0]}")/../staging-account.env" 2>/dev/null; echo "${STAGING_ACCOUNT_ID:-}")"
 if [ -n "$STAGING_ACCOUNT_ID" ] && [ "${UNI_SEALED_ACCOUNT_ID:-}" = "$STAGING_ACCOUNT_ID" ]; then
   case " $* " in *" --env staging "*|*" --env=staging "*|*" -e staging "*) ;;
     *) echo "shim: refused: on the staging account only \`wrangler deploy --env staging\` deploys" >&2; exit 2 ;; esac
