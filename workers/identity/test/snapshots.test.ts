@@ -33,7 +33,9 @@ import {
 import { PLAN_SPECS } from "../src/plans.ts";
 import { createVault, getVault } from "../src/vaults.ts";
 import { handleOpsSnapshotRunPost } from "../src/ops-daily.ts";
-import { validateAccessToken } from "../src/tokens.ts";
+import { signAccessToken, validateAccessToken } from "../src/tokens.ts";
+import { ACCOUNT_TOKEN_AUDIENCE } from "../src/account-auth.ts";
+import { ACCOUNT_TOKEN_CLIENT_ID } from "../src/account-token.ts";
 import type { OAuthDeps } from "../src/oauth-shared.ts";
 import type { EmailSender, SendResult } from "../src/email.ts";
 import { CSRF, ISSUER, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
@@ -1068,5 +1070,86 @@ describe("staging snapshot trigger", () => {
     expect(summary.taken).toBe(1);
     // trig-scope-b was never snapshotted — no interceptor + assertNoPendingInterceptors.
     expect((await mirrorRows()).map((r) => r.vault_name)).toEqual(["trig-scope-a"]);
+  });
+});
+
+// --- the account API's restore (T-430: a key-only owner has no session) ---------
+
+async function accountToken(userId: string, verb: "admin" | "read", clientId = ACCOUNT_TOKEN_CLIENT_ID): Promise<string> {
+  return (
+    await signAccessToken(env.DB, {
+      sub: userId,
+      scopes: [`account:${userId}:${verb}`],
+      audience: ACCOUNT_TOKEN_AUDIENCE,
+      clientId,
+      issuer: ISSUER,
+      vaultScope: [],
+      ttlSeconds: 600,
+    })
+  ).token;
+}
+
+function accountCall(path: string, token: string, method = "GET", body?: unknown): Promise<Response> {
+  return app.fetch(
+    new Request(`${ISSUER}${path}`, {
+      method,
+      headers: { authorization: `Bearer ${token}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    }),
+    env,
+  );
+}
+
+describe("GET /account/vaults/<name>/snapshots and POST …/restore", () => {
+  test("lists restore points newest first; restore with no key takes the newest into a NEW vault", async () => {
+    const { id: userId } = await seedUser("acct-rp@example.com");
+    await seedVault("acct-rp", userId);
+    const older = wireEntry("acct-rp", "2026-07-01T04:00:00.000Z");
+    const newer = wireEntry("acct-rp", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("acct-rp", older);
+    await seedMirrorRow("acct-rp", newer);
+
+    const list = await accountCall("/account/vaults/acct-rp/snapshots", await accountToken(userId, "read"));
+    expect(list.status).toBe(200);
+    expect(((await list.json()) as any).snapshots.map((x: any) => x.key)).toEqual([newer.key, older.key]);
+
+    const target = restoredVaultName("acct-rp", new Date());
+    let restoreBody = "";
+    interceptRestoreFlow(target, { captureRestoreBody: (b) => (restoreBody = b) });
+    const res = await quietly(async () => accountCall("/account/vaults/acct-rp/restore", await accountToken(userId, "admin"), "POST", {}));
+    expect(res.status, await res.clone().text()).toBe(201);
+    expect(await res.json()).toEqual({ vault: target, restored_from: { vault: "acct-rp", key: newer.key } });
+    expect(JSON.parse(restoreBody)).toEqual({ source_vault: "acct-rp", snapshot_key: newer.key });
+    const row = await env.DB.prepare("SELECT owner_user_id FROM vaults WHERE name = ?").bind(target).first<{ owner_user_id: string }>();
+    expect(row?.owner_user_id).toBe(userId);
+  });
+
+  test("a named key restores that one; someone else's vault, an unknown key, a read token or an OAuth app's token is refused", async () => {
+    const { id: userId } = await seedUser("acct-rp2@example.com");
+    const { id: otherId } = await seedUser("acct-rp2-other@example.com");
+    await seedVault("acct-rp2", userId);
+    const entry = wireEntry("acct-rp2", "2026-07-01T04:00:00.000Z");
+    await seedMirrorRow("acct-rp2", entry);
+    const admin = await accountToken(userId, "admin");
+
+    expect((await accountCall("/account/vaults/acct-rp2/restore", await accountToken(otherId, "admin"), "POST", { key: entry.key })).status).toBe(403);
+    expect((await accountCall("/account/vaults/acct-rp2/restore", admin, "POST", { key: "vault-acct-rp2/snapshots/nope.tar" })).status).toBe(404);
+    expect((await accountCall("/account/vaults/acct-rp2/restore", await accountToken(userId, "read"), "POST", { key: entry.key })).status).toBe(403);
+    const app3p = await accountCall("/account/vaults/acct-rp2/restore", await accountToken(userId, "admin", "some-oauth-app"), "POST", { key: entry.key });
+    expect(app3p.status).toBe(403);
+    expect(((await app3p.json()) as any).error).toBe("first_party_only");
+
+    const target = restoredVaultName("acct-rp2", new Date());
+    interceptRestoreFlow(target);
+    const res = await quietly(async () => accountCall("/account/vaults/acct-rp2/restore", admin, "POST", { key: entry.key }));
+    expect(res.status).toBe(201);
+  });
+
+  test("a vault with no snapshot yet says so", async () => {
+    const { id: userId } = await seedUser("acct-rp3@example.com");
+    await seedVault("acct-rp3", userId);
+    const res = await accountCall("/account/vaults/acct-rp3/restore", await accountToken(userId, "admin"), "POST", {});
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as any).error).toBe("no_snapshot");
   });
 });

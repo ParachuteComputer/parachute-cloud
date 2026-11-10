@@ -87,6 +87,8 @@ import {
   userOwnsVault,
 } from "./vaults.ts";
 import { latestUsageForVaults } from "./usage.ts";
+import { isKnownSnapshot, listSnapshotsForVaults } from "./snapshots.ts";
+import { restoreSnapshotCore } from "./console.ts";
 
 /** TTL for the tenant-facing vault tokens this surface mints — the standard
  *  access-token lifetime. Stateless (no registry row, no refresh, like the
@@ -775,4 +777,62 @@ async function mintVaultToken(
     now: deps.now,
   });
   return { token: signed.token, expiresAt: signed.expiresAt };
+}
+
+// --- snapshots and restore (T-430, door/0.9) ----------------------------------
+
+/** `/account/vaults/<name>/snapshots|restore` → the vault name, lowercased. */
+function vaultNameBefore(req: Request, suffix: "snapshots" | "restore"): string | null {
+  const m = new RegExp(`^/account/vaults/([^/]+)/${suffix}/?$`).exec(new URL(req.url).pathname);
+  return m ? decodeURIComponent(m[1]!).toLowerCase() : null;
+}
+
+/**
+ * `GET /account/vaults/<name>/snapshots` — the vault's restore points, newest first: the nightly snapshots
+ * (snapshots.ts, 04:00 UTC, the plan's GFS retention) the console's History section lists. `account:<id>:read`.
+ */
+export async function handleAccountVaultSnapshots(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const auth = await requireAccount(db, req, deps, "read");
+  if (!auth.ok) return auth.response;
+  const name = vaultNameBefore(req, "snapshots");
+  if (!name || !(await userOwnsVault(db, auth.accountId, name))) {
+    return restError(403, "not_owner", `You do not own a vault named "${name ?? ""}".`);
+  }
+  const rows = (await listSnapshotsForVaults(db, [name])).get(name) ?? [];
+  return Response.json(
+    { vault: name, snapshots: rows.map((r) => ({ key: r.key, taken_at: r.takenAt, bytes: r.bytes, ranks: r.ranks })) },
+    { headers: { "cache-control": "no-store" } },
+  );
+}
+
+/**
+ * `POST /account/vaults/<name>/restore {key?}` — restore one snapshot (the newest when `key` is absent) into a NEW
+ * vault, `<name>-restored-<date>[-n]`; the old vault is never touched. The console's restore (console.ts
+ * restoreSnapshotCore) behind the account token instead of a session, so a key-only owner (NIP-98 sign-in, no
+ * cookie) has the same one-step restore. Account admin, first-party account token only (like /account/keys: an
+ * OAuth app granted account scope can't replay a vault), the plan's restore entitlement, ownership, a known key.
+ */
+export async function handleAccountVaultRestore(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const auth = await requireAccount(db, req, deps, "admin");
+  if (!auth.ok) return auth.response;
+  if (auth.clientId !== ACCOUNT_TOKEN_CLIENT_ID) {
+    return restError(403, "first_party_only", "restore needs the account's own token (POST /account/token)");
+  }
+  const mode = billingModeOf(deps);
+  if (!PLAN_SPECS[livePlan(auth.user.plan, mode)].restore) {
+    return restError(403, "restore_not_included", "this plan has no restore");
+  }
+  const name = vaultNameBefore(req, "restore");
+  if (!name || !(await userOwnsVault(db, auth.accountId, name))) {
+    return restError(403, "not_owner", `You do not own a vault named "${name ?? ""}".`);
+  }
+  const body = await readJsonBody(req);
+  let key = typeof body.key === "string" ? body.key : "";
+  if (!key) key = ((await listSnapshotsForVaults(db, [name])).get(name) ?? [])[0]?.key ?? "";
+  if (!key) return restError(404, "no_snapshot", `"${name}" has no snapshot yet (the first is taken at 04:00 UTC after it is made).`);
+  if (!(await isKnownSnapshot(db, name, key))) return restError(404, "unknown_snapshot", "that restore point isn't one of this vault's");
+  const vaultLimit = PLAN_SPECS[vaultLimitPlan(auth.user.plan, auth.user.pendingPlan, mode)].vault_count;
+  const r = await restoreSnapshotCore(db, deps, auth.user, name, key, vaultLimit);
+  if (!r.ok) return restError(r.status, r.error, r.message);
+  return Response.json({ vault: r.target, restored_from: { vault: name, key } }, { status: 201, headers: { "cache-control": "no-store" } });
 }

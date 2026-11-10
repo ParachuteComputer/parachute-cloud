@@ -96,6 +96,8 @@ import {
   handleAccountSummary,
   handleAccountVaultCreate,
   handleAccountVaultDelete,
+  handleAccountVaultRestore,
+  handleAccountVaultSnapshots,
   handleAccountVaultTokenMint,
   handleAccountVaultsList,
 } from "./account-api.ts";
@@ -357,6 +359,9 @@ app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, d
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/vaults/:name", (c) => handleAccountVaultDelete(c.env.DB, c.req.raw, depsFor(c.env)));
+// Restore points and a one-step restore into a new vault (T-430): the console's, behind the account token.
+app.get("/account/vaults/:name/snapshots", (c) => handleAccountVaultSnapshots(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/vaults/:name/restore", (c) => handleAccountVaultRestore(c.env.DB, c.req.raw, depsFor(c.env)));
 // Connected apps (T-318): list + disconnect the OAuth clients reaching a vault.
 app.get("/account/vaults/:name/connections", (c) => handleVaultConnectionsList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/vaults/:name/connections/:clientId", (c) =>

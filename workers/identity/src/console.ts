@@ -1086,6 +1086,24 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
     return consoleError(db, req, deps, user, "That restore point wasn't recognized — reload and try again.");
   }
 
+  const r = await restoreSnapshotCore(db, deps, user, vaultName, key, vaultLimit);
+  if (!r.ok) return consoleError(db, req, deps, user, r.message);
+  return redirectResponse(`/console?restored=${encodeURIComponent(r.target)}`);
+}
+
+/**
+ * Restore one snapshot of `vaultName` into a NEW vault the owner holds (never over the old one): the core both the
+ * console form (handleRestorePost) and the account API (POST /account/vaults/<name>/restore) run, once the caller
+ * has checked the session or token, the plan's restore entitlement, ownership and the snapshot key.
+ */
+export async function restoreSnapshotCore(
+  db: D1Database,
+  deps: OAuthDeps,
+  user: User,
+  vaultName: string,
+  key: string,
+  vaultLimit: number,
+): Promise<{ ok: true; target: string } | { ok: false; status: number; error: string; message: string }> {
   const now = deps.now?.() ?? new Date();
   let targetName = "";
   let reuse = false;
@@ -1113,20 +1131,20 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
     // name someone else holds: never replay into it.
   }
   if (!targetName) {
-    return consoleError(db, req, deps, user, "Couldn't claim a name for the restored vault. Please try again tomorrow.");
+    return { ok: false, status: 409, error: "no_name", message: "Couldn't claim a name for the restored vault. Please try again tomorrow." };
   }
   if (!reuse) {
     // Restore creates a NEW vault — it counts against the plan's vault limit
     // exactly like any other creation (same `>=` grandfathering rule).
     if ((await countVaultsForOwner(db, user.id)) >= vaultLimit) {
-      return consoleError(db, req, deps, user, restoreAtCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
+      return { ok: false, status: 409, error: "vault_limit", message: restoreAtCapMessage(user.plan, billingModeOf(deps), user.pendingPlan) };
     }
     try {
       // Flagged so a retry after a failed replay may reuse it (cleared below).
       await createVault(db, targetName, user.id, now, { pending: "restore" });
     } catch (err) {
       if (err instanceof VaultNameTakenError || err instanceof VaultNameInvalidError) {
-        return consoleError(db, req, deps, user, "Couldn't claim a name for the restored vault. Please try again.");
+        return { ok: false, status: 409, error: "no_name", message: "Couldn't claim a name for the restored vault. Please try again." };
       }
       throw err;
     }
@@ -1142,13 +1160,7 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
     console.warn(
       `event=restore_failed vault=${vaultName} target=${targetName} error=${err instanceof Error ? err.message : String(err)}`,
     );
-    return consoleError(
-      db,
-      req,
-      deps,
-      user,
-      `Restore didn't complete — please try again in a moment. (Retrying reuses "${targetName}"; it never touches "${vaultName}".)`,
-    );
+    return { ok: false, status: 503, error: "restore_failed", message: `Restore didn't complete — please try again in a moment. (Retrying reuses "${targetName}"; it never touches "${vaultName}".)` };
   }
   // Finished: the target is the owner's vault now, never a retry target. A
   // D1 hiccup here must not turn the restore into an error; the residual (a
@@ -1161,7 +1173,7 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
     );
   }
   console.log(`event=restore_completed vault=${vaultName} target=${targetName}`);
-  return redirectResponse(`/console?restored=${encodeURIComponent(targetName)}`);
+  return { ok: true, target: targetName };
 }
 
 // --- the getting-started checklist ------------------------------------------
