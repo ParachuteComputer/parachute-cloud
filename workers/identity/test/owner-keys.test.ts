@@ -187,19 +187,20 @@ describe("NIP-98 owner sign-in (POST /account/token)", () => {
 });
 
 describe("ADMIN_PUBKEYS: a second principal on a single-owner deploy (door/0.9, T-430)", () => {
-  test("an admin key signs in as the owner's account once the owner has, and only while it is listed", async () => {
+  test("an admin key signs in as the owner's account, and only while it is listed", async () => {
     const owner = nostrKey();
     const admin = nostrKey();
     const both = app({ ownerPubkey: owner.pubkey, adminPubkeys: `${admin.pubkey}, ` });
-    // The owner's key makes the account; the admin key can't be first.
-    expect((await signIn(both, admin)).status).toBe(401);
-    expect(await userCount()).toBe(0);
-    const o = await signIn(both, owner);
-    expect(o.status).toBe(200);
+    // The admin may be first: it makes the OWNER's account (the owner's key linked, never its own).
     const a = await signIn(both, admin);
     expect(a.status).toBe(200);
+    expect(await userCount()).toBe(1);
+    const o = await signIn(both, owner);
+    expect(o.status).toBe(200);
     const ownerId = decodeJwtPayload(o.json.token).sub;
     expect(decodeJwtPayload(a.json.token).sub).toBe(ownerId);
+    // A stranger is still nobody.
+    expect((await signIn(both, nostrKey())).status).toBe(401);
     expect(decodeJwtPayload(a.json.token).scope).toBe(`account:${ownerId}:admin`);
     // The admin's token drives /account/* like the owner's: it can make a vault.
     expect((await both.call("/account/vaults", { auth: `Bearer ${a.json.token}` })).status).toBe(200);

@@ -218,18 +218,23 @@ export async function resolvePubkeyAccount(
 ): Promise<User> {
   // An admin key (env ADMIN_PUBKEYS, single-owner deploys only) signs in as the owner's account while it is listed.
   // It is read from the config at every sign-in and never stored as a link, so dropping it from ADMIN_PUBKEYS is
-  // the whole revocation: the owner's own key and account are untouched. The owner signs in first (the bootstrap
-  // stays the owner key's alone).
+  // the whole revocation: the owner's own key and account are untouched. On an empty instance an admin's first
+  // sign-in makes the owner's account exactly as the owner's own first sign-in would: linked to OWNER_PUBKEY, never
+  // to the admin key, so the account is the owner's from its first moment.
   if (opts.ownerPubkey && opts.adminPubkeys?.includes(pubkey) && pubkey !== opts.ownerPubkey) {
-    const owner = await findPubkeyUser(db, opts.ownerPubkey);
-    if (!owner) throw new NostrAuthError("unknown_pubkey", "an admin key signs in once the owner has (the owner's key signs in first)");
-    return owner;
+    return (await findPubkeyUser(db, opts.ownerPubkey)) ?? bootstrapOwner(db, opts.ownerPubkey, opts.now);
   }
   const linked = await findPubkeyUser(db, pubkey);
   if (linked) return linked;
   if (!opts.ownerPubkey || opts.ownerPubkey !== pubkey) {
     throw new NostrAuthError("unknown_pubkey", "Nostr pubkey is not linked to an account");
   }
+  return bootstrapOwner(db, pubkey, opts.now);
+}
+
+/** The single-owner bootstrap: on an instance with no accounts, the key-only owner's account, `pubkey` linked. */
+async function bootstrapOwner(db: D1Database, pubkey: string, nowOpt?: Date): Promise<User> {
+  const opts = { now: nowOpt };
   const anyUser = await db.prepare("SELECT 1 AS x FROM users LIMIT 1").first<number>("x");
   if (anyUser !== null) {
     throw new NostrAuthError("unknown_pubkey", "Nostr pubkey is not linked to an account (link it from your account)");
