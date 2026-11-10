@@ -101,13 +101,33 @@ describe("staging-bootstrap.sh against a fake Cloudflare", () => {
     expect(stagingDbId(fx.root)).toBe(FAKE_UUID);
   });
 
-  test("refuses a live-mode Stripe key before any secret is sent", () => {
+  test("refuses a live-mode Stripe key before any secret is sent, wherever it sits in the file", () => {
+    for (const body of ["sk_live_abc", "\n  sk_live_abc\n", " rk_live_abc"]) {
+      const fx = fixture();
+      writeFileSync(join(fx.secrets, "STRIPE_SECRET_KEY"), body);
+      const r = run(fx, ["--steps", "secrets", "--secrets-dir", fx.secrets]);
+      expect(r.code).toBe(2);
+      expect(r.out).toContain("live-mode Stripe key");
+      expect(calls(fx.cf).filter((l) => l.includes("secret bulk"))).toEqual([]);
+    }
+  });
+
+  test("deploy-staging.sh refuses before any install or call while the D1 id is the placeholder or disagrees", () => {
     const fx = fixture();
-    writeFileSync(join(fx.secrets, "STRIPE_SECRET_KEY"), "sk_live_abc");
-    const r = run(fx, ["--steps", "secrets", "--secrets-dir", fx.secrets]);
+    cpSync(join(ROOT, "scripts/deploy-staging.sh"), join(fx.root, "scripts/deploy-staging.sh"));
+    const deploy = () => {
+      const env: Record<string, string> = { ...(process.env as Record<string, string>), PATH: `${fx.bin}:${process.env.PATH}`, FAKE_CF: fx.cf };
+      const p = Bun.spawnSync(["bash", join(fx.root, "scripts/deploy-staging.sh")], { env, cwd: fx.t });
+      return { code: p.exitCode, out: p.stdout.toString() + p.stderr.toString() };
+    };
+    let r = deploy(); // as committed: the placeholder
     expect(r.code).toBe(2);
-    expect(r.out).toContain("live-mode Stripe key");
-    expect(calls(fx.cf).filter((l) => l.includes("secret bulk"))).toEqual([]);
+    expect(r.out).toContain("staging-bootstrap.sh");
+    const f = join(fx.root, "scripts/staging-account.env"); // the env file names an id the toml does not
+    writeFileSync(f, readFileSync(f, "utf8").replace(/^STAGING_D1_ID=.*$/m, `STAGING_D1_ID=${FAKE_UUID}`));
+    r = deploy();
+    expect(r.code).toBe(2);
+    expect(calls(fx.cf)).toEqual([]);
   });
 
   test("refuses a sealed job on the production account before any call", () => {
@@ -232,6 +252,17 @@ esac
     expect(r.log).toContain("wrangler versions upload");
     expect(r.log).toContain("wrangler versions deploy 0123abcd-0000-4000-8000-000000000002@100%");
     expect(r.log).not.toMatch(/wrangler deploy\b/);
+  });
+
+  test("every spelling of the staging env passes through; any other env is refused", () => {
+    for (const args of [["deploy", "-e", "staging"], ["deploy", "--env=staging"]]) {
+      const r = shim(STAGING, args);
+      expect(r.code, r.err).toBe(0);
+      expect(r.log).toContain(`real key=set wrangler ${args.join(" ")}`);
+    }
+    const other = shim(STAGING, ["deploy", "--env", "production"]);
+    expect(other.code).toBe(2);
+    expect(other.log).toBe("");
   });
 
   test("on the staging account a deploy without --env staging is refused", () => {

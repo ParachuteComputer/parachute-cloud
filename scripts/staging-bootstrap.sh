@@ -163,7 +163,8 @@ secrets_json() {
   for n in $names; do
     f="$SECRETS_DIR/$n"
     if [ -s "$f" ]; then
-      if [ "${n#STRIPE_}" != "$n" ] && grep -qE '^(sk|rk)_live_' "$f"; then die "$n holds a live-mode Stripe key: staging takes test mode only"; fi
+      # Anywhere in the file, not only at its start: the upload trims the value.
+      if [ "${n#STRIPE_}" != "$n" ] && grep -qE '(sk|rk)_live_' "$f"; then die "$n holds a live-mode Stripe key: staging takes test mode only"; fi
       set="$set $n"
     else skip="$skip $n"; fi
   done
@@ -273,7 +274,7 @@ if want deploy; then
   done
   if want secrets && [ -s "$SECRETS_DIR/OPS_READ_TOKEN" ]; then
     # The secret reached the worker: the ops door answers its bearer and refuses a wrong one.
-    good="$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $(cat "$SECRETS_DIR/OPS_READ_TOKEN")" "http://127.0.0.1:$IP/ops/health")"
+    good="$(curl -s -o /dev/null -w '%{http_code}' -H @<(printf 'authorization: Bearer %s\n' "$(cat "$SECRETS_DIR/OPS_READ_TOKEN")") "http://127.0.0.1:$IP/ops/health")"
     bad="$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer wrong" "http://127.0.0.1:$IP/ops/health")"
     echo "   ops door with OPS_READ_TOKEN: $good; with a wrong bearer: $bad"
     [ "$good" = 200 ] && [ "$bad" = 401 ] || die "the identity worker did not take OPS_READ_TOKEN"
