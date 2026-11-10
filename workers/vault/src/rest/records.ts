@@ -51,6 +51,11 @@ function toolFor(method: string): string {
  */
 /** The /api/notes requests that are /api/records twins (only these take `?type=`). Set here, read by handleNotes. */
 export const RECORDS_REQUESTS = new WeakSet<Request>();
+/**
+ * A records body the translator refused (an old word beside its new one): the refusal, answered by handleNotes, so
+ * after auth (an anonymous caller still gets 401 first) and before anything is written.
+ */
+export const RECORDS_REFUSALS = new WeakMap<Request, Response>();
 
 export async function recordsDoor(request: Request, route: { kind: "records" | "types"; notesPath: string }, inner: (req: Request) => Promise<Response>): Promise<Response> {
   const url = new URL(request.url);
@@ -61,6 +66,7 @@ export async function recordsDoor(request: Request, route: { kind: "records" | "
     for (const [k, v] of url.searchParams) out.searchParams.append(QUERY_RENAMES[k] ?? k, v);
   }
   const tool = toolFor(request.method);
+  let refusal: Response | null = null;
   const headers = new Headers(request.headers);
   let body: BodyInit | null = null;
   if (request.method !== "GET" && request.method !== "HEAD") {
@@ -70,14 +76,25 @@ export async function recordsDoor(request: Request, route: { kind: "records" | "
     if (route.kind === "records" && !/^(multipart\/|application\/octet-stream|audio\/|video\/|image\/)/.test(ct)) {
       const text = await request.text();
       if (text.trim()) {
-        // A body that isn't JSON, or whose words conflict, goes on as it came: the handler answers it after auth,
-        // exactly as /api/notes would (an unauthenticated caller gets 401 first, never a parse answer).
+        // Not JSON: it goes on as it came, and the handler answers it after auth, as /api/notes would. Words that
+        // conflict (`body` beside `content`): refused, never written, but answered after auth too (RECORDS_REFUSALS).
+        let parsed: unknown;
+        let isJson = true;
         try {
-          const parsed: unknown = JSON.parse(text);
-          headers.set("content-type", "application/json");
-          body = JSON.stringify(parsed && typeof parsed === "object" && !Array.isArray(parsed) ? paramsIn(tool, parsed as Record<string, unknown>) : parsed);
+          parsed = JSON.parse(text);
         } catch {
+          isJson = false;
           body = text;
+        }
+        if (isJson) {
+          headers.set("content-type", "application/json");
+          try {
+            body = JSON.stringify(parsed && typeof parsed === "object" && !Array.isArray(parsed) ? paramsIn(tool, parsed as Record<string, unknown>) : parsed);
+          } catch (err) {
+            const e = err as { message?: string; error_type?: string; field?: string; hint?: string };
+            refusal = Response.json({ error: e.message ?? "invalid parameters", error_type: e.error_type ?? "invalid_query", field: e.field, hint: e.hint }, { status: 400 });
+            body = "{}";
+          }
         }
         headers.delete("content-length");
       }
@@ -87,6 +104,7 @@ export async function recordsDoor(request: Request, route: { kind: "records" | "
   }
   const twin = new Request(out.toString(), { method: request.method, headers, body });
   if (route.kind === "records") RECORDS_REQUESTS.add(twin);
+  if (refusal) RECORDS_REFUSALS.set(twin, refusal);
   const res = await inner(twin);
   if (route.kind === "types") return res;
   if (!(res.headers.get("content-type") ?? "").includes("application/json")) return res;

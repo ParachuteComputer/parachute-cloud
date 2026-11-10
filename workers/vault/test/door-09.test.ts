@@ -233,6 +233,17 @@ describe("door/0.9 REST: /api/records and /api/types", () => {
     expect(clash.status).toBe(401);
   });
 
+  it("a signed-in body with an old word beside its new one is a 400 that writes nothing (single, batch, fields)", async () => {
+    const v = freshVault("d9clash");
+    const one = await op(v, "/api/records", json({ path: "C/1", body: "new", content: "old" }));
+    const batch = await op(v, "/api/records", json({ records: [{ path: "B/1", body: "a", content: "x" }, { path: "B/2", body: "c" }] }));
+    const fields = await op(v, "/api/records", json({ path: "F/1", body: "z", fields: { a: 1 }, metadata: { a: 2 } }));
+    expect([one.status, batch.status, fields.status]).toEqual([400, 400, 400]);
+    expect(((await one.json()) as any).error).toMatch(/body/);
+    const all = (await (await op(v, "/api/records")).json()) as any;
+    expect((Array.isArray(all) ? all : all.records).map((r: any) => r.path).filter((p: string) => /^(C|B|F)\//.test(p ?? ""))).toEqual([]);
+  });
+
   it("a batch is `records`, and a bad type is a 422 that makes nothing", async () => {
     const v = freshVault("d9batch");
     const batch = await op(v, "/api/records", json({ records: [{ path: "B/1", body: "one" }, { path: "B/2", body: "two" }] }));

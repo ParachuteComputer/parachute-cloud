@@ -37,7 +37,7 @@ import * as linkOps from "@openparachute/core/src/links.js";
 import { getUnresolvedLinksForNote, getUnresolvedLinksForNotes, getAmbiguousLinksForNote, getAmbiguousLinksForNotes, resolveOrQueueLink, resolveStructuredLinkNote, unresolvedLinkWarning, ambiguousLinkWarning, getContentWikilinkWarnings } from "@openparachute/core/src/wikilinks.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
 import { foldTypeFilter, holdTypes, markTypes, prepareCallTypes, refreshTypes } from "@openparachute/core/src/tag-kind.js";
-import { RECORDS_REQUESTS } from "./records.js";
+import { RECORDS_REFUSALS, RECORDS_REQUESTS } from "./records.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
 import { embeddingsPendingWarning, ignoredParamWarning, collectUnknownTagWarnings, computeSearchDidYouMean, searchDidYouMeanWarning, truncatedResultsWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
 import {
@@ -284,10 +284,14 @@ export async function handleNotes(
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
   writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
+  // A records body the translator refused: answered here, after auth, before anything is written (rest/records.ts).
+  const refused = RECORDS_REFUSALS.get(req);
+  if (refused) return refused;
   try {
     // door/0.9: `?type=` on /api/records is query-records' `type`, folded by the engine (subtypes, and with ?tag all of
     // them; a plain tag refused). /api/notes gains nothing new (SPEC §5.1).
-    if (req.method === "GET" && RECORDS_REQUESTS.has(req) && new URL(req.url).searchParams.has("type")) {
+    // An empty ?type= is no type filter at all (as an absent one), never "every record".
+    if (req.method === "GET" && RECORDS_REQUESTS.has(req) && (new URL(req.url).searchParams.get("type") ?? "").trim() !== "") {
       const url = new URL(req.url);
       const params: Record<string, unknown> = { type: parseQueryList(url, "type") ?? [] };
       const tag = parseQueryList(url, "tag");
