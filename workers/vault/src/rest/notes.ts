@@ -39,13 +39,15 @@ import {
   IF_UPDATED_AT_HINT,
 } from "@openparachute/core/src/notes.js";
 import { applyContentRange } from "@openparachute/core/src/content-range.js";
-import { attachValidationStatus, enforceStrictWrite, resolveNoteExact } from "@openparachute/core/src/mcp.js";
+// applySchemaDefaults is the engine's (vault#553): only a field's declared `default` backfills; a field without one
+// stays absent. This door had its own pre-0.7 copy that filled the first enum value or "" (T-437), which also made
+// every later edit of a note with an indexed date 422. The box's REST and every door's MCP use this same function.
+import { applySchemaDefaults, attachValidationStatus, enforceStrictWrite, resolveNoteExact } from "@openparachute/core/src/mcp.js";
 import { expandContent } from "@openparachute/core/src/expand.js";
 import { transactionAsync } from "@openparachute/core/src/txn.js";
 import { normalizePath } from "@openparachute/core/src/paths.js";
 import * as linkOps from "@openparachute/core/src/links.js";
 import { getUnresolvedLinksForNote, getUnresolvedLinksForNotes, getAmbiguousLinksForNote, getAmbiguousLinksForNotes, resolveOrQueueLink, resolveStructuredLinkNote, unresolvedLinkWarning, ambiguousLinkWarning, getContentWikilinkWarnings } from "@openparachute/core/src/wikilinks.js";
-import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
 import { embeddingsPendingWarning, ignoredParamWarning, collectUnknownTagWarnings, computeSearchDidYouMean, searchDidYouMeanWarning, truncatedResultsWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
 import {
@@ -139,46 +141,6 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
   content = content.replace(new RegExp(`\\[\\[${escaped}\\|([^\\]]+)\\]\\]`, "gi"), "$1");
   content = content.replace(new RegExp(`\\[\\[${escaped}(#[^\\]]+)?\\]\\]`, "gi"), `${targetPath}$1`);
   return content;
-}
-
-function defaultForField(field: { type: string; enum?: string[] }): unknown {
-  if (field.enum && field.enum.length > 0) return field.enum[0];
-  switch (field.type) {
-    case "boolean": return false;
-    case "integer": return 0;
-    default: return "";
-  }
-}
-
-/** Tag-schema defaults — mirrors routes.ts:applySchemaDefaults / core mcp.ts. */
-async function applySchemaDefaults(store: Store, db: any, noteIds: string[], tags: string[]): Promise<string[]> {
-  const schemas = tagSchemaOps.getTagSchemaMap(db);
-  if (Object.keys(schemas).length === 0) return [];
-
-  const defaults: Record<string, unknown> = {};
-  for (const tag of tags) {
-    const schema = schemas[tag];
-    if (!schema?.fields) continue;
-    for (const [field, fieldSchema] of Object.entries(schema.fields)) {
-      if (!(field in defaults)) defaults[field] = defaultForField(fieldSchema);
-    }
-  }
-  if (Object.keys(defaults).length === 0) return [];
-
-  const mutated: string[] = [];
-  for (const noteId of noteIds) {
-    const note = await store.getNote(noteId);
-    if (!note) continue;
-    const existing = (note.metadata as Record<string, unknown>) ?? {};
-    const missing: Record<string, unknown> = {};
-    for (const [field, value] of Object.entries(defaults)) {
-      if (!(field in existing)) missing[field] = value;
-    }
-    if (Object.keys(missing).length === 0) continue;
-    await store.updateNote(noteId, { metadata: { ...existing, ...missing }, skipUpdatedAt: true });
-    mutated.push(noteId);
-  }
-  return mutated;
 }
 
 /**
