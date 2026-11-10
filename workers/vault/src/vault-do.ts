@@ -724,9 +724,14 @@ export class VaultDO extends DurableObject {
     // in flight: a refused request must not hold up the import's drain.
     if (this.importRun) {
       const refused = await this.answerDuringImport(request);
-      if (refused) return refused;
+      if (refused) {
+        await dropUnreadBody(request);
+        return refused;
+      }
     }
-    return this.counted(() => this.countedFetch(request));
+    const res = await this.counted(() => this.countedFetch(request));
+    await dropUnreadBody(request);
+    return res;
   }
 
   /**
@@ -4348,5 +4353,32 @@ export class VaultDO extends DurableObject {
       databaseSize: { before: sizeBefore, after: sizeAfter, delta: sizeAfter - sizeBefore, bytesPerNote: Math.round((sizeAfter - sizeBefore) / count) },
       txnInterceptCount: this.shim.txnIntercepts.length,
     };
+  }
+}
+
+/**
+ * A request answered before its body was read (a refusal: 401, 403, 404, a cap) still has the router piping that
+ * body in. Once the answer is out the pipe fails with "Can't read from request stream after response has been
+ * sent", uncaught: under local workerd that restarts the worker and the next requests get 503, and a client sees
+ * its connection drop instead of the refusal. So the unread body is read to its end and thrown away first, up to
+ * DRAIN_LIMIT_BYTES; past that (a refused large upload) it is cancelled, as before.
+ */
+const DRAIN_LIMIT_BYTES = 8 * 1024 * 1024;
+async function dropUnreadBody(request: Request): Promise<void> {
+  if (!request.body || request.bodyUsed) return;
+  try {
+    const reader = request.body.getReader();
+    let seen = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      seen += value?.byteLength ?? 0;
+      if (seen > DRAIN_LIMIT_BYTES) {
+        await reader.cancel();
+        return;
+      }
+    }
+  } catch {
+    // Already locked or closed: nothing left to drop.
   }
 }
