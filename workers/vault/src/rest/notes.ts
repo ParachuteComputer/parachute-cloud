@@ -338,7 +338,8 @@ async function foldRestTypes(
   subpath: string,
 ): Promise<{ req: Request; types: string[]; release: () => void } | Response | null> {
   const mode = req.method === "POST" && (subpath === "" || subpath === "/") ? "create" : req.method === "PATCH" && /^\/[^/]+$/.test(subpath) ? "update" : null;
-  if (!mode || !(req.headers.get("content-type") ?? "").includes("application/json")) return null;
+  // Read as JSON whatever the content-type says, as the handler below does (curl -d sends a form type).
+  if (!mode || /^(multipart\/|application\/octet-stream)/i.test(req.headers.get("content-type") ?? "")) return null;
   const text = await req.clone().text();
   if (!text.includes('"types"')) return null;
   let body: any;

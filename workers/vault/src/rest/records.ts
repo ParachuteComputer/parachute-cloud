@@ -61,8 +61,10 @@ export async function recordsDoor(request: Request, route: { kind: "records" | "
   const headers = new Headers(request.headers);
   let body: BodyInit | null = null;
   if (request.method !== "GET" && request.method !== "HEAD") {
-    const ct = request.headers.get("content-type") ?? "";
-    if (route.kind === "records" && ct.includes("application/json")) {
+    // Any body that isn't plainly binary or multipart is read as JSON, as the /api/notes handler reads it whatever
+    // the content-type says (curl -d sends application/x-www-form-urlencoded).
+    const ct = (request.headers.get("content-type") ?? "").toLowerCase();
+    if (route.kind === "records" && !/^(multipart\/|application\/octet-stream|audio\/|video\/|image\/)/.test(ct)) {
       const text = await request.text();
       if (text.trim()) {
         let parsed: unknown;
@@ -71,6 +73,7 @@ export async function recordsDoor(request: Request, route: { kind: "records" | "
         } catch {
           return Response.json({ error: "body is not JSON", error_type: "invalid_json" }, { status: 400 });
         }
+        headers.set("content-type", "application/json");
         try {
           body = JSON.stringify(parsed && typeof parsed === "object" && !Array.isArray(parsed) ? paramsIn(tool, parsed as Record<string, unknown>) : parsed);
         } catch (err) {

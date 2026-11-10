@@ -181,6 +181,17 @@ describe("door/0.9 REST: /api/records and /api/types", () => {
     expect((await op(v, `/api/records/${rec.id}`)).status).toBe(404);
   });
 
+  it("a JSON body without a JSON content-type (curl -d) is translated too, as /api/notes parses it", async () => {
+    const v = freshVault("d9ctype");
+    const form = { "Content-Type": "application/x-www-form-urlencoded" };
+    const made = await op(v, "/api/records", { method: "POST", headers: form, body: JSON.stringify({ path: "C/1", body: "plain curl", types: ["episode"], fields: { guest: "Robin" } }) });
+    expect(made.status, await made.clone().text()).toBe(201);
+    const rec = (await made.json()) as any;
+    expect(rec).toMatchObject({ body: "plain curl", types: ["episode"], fields: { guest: "Robin" } });
+    const bare = await op(v, "/api/notes", { method: "POST", body: JSON.stringify({ path: "C/2", content: "x", types: ["meeting"] }) });
+    expect(((await bare.json()) as any).tags).toContain("meeting");
+  });
+
   it("a batch is `records`, and a bad type is a 422 that makes nothing", async () => {
     const v = freshVault("d9batch");
     const batch = await op(v, "/api/records", json({ records: [{ path: "B/1", body: "one" }, { path: "B/2", body: "two" }] }));
