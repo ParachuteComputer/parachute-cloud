@@ -142,6 +142,8 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
     clientId: APP_KEY_CLIENT_ID,
     issuer: deps.issuer,
     vaultScope: [vault],
+    // The vault names this key's writes `key:<name>` (vault auth.ts parseAppKeyName; T-430).
+    permissions: { app_key: name },
     ttlSeconds: ttl,
     now: () => now,
   });

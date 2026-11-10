@@ -335,6 +335,19 @@ export function nostrVia(pubkey: string): string {
  * label, not an access decision — the opposite of a `scoped_tags` misread,
  * which must fail closed.
  */
+/**
+ * Write-attribution for an app key (door/0.9, T-430): identity stamps the key's name in `permissions.app_key` when it
+ * mints one (account-keys.ts), so the key's writes say which app made them: `created_via` / `last_updated_via`
+ * `key:<name>`. Only on a token of the app-key client id, and only a name in the key-name rule; anything else is
+ * no name (the generic credential class).
+ */
+export const APP_KEY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+export function parseAppKeyName(clientId: string | null | undefined, permissions: Record<string, unknown> | undefined): string | null {
+  if (clientId !== "parachute-app-key" || !permissions) return null;
+  const raw = permissions.app_key;
+  return typeof raw === "string" && APP_KEY_NAME_RE.test(raw) ? raw : null;
+}
+
 export function parsePrincipalPubkey(
   permissions: Record<string, unknown> | undefined,
 ): string | null {
@@ -426,6 +439,7 @@ export function parseScopedTagsFromPermissions(
 export function refineMcpVia(via: string | null | undefined): string {
   if (via === "operator") return "operator";
   if (typeof via === "string" && via.startsWith("nostr:")) return via;
+  if (typeof via === "string" && via.startsWith("key:")) return via; // an app key's own name (door/0.9)
   return "mcp";
 }
 
@@ -550,6 +564,7 @@ export async function authenticateVaultToken(
   // Write-attribution axis 2 — the NIP-98 signing pubkey, when present.
   // Fail-soft; see `parsePrincipalPubkey`.
   const principalPubkey = parsePrincipalPubkey(claims.permissions);
+  const appKeyName = parseAppKeyName(claims.clientId, claims.permissions);
 
   // The signature is already verified (validateHubJwt above); decoding the
   // payload for `exp` is safe. `jti` is surfaced by scope-guard's claims.
@@ -577,7 +592,7 @@ export async function authenticateVaultToken(
       // generic `api` credential class the request path refines. `actor` is
       // untouched — it stays the hub USER id, so two agents sharing one hub
       // user keep one `created_by` and are told apart by `*_via`. (cloud#277)
-      via: principalPubkey !== null ? nostrVia(principalPubkey) : "api",
+      via: principalPubkey !== null ? nostrVia(principalPubkey) : appKeyName !== null ? `key:${appKeyName}` : "api",
       clientId: claims.clientId ?? null,
       exp,
       jti: claims.jti ?? null,

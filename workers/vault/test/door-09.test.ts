@@ -216,3 +216,23 @@ describe("door/0.9 REST: /api/records and /api/types", () => {
     expect(read.status).toBe(200);
   });
 });
+
+describe("door/0.9: an app key's writes are named", () => {
+  it("createdVia / lastUpdatedVia say key:<name> on REST and MCP; another client's claim is ignored", async () => {
+    const v = freshVault("d9key");
+    const key = await mintToken({ vault: v, scopes: `vault:${v}:read vault:${v}:write`, vaultScope: [v], clientId: "parachute-app-key", permissions: { app_key: "podcast-studio" } });
+    const rest = await SELF.fetch(`${base(v)}/api/records`, { ...json({ path: "K/1", body: "from the studio" }), headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` } });
+    expect(rest.status, await rest.clone().text()).toBe(201);
+    const made = (await rest.json()) as any;
+    expect(made.createdVia).toBe("key:podcast-studio");
+
+    const mcp = await call(v, "update-record", { id: made.id, body: "edited by MCP", force: true }, key);
+    expect(mcp.ok, JSON.stringify(mcp.out)).toBe(true);
+    expect(mcp.out.lastUpdatedVia).toBe("key:podcast-studio");
+
+    // The same claim on a token that isn't an app key names nothing.
+    const other = await mintToken({ vault: v, scopes: `vault:${v}:read vault:${v}:write`, vaultScope: [v], clientId: "some-app", permissions: { app_key: "pretender" } });
+    const r2 = await SELF.fetch(`${base(v)}/api/records`, { ...json({ path: "K/2", body: "x" }), headers: { "Content-Type": "application/json", Authorization: `Bearer ${other}` } });
+    expect(((await r2.json()) as any).createdVia).toBe("api");
+  });
+});

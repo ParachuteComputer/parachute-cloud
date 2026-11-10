@@ -366,6 +366,7 @@ describe("app keys (/account/keys)", () => {
     const c = decodeJwtPayload(r.json.token) as { scope: string; exp: number; iat: number; aud: string; sub: string; client_id: string; vault_scope: string[] };
     expect(c.scope.split(" ").sort()).toEqual(["vault:arcade:read", "vault:arcade:write"]);
     expect([c.aud, c.sub, c.client_id, c.vault_scope]).toEqual(["vault.arcade", id, "parachute-app-key", ["arcade"]]);
+    expect(c.permissions).toEqual({ app_key: "arcade-worker" }); // the vault names its writes key:arcade-worker (T-430)
     expect(c.exp - c.iat).toBeGreaterThan(300 * 86400);
     const listed = await a.call("/account/keys", { auth: bearer });
     expect(listed.json.keys).toHaveLength(1);
