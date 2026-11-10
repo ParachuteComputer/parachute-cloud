@@ -42,7 +42,8 @@ export interface Env {
    * account, comma- or space-separated (hex or npub), e.g. an agent's own key beside the owner's. Read at every
    * sign-in and never stored as a link, so removing a key from this list stops its sign-ins without touching the
    * owner (its last account token runs out within 10 minutes; app keys it minted stay until revoked by name). Its
-   * account token can't change the account's sign-in keys (account-pubkeys.ts), so it can't keep itself on.
+   * account token can't change the account's sign-in keys (account-pubkeys.ts), so it can't keep itself on, and
+   * can't delete the account (account-delete.ts).
    * Ignored without OWNER_PUBKEY. Unset on Parachute Cloud.
    */
   ADMIN_PUBKEYS?: string;

@@ -212,7 +212,7 @@ export async function requireAccount(
 
 /** The vault name segment from `/account/vaults/<name>[/token]`, lowercased, or
  *  null if the path doesn't match (defensive — the router guarantees a match). */
-function vaultNameFromPath(req: Request, suffix: "" | "/token"): string | null {
+function vaultNameFromPath(req: Request, suffix: "" | "/token" | "/snapshots" | "/restore"): string | null {
   const path = new URL(req.url).pathname;
   const m = new RegExp(`^/account/vaults/([^/]+)${suffix}/?$`).exec(path);
   return m ? decodeURIComponent(m[1]!).toLowerCase() : null;
@@ -784,12 +784,6 @@ async function mintVaultToken(
 
 // --- snapshots and restore (T-430, door/0.9) ----------------------------------
 
-/** `/account/vaults/<name>/snapshots|restore` → the vault name, lowercased. */
-function vaultNameBefore(req: Request, suffix: "snapshots" | "restore"): string | null {
-  const m = new RegExp(`^/account/vaults/([^/]+)/${suffix}/?$`).exec(new URL(req.url).pathname);
-  return m ? decodeURIComponent(m[1]!).toLowerCase() : null;
-}
-
 /**
  * `GET /account/vaults/<name>/snapshots` — the vault's restore points, newest first: the nightly snapshots
  * (snapshots.ts, 04:00 UTC, the plan's GFS retention) the console's History section lists. `account:<id>:read`.
@@ -797,7 +791,7 @@ function vaultNameBefore(req: Request, suffix: "snapshots" | "restore"): string 
 export async function handleAccountVaultSnapshots(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const auth = await requireAccount(db, req, deps, "read");
   if (!auth.ok) return auth.response;
-  const name = vaultNameBefore(req, "snapshots");
+  const name = vaultNameFromPath(req, "/snapshots");
   if (!name || !(await userOwnsVault(db, auth.accountId, name))) {
     return restError(403, "not_owner", `You do not own a vault named "${name ?? ""}".`);
   }
@@ -825,7 +819,7 @@ export async function handleAccountVaultRestore(db: D1Database, req: Request, de
   if (!PLAN_SPECS[livePlan(auth.user.plan, mode)].restore) {
     return restError(403, "restore_not_included", "this plan has no restore");
   }
-  const name = vaultNameBefore(req, "restore");
+  const name = vaultNameFromPath(req, "/restore");
   if (!name || !(await userOwnsVault(db, auth.accountId, name))) {
     return restError(403, "not_owner", `You do not own a vault named "${name ?? ""}".`);
   }

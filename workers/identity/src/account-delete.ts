@@ -157,6 +157,10 @@ export async function handleAccountDelete(
 ): Promise<Response> {
   const auth = await requireAccount(env.DB, req, deps, "admin");
   if (!auth.ok) return auth.response;
+  // An ADMIN_PUBKEYS key (door/0.9) works the owner's account but never ends it: only the owner deletes it.
+  if (auth.adminPubkey) {
+    return Response.json({ error: "admin_key", message: "an admin key can't delete the account; the owner does" }, { status: 403, headers: { "cache-control": "no-store" } });
+  }
   const user = auth.user;
 
   const body = await readJsonBody(req);

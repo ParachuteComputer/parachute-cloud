@@ -293,12 +293,16 @@ export async function handleNotes(
     // An empty ?type= is no type filter at all (as an absent one), never "every record".
     if (req.method === "GET" && RECORDS_REQUESTS.has(req) && (parseQueryList(new URL(req.url), "type") ?? []).some((t) => t.trim() !== "")) {
       const url = new URL(req.url);
-      const params: Record<string, unknown> = { type: parseQueryList(url, "type") ?? [] };
+      const params: Record<string, unknown> = { type: (parseQueryList(url, "type") ?? []).map((t) => t.trim()).filter(Boolean) };
       const tag = parseQueryList(url, "tag");
       if (tag) params.tag = tag;
       if (url.searchParams.has("tag_match")) params.tag_match = url.searchParams.get("tag_match");
       if (url.searchParams.has("expand")) params.expand = url.searchParams.get("expand");
       const f = foldTypeFilter(store.db as any, params) as { tag: string[]; tag_match: string };
+      // Full-text search filters tags as "any of them": a type with a tag and a search would quietly widen.
+      if (url.searchParams.has("search") && f.tag.length > 1) {
+        return json({ error: "type with tag and search isn't one query yet: drop the tag, or search inside the type and filter", error_type: "invalid_query", field: "type" }, 422);
+      }
       for (const k of ["type", "tag", "tag_match", "expand"]) url.searchParams.delete(k);
       url.searchParams.set("tag", f.tag.join(","));
       url.searchParams.set("tag_match", f.tag_match);

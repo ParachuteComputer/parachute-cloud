@@ -111,6 +111,8 @@ describe("door/0.9 MCP: the record door", () => {
     expect(help.ok, JSON.stringify(help.out)).toBe(true);
     expect(help.out.tool).toBe("create-record");
     expect(JSON.stringify(help.out.parameters)).toContain('"body"');
+    const both = await call(v, "vault-info", { help: "query-records", description: "x" });
+    expect(both.ok).toBe(false);
     const mt = await call(v, "vault-info", { help: "manage-types" });
     expect(Object.keys(mt.out.actions)).toEqual(["update", "rename", "merge", "delete", "prune"]);
   });
@@ -220,6 +222,10 @@ describe("door/0.9 REST: /api/records and /api/types", () => {
     expect((Array.isArray(both) ? both : both.records).map((r: any) => r.path)).toEqual(["A/1"]);
     const typed = (await (await op(v, "/api/records?type=task")).json()) as any;
     expect((Array.isArray(typed) ? typed : typed.records).map((r: any) => r.path).sort()).toEqual(["A/1", "A/2"]);
+    // Blank entries are no type; type+tag with a search can't be one query yet, so it says so.
+    const blanks = (await (await op(v, "/api/records?type=task,%20")).json()) as any;
+    expect((Array.isArray(blanks) ? blanks : blanks.records).map((r: any) => r.path).sort()).toEqual(["A/1", "A/2"]);
+    expect((await op(v, "/api/records?type=task&tag=urgent&search=a")).status).toBe(422);
     const plain = await op(v, "/api/records?type=urgent");
     expect(plain.status).toBe(422);
     expect(((await plain.json()) as any).error_type).toBe("tag_kind");

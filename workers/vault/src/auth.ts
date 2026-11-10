@@ -25,6 +25,7 @@ import {
 } from "@openparachute/scope-guard";
 import { createLocalJWKSet, decodeJwt } from "jose";
 import type { Env } from "./env.js";
+import { APP_KEY_CLIENT_ID } from "./app-keys.js";
 
 export const SCOPE_READ = "vault:read";
 export const SCOPE_WRITE = "vault:write";
@@ -313,6 +314,19 @@ export function nostrVia(pubkey: string): string {
 }
 
 /**
+ * Write-attribution for an app key (door/0.9, T-430): identity stamps the key's name in `permissions.app_key` when it
+ * mints one (account-keys.ts), so the key's writes say which app made them: `created_via` / `last_updated_via`
+ * `key:<name>`. Only on a token of the app-key client id, and only a name in the key-name rule; anything else is
+ * no name (the generic credential class).
+ */
+export const APP_KEY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+export function parseAppKeyName(clientId: string | null | undefined, permissions: Record<string, unknown> | undefined): string | null {
+  if (clientId !== APP_KEY_CLIENT_ID || !permissions) return null;
+  const raw = permissions.app_key;
+  return typeof raw === "string" && APP_KEY_NAME_RE.test(raw) ? raw : null;
+}
+
+/**
  * Read the signing pubkey out of a validated hub JWT's `permissions` claim.
  *
  * Wire contract: `permissions: { principal_pubkey: "<64 lowercase hex>" }`,
@@ -335,19 +349,6 @@ export function nostrVia(pubkey: string): string {
  * label, not an access decision — the opposite of a `scoped_tags` misread,
  * which must fail closed.
  */
-/**
- * Write-attribution for an app key (door/0.9, T-430): identity stamps the key's name in `permissions.app_key` when it
- * mints one (account-keys.ts), so the key's writes say which app made them: `created_via` / `last_updated_via`
- * `key:<name>`. Only on a token of the app-key client id, and only a name in the key-name rule; anything else is
- * no name (the generic credential class).
- */
-export const APP_KEY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
-export function parseAppKeyName(clientId: string | null | undefined, permissions: Record<string, unknown> | undefined): string | null {
-  if (clientId !== "parachute-app-key" || !permissions) return null;
-  const raw = permissions.app_key;
-  return typeof raw === "string" && APP_KEY_NAME_RE.test(raw) ? raw : null;
-}
-
 export function parsePrincipalPubkey(
   permissions: Record<string, unknown> | undefined,
 ): string | null {

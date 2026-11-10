@@ -333,6 +333,18 @@ describe("POST /ops/snapshot-run", () => {
     expect((await mirrorRows()).filter((r) => r.vault_name === "opsrun-new").map((r) => r.key)).toEqual([fresh.key]);
   });
 
+  test("{vault} naming no vault is a 404, not a silent empty run", async () => {
+    const res = await quietly(() =>
+      handleOpsSnapshotRunPost(
+        { ...env, OPS_RUN_TOKEN: TOKEN },
+        new Request(`${ISSUER}/ops/snapshot-run`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}` }, body: JSON.stringify({ vault: "journl" }) }),
+        sweepDeps(() => new Date()),
+        silentSender(),
+      ),
+    );
+    expect(res!.status).toBe(404);
+  });
+
   test("nothing stale → no vault call, run null", async () => {
     const res = await quietly(() => call({ ...env, OPS_RUN_TOKEN: TOKEN }, `Bearer ${TOKEN}`));
     expect(await res!.json()).toEqual({ stale_before: 0, run: null, stale_after: 0, vaults: 0 });

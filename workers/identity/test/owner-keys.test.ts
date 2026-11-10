@@ -250,6 +250,9 @@ describe("ADMIN_PUBKEYS: a second principal on a single-owner deploy (door/0.9, 
     expect([link.status, link.json.error]).toEqual([403, "admin_key"]);
     const unlink = await a.call(`/account/pubkeys/${owner.pubkey}`, { method: "DELETE", auth: `Bearer ${t}` });
     expect([unlink.status, unlink.json.error]).toEqual([403, "admin_key"]);
+    // Nor can it delete the account (the owner's lock-out).
+    const del = await a.call("/account/delete", { method: "POST", auth: `Bearer ${t}`, body: { confirm: `${owner.pubkey}@nostr.invalid` } });
+    expect([del.status, del.json?.error]).toEqual([403, "admin_key"]);
     // The owner's own token is not marked and may.
     const ot = (await signIn(a, owner)).json.token as string;
     expect((decodeJwtPayload(ot) as any).permissions).toBeUndefined();
