@@ -192,7 +192,7 @@ describe("POST /account/vaults/import", () => {
 
   test("a refusal from the vault that isn't about the file reads as 'didn't finish', not 'unreadable file'", async () => {
     const u = await seedUser("hop@example.com");
-    const v = fakeVault({ import: () => j({ error: "Forbidden" }, 403) });
+    const v = fakeVault({ import: () => j({ error: "Forbidden", error_type: "insufficient_scope" }, 403) });
     const res = await handleAccountVaultImport(db(), await importReq(await accountToken(u.id), "hop-refused"), withVault(v));
     expect([res.status, ((await res.json()) as { error: string }).error]).toEqual([502, "import_failed"]);
   });

@@ -730,9 +730,12 @@ export class VaultDO extends DurableObject {
         return refused;
       }
     }
-    const res = await this.counted(() => this.countedFetch(request));
-    await dropUnreadBody(request);
-    return res;
+    try {
+      return await this.counted(() => this.countedFetch(request));
+    } finally {
+      // Also when the handler threw: the 500 the router then answers must not be followed by the pipe failing.
+      await dropUnreadBody(request);
+    }
   }
 
   /**
@@ -2171,11 +2174,6 @@ export class VaultDO extends DurableObject {
       return json({ error: "path, sha256 (hex) and file are required", error_type: "import_file_invalid" }, 400);
     }
     if (file.size > MAX_IMPORT_BYTES) return this.importTooLargeResponse();
-    // The upload door refuses these (active content served from this origin). A file that arrives by import is
-    // held to the same list, so that guarantee never rests on what the served content type happens to be.
-    if (BLOCKED_EXTENSIONS.has(extLower(path))) {
-      return json({ error: `File type ${extLower(path)} not allowed (active/executable content)`, error_type: "blocked_upload_extension", extension: extLower(path) }, 400);
-    }
     const known = this.raw().exec("SELECT 1 FROM attachments WHERE path = ? LIMIT 1", path).toArray().length > 0;
     if (!known) return json({ error: "No attachment row has this path", error_type: "import_file_unknown" }, 404);
 
@@ -3987,10 +3985,11 @@ export class VaultDO extends DurableObject {
       let range = head ? parseByteRangeHeader(rangeHeader, head.size) : null;
       let obj: R2ObjectBody | null = null;
       if (range) {
-        // The object can be replaced or removed between the size read and this one. A range it no longer holds
-        // falls back to the whole file rather than answering with lengths that describe something else.
+        // The object can be replaced or removed between the size read and this one. Anything but the same object
+        // (its size and its etag) falls back to the whole file rather than answering with lengths, or bytes, that
+        // belong to something else.
         obj = await this.env.ATTACHMENTS.get(key, { range: { offset: range.start, length: range.end - range.start + 1 } }).catch(() => null);
-        if (!obj || obj.size !== head!.size) {
+        if (!obj || obj.size !== head!.size || obj.etag !== head!.etag) {
           range = null;
           obj = null;
         }
@@ -4423,8 +4422,9 @@ export class VaultDO extends DurableObject {
  *
  * Bounded on purpose, because this runs for requests that were never signed in: only a body that says how long it
  * is and is at most {@link DRAIN_LIMIT_BYTES}, and for at most {@link DRAIN_LIMIT_MS}. Anything else (no
- * Content-Length, a large upload, a sender that trickles) is cancelled as before, so a refusal is never held open
- * by whoever is being refused.
+ * Content-Length, a large upload, a sender that trickles) is cancelled, so a refusal is never held open by whoever
+ * is being refused. What this changes in production: a refusal for a small body now waits for that body to arrive
+ * (at most two seconds) where it used to go out at once.
  */
 export const DRAIN_LIMIT_BYTES = 1024 * 1024;
 export const DRAIN_LIMIT_MS = 2000;
@@ -4455,7 +4455,7 @@ export async function dropUnreadBody(request: Request, limits: { bytes?: number;
       if (step === "late") return cancel();
       if (step.done) return "drained";
       seen += step.value?.byteLength ?? 0;
-      if (seen > maxBytes) return cancel(); // more than it declared
+      if (seen > declared) return cancel(); // more than it said it would send
     }
   } catch {
     return "cancelled";

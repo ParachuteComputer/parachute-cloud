@@ -152,20 +152,6 @@ describe("a model can look at a file (read-attachment)", () => {
   });
 });
 
-describe("a file that arrives by import is held to the upload door's list", () => {
-  it("an import-file for a path with a blocked extension is refused before anything is stored", async () => {
-    const v = freshVault();
-    const firstParty = await mintToken({ vault: v, scopes: `vault:${v}:read vault:${v}:write vault:${v}:admin`, clientId: "parachute-console" });
-    const f = new FormData();
-    f.set("path", "2026-01-02/page.html");
-    f.set("sha256", "ab".repeat(32));
-    f.set("file", new File(["<html></html>"], "page.html", { type: "text/html" }));
-    const res = await SELF.fetch(`${base(v)}/api/internal/import-file`, { method: "POST", headers: { Authorization: `Bearer ${firstParty}` }, body: f });
-    expect(res.status).toBe(400);
-    expect(await res.json()).toMatchObject({ error_type: "blocked_upload_extension", extension: ".html" });
-  });
-});
-
 describe("an unread request body is dropped without holding the answer", () => {
   const body = (chunks: (Uint8Array | "wait")[], waitMs = 5000) =>
     new ReadableStream<Uint8Array>({

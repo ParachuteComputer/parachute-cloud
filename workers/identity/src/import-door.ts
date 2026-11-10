@@ -34,7 +34,7 @@ export type OwnerImportResult =
   | { kind: "vault_limit"; message: string }
   /** The vault row exists (and stays the caller's); the tar was over the cap, refused, or the replay failed. */
   | { kind: "too_large"; vaultName: string }
-  | { kind: "refused"; vaultName: string; errorType: string | null }
+  | { kind: "refused"; vaultName: string; status: number; errorType: string | null }
   | { kind: "failed"; vaultName: string };
 
 export async function importAsOwner(
@@ -75,7 +75,7 @@ export async function importAsOwner(
 
   const outcome = await forwardImport(db, deps, user.id, vaultName, tar, startedMs);
   if (outcome.kind === "too_large") return { kind: "too_large", vaultName };
-  if (outcome.kind === "refused") return { kind: "refused", vaultName, errorType: outcome.errorType };
+  if (outcome.kind === "refused") return { kind: "refused", vaultName, status: outcome.status, errorType: outcome.errorType };
   if (outcome.kind !== "landed") return { kind: "failed", vaultName };
   // The vault holds real content now: close the retry gate, so a later import naming it is "taken", never a
   // blow-away. A D1 hiccup here must not turn a landed import into an error; the residue (a still-flagged, populated

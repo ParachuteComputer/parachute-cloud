@@ -97,9 +97,9 @@ export async function handleAccountVaultImport(db: D1Database, req: Request, dep
     case "too_large":
       return tooLarge("That export");
     case "refused":
-      // The hop to the vault was refused for a reason that isn't about the file (its credential, the vault's
-      // state): the caller can't fix that by sending another file. The name stays theirs; the same call may land.
-      if (r.errorType === null || r.errorType === "Unauthorized" || r.errorType === "Forbidden") {
+      // The hop to the vault was refused for a reason that isn't about the file (the internal credential, a scope,
+      // a closed account: a 401 or 403). The caller can't fix that by sending another file. The name stays theirs.
+      if (r.status === 401 || r.status === 403) {
         return refuse(502, "import_failed", "The import didn't finish. The name is still yours: send the same request again.", { name: r.vaultName });
       }
       // A vault of this name was deleted moments ago and its storage object hasn't let go yet (it answers 410 until
