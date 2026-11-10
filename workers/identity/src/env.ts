@@ -33,10 +33,13 @@ export interface Env {
    * OPTIONAL — single-owner deploys (your own Cloudflare; T-414). The owner's Nostr key, as 64-hex or `npub1…`.
    * On an instance with NO accounts yet, the first NIP-98 sign-in (`POST /account/token`) signed by exactly this
    * key creates the owner: a key-only account (no password, no mail) with the key linked. Once any account
-   * exists it does nothing; more keys are linked from a signed-in account (`POST /account/pubkeys`). Set, it also
+   * exists it makes no account; more keys are linked from a signed-in account (`POST /account/pubkeys`). Set, it also
    * opens `POST /account/session-link` (T-442, account-session-link.ts): the owner's account token buys a one-time
    * browser sign-in link, the key-only owner's only way to a session for OAuth consent. Unset on Parachute Cloud,
-   * where that route is a 404. A malformed value is ignored (no bootstrap, no route), never widened.
+   * where that route is a 404. So on a single-owner door keep it set for the door's whole life: unset (or
+   * malformed) after the bootstrap, the owner keeps signing in with their key but loses the browser session, and
+   * with it OAuth consent, and sign-in codes are minted for their placeholder address again (auth-handlers.ts
+   * sendSignInLink). A malformed value is ignored (no bootstrap, no route), never widened.
    */
   OWNER_PUBKEY?: string;
   /**

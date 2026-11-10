@@ -198,6 +198,18 @@ export async function verifyNostrRequest(
   }
 }
 
+/**
+ * The key-only owner's address: a placeholder on the reserved `.invalid` domain (RFC 2606), which never routes, so no
+ * mail reaches it. One spelling for every place that makes or recognises it (drip.ts keeps its own SQL twin).
+ */
+export const PLACEHOLDER_DOMAIN = "@nostr.invalid";
+export function placeholderAddress(pubkey: string): string {
+  return `${pubkey}${PLACEHOLDER_DOMAIN}`;
+}
+export function isPlaceholderAddress(email: string): boolean {
+  return email.trim().toLowerCase().endsWith(PLACEHOLDER_DOMAIN);
+}
+
 /** The account a verified pubkey signs in as, or null. */
 export async function findPubkeyUser(db: D1Database, pubkey: string): Promise<User | null> {
   const row = await db.prepare("SELECT user_id FROM user_pubkeys WHERE pubkey = ?").bind(pubkey).first<{ user_id: string }>();
@@ -228,7 +240,7 @@ export async function resolvePubkeyAccount(
   const now = opts.now ?? new Date();
   let user: User;
   try {
-    user = await createUser(db, `${pubkey}@nostr.invalid`, "", now, { emailVerified: true });
+    user = await createUser(db, placeholderAddress(pubkey), "", now, { emailVerified: true });
   } catch {
     // A racing first sign-in by the same key made the placeholder address first.
     const winner = await findPubkeyUser(db, pubkey);

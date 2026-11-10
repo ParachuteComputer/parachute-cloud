@@ -54,7 +54,7 @@ import { auditStatement } from "./account-audit.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { safeNext } from "./auth-handlers.ts";
 import { createSessionLink } from "./magic-links.ts";
-import { findPubkeyUser } from "./nostr-auth.ts";
+import { placeholderAddress } from "./nostr-auth.ts";
 import { jsonResponse, type OAuthDeps } from "./oauth-shared.ts";
 import { checkAndBumpSessionLink } from "./rate-limit.ts";
 
@@ -87,8 +87,28 @@ const MAX_BODY_BYTES = 8192;
 /** The body: nothing, or `{"next": "<same-origin path or URL>"}`. Anything else is a 400. */
 async function readNext(req: Request): Promise<{ ok: true; next: string | null } | { ok: false }> {
   if (Number(req.headers.get("content-length") ?? 0) > MAX_BODY_BYTES) return { ok: false };
-  const bytes = await req.arrayBuffer();
-  if (bytes.byteLength > MAX_BODY_BYTES) return { ok: false };
+  // Read with a running count, so a body with no declared length is cut off at the cap, not buffered whole.
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  if (req.body) {
+    const reader = req.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_BODY_BYTES) {
+        await reader.cancel();
+        return { ok: false };
+      }
+      chunks.push(value);
+    }
+  }
+  const bytes = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    bytes.set(c, at);
+    at += c.byteLength;
+  }
   const text = new TextDecoder().decode(bytes);
   if (text.trim() === "") return { ok: true, next: null };
   let body: unknown;
@@ -119,10 +139,11 @@ export async function handleAccountSessionLink(db: D1Database, req: Request, dep
   if (auth.clientId !== ACCOUNT_TOKEN_CLIENT_ID || carriesDelegatedPrincipal(req)) {
     return err(403, "insufficient_scope", "a session link is minted with the owner's own account token, not an app's or an admin's");
   }
-  // The door's owner: the account OWNER_PUBKEY signs in as. A single-owner door has one account, but if another
-  // ever exists (a linked mail sender, an operator import) it gets no browser session this way.
-  const owner = deps.ownerPubkey ? await findPubkeyUser(db, deps.ownerPubkey) : null;
-  if (!owner || owner.id !== auth.accountId) {
+  // The door's owner: the key-only account OWNER_PUBKEY's first sign-in made, known by the address it was given
+  // (`<OWNER_PUBKEY>@nostr.invalid`, which no other account can hold). Not "the account the key is linked to now":
+  // the owner may link a new key and unlink the first, and must keep this way in. A single-owner door has one
+  // account, but if another ever exists (an operator import, a mail sender added) it gets no session this way.
+  if (!deps.ownerPubkey || auth.user.email !== placeholderAddress(deps.ownerPubkey)) {
     return err(403, "not_owner", "only this door's owner opens a browser session this way");
   }
   if (!auth.user.emailVerified) {

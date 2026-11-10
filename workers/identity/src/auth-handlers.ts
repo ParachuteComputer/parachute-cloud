@@ -23,6 +23,7 @@ import {
   createMagicLink,
   verifyMagicCode,
 } from "./magic-links.ts";
+import { isPlaceholderAddress } from "./nostr-auth.ts";
 import { bumpMagicLinkEvent } from "./ops.ts";
 import {
   buildPendingLoginCookie,
@@ -204,7 +205,7 @@ export async function sendSignInLink(
   // such an address reaches nobody, yet its 6-digit code could be guessed at POST /auth/code; so mint none, and the
   // caller's neutral answer stays the same (/auth/magic and /signup both come through here). The owner's browser
   // sign-in is POST /account/session-link. Parachute Cloud never sets OWNER_PUBKEY: nothing changes there.
-  if (deps.ownerPubkey && email.endsWith("@nostr.invalid")) return {};
+  if (deps.ownerPubkey && isPlaceholderAddress(email)) return {};
   const pending = existing ? null : (args.pending ?? null);
   const { rawToken, code } = await createMagicLink(db, email, existing?.id ?? null, now, next, pending);
   // Build the emailed link from the origin the request came in on (app. or

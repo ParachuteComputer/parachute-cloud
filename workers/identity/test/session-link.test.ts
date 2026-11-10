@@ -401,6 +401,21 @@ describe("only the owner's own account token mints a link", () => {
     expect(await linkRows()).toBe(0);
   });
 
+  test("the owner keeps the way in after rotating keys (link a new key, unlink the first)", async () => {
+    const d = await door();
+    const fresh = nostrKey();
+    const unsigned = {
+      pubkey: fresh.pubkey, created_at: Math.floor(Date.now() / 1000), kind: 27235, content: "",
+      tags: [["u", `${ORIGIN}/account/pubkeys`], ["method", "POST"], ["account", d.id]],
+    };
+    const id = await sha256Hex(JSON.stringify([0, unsigned.pubkey, unsigned.created_at, unsigned.kind, unsigned.tags, unsigned.content]));
+    const event = { ...unsigned, id, sig: hex(schnorr.sign(fromHex(id), fresh.secret)) };
+    expect((await api(d.e, "/account/pubkeys", { method: "POST", auth: d.bearer, body: { event } })).status).toBe(201);
+    expect((await api(d.e, `/account/pubkeys/${d.key.pubkey}`, { method: "DELETE", auth: d.bearer })).status).toBe(200);
+    const { token } = await ownerSignIn(d.e, fresh);
+    expect((await mint(d.e, `Bearer ${token}`, { next: "/console" })).status).toBe(200);
+  });
+
   test("an unverified account can't mint (opening it would claim the account)", async () => {
     const d = await door();
     const user = await createUser(env.DB, "unproven@example.com", "pw-unproven-1", new Date(), { emailVerified: false });
@@ -435,6 +450,21 @@ describe("next stays on this door", () => {
     expect((await mint(d.e, d.bearer, { next: "/console", extra: 1 })).status).toBe(400);
     expect((await mint(d.e, d.bearer, "not json")).status).toBe(400);
     expect((await mint(d.e, d.bearer, { next: `/console?${"a".repeat(5000)}` })).status).toBe(400); // past the length cap
+    // A body with no declared length is cut off at the cap, not read whole.
+    const chunk = new TextEncoder().encode(" ".repeat(4096));
+    let sent = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (sent++ < 64) c.enqueue(chunk);
+        else c.close();
+      },
+    });
+    const big = await worker.fetch(
+      new Request(`${ORIGIN}/account/session-link`, { method: "POST", headers: { authorization: d.bearer, "content-type": "application/json" }, body: stream, duplex: "half" } as RequestInit),
+      d.e as never,
+    );
+    expect(big.status).toBe(400);
+    expect(sent).toBeLessThan(64);
     expect(await linkRows()).toBe(0);
     // An absolute URL on this door is the same place, and allowed.
     expect((await mint(d.e, d.bearer, { next: `${ORIGIN}/console` })).status).toBe(200);
