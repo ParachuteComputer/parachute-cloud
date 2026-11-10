@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# deploy/personal/wr: `wrangler ARGS...` with its own short-lived child key from the sealed job, for that one process.
+#   wrangler d1 ...    -> d1-write
+#   wrangler r2 ...    -> r2-admin
+#   anything else      -> workers-scripts-write
+#   wr --api PATH      -> GET https://api.cloudflare.com/client/v4/accounts/<account>/PATH with a workers-scripts-write
+#                         child (the workers.dev subdomain lookup); prints the JSON result only
+# Runs only inside `sealed job` (UNI_SEALED_ACCOUNT_ID set). Retries a failed call (a fresh child can take a few
+# seconds to be accepted); every call deploy.sh makes is idempotent. Nothing secret printed: the key lives in the one
+# child process's environment only.
+set -uo pipefail
+[ -n "${UNI_SEALED_ACCOUNT_ID:-}" ] || { echo "wr: refused: not inside a sealed job" >&2; exit 2; }
+REAL="${REAL_BUNX:-$HOME/.bun/bin/bunx}"
+PY="${PY:-$HOME/REPOS/hermes-agent/.venv/bin/python}"; SEALED="${SEALED:-$HOME/Code/uni-ops/sealed/cli.py}"
+LOG="${WR_LOG:-/dev/null}"
+if [ "${1:-}" = --api ]; then TPL=workers-scripts-write
+else case "${1:-}" in d1) TPL=d1-write ;; r2) TPL=r2-admin ;; *) TPL=workers-scripts-write ;; esac; fi
+here="$PWD"; out="$(mktemp)"; err="$(mktemp)"; tries="${WR_TRIES:-8}"
+for i in $(seq 1 "$tries"); do
+  if [ "${1:-}" = --api ]; then
+    (cd "$HOME/Code/uni-ops" && "$PY" -I "$SEALED" job-child "$TPL" -- bash -c \
+      'curl -fsS -H "Authorization: Bearer $(cat <&"$UNI_SEALED_FD")" "https://api.cloudflare.com/client/v4/accounts/$UNI_SEALED_ACCOUNT_ID/$0"' "$2") >"$out" 2>"$err"
+  else
+    (cd "$HOME/Code/uni-ops" && "$PY" -I "$SEALED" job-child "$TPL" -- \
+      bash -c 'cd "$0"; CLOUDFLARE_ACCOUNT_ID="$UNI_SEALED_ACCOUNT_ID" CLOUDFLARE_API_TOKEN="$(cat <&"$UNI_SEALED_FD")" CI=1 WRANGLER_SEND_METRICS=false exec "$1" wrangler "${@:2}"' "$here" "$REAL" "$@") >"$out" 2>"$err"
+  fi
+  rc=$?
+  [ $rc = 0 ] && break
+  echo "wr: ${1:-} ${2:-} try $i/$tries failed (exit $rc)" >&2
+  grep -E "ERROR|✘|Authentication|refused|already exists" "$err" "$out" 2>/dev/null | grep -vi token | head -3 >&2
+  # Idempotent "already there" answers are a success for the caller to read, not a retry.
+  grep -qi "already exists" "$err" "$out" 2>/dev/null && break
+  [ "$i" -lt "$tries" ] && sleep "${WR_RETRY_S:-8}"
+done
+cat "$out"; grep -vi token "$err" >&2; rm -f "$out" "$err"
+echo "$(date -u +%H:%M:%S) $TPL ${1:-} ${2:-} -> $rc" >> "$LOG"
+exit $rc

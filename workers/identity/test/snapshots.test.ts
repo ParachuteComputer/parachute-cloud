@@ -310,6 +310,29 @@ describe("POST /ops/snapshot-run", () => {
     expect(summary).toMatchObject({ vaults: 0, failed: 0, capped: true });
   });
 
+  test("{vault} snapshots that one vault now, though it isn't stale (T-430)", async () => {
+    const { id: owner } = await seedUser("opsrun-one@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'power' WHERE id = ?").bind(owner).run();
+    await seedVault("opsrun-new", owner);
+    await seedVault("opsrun-other", owner);
+    const fresh = wireEntry("opsrun-new", new Date().toISOString());
+    fetchMock
+      .get(env.VAULT_ORIGIN!)
+      .intercept({ path: "/vault/opsrun-new/api/internal/snapshot", method: "POST" })
+      .reply(200, { skipped: false, long_paths: 0, manifest: [fresh] }, { headers: { "content-type": "application/json" } });
+    const res = await quietly(() =>
+      handleOpsSnapshotRunPost(
+        { ...env, OPS_RUN_TOKEN: TOKEN },
+        new Request(`${ISSUER}/ops/snapshot-run`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ vault: "opsrun-new" }) }),
+        sweepDeps(() => new Date()),
+        silentSender(),
+      ),
+    );
+    expect(res!.status).toBe(200);
+    expect(((await res!.json()) as any).run).toMatchObject({ vaults: 1, taken: 1, failed: 0 });
+    expect((await mirrorRows()).filter((r) => r.vault_name === "opsrun-new").map((r) => r.key)).toEqual([fresh.key]);
+  });
+
   test("nothing stale → no vault call, run null", async () => {
     const res = await quietly(() => call({ ...env, OPS_RUN_TOKEN: TOKEN }, `Bearer ${TOKEN}`));
     expect(await res!.json()).toEqual({ stale_before: 0, run: null, stale_after: 0, vaults: 0 });

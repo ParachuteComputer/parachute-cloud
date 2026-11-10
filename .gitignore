@@ -14,3 +14,6 @@ dist
 
 # local wrangler/miniflare state from health-report.ts --local runs (T-411)
 tmp/
+
+# deploy/personal (T-430): rendered per profile, never committed
+workers/*/wrangler.personal.gen.toml

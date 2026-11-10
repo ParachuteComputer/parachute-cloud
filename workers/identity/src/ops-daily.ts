@@ -405,8 +405,18 @@ export async function handleOpsSnapshotRunPost(
   if (req.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
   const mode = billingModeOf(deps);
   const before = await staleSnapshotVaults(env.DB, deps.now?.() ?? new Date(), mode);
+  // `{vault: "<name>"}` (T-430): snapshot that one vault now, stale or not (before a risky change; the personal
+  // door's smoke). Its owner's plan policy still decides what is kept. Without it: only the stale vaults, as before.
+  let only: string | null = null;
+  try {
+    const body = (await req.clone().json()) as { vault?: unknown } | null;
+    if (body && typeof body.vault === "string" && body.vault.trim()) only = body.vault.trim().toLowerCase();
+  } catch {
+    // no body, or not JSON: the stale run
+  }
   let run: SnapshotSweepSummary | null = null;
-  if (before.names.length > 0) run = await runSnapshotSweep(env, deps, { onlyVaults: before.names, sender });
+  if (only) run = await runSnapshotSweep(env, deps, { onlyVaults: [only], sender });
+  else if (before.names.length > 0) run = await runSnapshotSweep(env, deps, { onlyVaults: before.names, sender });
   const after = await countStaleSnapshots(env.DB, deps.now?.() ?? new Date(), mode);
   console.log(`event=ops_snapshot_run stale_before=${before.names.length} stale_after=${after.stale}`);
   return Response.json(
