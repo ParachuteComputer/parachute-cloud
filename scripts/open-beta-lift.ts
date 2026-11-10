@@ -24,8 +24,7 @@
  * vaults/day); the vault worker already ignores `frozen` in open beta, so no
  * write is blocked in the meantime.
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -93,22 +92,56 @@ function query<T>(sql: string): T[] {
   return envelope.results ?? [];
 }
 
-/** Run statements from a temp file (wrangler --file). Row-change counts are
- *  NOT read from wrangler's output (local D1 doesn't report them); the before/
- *  after COUNTS are the audit trail. */
-function execFile(statements: readonly string[]): void {
-  const dir = mkdtempSync(join(tmpdir(), "open-beta-lift-"));
-  const file = join(dir, "lift.sql");
-  try {
-    writeFileSync(file, statements.map((s) => (s.trim().endsWith(";") ? s : `${s};`)).join("\n"));
-    const stdout = wrangler(["--file", file]);
-    const parsed = JSON.parse(stdout.slice(stdout.indexOf("["), stdout.lastIndexOf("]") + 1)) as Array<{
-      success?: boolean;
-    }>;
-    if (parsed.some((e) => e.success === false)) throw new Error("a statement reported success=false");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+/** Run statements through `--command` (D1's /query API), in order. NOT
+ *  `--file`: wrangler sends a remote `--file` to D1's /import API, which the
+ *  scoped deploy key refuses (401, code 10000; T-413); /query is the path
+ *  `d1 migrations apply` uses. Statements are packed into commands of at most
+ *  MAX_COMMAND_BYTES and MAX_COMMAND_STATEMENTS (well under Linux's 128 KiB
+ *  argv-string limit and D1's 100 KB SQL limit), so a large rollback runs as
+ *  several commands. Unlike the old /import, the run is NOT all-or-nothing:
+ *  every statement here is guarded and idempotent, so a failed run is safe to
+ *  re-run, and a failure names how many commands had already committed.
+ *  Row-change counts are NOT read from wrangler's output (local D1 doesn't
+ *  report them); the before/after COUNTS are the audit trail. */
+const MAX_COMMAND_BYTES = 30_000;
+const MAX_COMMAND_STATEMENTS = 50;
+function packStatements(statements: readonly string[]): string[] {
+  const out: string[] = [];
+  let cur: string[] = [];
+  let curBytes = 0;
+  for (const raw of statements) {
+    const s = raw.trim().endsWith(";") ? raw.trim() : `${raw.trim()};`;
+    const bytes = Buffer.byteLength(s) + 1;
+    if (bytes > MAX_COMMAND_BYTES) throw new Error(`a statement is over ${MAX_COMMAND_BYTES} bytes`);
+    if (cur.length && (curBytes + bytes > MAX_COMMAND_BYTES || cur.length >= MAX_COMMAND_STATEMENTS)) {
+      out.push(cur.join("\n"));
+      cur = [];
+      curBytes = 0;
+    }
+    cur.push(s);
+    curBytes += bytes;
   }
+  if (cur.length) out.push(cur.join("\n"));
+  return out;
+}
+
+function execStatements(statements: readonly string[]): number {
+  const commands = packStatements(statements);
+  commands.forEach((command, i) => {
+    try {
+      const stdout = wrangler(["--command", command]);
+      const parsed = JSON.parse(stdout.slice(stdout.indexOf("["), stdout.lastIndexOf("]") + 1)) as Array<{
+        success?: boolean;
+      }>;
+      if (parsed.some((e) => e.success === false)) throw new Error("a statement reported success=false");
+    } catch (err) {
+      throw new Error(
+        `command ${i + 1} of ${commands.length} failed; the ${i} before it committed. Every statement is guarded, ` +
+          `so re-run the same command (keep any backup file already written).\n${(err as Error).message}`,
+      );
+    }
+  });
+  return commands.length;
 }
 
 function counts(label: string): LiftCounts {
@@ -138,8 +171,8 @@ function main(): void {
       console.log("Backup is empty — nothing to roll back.");
       return;
     }
-    execFile(statements);
-    console.log(`Ran ${statements.length} guarded restores (a row that moved to a paid plan since is skipped).`);
+    const commands = execStatements(statements);
+    console.log(`Ran ${statements.length} guarded restores in ${commands} wrangler command(s) (a row that moved to a paid plan since is skipped).`);
     counts("After rollback");
     return;
   }
@@ -158,7 +191,7 @@ function main(): void {
   liftRollbackSql(backup); // prove the backup is restorable BEFORE changing anything
   console.log(`\nBackup of ${backup.length} rows → ${backupFile} (keep it; rollback input).`);
 
-  execFile(LIFT_APPLY_SQL);
+  execStatements(LIFT_APPLY_SQL);
   console.log(`Applied the lift (${LIFT_APPLY_SQL.length} statements).`);
   counts("After");
 }

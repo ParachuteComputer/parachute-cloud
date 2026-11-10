@@ -123,6 +123,37 @@ describe("subscribe — live push (single-writer fan-out)", () => {
     await sse.cancel();
   });
 
+  it("a bare field filter delivers live exactly what the same query finds (one matcher, core's; audit L1-03)", async () => {
+    // Cloud's copied matcher compared loosely (String(a) === String(b)) after core's #47 matched by JSON type: with
+    // `meta[count]=5` a stored number 5 was left out of the snapshot (the query doesn't find it) and then delivered
+    // live. The rule checked here is parity, whatever type the REST door gives the filter value.
+    const v = freshVault();
+    const q = "?tag=watch&meta[count]=5";
+    await createNote(v, { path: "c/number-before", content: "n", tags: ["watch"], metadata: { count: 5 } });
+    await createNote(v, { path: "c/string-before", content: "s", tags: ["watch"], metadata: { count: "5" } });
+    const res = await sub(v, q);
+    const sse = sseReader(res);
+    const snap = await sse.next();
+    expect(snap.event).toBe("snapshot");
+
+    await createNote(v, { path: "c/number-live", content: "n", tags: ["watch"], metadata: { count: 5 } });
+    await createNote(v, { path: "c/string-live", content: "s", tags: ["watch"], metadata: { count: "5" } });
+    await createNote(v, { path: "c/boolean-live", content: "b", tags: ["watch"], metadata: { count: true } });
+    const live: string[] = [];
+    for (;;) {
+      const ev = await sse.next(2500).catch(() => null);
+      if (!ev) break;
+      if (ev.event === "upsert") live.push(ev.data.note.path);
+    }
+    await sse.cancel();
+
+    const found = (await (await SELF.fetch(`${base(v)}/api/notes${q}`, { headers: { Authorization: `Bearer ${OP}` } })).json()) as any[];
+    const paths = found.map((n) => n.path);
+    expect(snap.data.notes.map((n: any) => n.path).sort()).toEqual(paths.filter((p) => p.endsWith("before")).sort());
+    expect(live.sort()).toEqual(paths.filter((p) => p.endsWith("live")).sort());
+    expect(live.length).toBeGreaterThan(0); // the filter matches something, so the stream is proven live
+  }, 60_000);
+
   it("a delete is pushed as remove{id}", async () => {
     const v = freshVault();
     const n = await createNote(v, { content: "doomed", tags: ["watch"] });

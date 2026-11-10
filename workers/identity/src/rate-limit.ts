@@ -1,21 +1,28 @@
 /**
- * Abuse-fence policy + the fail-open client for {@link RateLimiterDO} (#30).
+ * Abuse-fence policy + the client for {@link RateLimiterDO} (#30).
  *
  * The counters live in a Durable Object — one instance per rate key, which
- * serializes updates (atomic read→write, no concurrent-burst slip-through) and
- * implements a true SLIDING window. This file owns the POLICY (the same
- * windows/limits as the retired D1 fences — see migrations/0006) and the key
- * derivation, and wraps every DO call in the availability posture:
+ * serializes updates and implements a true SLIDING window. This file owns the
+ * POLICY (the same windows/limits as the retired D1 fences — see
+ * migrations/0006), the key derivation, and the availability posture of every
+ * DO call. Each fence is ONE DO call that checks and records together
+ * (`checkAndBump`): a parallel burst can't all read "under the limit" before
+ * any of them is counted (T-419, audit L3-03 F1 — the login lockout used to be
+ * a separate check call and record call, and 60 parallel wrong passwords were
+ * all checked).
  *
- * FAIL OPEN. If the Durable Object errors or is unreachable, the request is
- * ALLOWED (and lockout checks report unlocked) with a structured
- * `event=rate_limiter_unavailable` log line — availability over strictness,
- * the same posture the best-effort D1 fences had. The log line is PII-free by
- * design: the op name only, never the key (keys carry ip/email).
+ * Two postures when the Durable Object errors or is unreachable, each with a
+ * PII-free `event=rate_limiter_unavailable` log line (the op only — keys carry
+ * ip/email, never log them):
+ *   - FAIL OPEN for the signup and magic-link SEND fences: availability over
+ *     strictness; they are abuse fences, not security controls.
+ *   - FAIL CLOSED for the sign-in GUESS fences (password, 2FA code, sign-in
+ *     code): a limiter outage must not turn into unlimited guessing, so the
+ *     attempt is refused with the ordinary "too many attempts" answer.
  *
- * These are still abuse FENCES, not full security controls: an attacker
- * rotating source IPs walks around any IP-keyed limit. Real bot fences
- * (Turnstile, email verification) remain design §6 Phase 5 (cloud#48).
+ * An attacker rotating source IPs still walks around any IP-keyed limit. Real
+ * bot fences (Turnstile, email verification) remain design §6 Phase 5
+ * (cloud#48).
  */
 
 export interface BumpOutcome {
@@ -30,7 +37,7 @@ export interface LockOutcome {
 /**
  * Structural view of the RATE_LIMITER binding (typed here rather than as
  * `DurableObjectNamespace<RateLimiterDO>` so tests can hand the client a fake
- * namespace — the fail-open tests inject one whose stub always throws).
+ * namespace — the outage tests inject one whose stub always throws).
  */
 export interface RateLimiterNamespace {
   idFromName(name: string): DurableObjectId;
@@ -38,8 +45,6 @@ export interface RateLimiterNamespace {
 }
 interface RateLimiterStub {
   checkAndBump(windowMs: number, max: number, nowMs: number): Promise<BumpOutcome>;
-  isLocked(windowMs: number, max: number, nowMs: number): Promise<LockOutcome>;
-  recordFailure(windowMs: number, nowMs: number): Promise<void>;
   clear(): Promise<void>;
 }
 
@@ -48,7 +53,7 @@ function stubFor(limiter: RateLimiterNamespace, key: string): RateLimiterStub {
 }
 
 /** PII-free unavailability trail (op only — keys carry ip/email, never log them). */
-function failOpen(op: string, err: unknown): void {
+function limiterDown(op: string, err: unknown): void {
   const msg = err instanceof Error ? err.message : String(err);
   console.error(`event=rate_limiter_unavailable op=${op} error=${JSON.stringify(msg)}`);
 }
@@ -77,7 +82,7 @@ export async function checkAndBumpSignup(
   try {
     return await stubFor(limiter, `signup:${ip}`).checkAndBump(SIGNUP_WINDOW_MS, SIGNUP_MAX_PER_WINDOW, now.getTime());
   } catch (err) {
-    failOpen("signup", err);
+    limiterDown("signup", err);
     return { allowed: true, retryAfterSeconds: 0 };
   }
 }
@@ -113,34 +118,30 @@ export function loginKey(ip: string, email: string): string {
   return `${ip}|${email.trim().toLowerCase()}`;
 }
 
+/** What a sign-in guess door answers when the limiter itself is down (fail closed). */
+export const LIMITER_DOWN_RETRY_SECONDS = 60;
+
 /**
- * Is this (ip, email) currently locked out? A locked key refuses even a correct
- * password until enough failures age out of the sliding window — that's the
- * brute-force fence. Returns the retry-after so callers can surface it.
+ * Reserve one guess for this (ip, email) key BEFORE checking the secret, in a
+ * single atomic DO call: `locked: false` means a slot was taken (it counts as
+ * a failure until {@link clearLoginFailures} wipes the key on success);
+ * `locked: true` means the window already holds the limit of guesses and
+ * nothing was recorded (being blocked never extends the block). A locked key
+ * refuses even a correct secret until enough guesses age out of the window.
+ *
+ * FAIL CLOSED: if the DO is unreachable the guess is refused (`locked: true`).
  */
-export async function isLoginLocked(
+export async function attemptLogin(
   limiter: RateLimiterNamespace,
   key: string,
   now: Date = new Date(),
 ): Promise<LockOutcome> {
   try {
-    return await stubFor(limiter, `login:${key}`).isLocked(LOGIN_WINDOW_MS, LOGIN_MAX_FAILURES, now.getTime());
+    const out = await stubFor(limiter, `login:${key}`).checkAndBump(LOGIN_WINDOW_MS, LOGIN_MAX_FAILURES, now.getTime());
+    return { locked: !out.allowed, retryAfterSeconds: out.retryAfterSeconds };
   } catch (err) {
-    failOpen("login-check", err);
-    return { locked: false, retryAfterSeconds: 0 };
-  }
-}
-
-/** Record a failed login attempt (ages out of the sliding window on its own). */
-export async function recordLoginFailure(
-  limiter: RateLimiterNamespace,
-  key: string,
-  now: Date = new Date(),
-): Promise<void> {
-  try {
-    await stubFor(limiter, `login:${key}`).recordFailure(LOGIN_WINDOW_MS, now.getTime());
-  } catch (err) {
-    failOpen("login-record", err);
+    limiterDown("login-attempt", err);
+    return { locked: true, retryAfterSeconds: LIMITER_DOWN_RETRY_SECONDS };
   }
 }
 
@@ -149,7 +150,7 @@ export async function clearLoginFailures(limiter: RateLimiterNamespace, key: str
   try {
     await stubFor(limiter, `login:${key}`).clear();
   } catch (err) {
-    failOpen("login-clear", err);
+    limiterDown("login-clear", err);
   }
 }
 
@@ -178,7 +179,7 @@ export async function checkAndBumpMagic(
       now.getTime(),
     );
   } catch (err) {
-    failOpen("magic", err);
+    limiterDown("magic", err);
     return { allowed: true, retryAfterSeconds: 0 };
   }
 }

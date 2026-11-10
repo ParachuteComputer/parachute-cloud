@@ -312,6 +312,12 @@ export interface ConsentProps {
   issuerHost: string;
   /** The authenticated account approving this grant — the "Signed in as" line. */
   email: string;
+  /**
+   * The app registered itself (RFC 7591) and Parachute can't vouch for it: not
+   * a reserved Parachute client id and not returning only to Parachute's own
+   * pages (oauth-connections.ts `isVouchedClient`). Shows the unverified label.
+   */
+  unverified: boolean;
   /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `authorizeResumePath`). */
   notYouNext: string;
   /**
@@ -515,7 +521,7 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
 }
 
 export function renderConsent(props: ConsentProps): string {
-  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults, replaces } = props;
+  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults, replaces, unverified } = props;
   // The plain sentence is the list (T-318 #15: raw `vault:<name>:read` under it
   // read as jargon). A scope with no sentence keeps its raw string here, so no
   // requested scope is ever only in the closed "Technical details" below.
@@ -542,6 +548,7 @@ export function renderConsent(props: ConsentProps): string {
     `<h1>Connect ${esc(clientName)}</h1>
      ${signedInAsLine(email, csrfToken, notYouNext)}
      <div class="card">
+       ${unverified ? unverifiedLabel() : ""}
        <p class="lead" data-testid="consent-ask">${ask}</p>
        <ul class="scopes">${scopeList}</ul>
        ${returnsToLine(params.redirectUri)}
@@ -566,17 +573,30 @@ export function renderConsent(props: ConsentProps): string {
 }
 
 /**
- * Where the connection goes back to, when that is an app on this device (a
- * private-use scheme redirect, RFC 8252 §7.1) rather than a web address: any
- * app can claim such a scheme, so the person sees which one before Allow
- * (MCP 2026-07-28 security considerations: inform the user when the redirect
- * is not one the server can vouch for). Empty for http(s).
+ * Where Allow sends the person, for EVERY client (T-419, audit L3-03 F2): the
+ * name is the app's own choice, so the page shows the one thing a person can
+ * check — the redirect's origin (scheme://host[:port], no path). For a native
+ * app's private-use scheme (RFC 8252 §7.1) any app on the device can claim
+ * it, so it says that instead (MCP 2026-07-28 security considerations).
+ * The redirect was already exact-matched against the client's registration.
  */
 function returnsToLine(redirectUri: string): string {
-  if (!isNativeAppRedirect(redirectUri)) return "";
-  const u = new URL(redirectUri);
-  const where = u.host ? `${u.protocol}//${u.host}` : `${u.protocol}${u.pathname}`;
-  return `<p class="muted" data-testid="consent-returns-to">After you allow, the connection goes back to an app on this device: <code>${esc(where)}</code>.</p>`;
+  let u: URL;
+  try {
+    u = new URL(redirectUri);
+  } catch {
+    return "";
+  }
+  if (isNativeAppRedirect(redirectUri)) {
+    const where = u.host ? `${u.protocol}//${u.host}` : `${u.protocol}${u.pathname}`;
+    return `<p class="muted" data-testid="consent-returns-to">After you allow, the connection goes back to an app on this device: <code>${esc(where)}</code>.</p>`;
+  }
+  return `<p class="muted" data-testid="consent-returns-to">After you allow, you go to <code>${esc(u.origin)}</code>.</p>`;
+}
+
+/** The unverified-app label: the app named itself and Parachute can't vouch for it. */
+function unverifiedLabel(): string {
+  return `<div class="warn" data-testid="consent-unverified" style="margin:0 0 .8rem"><strong>Unverified app.</strong> This app registered itself, so Parachute can't confirm who made it. Allow only if you started this connection and recognise where it sends you.</div>`;
 }
 
 /**

@@ -20,7 +20,7 @@
 import type { Store, QueryOpts } from "@openparachute/core/src/types.js";
 import { parseNotesQueryOpts } from "../rest/parse.js";
 import { type TagScopeCtx, filterNotesByTagScope } from "../rest/tag-scope.js";
-import { buildLiveMatcher, unsupportedSubscriptionReason } from "./live-match.js";
+import { buildLiveMatcher, unsupportedSubscriptionReason } from "@openparachute/core/src/live-match.js";
 import { snapshotFrame, SseSink, type SubscriptionManager } from "./subscriptions.js";
 
 /** Keepalive interval — `:` comment every ~25s to defeat idle-proxy timeouts. */

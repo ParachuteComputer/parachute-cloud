@@ -66,21 +66,10 @@ export async function handleVault(
     return json(result);
   }
 
-  // KNOWN GAP (cloud#134 A.2, drift vs. the MCP door — NOT fixed here, annotation
-  // only): this REST PATCH still writes `description` (and audio_retention /
-  // auto_transcribe below) at the generic WRITE tier — the caller's REST scope
-  // gate is `verbForMethod`'s plain write (vault-do.ts's dispatcher has no
-  // admin carve-out for `/vault`), unlike `mcp.ts`'s `overrideVaultInfo`, which
-  // was tightened to require `vault:admin` for the SAME mutation (description
-  // is curation, same class as update-tag). Left asymmetric ON PURPOSE: the bun
-  // vault's `routes.ts handleVault` has the identical write-tier REST PATCH (no
-  // admin gate), so re-tiering cloud's REST door alone would fork the wire
-  // contract this file is required to stay byte-shaped with (see this repo's
-  // CLAUDE.md: "the WIRE contract ... must match the bun vault byte-shaped").
-  // Net effect: the MCP-door admin gate is ADVISORY, not a real boundary, until
-  // bun's REST door moves too and both doors re-tier together — a write-tier
-  // token can always reach this mutation via REST even though the MCP tool
-  // refuses it. Tracked, not silently accepted; do not "fix" only one side.
+  // Scope (T-419, audit L3-01; closes cloud#134 A.2): a PATCH that carries `description` needs vault:admin, checked
+  // in vault-do.ts before this handler runs, the same rule as MCP vault-info and the bun vault's REST door. The
+  // description is the instruction text every connected AI reads, so writing it is curation. `config` alone
+  // (audio_retention, auto_transcribe) stays at write: the Notes app sets audio retention with a write token.
   if (req.method === "PATCH") {
     const body = await req.json() as {
       // `unknown`, not `string` — this is parsed JSON off the wire, and the old

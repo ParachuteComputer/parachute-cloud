@@ -45,13 +45,12 @@ import { forwardImport, logForwardFailed } from "./import-forward.ts";
 import { MAX_IMPORT_BYTES, MAX_IMPORT_MIB } from "./import-limit.ts";
 export { MAX_IMPORT_BYTES, MAX_IMPORT_MIB };
 import {
+  attemptLogin,
   checkAndBumpMagic,
   checkAndBumpSignup,
   clearLoginFailures,
   clientIp,
-  isLoginLocked,
   loginKey,
-  recordLoginFailure,
 } from "./rate-limit.ts";
 import {
   SESSION_COOKIE,
@@ -258,19 +257,20 @@ export async function handleLoginPost(db: D1Database, req: Request, deps: OAuthD
   const email = String(form.get("email") ?? "").trim();
   const password = String(form.get("password") ?? "");
   const now = deps.now?.() ?? new Date();
-  // Brute-force fence BEFORE the (expensive) password verify: a locked key is
-  // refused without even running PBKDF2.
+  // Brute-force fence BEFORE the (expensive) password verify: one atomic call
+  // reserves this guess or refuses (locked, or the limiter is down) without
+  // even running PBKDF2. A reserved guess counts as a failure until success
+  // clears the key, so a parallel burst can't all be checked (T-419).
   const key = loginKey(clientIp(req), email);
-  if ((await isLoginLocked(deps.rateLimiter, key, now)).locked) {
+  if ((await attemptLogin(deps.rateLimiter, key, now)).locked) {
     return loginError(req, "Too many attempts. Please wait a few minutes and try again.", email);
   }
   const user = email ? await getUserByEmail(db, email) : null;
   // A SUSPENDED or DELETED account fails with the exact wrong-password
   // message — even on the correct password (neither is ever revealed;
-  // migrations 0011 + 0023). The failure is recorded like any other so the
-  // fence stays indistinguishable.
+  // migrations 0011 + 0023). Its reserved guess stays counted like any other
+  // failure, so the fence stays indistinguishable.
   if (!user || !(await verifyPassword(user, password)) || user.suspendedAt || user.deletedAt) {
-    await recordLoginFailure(deps.rateLimiter, key, now);
     return loginError(req, "Incorrect email or password.", email);
   }
   await clearLoginFailures(deps.rateLimiter, key);

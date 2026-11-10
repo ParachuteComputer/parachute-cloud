@@ -174,6 +174,39 @@ export function isNativeAppRedirect(uri: string): boolean {
 }
 
 /**
+ * The one callback path a Parachute page uses: the Notes app's PKCE return
+ * (parachute-app `src/lib/vault/oauth.ts` REDIRECT_PATH, served at the root of
+ * app./my.). An allowlist, not a denylist: bound origins also carry the vault
+ * worker's tenant routes (my.parachute.computer `/vault/*`, `/mcp*`), and any
+ * other path — encoded, doubled slashes, a future route — is simply not it.
+ */
+const FIRST_PARTY_CALLBACK_PATH = "/oauth/callback";
+
+/**
+ * True when every redirect URI is a first-party Parachute page: an http(s)
+ * URL on the issuer or a BOUND_ORIGINS member (`firstPartyOrigins`) at exactly
+ * {@link FIRST_PARTY_CALLBACK_PATH}. A private-use scheme has no web origin,
+ * so never counts. Used to decide whether a registration may carry a
+ * Parachute-like name (oauth-register.ts) and whether consent labels the app
+ * unverified (oauth-connections.ts `isVouchedClient`).
+ */
+export function redirectsAreFirstParty(redirectUris: readonly string[], firstPartyOrigins: readonly string[]): boolean {
+  if (redirectUris.length === 0) return false;
+  return redirectUris.every((uri) => {
+    try {
+      const u = new URL(uri);
+      return (
+        (u.protocol === "https:" || u.protocol === "http:") &&
+        firstPartyOrigins.includes(u.origin) &&
+        u.pathname === FIRST_PARTY_CALLBACK_PATH
+      );
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
  * Light validation — refuses obviously-wrong shapes (relative paths,
  * javascript:/data: URIs, embedded control chars, userinfo). http(s), or a
  * native app's private-use scheme ({@link isPrivateUseRedirect}).

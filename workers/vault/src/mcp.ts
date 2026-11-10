@@ -298,17 +298,8 @@ function overrideVaultInfo(
       // (The frozen/cap paywall is applied at the dispatch layer — see
       // isGatedWrite/handleToolCall — so this only guards SCOPE.)
       //
-      // KNOWN GAP (cloud#134 A.2, drift vs. the REST door — NOT closed, this
-      // gate is ADVISORY): `PATCH /api/vault` (rest/vault.ts) still writes this
-      // SAME `description` field at the generic write tier — no admin carve-out
-      // exists in vault-do.ts's REST dispatcher for `/vault`, and it stays that
-      // way on purpose: the bun vault's own `routes.ts handleVault` REST PATCH
-      // has the identical write-tier gap, and re-tiering cloud's REST door
-      // alone would fork the wire contract cloud is required to keep
-      // byte-shaped with bun (see rest/vault.ts's matching annotation). So this
-      // MCP-only admin check narrows just the MCP door's tool surface; a
-      // write-tier token can still reach the exact same mutation via REST.
-      // Both doors need to move together before this stops being advisory.
+      // The REST door matches since T-419 (audit L3-01): `PATCH /api/vault` with a `description` needs admin too
+      // (vault-do.ts), so this check is a real boundary, not an advisory one.
       if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
         throw new Error(
           `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
@@ -582,6 +573,14 @@ function visibleTools(
 export type HealthRecord = (subject: string, outcome: string) => Promise<void>;
 const noRecord: HealthRecord = async () => {};
 
+/**
+ * Writes the one server-side line for a crash (error-log.ts, T-420): `tool` is
+ * a visible tool's own name or a fixed label, never the caller's string. Only
+ * for server-class errors; a refusal the tool makes on purpose is not logged.
+ */
+export type ToolCrashLog = (tool: string, err: unknown) => void;
+const noLog: ToolCrashLog = () => {};
+
 async function handleToolCall(
   id: JsonRpcId,
   params: Record<string, unknown> | undefined,
@@ -589,6 +588,7 @@ async function handleToolCall(
   writeGate: McpWriteGate,
   attachmentMintGate: (declaredBytes: number) => Response | null,
   record: HealthRecord = noRecord,
+  logCrash: ToolCrashLog = noLog,
 ): Promise<JsonRpcMessage> {
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
@@ -638,11 +638,17 @@ async function handleToolCall(
     const domain = mapDomainError(err);
     const message = err instanceof Error ? err.message : "Unknown error";
     // Never the message: the error's class decides (health.ts toolErrorOutcome).
-    await record(subject, domain ? `domain:${domain.code}` : toolErrorOutcome(err));
+    const outcome = domain ? `domain:${domain.code}` : toolErrorOutcome(err);
+    // A server-class fault also leaves one log line (the count alone has no cause).
+    if (outcome.startsWith("exception:")) logCrash(name, err);
+    await record(subject, outcome);
     if (domain) return rpcError(id, domain.code, message, domain.data);
     return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
   }
 }
+
+/** The methods whose own code can throw into handleOne's catch (tools/call returns its promise un-awaited). */
+const CATCHABLE_METHODS = new Set(["initialize", "tools/list"]);
 
 async function handleOne(
   m: JsonRpcMessage,
@@ -653,9 +659,11 @@ async function handleOne(
     writeGate: McpWriteGate;
     attachmentMintGate: (declaredBytes: number) => Response | null;
     record?: HealthRecord;
+    logCrash?: ToolCrashLog;
   },
 ): Promise<JsonRpcMessage> {
   const record = ctx.record ?? noRecord;
+  const logCrash = ctx.logCrash ?? noLog;
   const { id = null, method, params } = m;
   try {
     switch (method) {
@@ -678,13 +686,17 @@ async function handleOne(
           tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
         });
       case "tools/call":
-        return handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate, record);
+        return handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate, record, logCrash);
       case "ping":
         return result(id, {});
       default:
         return rpcError(id, METHOD_NOT_FOUND, `Method not found: ${method}`);
     }
   } catch (err) {
+    // initialize / tools/list threw: always a fault. Named by the fixed method,
+    // never the caller's string. (A tools/call rejection outside its tool's
+    // execute is not caught here; it propagates to the router's own log.)
+    logCrash(CATCHABLE_METHODS.has(method ?? "") ? `rpc:${method}` : "rpc", err);
     await record("mcp:rpc", `exception:${errorClass(err)}`);
     return rpcError(id, INTERNAL_ERROR, err instanceof Error ? err.message : "Internal error");
   }
@@ -875,6 +887,7 @@ export async function handleMcp(
    */
   tickets: { provider: AttachmentTicketProvider; mintGate: (declaredBytes: number) => Response | null },
   record: HealthRecord = noRecord,
+  logCrash: ToolCrashLog = noLog,
 ): Promise<Response> {
   if (req.method === "DELETE") return new Response(null, { status: 200 });
   if (req.method !== "POST") {
@@ -954,7 +967,7 @@ export async function handleMcp(
   // (core ships a placeholder execute — "must be configured by the server
   // layer"). Parity with bun's mcp-tools.ts overrideVaultInfo.
   overrideVaultInfo(tools, { vaultName, auth, description, origin, ctx: vaultInfo });
-  const ctx = { tools, vaultName, description, writeGate, attachmentMintGate: tickets.mintGate, record };
+  const ctx = { tools, vaultName, description, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));

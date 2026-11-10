@@ -15,15 +15,13 @@
  * inside `declareField`) rolls the whole thing back instead of leaving a schema
  * row that claims an index the engine never built.
  *
- * Not yet routed through here (still no-op-intercepted by the shim, harmless on
- * a single-writer DO but not atomic-on-caught-error):
+ * The other two transaction paths go through the shim (src/shim.ts), not here:
  *  - core's FREE `transaction(db, fn)` call sites (renameTag / mergeTags /
- *    batchTag / createNotes / boot migrations) — they call the helper with the
- *    shim `db` directly, not `Store.transaction`. Making those DO-atomic + fully
- *    zeroing the interception counter is a ~3-line core follow-up: teach
- *    `transaction(db, fn)` to prefer a native `db.transactionSync` when present.
- *  - the ASYNC batch (`transactionAsync`) — `transactionSync` forbids awaiting,
- *    so the async Store-facade batch can't map onto it (core defers this too).
+ *    batchTag / createNotes / boot migrations) prefer the shim's
+ *    `transactionSync` (vault#523);
+ *  - core's ASYNC batch seam (`transactionAsync`: a multi-note POST, MCP
+ *    create-note / update-note batches) prefers the shim's `transactionAsync`,
+ *    a real `ctx.storage.transaction` (audit L2-05, test/batch-atomic.test.ts).
  */
 import { BunSqliteStore } from "@openparachute/core/src/store.js";
 import type { HookRegistry } from "@openparachute/core/src/hooks.js";

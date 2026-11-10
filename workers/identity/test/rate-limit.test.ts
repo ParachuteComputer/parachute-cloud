@@ -1,15 +1,17 @@
 /**
- * RateLimiterDO + fail-open client tests (#30). The DO runs for real inside
+ * RateLimiterDO + client tests (#30). The DO runs for real inside
  * workerd (env.RATE_LIMITER from wrangler.toml); its storage participates in
  * vitest-pool-workers isolated storage, so each test sees fresh counters.
  *
  * Covered: sliding-window behavior (including the end-of-window burst the old
- * fixed-window D1 fence allowed), per-key isolation, lockout record/clear
- * semantics, and the FAIL-OPEN posture when the DO is unreachable.
+ * fixed-window D1 fence allowed), per-key isolation, lockout attempt/clear
+ * semantics, and the outage posture when the DO is unreachable (send fences
+ * fail open, sign-in guess fences fail closed — T-419).
  */
 import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import {
+  LIMITER_DOWN_RETRY_SECONDS,
   LOGIN_MAX_FAILURES,
   LOGIN_WINDOW_MS,
   MAGIC_MAX_PER_WINDOW,
@@ -17,10 +19,9 @@ import {
   SIGNUP_WINDOW_MS,
   checkAndBumpMagic,
   checkAndBumpSignup,
+  attemptLogin,
   clearLoginFailures,
-  isLoginLocked,
   loginKey,
-  recordLoginFailure,
   type RateLimiterNamespace,
 } from "../src/rate-limit.ts";
 
@@ -74,34 +75,39 @@ describe("sliding window (signup fence)", () => {
   });
 });
 
-describe("login lockout (record / check / clear)", () => {
+describe("login lockout (attempt / clear)", () => {
   const key = loginKey("203.0.113.9", "Locked@Example.com");
 
-  test("locks after max failures, reports retry-after, unlocks when failures age out", async () => {
+  test("the max attempts are let through, the next is locked with a retry-after; unlocks when they age out", async () => {
     for (let i = 0; i < LOGIN_MAX_FAILURES; i++) {
-      expect((await isLoginLocked(env.RATE_LIMITER, key, at(0))).locked).toBe(false);
-      await recordLoginFailure(env.RATE_LIMITER, key, at(0));
+      expect((await attemptLogin(env.RATE_LIMITER, key, at(0))).locked).toBe(false);
     }
-    const locked = await isLoginLocked(env.RATE_LIMITER, key, at(0));
+    const locked = await attemptLogin(env.RATE_LIMITER, key, at(0));
     expect(locked.locked).toBe(true);
     expect(locked.retryAfterSeconds).toBeGreaterThan(0);
     expect(locked.retryAfterSeconds).toBeLessThanOrEqual(LOGIN_WINDOW_MS / 1000);
-    // The sliding window frees the key once the failures age out.
-    expect((await isLoginLocked(env.RATE_LIMITER, key, at(LOGIN_WINDOW_MS + 1000))).locked).toBe(false);
+    // The sliding window frees the key once the attempts age out.
+    expect((await attemptLogin(env.RATE_LIMITER, key, at(LOGIN_WINDOW_MS + 1000))).locked).toBe(false);
+  });
+
+  test("a locked attempt records nothing (hammering while locked never extends the lock)", async () => {
+    for (let i = 0; i < LOGIN_MAX_FAILURES; i++) await attemptLogin(env.RATE_LIMITER, key, at(0));
+    for (let i = 0; i < 10; i++) expect((await attemptLogin(env.RATE_LIMITER, key, at(10 * MIN))).locked).toBe(true);
+    expect((await attemptLogin(env.RATE_LIMITER, key, at(LOGIN_WINDOW_MS + 1000))).locked).toBe(false);
   });
 
   test("a successful login clears the counter atomically", async () => {
-    for (let i = 0; i < LOGIN_MAX_FAILURES; i++) await recordLoginFailure(env.RATE_LIMITER, key, at(0));
-    expect((await isLoginLocked(env.RATE_LIMITER, key, at(0))).locked).toBe(true);
+    for (let i = 0; i < LOGIN_MAX_FAILURES; i++) await attemptLogin(env.RATE_LIMITER, key, at(0));
+    expect((await attemptLogin(env.RATE_LIMITER, key, at(0))).locked).toBe(true);
     await clearLoginFailures(env.RATE_LIMITER, key);
-    expect((await isLoginLocked(env.RATE_LIMITER, key, at(0))).locked).toBe(false);
+    expect((await attemptLogin(env.RATE_LIMITER, key, at(0))).locked).toBe(false);
   });
 
   test("per-key isolation: same email from another IP is unaffected", async () => {
-    for (let i = 0; i < LOGIN_MAX_FAILURES; i++) await recordLoginFailure(env.RATE_LIMITER, key, at(0));
+    for (let i = 0; i < LOGIN_MAX_FAILURES; i++) await attemptLogin(env.RATE_LIMITER, key, at(0));
     const otherIp = loginKey("203.0.113.10", "locked@example.com");
-    expect((await isLoginLocked(env.RATE_LIMITER, key, at(0))).locked).toBe(true);
-    expect((await isLoginLocked(env.RATE_LIMITER, otherIp, at(0))).locked).toBe(false);
+    expect((await attemptLogin(env.RATE_LIMITER, key, at(0))).locked).toBe(true);
+    expect((await attemptLogin(env.RATE_LIMITER, otherIp, at(0))).locked).toBe(false);
   });
 });
 
@@ -115,7 +121,7 @@ describe("magic-link fence", () => {
   });
 });
 
-describe("fail-open posture (DO unreachable)", () => {
+describe("outage posture (DO unreachable): send fences fail open, guess fences fail closed", () => {
   const brokenLimiter: RateLimiterNamespace = {
     idFromName: (name: string) => ({ toString: () => name }) as unknown as DurableObjectId,
     get: () => {
@@ -134,15 +140,14 @@ describe("fail-open posture (DO unreachable)", () => {
     });
   });
 
-  test("isLoginLocked reports unlocked when the DO errors", async () => {
-    expect(await isLoginLocked(brokenLimiter, loginKey("10.0.0.1", "a@example.com"))).toEqual({
-      locked: false,
-      retryAfterSeconds: 0,
+  test("attemptLogin reports LOCKED when the DO errors (fail closed: an outage is not unlimited guessing)", async () => {
+    expect(await attemptLogin(brokenLimiter, loginKey("10.0.0.1", "a@example.com"))).toEqual({
+      locked: true,
+      retryAfterSeconds: LIMITER_DOWN_RETRY_SECONDS,
     });
   });
 
-  test("recordLoginFailure/clearLoginFailures swallow DO errors (login flow never 500s on the fence)", async () => {
-    await expect(recordLoginFailure(brokenLimiter, "k")).resolves.toBeUndefined();
+  test("clearLoginFailures swallows DO errors (a verified sign-in never 500s on the fence)", async () => {
     await expect(clearLoginFailures(brokenLimiter, "k")).resolves.toBeUndefined();
   });
 });

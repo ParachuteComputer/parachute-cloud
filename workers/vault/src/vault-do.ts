@@ -48,10 +48,11 @@ import {
 import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./rest/storage-constants.js";
 import { handleMcp } from "./mcp.js";
 import { HealthSink, errorClass, responseOutcome, routeOf, utcDay, versionLabel } from "./health.js";
+import { logServerError } from "./error-log.js";
 import { mcpWwwAuthenticate } from "./discovery.js";
 import { handleSubscribe } from "./live/subscribe.js";
 import { SubscriptionManager, WsSink, type SubscriptionHandle } from "./live/subscriptions.js";
-import { buildLiveMatcher, type LiveMatcher } from "./live/live-match.js";
+import { buildLiveMatcher, type LiveMatcher } from "@openparachute/core/src/live-match.js";
 import {
   MAX_WS_SUBSCRIPTIONS,
   WS_AUTH_DEADLINE_MS,
@@ -143,6 +144,15 @@ import type { AttachmentTicketProvider } from "@openparachute/core/src/attachmen
 function errText(e: unknown): string {
   if (e instanceof Error) return `${e.name}: ${e.message}`;
   return String(e);
+}
+
+/** decodeURIComponent, or null for a malformed escape. */
+function safeDecode(s: string): string | null {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return null;
+  }
 }
 
 function json(data: unknown, status = 200): Response {
@@ -635,7 +645,9 @@ export class VaultDO extends DurableObject {
     this.env = env;
     this.attachmentTickets = new DoAttachmentTicketProvider(ctx.storage);
     this.appKeys = new AppKeyLedger(ctx.storage);
-    this.health = new HealthSink(ctx.storage, versionLabel(env.CF_VERSION_METADATA));
+    const version = versionLabel(env.CF_VERSION_METADATA);
+    this.health = new HealthSink(ctx.storage, version);
+    this.logFields = { version, vaultId: ctx.id.toString() };
     // The shim carries `ctx.storage` (not just `.sql`) so its `transactionSync`
     // can delegate to the real DO transaction primitive — the free
     // `transaction(db, fn)` path (incl. boot migrations) prefers it (vault#523).
@@ -690,6 +702,7 @@ export class VaultDO extends DurableObject {
       });
     } catch (e) {
       this.bootError = errText(e);
+      this.noteBootError(e);
     }
 
     // Client-driven WS liveness: the runtime answers a literal `ping` with
@@ -766,6 +779,32 @@ export class VaultDO extends DurableObject {
     await this.health.record("do", kind);
   }
 
+  /**
+   * The engine refused to boot this instance (e.g. NewerSchemaError after a
+   * rollback past a schema bump): every request will answer 500, so leave the
+   * cause once per instance — one `event=do_boot_error` line and a
+   * `do:boot|exception:<class>` count (server class in the health report).
+   * Counted only for a vault that exists, like a router failure. The count
+   * goes to DO key-value storage, outside the engine's tables, so it lands
+   * while the vault is down, and GET /api/internal/health (the on-demand
+   * collect) still reads it (see handleFetch). The nightly rollup's config GET
+   * still 500s, which it records as `collect|fail`. The nightly copy and the
+   * on-demand collect read only yesterday and today, so a `do:boot` count
+   * older than that never reaches D1; while the vault is down, collect it on
+   * demand.
+   */
+  private noteBootError(e: unknown): void {
+    logServerError("do_boot_error", e, this.logFields);
+    // Before the first request is served; a throw here would reset the object, so none escapes.
+    void this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        if (await this.vaultExists()) await this.health.record("do:boot", `exception:${errorClass(e)}`);
+      } catch (err) {
+        console.warn(`event=health_record_failed error=${errorClass(err)}`);
+      }
+    });
+  }
+
   /** The vault has been materialized and not destroyed: its config is stored. */
   private async vaultExists(): Promise<boolean> {
     if (this.stateLoaded && this.config) return true;
@@ -774,6 +813,9 @@ export class VaultDO extends DurableObject {
 
   /** The vault's health counter sink (T-411); see health.ts. */
   private readonly health: HealthSink;
+
+  /** What every server-side error line names (error-log.ts): the worker version and the DO's id, never the vault's name. */
+  private readonly logFields: { version: string; vaultId: string };
 
   /**
    * STAGING/DEV-ONLY planted failure (T-411 report proof): the next N
@@ -856,7 +898,20 @@ export class VaultDO extends DurableObject {
   }
 
   private async handleFetch(request: Request): Promise<Response> {
-    if (this.bootError) return json({ error: "Internal server error", detail: this.bootError }, 500);
+    if (this.bootError) {
+      // The platform's health read still answers: its counters live outside
+      // the engine, and they carry this instance's `do:boot` count.
+      const hm = /^\/vault\/([^/]+)\/api\/internal\/health$/.exec(new URL(request.url).pathname);
+      const vaultName = hm ? safeDecode(hm[1]!) : null;
+      if (vaultName !== null) {
+        const auth = await authenticateVaultRequest(request, this.env, vaultName);
+        if ("error" in auth) return auth.error;
+        const forbidden = this.internalForbidden(auth, vaultName);
+        if (forbidden) return forbidden;
+        return this.handleInternalHealth(request);
+      }
+      return json({ error: "Internal server error", detail: this.bootError }, 500);
+    }
 
     const url = new URL(request.url);
     const m = /^\/vault\/([^/]+)(\/.*)?$/.exec(url.pathname);
@@ -1119,6 +1174,7 @@ export class VaultDO extends DurableObject {
           mintGate: (declaredBytes) => this.attachmentMintGate(declaredBytes),
         },
         (subject, outcome) => this.health.record(subject, outcome),
+        (tool, err) => logServerError("mcp_tool_error", err, { ...this.logFields, tool }),
       );
     }
 
@@ -1201,7 +1257,17 @@ export class VaultDO extends DurableObject {
       (eraseParam !== null && eraseParam !== "false");
     const isHistoryCompact = request.method === "POST" && apiPath === "/history/compact";
     const isDeletedList = request.method === "GET" && apiPath === "/history/deleted";
-    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDeletedList
+    // The description is what every connected AI reads as its instructions (MCP initialize), so writing it is
+    // curation: admin, as MCP vault-info already required (T-419, audit L3-01; same rule as the bun vault). A PATCH
+    // with only `config` stays at write: the Notes app connects with vault:read vault:write and sets audio retention
+    // there. The gate reads a clone of the body with the same Request.json() the handler uses; a body that doesn't
+    // parse isn't a description write (the handler then fails on it, as before).
+    const isDescriptionWrite = request.method === "PATCH" && apiPath === "/vault" &&
+      await request.clone().json().then(
+        (b: unknown) => b !== null && typeof b === "object" && !Array.isArray(b) && "description" in b,
+        () => false,
+      );
+    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDeletedList || isDescriptionWrite
       ? "admin"
       : verbForMethod(request.method);
     if (requiredVerb !== "read" && !hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
@@ -1311,12 +1377,15 @@ export class VaultDO extends DurableObject {
         audio_retention: this.config!.audio_retention,
         auto_transcribe: this.config!.auto_transcribe,
       };
+      const descriptionBefore = cfg.description;
       const res = await handleVault(
         request,
         this.store,
         cfg,
         () => {
-          this.config!.description = cfg.description ?? null;
+          // Write the description back only when this PATCH changed it: a config-only PATCH that overlapped an admin's
+          // description change must not restore the old text (T-419 review).
+          if (cfg.description !== descriptionBefore) this.config!.description = cfg.description ?? null;
           this.config!.audio_retention = cfg.audio_retention ?? "keep";
           this.config!.auto_transcribe = { enabled: cfg.auto_transcribe?.enabled ?? false };
           void this.ctx.storage.put("config", this.config);

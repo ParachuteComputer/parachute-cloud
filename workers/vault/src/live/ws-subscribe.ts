@@ -32,7 +32,7 @@ import type { Note, QueryOpts } from "@openparachute/core/src/types.js";
 import { defaultRevocationFetcher, REVOCATION_CACHE_TTL_MS } from "@openparachute/scope-guard";
 import type { RevocationFetcher } from "@openparachute/scope-guard";
 import { parseNotesQueryOpts } from "../rest/parse.js";
-import { unsupportedSubscriptionReason } from "./live-match.js";
+import { unsupportedSubscriptionReason } from "@openparachute/core/src/live-match.js";
 
 /** Per-vault concurrent WS-subscription cap (mirrors the SSE cap). Enforced at
  *  upgrade via `getWebSockets().length` — over it → 503. */

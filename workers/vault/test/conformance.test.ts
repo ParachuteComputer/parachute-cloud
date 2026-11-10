@@ -224,11 +224,7 @@ describe("batch cap", () => {
     expect(arr).toHaveLength(2);
   });
 
-  // The ASYNC batch (transactionAsync) still can't map to the sync-only
-  // ctx.storage.transactionSync, so mid-batch rollback remains pending a core
-  // port of the async seam (core defers it too). The SYNC seam IS wired — see
-  // the "transaction seam" block below.
-  it.todo("POST batch is atomic — async transactionAsync → transactionSync port pending (core follow-up)");
+  // Batch atomicity (a mid-batch failure rolls every prior insert back): test/batch-atomic.test.ts.
 });
 
 describe("transaction seam (vault#521 / DoSqliteStore)", () => {
@@ -274,8 +270,8 @@ describe("transaction seam (vault#521 / DoSqliteStore)", () => {
     // transactions, not the no-op BEGIN interception. A freshly-booted DO reads 0.
     expect(await stub.debugTxnInterceptCount()).toBe(0);
 
-    // Exercise every free-transaction() site through the wire (single-note ops
-    // only — the async BATCH path is the deferred residual, tested below):
+    // Exercise every free-transaction() site through the wire (single-note ops;
+    // the async batch path is the next test):
     // create → update → rename tag → merge tags → Store.transaction indexed
     // field → delete.
     const post = (body: unknown) =>
@@ -310,21 +306,21 @@ describe("transaction seam (vault#521 / DoSqliteStore)", () => {
     expect(await stub.debugTxnInterceptCount()).toBe(0);
   });
 
-  it("the async batch path is the SOLE residual — transactionAsync still BEGINs (deferred core port)", async () => {
+  it("the async batch path runs in a real DO transaction too — no BEGIN reaches the shim (audit L2-05)", async () => {
     const v = freshVault();
     const stub = env.VAULT.get(env.VAULT.idFromName(v));
-    expect(await stub.debugTxnInterceptCount()).toBe(0); // boot is clean now
+    expect(await stub.debugTxnInterceptCount()).toBe(0); // boot is clean
 
-    // A multi-note POST wraps N creates in transactionAsync — the one path the
-    // sync-only transactionSync can't absorb (its body awaits the Store facade
-    // between writes). BEGIN IMMEDIATE + COMMIT are both intercepted → exactly 2.
+    // A multi-note POST wraps N creates in core's transactionAsync, which now prefers the shim's
+    // transactionAsync (ctx.storage.transaction). Before, its BEGIN IMMEDIATE + COMMIT were intercepted
+    // no-ops (exactly 2) and a failed batch kept its first writes (test/batch-atomic.test.ts).
     const res = await op(v, "/api/notes", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ notes: [{ content: "a" }, { content: "b" }] }),
     });
     expect(res.status).toBe(201);
-    expect(await stub.debugTxnInterceptCount()).toBe(2);
+    expect(await stub.debugTxnInterceptCount()).toBe(0);
   });
 });
 
