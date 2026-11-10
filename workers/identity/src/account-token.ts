@@ -102,6 +102,7 @@ async function handleNostrAccountToken(db: D1Database, req: Request, deps: OAuth
     ({ user } = await authenticateNostrRequest(db, req, {
       ...(deps.ownerPubkey ? { ownerPubkey: deps.ownerPubkey } : {}),
       ...(deps.adminPubkeys?.length ? { adminPubkeys: deps.adminPubkeys } : {}),
+      ...(deps.ownerPlan ? { ownerPlan: deps.ownerPlan } : {}),
       now: deps.now?.() ?? new Date(),
     }));
   } catch (err) {

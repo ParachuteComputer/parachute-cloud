@@ -45,6 +45,12 @@ export interface Env {
    */
   ADMIN_PUBKEYS?: string;
   /**
+   * Single-owner deploys only: the plan the bootstrapped owner starts on (entry|standard|plus|power; anything else
+   * is ignored and the owner starts on the trial). Billing stays off; this only sets entitlements (vault count, caps,
+   * snapshot retention). Ignored without OWNER_PUBKEY. Unset on Parachute Cloud.
+   */
+  OWNER_PLAN?: string;
+  /**
    * Extra origins the same-origin gate accepts, comma-separated (P0.5). The
    * cookie-authed console/account POSTs gate on `isSameOriginRequest` against the
    * bound-origin set; `ISSUER` is ALWAYS in that set, and any origin listed here

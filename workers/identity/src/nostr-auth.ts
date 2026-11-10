@@ -17,6 +17,7 @@
  * someone else's id. It is checked before the account lookup, so an unknown key's id is spent too.
  */
 import { schnorr } from "@noble/curves/secp256k1.js";
+import type { PaidPlanId } from "./oauth-shared.ts";
 import { createUser, getUserById, type User } from "./users.ts";
 
 export const NOSTR_AUTH_KIND = 27235;
@@ -214,7 +215,7 @@ export async function findPubkeyUser(db: D1Database, pubkey: string): Promise<Us
 export async function resolvePubkeyAccount(
   db: D1Database,
   pubkey: string,
-  opts: { ownerPubkey?: string; adminPubkeys?: readonly string[]; now?: Date },
+  opts: { ownerPubkey?: string; adminPubkeys?: readonly string[]; ownerPlan?: PaidPlanId; now?: Date },
 ): Promise<User> {
   // An admin key (env ADMIN_PUBKEYS, single-owner deploys only) signs in as the owner's account while it is listed.
   // It is read from the config at every sign-in and never stored as a link, so dropping it from ADMIN_PUBKEYS is
@@ -222,18 +223,18 @@ export async function resolvePubkeyAccount(
   // sign-in makes the owner's account exactly as the owner's own first sign-in would: linked to OWNER_PUBKEY, never
   // to the admin key, so the account is the owner's from its first moment.
   if (opts.ownerPubkey && opts.adminPubkeys?.includes(pubkey) && pubkey !== opts.ownerPubkey) {
-    return (await findPubkeyUser(db, opts.ownerPubkey)) ?? bootstrapOwner(db, opts.ownerPubkey, opts.now);
+    return (await findPubkeyUser(db, opts.ownerPubkey)) ?? bootstrapOwner(db, opts.ownerPubkey, opts.now, opts.ownerPlan);
   }
   const linked = await findPubkeyUser(db, pubkey);
   if (linked) return linked;
   if (!opts.ownerPubkey || opts.ownerPubkey !== pubkey) {
     throw new NostrAuthError("unknown_pubkey", "Nostr pubkey is not linked to an account");
   }
-  return bootstrapOwner(db, pubkey, opts.now);
+  return bootstrapOwner(db, pubkey, opts.now, opts.ownerPlan);
 }
 
 /** The single-owner bootstrap: on an instance with no accounts, the key-only owner's account, `pubkey` linked. */
-async function bootstrapOwner(db: D1Database, pubkey: string, nowOpt?: Date): Promise<User> {
+async function bootstrapOwner(db: D1Database, pubkey: string, nowOpt?: Date, plan?: PaidPlanId): Promise<User> {
   const opts = { now: nowOpt };
   const anyUser = await db.prepare("SELECT 1 AS x FROM users LIMIT 1").first<number>("x");
   if (anyUser !== null) {
@@ -263,6 +264,11 @@ async function bootstrapOwner(db: D1Database, pubkey: string, nowOpt?: Date): Pr
     if (winner) return winner;
     throw new NostrAuthError("unknown_pubkey", "Nostr pubkey is not linked to an account");
   }
+  // OWNER_PLAN (a single-owner deploy with billing off): the owner's entitlements from the first moment, no trial clock.
+  if (plan) {
+    await db.prepare("UPDATE users SET plan = ?, pending_plan = NULL, plan_downgrade_at = NULL WHERE id = ?").bind(plan, user.id).run();
+    return { ...user, plan, pendingPlan: null, planDowngradeAt: null } as User;
+  }
   return user;
 }
 
@@ -270,7 +276,7 @@ async function bootstrapOwner(db: D1Database, pubkey: string, nowOpt?: Date): Pr
 export async function authenticateNostrRequest(
   db: D1Database,
   req: Request,
-  opts: { ownerPubkey?: string; adminPubkeys?: readonly string[]; now?: Date },
+  opts: { ownerPubkey?: string; adminPubkeys?: readonly string[]; ownerPlan?: PaidPlanId; now?: Date },
 ): Promise<{ user: User; pubkey: string }> {
   const event = extractNostrEvent(req);
   const body = new Uint8Array(await req.arrayBuffer());

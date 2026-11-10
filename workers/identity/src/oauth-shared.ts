@@ -106,7 +106,12 @@ export interface OAuthDeps {
    * account while listed (nostr-auth.ts resolvePubkeyAccount). Empty without an owner key.
    */
   adminPubkeys?: string[];
+  /** The single-owner deploy's owner plan (env OWNER_PLAN: entry|standard|plus|power), set when the owner is made. */
+  ownerPlan?: PaidPlanId;
 }
+
+export type PaidPlanId = "entry" | "standard" | "plus" | "power";
+const PAID_PLAN_IDS: readonly string[] = ["entry", "standard", "plus", "power"];
 
 /** The deps' money switch — unset is open_beta, like BILLING_MODE itself. */
 export function billingModeOf(deps: { billingMode?: BillingMode }): BillingMode {
@@ -253,6 +258,7 @@ export function depsForEnv(env: Env): OAuthDeps {
     ...(env.VAULT_SERVICE ? { vaultFetch: env.VAULT_SERVICE.fetch.bind(env.VAULT_SERVICE) } : {}),
     ...(parseOwnerPubkey(env.OWNER_PUBKEY) ? { ownerPubkey: parseOwnerPubkey(env.OWNER_PUBKEY)! } : {}),
     ...(parseOwnerPubkey(env.OWNER_PUBKEY) && parseAdminPubkeys(env.ADMIN_PUBKEYS).length ? { adminPubkeys: parseAdminPubkeys(env.ADMIN_PUBKEYS) } : {}),
+    ...(parseOwnerPubkey(env.OWNER_PUBKEY) && PAID_PLAN_IDS.includes(env.OWNER_PLAN ?? "") ? { ownerPlan: env.OWNER_PLAN as PaidPlanId } : {}),
   };
 }
 

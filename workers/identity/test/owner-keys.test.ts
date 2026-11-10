@@ -53,13 +53,14 @@ async function nip98(key: Key, url: string, method: string, body?: string, creat
 
 type Calls = { method: string; url: string; body: string }[];
 /** The worker with a stubbed vault (identity → vault calls go through VAULT_SERVICE). */
-function app(opts: { ownerPubkey?: string; adminPubkeys?: string; vault?: (req: Request) => Response | Promise<Response> } = {}) {
+function app(opts: { ownerPubkey?: string; adminPubkeys?: string; ownerPlan?: string; vault?: (req: Request) => Response | Promise<Response> } = {}) {
   const calls: Calls = [];
   const vault = opts.vault ?? (() => Response.json({}));
   const e = {
     ...env,
     ...(opts.ownerPubkey ? { OWNER_PUBKEY: opts.ownerPubkey } : {}),
     ...(opts.adminPubkeys !== undefined ? { ADMIN_PUBKEYS: opts.adminPubkeys } : {}),
+    ...(opts.ownerPlan !== undefined ? { OWNER_PLAN: opts.ownerPlan } : {}),
     VAULT_SERVICE: {
       fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
         const req = new Request(input, init);
@@ -221,6 +222,18 @@ describe("ADMIN_PUBKEYS: a second principal on a single-owner deploy (door/0.9, 
     const { key } = await linkedOwner();
     expect((await signIn(app({ adminPubkeys: admin.pubkey }), admin)).status).toBe(401);
     expect((await signIn(app({ adminPubkeys: "not-a-key" }), key)).status).toBe(200);
+  });
+
+  test("OWNER_PLAN: the bootstrapped owner starts on that plan, with no trial clock; an unknown plan is ignored", async () => {
+    const owner = nostrKey();
+    expect((await signIn(app({ ownerPubkey: owner.pubkey, ownerPlan: "power" }), owner)).status).toBe(200);
+    const row = await env.DB.prepare("SELECT plan, pending_plan, plan_downgrade_at FROM users").first<any>();
+    expect(row).toEqual({ plan: "power", pending_plan: null, plan_downgrade_at: null });
+    await env.DB.prepare("DELETE FROM user_pubkeys").run();
+    await env.DB.prepare("DELETE FROM users").run();
+    const o2 = nostrKey();
+    expect((await signIn(app({ ownerPubkey: o2.pubkey, ownerPlan: "free-forever" }), o2)).status).toBe(200);
+    expect((await env.DB.prepare("SELECT plan FROM users").first<any>()).plan).toBe("trial");
   });
 
   test("an admin key can't be linked (the config is its one switch)", async () => {
