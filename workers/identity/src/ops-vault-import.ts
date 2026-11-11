@@ -86,16 +86,16 @@ const MAX_DESCRIPTION_CHARS = 64_000;
 const READ_TOKEN_CLIENT_ID = "parachute-ops-import";
 const READ_TOKEN_TTL_SECONDS = 300;
 
-function refuse(status: number, error: string, message: string, extra: Record<string, unknown> = {}): Response {
+export function refuse(status: number, error: string, message: string, extra: Record<string, unknown> = {}): Response {
   return Response.json({ error, message, ...extra }, { status, headers: NO_STORE });
 }
 
-function ok(body: Record<string, unknown>, status = 200): Response {
+export function ok(body: Record<string, unknown>, status = 200): Response {
   return Response.json(body, { status, headers: NO_STORE });
 }
 
 /** The address twice and a reference, as the erase door asks: `Response` when they don't hold. */
-function identify(emailRaw: unknown, confirm: unknown, referenceRaw: unknown): { email: string; reference: string } | Response {
+export function identify(emailRaw: unknown, confirm: unknown, referenceRaw: unknown): { email: string; reference: string } | Response {
   const email = typeof emailRaw === "string" ? emailRaw.trim().toLowerCase() : "";
   if (!EMAIL_RE.test(email)) return refuse(400, "invalid_request", "email must be one address. Nothing changed.");
   if (!confirmMatchesEmail(confirm, email)) return refuse(400, "confirm_mismatch", "confirm must repeat email. Nothing changed.");
@@ -111,7 +111,7 @@ function identify(emailRaw: unknown, confirm: unknown, referenceRaw: unknown): {
 }
 
 /** A hard audit write: the door refuses rather than act unrecorded. */
-async function audit(env: Env, deps: OAuthDeps, action: AuditAction, userId: string, note: Record<string, string | number | boolean | null>): Promise<void> {
+export async function audit(env: Env, deps: OAuthDeps, action: AuditAction, userId: string, note: Record<string, string | number | boolean | null>): Promise<void> {
   await (await auditStatement(env.DB, { actor: ACTOR, action, userId, note, now: deps.now?.() ?? new Date() })).run();
 }
 
@@ -209,7 +209,7 @@ export async function handleOpsVaultImportPost(env: Env, req: Request, deps: OAu
   return ok({ imported: true, vault_name: vaultName, notes: outcome.notes, skipped_attachments: outcome.skipped, retry });
 }
 
-function accountRefusal(user: User): Response | null {
+export function accountRefusal(user: User): Response | null {
   if (user.deletedAt !== null) return refuse(409, "account_closing", "This account is being deleted. Nothing changed.");
   if (user.suspendedAt !== null) return refuse(409, "account_suspended", "This account is suspended. Nothing changed.");
   if (!user.emailVerified) return refuse(409, "account_unverified", "This account has not proven its address. Nothing changed.");
@@ -217,7 +217,7 @@ function accountRefusal(user: User): Response | null {
 }
 
 /** JSON body, or a `Response` refusing it. */
-async function jsonBody(req: Request): Promise<Record<string, unknown> | Response> {
+export async function jsonBody(req: Request): Promise<Record<string, unknown> | Response> {
   try {
     const parsed = (await req.json()) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
@@ -227,7 +227,7 @@ async function jsonBody(req: Request): Promise<Record<string, unknown> | Respons
   return refuse(400, "invalid_request", "body must be a JSON object. Nothing changed.");
 }
 
-function namedVault(raw: unknown): string | Response {
+export function namedVault(raw: unknown): string | Response {
   const check = validateVaultName(typeof raw === "string" ? raw : "");
   return check.ok ? check.name : refuse(400, "vault_name_invalid", "vault_name is not usable. Nothing changed.");
 }

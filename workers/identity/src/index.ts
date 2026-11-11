@@ -60,6 +60,12 @@ import {
   handleOpsVaultImportReadToken,
   handleOpsVaultImportStatus,
 } from "./ops-vault-import.ts";
+import {
+  handleOpsHistoryImportDigest,
+  handleOpsHistoryImportFinish,
+  handleOpsHistoryImportPost,
+  handleOpsHistoryImportStatus,
+} from "./ops-history-import.ts";
 import { handleAccountVaultImport, handleAccountVaultImportCheck, handleAccountVaultImportFile } from "./account-import.ts";
 import { handleOpsCanaryToken } from "./ops-canary.ts";
 import { handleTestAccountDeleteReport, handleTestAccountDeleteSweep } from "./account-delete-hooks.ts";
@@ -614,6 +620,12 @@ app.post("/ops/vault-import/status", async (c) => (await handleOpsVaultImportSta
 app.post("/ops/vault-import/read-token", async (c) => (await handleOpsVaultImportReadToken(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
 app.post("/ops/vault-import/finish", async (c) => (await handleOpsVaultImportFinish(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
 app.post("/ops/vault-import/abort", async (c) => (await handleOpsVaultImportAbort(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+// Add a box's note history behind the notes of a vault the account owns (T-450, ops-history-import.ts):
+// the same bearer, OPS_RUN_TOKEN; unset → 404.
+app.post("/ops/history-import", async (c) => (await handleOpsHistoryImportPost(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+app.post("/ops/history-import/status", async (c) => (await handleOpsHistoryImportStatus(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+app.post("/ops/history-import/digest", async (c) => (await handleOpsHistoryImportDigest(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+app.post("/ops/history-import/finish", async (c) => (await handleOpsHistoryImportFinish(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
 
 // A 5-minute read-only token for the canary vault, for an external uptime
 // checker (L6-03, ops-canary.ts; scripts/uptime-check.sh): bearer
