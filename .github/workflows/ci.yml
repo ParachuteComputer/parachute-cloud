@@ -77,9 +77,17 @@ jobs:
         working-directory: workers/identity
         run: bun run typecheck
 
-      - name: Test workers/identity (vitest under workerd)
+      # Three shards, one after another. The workers pool starts every test file of a run at once in one workerd; at
+      # 85 files a 4-core runner saturates and unrelated tests fail differently each run ("Isolated storage failed",
+      # 5 s timeouts, "Network connection lost"). A third of the files at a time keeps it under that edge (T-446).
+      - name: Test workers/identity (vitest under workerd, in three shards)
         working-directory: workers/identity
-        run: bun x vitest run
+        run: |
+          for shard in 1 2 3; do
+            echo "::group::identity shard $shard/3"
+            bun x vitest run --shard="$shard/3"
+            echo "::endgroup::"
+          done
 
   vault-worker:
     name: vault worker (typecheck + vitest/workerd)
