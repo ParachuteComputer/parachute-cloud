@@ -99,7 +99,7 @@ import {
 } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
 import { digestNotes, finishRun, graftBatch, graftStatus } from "./history-graft.js";
-import { GRAFT_MAX_BODY_BYTES, GRAFT_OUTCOMES, parseDigestQuery, parseGraftBatch } from "./history-graft-shared.js";
+import { GRAFT_MAX_BODY_BYTES, GRAFT_OUTCOMES, HISTORY_IMPORT_CAP_SHARE, parseDigestQuery, parseGraftBatch } from "./history-graft-shared.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, withCloudGuideText, type WelcomeSeedResult } from "./welcome.js";
 import {
   SEED_PACK_NAMES,
@@ -365,8 +365,6 @@ const WRITTEN_SINCE_IMPORT_KEY = "written_since_import";
 const HISTORY_KEEP_ALL_KEY = "history_keep_all";
 /** The policy a keep-all vault runs, merged over core's defaults by `resolveHistoryPolicy`. */
 export const HISTORY_KEEP_ALL_POLICY = { max_versions: 1_000_000, max_age_days: 36500, max_bytes_per_note: null } as const;
-/** A history import batch is refused (413, rolled back whole) when it would leave the database above this share of a pushed notes cap. */
-export const HISTORY_IMPORT_CAP_SHARE = 0.9;
 
 /** How long an import waits for in-flight requests to finish before its replay. */
 const IMPORT_DRAIN_MAX_MS = 60_000;
@@ -2273,8 +2271,8 @@ export class VaultDO extends DurableObject {
    * inside ONE outer `transactionSync` for the whole batch (DO transactions nest
    * as savepoints: an inner rollback undoes only its note, the outer one undoes
    * everything). The outer one is rolled back for a dry run, so it reports
-   * exactly what a real run would, and for a batch that would leave the
-   * database above 90% of a pushed notes cap: internal routes skip the cap
+   * exactly what a real run would, and for a batch that grafts a note and
+   * would leave the database above 90% of a pushed notes cap: internal routes skip the cap
    * gate, and a vault over its cap answers every owner write 413. (Checked:
    * `sql.databaseSize` read inside an open transaction counts that
    * transaction's pages, and falls back when it rolls back.) No cap pushed, no
@@ -2309,6 +2307,8 @@ export class VaultDO extends DurableObject {
       return json({ error: 'dry_run must be "true" or "false"', error_type: "invalid_request" }, 400);
     }
     const dry = dryFlag === "true";
+    // The run the identity door recorded in its audit row: a batch for another run is refused, so the record can't name the wrong one.
+    const statedRun = new URL(request.url).searchParams.get("run_id");
     const tooLarge = () =>
       json({ error: `A history batch is at most ${GRAFT_MAX_BODY_BYTES / 1048576} MiB`, error_type: "history_import_too_large" }, 413);
     const declared = Number(request.headers.get("content-length") ?? "");
@@ -2326,6 +2326,9 @@ export class VaultDO extends DurableObject {
     const parsed = parseGraftBatch(raw);
     if (!parsed.ok) return json({ error: parsed.error, error_type: "invalid_request" }, 400);
     const batch = parsed.value;
+    if (statedRun !== null && statedRun !== batch.run.run_id) {
+      return json({ error: "run_id beside the batch is not the batch's run", error_type: "invalid_request" }, 400);
+    }
     const notesCap = this.planCaps()?.notes_bytes ?? null;
 
     // ---- synchronous from here to the answer ----
@@ -2342,7 +2345,8 @@ export class VaultDO extends DurableObject {
         if (!result.ok) return; // refused before any write
         bytesAfter = Number(sql.databaseSize);
         if (dry) throw rollback;
-        if (notesCap !== null && bytesAfter > notesCap * HISTORY_IMPORT_CAP_SHARE) {
+        // Only a batch that grafts can be refused: a retry that finds every note already there adds nothing.
+        if (notesCap !== null && result.summary.totals.grafted > 0 && bytesAfter > notesCap * HISTORY_IMPORT_CAP_SHARE) {
           overCap = true;
           throw rollback;
         }

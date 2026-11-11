@@ -101,19 +101,24 @@ export function storedDigest(db: GraftDb, id: string, throughIx: number): string
  * blob's logical byte length, and each delta's logical body (needed when its
  * base here turns out not to be whole, so it is stored whole instead).
  */
-function verifyBlobs(db: GraftDb, blobs: GraftBlob[]): { ok: true; lengths: Map<string, number>; deltaBodies: Map<string, string> } | { ok: false; hash: string } {
+function verifyBlobs(
+  db: GraftDb,
+  blobs: GraftBlob[],
+): { ok: true; lengths: Map<string, number>; deltaBodies: Map<string, string> } | { ok: false; hash: string; tooLarge?: true } {
   const byHash = new Map(blobs.map((b) => [b.hash, b]));
   const lengths = new Map<string, number>();
   const deltaBodies = new Map<string, string>();
   for (const b of blobs) {
     if (b.encoding !== null) continue;
     const size = byteLength(b.content);
-    if (size > VERSION_MAX_BYTES || hashContent(b.content) !== b.hash || b.byte_size !== size) return { ok: false, hash: b.hash };
+    if (size > VERSION_MAX_BYTES) return { ok: false, hash: b.hash, tooLarge: true };
+    if (hashContent(b.content) !== b.hash || b.byte_size !== size) return { ok: false, hash: b.hash };
     lengths.set(b.hash, size);
   }
   for (const b of blobs) {
     if (b.encoding === null) continue;
-    if (b.byte_size !== byteLength(b.content) || b.byte_size > VERSION_MAX_BYTES) return { ok: false, hash: b.hash };
+    if (b.byte_size > VERSION_MAX_BYTES) return { ok: false, hash: b.hash, tooLarge: true };
+    if (b.byte_size !== byteLength(b.content)) return { ok: false, hash: b.hash };
     let base: string | null = null;
     const sent = byHash.get(b.delta_of!);
     if (sent) {
@@ -130,7 +135,8 @@ function verifyBlobs(db: GraftDb, blobs: GraftBlob[]): { ok: true; lengths: Map<
       return { ok: false, hash: b.hash };
     }
     const length = byteLength(text);
-    if (length > VERSION_MAX_BYTES || hashContent(text) !== b.hash) return { ok: false, hash: b.hash };
+    if (length > VERSION_MAX_BYTES) return { ok: false, hash: b.hash, tooLarge: true };
+    if (hashContent(text) !== b.hash) return { ok: false, hash: b.hash };
     lengths.set(b.hash, length);
     deltaBodies.set(b.hash, text);
   }
@@ -248,7 +254,13 @@ function tipHolds(note: GraftNote, live: { content: string | null; path: string 
  * in an outer transaction too: rolled back for a dry run or a batch past the
  * storage guard, committed otherwise.
  */
-const blobRefusal = (hash: string) => ({ ok: false as const, status: 400, body: { error: "A blob does not match its hash", error_type: "blob_invalid", hash } });
+const blobRefusal = (hash: string, tooLarge?: true) => ({
+  ok: false as const,
+  status: 400,
+  body: tooLarge
+    ? { error: `A blob is over the engine's ${VERSION_MAX_BYTES}-byte version limit`, error_type: "blob_invalid", reason: "too_large", hash }
+    : { error: "A blob does not match its hash", error_type: "blob_invalid", hash },
+});
 const runConflictRefusal = () => ({ ok: false as const, status: 409, body: { error: "This run id was recorded with other fields", error_type: "run_conflict" } });
 function runConflict(db: GraftDb, batch: GraftBatch): boolean {
   const existing = db.prepare("SELECT source_fingerprint, tip, options_digest FROM history_import_runs WHERE run_id = ?").get(batch.run.run_id) as
@@ -259,7 +271,7 @@ function runConflict(db: GraftDb, batch: GraftBatch): boolean {
 
 export function graftBatch(db: GraftDb, txn: SyncTxn, batch: GraftBatch, opts: { dryRun?: boolean } = {}): GraftResult {
   const checked = verifyBlobs(db, batch.blobs);
-  if (!checked.ok) return blobRefusal(checked.hash);
+  if (!checked.ok) return blobRefusal(checked.hash, checked.tooLarge);
   if (runConflict(db, batch)) return runConflictRefusal();
   const existingRun = !!db.prepare("SELECT 1 FROM history_import_runs WHERE run_id = ?").get(batch.run.run_id);
 

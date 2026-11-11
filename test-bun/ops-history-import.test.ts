@@ -306,6 +306,31 @@ describe("the operator client (scripts/ops-history-import.ts) against a made-up 
     expect(statSync(refusedOut).mode & 0o777).toBe(0o600);
   });
 
+  it("plan refuses to guess when the vault does not report its size", async () => {
+    const box = await boxFile(2);
+    const door = fakeDoor((s) => ({ status: 200, body: { dry_run: true, notes: (s.batch?.notes ?? []).map((n) => ({ id: n.id, outcome: "grafted" })), totals: { grafted: 2 } } }));
+    const r = await client(door.url, ["plan", "made-up-vault", box]);
+    expect(r.code, r.out).not.toBe(0);
+    expect(r.out).toContain("did not report its database size");
+  });
+
+  it("finish of a run that grafted nothing says so and succeeds: the vault keeps no empty run", async () => {
+    const box = await boxFile(2);
+    const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "history-client-refused-"));
+    cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+    const refused = join(dir, "refused.txt");
+    writeFileSync(refused, "n-0000\nn-0001\n");
+    const door = fakeDoor(() => ({ status: 404, body: { error: "No run has this id", error_type: "run_not_found" } }));
+    const r = await client(door.url, ["finish", "made-up-vault", box, "--refused", refused]);
+    expect(r.code, r.out).toBe(0);
+    expect(r.out).toContain("nothing was grafted");
+    expect(door.seen[0]!.json).toMatchObject({ expect_receipts: 0 });
+    // With receipts expected, the same answer is a failure.
+    writeFileSync(refused, "n-0000\n");
+    const bad = await client(door.url, ["finish", "made-up-vault", box, "--refused", refused]);
+    expect(bad.code, bad.out).not.toBe(0);
+  });
+
   it("status and digest send the same consent as the batch door", async () => {
     const box = await boxFile(2);
     const door = fakeDoor((s) =>

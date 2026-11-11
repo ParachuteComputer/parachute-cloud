@@ -32,6 +32,7 @@ import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import {
   DIGEST_MAX_NOTES,
   GRAFT_OUTCOMES,
+  HISTORY_IMPORT_CAP_SHARE,
   NOTE_MAX_BYTES,
   boxNoteIds,
   highestNativeIx,
@@ -162,8 +163,8 @@ export function batchForm(fields: Record<string, string>, batch: GraftBatch, dry
   return form;
 }
 
-/** The share of the notes cap past which the vault refuses a batch (vault-do.ts HISTORY_IMPORT_CAP_SHARE). */
-export const CAP_SHARE = 0.9;
+/** The share of the notes cap past which the vault refuses a batch that grafts. */
+export const CAP_SHARE = HISTORY_IMPORT_CAP_SHARE;
 
 /**
  * Where the dry batches say the vault would end: its size before the first, plus each batch's growth (every dry batch
@@ -234,6 +235,9 @@ async function sendAll(vault: string, dbPath: string, dryRun: boolean, refusedOu
   );
   if (refusedOut && !dryRun) console.log(`${verb} ${vault}: ${refused.length} refused note ids written to the --refused-out file`);
   if (dryRun) {
+    if (sizes.some((a) => typeof a.database_bytes_before !== "number" || typeof a.database_bytes !== "number")) {
+      die(`${verb} ${vault}: the vault did not report its database size, so there is no projection against its cap: is it running the door with the cap guard?`);
+    }
     const p = projectStorage(sizes);
     console.log(
       `${verb} ${vault}: database ${mib(p.start)} MiB now, projected ${mib(p.projected)} MiB` +
@@ -288,6 +292,12 @@ async function finish(vault: string, dbPath: string, refusedPath: string | undef
   const refused = readIdList(refusedPath);
   const expect = boxNoteIds(db).filter((id) => !refused.has(id)).length;
   const r = await postJson(d, "/ops/history-import/finish", { ...person(vault), run_id: run.run_id, expect_receipts: expect, ...(dryRun ? { dry_run: true } : {}) });
+  // The vault says it as error_type; identity's own dry finish says it as error.
+  if (r.status === 404 && (r.body.error_type ?? r.body.error) === "run_not_found" && expect === 0) {
+    // A batch that grafts nothing leaves no run behind, so a run where every note was refused has none to finish.
+    console.log(`finish ${vault}: nothing was grafted (every note refused), so the vault holds no run to finish; nothing to do`);
+    return;
+  }
   if (r.status !== 200) die(`finish ${vault}: ${why(r.body, r.status)}${r.body.receipts !== undefined ? ` (the vault holds ${r.body.receipts}, expected ${expect})` : ""}`);
   console.log(`finish ${vault}: ${dryRun ? (r.body.would_finish ? "would finish" : "would NOT finish") : "run complete"}, ${r.body.receipts} receipts (expected ${expect})`);
 }

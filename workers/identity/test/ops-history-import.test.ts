@@ -189,6 +189,48 @@ describe("/ops/history-import", () => {
     expect(await auditCount()).toBe(before);
   });
 
+  test("a body with no declared length stops being read at the cap: 413, nothing forwarded or recorded", async () => {
+    const { id } = await seedUser("chunked-history@example.com");
+    await seedVault("chunked-history-vault", id);
+    const before = await auditCount();
+    const vault = fakeVault();
+    // A real multipart body whose file part runs to 40 MiB, sent as a stream (no content-length).
+    const boundary = "made-up-boundary";
+    const enc = new TextEncoder();
+    const head = Object.entries(formFields("chunked-history@example.com", "chunked-history-vault"))
+      .map(([k, v]) => `--${boundary}\r\ncontent-disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`)
+      .join("") + `--${boundary}\r\ncontent-disposition: form-data; name="batch"; filename="batch.json"\r\ncontent-type: application/json\r\n\r\n`;
+    let pulled = 0;
+    let sent = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (sent === 0) c.enqueue(enc.encode(head));
+        if (sent < 40) {
+          // A fresh buffer each time: an enqueued one is handed over to the reader.
+          const chunk = new Uint8Array(1024 * 1024).fill(0x20);
+          pulled += chunk.byteLength;
+          c.enqueue(chunk);
+        } else {
+          c.enqueue(enc.encode(`\r\n--${boundary}--\r\n`));
+          c.close();
+        }
+        sent++;
+      },
+    });
+    const req = new Request(`${ISSUER}/ops/history-import`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${TOKEN}`, "content-type": `multipart/form-data; boundary=${boundary}` },
+      body,
+      duplex: "half",
+    } as RequestInit);
+    expect(req.headers.get("content-length")).toBeNull();
+    const res = await handleOpsHistoryImportPost(OPS_ENV, req, withVault(vault));
+    expect(res!.status).toBe(413);
+    expect(pulled).toBeLessThan(20 * 1024 * 1024);
+    expect(vault.calls).toEqual([]);
+    expect(await auditCount()).toBe(before);
+  });
+
   test("a dry run forwards the batch's bytes untouched with ?dry_run=true and records nothing; a real batch records one row first, then forwards", async () => {
     const { id } = await seedUser("move-history@example.com");
     await seedVault("move-history-vault", id);
@@ -199,7 +241,7 @@ describe("/ops/history-import", () => {
     expect(dry.res.status).toBe(200);
     expect(await dry.res.json()).toMatchObject({ dry_run: true });
     expect(dryVault.calls).toHaveLength(1);
-    expect(dryVault.calls[0]).toMatchObject({ method: "POST", path: "/api/internal/history-import", query: "?dry_run=true", contentType: "application/json", raw: BATCH_BYTES });
+    expect(dryVault.calls[0]).toMatchObject({ method: "POST", path: "/api/internal/history-import", query: `?run_id=${RUN_ID}&dry_run=true`, contentType: "application/json", raw: BATCH_BYTES });
     expect(await auditCount()).toBe(before);
 
     // The audit row must exist before the vault is called.
@@ -211,7 +253,7 @@ describe("/ops/history-import", () => {
     const real = await send(formFields("move-history@example.com", "move-history-vault", { dry_run: "false" }), vault);
     expect(real.res.status).toBe(200);
     expect(await real.res.json()).toMatchObject({ totals: { grafted: 1 } });
-    expect(vault.calls.map((c) => [c.method, c.path, c.query])).toEqual([["POST", "/api/internal/history-import", ""]]);
+    expect(vault.calls.map((c) => [c.method, c.path, c.query])).toEqual([["POST", "/api/internal/history-import", `?run_id=${RUN_ID}`]]);
     expect(vault.calls[0]!.raw).toBe(BATCH_BYTES);
     // A first-party admin mint for this vault: the vault's internal gate needs exactly that.
     const claims = decodeJwtPayload(vault.calls[0]!.auth.replace(/^Bearer /, ""));

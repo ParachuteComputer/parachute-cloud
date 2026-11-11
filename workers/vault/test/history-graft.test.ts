@@ -476,16 +476,19 @@ describe("operator history import (vault side)", () => {
     oversized.blobs.push({ hash: hashContent(tooBig), content: tooBig, byte_size: 2_000_001, encoding: null, delta_of: null });
     const r = await graft(cloud, oversized);
     expect(r.status, JSON.stringify(r.body).slice(0, 200)).toBe(400);
-    expect(r.body).toEqual({ error: "A blob does not match its hash", error_type: "blob_invalid", hash: hashContent(tooBig) });
+    expect(r.body).toEqual({ error: "A blob is over the engine's 2000000-byte version limit", error_type: "blob_invalid", reason: "too_large", hash: hashContent(tooBig) });
     const times: Array<[string, unknown]> = [
       ["superseded_at", "not a date"],
       ["superseded_at", "2020-01-01T00:00:00.000Z" + " ".repeat(30)],
       ["created_at", "yesterday-ish"],
       ["created_at", "x".repeat(41)],
+      ["completed_at", "not a date"],
+      ["completed_at", "2020-01-01T00:00:00.000Z" + "x".repeat(30)],
     ];
     for (const [field, value] of times) {
       const b = structuredClone(batch!);
-      (b.notes[0]!.versions[0] as any)[field] = value;
+      if (field === "completed_at") (b.notes[0]!.receipt as any)[field] = value;
+      else (b.notes[0]!.versions[0] as any)[field] = value;
       const res = await graft(cloud, b);
       expect(res.status, `${field}=${String(value).slice(0, 20)}`).toBe(400);
       expect(res.body.error_type).toBe("invalid_request");
@@ -588,6 +591,20 @@ describe("operator history import (vault side)", () => {
     expect(res.body).toMatchObject({ database_bytes_before: roomyBefore, notes_cap_bytes: 100 * 1024 * 1024 });
     expect(res.body.database_bytes).toBeGreaterThan(roomyBefore + 250_000);
     expect(await status(roomy)).toMatchObject({ keep_all: true });
+    // The vault is now past 90% of a lower cap: a retry of the batch that landed adds nothing, and is answered, not refused.
+    const full = await dbSize(roomy);
+    await pushCaps(roomy, Math.floor(full / 0.95));
+    const retry = await graft(roomy, batch!);
+    expect(retry.status, JSON.stringify(retry.body).slice(0, 300)).toBe(200);
+    expect(retry.body.totals).toMatchObject({ grafted: 0, already: 1 });
+
+    // A batch whose run id is not the one the identity door recorded is refused.
+    const other = await makeCloud([current(K)]);
+    const mismatch = await post(other, `/internal/history-import?run_id=${hashContent("another run")}`, batch!);
+    expect(mismatch.status).toBe(400);
+    expect(((await mismatch.json()) as any).error_type).toBe("invalid_request");
+    const matching = await post(other, `/internal/history-import?run_id=${batch!.run.run_id}&dry_run=true`, batch!);
+    expect(matching.status).toBe(200);
 
     // No cap pushed: no guard, and the answer says so.
     const uncapped = await makeCloud([current(K)]);

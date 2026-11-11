@@ -103,7 +103,8 @@ the operator then sends each note's version rows, refs, receipt and blobs with
   reference and vault, and forward to the vault; status and digest write no
   audit row.
 - `POST /api/internal/history-import` (vault; platform only; `?dry_run=true`
-  for a dry run, never inside the batch): checks the envelope (native indices,
+  for a dry run, never inside the batch; `?run_id=`, which identity sends, must
+  be the batch's run, so the audit row names the run that was sent): checks the envelope (native indices,
   import indices and counts at most 10,000,000; times `Date.parse` reads; no
   blob over the engine's 2,000,000-byte version limit), verifies every blob by
   hash, then per note, in its own transaction: grafts only when the note's
@@ -122,14 +123,16 @@ every state load before maintenance): max 1,000,000 versions, 36,500 days, no
 per-note byte ceiling. Its history then grows with every edit and counts against
 the storage meter. The flag is set only by a batch that grafted at least one
 note, in the same commit as its rows; a batch that grafts nothing, or is
-refused, leaves no flag and no run behind. No production run is part of this
+refused, leaves no flag and no run behind (so `finish` of a run where every
+note was refused finds no run, and the client says there is nothing to do). No production run is part of this
 change.
 
 The graft is not counted as the person writing, and internal routes skip the
 plan's cap gate, so the door has its own: the whole batch runs in one
-transaction, and when a cap is pushed and the batch would leave the database
-above 90% of the notes cap, it is rolled back whole and answered `413
-history_import_over_cap` with the sizes. Batches before it stay. `plan` adds up
+transaction, and when a cap is pushed and a batch that grafts a note would
+leave the database above 90% of the notes cap, it is rolled back whole and
+answered `413 history_import_over_cap` with the sizes (a retry that finds every
+note already there is answered as usual). Batches before it stay. `plan` adds up
 each dry batch's growth and fails when the projection passes 90% of the cap;
 `run` stops at that 413. No cap pushed, no guard. A later `/ops/vault-import`
 retry would still replace the notes the history sits behind.

@@ -158,10 +158,28 @@ export async function handleOpsHistoryImportPost(env: Env, req: Request, deps: O
     await req.body?.cancel().catch(() => {});
     return tooLarge();
   }
+  // A body with no declared length is counted as it is read and cut off at the cap, so formData never holds more.
+  let over = false;
+  let read = 0;
+  const cap = MAX_HISTORY_BATCH_BYTES + FORM_OVERHEAD;
+  const counted = req.body?.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, c) {
+        read += chunk.byteLength;
+        if (read > cap) {
+          over = true;
+          c.error(new Error("over the cap"));
+          return;
+        }
+        c.enqueue(chunk);
+      },
+    }),
+  );
   let form: FormData;
   try {
-    form = await req.formData();
+    form = await new Request(req.url, { method: "POST", headers: req.headers, body: counted ?? null }).formData();
   } catch {
+    if (over) return tooLarge();
     return refuse(400, "invalid_request", "body must be multipart/form-data (scripts/ops-history-import.ts sends it). Nothing changed.");
   }
   const unknown = [...new Set(form.keys())].filter((k) => !IMPORT_FIELDS.has(k));
@@ -208,7 +226,8 @@ export async function handleOpsHistoryImportPost(env: Env, req: Request, deps: O
     userId: vault.ownerUserId,
     vaultName: vault.name,
     method: "POST",
-    apiPath: `/api/internal/history-import${dryRun ? "?dry_run=true" : ""}`,
+    // run_id: the vault refuses a batch for any other run than the one the audit row names.
+    apiPath: `/api/internal/history-import?run_id=${runId}${dryRun ? "&dry_run=true" : ""}`,
     verb: "admin",
     rawBody: batch,
     rawContentType: "application/json",

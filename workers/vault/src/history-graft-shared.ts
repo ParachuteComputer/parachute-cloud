@@ -128,6 +128,12 @@ export const DIGEST_MAX_NOTES = 2_000;
  * later edit of the note would fail. Ten million is far past any real history.
  */
 export const HISTORY_IX_MAX = 10_000_000;
+/**
+ * The vault refuses (413, rolled back whole) a batch that grafts a note and
+ * leaves the database above this share of a pushed notes cap; the client's
+ * `plan` projects against the same share.
+ */
+export const HISTORY_IMPORT_CAP_SHARE = 0.9;
 
 /**
  * A note's state as the box holds it, with the body's exported form beside it
@@ -287,7 +293,7 @@ function checkNote(v: unknown): string | null {
   for (const k of ["imported_count", "retained_count", "pruned_imported", "pruned_native"] as const) {
     if (!isBounded(r[k])) return `note.receipt.${k}: whole number up to ${HISTORY_IX_MAX}`;
   }
-  if (!isStr(r.completed_at)) return "note.receipt.completed_at: string";
+  if (!isTime(r.completed_at)) return "note.receipt.completed_at: a time (at most 40 characters)";
   if (!Array.isArray(v.versions)) return "note.versions: array";
   for (const x of v.versions) {
     const e = checkVersion(x);
