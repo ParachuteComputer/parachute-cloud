@@ -243,20 +243,11 @@ function tipHolds(note: GraftNote, live: { content: string | null; path: string 
 
 /**
  * One batch: verify blobs, record the run, then each note in its own
- * transaction. `txn` is the DO's `transactionSync`. The caller wraps the whole
- * call in an outer transaction it rolls back for a dry run.
+ * transaction; a run row this call inserted is taken out again when no note
+ * grafted. `txn` is the DO's `transactionSync`. The caller wraps the whole call
+ * in an outer transaction too: rolled back for a dry run or a batch past the
+ * storage guard, committed otherwise.
  */
-/**
- * The batch-level refusals (a bad blob, a run id recorded with other fields),
- * without writing. The DO runs it before turning keep-all on, so a refused
- * batch changes nothing at all; {@link graftBatch} runs the same checks again
- * in the same synchronous turn as its writes.
- */
-export function precheckBatch(db: GraftDb, batch: GraftBatch): { ok: true } | { ok: false; status: number; body: Record<string, unknown> } {
-  const checked = verifyBlobs(db, batch.blobs);
-  if (!checked.ok) return blobRefusal(checked.hash);
-  return runConflict(db, batch) ? runConflictRefusal() : { ok: true };
-}
 const blobRefusal = (hash: string) => ({ ok: false as const, status: 400, body: { error: "A blob does not match its hash", error_type: "blob_invalid", hash } });
 const runConflictRefusal = () => ({ ok: false as const, status: 409, body: { error: "This run id was recorded with other fields", error_type: "run_conflict" } });
 function runConflict(db: GraftDb, batch: GraftBatch): boolean {
@@ -266,14 +257,14 @@ function runConflict(db: GraftDb, batch: GraftBatch): boolean {
   return !!existing && (existing.source_fingerprint !== batch.run.source_fingerprint || existing.tip !== batch.run.tip || existing.options_digest !== batch.run.options_digest);
 }
 
-export function graftBatch(db: GraftDb, txn: SyncTxn, batch: GraftBatch): GraftResult {
+export function graftBatch(db: GraftDb, txn: SyncTxn, batch: GraftBatch, opts: { dryRun?: boolean } = {}): GraftResult {
   const checked = verifyBlobs(db, batch.blobs);
   if (!checked.ok) return blobRefusal(checked.hash);
   if (runConflict(db, batch)) return runConflictRefusal();
   const existingRun = !!db.prepare("SELECT 1 FROM history_import_runs WHERE run_id = ?").get(batch.run.run_id);
 
   const summary: GraftSummary = {
-    dry_run: batch.dry_run === true,
+    dry_run: opts.dryRun === true,
     run_id: batch.run.run_id,
     notes: [],
     totals: Object.fromEntries(GRAFT_OUTCOMES.map((o) => [o, 0])) as Record<GraftOutcome, number>,
@@ -321,7 +312,11 @@ export function graftBatch(db: GraftDb, txn: SyncTxn, batch: GraftBatch): GraftR
     }
   }
 
-  const dropped = txn(() => dropUnused(db, written));
+  const dropped = txn(() => {
+    // No empty `applying` run left behind by a batch that grafted nothing.
+    if (!existingRun && summary.totals.grafted === 0) db.prepare("DELETE FROM history_import_runs WHERE run_id = ?").run(batch.run.run_id);
+    return dropUnused(db, written);
+  });
   summary.blobs_written = written.length - dropped;
   return { ok: true, summary };
 }

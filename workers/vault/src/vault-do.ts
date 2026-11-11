@@ -98,7 +98,7 @@ import {
   restoreFromTar,
 } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
-import { digestNotes, finishRun, graftBatch, graftStatus, precheckBatch } from "./history-graft.js";
+import { digestNotes, finishRun, graftBatch, graftStatus } from "./history-graft.js";
 import { GRAFT_MAX_BODY_BYTES, GRAFT_OUTCOMES, parseDigestQuery, parseGraftBatch } from "./history-graft-shared.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, withCloudGuideText, type WelcomeSeedResult } from "./welcome.js";
 import {
@@ -365,6 +365,8 @@ const WRITTEN_SINCE_IMPORT_KEY = "written_since_import";
 const HISTORY_KEEP_ALL_KEY = "history_keep_all";
 /** The policy a keep-all vault runs, merged over core's defaults by `resolveHistoryPolicy`. */
 export const HISTORY_KEEP_ALL_POLICY = { max_versions: 1_000_000, max_age_days: 36500, max_bytes_per_note: null } as const;
+/** A history import batch is refused (413, rolled back whole) when it would leave the database above this share of a pushed notes cap. */
+export const HISTORY_IMPORT_CAP_SHARE = 0.9;
 
 /** How long an import waits for in-flight requests to finish before its replay. */
 const IMPORT_DRAIN_MAX_MS = 60_000;
@@ -2266,14 +2268,27 @@ export class VaultDO extends DurableObject {
    * behind the notes' current state (T-450; history-graft.ts has the rules).
    * GET — the history import's status, counts only.
    *
-   * The lock: after the body is read, the only `await` is the keep-all flag's
-   * put (on the first real batch, after a read-only precheck that refuses a
-   * bad blob or a conflicting run first); from the graft's first read to the
-   * answer everything is synchronous, so no other request interleaves, and
-   * each note is its own transaction. A dry run runs the very same code inside
-   * an outer `transactionSync` that is then rolled back (DO transactions nest as
-   * savepoints: an inner rollback undoes only its note, the outer one undoes
-   * everything), so it reports exactly what a real run would.
+   * The lock: once the body is read there is no `await` until the answer is
+   * built, so no other request interleaves; each note is its own transaction,
+   * inside ONE outer `transactionSync` for the whole batch (DO transactions nest
+   * as savepoints: an inner rollback undoes only its note, the outer one undoes
+   * everything). The outer one is rolled back for a dry run, so it reports
+   * exactly what a real run would, and for a batch that would leave the
+   * database above 90% of a pushed notes cap: internal routes skip the cap
+   * gate, and a vault over its cap answers every owner write 413. (Checked:
+   * `sql.databaseSize` read inside an open transaction counts that
+   * transaction's pages, and falls back when it rolls back.) No cap pushed, no
+   * guard.
+   *
+   * Keep-all is turned on only by a batch that grafted at least one note, right
+   * after the outer transaction commits and in the SAME synchronous turn: the
+   * in-memory mirror, the store's policy, then `storage.put` with its promise
+   * awaited only afterwards. A SQLite-backed Durable Object keeps its KV pairs
+   * in the same database (`_cf_KV`) and commits every write made with no
+   * intervening `await` as one atomic batch (workerd names this "Durable
+   * Objects' automatic atomic write coalescing"), so the flag and the grafted
+   * rows land together or not at all. A batch that grafts nothing, or is
+   * refused, leaves the flag as it was.
    *
    * Never marks the vault written (internal paths skip markWritten), fires no
    * hook or live event, never touches a `notes` row.
@@ -2306,48 +2321,69 @@ export class VaultDO extends DurableObject {
     if (!parsed.ok) return json({ error: parsed.error, error_type: "invalid_request" }, 400);
     const batch = parsed.value;
     const dry = batch.dry_run === true;
-    if (!dry && !this.historyKeepAll) {
-      // A batch the vault refuses whole must leave it exactly as it was, keep-all flag included.
-      const pre = precheckBatch(this.shim, batch);
-      if (!pre.ok) return json(pre.body, pre.status);
-      // Keep-all is on, durably, before the first imported row can land. (graftBatch checks again below, in the
-      // same synchronous turn as its writes: this await is the only one after the body is read.)
-      await this.ctx.storage.put(HISTORY_KEEP_ALL_KEY, true);
+    const notesCap = this.planCaps()?.notes_bytes ?? null;
+
+    // ---- synchronous from here to the answer ----
+    const sql = this.raw();
+    const txn = <T,>(fn: () => T): T => this.ctx.storage.transactionSync(fn);
+    const bytesBefore = Number(sql.databaseSize);
+    let bytesAfter = bytesBefore;
+    let result: ReturnType<typeof graftBatch> | undefined;
+    let overCap = false;
+    const rollback = new Error("history import rolled back");
+    try {
+      txn(() => {
+        result = graftBatch(this.shim, txn, batch, { dryRun: dry });
+        if (!result.ok) return; // refused before any write
+        bytesAfter = Number(sql.databaseSize);
+        if (dry) throw rollback;
+        if (notesCap !== null && bytesAfter > notesCap * HISTORY_IMPORT_CAP_SHARE) {
+          overCap = true;
+          throw rollback;
+        }
+      });
+    } catch (err) {
+      if (err !== rollback) throw err;
+    }
+    if (!result!.ok) {
+      const refused = result!;
+      console.log(`event=history_import_refused status=${refused.status} error_type=${String(refused.body.error_type)}`);
+      return json(refused.body, refused.status);
+    }
+    if (overCap) {
+      console.log(`event=history_import_refused status=413 error_type=history_import_over_cap database_bytes_before=${bytesBefore} database_bytes_after=${bytesAfter} notes_cap_bytes=${notesCap}`);
+      return json(
+        {
+          error: `This batch would leave the vault above ${HISTORY_IMPORT_CAP_SHARE * 100}% of its notes storage cap. Nothing changed.`,
+          error_type: "history_import_over_cap",
+          database_bytes_before: bytesBefore,
+          database_bytes_after: bytesAfter,
+          notes_cap_bytes: notesCap,
+        },
+        413,
+      );
+    }
+    const s = result!.summary;
+    let keepAllWrite: Promise<void> | null = null;
+    if (!dry && s.totals.grafted > 0 && !this.historyKeepAll) {
+      // Same synchronous turn as the commit above: see the comment on this method.
       this.historyKeepAll = true;
       this.applyHistoryPolicy();
+      keepAllWrite = this.ctx.storage.put(HISTORY_KEEP_ALL_KEY, true);
     }
-    // ---- synchronous from here to the answer ----
-    const txn = <T,>(fn: () => T): T => this.ctx.storage.transactionSync(fn);
-    let result: ReturnType<typeof graftBatch>;
-    if (dry) {
-      const rollback = new Error("dry run");
-      let out: ReturnType<typeof graftBatch> | undefined;
-      try {
-        txn(() => {
-          out = graftBatch(this.shim, txn, batch);
-          throw rollback;
-        });
-      } catch (err) {
-        if (err !== rollback) throw err;
-      }
-      result = out!;
-    } else {
-      result = graftBatch(this.shim, txn, batch);
-    }
-    if (!result.ok) {
-      console.log(`event=history_import_refused status=${result.status} error_type=${String(result.body.error_type)}`);
-      return json(result.body, result.status);
-    }
-    const s = result.summary;
+    // ---- the first await ----
+    if (keepAllWrite) await keepAllWrite;
     console.log(
       `event=history_import dry_run=${dry} notes=${s.notes.length} ` +
         GRAFT_OUTCOMES.map((o) => `${o}=${s.totals[o]}`).join(" ") +
-        ` blobs_written=${s.blobs_written} versions_written=${s.versions_written} shifted_notes=${s.shifted_notes}`,
+        ` blobs_written=${s.blobs_written} versions_written=${s.versions_written} shifted_notes=${s.shifted_notes}` +
+        ` database_bytes_before=${bytesBefore} database_bytes=${bytesAfter}`,
     );
     return json({
       ...s,
-      database_bytes: Number(this.raw().databaseSize),
-      notes_cap_bytes: this.planCaps()?.notes_bytes ?? null,
+      database_bytes_before: bytesBefore,
+      database_bytes: dry ? bytesAfter : Number(sql.databaseSize),
+      notes_cap_bytes: notesCap,
     });
   }
 

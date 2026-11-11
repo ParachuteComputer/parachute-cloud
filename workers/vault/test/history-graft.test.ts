@@ -124,6 +124,10 @@ async function graft(v: string, batch: GraftBatch): Promise<{ status: number; bo
   const r = await post(v, "/internal/history-import", batch);
   return { status: r.status, body: await r.json() };
 }
+/** The same batch as a dry run. */
+async function graftDry(v: string, batch: GraftBatch): Promise<{ status: number; body: any }> {
+  return graft(v, { ...batch, dry_run: true });
+}
 
 /** Everything the import may touch, counted; plus the full `notes` rows. */
 async function snapshot(v: string): Promise<any> {
@@ -482,6 +486,104 @@ describe("operator history import (vault side)", () => {
     for (const v of nullCreated.notes[0]!.versions) v.created_at = null;
     nullCreated.notes[0]!.digest = historyDigest(nullCreated.notes[0]!.versions, nullCreated.notes[0]!.refs);
     expect((await graft(cloud, nullCreated)).body.totals.grafted).toBe(1);
+  });
+
+  it("keep-all and the run row stay off for a batch that grafts nothing or is refused; a batch that grafts sets them", async () => {
+    const box = await makeBox([A, B]);
+    const [batch] = await boxBatches(box);
+    const keepAll = async (v: string) => ((await (await op(v, "/api/internal/history-import")).json()) as any).keep_all;
+
+    // Every note not_found: 200, but nothing to keep, and no empty `applying` run left behind.
+    const elsewhere = await makeCloud([{ id: "unrelated", path: "Other", body: "other" }]);
+    const before = await snapshot(elsewhere);
+    const none = await graft(elsewhere, batch!);
+    expect(none.status).toBe(200);
+    expect(none.body.totals).toMatchObject({ not_found: 2, grafted: 0 });
+    expect(await keepAll(elsewhere)).toBe(false);
+    expect(await snapshot(elsewhere)).toEqual(before);
+
+    // Refused whole: 400 (a tampered blob) and 409 (the run id recorded with other fields).
+    const cloud = await makeCloud([current(A), current(B)]);
+    const tampered = structuredClone(batch!);
+    const whole = tampered.blobs.find((b) => b.encoding === null)!;
+    whole.content = (whole.content.at(-1) === "x" ? "y" : "x") + whole.content.slice(1);
+    expect((await graft(cloud, tampered)).status).toBe(400);
+    expect(await keepAll(cloud)).toBe(false);
+    await runInDurableObject<DurableObject, void>(stub(cloud), async (inst: any) => {
+      inst.store.db
+        .prepare("INSERT INTO history_import_runs (run_id, source_fingerprint, tip, options_digest, status, created_at) VALUES (?, ?, ?, ?, 'applying', ?)")
+        .run(RUN.run_id, RUN.source_fingerprint, hashContent("another tip").slice(0, 40), RUN.options_digest, "2026-01-01T00:00:00.000Z");
+    });
+    const withRun = await snapshot(cloud);
+    const conflict = await graft(cloud, batch!);
+    expect(conflict.status).toBe(409);
+    expect(await keepAll(cloud)).toBe(false);
+    expect(await snapshot(cloud)).toEqual(withRun);
+
+    // A batch that grafts turns both on.
+    const good = await makeCloud([current(A), current(B)]);
+    expect((await graft(good, batch!)).body.totals.grafted).toBe(2);
+    expect(await keepAll(good)).toBe(true);
+    expect((await snapshot(good)).runs).toBe(1);
+  });
+
+  it("refuses a batch that would put the vault past 90% of its notes cap, whole; the same batch grafts under a roomy cap", async () => {
+    // Bodies big enough to move the database size well past any page rounding.
+    const page = (tag: string) => Array.from({ length: 7000 }, (_, i) => `${tag} line ${i} of made-up text`).join("\n");
+    const K: NoteSpec = { id: "note-k", path: "Notes/K", native: [page("k0"), page("k1"), page("k2")], imports: [page("k old")] };
+    const box = await makeBox([K]);
+    const [batch] = await boxBatches(box);
+    const pushCaps = async (v: string, notes_bytes: number) => {
+      const r = await SELF.fetch(`${base(v)}/api/internal/config`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${await firstParty(v)}`, "content-type": "application/json" },
+        body: JSON.stringify({ caps: { notes_bytes, attachment_bytes: 0 } }),
+      });
+      expect(r.status).toBe(200);
+    };
+    const dbSize = (v: string) => runInDurableObject<DurableObject, number>(stub(v), async (inst: any) => Number(inst.ctx.storage.sql.databaseSize));
+    const status = async (v: string) => (await (await op(v, "/api/internal/history-import")).json()) as any;
+
+    const tight = await makeCloud([current(K)]);
+    const sizeBefore = await dbSize(tight);
+    // 90% of this cap sits above the vault now and below it after the graft (three bodies of about 200 KB).
+    const cap = Math.ceil((sizeBefore + 250_000) / 0.9);
+    await pushCaps(tight, cap);
+    const before = await snapshot(tight);
+
+    // A dry run says how far it would go, and writes nothing.
+    const dry = await graftDry(tight, batch!);
+    expect(dry.status, JSON.stringify(dry.body).slice(0, 300)).toBe(200);
+    expect(dry.body).toMatchObject({ dry_run: true, database_bytes_before: sizeBefore, notes_cap_bytes: cap });
+    expect(dry.body.database_bytes).toBeGreaterThan(cap * 0.9);
+    expect(await snapshot(tight)).toEqual(before);
+
+    const refused = await graft(tight, batch!);
+    expect(refused.status, JSON.stringify(refused.body).slice(0, 300)).toBe(413);
+    expect(refused.body).toMatchObject({ error_type: "history_import_over_cap", database_bytes_before: sizeBefore, notes_cap_bytes: cap });
+    expect(refused.body.database_bytes_after).toBeGreaterThan(cap * 0.9);
+    expect(await snapshot(tight)).toEqual(before);
+    expect(await status(tight)).toMatchObject({ keep_all: false, runs: [] });
+    expect(await dbSize(tight)).toBe(sizeBefore);
+    // The owner can still write.
+    const edit = await op(tight, `/api/notes/${K.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ content: "k smaller", force: true }) });
+    expect(edit.status).toBe(200);
+
+    const roomy = await makeCloud([current(K)]);
+    const roomyBefore = await dbSize(roomy);
+    await pushCaps(roomy, 100 * 1024 * 1024);
+    const res = await graft(roomy, batch!);
+    expect(res.status, JSON.stringify(res.body).slice(0, 300)).toBe(200);
+    expect(res.body.totals.grafted).toBe(1);
+    expect(res.body).toMatchObject({ database_bytes_before: roomyBefore, notes_cap_bytes: 100 * 1024 * 1024 });
+    expect(res.body.database_bytes).toBeGreaterThan(roomyBefore + 250_000);
+    expect(await status(roomy)).toMatchObject({ keep_all: true });
+
+    // No cap pushed: no guard, and the answer says so.
+    const uncapped = await makeCloud([current(K)]);
+    const free = await graft(uncapped, batch!);
+    expect(free.status).toBe(200);
+    expect(free.body.notes_cap_bytes).toBeNull();
   });
 
   it("a grafted vault keeps every imported row through 150 later edits; a plain vault still prunes", async () => {
