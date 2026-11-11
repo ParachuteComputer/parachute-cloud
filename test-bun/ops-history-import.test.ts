@@ -19,6 +19,7 @@ import {
   BATCH_MAX_NOTES,
   EMPTY_OBSERVATIONS_DIGEST,
   boxNoteIds,
+  boxUnsendableIds,
   highestNativeIx,
   historyDigest,
   parseGraftBatch,
@@ -77,6 +78,23 @@ async function makeCloud(box: Database): Promise<Database> {
   }
   return db;
 }
+
+describe("a note the door could not take is left out, and counted", () => {
+  it("leaves out a note with a version whose metadata is not a JSON object; the rest go as before", async () => {
+    // A client on a box once wrote metadata double-encoded: the version row holds a JSON string, not an object.
+    const box = await makeBox();
+    const all = boxNoteIds(box);
+    box.prepare("UPDATE note_versions SET metadata = ? WHERE note_id = ? AND version_ix = (SELECT MIN(version_ix) FROM note_versions WHERE note_id = ?)").run(JSON.stringify(JSON.stringify({ made: "up" })), "n-2-b", "n-2-b");
+    expect(boxUnsendableIds(box)).toEqual(["n-2-b"]);
+    expect(boxNoteIds(box)).toEqual(all.filter((id) => id !== "n-2-b"));
+    const plan = planBatches(box);
+    expect(plan.batches.flatMap((b) => b.batch.notes.map((n) => n.id))).toEqual(all.filter((id) => id !== "n-2-b"));
+    for (const { batch } of plan.batches) expect(parseGraftBatch(JSON.parse(JSON.stringify(batch))).ok).toBe(true);
+    // Text that is not JSON at all counts the same way.
+    box.prepare("UPDATE note_versions SET metadata = 'not json' WHERE note_id = 'n-3-c'").run();
+    expect(boxUnsendableIds(box)).toEqual(["n-2-b", "n-3-c"]);
+  });
+});
 
 describe("history import payload builder (bun:sqlite box)", () => {
   it("sends every live note with history, in id order, each batch self-sufficient, bases before deltas", async () => {

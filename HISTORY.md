@@ -139,6 +139,10 @@ projection passes 90% of the cap; `run` stops at that 413. No cap pushed, no
 guard. A later `/ops/vault-import` retry would still replace the notes the
 history sits behind.
 
+A note with a version whose metadata is not a JSON object (a client once wrote it
+double-encoded on the box) is left out whole by the client and counted: the door
+refuses such a row, and a note's history is not sent in part.
+
 Before a run: stop editing on the box after `apply` (its retention may prune
 imported rows, and the client then refuses to send: `local` shows the count);
 `plan` first. Then know these:

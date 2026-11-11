@@ -35,6 +35,7 @@ import {
   HISTORY_IMPORT_CAP_SHARE,
   NOTE_MAX_BYTES,
   boxNoteIds,
+  boxUnsendableIds,
   highestNativeIx,
   planBatches,
   readBoxBlobs,
@@ -66,17 +67,21 @@ export function localCounts(db: Database) {
   const ids = boxNoteIds(db);
   let largest = 0;
   let stale = 0;
+  const notesSent: { versions: { version_ix: number }[] }[] = [];
   for (const id of ids) {
     const note = readBoxNote(db, id, run);
+    notesSent.push({ versions: note.versions.map((v) => ({ version_ix: v.version_ix })) });
     if (!receiptHolds(note)) stale++;
     const blobs = readBoxBlobs(db, note.versions.flatMap((v) => (v.content_hash ? [v.content_hash] : [])));
     const bytes = Buffer.byteLength(JSON.stringify(note)) + blobs.reduce((s, b) => s + Buffer.byteLength(JSON.stringify(b)), 0);
     if (bytes > largest) largest = bytes;
   }
   return {
+    left_out: boxUnsendableIds(db).length,
     notes_with_history: ids.length,
-    imported_rows: n("SELECT COUNT(*) AS n FROM note_versions v JOIN notes x ON x.id = v.note_id WHERE v.version_ix < 0"),
-    native_rows: n("SELECT COUNT(*) AS n FROM note_versions v JOIN notes x ON x.id = v.note_id WHERE v.version_ix >= 0"),
+    // Counted over the notes that are sent, so they are what Cloud ends with when every note grafts.
+    imported_rows: notesSent.reduce((s, x) => s + x.versions.filter((v) => v.version_ix < 0).length, 0),
+    native_rows: notesSent.reduce((s, x) => s + x.versions.filter((v) => v.version_ix >= 0).length, 0),
     refs: n("SELECT COUNT(*) AS n FROM history_import_refs"),
     runs: n("SELECT COUNT(*) AS n FROM history_import_runs"),
     stored_bytes: n("SELECT COALESCE(SUM(byte_size), 0) AS n FROM note_blobs"),
@@ -195,6 +200,8 @@ async function sendAll(vault: string, dbPath: string, dryRun: boolean, refusedOu
   if (staleReceipts.length > 0) {
     die(`${verb} ${vault}: ${staleReceipts.length} notes' receipts no longer match their rows (the box edited them after apply and pruned imported rows); nothing sent`);
   }
+  const leftOut = boxUnsendableIds(db).length;
+  if (leftOut > 0) console.log(`${verb} ${vault}: ${leftOut} note(s) left out, with all their history: a version's metadata is not a JSON object`);
   const totals = zeroTotals();
   const refused: string[] = [];
   const sizes: { database_bytes_before?: number; database_bytes?: number; notes_cap_bytes?: number | null }[] = [];
@@ -330,6 +337,7 @@ if (import.meta.main) {
         `${(c.stored_bytes / 1048576).toFixed(1)} MiB stored, largest note ${(c.largest_note_bytes / 1048576).toFixed(2)} MiB (limit ${c.note_limit_bytes / 1048576}), ` +
         `${c.stale_receipts} notes whose receipt no longer matches (must be 0)`,
     );
+    if (c.left_out > 0) console.log(`local: ${c.left_out} more note(s) left out, with all their history: a version's metadata is not a JSON object (the door refuses such a row)`);
   } else if (cmd === "plan" && a && b) await sendAll(a, b, true, undefined);
   else if (cmd === "run" && a && b) await sendAll(a, b, false, flag(rest, "--refused-out") ?? die("run needs --refused-out FILE: digest and finish read it"));
   else if (cmd === "digest" && a && b) await digest(a, b, flag(rest, "--refused"));

@@ -398,10 +398,27 @@ export function readBoxRun(db: SqlLike): GraftRun & { created_at: string } {
 }
 
 /** Every note with any version row AND a live notes row, in id order. */
-export function boxNoteIds(db: SqlLike): string[] {
-  return (db.prepare("SELECT DISTINCT v.note_id AS id FROM note_versions v JOIN notes n ON n.id = v.note_id ORDER BY v.note_id").all() as { id: string }[]).map(
+/** A version row the door refuses by rule: metadata that is text but not a JSON object. */
+const UNSENDABLE = "v.metadata IS NOT NULL AND (json_valid(v.metadata) = 0 OR json_type(v.metadata) <> 'object')";
+
+/**
+ * Live notes with a version the door would refuse (`metadata_not_object`): a
+ * client once wrote metadata double-encoded, so the row holds a JSON string.
+ * Such a note is left out whole (its history is not sent in part), and the
+ * client counts it, so one malformed row doesn't fail a run.
+ */
+export function boxUnsendableIds(db: SqlLike): string[] {
+  return (db.prepare(`SELECT DISTINCT v.note_id AS id FROM note_versions v JOIN notes n ON n.id = v.note_id WHERE ${UNSENDABLE} ORDER BY v.note_id`).all() as { id: string }[]).map(
     (r) => r.id,
   );
+}
+
+/** Every live note with history that can be sent (see {@link boxUnsendableIds} for the ones left out), in id order. */
+export function boxNoteIds(db: SqlLike): string[] {
+  const out = new Set(boxUnsendableIds(db));
+  return (db.prepare("SELECT DISTINCT v.note_id AS id FROM note_versions v JOIN notes n ON n.id = v.note_id ORDER BY v.note_id").all() as { id: string }[])
+    .map((r) => r.id)
+    .filter((id) => !out.has(id));
 }
 
 /** One note's payload, from the box. Throws on a receipt from another run (the DB isn't what the run says). */
