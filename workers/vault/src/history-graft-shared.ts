@@ -13,6 +13,7 @@
  */
 import { canonicalJson, importObservationDigest } from "@openparachute/core/src/history-import.js";
 import { byteLength, hashContent } from "@openparachute/core/src/history.js";
+import { supportsInlineFrontmatter } from "@openparachute/core/src/portable-md.js";
 
 /** The run row of the box's import (core `ImportRun`). */
 export interface GraftRun {
@@ -67,9 +68,19 @@ export interface GraftReceipt {
   completed_at: string;
 }
 
-/** The source snapshot's CURRENT note state: sha256 of the body, path, extension. */
+/**
+ * The source snapshot's CURRENT note state: sha256 of the body, path, extension.
+ *
+ * `exported_content_hash` is the same body as a portable-md export leaves it,
+ * when that differs: the exporter gives a markdown body with no final newline
+ * one (core `toPortableMarkdown`), and the operator vault import builds the
+ * Cloud vault from such an export. So for those notes Cloud holds "body\n"
+ * where the box holds "body", and that is the snapshot's state too, not an
+ * edit. Absent when the export changes nothing.
+ */
 export interface GraftTip {
   content_hash: string;
+  exported_content_hash?: string;
   path: string | null;
   extension: string | null;
 }
@@ -110,6 +121,22 @@ export const GRAFT_MAX_NOTES = 5_000;
 export const GRAFT_MAX_VERSIONS = 50_000;
 export const GRAFT_MAX_BLOBS = 50_000;
 export const DIGEST_MAX_NOTES = 2_000;
+
+/**
+ * A note's state as the box holds it, with the body's exported form beside it
+ * when the export would change it (see {@link GraftTip}): inline-frontmatter
+ * extensions only, and only a body that is not empty and has no final newline.
+ */
+export function tipOf(live: { content: string | null; path: string | null; extension: string | null }): GraftTip {
+  const body = live.content ?? "";
+  const exported = supportsInlineFrontmatter(live.extension ?? "md") && body !== "" && !body.endsWith("\n") ? body + "\n" : body;
+  return {
+    content_hash: hashContent(body),
+    ...(exported !== body ? { exported_content_hash: hashContent(exported) } : {}),
+    path: live.path,
+    extension: live.extension,
+  };
+}
 
 /** The client's batch shape: close at about this much JSON, or this many notes. */
 export const BATCH_TARGET_BYTES = 6 * 1024 * 1024;
@@ -231,9 +258,12 @@ function checkNote(v: unknown): string | null {
   if (!isStr(v.digest) || !HEX64.test(v.digest)) return "note.digest: 64 hex";
   const tip = v.tip;
   if (!isObj(tip)) return "note.tip: object";
-  const tipBad = onlyKeys(tip, ["content_hash", "path", "extension"], "note.tip");
+  // `exported_content_hash` is the one optional field: checked below when present.
+  const { exported_content_hash: _exported, ...tipRequired } = tip;
+  const tipBad = onlyKeys(tipRequired, ["content_hash", "path", "extension"], "note.tip");
   if (tipBad) return tipBad;
   if (!isStr(tip.content_hash) || !HEX64.test(tip.content_hash)) return "note.tip.content_hash: 64 hex";
+  if (tip.exported_content_hash !== undefined && (!isStr(tip.exported_content_hash) || !HEX64.test(tip.exported_content_hash))) return "note.tip.exported_content_hash: 64 hex";
   if (!isStrOrNull(tip.path)) return "note.tip.path: string or null";
   if (!isStrOrNull(tip.extension)) return "note.tip.extension: string or null";
   const r = v.receipt;
@@ -382,7 +412,7 @@ export function readBoxNote(db: SqlLike, id: string, run: GraftRun & { created_a
     : { state_digest: EMPTY_OBSERVATIONS_DIGEST, imported_count: 0, retained_count: 0, pruned_imported: 0, pruned_native: 0, completed_at: run.created_at };
   return {
     id,
-    tip: { content_hash: hashContent(live.content ?? ""), path: live.path, extension: live.extension },
+    tip: tipOf(live),
     receipt,
     versions,
     refs,

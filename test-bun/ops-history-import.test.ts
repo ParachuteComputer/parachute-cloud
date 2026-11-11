@@ -107,7 +107,7 @@ describe("history import payload builder (bun:sqlite box)", () => {
     expect(a.versions[0]!.metadata).toBe('{"i":0}');
     expect(a.refs.map((r) => r.import_ix)).toEqual([0, 1]);
     expect(a.receipt).toMatchObject({ imported_count: 2, retained_count: 2 });
-    expect(a.tip).toEqual({ content_hash: hashContent("a1"), path: "A", extension: "md" });
+    expect(a.tip).toEqual({ content_hash: hashContent("a1"), exported_content_hash: hashContent("a1\n"), path: "A", extension: "md" });
     expect(a.digest).toBe(historyDigest(a.versions, a.refs));
     // Native history only: an empty receipt, so the run covers it on Cloud too.
     const d = batch.notes.find((n) => n.id === "n-4-d")!;

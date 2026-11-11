@@ -98,7 +98,8 @@ the operator then sends each note's version rows, refs, receipt and blobs with
   `/ops/history-import/status`, `/digest`, `/finish` forward to the vault.
 - `POST /api/internal/history-import` (vault; platform only): verifies every blob
   by hash, then per note, in its own transaction: grafts only when the note's
-  state on Cloud is the snapshot's (or the owner's oldest version is), moves the
+  state on Cloud is the snapshot's (or the owner's oldest version is; a markdown
+  body the export gave a final newline counts as the snapshot's), moves the
   owner's later versions above the box's native ones, and checks the grafted
   part's digest. A note already receipted by the same run is left exactly as it
   is, so a retry never brings back history the owner erased. Never changes a

@@ -225,12 +225,16 @@ function checkRows(db: GraftDb, note: GraftNote, lengths: Map<string, number>, l
  * The tip check: the owner's history here must sit directly on the snapshot's
  * state. With no own rows, the note itself must still be the snapshot's state;
  * with own rows, the OLDEST one (the state the owner first edited away from)
- * must be. Metadata is deliberately not compared: an export/import round trip
- * may normalise it, and id + body + path + extension identify the state.
+ * must be. The body may be in either of the snapshot's two forms: as the box
+ * holds it, or as the export that built this vault left it (a final newline
+ * added; see `GraftTip`). Metadata is deliberately not compared: an
+ * export/import round trip may normalise it, and id + body + path + extension
+ * identify the state.
  */
 function tipHolds(note: GraftNote, live: { content: string | null; path: string | null; extension: string | null }, oldestOwn: { content_hash: string | null; path: string | null; extension: string | null } | null): boolean {
   const state = oldestOwn ?? { content_hash: hashContent(live.content ?? ""), path: live.path, extension: live.extension };
-  return state.content_hash === note.tip.content_hash && state.path === note.tip.path && state.extension === note.tip.extension;
+  const sameBody = state.content_hash === note.tip.content_hash || (note.tip.exported_content_hash !== undefined && state.content_hash === note.tip.exported_content_hash);
+  return sameBody && state.path === note.tip.path && state.extension === note.tip.extension;
 }
 
 /**

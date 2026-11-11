@@ -257,6 +257,38 @@ describe("operator history import (vault side)", () => {
     expect(end.notes).toEqual(before.notes);
   });
 
+  it("takes the export's trailing newline as the same state: the Cloud vault was built from an export of the box", async () => {
+    // A portable-md export gives a markdown body with no final newline one, and the operator import builds the
+    // Cloud vault from that export. So Cloud holds "body\n" where the box holds "body": the same state, not an edit.
+    const G: NoteSpec = { id: "note-g", path: "Notes/G", native: ["g0", "g no newline"], imports: ["g old"] };
+    const H: NoteSpec = { id: "note-h", path: "Notes/H", native: ["h0", "h no newline"], imports: ["h old"] };
+    const I: NoteSpec = { id: "note-i", path: "Notes/I", native: ["i ends with one\n"], imports: ["i old"] };
+    const J: NoteSpec = { id: "note-j", path: "Notes/J", native: ["j no newline"], imports: ["j old"] };
+    const box = await makeBox([G, H, I, J]);
+    const [batch] = await boxBatches(box);
+    const tips = Object.fromEntries(batch!.notes.map((n) => [n.id, n.tip]));
+    expect(tips[G.id]).toEqual({ content_hash: hashContent("g no newline"), exported_content_hash: hashContent("g no newline\n"), path: G.path, extension: "md" });
+    expect(tips[I.id]).toEqual({ content_hash: hashContent("i ends with one\n"), path: I.path, extension: "md" });
+    // G: as the export left it. H: the owner then edited it on Cloud. I: a second newline is an edit, not the export.
+    // J: two newlines added is not the export either.
+    const cloud = await makeCloud([{ ...current(G), body: "g no newline\n" }, { ...current(H), body: "h no newline\n" }, { ...current(I), body: "i ends with one\n\n" }, { ...current(J), body: "j no newline\n\n" }]);
+    expect((await op(cloud, `/api/notes/${H.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ content: "h rewritten by the owner", force: true }) })).status).toBe(200);
+    const before = await snapshot(cloud);
+    const res = await graft(cloud, batch!);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(Object.fromEntries(res.body.notes.map((n: any) => [n.id, n.outcome]))).toEqual({ [G.id]: "grafted", [H.id]: "grafted", [I.id]: "note_changed", [J.id]: "note_changed" });
+    expect((await snapshot(cloud)).notes).toEqual(before.notes);
+    // H: the owner's version (the exported body) is newest; the box's native row keeps index 0 below it.
+    const list: any = await (await op(cloud, `/api/notes/${H.id}/versions`)).json();
+    expect(list.versions.map((v: any) => v.version_ix ?? `import ${v.import_ix}`)).toEqual([1, 0, "import 0"]);
+    expect(((await (await op(cloud, `/api/notes/${H.id}/versions/1`)).json()) as any).content).toBe("h no newline\n");
+    expect(((await (await op(cloud, `/api/notes/${H.id}/versions/0`)).json()) as any).content).toBe("h0");
+    // A hash that is neither form is refused at the envelope.
+    const bad = structuredClone(batch!);
+    (bad.notes[0]!.tip as any).exported_content_hash = "not a hash";
+    expect((await graft(cloud, bad)).status).toBe(400);
+  });
+
   it("keeps the owner's later edits on top: box native rows keep their indices, imports below", async () => {
     const box = await makeBox([A]);
     const [batch] = await boxBatches(box);
