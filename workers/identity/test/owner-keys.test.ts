@@ -451,6 +451,83 @@ describe("app keys (/account/keys)", () => {
   });
 });
 
+// The write stamp (Parachute 0.9.1, T-446): the twin of the box's hub account-keys.ts. Every app key carries its name
+// and kind in a top-level `key` claim; with the owner's `on_behalf_of: true` it also carries `permissions.acts_for`.
+describe("the write stamp on app keys (key claim, on_behalf_of)", () => {
+  async function owner(a: ReturnType<typeof app>, vault = "arcade") {
+    const { key, id } = await linkedOwner();
+    await seedVault(vault, id);
+    const token = (await signIn(a, key)).json.token as string;
+    return { id, bearer: `Bearer ${token}` };
+  }
+  const mint = (a: ReturnType<typeof app>, bearer: string, body: unknown) => a.call("/account/keys", { method: "POST", auth: bearer, body });
+
+  test("every key carries {name, kind: app} at the top level; a key without the field carries no permissions and no on_behalf_of", async () => {
+    const a = app();
+    const { bearer } = await owner(a);
+    const r = await mint(a, bearer, { name: "arcade-worker", vault: "arcade", can: "write" });
+    expect(r.status).toBe(201);
+    const c = decodeJwtPayload(r.json.token);
+    expect(c.key).toEqual({ name: "arcade-worker", kind: "app" });
+    expect(c.permissions).toBeUndefined();
+    expect("on_behalf_of" in r.json).toBe(false);
+    const off = await mint(a, bearer, { name: "plain", vault: "arcade", can: "write", on_behalf_of: false });
+    expect(off.status).toBe(201);
+    expect(decodeJwtPayload(off.json.token).permissions).toBeUndefined();
+    const listed = (await a.call("/account/keys", { auth: bearer })).json.keys as Record<string, unknown>[];
+    expect(listed.every((k) => !("on_behalf_of" in k))).toBe(true);
+  });
+
+  test("on_behalf_of: true mints permissions.acts_for = the key's name, and the list shows it, also once revoked", async () => {
+    const a = app();
+    const { bearer } = await owner(a);
+    const r = await mint(a, bearer, { name: "fernhill-portal", vault: "arcade", can: "write", on_behalf_of: true });
+    expect(r.status).toBe(201);
+    expect(r.json.on_behalf_of).toBe(true);
+    const c = decodeJwtPayload(r.json.token);
+    expect(c.permissions).toEqual({ acts_for: "fernhill-portal" });
+    expect(c.key).toEqual({ name: "fernhill-portal", kind: "app" });
+    await mint(a, bearer, { name: "other", vault: "arcade", can: "read" });
+    const byName = async () =>
+      Object.fromEntries(((await a.call("/account/keys", { auth: bearer })).json.keys as any[]).map((k) => [k.name, k]));
+    expect((await byName())["fernhill-portal"].on_behalf_of).toBe(true);
+    expect("on_behalf_of" in (await byName()).other).toBe(false);
+    await a.call("/account/keys/fernhill-portal", { method: "DELETE", auth: bearer });
+    const after = (await byName())["fernhill-portal"];
+    expect([after.status, after.on_behalf_of]).toEqual(["revoked", true]);
+  });
+
+  test("on_behalf_of must be a boolean, and a key that writes on behalf of others needs a prefix-shaped, unreserved name", async () => {
+    const a = app();
+    const { bearer } = await owner(a);
+    const bad = async (body: unknown) => {
+      const r = await mint(a, bearer, body);
+      return [r.status, r.json?.error];
+    };
+    expect(await bad({ name: "k1", vault: "arcade", can: "write", on_behalf_of: "yes" })).toEqual([400, "invalid_request"]);
+    expect(await bad({ name: "Fernhill_Portal", vault: "arcade", can: "write", on_behalf_of: true })).toEqual([400, "invalid_name"]);
+    expect(await bad({ name: "nostr", vault: "arcade", can: "write", on_behalf_of: true })).toEqual([400, "invalid_name"]);
+    // The same names are fine without the grant (any key name), and nothing above was written.
+    expect((await mint(a, bearer, { name: "Fernhill_Portal", vault: "arcade", can: "write" })).status).toBe(201);
+    expect(((await a.call("/account/keys", { auth: bearer })).json.keys as any[]).map((k) => k.name)).toEqual(["Fernhill_Portal"]);
+  });
+
+  test("only the owner's own account token sets it: not an OAuth app, not an app key (even one holding the grant)", async () => {
+    const a = app();
+    const { id, bearer } = await owner(a);
+    const granted = (await mint(a, bearer, { name: "portal", vault: "arcade", can: "write", on_behalf_of: true })).json.token as string;
+    expect([401, 403]).toContain((await mint(a, `Bearer ${granted}`, { name: "portal2", vault: "arcade", can: "write", on_behalf_of: true })).status);
+    const oauthApp = (
+      await signAccessToken(env.DB, {
+        sub: id, scopes: [`account:${id}:admin`], audience: "account", clientId: "some-third-party-app",
+        issuer: ISSUER, vaultScope: [], ttlSeconds: 600, emailVerified: true,
+      })
+    ).token;
+    expect((await mint(a, `Bearer ${oauthApp}`, { name: "sneaky", vault: "arcade", can: "write", on_behalf_of: true })).status).toBe(403);
+    expect(((await a.call("/account/keys", { auth: bearer })).json.keys as any[]).map((k) => k.name)).toEqual(["portal"]);
+  });
+});
+
 describe("bare create (POST /account/vaults {bare: true})", () => {
   async function bearerFor(a: ReturnType<typeof app>) {
     const { key } = await linkedOwner();
