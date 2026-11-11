@@ -8,11 +8,13 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { readStagingAccount } from "../scripts/staging-origins.ts";
 
 const ROOT = join(import.meta.dir, "..");
 const STAGING = "5b543fa4332a619203356ae1418af504";
 const PROD = "d5d7c8646c3b69ce9f16bfd12ecbe98a";
 const FAKE_UUID = "1111aaaa-2222-4333-8444-555566667777";
+const PLACEHOLDER = "00000000-0000-0000-0000-000000000000";
 const temps: string[] = [];
 afterAll(() => temps.forEach((t) => rmSync(t, { recursive: true, force: true })));
 
@@ -45,6 +47,20 @@ function fixture() {
     mkdirSync(dirname(join(root, f)), { recursive: true });
     cpSync(join(ROOT, f), join(root, f));
   }
+  // The real files may already carry the real staging D1 id (bootstrapped on the real account, T-432b): a fixture
+  // proves the fresh-account path, so it always starts from the placeholder here, whatever is actually committed.
+  const envPath = join(root, "scripts/staging-account.env");
+  const tomlPath = join(root, "workers/identity/wrangler.toml");
+  const realId = readStagingAccount(envPath).STAGING_D1_ID!;
+  const envLine = `STAGING_D1_ID=${realId}`;
+  const tomlLine = `database_id = "${realId}"`;
+  const envBody = readFileSync(envPath, "utf8");
+  const tomlBody = readFileSync(tomlPath, "utf8");
+  if (!envBody.includes(envLine)) throw new Error(`fixture: '${envLine}' not found in ${envPath}`);
+  if (!tomlBody.includes(tomlLine)) throw new Error(`fixture: '${tomlLine}' not found in ${tomlPath}`);
+  writeFileSync(envPath, envBody.replace(envLine, `STAGING_D1_ID=${PLACEHOLDER}`));
+  writeFileSync(tomlPath, tomlBody.replace(tomlLine, `database_id = "${PLACEHOLDER}"`));
+
   const bin = join(t, "bin");
   mkdirSync(bin);
   writeFileSync(join(bin, "bunx"), FAKE_WRANGLER);

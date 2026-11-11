@@ -409,7 +409,7 @@ routes = []
 [[env.staging.d1_databases]]
 binding = "DB"
 database_name = "parachute-identity-staging"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "eed4ddc9-b4aa-4e32-b8db-82c32c823a11"
 migrations_dir = "migrations"
 
 # Non-inheritable, restated: version metadata — the propagation-poll signal
