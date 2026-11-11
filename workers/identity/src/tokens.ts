@@ -89,6 +89,13 @@ export interface SignAccessTokenOpts {
    * (account-api.ts requireAccount).
    */
   emailVerified?: boolean;
+  /**
+   * Optional top-level `key` claim (the write stamp, Parachute 0.9.1): the named key's `{name, kind}`, which the
+   * 0.9 vault reads as `via key:<name>` and the kind its revisions record (core `write-stamp.ts` parseKeyClaim).
+   * Top-level on purpose, as on the box: a vault that doesn't know it ignores it (scope-guard drops every claim
+   * outside its fixed surface), so an older vault keeps serving the key as before.
+   */
+  key?: { name: string; kind: "person" | "agent" | "app" | "service" };
 }
 
 export interface SignedAccessToken {
@@ -112,6 +119,7 @@ export async function signAccessToken(db: D1Database, opts: SignAccessTokenOpts)
     vault_scope: opts.vaultScope ?? [],
     ...(opts.permissions !== undefined ? { permissions: opts.permissions } : {}),
     ...(opts.emailVerified !== undefined ? { email_verified: opts.emailVerified } : {}),
+    ...(opts.key !== undefined ? { key: opts.key } : {}),
   })
     .setProtectedHeader({ alg: SIGNING_ALGORITHM, kid: key.kid })
     .setSubject(opts.sub)
