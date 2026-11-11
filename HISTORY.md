@@ -74,14 +74,43 @@ This POST retains the hosted frozen/cap write gate; history erasure remains
 available when capped, but manual compaction is not a cap-bypass mechanism.
 
 Core retention defaults apply (20-version floor, 100-version ceiling, 180-day
-age target, no automatic expiry of deleted-note history). History occupies the
-existing physical SQLite storage meter. A bounded maintenance pass runs once
-when an instance loads state, without a new recurring alarm. This does not
-promise immediate compaction of every edit on a long-lived instance.
+age target, no automatic expiry of deleted-note history), except in a vault that
+received an operator history import (below), which keeps all its history.
+History occupies the existing physical SQLite storage meter. A bounded
+maintenance pass runs once when an instance loads state, without a new recurring
+alarm. This does not promise immediate compaction of every edit on a long-lived
+instance.
 
-No Git archive import, mirror retirement or backfill runs in a Durable Object.
-Imported selectors support already-present rows; they are not a hosted import
-workflow. No production deployment is included in this change.
+No Git archive import, mirror retirement or backfill runs in a Durable Object:
+the archive is read on a self-hosted box, and Cloud only receives its result.
+
+## Operator history import (T-450)
+
+A person who moved from a self-hosted box can have the box's note history put
+behind their notes on Cloud. The box runs core's `history-import apply` first;
+the operator then sends each note's version rows, refs, receipt and blobs with
+`scripts/ops-history-import.ts` (`local`, `plan`, `run`, `digest`, `finish`,
+`status`; counts only). The doors:
+
+- `POST /ops/history-import` (identity; bearer `OPS_RUN_TOKEN`): address twice,
+  a reference, the vault name, one batch, `dry_run?`. The account must be in good
+  standing and own the vault. A batch that writes is audited first.
+  `/ops/history-import/status`, `/digest`, `/finish` forward to the vault.
+- `POST /api/internal/history-import` (vault; platform only): verifies every blob
+  by hash, then per note, in its own transaction: grafts only when the note's
+  state on Cloud is the snapshot's (or the owner's oldest version is), moves the
+  owner's later versions above the box's native ones, and checks the grafted
+  part's digest. A note already receipted by the same run is left exactly as it
+  is, so a retry never brings back history the owner erased. Never changes a
+  note's current state, marks the vault written, or fires hooks. Up to 32 MiB.
+  `GET` answers counts; `/finish` marks the run complete at a receipt count.
+- `POST /api/internal/history-digest`: per note, the history digest up to an
+  index and whether every body reads back to its hash.
+
+A vault that received a graft keeps all history (a DO-storage flag, applied on
+every state load before maintenance): max 1,000,000 versions, 36,500 days, no
+per-note byte ceiling. Its history then grows with every edit and counts against
+the storage meter. No production run is part of this change.
 
 ## Browser bundle and validation
 

@@ -162,6 +162,8 @@ const INTERNAL_ROUTES = new Set([
   "import-status",
   "import-file",
   "import-check",
+  "history-import",
+  "history-digest",
   "destroy",
   "health",
 ]);
