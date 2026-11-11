@@ -67,10 +67,10 @@ export function localCounts(db: Database) {
   const ids = boxNoteIds(db);
   let largest = 0;
   let stale = 0;
-  const notesSent: { versions: { version_ix: number }[] }[] = [];
+  const notesSent: { versions: { version_ix: number }[]; refs: number }[] = [];
   for (const id of ids) {
     const note = readBoxNote(db, id, run);
-    notesSent.push({ versions: note.versions.map((v) => ({ version_ix: v.version_ix })) });
+    notesSent.push({ versions: note.versions.map((v) => ({ version_ix: v.version_ix })), refs: note.refs.length });
     if (!receiptHolds(note)) stale++;
     const blobs = readBoxBlobs(db, note.versions.flatMap((v) => (v.content_hash ? [v.content_hash] : [])));
     const bytes = Buffer.byteLength(JSON.stringify(note)) + blobs.reduce((s, b) => s + Buffer.byteLength(JSON.stringify(b)), 0);
@@ -82,7 +82,7 @@ export function localCounts(db: Database) {
     // Counted over the notes that are sent, so they are what Cloud ends with when every note grafts.
     imported_rows: notesSent.reduce((s, x) => s + x.versions.filter((v) => v.version_ix < 0).length, 0),
     native_rows: notesSent.reduce((s, x) => s + x.versions.filter((v) => v.version_ix >= 0).length, 0),
-    refs: notesSent.reduce((s, x) => s + x.versions.filter((v) => v.version_ix < 0).length, 0),
+    refs: notesSent.reduce((s, x) => s + x.refs, 0),
     runs: n("SELECT COUNT(*) AS n FROM history_import_runs"),
     stored_bytes: n("SELECT COALESCE(SUM(byte_size), 0) AS n FROM note_blobs"),
     largest_note_bytes: largest,
@@ -250,11 +250,11 @@ async function sendAll(vault: string, dbPath: string, dryRun: boolean, refusedOu
       `${verb} ${vault}: database ${mib(p.start)} MiB now, projected ${mib(p.projected)} MiB` +
         (p.cap === null ? ", no cap" : ` of ${(p.cap / 1048576).toFixed(0)} MiB`),
     );
-    // The vault refuses only a batch that grafts (or grows the file): a re-plan with nothing left to graft passes.
-    if (p.over && (totals.grafted > 0 || p.projected > p.start)) die(`${verb} ${vault}: the projection is past ${CAP_SHARE * 100}% of the notes cap: the vault would refuse the batches that cross it. Raise the cap first.`);
+    // The vault refuses only a batch that grafts: a re-plan with nothing left to graft passes.
+    if (p.over && totals.grafted > 0) die(`${verb} ${vault}: the projection is past ${CAP_SHARE * 100}% of the notes cap: the vault would refuse the batches that cross it. Raise the cap first.`);
   } else {
     const last = sizes.at(-1);
-    if (last) console.log(`${verb} ${vault}: database ${mib(Number(last.database_bytes))} MiB` + (last.notes_cap_bytes ? ` of ${(Number(last.notes_cap_bytes) / 1048576).toFixed(0)} MiB` : ", no cap"));
+    if (last) console.log(`${verb} ${vault}: database ${mib(Number(last.database_bytes))} MiB` + (typeof last.notes_cap_bytes === "number" ? ` of ${(last.notes_cap_bytes / 1048576).toFixed(0)} MiB` : ", cap not reported"));
   }
   const failing = FAILING_OUTCOMES.reduce((s, o) => s + totals[o], 0);
   if (failing > 0) die(`${verb} ${vault}: ${failing} notes failed (${FAILING_OUTCOMES.join(", ")}): stop and look`);
@@ -317,7 +317,7 @@ async function status(vault: string): Promise<void> {
   const runs = ((b.runs ?? []) as { run_id: string; status: string; receipts: number }[]).map((x) => `${x.run_id.slice(0, 12)} ${x.status} ${x.receipts} receipts`);
   console.log(
     `status ${vault}: runs [${runs.join("; ")}], imported ${b.imported_versions}, native ${b.native_versions}, refs ${b.refs}, keep_all ${b.keep_all}, ` +
-      `database ${(Number(b.database_bytes) / 1048576).toFixed(1)} MiB` + (b.notes_cap_bytes ? ` of ${(Number(b.notes_cap_bytes) / 1048576).toFixed(0)} MiB` : ""),
+      `database ${(Number(b.database_bytes) / 1048576).toFixed(1)} MiB` + (typeof b.notes_cap_bytes === "number" ? ` of ${(b.notes_cap_bytes / 1048576).toFixed(0)} MiB` : ""),
   );
 }
 

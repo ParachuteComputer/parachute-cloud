@@ -2124,7 +2124,9 @@ export class VaultDO extends DurableObject {
   private holdsHistoryReceipts(): boolean {
     try {
       return this.raw().exec("SELECT 1 FROM history_import_receipts LIMIT 1").toArray().length > 0;
-    } catch {
+    } catch (err) {
+      // Only a schema from before the table is "no receipts". Anything else is said, not swallowed.
+      if (!/no such table/i.test(errText(err))) console.warn(`event=history_receipts_unreadable error=${errText(err).slice(0, 120)}`);
       return false;
     }
   }
@@ -2295,17 +2297,17 @@ export class VaultDO extends DurableObject {
    * inside ONE outer `transactionSync` for the whole batch (DO transactions nest
    * as savepoints: an inner rollback undoes only its note, the outer one undoes
    * everything). The outer one is rolled back for a dry run, so it reports
-   * exactly what a real run would, and for a batch that grafts a note or grows
-   * the file and would leave it above 90% of a pushed notes cap: internal routes skip the cap
-   * gate, and a vault over its cap answers every owner write 413. (Checked:
-   * `sql.databaseSize` read inside an open transaction counts that
-   * transaction's pages, and falls back when it rolls back.) No cap pushed, no
-   * guard.
+   * exactly what a real run would, and for a batch that grafts a note and would
+   * leave the database above 90% of its cap ({@link historyNotesCap}: every
+   * vault has one): internal routes skip the cap gate, and a vault over its cap
+   * answers every owner write 413. (Checked: `sql.databaseSize` read inside an
+   * open transaction counts that transaction's pages, and falls back when it
+   * rolls back.)
    *
    * Keep-all is turned on only by a batch that grafted at least one note, right
-   * after the outer transaction commits and in the SAME synchronous turn: the
-   * in-memory mirror, the store's policy, then `storage.put` with its promise
-   * awaited only afterwards. A SQLite-backed Durable Object keeps its KV pairs
+   * after the outer transaction commits and in the SAME synchronous turn:
+   * `storage.put` first (its promise awaited only afterwards), then the
+   * in-memory mirror and the store's policy. A SQLite-backed Durable Object keeps its KV pairs
    * in the same database (`_cf_KV`) and commits every write made with no
    * intervening `await` as one atomic batch (workerd names this "Durable
    * Objects' automatic atomic write coalescing"), so the flag and the grafted
@@ -2371,11 +2373,11 @@ export class VaultDO extends DurableObject {
         if (!result.ok) return; // refused before any write
         bytesAfter = Number(sql.databaseSize);
         if (dry) throw rollback;
-        // A batch that grafts a note (it adds history, and may turn keep-all on), or that grows the file at all, is
-        // refused past the share; a retry that grafts nothing and leaves the file as it was is answered as usual.
-        // "Adds" is what the batch left behind (a grafted note, a kept blob), not a moved file size: blobs written
-        // and dropped again for a refused note can leave freed pages, and that is not growth to refuse a retry for.
-        const adds = result.summary.totals.grafted > 0 || result.summary.blobs_written > 0;
+        // Only a batch that grafts a note leaves anything behind: a blob stays only when a grafted version holds it
+        // (the rest are dropped again), and the run row goes with a batch that grafts nothing. So a retry or a batch
+        // of refused notes is answered as usual, whatever freed pages did to the file size, and a batch that grafts
+        // is refused past the share.
+        const adds = result.summary.totals.grafted > 0;
         if (adds && bytesAfter > notesCap * HISTORY_IMPORT_CAP_SHARE) {
           overCap = true;
           throw rollback;

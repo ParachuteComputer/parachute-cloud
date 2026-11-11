@@ -94,7 +94,7 @@ describe("the tip's exported form, and the production guard", () => {
   });
 
   it("refuses any host but this machine or staging without MOVE_PRODUCTION=yes, before reading the token", () => {
-    const run = (env: Record<string, string>) => Bun.spawnSync(["bun", "scripts/ops-history-import.ts", "status", "made-up"], {
+    const run = (env: Record<string, string>) => Bun.spawnSync(["bun", `${import.meta.dir}/../scripts/ops-history-import.ts`, "status", "made-up"], {
       env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", MOVE_EMAIL: "made-up@example.com", MOVE_REF: "made-up reference", OPS_RUN_TOKEN_FILE: "/nonexistent/made-up-token", ...env },
       stdout: "pipe", stderr: "pipe",
     });
@@ -119,6 +119,12 @@ describe("a note the door could not take is left out, and counted", () => {
     const plan = planBatches(box);
     expect(plan.batches.flatMap((b) => b.batch.notes.map((n) => n.id))).toEqual(all.filter((id) => id !== "n-2-b"));
     for (const { batch } of plan.batches) expect(parseGraftBatch(JSON.parse(JSON.stringify(batch))).ok).toBe(true);
+    // The counts are of what is sent: the left-out note's rows and refs are not in them.
+    const counts = localCounts(box as never);
+    const refsOf = (id: string) => (box.prepare("SELECT COUNT(*) AS n FROM history_import_refs WHERE note_id = ?").get(id) as { n: number }).n;
+    expect(refsOf("n-2-b")).toBeGreaterThan(0);
+    expect(counts.left_out).toBe(1);
+    expect(counts.refs).toBe(all.filter((id) => id !== "n-2-b").reduce((s, id) => s + refsOf(id), 0));
     // Text that is not JSON at all counts the same way.
     box.prepare("UPDATE note_versions SET metadata = 'not json' WHERE note_id = 'n-3-c'").run();
     expect(boxUnsendableIds(box)).toEqual(["n-2-b", "n-3-c"]);

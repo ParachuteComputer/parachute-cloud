@@ -131,15 +131,17 @@ client says there is nothing to do). No production run is part of this change.
 
 The graft is not counted as the person writing, and internal routes skip the
 plan's cap gate, so the door has its own: the whole batch runs in one
-transaction, and when a cap is pushed and a batch that grafts a note (or grows
-the database) would leave it above 90% of the notes cap, it is rolled back whole
-and answered `413 history_import_over_cap` with the sizes. Batches before it
-stay. A retry that grafts nothing and leaves the database the same size is
-answered as usual. `plan` adds up each dry batch's growth and fails when the
+transaction, and a batch that grafts a note and would leave the database above
+90% of the vault's cap is rolled back whole and answered
+`413 history_import_over_cap` with the sizes. Batches before it stay. A retry
+that grafts nothing is answered as usual. `plan` adds up each dry batch's growth and fails when the
 projection passes 90% of the cap; `run` stops at that 413. A vault with no plan
 caps pushed is held to what its whole-storage cap leaves once its files are
 counted, so every vault is guarded. A batch that grafts into a run already
-marked complete reopens it. A later `/ops/vault-import` retry would still replace the notes the
+marked complete reopens it. Receipts are not tied to notes: a later blow-away
+import or restore into the same vault leaves them (and keep-all) in place, so a
+second graft of the same run answers `already` for those notes. Only destroying
+the vault clears them. A later `/ops/vault-import` retry would still replace the notes the
 history sits behind.
 
 A note with a version whose metadata is not a JSON object (a client once wrote it
