@@ -333,6 +333,12 @@ describe("/ops/history-import", () => {
     expect(noRun!.status).toBe(404);
     expect(await noRun!.json()).toMatchObject({ error: "run_not_found" });
     expect(await auditCount()).toBe(before);
+    expect(vault.calls.at(-1)!.path).toBe("/api/internal/history-import");
+    // A status answer the door can't read is not taken as "no run".
+    const garbled = fakeVault(() => new Response("not json", { status: 200 }));
+    const unread = await handleOpsHistoryImportFinish(OPS_ENV, post("/ops/history-import/finish", finishFields), withVault(garbled));
+    expect(unread!.status).toBe(502);
+    expect(await auditCount()).toBe(before);
 
     const done = await handleOpsHistoryImportFinish(OPS_ENV, post("/ops/history-import/finish", finishFields), withVault(vault));
     expect(done!.status).toBe(200);

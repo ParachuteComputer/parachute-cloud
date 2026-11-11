@@ -289,7 +289,9 @@ export async function handleOpsHistoryImportFinish(env: Env, req: Request, deps:
   // was refused leaves none).
   const status = await forward(env, deps, vault, "GET", "/api/internal/history-import");
   if (!status.ok) return status;
-  const runs = ((await status.json().catch(() => ({}))) as { runs?: { run_id: string; status: string; receipts: number }[] }).runs ?? [];
+  const runs = ((await status.json().catch(() => ({}))) as { runs?: { run_id: string; status: string; receipts: number }[] }).runs;
+  // An answer this door can't read is not "no run".
+  if (!Array.isArray(runs)) return refuse(502, "vault_unreadable", "The vault's status answer could not be read. Nothing changed; retry.");
   const run = runs.find((r) => r.run_id === runId);
   if (!run) return refuse(404, "run_not_found", "The vault has no run with this id. Nothing changed.");
   if (body.dry_run === true) {

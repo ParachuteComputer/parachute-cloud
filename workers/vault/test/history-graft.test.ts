@@ -637,6 +637,8 @@ describe("operator history import (vault side)", () => {
     await pushCaps(crowded, Math.floor(crowdedBefore / 0.95));
     const intoFull = await graft(crowded, smallBatch!);
     expect(intoFull.status, JSON.stringify({ ...intoFull.body, notes: undefined })).toBe(413);
+    // Its rows fit in pages the file had: the size did not move, so only the grafted note can refuse it.
+    expect(intoFull.body.database_bytes_after).toBe(crowdedBefore);
     expect(await status(crowded)).toMatchObject({ keep_all: false, runs: [] });
 
     // No cap pushed: no guard, and the answer says so.

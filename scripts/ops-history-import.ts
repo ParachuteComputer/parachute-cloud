@@ -243,7 +243,8 @@ async function sendAll(vault: string, dbPath: string, dryRun: boolean, refusedOu
       `${verb} ${vault}: database ${mib(p.start)} MiB now, projected ${mib(p.projected)} MiB` +
         (p.cap === null ? ", no cap" : ` of ${(p.cap / 1048576).toFixed(0)} MiB`),
     );
-    if (p.over) die(`${verb} ${vault}: the projection is past ${CAP_SHARE * 100}% of the notes cap: the vault would refuse the batches that cross it. Raise the cap first.`);
+    // The vault refuses only a batch that grafts (or grows the file): a re-plan with nothing left to graft passes.
+    if (p.over && (totals.grafted > 0 || p.projected > p.start)) die(`${verb} ${vault}: the projection is past ${CAP_SHARE * 100}% of the notes cap: the vault would refuse the batches that cross it. Raise the cap first.`);
   } else {
     const last = sizes.at(-1);
     if (last) console.log(`${verb} ${vault}: database ${mib(Number(last.database_bytes))} MiB` + (last.notes_cap_bytes ? ` of ${(Number(last.notes_cap_bytes) / 1048576).toFixed(0)} MiB` : ", no cap"));

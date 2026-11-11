@@ -285,6 +285,10 @@ describe("the operator client (scripts/ops-history-import.ts) against a made-up 
     expect(over.code, over.out).not.toBe(0);
     expect(over.out).toContain("projected 16.0 MiB of 17 MiB");
     expect(over.out).toMatch(/past 90%/);
+    // Already past 90%, but nothing left to graft (a re-plan after a finished run): the vault answers every batch, so plan passes.
+    const done = fakeDoor((s) => graftAnswer(s, { before: 16 * MiB, after: 16 * MiB, cap: 17 * MiB }, () => "already"));
+    const replan = await client(done.url, ["plan", "made-up-vault", box]);
+    expect(replan.code, replan.out).toBe(0);
   });
 
   it("run writes the refused list after every batch, and stops plainly at the vault's cap guard", async () => {
