@@ -52,4 +52,6 @@ mkdir -p "$RESULTS"
 cd "$SUITE/contracts"
 bun install --frozen-lockfile >/dev/null
 # The sandbox has its own /tmp; a TMPDIR under the home it hides would not exist inside.
-env -u TMPDIR CLOUD_REPO="$ROOT" DOOR_RESULTS="$RESULTS" bun run doors -- --doors cloud --with-golden "$DOOR_SUITE_GOLDEN"
+# Which door this checkout is: `cloud` (Parachute Cloud, on next) or `personal` (the single-owner profile, door/0.9).
+env -u TMPDIR CLOUD_REPO="$ROOT" PERSONAL_REPO="$ROOT" DOOR_RESULTS="$RESULTS" \
+  bun run doors -- --doors "${DOOR_SUITE_DOOR:-cloud}" --with-golden "$DOOR_SUITE_GOLDEN"
