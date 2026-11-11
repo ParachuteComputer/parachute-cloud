@@ -63,6 +63,9 @@ curl -K acct.curl https://<identity>/account/keys -d '{"name":"podcast-studio","
 The app keeps that key (a year, one vault, read or write, never admin) and calls
 `https://<PREFIX>-vault.<sub>.workers.dev/vault/podcast/api/records` or `/mcp`. Its writes are named
 (`createdVia: key:podcast-studio`). `DELETE /account/keys/podcast-studio` stops it on its next request.
+One key can also cover several vaults, each at its own level (0.9.1): send `"vaults": {"podcast": "write", "notes":
+"read"}` instead of `vault` and `can`. That key opens the account door (`https://<identity>/account/mcp`), not a
+vault directly.
 
 An app that writes for other people (a client portal) can be let say whom each write is for: mint its key with
 `"on_behalf_of": true` (its name is then lowercase letters, digits, `.` and `-`, e.g. `fernhill-portal`). Its writes
