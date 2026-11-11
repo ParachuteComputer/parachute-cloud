@@ -124,21 +124,20 @@ every state load before maintenance): max 1,000,000 versions, 36,500 days, no
 per-note byte ceiling. Its history then grows with every edit and counts against
 the storage meter. The flag is set only by a batch that grafted at least one
 note, in the same commit as its rows; a batch that grafts nothing, or is
-refused, leaves no flag and no run behind (so `finish` of a run where every
-note was refused finds no run: the client asks a dry finish first, which writes
-no audit row, and says there is nothing to do). No production run is part of this
-change.
+refused, leaves no flag and no run behind (so `finish` of a run where every note
+was refused finds no run: identity looks the run up before it audits, and the
+client says there is nothing to do). No production run is part of this change.
 
 The graft is not counted as the person writing, and internal routes skip the
 plan's cap gate, so the door has its own: the whole batch runs in one
-transaction, and when a cap is pushed and a batch would grow the database
-and leave it above 90% of the notes cap, it is rolled back whole and
-answered `413 history_import_over_cap` with the sizes. Only a batch that grows
-the database is refused: a retry that finds every note already there is
-answered as usual. Batches before it stay. `plan` adds up
-each dry batch's growth and fails when the projection passes 90% of the cap;
-`run` stops at that 413. No cap pushed, no guard. A later `/ops/vault-import`
-retry would still replace the notes the history sits behind.
+transaction, and when a cap is pushed and a batch that grafts a note (or grows
+the database) would leave it above 90% of the notes cap, it is rolled back whole
+and answered `413 history_import_over_cap` with the sizes. Batches before it
+stay. A retry that grafts nothing and leaves the database the same size is
+answered as usual. `plan` adds up each dry batch's growth and fails when the
+projection passes 90% of the cap; `run` stops at that 413. No cap pushed, no
+guard. A later `/ops/vault-import` retry would still replace the notes the
+history sits behind.
 
 Before a run: stop editing on the box after `apply` (its retention may prune
 imported rows, and the client then refuses to send: `local` shows the count);

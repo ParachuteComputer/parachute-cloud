@@ -129,9 +129,9 @@ export const DIGEST_MAX_NOTES = 2_000;
  */
 export const HISTORY_IX_MAX = 10_000_000;
 /**
- * The vault refuses (413, rolled back whole) a batch that grows the database
- * and leaves it above this share of a pushed notes cap; the client's `plan`
- * projects against the same share.
+ * The vault refuses (413, rolled back whole) a batch that grafts a note or
+ * grows the database and leaves it above this share of a pushed notes cap; the
+ * client's `plan` projects against the same share.
  */
 export const HISTORY_IMPORT_CAP_SHARE = 0.9;
 

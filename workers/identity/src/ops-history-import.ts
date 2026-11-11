@@ -158,31 +158,27 @@ export async function handleOpsHistoryImportPost(env: Env, req: Request, deps: O
     await req.body?.cancel().catch(() => {});
     return tooLarge();
   }
-  // A body with no declared length is counted as it is read and cut off at the cap, so formData never holds more
-  // (a declared one was checked above).
+  // Every body is counted as it is read and cut off at the cap, whatever length it declared, so formData never
+  // holds more.
   let over = false;
-  let source: Request = req;
-  if (!Number.isFinite(declared) || req.headers.get("content-length") === null) {
-    let read = 0;
-    const cap = MAX_HISTORY_BATCH_BYTES + FORM_OVERHEAD;
-    const counted = req.body?.pipeThrough(
-      new TransformStream<Uint8Array, Uint8Array>({
-        transform(chunk, c) {
-          read += chunk.byteLength;
-          if (read > cap) {
-            over = true;
-            c.error(new Error("over the cap"));
-            return;
-          }
-          c.enqueue(chunk);
-        },
-      }),
-    );
-    source = new Request(req.url, { method: "POST", headers: req.headers, body: counted ?? null });
-  }
+  let read = 0;
+  const cap = MAX_HISTORY_BATCH_BYTES + FORM_OVERHEAD;
+  const counted = req.body?.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, c) {
+        read += chunk.byteLength;
+        if (read > cap) {
+          over = true;
+          c.error(new Error("over the cap"));
+          return;
+        }
+        c.enqueue(chunk);
+      },
+    }),
+  );
   let form: FormData;
   try {
-    form = await source.formData();
+    form = await new Request(req.url, { method: "POST", headers: req.headers, body: counted ?? null }).formData();
   } catch {
     if (over) return tooLarge();
     return refuse(400, "invalid_request", "body must be multipart/form-data (scripts/ops-history-import.ts sends it). Nothing changed.");
@@ -289,12 +285,14 @@ export async function handleOpsHistoryImportFinish(env: Env, req: Request, deps:
   if (target instanceof Response) return target;
   const { vault, reference, userId } = target;
   const runId = body.run_id;
+  // The run is looked up first, dry or not: no audit row for a run the vault does not hold (a run where every note
+  // was refused leaves none).
+  const status = await forward(env, deps, vault, "GET", "/api/internal/history-import");
+  if (!status.ok) return status;
+  const runs = ((await status.json().catch(() => ({}))) as { runs?: { run_id: string; status: string; receipts: number }[] }).runs ?? [];
+  const run = runs.find((r) => r.run_id === runId);
+  if (!run) return refuse(404, "run_not_found", "The vault has no run with this id. Nothing changed.");
   if (body.dry_run === true) {
-    const status = await forward(env, deps, vault, "GET", "/api/internal/history-import");
-    if (!status.ok) return status;
-    const runs = ((await status.json().catch(() => ({}))) as { runs?: { run_id: string; status: string; receipts: number }[] }).runs ?? [];
-    const run = runs.find((r) => r.run_id === runId);
-    if (!run) return refuse(404, "run_not_found", "The vault has no run with this id.");
     return ok({ dry_run: true, would_finish: run.receipts === expect, run_id: runId, status: run.status, receipts: run.receipts });
   }
   await audit(env, deps, "history_import_finished", userId, { vault: vault.name, reference, run: runId.slice(0, 12), expect_receipts: expect });

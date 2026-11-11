@@ -2271,8 +2271,8 @@ export class VaultDO extends DurableObject {
    * inside ONE outer `transactionSync` for the whole batch (DO transactions nest
    * as savepoints: an inner rollback undoes only its note, the outer one undoes
    * everything). The outer one is rolled back for a dry run, so it reports
-   * exactly what a real run would, and for a batch that grows the database
-   * file and would leave it above 90% of a pushed notes cap: internal routes skip the cap
+   * exactly what a real run would, and for a batch that grafts a note or grows
+   * the file and would leave it above 90% of a pushed notes cap: internal routes skip the cap
    * gate, and a vault over its cap answers every owner write 413. (Checked:
    * `sql.databaseSize` read inside an open transaction counts that
    * transaction's pages, and falls back when it rolls back.) No cap pushed, no
@@ -2347,9 +2347,10 @@ export class VaultDO extends DurableObject {
         if (!result.ok) return; // refused before any write
         bytesAfter = Number(sql.databaseSize);
         if (dry) throw rollback;
-        // Only a batch that grows the file is refused: a retry that finds every note already there adds nothing,
-        // while one that grafts nothing can still leave pages behind (blobs written, then dropped).
-        if (notesCap !== null && bytesAfter > bytesBefore && bytesAfter > notesCap * HISTORY_IMPORT_CAP_SHARE) {
+        // A batch that grafts a note (it adds history, and may turn keep-all on), or that grows the file at all, is
+        // refused past the share; a retry that grafts nothing and leaves the file as it was is answered as usual.
+        const adds = result.summary.totals.grafted > 0 || bytesAfter > bytesBefore;
+        if (notesCap !== null && adds && bytesAfter > notesCap * HISTORY_IMPORT_CAP_SHARE) {
           overCap = true;
           throw rollback;
         }

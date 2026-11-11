@@ -53,8 +53,10 @@ const BATCH = {
 };
 
 /** Records every call to the vault worker and answers as a healthy one would. */
-function fakeVault(answer: (path: string, body: unknown) => Response | Promise<Response> = (path) =>
-  path === "/api/internal/history-import"
+function fakeVault(answer: (path: string, body: unknown) => Response | Promise<Response> = (path, body) =>
+  path === "/api/internal/history-import" && body === undefined
+    ? j({ runs: [{ run_id: RUN_ID, status: "applying", receipts: 1 }], imported_versions: 1, native_versions: 1, refs: 1, keep_all: true })
+    : path === "/api/internal/history-import"
     ? j({ dry_run: false, run_id: RUN_ID, notes: [{ id: NOTE_ID, outcome: "grafted" }], totals: { grafted: 1 }, versions_written: 2, blobs_written: 1, database_bytes_before: 1000, database_bytes: 2000, notes_cap_bytes: null })
     : path === "/api/internal/destroy"
       ? j({ destroyed: true, r2_objects_deleted: 0 })
@@ -324,6 +326,12 @@ describe("/ops/history-import", () => {
     const finishFields = { ...who, run_id: RUN_ID, expect_receipts: 3 };
     const dry = await handleOpsHistoryImportFinish(OPS_ENV, post("/ops/history-import/finish", { ...finishFields, dry_run: true }), withVault(vault));
     expect(await dry!.json()).toEqual({ dry_run: true, would_finish: true, run_id: RUN_ID, status: "applying", receipts: 3 });
+    expect(await auditCount()).toBe(before);
+
+    // A run the vault does not hold: 404, and no audit row for a run that never was.
+    const noRun = await handleOpsHistoryImportFinish(OPS_ENV, post("/ops/history-import/finish", { ...finishFields, run_id: "b".repeat(64), expect_receipts: 0 }), withVault(vault));
+    expect(noRun!.status).toBe(404);
+    expect(await noRun!.json()).toMatchObject({ error: "run_not_found" });
     expect(await auditCount()).toBe(before);
 
     const done = await handleOpsHistoryImportFinish(OPS_ENV, post("/ops/history-import/finish", finishFields), withVault(vault));

@@ -479,6 +479,12 @@ describe("operator history import (vault side)", () => {
     const r = await graft(cloud, oversized);
     expect(r.status, JSON.stringify(r.body).slice(0, 200)).toBe(400);
     expect(r.body).toEqual({ error: "A blob is over the engine's 2000000-byte version limit", error_type: "blob_invalid", reason: "too_large", hash: hashContent(tooBig) });
+    // A delta whose stated size is past the limit but not its content: named as a mismatch, not as too large.
+    const lying = structuredClone(batch!);
+    lying.blobs.push({ hash: hashContent("made-up delta target"), content: "tiny", byte_size: 3_000_000, encoding: "fossil-delta", delta_of: lying.blobs.find((b) => b.encoding === null)!.hash });
+    const lie = await graft(cloud, lying);
+    expect(lie.status).toBe(400);
+    expect(lie.body).toEqual({ error: "A blob does not match its hash", error_type: "blob_invalid", hash: hashContent("made-up delta target") });
     const times: Array<[string, unknown]> = [
       ["superseded_at", "not a date"],
       ["superseded_at", "2020-01-01T00:00:00.000Z" + " ".repeat(30)],
@@ -621,6 +627,17 @@ describe("operator history import (vault side)", () => {
     expect(nothing.status, JSON.stringify({ ...nothing.body, notes: undefined })).toBe(200);
     expect(nothing.body).toMatchObject({ totals: { not_found: 1 }, database_bytes_before: nearlyBefore, database_bytes: nearlyBefore });
     expect(await dbSize(nearly)).toBe(nearlyBefore);
+
+    // A vault already past 90% of its cap (the owner's own notes): a batch that grafts is refused even when its rows
+    // fit in pages the file already has.
+    const small = await makeBox([B], { ...RUN, run_id: hashContent("made-up run small") });
+    const [smallBatch] = await boxBatches(small);
+    const crowded = await makeCloud([current(B)]);
+    const crowdedBefore = await dbSize(crowded);
+    await pushCaps(crowded, Math.floor(crowdedBefore / 0.95));
+    const intoFull = await graft(crowded, smallBatch!);
+    expect(intoFull.status, JSON.stringify({ ...intoFull.body, notes: undefined })).toBe(413);
+    expect(await status(crowded)).toMatchObject({ keep_all: false, runs: [] });
 
     // No cap pushed: no guard, and the answer says so.
     const uncapped = await makeCloud([current(K)]);
