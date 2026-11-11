@@ -30,6 +30,32 @@ vault_scope, sub, iss, iat, exp, aud, jti}`; `aud = vault.<name>` for a named
 vault scope. Refresh tokens: 30-day, rotated on use, one-generation 30s grace
 window (`REFRESH_GRACE_MS`), family revocation on replay.
 
+## Handing a vault to another account (T-446)
+
+The owner of a vault hands it to another account; the vault stays where it is (same name, `vault_id`, notes,
+history, attachments, snapshots, write stamps). Only the owner changes. All four routes take the owner's own
+account token (`POST /account/token`; an OAuth app's account grant or an app key is refused). Code:
+`src/vault-handover.ts`; table: migration `0031_vault_handovers.sql` (new, additive).
+
+| Route | What |
+|---|---|
+| `POST /account/vaults/<name>/handover` `{to}` | the owner offers the vault to the account with address `to`. One open offer per vault (409 `offer_exists`); it expires in 7 days. An address with no account gets the same 201 |
+| `DELETE /account/vaults/<name>/handover` | the owner withdraws the open offer |
+| `GET /account/handovers` | `{outgoing, incoming}`: open offers this account made, and open offers to its proven address |
+| `POST /account/handovers/<id>/accept` | the receiving account accepts: one D1 batch changes the owner. A replay answers `already: true` |
+
+Refusals teach: `vault_limit_reached` (the receiver's plan has no room; the offer stays open), `offer_expired`,
+`offer_withdrawn`, `unverified_account`, `offer_unavailable` (the vault or the offering account is gone or closed),
+`plan_frozen` (an ended plan can't offer), `vault_busy` (an import or restore is running).
+
+What ends at the handover: the old owner's named app keys on that vault (the new owner mints their own), OAuth
+tokens, standing consent and auth codes that name it, and, at the vault itself (`POST /api/internal/handover-cut`),
+every token of the old owner issued before the handover. Their account, sessions and other vaults keep working.
+Both accounts get an audit row (`vault_handover_*`, note `{vault_id, handover}`).
+
+**Not on a single-owner door** (`OWNER_PUBKEY` set): it has exactly one account, so there is no one to hand a vault
+to. The routes answer 403 `handover_unavailable`; to give a vault away, export it and import it at the other door.
+
 ## Layout
 
 ```

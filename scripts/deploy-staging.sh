@@ -2,13 +2,16 @@
 #
 # deploy-staging.sh — reproducible deploy of the two Vault Cloud workers to the
 # STAGING environment ([env.staging] in both wrangler.toml files). Idempotent:
-# safe to re-run. Provisioning (staging D1 + R2) is one-time — see the commented
-# block below; the ids are already committed in the wrangler.toml files.
+# safe to re-run. Provisioning (staging D1 + R2 + secrets) is one-time:
+# scripts/staging-bootstrap.sh, which then runs this script.
 #
-# STAGING SHAPE (since 2026-07-02, the production/staging split):
+# STAGING SHAPE (production/staging split 2026-07-02; own account since T-432):
+#   - its OWN Cloudflare account, "Parachute Staging" (scripts/staging-account.env),
+#     never the production account: a staging key there cannot touch production.
 #   - workers.dev URLs ONLY (no custom domains — those belong to production):
-#       console + OAuth issuer:  https://parachute-identity-staging.openparachute.workers.dev
-#       vaults (path routing):   https://parachute-vault-do-staging.openparachute.workers.dev/vault/<name>/...
+#       console + OAuth issuer:  https://parachute-identity-staging.<subdomain>.workers.dev
+#       vaults (path routing):   https://parachute-vault-do-staging.<subdomain>.workers.dev/vault/<name>/...
+#     (<subdomain> = STAGING_WORKERS_SUBDOMAIN in scripts/staging-account.env)
 #   - its OWN D1 (parachute-identity-staging) + R2 (parachute-vault-staging) +
 #     a fresh DO namespace (a different worker = different Durable Objects).
 #   - ENVIRONMENT="staging": POST /auth/magic echoes the link in the
@@ -28,12 +31,23 @@ case "$(. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/core-source.env"; echo 
   *) echo "refused: this checkout pins a non-0.8 engine; Parachute Cloud deploys from next (deploy/personal/ for door/0.9)" >&2; exit 2 ;;
 esac
 
-export CLOUDFLARE_ACCOUNT_ID=d5d7c8646c3b69ce9f16bfd12ecbe98a   # new Parachute account
-
-IDENTITY_STAGING="https://parachute-identity-staging.openparachute.workers.dev"
-VAULT_STAGING="https://parachute-vault-do-staging.openparachute.workers.dev"
-
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=staging-account.env
+. "$ROOT/scripts/staging-account.env"
+# The staging account, whatever the caller had: [env.staging] also pins it as account_id (which wrangler prefers), so
+# both agree; a production id here would only be a confusing log line.
+export CLOUDFLARE_ACCOUNT_ID="$STAGING_ACCOUNT_ID"
+
+IDENTITY_STAGING="https://parachute-identity-staging.${STAGING_WORKERS_SUBDOMAIN}.workers.dev"
+VAULT_STAGING="https://parachute-vault-do-staging.${STAGING_WORKERS_SUBDOMAIN}.workers.dev"
+
+# The staging D1 must exist on the staging account first (staging-bootstrap.sh makes it and writes its id).
+if [ "$STAGING_D1_ID" = 00000000-0000-0000-0000-000000000000 ] \
+   || ! grep -q "database_id = \"$STAGING_D1_ID\"" "$ROOT/workers/identity/wrangler.toml"; then
+  echo "refused: the staging D1 id is the placeholder or differs between scripts/staging-account.env and" \
+       "workers/identity/wrangler.toml. Run scripts/staging-bootstrap.sh once (it creates the D1 and writes the id)." >&2
+  exit 2
+fi
 # Verify the exact pinned parachute-core engine commit (cloud#45, cloud#59) and the
 # shared Hub contract before the workspace install snapshots either file:
 # dependency into node_modules. This is the local-deploy close for cloud#59:
@@ -55,13 +69,8 @@ bash "$ROOT/scripts/materialize-door-contract.sh"
 # either worker deploys if the browser artifact cannot be reproduced.
 bash "$ROOT/scripts/build-spa.sh"
 
-# --- one-time provisioning (already done 2026-07-02; kept for a fresh account) --
-#   bunx wrangler d1 create parachute-identity-staging   # -> id into [env.staging.d1_databases]
-#                                                        #    in workers/identity/wrangler.toml
-#   bunx wrangler r2 bucket create parachute-vault-staging
-#
-# NOTE: the stored wrangler OAuth token carries d1 + r2 write scope. If a future
-# token lacks them, run an interactive `bunx wrangler login` before provisioning.
+# --- one-time provisioning: scripts/staging-bootstrap.sh (D1 + R2 on the staging
+# account, the D1 id into wrangler.toml, then this script, then the secrets).
 
 # --- vault DO worker (DO SQLite + R2 + scope-guard against staging identity) --
 # Deployed FIRST: the identity worker's [[env.staging.services]] binding

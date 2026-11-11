@@ -108,6 +108,30 @@ export async function checkAndBumpNostrSignin(
   }
 }
 
+// --- session-link fence (T-442) ---------------------------------------------
+
+export const SESSION_LINK_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+// Each link is a full browser session for the account. An owner approving a few apps needs a handful; per ACCOUNT,
+// so a leaked account token can't mint a stream of them from many networks.
+export const SESSION_LINK_MAX_PER_WINDOW = 10;
+
+/**
+ * Reserve one session-link mint for `accountId`. FAIL CLOSED: a link is a full session, so while the limiter is
+ * down none is minted (the owner can retry in a minute; nothing else depends on it).
+ */
+export async function checkAndBumpSessionLink(
+  limiter: RateLimiterNamespace,
+  accountId: string,
+  now: Date = new Date(),
+): Promise<BumpOutcome> {
+  try {
+    return await stubFor(limiter, `session-link:${accountId}`).checkAndBump(SESSION_LINK_WINDOW_MS, SESSION_LINK_MAX_PER_WINDOW, now.getTime());
+  } catch (err) {
+    limiterDown("session-link", err);
+    return { allowed: false, retryAfterSeconds: LIMITER_DOWN_RETRY_SECONDS };
+  }
+}
+
 // --- login brute-force fence ----------------------------------------------
 
 export const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes

@@ -37,6 +37,8 @@ export async function mintToken(opts: {
    * verbatim.
    */
   permissions?: unknown;
+  /** Raw top-level `key` claim (the write stamp's `{name, kind}`, Parachute 0.9.1). */
+  key?: unknown;
 }): Promise<string> {
   const key = await importJWK(TEST_PRIVATE_JWK as any, "RS256");
   return new SignJWT({
@@ -44,6 +46,7 @@ export async function mintToken(opts: {
     ...(opts.vaultScope ? { vault_scope: opts.vaultScope } : {}),
     ...(opts.clientId ? { client_id: opts.clientId } : {}),
     ...(opts.permissions !== undefined ? { permissions: opts.permissions } : {}),
+    ...(opts.key !== undefined ? { key: opts.key } : {}),
   })
     .setProtectedHeader({ alg: "RS256", kid: opts.kid ?? TEST_KID })
     .setIssuer(opts.iss ?? ISSUER)

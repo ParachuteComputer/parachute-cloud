@@ -60,6 +60,13 @@ import {
   handleOpsVaultImportReadToken,
   handleOpsVaultImportStatus,
 } from "./ops-vault-import.ts";
+import {
+  handleOpsHistoryImportDigest,
+  handleOpsHistoryImportFinish,
+  handleOpsHistoryImportPost,
+  handleOpsHistoryImportStatus,
+} from "./ops-history-import.ts";
+import { handleAccountVaultImport, handleAccountVaultImportCheck, handleAccountVaultImportFile } from "./account-import.ts";
 import { handleOpsCanaryToken } from "./ops-canary.ts";
 import { handleTestAccountDeleteReport, handleTestAccountDeleteSweep } from "./account-delete-hooks.ts";
 import { type EmailSender, bindingSender, devLogSender } from "./email.ts";
@@ -88,6 +95,8 @@ import { handleUnsubscribe, runDrip } from "./drip.ts";
 import { runSnapshotSweep } from "./snapshots.ts";
 import { runUsageRollup } from "./usage.ts";
 import { handleAccountSession } from "./account-session.ts";
+import { handleAccountSessionLink } from "./account-session-link.ts";
+import { handleHandoverAccept, handleHandoverOffer, handleHandoversList, handleHandoverWithdraw } from "./vault-handover.ts";
 import { handleAccountToken } from "./account-token.ts";
 import {
   handleAccountHandleCheck,
@@ -352,11 +361,28 @@ app.get("/account/summary", (c) => handleAccountSummary(c.env.DB, c.req.raw, dep
 app.get("/account/keys", (c) => handleAccountKeysList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/keys", (c) => handleAccountKeyMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/keys/:name", (c) => handleAccountKeyRevoke(c.env.DB, c.req.raw, depsFor(c.env)));
+// T-442: a one-time browser sign-in link for a single-owner door's key-only owner (account-session-link.ts). Only
+// there: without OWNER_PUBKEY (Parachute Cloud) this is the router's own 404, the same as an unknown route.
+app.post("/account/session-link", (c) => {
+  const deps = depsFor(c.env);
+  if (!deps.ownerPubkey) return c.notFound();
+  return handleAccountSessionLink(c.env.DB, c.req.raw, deps);
+});
+// T-446: hand a vault to another account in place (vault-handover.ts). Bearer (the owner's account token).
+app.post("/account/vaults/:name/handover", (c) => handleHandoverOffer(c.env.DB, c.req.raw, depsFor(c.env)));
+app.delete("/account/vaults/:name/handover", (c) => handleHandoverWithdraw(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/account/handovers", (c) => handleHandoversList(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/handovers/:id/accept", (c) => handleHandoverAccept(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/pubkeys", (c) => handleAccountPubkeysList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/pubkeys", (c) => handleAccountPubkeyLink(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/pubkeys/:pubkey", (c) => handleAccountPubkeyUnlink(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
+// The account door's import (T-431, account-import.ts): an owner brings a vault in with one credential. No other
+// POST route is `/account/vaults/<one segment>`, so a vault that happens to be named "import" is not shadowed.
+app.post("/account/vaults/import", (c) => handleAccountVaultImport(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/vaults/:name/import-file", (c) => handleAccountVaultImportFile(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/account/vaults/:name/import-check", (c) => handleAccountVaultImportCheck(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults/:name/token", (c) => handleAccountVaultTokenMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/vaults/:name", (c) => handleAccountVaultDelete(c.env.DB, c.req.raw, depsFor(c.env)));
 // Restore points and a one-step restore into a new vault (T-430): the console's, behind the account token.
@@ -613,6 +639,12 @@ app.post("/ops/vault-import/status", async (c) => (await handleOpsVaultImportSta
 app.post("/ops/vault-import/read-token", async (c) => (await handleOpsVaultImportReadToken(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
 app.post("/ops/vault-import/finish", async (c) => (await handleOpsVaultImportFinish(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
 app.post("/ops/vault-import/abort", async (c) => (await handleOpsVaultImportAbort(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+// Add a box's note history behind the notes of a vault the account owns (T-450, ops-history-import.ts):
+// the same bearer, OPS_RUN_TOKEN; unset → 404.
+app.post("/ops/history-import", async (c) => (await handleOpsHistoryImportPost(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+app.post("/ops/history-import/status", async (c) => (await handleOpsHistoryImportStatus(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+app.post("/ops/history-import/digest", async (c) => (await handleOpsHistoryImportDigest(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
+app.post("/ops/history-import/finish", async (c) => (await handleOpsHistoryImportFinish(c.env, c.req.raw, depsFor(c.env))) ?? c.notFound());
 
 // A 5-minute read-only token for the canary vault, for an external uptime
 // checker (L6-03, ops-canary.ts; scripts/uptime-check.sh): bearer

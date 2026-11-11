@@ -31,6 +31,7 @@ export async function handleTags(
   store: Store,
   subpath = "",
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
+  writeCtx: { actor: string | null; via: string | null } = { actor: null, via: null },
 ): Promise<Response> {
   const url = new URL(req.url);
 
@@ -161,7 +162,8 @@ export async function handleTags(
     if (tagScope.allowed && (!tagScope.allowed.has(oldName) || !tagScope.allowed.has(newName))) {
       return tagScopeForbidden(tagScope.raw ?? []);
     }
-    const result = await store.renameTag(oldName, newName);
+    // A rename rewrites notes: they carry the write stamp, as on the box (routes.ts).
+    const result = await store.renameTag(oldName, newName, { actor: writeCtx.actor ?? undefined, via: writeCtx.via ?? undefined });
     if ("error" in result) {
       if (result.error === "not_found") return json({ error: "not_found", error_type: "tag_not_found", tag: oldName }, 404);
       if (result.error === "target_exists") {

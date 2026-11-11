@@ -380,6 +380,19 @@ async function main() {
         `status ${r.status}`,
       );
     }
+    // The operator history import (T-450): same bearer, same refusal.
+    for (const door of ["", "/status", "/digest", "/finish"]) {
+      const r = await fetch(`${IDENTITY}/ops/history-import${door}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ vault_name: "smoke-prod-probe", dry_run: true }),
+      });
+      assert(
+        r.status === 404 || r.status === 401,
+        `PRODUCTION: /ops/history-import${door} without a bearer is refused (404 unset / 401 set)`,
+        `status ${r.status}`,
+      );
+    }
     // The canary token door (L6-03) mints a read token: never without its bearer.
     const opsCanary = await fetch(`${IDENTITY}/ops/canary-token`, { method: "POST" });
     assert(
@@ -397,6 +410,10 @@ async function main() {
       });
       assert(r.status === 404, `PRODUCTION: ${hook} does not exist (404)`, `status ${r.status}`);
     }
+    // T-442: the browser sign-in link exists only on a single-owner door (OWNER_PUBKEY); Parachute Cloud leaves
+    // that unset, so the route is the router's 404 even before any credential is looked at.
+    const sessionLink = await fetch(`${IDENTITY}/account/session-link`, { method: "POST" });
+    assert(sessionLink.status === 404, "PRODUCTION: /account/session-link does not exist (404, OWNER_PUBKEY unset)", `status ${sessionLink.status}`);
     // THE MOCK-BILLING SECURITY PIN: the interim mock-checkout endpoint is
     // hard-gated to non-production (billing-config.ts mockBillingEnabled). In
     // prod it 404s exactly like the __test/* hooks — a free self-upgrade is

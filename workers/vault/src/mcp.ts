@@ -35,10 +35,12 @@
  */
 import type { Database } from "bun:sqlite";
 import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.js";
-import { buildVaultProjection, attachmentsInstructionBlock } from "@openparachute/core/src/vault-projection.js";
+import { buildVaultProjection, attachmentsInstructionBlock, connectionReach } from "@openparachute/core/src/vault-projection.js";
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
+import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
+import { applyOnBehalf } from "./rest/write-stamp.js";
 import { recordWords, shape09, toolHelp } from "./mcp-09.js";
 import { errorClass, toolErrorOutcome } from "./health.js";
 
@@ -208,8 +210,12 @@ async function gateError(id: JsonRpcId, blocked: Response): Promise<JsonRpcMessa
  * doesn't (yet) adopt the full projection. `ticketsEnabled: true`
  * unconditionally — this door always wires an `AttachmentTicketProvider`
  * (see `VaultDO`'s constructor), same as bun.
+ *
+ * `reach` (0.9.1, SPEC §3.4) is the engine's own sentence for what this
+ * connection can read (`connectionReachFor`), on the line right under the one
+ * that names the vault. Omitted: no line.
  */
-export function serverInstruction(vaultName: string, description: string | null): string {
+export function serverInstruction(vaultName: string, description: string | null, reach?: string): string {
   const base =
     `Parachute vault "${vaultName}" — an agent-native knowledge graph of records, types, tags, and links. ` +
     `Read with query-records; write with create-record / update-record; see and change types with list-types / ` +
@@ -226,8 +232,18 @@ export function serverInstruction(vaultName: string, description: string | null)
   // non-string degrades to "no description": the vault connects with the base
   // brief instead of refusing the session.
   const d = typeof description === "string" ? description.trim() : undefined;
-  const head = d ? `${d}\n\n${base}` : base;
+  const named = reach ? `${base}\n${reach}` : base;
+  const head = d ? `${d}\n\n${named}` : named;
   return `${head}\n\n${recordWords(attachmentsInstructionBlock({ ticketsEnabled: true, ticketTool: "attachment-url" }))}`;
+}
+
+/**
+ * What this connection can read, in the engine's words (`connectionReach`, the box's mcp-tools.ts does the same):
+ * the key's highest verb on this vault, and its tag scope. Never less than the key can do.
+ */
+export function connectionReachFor(auth: AuthResult, vaultName: string): string {
+  const level = hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
+  return connectionReach(level, auth.scoped_tags);
 }
 
 /**
@@ -565,6 +581,7 @@ function visibleTools(
   vaultName: string,
   auth: AuthResult,
   attachmentTickets: { provider: AttachmentTicketProvider; urlBase: string },
+  attachmentBytes?: AttachmentBytesProvider,
 ): McpToolDef[] {
   // Write-attribution: refine the credential class to the `mcp` channel, but
   // keep `operator` and `nostr:<pubkey>` — each names something more specific
@@ -576,6 +593,9 @@ function visibleTools(
   const tools = generateMcpTools(store, {
     writeContext,
     attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
+    // read-attachment (the engine adds the tool only when a door wires bytes): ranged R2 reads. Without it an AI
+    // app on this door could list a note's files but not look at one, which it can on a box.
+    ...(attachmentBytes ? { attachmentBytes: { provider: attachmentBytes } } : {}),
     // T-412: delete-note's erase_history is admin-only, like DELETE /notes/:id/versions. Core refuses it unless this
     // is set. Cloud has no tag-scoped passes, so an admin may also name a note already deleted.
     ...(hasScopeForVault(auth.scopes, vaultName, "admin") ? { eraseHistory: "all" as const } : {}),
@@ -663,7 +683,10 @@ async function handleToolCall(
   try {
     const out = await tool.execute(args);
     await record(subject, "ok");
-    return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
+    // A tool may shape its own content blocks (read-attachment returns a real image block); every other tool's
+    // result is one text block of JSON. The same rule as the box's MCP layer (parachute-core src/mcp-http.ts).
+    const content = tool.resultContent ? tool.resultContent(out) : [{ type: "text" as const, text: JSON.stringify(out, null, 2) }];
+    return result(id, { content });
   } catch (err) {
     const domain = mapDomainError(err);
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -686,6 +709,8 @@ async function handleOne(
     tools: McpToolDef[];
     vaultName: string;
     description: string | null;
+    /** What this connection can read (`connectionReachFor`), for the instructions. */
+    reach: string;
     writeGate: McpWriteGate;
     attachmentMintGate: (declaredBytes: number) => Response | null;
     record?: HealthRecord;
@@ -707,7 +732,7 @@ async function handleOne(
           protocolVersion,
           capabilities: { tools: {} },
           serverInfo: { name: `parachute-vault/${ctx.vaultName}`, version: "0.1.0" },
-          instructions: serverInstruction(ctx.vaultName, ctx.description),
+          instructions: serverInstruction(ctx.vaultName, ctx.description, ctx.reach),
         });
       }
       case "tools/list":
@@ -869,7 +894,7 @@ async function handleModern(m: JsonRpcMessage, ctx: Parameters<typeof handleOne>
       reply = result(id, {
         supportedVersions: ALL_SUPPORTED_VERSIONS,
         capabilities: { tools: {} },
-        instructions: serverInstruction(ctx.vaultName, ctx.description),
+        instructions: serverInstruction(ctx.vaultName, ctx.description, ctx.reach),
         ttlMs: MODERN_CACHE_TTL_MS,
         cacheScope: "private",
       });
@@ -915,7 +940,12 @@ export async function handleMcp(
    * provider); no optionality here keeps `visibleTools` from ever needing
    * to special-case an unwired seam on cloud.
    */
-  tickets: { provider: AttachmentTicketProvider; mintGate: (declaredBytes: number) => Response | null },
+  tickets: {
+    provider: AttachmentTicketProvider;
+    mintGate: (declaredBytes: number) => Response | null;
+    /** Ranged reads of a stored file, for `read-attachment`. Absent in tests that wire no bucket. */
+    bytes?: AttachmentBytesProvider;
+  },
   record: HealthRecord = noRecord,
   logCrash: ToolCrashLog = noLog,
 ): Promise<Response> {
@@ -992,14 +1022,22 @@ export async function handleMcp(
   // calls for; bun derives it the same way, `mcp-tools.ts`'s `ticketUrlBase`).
   const origin = publicOrigin(req);
   const ticketUrlBase = `${origin.replace(/\/$/, "")}/vault/${vaultName}`;
-  const all = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase });
+  const all = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes);
   // Wire the server-layer vault-info override onto core's tools (core ships a
   // placeholder execute — "must be configured by the server layer"), then the
   // 0.9 shape and the scope filter. Parity with bun's mcp-tools.ts: override
   // first, so the record surface wraps the real vault-info.
   overrideVaultInfo(all, { vaultName, auth, description, origin, ctx: vaultInfo });
   const tools = scopedTools(all, vaultName, auth);
-  const ctx = { tools, vaultName, description, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
+  // The write stamp (rest/write-stamp.ts): a key with the owner's on-behalf-of grant names who a write is for with
+  // `on_behalf_of`; the call runs on the same tools built for that "by", with the token's own scopes.
+  applyOnBehalf(tools, auth, (by) => {
+    const forBy: AuthResult = { ...auth, actor: by, acts_for: null };
+    const twin = visibleTools(store, vaultName, forBy, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes);
+    overrideVaultInfo(twin, { vaultName, auth: forBy, description, origin, ctx: vaultInfo });
+    return scopedTools(twin, vaultName, forBy);
+  });
+  const ctx = { tools, vaultName, description, reach: connectionReachFor(auth, vaultName), writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));

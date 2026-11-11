@@ -26,7 +26,7 @@
 import { BunSqliteStore } from "@openparachute/core/src/store.js";
 import type { HookRegistry } from "@openparachute/core/src/hooks.js";
 import type { EmbeddingProvider } from "@openparachute/core/src/embedding/provider.js";
-import type { HistoryPolicy } from "@openparachute/core/src/history.js";
+import { resolveHistoryPolicy, type HistoryPolicy } from "@openparachute/core/src/history.js";
 
 export class DoSqliteStore extends BunSqliteStore {
   private readonly storage: DurableObjectStorage;
@@ -51,5 +51,32 @@ export class DoSqliteStore extends BunSqliteStore {
    *  return, rollback on throw), replacing the bun `BEGIN IMMEDIATE … COMMIT`. */
   override transaction<T>(fn: () => T): T {
     return this.storage.transactionSync(fn);
+  }
+
+  /**
+   * Replace the history policy every later capture, prune and compaction uses
+   * (T-450: a vault that received an operator history import keeps all its
+   * history, see vault-do.ts `HISTORY_KEEP_ALL_KEY`). `partial` is merged over
+   * core's defaults by `resolveHistoryPolicy`, exactly as the constructor does.
+   *
+   * The engine keeps the policy in `private readonly historyPolicy`, set once in
+   * BunSqliteStore's constructor, and the DO constructs the store before it can
+   * read DO storage. So this writes that field through a documented cast rather
+   * than editing the engine. The guard makes a renamed field fail loudly instead
+   * of silently setting a field nothing reads.
+   */
+  setHistoryPolicy(partial?: Partial<HistoryPolicy>): HistoryPolicy {
+    const self = this as unknown as { historyPolicy?: HistoryPolicy };
+    if (!self.historyPolicy || typeof self.historyPolicy !== "object") {
+      throw new Error("engine store has no historyPolicy field: setHistoryPolicy needs updating for this engine");
+    }
+    const policy = resolveHistoryPolicy(partial);
+    self.historyPolicy = policy;
+    return policy;
+  }
+
+  /** The policy in force (tests and the status door read it). */
+  currentHistoryPolicy(): HistoryPolicy {
+    return (this as unknown as { historyPolicy: HistoryPolicy }).historyPolicy;
   }
 }

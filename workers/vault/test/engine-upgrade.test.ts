@@ -104,8 +104,14 @@ describe("engine upgrade on an existing vault DO", () => {
       // door/0.9 (T-318 §8a): 0.9's engine adds one column, tags.kind, with no SCHEMA_VERSION bump (core schema.ts
       // ensureTagKinds). The rollback engines name every column they write, so they still open and write the vault;
       // a row they add has no kind and is read by the same rule (tag-kind.ts KIND_SQL). Nothing else may differ.
+      // 0.9.1's write stamp adds one more, note_versions.via_kind (core schema.ts ensureRevisionKeyKind), also with no
+      // SCHEMA_VERSION bump: the rollback engines name the columns they read and write, so they ignore it.
       const withoutKind = (o: any) =>
-        o.name === "tags" ? { ...o, sql: String(o.sql).replace(/,\s*(?:--[^\n]*\n\s*)*kind TEXT/, "") } : o;
+        o.name === "tags" ? { ...o, sql: String(o.sql).replace(/,\s*(?:--[^\n]*\n\s*)*kind TEXT/, "") }
+          : o.name === "note_versions" ? { ...o, sql: String(o.sql).replace(/\n\s*(?:--[^\n]*\n\s*)*via_kind\s+TEXT,/, "") }
+          : o;
+      const revisions = engine.find((o: any) => o.name === "note_versions") as any;
+      expect(String(revisions.sql)).toMatch(/\bvia_kind\s+TEXT,/);
       const tags = engine.find((o: any) => o.name === "tags") as any;
       expect(String(tags.sql)).toMatch(/\bkind TEXT\n\)$/);
       expect(engine.filter((o: any) => !additive.has(String(o.name))).map(withoutKind)).toEqual(ROLLBACK_ENGINE_DDL.objects);

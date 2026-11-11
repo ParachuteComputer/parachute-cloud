@@ -1,5 +1,7 @@
 /**
- * The account-deletion audit log (migration 0026, T-318). One row per
+ * The account-deletion audit log (migration 0026, T-318), which also records
+ * each browser session link a single-owner door's owner mints (T-442,
+ * account-session-link.ts; the note names `next`'s path, never the token). One row per
  * delete request, undo, and purge — the durable answer to "was this emailed
  * request acted on, by whom, when", and the place the purge records its
  * Stripe outcome once the user row that carried the Stripe ids is gone.
@@ -7,8 +9,9 @@
  * No email and no user id in clear: rows are keyed by {@link auditTargetHash},
  * a salted hash of the (random, purged-with-the-account) user id. `note` is
  * counts and booleans only, with one exception: a `vault_import_*` row (the
- * operator import, T-379) names the vault and the operator's reference while the
- * account exists, and the purge takes those two out ({@link scrubOperatorImportNotes}).
+ * operator import, T-379) or a `history_import_*` row (the operator history
+ * import, T-450) names the vault and the operator's reference while the account
+ * exists, and the purge takes those two out ({@link scrubOperatorImportNotes}).
  */
 import { randomBase64url, sha256Hex } from "./crypto.ts";
 
@@ -20,7 +23,15 @@ export type AuditAction =
   | "vault_import_started"
   | "vault_import_finished"
   | "vault_import_read_token"
-  | "vault_import_abort";
+  | "vault_import_abort"
+  | "session_link_minted"
+  | "history_import_batch"
+  | "history_import_finished"
+  // T-446 handover (vault-handover.ts). The note is {vault_id, handover}: two server ids, never an address or a name.
+  | "vault_handover_offered"
+  | "vault_handover_withdrawn"
+  | "vault_handover_given"
+  | "vault_handover_received";
 
 /** Stable per-account key that is not the user id itself. */
 export function auditTargetHash(userId: string): Promise<string> {
@@ -50,12 +61,22 @@ export async function auditStatement(db: D1Database, entry: AuditEntry): Promise
     );
 }
 
+/** Every action whose note names a vault and a reference: the purge scrubs those two out of each. */
+export const OPERATOR_IMPORT_ACTIONS: readonly AuditAction[] = [
+  "vault_import_started",
+  "vault_import_finished",
+  "vault_import_read_token",
+  "vault_import_abort",
+  "history_import_batch",
+  "history_import_finished",
+];
+
 /** The purge's statement: the rows it keeps stop naming the vault (see the module note). */
 export async function scrubOperatorImportNotes(db: D1Database, userId: string): Promise<D1PreparedStatement> {
   return db
     .prepare(
       "UPDATE account_audit SET note = json_remove(note, '$.vault', '$.reference') " +
-        "WHERE target_hash = ? AND action IN ('vault_import_started', 'vault_import_finished', 'vault_import_read_token', 'vault_import_abort')",
+        "WHERE target_hash = ? AND action IN (" + OPERATOR_IMPORT_ACTIONS.map((a) => `'${a}'`).join(", ") + ")",
     )
     .bind(await auditTargetHash(userId));
 }

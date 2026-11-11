@@ -63,6 +63,38 @@ curl -K acct.curl https://<identity>/account/keys -d '{"name":"podcast-studio","
 The app keeps that key (a year, one vault, read or write, never admin) and calls
 `https://<PREFIX>-vault.<sub>.workers.dev/vault/podcast/api/records` or `/mcp`. Its writes are named
 (`createdVia: key:podcast-studio`). `DELETE /account/keys/podcast-studio` stops it on its next request.
+One key can also cover several vaults, each at its own level (0.9.1): send `"vaults": {"podcast": "write", "notes":
+"read"}` instead of `vault` and `can`. That key opens the account door (`https://<identity>/account/mcp`), not a
+vault directly.
+
+An app that writes for other people (a client portal) can be let say whom each write is for: mint its key with
+`"on_behalf_of": true` (its name is then lowercase letters, digits, `.` and `-`, e.g. `fernhill-portal`). Its writes
+may send `Parachute-On-Behalf-Of: client-42` (on MCP, the write tool's `on_behalf_of`) and are stamped
+`createdBy: fernhill-portal:client-42`. A key without it that sends one is refused (403 `on_behalf_not_allowed`).
+
+## Connect an app that signs in through a browser (a Claude connector)
+
+An app that uses OAuth sends you to this door's sign-in page, and a key has no browser session. So open one
+first, with your account pass (0.9.1, `POST /account/session-link`):
+
+```bash
+bun deploy/personal/nip98.ts token https://<identity> <your secret key file> acct.curl
+# Simplest: sign the browser in, then add the connector
+curl -K acct.curl https://<identity>/account/session-link -d '{}'
+#   → {"url":"https://<identity>/auth/verify?token=…","expires_at":"…","next":"/console"}
+# Or carry the app's pending request: copy the /oauth/authorize?... address from the tab the app opened
+curl -K acct.curl https://<identity>/account/session-link \
+  -d '{"next":"/oauth/authorize?response_type=code&client_id=…&state=…"}'
+```
+
+Open `url` in your browser within 5 minutes. It works once. Then add the connector (or retry it): its sign-in
+page goes straight to the consent screen.
+
+- The link is a full browser session (90 days, like any sign-in). Treat it like a password.
+- Only your own account pass mints one. An app key, an app's OAuth token and an `ADMIN_PUBKEYS` sign-in are refused.
+- `OWNER_PUBKEY` must stay set: it is what opens this route. On Parachute Cloud the route does not exist.
+- Keep `APP_ORIGIN` unset or equal to the issuer: the link is built on the issuer, and consent on another origin
+  would not see the cookie.
 
 ## Restore (one line)
 

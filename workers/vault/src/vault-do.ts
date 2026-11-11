@@ -12,6 +12,8 @@
  * fts) so the spike conformance suite (test/spike.test.ts) keeps passing — they
  * exercise the shim + the four DO SQLite unknowns and are cheap to keep.
  */
+import { mcpHeaderRefusal, restWriteStamp } from "./rest/write-stamp.js";
+import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
 import { DurableObject } from "cloudflare:workers";
 import { SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 import { DatabaseShim } from "./shim.js";
@@ -99,6 +101,8 @@ import {
 } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
 import { APP_KEY_CLIENT_ID, AppKeyLedger, SEED_PENDING_KEY } from "./app-keys.js";
+import { digestNotes, finishRun, graftBatch, graftStatus } from "./history-graft.js";
+import { GRAFT_MAX_BODY_BYTES, GRAFT_OUTCOMES, HISTORY_IMPORT_CAP_SHARE, parseDigestQuery, parseGraftBatch } from "./history-graft-shared.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, withCloudGuideText, type WelcomeSeedResult } from "./welcome.js";
 import {
   SEED_PACK_NAMES,
@@ -350,6 +354,20 @@ export interface ImportStateRecord {
  * attached, a tag, a link, the description), and it is checked under the lock.
  */
 const WRITTEN_SINCE_IMPORT_KEY = "written_since_import";
+
+/**
+ * DO-storage flag (T-450): this vault received an operator history import, so
+ * it keeps ALL its history. Core's default policy (100 versions / 180 days /
+ * 8 MiB per note) would prune the imported rows on the note's next edit. Its own
+ * key, not a field of `config`: `config` is the platform's plan object (PUT
+ * /api/internal/config merges the pushed fields into it and writes the whole
+ * object back; a replay rewrites it for the description), and a retention
+ * promise to the owner should not ride on any of those paths. Set once, never
+ * cleared (a destroy wipes it with everything else).
+ */
+const HISTORY_KEEP_ALL_KEY = "history_keep_all";
+/** The policy a keep-all vault runs, merged over core's defaults by `resolveHistoryPolicy`. */
+export const HISTORY_KEEP_ALL_POLICY = { max_versions: 1_000_000, max_age_days: 36500, max_bytes_per_note: null } as const;
 
 /** How long an import waits for in-flight requests to finish before its replay. */
 const IMPORT_DRAIN_MAX_MS = 60_000;
@@ -731,16 +749,25 @@ export class VaultDO extends DurableObject {
     // in flight: a refused request must not hold up the import's drain.
     if (this.importRun) {
       const refused = await this.answerDuringImport(request);
-      if (refused) return refused;
+      if (refused) {
+        await dropUnreadBody(request);
+        return refused;
+      }
     }
     // door/0.9: /api/records and /api/types run as their /api/notes and /api/tags twins, in record words
     // (rest/records.ts); a direct /api/notes answer says it is leaving.
     const path = new URL(request.url).pathname;
     const records = recordsRoute(path);
-    // Counted BEFORE the records door reads the body: the import lock checked above must not see a request that is
-    // already past it but not yet in flight.
-    if (records) return this.counted(() => recordsDoor(request, records, (r) => this.countedFetch(r)));
-    return withNotesDeprecation(path, await this.counted(() => this.countedFetch(request)));
+    try {
+      // Counted BEFORE the records door reads the body: the import lock checked above must not see a request that
+      // is already past it but not yet in flight.
+      return records
+        ? await this.counted(() => recordsDoor(request, records, (r) => this.countedFetch(r)))
+        : withNotesDeprecation(path, await this.counted(() => this.countedFetch(request)));
+    } finally {
+      // Also when the handler threw: the 500 the router then answers must not be followed by the pipe failing.
+      await dropUnreadBody(request);
+    }
   }
 
   /**
@@ -968,11 +995,26 @@ export class VaultDO extends DurableObject {
       this.seedChecked = true;
       return json({ bare: true });
     }
+    // Handover (T-446) — POST /api/internal/handover-cut, dispatched here, ahead of the tenant door's bar check:
+    // the push for a vault handed BACK is minted for its returning owner, whom the earlier handover barred. Same
+    // first-party gate as every /internal/* route.
+    if (rest === "/api/internal/handover-cut") {
+      const cutAuth = await authenticateVaultRequest(request, this.env, vaultName);
+      if ("error" in cutAuth) return cutAuth.error;
+      const cutForbidden = this.internalForbidden(cutAuth, vaultName);
+      if (cutForbidden) return cutForbidden;
+      if (this.destroyed) return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
+      return this.handleHandoverCut(request);
+    }
     if (rest === "/api/internal/destroy") {
       const destroyAuth = await authenticateVaultRequest(request, this.env, vaultName);
       if ("error" in destroyAuth) return destroyAuth.error;
       const destroyForbidden = this.internalForbidden(destroyAuth, vaultName);
       if (destroyForbidden) return destroyForbidden;
+      // A delete the previous owner started just before a handover (T-446) must not land after it.
+      if (await this.appKeys.refuses(destroyAuth)) {
+        return json({ error: "Unauthorized", message: "this token's account no longer owns this vault" }, 401);
+      }
       return this.handleDestroy(request, vaultName);
     }
     // STAGING/DEV-ONLY purge probe (T-318 delete proof) — GET
@@ -1150,6 +1192,10 @@ export class VaultDO extends DurableObject {
         return new Response(mauth.error.body, { status: mauth.error.status, headers });
       }
       if (closed) return accountClosed(request);
+      // The write stamp on MCP rides each write tool's `on_behalf_of` (rest/write-stamp.ts applyOnBehalf); the REST
+      // header is never read here, so it is refused rather than dropped.
+      const headerRefused = mcpHeaderRefusal(request);
+      if (headerRefused) return headerRefused;
       // Any POST counts, a read too: a connected AI is the vault in use.
       if (request.method === "POST") await this.markWritten();
       // The write gate: MCP is the flagship write door, so the paywall (frozen
@@ -1180,6 +1226,7 @@ export class VaultDO extends DurableObject {
         {
           provider: this.attachmentTickets,
           mintGate: (declaredBytes) => this.attachmentMintGate(declaredBytes),
+          bytes: r2AttachmentBytes(this.env.ATTACHMENTS, vaultName),
         },
         (subject, outcome) => this.health.record(subject, outcome),
         (tool, err) => logServerError("mcp_tool_error", err, { ...this.logFields, tool }),
@@ -1242,6 +1289,12 @@ export class VaultDO extends DurableObject {
     const auth = await this.authenticate(request, vaultName);
     if ("error" in auth) return auth.error;
     if (closed && !apiPath.startsWith("/internal/")) return accountClosed(request);
+    // The write stamp, decided once for every route below (core write-stamp.ts, rest/write-stamp.ts): `by` is the
+    // token's subject unless the request names who the write is for (Parachute-On-Behalf-Of) and the token holds the
+    // owner's on-behalf-of permission. Refused, never ignored, when it doesn't or when the route records no writer;
+    // checked before any route runs, so a refused request writes nothing. On-behalf-of never opens access.
+    const stamp = restWriteStamp(request, apiPath, auth);
+    if ("refusal" in stamp) return stamp.refusal;
 
     // REST scope gate — mirrors bun's routing.ts: GET/HEAD/OPTIONS → read,
     // other methods → write, EXCEPT the enumerated tag-schema mutations
@@ -1287,7 +1340,7 @@ export class VaultDO extends DurableObject {
     const platform = auth.clientId === FIRST_PARTY_CLIENT_ID && hasScopeForVault(auth.scopes, vaultName, "admin");
     if (!apiPath.startsWith("/internal/") && requiredVerb !== "read" && request.method !== "GET" && !platform) await this.markWritten();
 
-    const writeCtx = { actor: auth.actor, via: auth.via };
+    const writeCtx = { actor: stamp.by, via: auth.via };
     const deps: RestDeps = {
       vaultName,
       deleteObject: (rel) => this.deleteObject(vaultName, rel),
@@ -1321,6 +1374,9 @@ export class VaultDO extends DurableObject {
       if (apiPath === "/internal/import-status") return this.handleImportStatus(request);
       if (apiPath === "/internal/import-file") return this.handleImportFile(request, vaultName);
       if (apiPath === "/internal/import-check") return this.handleImportCheck(request, vaultName);
+      if (apiPath === "/internal/history-import") return this.handleHistoryImport(request);
+      if (apiPath === "/internal/history-import/finish") return this.handleHistoryImportFinish(request);
+      if (apiPath === "/internal/history-digest") return this.handleHistoryDigest(request);
       return json({ error: "Not found" }, 404);
     }
 
@@ -1358,7 +1414,7 @@ export class VaultDO extends DurableObject {
       return handleHistoryCompact(request, this.store);
     }
     if (apiPath.startsWith("/tags")) {
-      return handleTags(request, this.store, apiPath.slice(5), NO_TAG_SCOPE);
+      return handleTags(request, this.store, apiPath.slice(5), NO_TAG_SCOPE, writeCtx);
     }
     if (apiPath === "/find-path") {
       return handleFindPath(request, this.store, NO_TAG_SCOPE);
@@ -1468,6 +1524,16 @@ export class VaultDO extends DurableObject {
     this.r2Bytes = (await this.ctx.storage.get<number>(R2_METER_KEY)) ?? 0;
     this.transcribeMinutes = (await this.ctx.storage.get<number>(TRANSCRIBE_MINUTES_KEY)) ?? 0;
     this.transcribeMonth = (await this.ctx.storage.get<string>(TRANSCRIBE_MONTH_KEY)) ?? "";
+    // Before anything can capture, prune or compact (the maintenance below, any
+    // write): a keep-all vault must never run one step under the default policy.
+    this.historyKeepAll = (await this.ctx.storage.get<boolean>(HISTORY_KEEP_ALL_KEY)) === true;
+    if (!this.historyKeepAll && this.holdsHistoryReceipts()) {
+      // The receipts are the fact; the flag is a note of it. A vault that holds grafted history runs keep-all even
+      // if its flag was ever lost, and the flag is put back.
+      this.historyKeepAll = true;
+      await this.ctx.storage.put(HISTORY_KEEP_ALL_KEY, true);
+    }
+    this.applyHistoryPolicy();
     this.stateLoaded = true;
     // Once per loaded instance, using core's bounded defaults. No separate
     // recurring alarm: idle vaults stay asleep, and transcription/embedding
@@ -1632,6 +1698,10 @@ export class VaultDO extends DurableObject {
     if (auth.jti && (await this.appKeys.isRevoked(auth.jti))) {
       return { error: json({ error: "Unauthorized", message: "this key has been revoked" }, 401) };
     }
+    // Handover (T-446): the previous owner's tokens from before the handover are refused here.
+    if (await this.appKeys.refuses(auth)) {
+      return { error: json({ error: "Unauthorized", message: "this token's account no longer owns this vault" }, 401) };
+    }
     if (auth.jti && auth.clientId === APP_KEY_CLIENT_ID) await this.appKeys.noteUse(auth.jti, auth.exp);
     return auth;
   }
@@ -1647,6 +1717,31 @@ export class VaultDO extends DurableObject {
       await this.ctx.storage.delete(SEED_PENDING_KEY);
     }
     this.seedChecked = true;
+  }
+
+  /**
+   * POST /api/internal/handover-cut {from, to, at} — identity's push when this vault is handed from one account to
+   * another (T-446): bar `from`'s tokens on every door from the next request, unbar `to` (app-keys.ts `handover`).
+   * Idempotent, and order-safe by `at` (ISO).
+   */
+  private async handleHandoverCut(request: Request): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    let body: { from?: unknown; to?: unknown; at?: unknown };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return json({ error: "Bad request", message: "send {from, to, at}" }, 400);
+    }
+    const at = typeof body.at === "string" ? Date.parse(body.at) : NaN;
+    const subject = (x: unknown): x is string => typeof x === "string" && x.length > 0 && x !== "operator";
+    if (!subject(body.from) || !subject(body.to) || body.from === body.to || Number.isNaN(at)) {
+      return json({ error: "Bad request", message: "send {from, to, at}" }, 400);
+    }
+    // Streams authenticate once, at open: end them all so each reconnects through the door that now bars `from`
+    // (a hibernated WebSocket is swept against the bar when the DO wakes). Only when this push changed who is barred:
+    // a stale or replayed push must not become a way to drop the current owner's streams.
+    if (await this.appKeys.handover(body.from, body.to, at)) this.subManager?.closeAll();
+    return json({ cut: true });
   }
 
   /** POST /api/internal/keys/revoke {jti, expires_at} — identity's push when the owner revokes an app key (T-414). */
@@ -2173,6 +2268,34 @@ export class VaultDO extends DurableObject {
     }
   }
 
+  /** Mirror of {@link HISTORY_KEEP_ALL_KEY}, loaded by ensureState before the store is used. */
+  private historyKeepAll = false;
+
+  /** Whether any note here has a history-import receipt (a graft landed). False on a vault whose schema predates them. */
+  private holdsHistoryReceipts(): boolean {
+    try {
+      return this.raw().exec("SELECT 1 FROM history_import_receipts LIMIT 1").toArray().length > 0;
+    } catch (err) {
+      // Only a schema from before the table is "no receipts". Anything else is said, not swallowed.
+      if (!/no such table/i.test(errText(err))) console.warn(`event=history_receipts_unreadable error=${errText(err).slice(0, 120)}`);
+      return false;
+    }
+  }
+
+  /**
+   * The cap the database is held to for a history graft: the plan's notes meter, or, on a vault with no plan caps
+   * pushed, what its whole-storage cap leaves once its files are counted (the cap `capBlockIfFull` blocks writes at).
+   * Every vault has one.
+   */
+  private historyNotesCap(): number {
+    return this.planCaps()?.notes_bytes ?? Math.max(0, this.capBytes() - this.r2Bytes);
+  }
+
+  /** Put the store on the policy this vault runs: keep-all after a history import, else core's defaults. */
+  private applyHistoryPolicy(): void {
+    this.store.setHistoryPolicy(this.historyKeepAll ? HISTORY_KEEP_ALL_POLICY : undefined);
+  }
+
   /** Cache of {@link WRITTEN_SINCE_IMPORT_KEY}; undefined until first read in this instance. */
   private writtenSinceImport: boolean | undefined;
 
@@ -2313,6 +2436,179 @@ export class VaultDO extends DurableObject {
       written_since_import: await this.isWritten(),
       r2_bytes: this.r2Bytes,
     });
+  }
+
+  /**
+   * POST /api/internal/history-import — graft a batch of a box's note history
+   * behind the notes' current state (T-450; history-graft.ts has the rules).
+   * GET — the history import's status, counts only.
+   *
+   * The lock: once the body is read there is no `await` until the answer is
+   * built, so no other request interleaves; each note is its own transaction,
+   * inside ONE outer `transactionSync` for the whole batch (DO transactions nest
+   * as savepoints: an inner rollback undoes only its note, the outer one undoes
+   * everything). The outer one is rolled back for a dry run, so it reports
+   * exactly what a real run would, and for a batch that grafts a note and would
+   * leave the database above 90% of its cap ({@link historyNotesCap}: every
+   * vault has one): internal routes skip the cap gate, and a vault over its cap
+   * answers every owner write 413. (Checked: `sql.databaseSize` read inside an
+   * open transaction counts that transaction's pages, and falls back when it
+   * rolls back.)
+   *
+   * Keep-all is turned on only by a batch that grafted at least one note, right
+   * after the outer transaction commits and in the SAME synchronous turn:
+   * `storage.put` first (its promise awaited only afterwards), then the
+   * in-memory mirror and the store's policy. A SQLite-backed Durable Object keeps its KV pairs
+   * in the same database (`_cf_KV`) and commits every write made with no
+   * intervening `await` as one atomic batch (workerd names this "Durable
+   * Objects' automatic atomic write coalescing"), so the flag and the grafted
+   * rows land together or not at all. A batch that grafts nothing, or is
+   * refused, leaves the flag as it was.
+   *
+   * Never marks the vault written (internal paths skip markWritten), fires no
+   * hook or live event, never touches a `notes` row.
+   */
+  private async handleHistoryImport(request: Request): Promise<Response> {
+    if (request.method === "GET") {
+      return json({
+        ...graftStatus(this.shim),
+        keep_all: this.historyKeepAll,
+        database_bytes: Number(this.raw().databaseSize),
+        notes_cap_bytes: this.historyNotesCap(),
+      });
+    }
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    // Said beside the batch, so the identity door can pass the batch's bytes through untouched: `dry_run`, and the
+    // run id identity's audit row names. A batch for any other run is refused, so a batch that grafts is always the
+    // run its audit row names (the row itself is written before this check, so it records an attempt).
+    const params = new URL(request.url).searchParams;
+    const dryFlag = params.get("dry_run");
+    if (dryFlag !== null && dryFlag !== "true" && dryFlag !== "false") {
+      return json({ error: 'dry_run must be "true" or "false"', error_type: "invalid_request" }, 400);
+    }
+    const dry = dryFlag === "true";
+    const statedRun = params.get("run_id");
+    const tooLarge = () =>
+      json({ error: `A history batch is at most ${GRAFT_MAX_BODY_BYTES / 1048576} MiB`, error_type: "history_import_too_large" }, 413);
+    const declared = Number(request.headers.get("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > GRAFT_MAX_BODY_BYTES) {
+      await request.body?.cancel().catch(() => {});
+      return tooLarge();
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(new TextDecoder().decode(await readCappedBody(request, GRAFT_MAX_BODY_BYTES)));
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) return tooLarge();
+      return json({ error: "Body is not JSON", error_type: "invalid_request" }, 400);
+    }
+    const parsed = parseGraftBatch(raw);
+    if (!parsed.ok) return json({ error: parsed.error, error_type: "invalid_request" }, 400);
+    const batch = parsed.value;
+    if (statedRun !== batch.run.run_id) {
+      return json({ error: "run_id beside the batch (?run_id=) must be the batch's run", error_type: "invalid_request" }, 400);
+    }
+    const notesCap = this.historyNotesCap();
+
+    // ---- synchronous from here to the answer ----
+    const sql = this.raw();
+    const txn = <T,>(fn: () => T): T => this.ctx.storage.transactionSync(fn);
+    const bytesBefore = Number(sql.databaseSize);
+    let bytesAfter = bytesBefore;
+    let result: ReturnType<typeof graftBatch> | undefined;
+    let overCap = false;
+    const rollback = new Error("history import rolled back");
+    try {
+      txn(() => {
+        result = graftBatch(this.shim, txn, batch, { dryRun: dry });
+        if (!result.ok) return; // refused before any write
+        bytesAfter = Number(sql.databaseSize);
+        if (dry) throw rollback;
+        // A batch that grafts nothing leaves nothing, by construction: it is rolled back like a dry run (its answer
+        // is already made). So a retry or a batch of refused notes is answered as usual and cannot grow the vault,
+        // and only a batch that grafts is measured against the share.
+        if (result.summary.totals.grafted === 0) throw rollback;
+        if (bytesAfter > notesCap * HISTORY_IMPORT_CAP_SHARE) {
+          overCap = true;
+          throw rollback;
+        }
+      });
+    } catch (err) {
+      if (err !== rollback) throw err;
+    }
+    if (!result!.ok) {
+      const refused = result!;
+      console.log(`event=history_import_refused status=${refused.status} error_type=${String(refused.body.error_type)}`);
+      return json(refused.body, refused.status);
+    }
+    if (overCap) {
+      console.log(`event=history_import_refused status=413 error_type=history_import_over_cap database_bytes_before=${bytesBefore} database_bytes_after=${bytesAfter} notes_cap_bytes=${notesCap}`);
+      return json(
+        {
+          error: `This batch would leave the vault above ${HISTORY_IMPORT_CAP_SHARE * 100}% of its notes storage cap. Nothing changed.`,
+          error_type: "history_import_over_cap",
+          database_bytes_before: bytesBefore,
+          database_bytes_after: bytesAfter,
+          notes_cap_bytes: notesCap,
+        },
+        413,
+      );
+    }
+    const s = result!.summary;
+    let keepAllWrite: Promise<void> | null = null;
+    if (!dry && s.totals.grafted > 0 && !this.historyKeepAll) {
+      // Same synchronous turn as the commit above: see the comment on this method.
+      // The durable write first: if applying the policy ever threw, the flag is still on its way to storage (and a
+      // vault that holds receipts turns keep-all on at its next load regardless).
+      keepAllWrite = this.ctx.storage.put(HISTORY_KEEP_ALL_KEY, true);
+      this.historyKeepAll = true;
+      this.applyHistoryPolicy();
+    }
+    // ---- the first await ----
+    if (keepAllWrite) await keepAllWrite;
+    console.log(
+      `event=history_import dry_run=${dry} notes=${s.notes.length} ` +
+        GRAFT_OUTCOMES.map((o) => `${o}=${s.totals[o]}`).join(" ") +
+        ` blobs_written=${s.blobs_written} versions_written=${s.versions_written} shifted_notes=${s.shifted_notes}` +
+        ` database_bytes_before=${bytesBefore} database_bytes=${bytesAfter}`,
+    );
+    return json({
+      ...s,
+      database_bytes_before: bytesBefore,
+      database_bytes: dry ? bytesAfter : Number(sql.databaseSize),
+      notes_cap_bytes: notesCap,
+    });
+  }
+
+  /** POST /api/internal/history-import/finish — `{ run_id, expect_receipts }`: the run is complete when it holds exactly those receipts. Idempotent. */
+  private async handleHistoryImportFinish(request: Request): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
+    if (
+      !body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).some((k) => k !== "run_id" && k !== "expect_receipts") ||
+      typeof body.run_id !== "string" || !/^[0-9a-f]{64}$/.test(body.run_id) ||
+      typeof body.expect_receipts !== "number" || !Number.isSafeInteger(body.expect_receipts) || body.expect_receipts < 0
+    ) {
+      return json({ error: "Body is { run_id: 64 hex, expect_receipts: whole number }", error_type: "invalid_request" }, 400);
+    }
+    const out = finishRun(this.shim, body.run_id, body.expect_receipts);
+    return json(out.body, out.status);
+  }
+
+  /** POST /api/internal/history-digest — `{ notes: [{ id, through_ix }] }`: digests and a real read of every body. Read-only. */
+  private async handleHistoryDigest(request: Request): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    let raw: unknown;
+    try {
+      raw = JSON.parse(new TextDecoder().decode(await readCappedBody(request, 1024 * 1024)));
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) return json({ error: "Body over 1 MiB", error_type: "invalid_request" }, 413);
+      return json({ error: "Body is not JSON", error_type: "invalid_request" }, 400);
+    }
+    const parsed = parseDigestQuery(raw);
+    if (!parsed.ok) return json({ error: parsed.error, error_type: "invalid_request" }, 400);
+    return json({ notes: digestNotes(this.shim, parsed.value) });
   }
 
   /** The import replay proper, under the import lock (see {@link underImportLock}). */
@@ -2800,7 +3096,7 @@ export class VaultDO extends DurableObject {
       // (ENVIRONMENT=test) to keep the integration suite hermetic — the tracker
       // is unit-tested with an injected fetcher, and staging exercises the live
       // path. A null jti (operator bearer) is never revocable.
-      if (att.jti && (await this.appKeys.isRevoked(att.jti))) {
+      if (await this.appKeys.refuses(att)) {
         this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
         continue;
       }
@@ -2908,7 +3204,7 @@ export class VaultDO extends DurableObject {
       return;
     }
     // App-key door (T-414): a key revoked at this vault can't open or keep a socket.
-    if (result.auth.jti && (await this.appKeys.isRevoked(result.auth.jti))) {
+    if (await this.appKeys.refuses(result.auth)) {
       this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
       return;
     }
@@ -2948,6 +3244,7 @@ export class VaultDO extends DurableObject {
       scopeRaw: auth.scopes,
       exp: auth.exp,
       jti: auth.jti,
+      iat: auth.iat ?? null,
       actor: auth.actor,
       via: auth.via,
       clientId: auth.clientId,
@@ -2984,7 +3281,7 @@ export class VaultDO extends DurableObject {
       return;
     }
     // App-key door (T-414): a key revoked at this vault can't open or keep a socket.
-    if (result.auth.jti && (await this.appKeys.isRevoked(result.auth.jti))) {
+    if (await this.appKeys.refuses(result.auth)) {
       this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
       return;
     }
@@ -3003,6 +3300,7 @@ export class VaultDO extends DurableObject {
       scopeRaw: auth.scopes,
       exp: auth.exp,
       jti: auth.jti,
+      iat: auth.iat ?? null,
       actor: auth.actor,
       via: auth.via,
       clientId: auth.clientId,
@@ -4011,15 +4309,37 @@ export class VaultDO extends DurableObject {
   /** POST /api/storage/upload · GET /api/storage/<date>/<file> — R2-backed. */
   private async handleStorage(req: Request, subpath: string, vaultName: string): Promise<Response> {
     if (req.method === "POST" && subpath === "/upload") {
-      const form = await req.formData();
+      // Refusal bodies carry the same `error_type` (and fields) as the box's (parachute-core routes.ts
+      // handleStorage), so a client branches on one vocabulary at every door.
+      let form: Awaited<ReturnType<Request["formData"]>>;
+      try {
+        form = await req.formData();
+      } catch {
+        return json(
+          {
+            error: "Request body must be valid multipart/form-data",
+            error_type: "invalid_request",
+            hint: "expected a multipart/form-data body with a `file` field",
+          },
+          400,
+        );
+      }
       const file = form.get("file");
-      if (!(file instanceof File)) return json({ error: "file is required" }, 400);
+      if (!(file instanceof File)) return json({ error: "file is required", error_type: "missing_required_field", field: "file" }, 400);
       if (file.size > MAX_UPLOAD_BYTES) {
-        return json({ error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB` }, 413);
+        return json(
+          {
+            error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB`,
+            error_type: "file_too_large",
+            limit: MAX_UPLOAD_BYTES,
+            got: file.size,
+          },
+          413,
+        );
       }
       const ext = extLower(file.name);
       if (BLOCKED_EXTENSIONS.has(ext)) {
-        return json({ error: `File type ${ext} not allowed (active/executable content)` }, 400);
+        return json({ error: `File type ${ext} not allowed (active/executable content)`, error_type: "blocked_upload_extension", extension: ext }, 400);
       }
       // The attachment write gate — shared with the ticket mint/spend paths;
       // see {@link attachmentMintGate}'s doc comment for the exact ladder.
@@ -4046,15 +4366,33 @@ export class VaultDO extends DurableObject {
     try {
       decodedPath = decodeURIComponent(subpath);
     } catch {
-      return json({ error: "Not found" }, 404);
+      return json({ error: "Not found", error_type: "not_found" }, 404);
     }
     const fileMatch = decodedPath.match(/^\/([^/]+)\/(.+)$/);
     if (req.method === "GET" && fileMatch) {
       const reqPath = `${fileMatch[1]}/${fileMatch[2]}`;
       // Traversal guard (R2 keys are flat, but reject `..` segments for parity).
-      if (reqPath.split("/").some((seg) => seg === "..")) return json({ error: "Invalid path" }, 403);
-      const obj = await this.env.ATTACHMENTS.get(r2Key(vaultName, reqPath));
-      if (!obj) return json({ error: "Not found" }, 404);
+      if (reqPath.split("/").some((seg) => seg === "..")) return json({ error: "Invalid path", error_type: "invalid_path" }, 403);
+      const key = r2Key(vaultName, reqPath);
+      // A single `Range: bytes=a-b` gets that part (206), as on a box: a client reads the head of a large file, or
+      // seeks in audio, without pulling all of it. Anything else (no header, malformed, several ranges, a start
+      // past the end) gets the whole file, the box's rule (parachute-core routes.ts parseByteRangeHeader).
+      const rangeHeader = req.headers.get("range");
+      const head = rangeHeader ? await this.env.ATTACHMENTS.head(key) : null;
+      let range = head ? parseByteRangeHeader(rangeHeader, head.size) : null;
+      let obj: R2ObjectBody | null = null;
+      if (range) {
+        // The object can be replaced or removed between the size read and this one. Anything but the same object
+        // (its size and its etag) falls back to the whole file rather than answering with lengths, or bytes, that
+        // belong to something else.
+        obj = await this.env.ATTACHMENTS.get(key, { range: { offset: range.start, length: range.end - range.start + 1 } }).catch(() => null);
+        if (!obj || obj.size !== head!.size || obj.etag !== head!.etag) {
+          range = null;
+          obj = null;
+        }
+      }
+      if (!obj) obj = await this.env.ATTACHMENTS.get(key);
+      if (!obj) return json({ error: "Not found", error_type: "not_found" }, 404);
       const ext = extLower(reqPath);
       // Extension ONLY, never R2 httpMetadata — the same rule as the ticket
       // download spend and bun's GET /storage/ (vault#617). Pre-#255 ticket
@@ -4066,16 +4404,29 @@ export class VaultDO extends DurableObject {
       // the owner's tokens. Every current writer stamps exactly this value,
       // so honest objects serve unchanged.
       const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
+      if (range) {
+        return new Response(obj.body, {
+          status: 206,
+          headers: {
+            "Content-Type": contentType,
+            "Content-Length": String(range.end - range.start + 1),
+            "Content-Range": `bytes ${range.start}-${range.end}/${obj.size}`,
+            "Accept-Ranges": "bytes",
+            "X-Content-Type-Options": "nosniff",
+          },
+        });
+      }
       return new Response(obj.body, {
         headers: {
           "Content-Type": contentType,
           "Content-Length": String(obj.size),
+          "Accept-Ranges": "bytes",
           "X-Content-Type-Options": "nosniff",
         },
       });
     }
 
-    return json({ error: "Not found" }, 404);
+    return json({ error: "Not found", error_type: "not_found" }, 404);
   }
 
   // -------------------------------------------------------------------------
@@ -4458,4 +4809,98 @@ export class VaultDO extends DurableObject {
       txnInterceptCount: this.shim.txnIntercepts.length,
     };
   }
+}
+
+/**
+ * A request answered before its body was read (a refusal: 401, 403, 404, a cap) still has the router piping that
+ * body in. Once the answer is out the pipe fails with "Can't read from request stream after response has been
+ * sent", uncaught: under local workerd that restarts the worker and the next requests get 503, and a client sees
+ * its connection drop instead of the refusal. So a small unread body is read to its end and thrown away first.
+ *
+ * Bounded on purpose, because this runs for requests that were never signed in: only a body that says how long it
+ * is and is at most {@link DRAIN_LIMIT_BYTES}, and for at most {@link DRAIN_LIMIT_MS}. Anything else (no
+ * Content-Length, a large upload, a sender that trickles) is cancelled, so a refusal is never held open by whoever
+ * is being refused. What this changes in production: a refusal for a small body now waits for that body to arrive
+ * (at most two seconds) where it used to go out at once.
+ */
+export const DRAIN_LIMIT_BYTES = 1024 * 1024;
+export const DRAIN_LIMIT_MS = 2000;
+export async function dropUnreadBody(request: Request, limits: { bytes?: number; ms?: number } = {}): Promise<"none" | "drained" | "cancelled"> {
+  if (!request.body || request.bodyUsed) return "none";
+  const maxBytes = limits.bytes ?? DRAIN_LIMIT_BYTES;
+  const declared = Number(request.headers.get("content-length") ?? "");
+  // Only the two calls used here; the platform's own reader type differs between the runtime and the test pool.
+  let reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<void> };
+  try {
+    reader = request.body.getReader() as unknown as typeof reader;
+  } catch {
+    return "none"; // already locked: someone else is reading it
+  }
+  const cancel = async (): Promise<"cancelled"> => {
+    await reader.cancel().catch(() => {});
+    return "cancelled";
+  };
+  if (!Number.isFinite(declared) || declared <= 0 || declared > maxBytes) return cancel();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<"late">((resolve) => {
+    timer = setTimeout(() => resolve("late"), limits.ms ?? DRAIN_LIMIT_MS);
+  });
+  try {
+    let seen = 0;
+    for (;;) {
+      const step = await Promise.race([reader.read(), late]);
+      if (step === "late") return cancel();
+      if (step.done) return "drained";
+      seen += step.value?.byteLength ?? 0;
+      if (seen > declared) return cancel(); // more than it said it would send
+    }
+  } catch {
+    return "cancelled";
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * One `Range: bytes=a-b` header as inclusive offsets, or null for "send the whole file": no header, a malformed
+ * value, another unit, several ranges, or a start past the end. The box's rule, kept exact (parachute-core
+ * `packages/vault/src/routes.ts` parseByteRangeHeader); the door contracts read the first eight bytes of a file at
+ * every door.
+ */
+export function parseByteRangeHeader(header: string | null, total: number): { start: number; end: number } | null {
+  if (!header || total <= 0) return null;
+  const match = header.match(/^bytes=(\d*)-(\d*)$/);
+  if (!match) return null;
+  const [, startRaw, endRaw] = match;
+  if (startRaw === "" && endRaw === "") return null;
+  if (startRaw === "") {
+    const suffixLength = Number(endRaw);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return null;
+    return { start: Math.max(0, total - suffixLength), end: total - 1 };
+  }
+  const start = Number(startRaw);
+  if (!Number.isSafeInteger(start) || start < 0 || start >= total) return null;
+  const end = endRaw === "" ? total - 1 : Math.min(Number(endRaw), total - 1);
+  if (!Number.isSafeInteger(end) || end < start) return null;
+  return { start, end };
+}
+
+/**
+ * The engine's attachment-bytes seam over R2 (`read-attachment`, parachute-core `core/src/attachment/
+ * bytes-provider.ts`): a size from `head`, and one ranged `get` per read, so a text window or a capped image never
+ * pulls a whole large object into the Durable Object. No transcript hook: on this door a transcript lives in the
+ * owning note's body, so the engine points at the note.
+ */
+export function r2AttachmentBytes(bucket: R2Bucket, vaultName: string): AttachmentBytesProvider {
+  return {
+    async stat(attachment) {
+      const head = await bucket.head(r2Key(vaultName, attachment.path));
+      return head ? { size: head.size } : null;
+    },
+    async readRange(attachment, start, end) {
+      if (end <= start) return new Uint8Array(0);
+      const obj = await bucket.get(r2Key(vaultName, attachment.path), { range: { offset: start, length: end - start } });
+      return obj ? new Uint8Array(await obj.arrayBuffer()) : new Uint8Array(0);
+    },
+  };
 }

@@ -973,6 +973,8 @@ async function purgeAccountRows(
     // linked can't sign in as whoever claims a reused id, and a freed npub can own another account.
     db.prepare("DELETE FROM app_keys WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM user_pubkeys WHERE user_id = ?").bind(userId),
+    // T-446: handover offers this account made, accepted, or that name its address (the audit rows keep only ids).
+    db.prepare("DELETE FROM vault_handovers WHERE from_user_id = ? OR to_user_id = ? OR to_email = ?").bind(userId, userId, email),
     db.prepare("DELETE FROM grants WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM auth_codes WHERE user_id = ?").bind(userId),
     // T-318: by EMAIL too. A sign-up link is minted before the account exists,

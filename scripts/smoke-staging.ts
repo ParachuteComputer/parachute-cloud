@@ -49,10 +49,11 @@ import { isUnverifiable, resolveMinAssertions, STAGING_MIN_ASSERTIONS, summarize
 // worker's node_modules by `bun install` (the same explicit path test-bun uses).
 import { GETTING_STARTED_PACK, welcomePack } from "../workers/vault/node_modules/@openparachute/core/src/seed-packs.js";
 import { DEFAULT_SEED_OMITTED_TAGS } from "../workers/vault/src/welcome.ts";
+import { STAGING_IDENTITY, STAGING_VAULT } from "./staging-origins.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.openparachute.workers.dev").replace(/\/$/, "");
-const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.openparachute.workers.dev").replace(/\/$/, "");
+const IDENTITY = (process.env.IDENTITY ?? STAGING_IDENTITY).replace(/\/$/, "");
+const VAULT = (process.env.VAULT ?? STAGING_VAULT).replace(/\/$/, "");
 const VAULT_NAME = process.env.VAULT_NAME ?? "demo";
 const REDIRECT_URI = "http://localhost:8976/callback";
 const MARKER = `smoke-${Date.now()}`;
@@ -386,7 +387,7 @@ async function main() {
   // REACHABILITY on staging: the root branch fires only when `resolveVault()`
   // returns null, i.e. the request names no vault by URL. Staging's
   // VAULT_BASE_DOMAIN is the workers.dev host ITSELF
-  // (`parachute-vault-do-staging.openparachute.workers.dev`), and the subdomain
+  // (`parachute-vault-do-staging.<staging subdomain>.workers.dev`), and the subdomain
   // test is `host.endsWith("." + base)` — the base host is not a subdomain OF
   // itself, so `${VAULT}/mcp` resolves no vault and lands on the root branch,
   // exactly as `u.parachute.computer/mcp` does in production. (If VAULT is ever

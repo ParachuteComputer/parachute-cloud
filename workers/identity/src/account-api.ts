@@ -114,7 +114,7 @@ function restError(status: number, error: string, message: string): Response {
 }
 
 /** Pull the `Bearer <token>` value from the Authorization header, or null. */
-function bearerToken(req: Request): string | null {
+export function bearerToken(req: Request): string | null {
   const header = req.headers.get("authorization") ?? "";
   const m = /^Bearer\s+(.+)$/i.exec(header.trim());
   return m ? m[1]!.trim() : null;
