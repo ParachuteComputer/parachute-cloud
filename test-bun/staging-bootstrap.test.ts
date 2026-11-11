@@ -131,12 +131,20 @@ describe("staging-bootstrap.sh against a fake Cloudflare", () => {
   test("deploy-staging.sh refuses before any install or call while the D1 id is the placeholder or disagrees", () => {
     const fx = fixture();
     cpSync(join(ROOT, "scripts/deploy-staging.sh"), join(fx.root, "scripts/deploy-staging.sh"));
+    // door/0.9: deploy-staging.sh first refuses a non-0.8 engine pin. This checkout's own pin is refused that way;
+    // the D1 checks below are Parachute Cloud's, so they run with an 0.8 pin beside the script.
+    const pin = join(fx.root, "scripts/core-source.env");
+    cpSync(join(ROOT, "scripts/core-source.env"), pin);
     const deploy = () => {
       const env: Record<string, string> = { ...(process.env as Record<string, string>), PATH: `${fx.bin}:${process.env.PATH}`, FAKE_CF: fx.cf };
       const p = Bun.spawnSync(["bash", join(fx.root, "scripts/deploy-staging.sh")], { env, cwd: fx.t });
       return { code: p.exitCode, out: p.stdout.toString() + p.stderr.toString() };
     };
-    let r = deploy(); // as committed: the placeholder
+    let r = deploy();
+    expect(r.code).toBe(2);
+    expect(r.out).toContain("refused: this checkout pins a non-0.8 engine");
+    writeFileSync(pin, 'PARACHUTE_CORE_VERSION="0.8.0-pre.2"\n');
+    r = deploy(); // as committed: the placeholder
     expect(r.code).toBe(2);
     expect(r.out).toContain("staging-bootstrap.sh");
     const f = join(fx.root, "scripts/staging-account.env"); // the env file names an id the toml does not
