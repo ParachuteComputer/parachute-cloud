@@ -22,10 +22,10 @@ const person = (vault: string, sub: string, clientId = "parachute-account") =>
   mintToken({ vault, sub, scopes: `vault:${vault}:read vault:${vault}:write`, vaultScope: [vault], clientId });
 const firstParty = (vault: string, sub: string) =>
   mintToken({ vault, sub, scopes: `vault:${vault}:admin`, vaultScope: [vault], clientId: "parachute-console" });
-const cut = async (vault: string, sub: string, token?: string) =>
-  call(vault, "/api/internal/handover-cut", token ?? (await firstParty(vault, BAKERY)), {
+const cut = async (vault: string, from: string, token?: string, opts: { to?: string; at?: Date } = {}) =>
+  call(vault, "/api/internal/handover-cut", token ?? (await firstParty(vault, opts.to ?? BAKERY)), {
     method: "POST",
-    body: JSON.stringify({ sub, before: new Date().toISOString() }),
+    body: JSON.stringify({ from, to: opts.to ?? BAKERY, at: (opts.at ?? new Date()).toISOString() }),
   });
 
 describe("a handover's owner cut at the vault", () => {
@@ -45,8 +45,6 @@ describe("a handover's owner cut at the vault", () => {
     const versionsBefore = await (await call(v, `/api/notes/${note.id}/versions`, maraV)).json();
     expect((await call(w, "/api/notes?limit=1", maraW)).status).toBe(200);
 
-    // A token minted a second before the cut, so `iat` is strictly earlier whatever the clock's rounding.
-    await new Promise((r) => setTimeout(r, 1100));
     const r = await cut(v, MARA);
     expect(r.status).toBe(200);
 
@@ -72,6 +70,34 @@ describe("a handover's owner cut at the vault", () => {
     expect(await (await call(v, `/api/notes/${note.id}/versions`, bakery)).json()).toEqual(versionsBefore);
   });
 
+  it("bars the old owner whenever their token was minted, until the vault is handed back; order-safe", async () => {
+    const v = freshVault("handed");
+    const before = await person(v, MARA);
+    await new Promise((r) => setTimeout(r, 1100)); // so `before`'s iat is strictly before the handover's second
+    const t0 = new Date();
+    expect((await cut(v, MARA, undefined, { at: t0 })).status).toBe(200);
+    // A token signed AFTER the handover by a mint that checked ownership just before it: still refused.
+    const late = await person(v, MARA);
+    expect((await call(v, "/api/notes?limit=1", late)).status).toBe(401);
+    // The old owner's first-party delete, started before the handover and landing after it: refused.
+    const destroy = await call(v, "/api/internal/destroy", await firstParty(v, MARA), { method: "POST", body: JSON.stringify({ confirm: v }) });
+    expect(destroy.status).toBe(401);
+    expect((await call(v, "/api/notes?limit=1", await person(v, BAKERY))).status).toBe(200);
+
+    // Handed back: Mara's new tokens work, her token from before she handed it away doesn't, the bakery is barred.
+    await new Promise((r) => setTimeout(r, 1100)); // so a new token's iat is past the first handover's second
+    const t1 = new Date();
+    expect((await cut(v, BAKERY, await firstParty(v, MARA), { to: MARA, at: t1 })).status).toBe(200);
+    const fresh = await person(v, MARA);
+    expect((await call(v, "/api/notes?limit=1", fresh)).status).toBe(200);
+    expect((await call(v, "/api/notes?limit=1", before)).status).toBe(401); // from before she handed it away
+    expect((await call(v, "/api/notes?limit=1", await person(v, BAKERY))).status).toBe(401);
+    // A late or replayed push of the first handover changes nothing.
+    expect((await cut(v, MARA, undefined, { at: t0 })).status).toBe(200);
+    expect((await call(v, "/api/notes?limit=1", fresh)).status).toBe(200);
+    expect((await call(v, "/api/notes?limit=1", await person(v, BAKERY))).status).toBe(401);
+  });
+
   it("a cut is the first party's alone, and a malformed one is refused", async () => {
     const v = freshVault("handed");
     const maraV = await person(v, MARA);
@@ -79,8 +105,11 @@ describe("a handover's owner cut at the vault", () => {
     expect((await cut(v, MARA, tenantAdmin)).status).toBe(403);
     expect((await cut(v, MARA, maraV)).status).toBe(403);
     const fp = await firstParty(v, BAKERY);
-    expect((await call(v, "/api/internal/handover-cut", fp, { method: "POST", body: JSON.stringify({ sub: MARA }) })).status).toBe(400);
-    expect((await call(v, "/api/internal/handover-cut", fp, { method: "POST", body: JSON.stringify({ sub: "operator", before: new Date().toISOString() }) })).status).toBe(400);
+    const bad = (body: unknown) => call(v, "/api/internal/handover-cut", fp, { method: "POST", body: JSON.stringify(body) });
+    const at = new Date().toISOString();
+    expect((await bad({ from: MARA, to: BAKERY })).status).toBe(400);
+    expect((await bad({ from: "operator", to: BAKERY, at })).status).toBe(400);
+    expect((await bad({ from: MARA, to: MARA, at })).status).toBe(400);
     expect((await call(v, "/api/notes?limit=1", maraV)).status).toBe(200); // nothing was cut
   });
 });

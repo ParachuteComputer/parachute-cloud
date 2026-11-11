@@ -138,11 +138,11 @@ describe("handing a vault to another account in place", { timeout: 30_000 }, () 
     expect(await owner(v)).toEqual({ owner_user_id: bakery.id, vault_id: before!.vault_id });
     expect((await owner(w))!.owner_user_id).toBe(mara.id);
 
-    // The vault was told to refuse Mara's tokens issued up to now, by a call made as its new owner.
+    // The vault was told it changed hands (bar Mara from now on), by a call made as its new owner.
     const cut = s.a.calls.find((c) => c.url.endsWith(`/vault/${v}/api/internal/handover-cut`) || (c.url.includes(v) && c.url.endsWith("/api/internal/handover-cut")));
     expect(cut).toBeDefined();
     expect(cut!.sub).toBe(bakery.id);
-    expect(JSON.parse(cut!.body)).toMatchObject({ sub: mara.id });
+    expect(JSON.parse(cut!.body)).toMatchObject({ from: mara.id, to: bakery.id, at: r.json.accepted_at });
 
     // Vault-token mints: Mara refused on v, fine on w; the bakery can mint for v.
     expect((await a.call(`/account/vaults/${v}/token`, { method: "POST", auth: mara.auth, body: {} })).status).toBe(403);
@@ -255,7 +255,15 @@ describe("handing a vault to another account in place", { timeout: 30_000 }, () 
     // The new owner can hand it on; the old owner can't withdraw or re-offer it.
     expect((await a.call(`/account/vaults/${v}/handover`, { method: "DELETE", auth: mara.auth })).status).toBe(404);
     expect((await offer(a, mara.auth, v, bakery.email)).status).toBe(404);
-    expect((await offer(a, bakery.auth, v, mara.email)).status).toBe(201);
+    const back = await offer(a, bakery.auth, v, mara.email);
+    expect(back.status).toBe(201);
+    // Handed back: Mara owns it again, and the vault is told so (bar the bakery, unbar Mara).
+    const r = await accept(a, mara.auth, back.json.id);
+    expect(r.status).toBe(200);
+    expect((await owner(v))!.owner_user_id).toBe(mara.id);
+    const pushes = a.calls.filter((c) => c.url.endsWith("/api/internal/handover-cut")).map((c) => JSON.parse(c.body));
+    expect(pushes.at(-1)).toEqual({ from: bakery.id, to: mara.id, at: r.json.accepted_at });
+    expect((await a.call(`/account/vaults/${v}/token`, { method: "POST", auth: mara.auth, body: {} })).status).toBe(200);
   });
 
   test("accept racing withdraw: one wins, never both", async () => {

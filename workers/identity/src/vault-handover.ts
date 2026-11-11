@@ -80,8 +80,9 @@ export const HANDOVER_CARRIES_OVER = [
  *   - Account-wide reach (the account token, account-wide OAuth grants, sessions) is NOT revoked: every path from it
  *     to a vault checks the vault's current owner (vault-token mint, the account MCP fan-out, the console), so it
  *     simply stops reaching this vault and keeps reaching the others.
- *   - Live short-lived tokens with no registry row (vault tokens the account minted, 15 minutes): the vault itself
- *     refuses the old owner's tokens issued before the handover, told by {@link pushOwnerCut} after the batch.
+ *   - Live short-lived tokens with no registry row (vault tokens the account minted, 15 minutes), and any token a
+ *     mint racing the batch signs: the vault itself refuses every token of the old owner from the handover on,
+ *     told by {@link pushOwnerCut} after the batch.
  */
 function endOldOwnerReach(
   db: D1Database,
@@ -89,7 +90,8 @@ function endOldOwnerReach(
   closedHere: { sql: string; binds: unknown[] },
 ): D1PreparedStatement[] {
   const needles = vaultNeedles(p.oldOwner, p.vault);
-  const reaches = `(${needles.map(() => "instr(' ' || scopes || ' ', ?) > 0").join(" OR ")})`;
+  // Lowercased like deleteVaultD1Rows: a vault name is lowercase, a stored scope may not be.
+  const reaches = `(${needles.map(() => "instr(' ' || lower(scopes) || ' ', ?) > 0").join(" OR ")})`;
   const out: D1PreparedStatement[] = [
     db
       .prepare(
@@ -105,7 +107,7 @@ function endOldOwnerReach(
   ];
   for (const g of p.grants) {
     const scopes = g.scopes.split(" ").filter((s) => s.length > 0);
-    const kept = scopes.filter((s) => !needles.some((n) => ` ${s} `.includes(n)));
+    const kept = scopes.filter((s) => !needles.some((n) => ` ${s.toLowerCase()} `.includes(n)));
     if (kept.length === scopes.length) continue;
     out.push(
       kept.length === 0
@@ -352,7 +354,7 @@ export async function handleHandoverAccept(db: D1Database, req: Request, deps: O
     return again ?? err(409, "offer_unavailable", "This offer can no longer be accepted.");
   }
 
-  const cutNow = await pushOwnerCut(db, deps, me.id, vault.name, offer.from_user_id);
+  const cutNow = await pushOwnerCut(db, deps, vault.name, offer.from_user_id, me.id, nowIso);
   await pushVaultCap(db, deps, me.id, vault.name, planEntitlement(entitlementPlanFor(me.plan, me.pendingPlan, billingModeOf(deps))));
   return ok({ id: offer.id, vault: vault.name, status: "accepted", already: false, accepted_at: nowIso, cut_now: cutNow });
 }
@@ -390,18 +392,20 @@ async function answerReplay(db: D1Database, deps: OAuthDeps, offerId: string, me
   const offer = (await db.prepare("SELECT * FROM vault_handovers WHERE id = ?").bind(offerId).first<OfferRow>())!;
   const vault = await getVault(db, offer.vault_name);
   const stillMine = vault !== null && vault.vaultId === offer.vault_id && vault.ownerUserId === me;
-  const cutNow = stillMine ? await pushOwnerCut(db, deps, me, vault.name, offer.from_user_id) : false;
+  const cutNow = stillMine ? await pushOwnerCut(db, deps, vault.name, offer.from_user_id, me, offer.closed_at!) : false;
   return ok({ id: offer.id, vault: offer.vault_name, status: "accepted", already: true, accepted_at: offer.closed_at, cut_now: cutNow });
 }
 
 /**
- * Tell the vault's Durable Object to refuse the previous owner's tokens issued up to now (`POST
- * /api/internal/handover-cut`, first-party, minted for the NEW owner). Called after the batch committed, so "now"
- * is after the last moment the old owner could mint for this vault. Retried like the cap push; when it can't land,
- * the registry revocations above still end every registry-backed credential within the revocation list's minute,
- * and an unregistered vault token lives out its 15 minutes; the answer says which (`cut_now`).
+ * Tell the vault's Durable Object that it changed hands at `at` (`POST /api/internal/handover-cut {from, to, at}`,
+ * first-party, minted for the NEW owner): from then on it refuses every token of the previous owner, whenever
+ * issued — so a mint that checked ownership just before the batch and signed just after is refused too — until a
+ * later handover gives the vault back to them. Ordered by `at`, so a replay or a late push never undoes a newer
+ * handover. Retried like the cap push; when it can't land, the registry revocations above still end every
+ * registry-backed credential within the revocation list's minute, and an unregistered vault token lives out its
+ * 15 minutes; the answer says which (`cut_now`), and a replayed accept pushes again.
  */
-async function pushOwnerCut(db: D1Database, deps: OAuthDeps, newOwner: string, vaultName: string, oldOwner: string): Promise<boolean> {
+async function pushOwnerCut(db: D1Database, deps: OAuthDeps, vaultName: string, oldOwner: string, newOwner: string, at: string): Promise<boolean> {
   for (let attempt = 1; attempt <= CAP_PUSH_MAX_ATTEMPTS; attempt++) {
     try {
       const res = await callVaultApi(db, deps, {
@@ -410,7 +414,7 @@ async function pushOwnerCut(db: D1Database, deps: OAuthDeps, newOwner: string, v
         method: "POST",
         apiPath: "/api/internal/handover-cut",
         verb: "admin",
-        jsonBody: { sub: oldOwner, before: nowOf(deps).toISOString() },
+        jsonBody: { from: oldOwner, to: newOwner, at },
         signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
       });
       await res.body?.cancel().catch(() => {});

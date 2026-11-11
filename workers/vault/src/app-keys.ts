@@ -24,12 +24,20 @@ export const SEED_PENDING_KEY = "welcome_seed_pending";
 export const KEY_USE_INTERVAL_MS = 60_000;
 const REVOKED_KEY = "app_keys_revoked";
 const USED_KEY = "app_keys_used";
-/** DO key (T-446): previous owners cut by a handover, subject → epoch seconds; see {@link AppKeyLedger.cutOwner}. */
+/** DO key (T-446): subjects a handover named, subject → {@link OwnerMark}; see {@link AppKeyLedger.handover}. */
 const OWNER_CUTS_KEY = "owner_cuts";
+interface OwnerMark {
+  /** The subject handed this vault away and hasn't been handed it back: all its tokens are refused. */
+  barred: boolean;
+  /** Epoch ms of the handover that set this mark (newer handovers win). */
+  at: number;
+  /** Epoch s: once unbarred, tokens issued at or before this are still refused (they predate the hand-away). */
+  cut?: number;
+}
 
 export class AppKeyLedger {
   private revoked: Record<string, string> | null = null; // jti → expires_at (ISO)
-  private cuts: Record<string, number> | null = null; // previous owner's sub → cut (epoch s)
+  private cuts: Record<string, OwnerMark> | null = null;
   private used: Record<string, { at: string; exp: number | null }> | null = null; // jti → last use, key's exp (s)
 
   constructor(private readonly storage: DurableObjectStorage) {}
@@ -81,30 +89,43 @@ export class AppKeyLedger {
     return Object.fromEntries(Object.entries(await this.usedMap()).map(([k, v]) => [k, v.at]));
   }
 
-  private async cutsMap(): Promise<Record<string, number>> {
-    this.cuts ??= (await this.storage.get<Record<string, number>>(OWNER_CUTS_KEY)) ?? {};
+  private async cutsMap(): Promise<Record<string, OwnerMark>> {
+    this.cuts ??= (await this.storage.get<Record<string, OwnerMark>>(OWNER_CUTS_KEY)) ?? {};
     return this.cuts;
   }
 
   /**
-   * A handover (T-446): every token whose subject is the vault's previous owner and that was issued at or before
-   * `before` (epoch seconds) is refused here from now on — an app key, an OAuth access token, a vault token the
-   * account minted, a socket already open. Idempotent; a later cut for the same subject only moves forward.
-   * Tokens that subject is issued AFTER the cut pass (identity mints only for a vault's current owner, so those
-   * exist only if the vault comes back to them). Kept for good: one small entry per handover.
+   * A handover (T-446) at `at` (epoch ms): from now on the previous owner `from` is BARRED here — every token whose
+   * subject it is is refused, whenever it was issued (an app key, an OAuth access token, a vault token the account
+   * minted, one minted by a request that checked ownership just before the handover and signed just after, a socket
+   * already open). The new owner `to` is unbarred if an earlier handover barred it, but its tokens issued before
+   * that earlier handover stay refused. Each subject keeps the time of the latest handover that named it, and an
+   * older one never overrides a newer one, so pushes that arrive out of order or are replayed land the same way.
+   * Kept for good: one small entry per subject.
    */
-  async cutOwner(sub: string, before: number): Promise<void> {
+  async handover(from: string, to: string, at: number): Promise<void> {
     const map = await this.cutsMap();
-    if ((map[sub] ?? -Infinity) >= before) return;
-    map[sub] = before;
-    await this.storage.put(OWNER_CUTS_KEY, map);
+    let changed = false;
+    const out = map[from];
+    if (!out || at > out.at) {
+      map[from] = { barred: true, at, cut: Math.floor(at / 1000) };
+      changed = true;
+    }
+    const into = map[to];
+    if (!into || at > into.at) {
+      map[to] = { barred: false, at, ...(into?.cut !== undefined ? { cut: into.cut } : {}) };
+      changed = true;
+    }
+    if (changed) await this.storage.put(OWNER_CUTS_KEY, map);
   }
 
-  /** Whether this vault refuses a token: its key was revoked here, or its subject was cut by a handover. */
+  /** Whether this vault refuses a token: its key was revoked here, or a handover barred or cut its subject. */
   async refuses(t: { jti: string | null; actor: string | null; iat?: number | null }): Promise<boolean> {
     if (t.jti && (await this.isRevoked(t.jti))) return true;
     if (!t.actor) return false;
-    const cut = (await this.cutsMap())[t.actor];
-    return cut !== undefined && (t.iat == null || t.iat <= cut);
+    const mark = (await this.cutsMap())[t.actor];
+    if (!mark) return false;
+    if (mark.barred) return true;
+    return mark.cut !== undefined && (t.iat == null || t.iat <= mark.cut);
   }
 }

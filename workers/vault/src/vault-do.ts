@@ -969,11 +969,26 @@ export class VaultDO extends DurableObject {
       this.seedChecked = true;
       return json({ bare: true });
     }
+    // Handover (T-446) — POST /api/internal/handover-cut, dispatched here, ahead of the tenant door's bar check:
+    // the push for a vault handed BACK is minted for its returning owner, whom the earlier handover barred. Same
+    // first-party gate as every /internal/* route.
+    if (rest === "/api/internal/handover-cut") {
+      const cutAuth = await authenticateVaultRequest(request, this.env, vaultName);
+      if ("error" in cutAuth) return cutAuth.error;
+      const cutForbidden = this.internalForbidden(cutAuth, vaultName);
+      if (cutForbidden) return cutForbidden;
+      if (this.destroyed) return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
+      return this.handleHandoverCut(request);
+    }
     if (rest === "/api/internal/destroy") {
       const destroyAuth = await authenticateVaultRequest(request, this.env, vaultName);
       if ("error" in destroyAuth) return destroyAuth.error;
       const destroyForbidden = this.internalForbidden(destroyAuth, vaultName);
       if (destroyForbidden) return destroyForbidden;
+      // A delete the previous owner started just before a handover (T-446) must not land after it.
+      if (await this.appKeys.refuses(destroyAuth)) {
+        return json({ error: "Unauthorized", message: "this token's account no longer owns this vault" }, 401);
+      }
       return this.handleDestroy(request, vaultName);
     }
     // STAGING/DEV-ONLY purge probe (T-318 delete proof) — GET
@@ -1312,7 +1327,6 @@ export class VaultDO extends DurableObject {
       if (apiPath === "/internal/config") return this.handleInternalConfig(request);
       if (apiPath === "/internal/health") return this.handleInternalHealth(request);
       if (apiPath === "/internal/keys/revoke") return this.handleKeyRevoke(request);
-      if (apiPath === "/internal/handover-cut") return this.handleHandoverCut(request);
       if (apiPath === "/internal/keys/used") {
         if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
         return json({ used: await this.appKeys.lastUsed() });
@@ -1657,23 +1671,24 @@ export class VaultDO extends DurableObject {
   }
 
   /**
-   * POST /api/internal/handover-cut {sub, before} — identity's push when this vault is handed to another account
-   * (T-446): refuse the previous owner's tokens issued at or before `before` (ISO), on every door, from the next
-   * request. Idempotent.
+   * POST /api/internal/handover-cut {from, to, at} — identity's push when this vault is handed from one account to
+   * another (T-446): bar `from`'s tokens on every door from the next request, unbar `to` (app-keys.ts `handover`).
+   * Idempotent, and order-safe by `at` (ISO).
    */
   private async handleHandoverCut(request: Request): Promise<Response> {
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
-    let body: { sub?: unknown; before?: unknown };
+    let body: { from?: unknown; to?: unknown; at?: unknown };
     try {
       body = (await request.json()) as typeof body;
     } catch {
-      return json({ error: "Bad request", message: "send {sub, before}" }, 400);
+      return json({ error: "Bad request", message: "send {from, to, at}" }, 400);
     }
-    const at = typeof body.before === "string" ? Date.parse(body.before) : NaN;
-    if (typeof body.sub !== "string" || !body.sub || body.sub === "operator" || Number.isNaN(at)) {
-      return json({ error: "Bad request", message: "send {sub, before}" }, 400);
+    const at = typeof body.at === "string" ? Date.parse(body.at) : NaN;
+    const subject = (x: unknown): x is string => typeof x === "string" && x.length > 0 && x !== "operator";
+    if (!subject(body.from) || !subject(body.to) || body.from === body.to || Number.isNaN(at)) {
+      return json({ error: "Bad request", message: "send {from, to, at}" }, 400);
     }
-    await this.appKeys.cutOwner(body.sub, Math.floor(at / 1000));
+    await this.appKeys.handover(body.from, body.to, at);
     return json({ cut: true });
   }
 
