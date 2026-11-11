@@ -120,7 +120,8 @@ the operator then sends each note's version rows, refs, receipt and blobs with
   index and whether every body reads back to its hash.
 
 A vault that received a graft keeps all history (a DO-storage flag, applied on
-every state load before maintenance): max 1,000,000 versions, 36,500 days, no
+every state load before maintenance; a vault that holds receipts runs keep-all
+even if the flag were lost, and puts it back): max 1,000,000 versions, 36,500 days, no
 per-note byte ceiling. Its history then grows with every edit and counts against
 the storage meter. The flag is set only by a batch that grafted at least one
 note, in the same commit as its rows; a batch that grafts nothing, or is
@@ -135,8 +136,10 @@ the database) would leave it above 90% of the notes cap, it is rolled back whole
 and answered `413 history_import_over_cap` with the sizes. Batches before it
 stay. A retry that grafts nothing and leaves the database the same size is
 answered as usual. `plan` adds up each dry batch's growth and fails when the
-projection passes 90% of the cap; `run` stops at that 413. No cap pushed, no
-guard. A later `/ops/vault-import` retry would still replace the notes the
+projection passes 90% of the cap; `run` stops at that 413. A vault with no plan
+caps pushed is held to what its whole-storage cap leaves once its files are
+counted, so every vault is guarded. A batch that grafts into a run already
+marked complete reopens it. A later `/ops/vault-import` retry would still replace the notes the
 history sits behind.
 
 A note with a version whose metadata is not a JSON object (a client once wrote it

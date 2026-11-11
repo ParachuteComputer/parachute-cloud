@@ -327,6 +327,9 @@ export function graftBatch(db: GraftDb, txn: SyncTxn, batch: GraftBatch, opts: {
   const dropped = txn(() => {
     // No empty `applying` run left behind by a batch that grafted nothing.
     if (!existingRun && summary.totals.grafted === 0) db.prepare("DELETE FROM history_import_runs WHERE run_id = ?").run(batch.run.run_id);
+    // A batch that grafts into a run already marked complete reopens it: its receipt count moved, so `finish` has to
+    // look again.
+    if (summary.totals.grafted > 0) db.prepare("UPDATE history_import_runs SET status = 'applying' WHERE run_id = ? AND status = 'complete'").run(batch.run.run_id);
     return dropUnused(db, written);
   });
   summary.blobs_written = written.length - dropped;

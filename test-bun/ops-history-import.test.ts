@@ -20,6 +20,7 @@ import {
   EMPTY_OBSERVATIONS_DIGEST,
   boxNoteIds,
   boxUnsendableIds,
+  tipOf,
   highestNativeIx,
   historyDigest,
   parseGraftBatch,
@@ -78,6 +79,34 @@ async function makeCloud(box: Database): Promise<Database> {
   }
   return db;
 }
+
+describe("the tip's exported form, and the production guard", () => {
+  it("adds the exported hash only where the exporter adds a newline: an inline-frontmatter body, not empty, with none", () => {
+    const tip = (content: string | null, extension: string | null) => tipOf({ content, path: "P", extension });
+    expect(tip("body", "md").exported_content_hash).toBe(hashContent("body\n"));
+    expect(tip("body", "mdx").exported_content_hash).toBe(hashContent("body\n"));
+    expect(tip("body", null).exported_content_hash).toBe(hashContent("body\n"));   // no extension is markdown
+    expect("exported_content_hash" in tip("body\n", "md")).toBe(false);
+    expect("exported_content_hash" in tip("", "md")).toBe(false);                    // the export of an empty body adds nothing
+    expect("exported_content_hash" in tip(null, "md")).toBe(false);
+    expect("exported_content_hash" in tip("a,b", "csv")).toBe(false);               // a sidecar note's file is its body, as is
+    expect("exported_content_hash" in tip("{}", "json")).toBe(false);
+  });
+
+  it("refuses any host but this machine or staging without MOVE_PRODUCTION=yes, before reading the token", () => {
+    const run = (env: Record<string, string>) => Bun.spawnSync(["bun", "scripts/ops-history-import.ts", "status", "made-up"], {
+      env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", MOVE_EMAIL: "made-up@example.com", MOVE_REF: "made-up reference", OPS_RUN_TOKEN_FILE: "/nonexistent/made-up-token", ...env },
+      stdout: "pipe", stderr: "pipe",
+    });
+    const refused = run({ IDENTITY: "https://cloud.example.org" });
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr.toString().trim()).toBe("refused: this is not staging and MOVE_PRODUCTION=yes is not set");
+    // With the word given it goes on to the token file (which is not there): the guard, not the file, refused above.
+    const allowed = run({ IDENTITY: "https://cloud.example.org", MOVE_PRODUCTION: "yes" });
+    expect(allowed.exitCode).not.toBe(0);
+    expect(allowed.stderr.toString()).toContain("ENOENT");
+  });
+});
 
 describe("a note the door could not take is left out, and counted", () => {
   it("leaves out a note with a version whose metadata is not a JSON object; the rest go as before", async () => {

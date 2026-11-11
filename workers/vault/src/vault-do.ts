@@ -1450,6 +1450,12 @@ export class VaultDO extends DurableObject {
     // Before anything can capture, prune or compact (the maintenance below, any
     // write): a keep-all vault must never run one step under the default policy.
     this.historyKeepAll = (await this.ctx.storage.get<boolean>(HISTORY_KEEP_ALL_KEY)) === true;
+    if (!this.historyKeepAll && this.holdsHistoryReceipts()) {
+      // The receipts are the fact; the flag is a note of it. A vault that holds grafted history runs keep-all even
+      // if its flag was ever lost, and the flag is put back.
+      this.historyKeepAll = true;
+      await this.ctx.storage.put(HISTORY_KEEP_ALL_KEY, true);
+    }
     this.applyHistoryPolicy();
     this.stateLoaded = true;
     // Once per loaded instance, using core's bounded defaults. No separate
@@ -2114,6 +2120,24 @@ export class VaultDO extends DurableObject {
   /** Mirror of {@link HISTORY_KEEP_ALL_KEY}, loaded by ensureState before the store is used. */
   private historyKeepAll = false;
 
+  /** Whether any note here has a history-import receipt (a graft landed). False on a vault whose schema predates them. */
+  private holdsHistoryReceipts(): boolean {
+    try {
+      return this.raw().exec("SELECT 1 FROM history_import_receipts LIMIT 1").toArray().length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The cap the database is held to for a history graft: the plan's notes meter, or, on a vault with no plan caps
+   * pushed, what its whole-storage cap leaves once its files are counted (the cap `capBlockIfFull` blocks writes at).
+   * Every vault has one.
+   */
+  private historyNotesCap(): number {
+    return this.planCaps()?.notes_bytes ?? Math.max(0, this.capBytes() - this.r2Bytes);
+  }
+
   /** Put the store on the policy this vault runs: keep-all after a history import, else core's defaults. */
   private applyHistoryPolicy(): void {
     this.store.setHistoryPolicy(this.historyKeepAll ? HISTORY_KEEP_ALL_POLICY : undefined);
@@ -2297,7 +2321,7 @@ export class VaultDO extends DurableObject {
         ...graftStatus(this.shim),
         keep_all: this.historyKeepAll,
         database_bytes: Number(this.raw().databaseSize),
-        notes_cap_bytes: this.planCaps()?.notes_bytes ?? null,
+        notes_cap_bytes: this.historyNotesCap(),
       });
     }
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
@@ -2331,7 +2355,7 @@ export class VaultDO extends DurableObject {
     if (statedRun !== batch.run.run_id) {
       return json({ error: "run_id beside the batch (?run_id=) must be the batch's run", error_type: "invalid_request" }, 400);
     }
-    const notesCap = this.planCaps()?.notes_bytes ?? null;
+    const notesCap = this.historyNotesCap();
 
     // ---- synchronous from here to the answer ----
     const sql = this.raw();
@@ -2349,8 +2373,10 @@ export class VaultDO extends DurableObject {
         if (dry) throw rollback;
         // A batch that grafts a note (it adds history, and may turn keep-all on), or that grows the file at all, is
         // refused past the share; a retry that grafts nothing and leaves the file as it was is answered as usual.
-        const adds = result.summary.totals.grafted > 0 || bytesAfter > bytesBefore;
-        if (notesCap !== null && adds && bytesAfter > notesCap * HISTORY_IMPORT_CAP_SHARE) {
+        // "Adds" is what the batch left behind (a grafted note, a kept blob), not a moved file size: blobs written
+        // and dropped again for a refused note can leave freed pages, and that is not growth to refuse a retry for.
+        const adds = result.summary.totals.grafted > 0 || result.summary.blobs_written > 0;
+        if (adds && bytesAfter > notesCap * HISTORY_IMPORT_CAP_SHARE) {
           overCap = true;
           throw rollback;
         }
@@ -2380,9 +2406,11 @@ export class VaultDO extends DurableObject {
     let keepAllWrite: Promise<void> | null = null;
     if (!dry && s.totals.grafted > 0 && !this.historyKeepAll) {
       // Same synchronous turn as the commit above: see the comment on this method.
+      // The durable write first: if applying the policy ever threw, the flag is still on its way to storage (and a
+      // vault that holds receipts turns keep-all on at its next load regardless).
+      keepAllWrite = this.ctx.storage.put(HISTORY_KEEP_ALL_KEY, true);
       this.historyKeepAll = true;
       this.applyHistoryPolicy();
-      keepAllWrite = this.ctx.storage.put(HISTORY_KEEP_ALL_KEY, true);
     }
     // ---- the first await ----
     if (keepAllWrite) await keepAllWrite;

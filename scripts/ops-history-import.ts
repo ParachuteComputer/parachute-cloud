@@ -82,7 +82,7 @@ export function localCounts(db: Database) {
     // Counted over the notes that are sent, so they are what Cloud ends with when every note grafts.
     imported_rows: notesSent.reduce((s, x) => s + x.versions.filter((v) => v.version_ix < 0).length, 0),
     native_rows: notesSent.reduce((s, x) => s + x.versions.filter((v) => v.version_ix >= 0).length, 0),
-    refs: n("SELECT COUNT(*) AS n FROM history_import_refs"),
+    refs: notesSent.reduce((s, x) => s + x.versions.filter((v) => v.version_ix < 0).length, 0),
     runs: n("SELECT COUNT(*) AS n FROM history_import_runs"),
     stored_bytes: n("SELECT COALESCE(SUM(byte_size), 0) AS n FROM note_blobs"),
     largest_note_bytes: largest,
