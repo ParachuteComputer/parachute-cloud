@@ -292,6 +292,15 @@ export class SubscriptionManager {
     }
   }
 
+  /**
+   * Close every live subscription (each sink closes; an SSE client reconnects and re-snapshots, a WS client re-opens
+   * and re-authenticates) while keeping the hooks for the next ones. A handover (T-446) uses it so a stream the
+   * previous owner opened before the handover doesn't keep receiving the new owner's writes.
+   */
+  closeAll(): void {
+    for (const sub of Array.from(this.subs)) this.remove(sub);
+  }
+
   shutdown(): void {
     this.detachHooks();
     for (const sub of Array.from(this.subs)) this.remove(sub);
