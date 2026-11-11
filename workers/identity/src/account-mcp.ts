@@ -1,6 +1,7 @@
 /**
- * The account-level MCP tools (Wave A PR3) — the payload behind the account-MCP
- * door. Three tools, ONE tenant key (the account id from the validated bearer),
+ * The account-level MCP tools (Wave A PR3; writes added in 0.9.1, T-446) — the payload behind the account-MCP
+ * door. Three read/create tools, plus three note writes shown only to a connection that can write somewhere
+ * ({@link toolsFor}), ONE tenant key (the account id from the validated bearer),
  * and the enforcement seam PR2 deferred: **coverage resolves by OWNERSHIP at
  * request time, never by scope-name alone.**
  *
@@ -13,6 +14,9 @@
  *     omitted → fan out across the coverage set, per-vault attribution, no
  *     cross-vault ranking (keyword + common tag/metadata/limit subset; semantic
  *     is NOT fanned out in v1).
+ *   - `create-note` / `update-note` / `delete-note` (0.9.1) — the vault's own tools of those names, forwarded through
+ *     one hop at write to the ONE vault the call names in `vault` (required), only where this connection's level on
+ *     that vault ({@link keyLevelOnVault}, THE LEVEL SEAM) is write or more, stamped with the key that made it.
  *
  * THE OWNERSHIP SEAM (hard requirement from the PR2 review). Every tool call
  * computes the coverage set LIVE as `buildAccountConnectionGrant(scopes, sub)` ∩
@@ -25,7 +29,7 @@
  *
  * THE BRIDGE. Every real vault op mints a 60s single-vault token through the
  * SAME `vault-call.ts` seam the console uses (`aud=vault.<name>`,
- * `vault_scope=[name]`, `vault:<name>:read`), but stamped
+ * `vault_scope=[name]`, `vault:<name>:read` — or `:write` for a write tool, never more), but stamped
  * `client_id="parachute-account"` ({@link ACCOUNT_TOKEN_CLIENT_ID}) — NOT the
  * `parachute-console` first-party id the vault worker's internal cap/snapshot
  * seam is gated on. These fan-out reads are exactly as powerful as a vault token
