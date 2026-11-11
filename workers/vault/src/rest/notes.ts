@@ -1689,7 +1689,11 @@ async function handleNotesInner(
       const contentChanged = updates.content !== undefined
         || updates.append !== undefined
         || updates.prepend !== undefined;
-      if (Object.keys(updates).length > 0) {
+      // A tags-only or links-only PATCH is a write too: it bumps updated_at and carries the write stamp, as on the box
+      // (routes.ts hasTagMutation || hasLinkMutation); otherwise a Parachute-On-Behalf-Of on it would be dropped.
+      const hasTagMutation = (body.tags?.add?.length ?? 0) > 0 || (body.tags?.remove?.length ?? 0) > 0;
+      const hasLinkMutation = body.links?.add !== undefined || body.links?.remove !== undefined;
+      if (Object.keys(updates).length > 0 || hasTagMutation || hasLinkMutation) {
         updates.actor = writeCtx.actor;
         updates.via = writeCtx.via;
         await store.updateNote(note.id, updates);

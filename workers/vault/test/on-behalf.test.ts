@@ -61,6 +61,14 @@ describe("on-behalf-of on REST", () => {
     expect((await read("OB/notes")).lastUpdatedBy).toBe("fernhill-portal:client-7");
     expect((await rest(g, "PATCH", `/api/notes/${encodeURIComponent("OB/notes")}`, { content: "mine", force: true })).status).toBe(200);
     expect((await read("OB/notes")).lastUpdatedBy).toBe("user-1");
+    // A tags-only or links-only change is a write too: stamped, never dropped (the box's hasTagMutation gate).
+    expect((await rest(g, "PATCH", `/api/notes/${encodeURIComponent("OB/notes")}`, { tags: { add: ["fernhill"] }, force: true }, "client-9")).status).toBe(200);
+    expect((await read("OB/notes")).lastUpdatedBy).toBe("fernhill-portal:client-9");
+    expect((await rest(g, "PATCH", `/api/notes/${encodeURIComponent("OB/notes")}`, { links: { add: [{ target: "OB/records", relationship: "for" }] }, force: true }, "client-3")).status).toBe(200);
+    expect((await read("OB/notes")).lastUpdatedBy).toBe("fernhill-portal:client-3");
+    // A batch on behalf of someone stamps every item.
+    expect((await rest(g, "POST", "/api/notes", { notes: [{ content: "b1", path: "OB/b1" }, { content: "b2", path: "OB/b2" }] }, "client-5")).status).toBe(201);
+    for (const p of ["OB/b1", "OB/b2"]) expect((await read(p)).createdBy, p).toBe("fernhill-portal:client-5");
   });
 
   it("a key without the grant is refused 403 on_behalf_not_allowed with the teaching text, and nothing is written", async () => {
@@ -73,7 +81,7 @@ describe("on-behalf-of on REST", () => {
     expect(await exists("OB/plain")).toBe(false);
     // Batch and records too; a delete by a key without the grant leaves the note.
     expect((await rest(p, "POST", "/api/records", { body: "x", path: "OB/plain2" }, "client-42")).status).toBe(403);
-    expect((await rest(p, "POST", "/api/notes/batch", { notes: [{ content: "x", path: "OB/plain3" }] }, "client-42")).status).toBe(403);
+    expect((await rest(p, "POST", "/api/notes", { notes: [{ content: "x", path: "OB/plain3" }] }, "client-42")).status).toBe(403);
     expect(await exists("OB/plain2")).toBe(false);
     expect(await exists("OB/plain3")).toBe(false);
     expect((await rest(OP, "POST", "/api/notes", { content: "keep", path: "OB/keep" })).status).toBe(201);
