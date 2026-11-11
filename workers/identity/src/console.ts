@@ -41,7 +41,8 @@
  * connect-your-AI consent without a second login.
  */
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { forwardImport, logForwardFailed } from "./import-forward.ts";
+import { logForwardFailed } from "./import-forward.ts";
+import { importAsOwner } from "./import-door.ts";
 import { MAX_IMPORT_BYTES, MAX_IMPORT_MIB } from "./import-limit.ts";
 export { MAX_IMPORT_BYTES, MAX_IMPORT_MIB };
 import {
@@ -909,84 +910,25 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
     return consoleError(db, req, deps, user, importTooLargeMessage());
   }
 
-  // Resolve reuse-vs-create. We NEVER free a vault name on a failed import (see
-  // the forward block below), so a RETRY must be able to reclaim the row it
-  // already owns — but ONLY a row still flagged `import_pending_at` (created by
-  // the import door, no successful import yet). A same-owner name WITHOUT the
-  // flag is a real, populated vault: blow-away importing into it would be
-  // same-account data loss, so it's refused exactly like a cross-account name.
-  // A new name is created below, with name validation identical to the create
-  // door.
-  const now = deps.now?.() ?? new Date();
-  const canonicalName = rawName.trim().toLowerCase();
-  const existing = canonicalName ? await getVault(db, canonicalName) : null;
-  if (existing && (existing.ownerUserId !== user.id || !isImportPending(existing))) {
-    return consoleError(db, req, deps, user, "That vault name is already taken.");
+  // Reuse-or-create, the plan's vault count, the forward and the retry gate are the account door's too
+  // (import-door.ts). A failed import never frees the name: the row stays this caller's and a retry converges.
+  const result = await importAsOwner(db, deps, user, rawName, buf, startedMs);
+  if (result.kind === "name_taken") return consoleError(db, req, deps, user, "That vault name is already taken.");
+  if (result.kind === "invalid_name") {
+    return consoleError(
+      db,
+      req,
+      deps,
+      user,
+      result.reason === "reserved"
+        ? "That name is reserved. Please choose another."
+        : "Use 2–63 characters: lowercase letters, numbers, and hyphens (starting with a letter or number).",
+    );
   }
-
-  let vaultName: string;
-  if (existing) {
-    // Retry into this caller's own still-import-pending row — reuse it. No NEW
-    // vault, so the plan vault-count cap doesn't apply and the caps were already
-    // pushed at its creation; the DO's blow-away purge makes the re-import
-    // converge (a partial earlier attempt is exactly this case).
-    vaultName = existing.name;
-  } else {
-    // A NEW vault — the plan vault-count gate, verbatim from the create door.
-    // `>=` grandfathers accounts already over a cap; expired (vault_count 0) is
-    // refused here exactly as create refuses it.
-    const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
-    if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-      return consoleError(db, req, deps, user, vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
-    }
-    try {
-      // `importPending: true` stamps `import_pending_at` atomically in the
-      // insert — the flag that authorizes a retry to reuse this row (cleared
-      // below on success). Atomic so a crash can't strand a flagless row.
-      const vault = await createVault(db, rawName, user.id, now, { importPending: true });
-      vaultName = vault.name;
-    } catch (err) {
-      if (err instanceof VaultNameInvalidError) {
-        const msg =
-          err.reason === "reserved"
-            ? "That name is reserved. Please choose another."
-            : "Use 2–63 characters: lowercase letters, numbers, and hyphens (starting with a letter or number).";
-        return consoleError(db, req, deps, user, msg);
-      }
-      if (err instanceof VaultNameTakenError) {
-        // TOCTOU: a concurrent create claimed it between getVault and here.
-        return consoleError(db, req, deps, user, "That vault name is already taken.");
-      }
-      throw err;
-    }
-    // Push the plan's caps + voice entitlement (best-effort, as any creation).
-    await pushVaultCap(db, deps, user.id, vaultName, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps))));
-  }
-
-  // Forward the tar. On ANY forward/replay failure we KEEP the ownership row —
-  // NEVER free the name (see the handler docstring: a freed name whose DO may
-  // still hold the just-uploaded data would be claimable by another account and
-  // leak the previous uploader's notes). The name stays reserved for the caller;
-  // a retry re-imports into the SAME vault and converges. Log loudly, and guard
-  // the failure render so a logging/DB hiccup can't escalate a handled import
-  // failure into an unhandled 500 (this worker has no Hono onError).
-  //
-  // An error here is not proof the import failed (forwardImport asks the vault).
-  const outcome = await forwardImport(db, deps, user.id, vaultName, buf, startedMs);
-  if (outcome.kind === "too_large") return importFailureResponse(db, req, deps, user, importTooLargeMessage());
-  if (outcome.kind !== "landed") return importFailureResponse(db, req, deps, user, importFailedMessage(vaultName));
-  const { notes, skipped } = outcome;
-  // Import succeeded — the vault now holds real content, so CLOSE the retry-
-  // reuse gate (a later import naming this vault must get "already taken",
-  // never a blow-away). Guarded: a D1 hiccup here must not turn a successful
-  // import into a 500 — log loudly instead (the residual, a still-flagged
-  // populated vault, is same-account-only and self-inflicted on reuse).
-  try {
-    await clearImportPending(db, vaultName, user.id);
-  } catch (err) {
-    logForwardFailed(user.id, vaultName, `flag_clear_failed:${err instanceof Error ? err.message : String(err)}`);
-  }
-  console.log(`event=import_completed vault=${vaultName} notes=${notes} skipped_attachments=${skipped}`);
+  if (result.kind === "vault_limit") return consoleError(db, req, deps, user, result.message);
+  if (result.kind === "too_large") return importFailureResponse(db, req, deps, user, importTooLargeMessage());
+  if (result.kind !== "landed") return importFailureResponse(db, req, deps, user, importFailedMessage(result.vaultName));
+  const { vaultName, notes, skipped } = result;
   return redirectResponse(
     `/console?imported=${encodeURIComponent(vaultName)}&notes=${notes}&skipped=${skipped}`,
   );

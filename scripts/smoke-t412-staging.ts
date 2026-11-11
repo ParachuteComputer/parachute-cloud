@@ -28,9 +28,10 @@
  * like smoke-staging.ts. Refuses production origins.
  */
 import { readFileSync, writeFileSync } from "node:fs";
+import { STAGING_IDENTITY, STAGING_VAULT } from "./staging-origins.ts";
 
-const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.openparachute.workers.dev").replace(/\/$/, "");
-const VAULT = (process.env.VAULT ?? "https://parachute-vault-do-staging.openparachute.workers.dev").replace(/\/$/, "");
+const IDENTITY = (process.env.IDENTITY ?? STAGING_IDENTITY).replace(/\/$/, "");
+const VAULT = (process.env.VAULT ?? STAGING_VAULT).replace(/\/$/, "");
 const REDIRECT_URI = "http://localhost:8976/callback";
 const FORM = { "content-type": "application/x-www-form-urlencoded" };
 const [PHASE, STATE] = [process.argv[2], process.argv[3]];

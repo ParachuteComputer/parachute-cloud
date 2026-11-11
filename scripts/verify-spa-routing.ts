@@ -17,7 +17,8 @@
  *
  * Read-only: no writes, safe against any deploy. Exits non-zero on any failure.
  */
-const IDENTITY = (process.env.IDENTITY ?? "https://parachute-identity-staging.openparachute.workers.dev").replace(/\/$/, "");
+import { STAGING_IDENTITY } from "./staging-origins.ts";
+const IDENTITY = (process.env.IDENTITY ?? STAGING_IDENTITY).replace(/\/$/, "");
 
 let failures = 0;
 function ok(label: string, detail = "") {

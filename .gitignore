@@ -17,3 +17,7 @@ tmp/
 
 # deploy/personal (T-430): rendered per profile, never committed
 workers/*/wrangler.personal.gen.toml
+
+# door-parity.sh: results of a local run, and the config the door contracts run the workers from
+.door-parity/
+workers/*/wrangler.door.gen.toml

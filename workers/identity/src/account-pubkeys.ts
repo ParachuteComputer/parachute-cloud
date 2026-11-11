@@ -18,7 +18,7 @@
  */
 import { requireAccount, readJsonBody } from "./account-api.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
-import { NostrAuthError, isUniqueViolation, parseNostrEvent, verifyNostrRequest } from "./nostr-auth.ts";
+import { NostrAuthError, isPlaceholderAddress, isUniqueViolation, parseNostrEvent, verifyNostrRequest } from "./nostr-auth.ts";
 import { jsonResponse, type OAuthDeps } from "./oauth-shared.ts";
 import { getUserById } from "./users.ts";
 
@@ -114,7 +114,7 @@ export async function handleAccountPubkeyUnlink(db: D1Database, req: Request, de
   // A key-only account (the OWNER_PUBKEY bootstrap: no password, a placeholder address no mail reaches) would lock
   // itself out by removing its last key. One conditional DELETE, so two racing unlinks can't remove the last two.
   const user = await getUserById(db, auth.accountId);
-  const keyOnly = !!user && user.passwordHash === "" && user.email.endsWith("@nostr.invalid");
+  const keyOnly = !!user && user.passwordHash === "" && isPlaceholderAddress(user.email);
   const res = await db
     .prepare(
       `DELETE FROM user_pubkeys WHERE pubkey = ? AND user_id = ?
