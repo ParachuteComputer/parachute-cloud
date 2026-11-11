@@ -24,7 +24,7 @@ function jsToTsResolver() {
 }
 
 /**
- * TWO PROJECTS, one `bun x vitest run` (T-318 money switch). The vault DO reads
+ * THREE PROJECTS, one `bun x vitest run` (T-318 money switch). The vault DO reads
  * BILLING_MODE from its env, and a DO's env can't vary per test — so the suite
  * runs twice-shaped:
  *   - `vault`           — everything, under BILLING_MODE="paid": the frozen
@@ -84,8 +84,12 @@ function project(name: string, billingMode: "paid" | "open_beta", files: { inclu
 export default defineConfig({
   test: {
     projects: [
-      project("vault", "paid", { exclude: [...configDefaults.exclude, "test/open-beta/**"] }),
+      project("vault", "paid", { exclude: [...configDefaults.exclude, "test/open-beta/**", "test/history-graft.test.ts"] }),
       project("vault-open-beta", "open_beta", { include: ["test/open-beta/**/*.test.ts"] }),
+      // Its own runtime (T-450): every project is one workerd whose vaults stay in memory for the whole run, and the
+      // main project already sits near the heap limit. This file makes some fifty vaults; added to that run it ended
+      // "JavaScript heap out of memory" in CI. Same bindings as "vault".
+      project("vault-history-graft", "paid", { include: ["test/history-graft.test.ts"] }),
     ],
   },
 });
