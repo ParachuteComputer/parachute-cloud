@@ -436,18 +436,20 @@ export interface PlannedBatch {
  * {@link BATCH_TARGET_BYTES} of JSON or {@link BATCH_MAX_NOTES} notes; each one
  * carries every blob its notes need (bases too), even when an earlier batch sent
  * them, so any batch can be retried alone. One note over {@link NOTE_MAX_BYTES}
- * throws before the first batch is yielded.
+ * throws before any batch is returned. A batch never carries `dry_run`: the
+ * sender says that beside it.
  */
 export function planBatches(
   db: SqlLike,
-  opts: { dryRun?: boolean; targetBytes?: number; maxNotes?: number; noteMaxBytes?: number } = {},
+  opts: { targetBytes?: number; maxNotes?: number; noteMaxBytes?: number } = {},
 ): { run: GraftRun; batches: PlannedBatch[]; notes: number } {
   const target = opts.targetBytes ?? BATCH_TARGET_BYTES;
   const maxNotes = opts.maxNotes ?? BATCH_MAX_NOTES;
   const noteMax = opts.noteMaxBytes ?? NOTE_MAX_BYTES;
   const boxRun = readBoxRun(db);
   const run: GraftRun = { run_id: boxRun.run_id, source_fingerprint: boxRun.source_fingerprint, tip: boxRun.tip, options_digest: boxRun.options_digest };
-  const envelope = jsonBytes({ run, ...(opts.dryRun ? { dry_run: true } : {}), blobs: [], notes: [] });
+  // Room for the door's own fields around the batch (address, reference, dry_run).
+  const envelope = jsonBytes({ run, blobs: [], notes: [] }) + 1024;
   const batches: PlannedBatch[] = [];
   let notes: GraftNote[] = [];
   let blobs = new Map<string, GraftBlob>();
@@ -456,7 +458,7 @@ export function planBatches(
     if (notes.length === 0) return;
     // Bases first across the whole batch, not only within one note's share.
     const all = [...blobs.values()];
-    const batch: GraftBatch = { run, ...(opts.dryRun ? { dry_run: true } : {}), blobs: [...all.filter((b) => b.encoding === null), ...all.filter((b) => b.encoding !== null)], notes };
+    const batch: GraftBatch = { run, blobs: [...all.filter((b) => b.encoding === null), ...all.filter((b) => b.encoding !== null)], notes };
     batches.push({ batch, bytes: jsonBytes(batch) });
     notes = [];
     blobs = new Map();

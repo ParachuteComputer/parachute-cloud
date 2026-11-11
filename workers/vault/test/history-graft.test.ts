@@ -96,7 +96,7 @@ async function makeBox(specs: NoteSpec[], run = RUN): Promise<string> {
 }
 
 /** The client's batches, read out of the box DO. */
-async function boxBatches(box: string, opts: { dryRun?: boolean; targetBytes?: number; maxNotes?: number } = {}): Promise<GraftBatch[]> {
+async function boxBatches(box: string, opts: { targetBytes?: number; maxNotes?: number } = {}): Promise<GraftBatch[]> {
   return runInDurableObject<DurableObject, GraftBatch[]>(stub(box), async (inst: any) => planBatches(inst.store.db, opts).batches.map((b) => b.batch));
 }
 
