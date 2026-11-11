@@ -139,7 +139,12 @@ export interface Env {
    * SECRET (`wrangler secret put OPS_RUN_TOKEN`), optional: the bearer for
    * `POST /ops/snapshot-run` (re-run the stale vaults' backups now). Separate
    * from OPS_READ_TOKEN because it writes. Also the bearer for the operator
-   * import, `/ops/vault-import*` (T-379, ops-vault-import.ts). Unset → 404.
+   * import, `/ops/vault-import*` (T-379, ops-vault-import.ts), and for the
+   * operator history import, `/ops/history-import*` (T-450,
+   * ops-history-import.ts): with it, the operator can add version history
+   * behind the notes of any vault a named account owns, finished or not. It
+   * still can't read a note's content or change a note's current state (the
+   * vault only adds rows behind a note whose state matches). Unset → 404.
    */
   OPS_RUN_TOKEN?: string;
   /**
