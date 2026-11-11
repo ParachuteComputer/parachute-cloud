@@ -12,6 +12,7 @@
  * fts) so the spike conformance suite (test/spike.test.ts) keeps passing — they
  * exercise the shim + the four DO SQLite unknowns and are cheap to keep.
  */
+import { mcpHeaderRefusal, restWriteStamp } from "./rest/write-stamp.js";
 import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
 import { DurableObject } from "cloudflare:workers";
 import { SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
@@ -1176,6 +1177,10 @@ export class VaultDO extends DurableObject {
         return new Response(mauth.error.body, { status: mauth.error.status, headers });
       }
       if (closed) return accountClosed(request);
+      // The write stamp on MCP rides each write tool's `on_behalf_of` (rest/write-stamp.ts applyOnBehalf); the REST
+      // header is never read here, so it is refused rather than dropped.
+      const headerRefused = mcpHeaderRefusal(request);
+      if (headerRefused) return headerRefused;
       // Any POST counts, a read too: a connected AI is the vault in use.
       if (request.method === "POST") await this.markWritten();
       // The write gate: MCP is the flagship write door, so the paywall (frozen
@@ -1269,6 +1274,12 @@ export class VaultDO extends DurableObject {
     const auth = await this.authenticate(request, vaultName);
     if ("error" in auth) return auth.error;
     if (closed && !apiPath.startsWith("/internal/")) return accountClosed(request);
+    // The write stamp, decided once for every route below (core write-stamp.ts, rest/write-stamp.ts): `by` is the
+    // token's subject unless the request names who the write is for (Parachute-On-Behalf-Of) and the token holds the
+    // owner's on-behalf-of permission. Refused, never ignored, when it doesn't or when the route records no writer;
+    // checked before any route runs, so a refused request writes nothing. On-behalf-of never opens access.
+    const stamp = restWriteStamp(request, apiPath, auth);
+    if ("refusal" in stamp) return stamp.refusal;
 
     // REST scope gate — mirrors bun's routing.ts: GET/HEAD/OPTIONS → read,
     // other methods → write, EXCEPT the enumerated tag-schema mutations
@@ -1314,7 +1325,7 @@ export class VaultDO extends DurableObject {
     const platform = auth.clientId === FIRST_PARTY_CLIENT_ID && hasScopeForVault(auth.scopes, vaultName, "admin");
     if (!apiPath.startsWith("/internal/") && requiredVerb !== "read" && request.method !== "GET" && !platform) await this.markWritten();
 
-    const writeCtx = { actor: auth.actor, via: auth.via };
+    const writeCtx = { actor: stamp.by, via: auth.via };
     const deps: RestDeps = {
       vaultName,
       deleteObject: (rel) => this.deleteObject(vaultName, rel),
@@ -1388,7 +1399,7 @@ export class VaultDO extends DurableObject {
       return handleHistoryCompact(request, this.store);
     }
     if (apiPath.startsWith("/tags")) {
-      return handleTags(request, this.store, apiPath.slice(5), NO_TAG_SCOPE);
+      return handleTags(request, this.store, apiPath.slice(5), NO_TAG_SCOPE, writeCtx);
     }
     if (apiPath === "/find-path") {
       return handleFindPath(request, this.store, NO_TAG_SCOPE);

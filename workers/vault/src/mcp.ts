@@ -40,6 +40,7 @@ import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
 import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
+import { applyOnBehalf } from "./rest/write-stamp.js";
 import { recordWords, shape09, toolHelp } from "./mcp-09.js";
 import { errorClass, toolErrorOutcome } from "./health.js";
 
@@ -1012,6 +1013,14 @@ export async function handleMcp(
   // first, so the record surface wraps the real vault-info.
   overrideVaultInfo(all, { vaultName, auth, description, origin, ctx: vaultInfo });
   const tools = scopedTools(all, vaultName, auth);
+  // The write stamp (rest/write-stamp.ts): a key with the owner's on-behalf-of grant names who a write is for with
+  // `on_behalf_of`; the call runs on the same tools built for that "by", with the token's own scopes.
+  applyOnBehalf(tools, auth, (by) => {
+    const forBy: AuthResult = { ...auth, actor: by, acts_for: null };
+    const twin = visibleTools(store, vaultName, forBy, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes);
+    overrideVaultInfo(twin, { vaultName, auth: forBy, description, origin, ctx: vaultInfo });
+    return scopedTools(twin, vaultName, forBy);
+  });
   const ctx = { tools, vaultName, description, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];

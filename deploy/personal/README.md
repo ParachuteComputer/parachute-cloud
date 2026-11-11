@@ -64,6 +64,11 @@ The app keeps that key (a year, one vault, read or write, never admin) and calls
 `https://<PREFIX>-vault.<sub>.workers.dev/vault/podcast/api/records` or `/mcp`. Its writes are named
 (`createdVia: key:podcast-studio`). `DELETE /account/keys/podcast-studio` stops it on its next request.
 
+An app that writes for other people (a client portal) can be let say whom each write is for: mint its key with
+`"on_behalf_of": true` (its name is then lowercase letters, digits, `.` and `-`, e.g. `fernhill-portal`). Its writes
+may send `Parachute-On-Behalf-Of: client-42` (on MCP, the write tool's `on_behalf_of`) and are stamped
+`createdBy: fernhill-portal:client-42`. A key without it that sends one is refused (403 `on_behalf_not_allowed`).
+
 ## Connect an app that signs in through a browser (a Claude connector)
 
 An app that uses OAuth sends you to this door's sign-in page, and a key has no browser session. So open one

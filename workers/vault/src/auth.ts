@@ -26,6 +26,7 @@ import {
 import { createLocalJWKSet, decodeJwt } from "jose";
 import type { Env } from "./env.js";
 import { APP_KEY_CLIENT_ID } from "./app-keys.js";
+import { keyVia, parseActsForClaim, parseKeyClaim, rememberKeyKind, StampClaimError } from "@openparachute/core/src/write-stamp.js";
 
 export const SCOPE_READ = "vault:read";
 export const SCOPE_WRITE = "vault:write";
@@ -69,6 +70,12 @@ export interface AuthResult {
   scoped_tags: string[] | null;
   actor: string | null;
   via: string | null;
+  /**
+   * The on-behalf-of prefix (`permissions.acts_for`), given only by the vault's owner at mint (identity
+   * account-keys.ts): a write may then name who it is for, stamped `by <prefix>:<id>` (core write-stamp.ts
+   * resolveBy; rest/write-stamp.ts). Absent or null: a supplied on-behalf-of is refused.
+   */
+  acts_for?: string | null;
   /**
    * The validated JWT's `client_id` claim (null for the operator bearer or a
    * token without one). The internal config seam gates on
@@ -562,23 +569,30 @@ export async function authenticateVaultToken(
     };
   }
 
-  // ON-BEHALF-OF (Parachute 0.9.1, T-446). Identity mints `permissions.acts_for` on an app key its owner let write
-  // on behalf of others. This worker doesn't stamp "by" from the request, so serving the key would write its
-  // custodial writes as the owner, unstamped. Refuse it (core write-stamp.ts: the grant rides in `permissions` so a
-  // vault that doesn't know it refuses the key). The 0.9 vault worker enforces it instead.
-  if (claims.permissions && "acts_for" in claims.permissions) {
-    console.warn("[auth] JWT rejected: permissions.acts_for is set but this vault cannot stamp on-behalf-of writes");
-    return {
-      ok: false,
-      reason: "unauthorized",
-      message: "token may write on behalf of others, which this vault does not support yet",
-    };
-  }
 
   // Write-attribution axis 2 — the NIP-98 signing pubkey, when present.
   // Fail-soft; see `parsePrincipalPubkey`.
   const principalPubkey = parsePrincipalPubkey(claims.permissions);
   const appKeyName = parseAppKeyName(claims.clientId, claims.permissions);
+
+  // The write stamp (Parachute 0.9.1, core write-stamp.ts, as the box reads it): the named key (a top-level claim,
+  // which scope-guard doesn't pass on, so read from the payload whose signature the guard just checked) and the
+  // on-behalf-of prefix in `permissions.acts_for`. Fail closed on a present-but-malformed claim, and on acts_for
+  // without a key claim (only a named key may act for others): a stamp the vault can't read must not become a
+  // generic one. The 0.8 shape (`permissions.app_key` alone) still names the key and can't act for anyone.
+  let stampKey: ReturnType<typeof parseKeyClaim>;
+  let actsFor: string | null;
+  try {
+    stampKey = parseKeyClaim(decodeJwt(token) as Record<string, unknown>);
+    actsFor = parseActsForClaim(claims.permissions, stampKey);
+  } catch (err) {
+    if (err instanceof StampClaimError) {
+      console.warn(`[auth] JWT rejected: ${err.message}`);
+      return { ok: false, reason: "unauthorized", message: `token has a malformed write-stamp claim: ${err.message}` };
+    }
+    throw err;
+  }
+  if (stampKey !== null) rememberKeyKind(stampKey);
 
   // The signature is already verified (validateHubJwt above); decoding the
   // payload for `exp` is safe. `jti` is surfaced by scope-guard's claims.
@@ -606,7 +620,10 @@ export async function authenticateVaultToken(
       // generic `api` credential class the request path refines. `actor` is
       // untouched — it stays the hub USER id, so two agents sharing one hub
       // user keep one `created_by` and are told apart by `*_via`. (cloud#277)
-      via: principalPubkey !== null ? nostrVia(principalPubkey) : appKeyName !== null ? `key:${appKeyName}` : "api",
+      via: stampKey !== null
+        ? keyVia(stampKey.name)
+        : principalPubkey !== null ? nostrVia(principalPubkey) : appKeyName !== null ? keyVia(appKeyName) : "api",
+      acts_for: actsFor,
       clientId: claims.clientId ?? null,
       exp,
       jti: claims.jti ?? null,
