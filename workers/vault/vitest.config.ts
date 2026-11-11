@@ -24,7 +24,7 @@ function jsToTsResolver() {
 }
 
 /**
- * THREE PROJECTS, one `bun x vitest run` (T-318 money switch). The vault DO reads
+ * FOUR PROJECTS, one `bun x vitest run` (T-318 money switch). The vault DO reads
  * BILLING_MODE from its env, and a DO's env can't vary per test — so the suite
  * runs twice-shaped:
  *   - `vault`           — everything, under BILLING_MODE="paid": the frozen
@@ -54,8 +54,6 @@ function project(name: string, billingMode: "paid" | "open_beta", files: { inclu
           // instead uses a UNIQUE vault name → a fresh DO (idFromName), so state
           // never crosses tests without the snapshot machinery.
           isolatedStorage: false,
-          // A project that must not share a workerd with another runs alone, one file at a time.
-          ...(ownRuntime ? { singleWorker: true } : {}),
           wrangler: { configPath: "./wrangler.toml" },
           miniflare: {
             // Conformance-test bindings. TEST_JWKS lets the auth matrix run
@@ -88,7 +86,11 @@ function project(name: string, billingMode: "paid" | "open_beta", files: { inclu
 export default defineConfig({
   test: {
     projects: [
-      project("vault", "paid", { exclude: [...configDefaults.exclude, "test/open-beta/**", "test/history-graft.test.ts"] }),
+      // The paid suite in two runtimes, by file name. One workerd holds every vault its files make and every test
+      // file's copy of the worker's modules; all of it in one sat at the heap limit ("JavaScript heap out of memory"
+      // on about a third of `next`'s runs, and on every run once the worker grew by the history import).
+      project("vault", "paid", { include: ["test/[a-h]*.test.ts"], exclude: [...configDefaults.exclude, "test/history-graft.test.ts"] }, true),
+      project("vault-2", "paid", { include: ["test/[i-z]*.test.ts"], exclude: [...configDefaults.exclude] }, true),
       project("vault-open-beta", "open_beta", { include: ["test/open-beta/**/*.test.ts"] }),
       // Its own runtime (T-450): every project is one workerd whose vaults stay in memory for the whole run, and the
       // main project already sits near the heap limit. This file makes some fifty vaults; added to that run it ended
