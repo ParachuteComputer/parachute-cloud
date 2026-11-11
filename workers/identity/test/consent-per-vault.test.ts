@@ -71,6 +71,24 @@ describe("consent per vault on the account door", () => {
     expect(sorted(t.scope)).toEqual([`account:${p.id}:vaults:${p.A}:read`, `account:${p.id}:vaults:${p.B}:write`].sort());
   });
 
+  test("the page's own defaults: picking \"only\" and \"Read only\" grants read, never write (review r1)", async () => {
+    const p = await person();
+    const { clientId } = await seedApprovedClient();
+    const { challenge } = await makePkce();
+    const q = { client_id: clientId, redirect_uri: REDIRECT_URI, response_type: "code", scope: "account:vaults", code_challenge: challenge, code_challenge_method: "S256", state: "s" };
+    const html = await (await handleAuthorizeGet(db(), authorizeGetReq(q, p.sessionId), deps())).text();
+    // What a browser posts for each select left as rendered.
+    const defaults = Object.fromEntries(
+      [...html.matchAll(/<select name="(vault_level:[^"]+)"[^>]*>([\s\S]*?)<\/select>/g)].map((m) => [m[1]!, /<option value="([^"]+)" selected/.exec(m[2]!)?.[1] ?? /<option value="([^"]+)"/.exec(m[2]!)![1]!]),
+    );
+    const o = await consent(p.sessionId, clientId, { ...defaults, account_vault_levels: "1", vault_mode: "specific", access_verb: "read" });
+    expect(o.code).toBeTruthy();
+    expect((await redeem(o)).scope).not.toContain(":write");
+    // Even with a select set to write, the "Read only" radio caps it.
+    const capped = await consent(p.sessionId, clientId, { ...levels({ [p.A]: "write" }), vault_mode: "specific", access_verb: "read" });
+    expect((await redeem(capped)).scope).toBe(`account:${p.id}:vaults:${p.A}:read`);
+  });
+
   test("above write, someone else's vault, a name holding ':' or every vault at none: no code", async () => {
     const p = await person();
     const { id: other } = await seedUser(`client-42-${crypto.randomUUID().slice(0, 6)}@example.com`);
@@ -138,7 +156,7 @@ describe("Connect says what it reads", () => {
       .replace(new RegExp(`${p.A}|${p.B}|${p.C}`, "g"), "<vault>")
       .replace(/\s+/g, " ")
       .trim();
-    expect(text).toMatchInlineSnapshot(`"data-testid="account-vaults"> What this connection can do See the vaults in this connection Listing your vaults is part of connecting — always included. Create new vaults Let this app create new vaults in your account. Uncheck to withhold. Which vaults Any vault — current and future Every vault you own now, plus any you create later, at the access level below. Only the vaults you choose, each at its own level None, read or read & write for each. A vault you create later won&#39;t be part of this connection until you reconnect. <vault> <vault> <vault> Access level for any vault Read only Read the whole vault: every note, tag and attachment, and its settings. Read & write Read the whole vault, and create, edit and delete its notes, tags and attachments. Read means the whole vault: every note, tag and attachment, and its settings. Read & write reads the whole vault too. What this app reads from your vaults goes to the company that runs it."`);
+    expect(text).toMatchInlineSnapshot(`"data-testid="account-vaults"> What this connection can do See the vaults in this connection Listing your vaults is part of connecting — always included. Create new vaults Let this app create new vaults in your account. Uncheck to withhold. Which vaults Any vault — current and future Every vault you own now, plus any you create later, at the access level below. Only the vaults you choose, each at its own level None, read or read & write for each (never above the access level below). A vault you create later won&#39;t be part of this connection until you reconnect. <vault> <vault> <vault> Access level Read only Read the whole vault: every note, tag and attachment, and its settings. Read & write Read the whole vault, and create, edit and delete its notes, tags and attachments. Read means the whole vault: every note, tag and attachment, and its settings. Read & write reads the whole vault too. What this app reads from your vaults goes to the company that runs it."`);
     expect(html).toContain("What this app reads from your vaults goes to the company that runs it.");
   });
 

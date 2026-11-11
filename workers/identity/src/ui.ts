@@ -501,7 +501,7 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
       (name) =>
         `<label class="vaultopt" style="display:flex;gap:.6rem;align-items:center"><span style="min-width:8rem">${esc(name)}</span>` +
         `<select name="vault_level:${esc(name)}" class="field" style="width:auto;margin:0">` +
-        `<option value="none">None</option><option value="read">Read</option><option value="write" selected>Read &amp; write</option>` +
+        `<option value="none">None</option><option value="read" selected>Read</option><option value="write">Read &amp; write</option>` +
         `</select></label>`,
     )
     .join("\n");
@@ -520,11 +520,11 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
            <div data-testid="account-vaults-set" style="margin:1rem 0 0">
              <p class="verbopt-title" style="margin:0 0 .2rem">Which vaults</p>
              ${opt("vault_mode", "wildcard", "Any vault — current and future", "Every vault you own now, plus any you create later, at the access level below.", true)}
-             ${opt("vault_mode", "specific", "Only the vaults you choose, each at its own level", "None, read or read & write for each. A vault you create later won't be part of this connection until you reconnect.", false)}
+             ${opt("vault_mode", "specific", "Only the vaults you choose, each at its own level", "None, read or read & write for each (never above the access level below). A vault you create later won't be part of this connection until you reconnect.", false)}
              <div data-testid="account-vaults-boxes" style="margin:.5rem 0 0 1.7rem">${rows}</div>
            </div>
            <fieldset class="verbsel" data-testid="account-vaults-access" style="margin-top:1rem">
-             <legend>Access level for any vault</legend>
+             <legend>Access level</legend>
              ${opt("access_verb", "read", "Read only", "Read the whole vault: every note, tag and attachment, and its settings.", false)}
              ${opt("access_verb", "write", "Read &amp; write", "Read the whole vault, and create, edit and delete its notes, tags and attachments.", true)}
            </fieldset>

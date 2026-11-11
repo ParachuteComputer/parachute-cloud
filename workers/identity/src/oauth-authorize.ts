@@ -204,6 +204,7 @@ async function perVaultConsentScopes(
   form: FormData,
   userId: string,
   params: AuthorizeParams,
+  cap: "read" | "write",
 ): Promise<string[] | Response> {
   const owned = new Set((await listVaultsForOwner(db, userId)).map((v) => v.name));
   const chosen: Array<[string, "read" | "write"]> = [];
@@ -222,7 +223,7 @@ async function perVaultConsentScopes(
       unowned.push(vault);
       continue;
     }
-    if (level !== "none") chosen.push([vault, level as "read" | "write"]);
+    if (level !== "none") chosen.push([vault, cap === "read" ? "read" : (level as "read" | "write")]);
   }
   if (unowned.length > 0) {
     return oauthErrorRedirect(params.redirectUri, "invalid_scope", `you do not own ${unowned.length > 1 ? "these vaults" : "the vault"}: ${unowned.join(", ")}`, params.state);
@@ -856,7 +857,10 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
     // Per-vault levels (0.9.1 "one multi-vault door"): each vault at none, read or write, chosen on this page.
     // Taken when the form says so (`account_vault_levels=1`) and the person did not pick "Any vault".
     if (form.get("account_vault_levels") === "1" && String(form.get("vault_mode") ?? "") !== "wildcard") {
-      const chosen = await perVaultConsentScopes(db, form, session.userId, params);
+      // The page's "Read only" radio caps every vault at read (review r1: a person who picked it must never grant
+      // write through a select left at a higher level). A form without the radio (the door contract's) is uncapped.
+      const cap = form.get("access_verb") === "read" ? "read" : "write";
+      const chosen = await perVaultConsentScopes(db, form, session.userId, params, cap);
       if (chosen instanceof Response) return chosen;
       if (form.get("vault_create") !== null) chosen.push(composedVaultCreateScope(session.userId));
       return recordGrantAndRedirect(db, params, chosen, session.userId, client, session.id, deps, replaceEarlier);
