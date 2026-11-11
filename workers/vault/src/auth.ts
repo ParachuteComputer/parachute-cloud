@@ -534,7 +534,8 @@ export async function authenticateVaultToken(
   //     returning the array enforces it: `src/tag-scope.ts` filters every REST
   //     handler, MCP read tool and write gate. Cloud's `rest/tag-scope.ts` is a
   //     documented STUB whose non-null branches no caller can reach —
-  //     `AuthResult.scoped_tags` is read NOWHERE in this worker, and every
+  //     `AuthResult.scoped_tags` is read nowhere that enforces (only the MCP
+  //     instructions' read sentence names it, `connectionReachFor`), and every
   //     handler is dispatched with the `NO_TAG_SCOPE` literal (`vault-do.ts`
   //     818/829/832/835/1908/1982). So passing the array through would look
   //     like honouring the claim while serving the WHOLE vault — the silent

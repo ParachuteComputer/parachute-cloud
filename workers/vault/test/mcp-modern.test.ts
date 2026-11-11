@@ -1,4 +1,5 @@
 import { SELF } from "cloudflare:test";
+import { connectionReach } from "@openparachute/core/src/vault-projection.js";
 import { describe, it, expect } from "vitest";
 import { base, freshVault, mintToken, op, OP } from "./helpers.ts";
 
@@ -68,6 +69,8 @@ describe("MCP 2026-07-28 — server/discover", () => {
     expect(body.result._meta["io.modelcontextprotocol/serverInfo"].name).toBe(`parachute-vault/${v}`);
     expect(typeof body.result.instructions).toBe("string");
     expect(body.result.instructions).toContain(v);
+    // 0.9.1: what this connection can read, as initialize says it (the engine's connectionReach; the operator is admin).
+    expect(body.result.instructions).toContain(connectionReach("admin", null));
     expect(typeof body.result.ttlMs).toBe("number");
     // the instructions carry this vault's name/description → never shared across tokens
     expect(body.result.cacheScope).toBe("private");
