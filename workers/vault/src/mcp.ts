@@ -35,7 +35,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.js";
-import { buildVaultProjection, attachmentsInstructionBlock } from "@openparachute/core/src/vault-projection.js";
+import { buildVaultProjection, attachmentsInstructionBlock, connectionReach } from "@openparachute/core/src/vault-projection.js";
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
 import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
@@ -210,8 +210,12 @@ async function gateError(id: JsonRpcId, blocked: Response): Promise<JsonRpcMessa
  * doesn't (yet) adopt the full projection. `ticketsEnabled: true`
  * unconditionally — this door always wires an `AttachmentTicketProvider`
  * (see `VaultDO`'s constructor), same as bun.
+ *
+ * `reach` (0.9.1, SPEC §3.4) is the engine's own sentence for what this
+ * connection can read (`connectionReachFor`), on the line right under the one
+ * that names the vault. Omitted: no line.
  */
-export function serverInstruction(vaultName: string, description: string | null): string {
+export function serverInstruction(vaultName: string, description: string | null, reach?: string): string {
   const base =
     `Parachute vault "${vaultName}" — an agent-native knowledge graph of records, types, tags, and links. ` +
     `Read with query-records; write with create-record / update-record; see and change types with list-types / ` +
@@ -228,8 +232,18 @@ export function serverInstruction(vaultName: string, description: string | null)
   // non-string degrades to "no description": the vault connects with the base
   // brief instead of refusing the session.
   const d = typeof description === "string" ? description.trim() : undefined;
-  const head = d ? `${d}\n\n${base}` : base;
+  const named = reach ? `${base}\n${reach}` : base;
+  const head = d ? `${d}\n\n${named}` : named;
   return `${head}\n\n${recordWords(attachmentsInstructionBlock({ ticketsEnabled: true, ticketTool: "attachment-url" }))}`;
+}
+
+/**
+ * What this connection can read, in the engine's words (`connectionReach`, the box's mcp-tools.ts does the same):
+ * the key's highest verb on this vault, and its tag scope. Never less than the key can do.
+ */
+export function connectionReachFor(auth: AuthResult, vaultName: string): string {
+  const level = hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
+  return connectionReach(level, auth.scoped_tags);
 }
 
 /**
@@ -695,6 +709,8 @@ async function handleOne(
     tools: McpToolDef[];
     vaultName: string;
     description: string | null;
+    /** What this connection can read (`connectionReachFor`), for the instructions. */
+    reach: string;
     writeGate: McpWriteGate;
     attachmentMintGate: (declaredBytes: number) => Response | null;
     record?: HealthRecord;
@@ -716,7 +732,7 @@ async function handleOne(
           protocolVersion,
           capabilities: { tools: {} },
           serverInfo: { name: `parachute-vault/${ctx.vaultName}`, version: "0.1.0" },
-          instructions: serverInstruction(ctx.vaultName, ctx.description),
+          instructions: serverInstruction(ctx.vaultName, ctx.description, ctx.reach),
         });
       }
       case "tools/list":
@@ -878,7 +894,7 @@ async function handleModern(m: JsonRpcMessage, ctx: Parameters<typeof handleOne>
       reply = result(id, {
         supportedVersions: ALL_SUPPORTED_VERSIONS,
         capabilities: { tools: {} },
-        instructions: serverInstruction(ctx.vaultName, ctx.description),
+        instructions: serverInstruction(ctx.vaultName, ctx.description, ctx.reach),
         ttlMs: MODERN_CACHE_TTL_MS,
         cacheScope: "private",
       });
@@ -1021,7 +1037,7 @@ export async function handleMcp(
     overrideVaultInfo(twin, { vaultName, auth: forBy, description, origin, ctx: vaultInfo });
     return scopedTools(twin, vaultName, forBy);
   });
-  const ctx = { tools, vaultName, description, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
+  const ctx = { tools, vaultName, description, reach: connectionReachFor(auth, vaultName), writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));
