@@ -117,8 +117,8 @@ function verifyBlobs(
   }
   for (const b of blobs) {
     if (b.encoding === null) continue;
-    if (b.byte_size > VERSION_MAX_BYTES) return { ok: false, hash: b.hash, tooLarge: true };
     if (b.byte_size !== byteLength(b.content)) return { ok: false, hash: b.hash };
+    if (b.byte_size > VERSION_MAX_BYTES) return { ok: false, hash: b.hash, tooLarge: true };
     let base: string | null = null;
     const sent = byHash.get(b.delta_of!);
     if (sent) {

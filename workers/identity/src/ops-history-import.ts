@@ -158,26 +158,31 @@ export async function handleOpsHistoryImportPost(env: Env, req: Request, deps: O
     await req.body?.cancel().catch(() => {});
     return tooLarge();
   }
-  // A body with no declared length is counted as it is read and cut off at the cap, so formData never holds more.
+  // A body with no declared length is counted as it is read and cut off at the cap, so formData never holds more
+  // (a declared one was checked above).
   let over = false;
-  let read = 0;
-  const cap = MAX_HISTORY_BATCH_BYTES + FORM_OVERHEAD;
-  const counted = req.body?.pipeThrough(
-    new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, c) {
-        read += chunk.byteLength;
-        if (read > cap) {
-          over = true;
-          c.error(new Error("over the cap"));
-          return;
-        }
-        c.enqueue(chunk);
-      },
-    }),
-  );
+  let source: Request = req;
+  if (!Number.isFinite(declared) || req.headers.get("content-length") === null) {
+    let read = 0;
+    const cap = MAX_HISTORY_BATCH_BYTES + FORM_OVERHEAD;
+    const counted = req.body?.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, c) {
+          read += chunk.byteLength;
+          if (read > cap) {
+            over = true;
+            c.error(new Error("over the cap"));
+            return;
+          }
+          c.enqueue(chunk);
+        },
+      }),
+    );
+    source = new Request(req.url, { method: "POST", headers: req.headers, body: counted ?? null });
+  }
   let form: FormData;
   try {
-    form = await new Request(req.url, { method: "POST", headers: req.headers, body: counted ?? null }).formData();
+    form = await source.formData();
   } catch {
     if (over) return tooLarge();
     return refuse(400, "invalid_request", "body must be multipart/form-data (scripts/ops-history-import.ts sends it). Nothing changed.");
@@ -226,7 +231,8 @@ export async function handleOpsHistoryImportPost(env: Env, req: Request, deps: O
     userId: vault.ownerUserId,
     vaultName: vault.name,
     method: "POST",
-    // run_id: the vault refuses a batch for any other run than the one the audit row names.
+    // run_id: the vault refuses a batch for any other run, so a batch that lands is the run the audit row names (the
+    // row, written above, records the attempt either way).
     apiPath: `/api/internal/history-import?run_id=${runId}${dryRun ? "&dry_run=true" : ""}`,
     verb: "admin",
     rawBody: batch,

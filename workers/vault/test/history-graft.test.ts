@@ -121,13 +121,15 @@ async function post(v: string, path: string, body: unknown, token?: string): Pro
     body: JSON.stringify(body),
   });
 }
+/** The door's query: the run id the identity door audited (required), and `dry_run` when given. */
+const importPath = (batch: GraftBatch, dry?: string) => `/internal/history-import?run_id=${encodeURIComponent(String((batch as any)?.run?.run_id))}${dry ? `&dry_run=${dry}` : ""}`;
 async function graft(v: string, batch: GraftBatch): Promise<{ status: number; body: any }> {
-  const r = await post(v, "/internal/history-import", batch);
+  const r = await post(v, importPath(batch), batch);
   return { status: r.status, body: await r.json() };
 }
 /** The same batch as a dry run: the vault reads `dry_run` from the query, never from the batch. */
 async function graftDry(v: string, batch: GraftBatch, flag = "true"): Promise<{ status: number; body: any }> {
-  const r = await post(v, `/internal/history-import?dry_run=${flag}`, batch);
+  const r = await post(v, importPath(batch, flag), batch);
   return { status: r.status, body: await r.json() };
 }
 
@@ -219,7 +221,7 @@ describe("operator history import (vault side)", () => {
     const once = await snapshot(cloud);
 
     // Through the operator bearer this time (not a first-party mint, which never marks anyway): still not "written".
-    const viaOperator = await op(cloud, "/api/internal/history-import", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(batch) });
+    const viaOperator = await op(cloud, `/api${importPath(batch!)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(batch) });
     const again = { status: viaOperator.status, body: (await viaOperator.json()) as any };
     expect(((await (await op(cloud, "/api/internal/import-check")).json()) as any).written_since_import).toBe(false);
     expect(again.status).toBe(200);
@@ -605,6 +607,20 @@ describe("operator history import (vault side)", () => {
     expect(((await mismatch.json()) as any).error_type).toBe("invalid_request");
     const matching = await post(other, `/internal/history-import?run_id=${batch!.run.run_id}&dry_run=true`, batch!);
     expect(matching.status).toBe(200);
+    // Without it, refused: the vault only takes a batch whose run the audit row names.
+    const missing = await post(other, "/internal/history-import?dry_run=true", batch!);
+    expect(missing.status).toBe(400);
+
+    // A batch that grafts nothing writes its blobs and drops them again. The guard is on growth, not on grafted
+    // notes; measured here, DO SQLite gives the dropped pages back, so such a batch leaves the file as it was and is
+    // answered (on a vault already near its cap).
+    const nearly = await makeCloud([{ id: "unrelated", path: "Other", body: "other" }]);
+    const nearlyBefore = await dbSize(nearly);
+    await pushCaps(nearly, Math.floor(nearlyBefore / 0.95));
+    const nothing = await graft(nearly, batch!);
+    expect(nothing.status, JSON.stringify({ ...nothing.body, notes: undefined })).toBe(200);
+    expect(nothing.body).toMatchObject({ totals: { not_found: 1 }, database_bytes_before: nearlyBefore, database_bytes: nearlyBefore });
+    expect(await dbSize(nearly)).toBe(nearlyBefore);
 
     // No cap pushed: no guard, and the answer says so.
     const uncapped = await makeCloud([current(K)]);

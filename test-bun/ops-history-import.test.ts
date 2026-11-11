@@ -324,7 +324,8 @@ describe("the operator client (scripts/ops-history-import.ts) against a made-up 
     const r = await client(door.url, ["finish", "made-up-vault", box, "--refused", refused]);
     expect(r.code, r.out).toBe(0);
     expect(r.out).toContain("nothing was grafted");
-    expect(door.seen[0]!.json).toMatchObject({ expect_receipts: 0 });
+    // Asked as a dry finish only (no audit row on identity for a run that does not exist).
+    expect(door.seen.map((x) => x.json)).toEqual([expect.objectContaining({ expect_receipts: 0, dry_run: true })]);
     // With receipts expected, the same answer is a failure.
     writeFileSync(refused, "n-0000\n");
     const bad = await client(door.url, ["finish", "made-up-vault", box, "--refused", refused]);

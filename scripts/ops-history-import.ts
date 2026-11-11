@@ -291,13 +291,17 @@ async function finish(vault: string, dbPath: string, refusedPath: string | undef
   const run = readBoxRun(db);
   const refused = readIdList(refusedPath);
   const expect = boxNoteIds(db).filter((id) => !refused.has(id)).length;
-  const r = await postJson(d, "/ops/history-import/finish", { ...person(vault), run_id: run.run_id, expect_receipts: expect, ...(dryRun ? { dry_run: true } : {}) });
-  // The vault says it as error_type; identity's own dry finish says it as error.
-  if (r.status === 404 && (r.body.error_type ?? r.body.error) === "run_not_found" && expect === 0) {
-    // A batch that grafts nothing leaves no run behind, so a run where every note was refused has none to finish.
-    console.log(`finish ${vault}: nothing was grafted (every note refused), so the vault holds no run to finish; nothing to do`);
-    return;
+  const ask = (dry: boolean) => postJson(d, "/ops/history-import/finish", { ...person(vault), run_id: run.run_id, expect_receipts: expect, ...(dry ? { dry_run: true } : {}) });
+  // A batch that grafts nothing leaves no run behind, so a run where every note was refused has none to finish. Asked
+  // as a dry finish first (identity writes no audit row for it; it says run_not_found as `error`).
+  if (expect === 0) {
+    const probe = await ask(true);
+    if (probe.status === 404 && (probe.body.error_type ?? probe.body.error) === "run_not_found") {
+      console.log(`finish ${vault}: nothing was grafted (every note refused), so the vault holds no run to finish; nothing to do`);
+      return;
+    }
   }
+  const r = await ask(dryRun);
   if (r.status !== 200) die(`finish ${vault}: ${why(r.body, r.status)}${r.body.receipts !== undefined ? ` (the vault holds ${r.body.receipts}, expected ${expect})` : ""}`);
   console.log(`finish ${vault}: ${dryRun ? (r.body.would_finish ? "would finish" : "would NOT finish") : "run complete"}, ${r.body.receipts} receipts (expected ${expect})`);
 }

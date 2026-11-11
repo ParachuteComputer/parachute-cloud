@@ -102,19 +102,20 @@ the operator then sends each note's version rows, refs, receipt and blobs with
   `/ops/history-import/status`, `/digest`, `/finish` take the same address,
   reference and vault, and forward to the vault; status and digest write no
   audit row.
-- `POST /api/internal/history-import` (vault; platform only; `?dry_run=true`
-  for a dry run, never inside the batch; `?run_id=`, which identity sends, must
-  be the batch's run, so the audit row names the run that was sent): checks the envelope (native indices,
-  import indices and counts at most 10,000,000; times `Date.parse` reads; no
-  blob over the engine's 2,000,000-byte version limit), verifies every blob by
-  hash, then per note, in its own transaction: grafts only when the note's
-  state on Cloud is the snapshot's (or the owner's oldest version is; a markdown
-  body the export gave a final newline counts as the snapshot's), moves the
-  owner's later versions above the box's native ones, and checks the grafted
-  part's digest. A note already receipted by the same run is left exactly as it
-  is, so a retry never brings back history the owner erased. Never changes a
-  note's current state, marks the vault written, or fires hooks. Up to 16 MiB.
-  `GET` answers counts; `/finish` marks the run complete at a receipt count.
+- `POST /api/internal/history-import` (vault; platform only; `?dry_run=true` for
+  a dry run, never inside the batch; `?run_id=`, which identity sends, must be
+  the batch's run, so a batch that lands is the run its audit row names): checks
+  the envelope (native indices, import indices and counts at most 10,000,000;
+  times `Date.parse` reads; no blob over the engine's 2,000,000-byte version
+  limit), verifies every blob by hash, then per note, in its own transaction:
+  grafts only when the note's state on Cloud is the snapshot's (or the owner's
+  oldest version is; a markdown body the export gave a final newline counts as
+  the snapshot's), moves the owner's later versions above the box's native ones,
+  and checks the grafted part's digest. A note already receipted by the same run
+  is left exactly as it is, so a retry never brings back history the owner
+  erased. Never changes a note's current state, marks the vault written, or
+  fires hooks. Up to 16 MiB. `GET` answers counts; `/finish` marks the run
+  complete at a receipt count.
 - `POST /api/internal/history-digest`: per note, the history digest up to an
   index and whether every body reads back to its hash.
 
@@ -124,15 +125,17 @@ per-note byte ceiling. Its history then grows with every edit and counts against
 the storage meter. The flag is set only by a batch that grafted at least one
 note, in the same commit as its rows; a batch that grafts nothing, or is
 refused, leaves no flag and no run behind (so `finish` of a run where every
-note was refused finds no run, and the client says there is nothing to do). No production run is part of this
+note was refused finds no run: the client asks a dry finish first, which writes
+no audit row, and says there is nothing to do). No production run is part of this
 change.
 
 The graft is not counted as the person writing, and internal routes skip the
 plan's cap gate, so the door has its own: the whole batch runs in one
-transaction, and when a cap is pushed and a batch that grafts a note would
-leave the database above 90% of the notes cap, it is rolled back whole and
-answered `413 history_import_over_cap` with the sizes (a retry that finds every
-note already there is answered as usual). Batches before it stay. `plan` adds up
+transaction, and when a cap is pushed and a batch would grow the database
+and leave it above 90% of the notes cap, it is rolled back whole and
+answered `413 history_import_over_cap` with the sizes. Only a batch that grows
+the database is refused: a retry that finds every note already there is
+answered as usual. Batches before it stay. `plan` adds up
 each dry batch's growth and fails when the projection passes 90% of the cap;
 `run` stops at that 413. No cap pushed, no guard. A later `/ops/vault-import`
 retry would still replace the notes the history sits behind.
