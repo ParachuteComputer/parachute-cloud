@@ -410,6 +410,10 @@ async function main() {
       });
       assert(r.status === 404, `PRODUCTION: ${hook} does not exist (404)`, `status ${r.status}`);
     }
+    // T-442: the browser sign-in link exists only on a single-owner door (OWNER_PUBKEY); Parachute Cloud leaves
+    // that unset, so the route is the router's 404 even before any credential is looked at.
+    const sessionLink = await fetch(`${IDENTITY}/account/session-link`, { method: "POST" });
+    assert(sessionLink.status === 404, "PRODUCTION: /account/session-link does not exist (404, OWNER_PUBKEY unset)", `status ${sessionLink.status}`);
     // THE MOCK-BILLING SECURITY PIN: the interim mock-checkout endpoint is
     // hard-gated to non-production (billing-config.ts mockBillingEnabled). In
     // prod it 404s exactly like the __test/* hooks — a free self-upgrade is

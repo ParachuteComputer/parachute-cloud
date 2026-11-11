@@ -95,6 +95,7 @@ import { handleUnsubscribe, runDrip } from "./drip.ts";
 import { runSnapshotSweep } from "./snapshots.ts";
 import { runUsageRollup } from "./usage.ts";
 import { handleAccountSession } from "./account-session.ts";
+import { handleAccountSessionLink } from "./account-session-link.ts";
 import { handleAccountToken } from "./account-token.ts";
 import {
   handleAccountHandleCheck,
@@ -357,6 +358,13 @@ app.get("/account/summary", (c) => handleAccountSummary(c.env.DB, c.req.raw, dep
 app.get("/account/keys", (c) => handleAccountKeysList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/keys", (c) => handleAccountKeyMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/keys/:name", (c) => handleAccountKeyRevoke(c.env.DB, c.req.raw, depsFor(c.env)));
+// T-442: a one-time browser sign-in link for a single-owner door's key-only owner (account-session-link.ts). Only
+// there: without OWNER_PUBKEY (Parachute Cloud) this is the router's own 404, the same as an unknown route.
+app.post("/account/session-link", (c) => {
+  const deps = depsFor(c.env);
+  if (!deps.ownerPubkey) return c.notFound();
+  return handleAccountSessionLink(c.env.DB, c.req.raw, deps);
+});
 app.get("/account/pubkeys", (c) => handleAccountPubkeysList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/pubkeys", (c) => handleAccountPubkeyLink(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/pubkeys/:pubkey", (c) => handleAccountPubkeyUnlink(c.env.DB, c.req.raw, depsFor(c.env)));

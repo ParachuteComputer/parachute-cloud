@@ -1,5 +1,7 @@
 /**
- * The account-deletion audit log (migration 0026, T-318). One row per
+ * The account-deletion audit log (migration 0026, T-318), which also records
+ * each browser session link a single-owner door's owner mints (T-442,
+ * account-session-link.ts; the note names `next`'s path, never the token). One row per
  * delete request, undo, and purge — the durable answer to "was this emailed
  * request acted on, by whom, when", and the place the purge records its
  * Stripe outcome once the user row that carried the Stripe ids is gone.
@@ -22,6 +24,7 @@ export type AuditAction =
   | "vault_import_finished"
   | "vault_import_read_token"
   | "vault_import_abort"
+  | "session_link_minted"
   | "history_import_batch"
   | "history_import_finished";
 

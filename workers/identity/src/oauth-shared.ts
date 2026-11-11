@@ -97,8 +97,9 @@ export interface OAuthDeps {
    */
   billingMode?: BillingMode;
   /**
-   * The single-owner deploy's owner key (env OWNER_PUBKEY, decoded to 64 lowercase hex), or undefined. Only read
-   * by the NIP-98 sign-in's first-owner bootstrap (nostr-auth.ts).
+   * The single-owner deploy's owner key (env OWNER_PUBKEY, decoded to 64 lowercase hex), or undefined. Read by the
+   * NIP-98 sign-in's first-owner bootstrap (nostr-auth.ts), and as the gate that makes `POST /account/session-link`
+   * exist at all (index.ts, account-session-link.ts).
    */
   ownerPubkey?: string;
 }
