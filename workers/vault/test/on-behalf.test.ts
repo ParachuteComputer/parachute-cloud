@@ -81,6 +81,16 @@ describe("on-behalf-of on REST", () => {
     expect(await exists("OB/keep")).toBe(true);
   });
 
+  it("a granted delete records who it was for on the delete revision, with the key and its kind", async () => {
+    const g = await granted();
+    expect((await rest(g, "POST", "/api/notes", { content: "to go", path: "OB/del" })).status).toBe(201);
+    const id = (await read("OB/del")).id;
+    expect((await rest(g, "DELETE", `/api/notes/${encodeURIComponent(id)}`, undefined, "client-2")).status).toBe(200);
+    const versions = ((await (await rest(OP, "GET", `/api/notes/${encodeURIComponent(id)}/versions`)).json()) as any).versions as any[];
+    const del = versions.find((v) => v.op === "delete") ?? versions[0];
+    expect([del?.actor, del?.via, del?.via_kind]).toEqual(["fernhill-portal:client-2", "key:fernhill-portal", "app"]);
+  });
+
   it("a bad id is 400 invalid_on_behalf_of; a route that records no writer refuses the header", async () => {
     const g = await granted();
     const bad = await rest(g, "POST", "/api/notes", { content: "x", path: "OB/bad" }, "a:b");
@@ -148,10 +158,14 @@ describe("the token's stamp claims", () => {
     expect([versions[0]?.via, versions[0]?.via_kind]).toEqual(["key:arcade-worker", "app"]);
   });
 
-  it("the 0.8 shape (permissions.app_key, no key claim) keeps its name and level and can't act for anyone", async () => {
+  it("the 0.8 shape (permissions.app_key, no key claim) keeps its name and level, its revisions say app, and it can't act for anyone", async () => {
     const old = await mintToken({ vault: V, scopes, vaultScope: [V], clientId: "parachute-app-key", permissions: { app_key: "podcast-studio" } });
     expect((await rest(old, "POST", "/api/notes", { content: "x", path: "OB/old" })).status).toBe(201);
     expect((await read("OB/old")).createdVia).toBe("key:podcast-studio");
+    expect((await rest(old, "PATCH", `/api/notes/${encodeURIComponent("OB/old")}`, { content: "y", force: true })).status).toBe(200);
+    const oldId = (await read("OB/old")).id;
+    const vs = ((await (await rest(OP, "GET", `/api/notes/${encodeURIComponent(oldId)}/versions`)).json()) as any).versions as any[];
+    expect([vs[0]?.via, vs[0]?.via_kind]).toEqual(["key:podcast-studio", "app"]);
     expect((await rest(old, "POST", "/api/notes", { content: "x", path: "OB/old2" }, "client-42")).status).toBe(403);
     expect((await rest(old, "PUT", "/api/tags/x", { description: "admin only" })).status).toBe(403);
   });

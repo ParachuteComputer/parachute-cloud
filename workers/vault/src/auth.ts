@@ -593,6 +593,8 @@ export async function authenticateVaultToken(
     throw err;
   }
   if (stampKey !== null) rememberKeyKind(stampKey);
+  // A key of the 0.8 shape (T-430: identity's `permissions.app_key` on an app-key token, no key claim) is an app key.
+  else if (appKeyName !== null) rememberKeyKind({ name: appKeyName, kind: "app" });
 
   // The signature is already verified (validateHubJwt above); decoding the
   // payload for `exp` is safe. `jti` is surfaced by scope-guard's claims.

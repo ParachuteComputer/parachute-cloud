@@ -1837,10 +1837,11 @@ async function handleNotesInner(
     if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (erase === "true") {
-      const r = await store.forgetNote(note.id);
+      const r = await store.forgetNote(note.id, { actor: writeCtx.actor, via: writeCtx.via });
       return json({ deleted: true, id: note.id, history_erased: { versions_deleted: r.versionsDeleted, blobs_deleted: r.blobsDeleted } });
     }
-    await store.deleteNote(note.id);
+    // The delete revision carries the write stamp, as on the box (routes.ts).
+    await store.deleteNote(note.id, { actor: writeCtx.actor, via: writeCtx.via });
     return json({ deleted: true, id: note.id });
   }
 
