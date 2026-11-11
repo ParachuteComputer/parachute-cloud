@@ -74,14 +74,96 @@ This POST retains the hosted frozen/cap write gate; history erasure remains
 available when capped, but manual compaction is not a cap-bypass mechanism.
 
 Core retention defaults apply (20-version floor, 100-version ceiling, 180-day
-age target, no automatic expiry of deleted-note history). History occupies the
-existing physical SQLite storage meter. A bounded maintenance pass runs once
-when an instance loads state, without a new recurring alarm. This does not
-promise immediate compaction of every edit on a long-lived instance.
+age target, no automatic expiry of deleted-note history), except in a vault that
+received an operator history import (below), which keeps all its history.
+History occupies the existing physical SQLite storage meter. A bounded
+maintenance pass runs once when an instance loads state, without a new recurring
+alarm. This does not promise immediate compaction of every edit on a long-lived
+instance.
 
-No Git archive import, mirror retirement or backfill runs in a Durable Object.
-Imported selectors support already-present rows; they are not a hosted import
-workflow. No production deployment is included in this change.
+No Git archive import, mirror retirement or backfill runs in a Durable Object:
+the archive is read on a self-hosted box, and Cloud only receives its result.
+
+## Operator history import (T-450)
+
+A person who moved from a self-hosted box can have the box's note history put
+behind their notes on Cloud. The box runs core's `history-import apply` first;
+the operator then sends each note's version rows, refs, receipt and blobs with
+`scripts/ops-history-import.ts` (`local`, `plan`, `run`, `digest`, `finish`,
+`status`; counts only). The doors:
+
+- `POST /ops/history-import` (identity; bearer `OPS_RUN_TOKEN`): multipart. The
+  address twice, a reference, the vault name, `dry_run`, the run id and the
+  batch's counts as fields, and the batch's JSON as the file part `batch`. The
+  account must be in good standing and own the vault. A batch that writes is
+  audited first; the counts in that row are the ones the client stated
+  (`stated_*`), since identity passes the batch's bytes to the vault without
+  opening them, and the log line after the vault answers has its real totals.
+  `/ops/history-import/status`, `/digest`, `/finish` take the same address,
+  reference and vault, and forward to the vault; status and digest write no
+  audit row.
+- `POST /api/internal/history-import` (vault; platform only; `?dry_run=true` for
+  a dry run, never inside the batch; `?run_id=`, which identity sends, must be
+  the batch's run, so a batch that lands is the run its audit row names): checks
+  the envelope (native indices, import indices and counts at most 10,000,000;
+  times `Date.parse` reads; no blob over the engine's 2,000,000-byte version
+  limit), verifies every blob by hash, then per note, in its own transaction:
+  grafts only when the note's state on Cloud is the snapshot's (or the owner's
+  oldest version is; a markdown body the export gave a final newline counts as
+  the snapshot's), moves the owner's later versions above the box's native ones,
+  and checks the grafted part's digest. A note already receipted by the same run
+  is left exactly as it is, so a retry never brings back history the owner
+  erased. Never changes a note's current state, marks the vault written, or
+  fires hooks. Up to 16 MiB. `GET` answers counts; `/finish` marks the run
+  complete at a receipt count.
+- `POST /api/internal/history-digest`: per note, the history digest up to an
+  index and whether every body reads back to its hash.
+
+A vault that received a graft keeps all history (a DO-storage flag, applied on
+every state load before maintenance; a vault that holds receipts runs keep-all
+even if the flag were lost, and puts it back): max 1,000,000 versions, 36,500 days, no
+per-note byte ceiling. Its history then grows with every edit and counts against
+the storage meter. The flag is set only by a batch that grafted at least one
+note, in the same commit as its rows; a batch that grafts nothing, or is
+refused, leaves no flag and no run behind (so `finish` of a run where every note
+was refused finds no run: identity looks the run up before it audits, and the
+client says there is nothing to do). No production run is part of this change.
+
+The graft is not counted as the person writing, and internal routes skip the
+plan's cap gate, so the door has its own: the whole batch runs in one
+transaction, and a batch that grafts a note and would leave the database above
+90% of the vault's cap is rolled back whole and answered
+`413 history_import_over_cap` with the sizes. Batches before it stay. A batch
+that grafts nothing (a retry, or every note refused) is rolled back too, so it
+leaves the vault exactly as it was, and is answered as usual. `plan` adds up each dry batch's growth and fails when the
+projection passes 90% of the cap; `run` stops at that 413. A vault with no plan
+caps pushed is held to what its whole-storage cap leaves once its files are
+counted, so every vault is guarded. A batch that grafts into a run already
+marked complete reopens it. Receipts are not tied to notes: a later blow-away
+import or restore into the same vault leaves them (and keep-all) in place, so a
+second graft of the same run answers `already` for those notes. Only destroying
+the vault clears them. A later `/ops/vault-import` retry would still replace the notes the
+history sits behind.
+
+A note with a version whose metadata is not a JSON object (a client once wrote it
+double-encoded on the box) is left out whole by the client and counted: the door
+refuses such a row, and a note's history is not sent in part.
+
+Before a run: stop editing on the box after `apply` (its retention may prune
+imported rows, and the client then refuses to send: `local` shows the count);
+`plan` first. Then know these:
+
+- Run in a quiet window, and have the person re-read a version list opened
+  before the graft. When the owner already had versions of a note, the graft
+  moves them up past the box's native ones, so an app still holding the old
+  list can restore the wrong version by its index.
+- A note refused as `note_changed` stays refused when the owner's oldest
+  version on Cloud was pruned before the graft (default retention keeps 100):
+  that version was the link to the box's state. There is no override.
+- There is no un-graft door. The owner can erase a note's history
+  (`DELETE /api/notes/:id/versions`); keep-all stays on.
+- A receipt with `imported_count 0` marks a note that got only the box's native
+  versions (it had no imported history).
 
 ## Browser bundle and validation
 
