@@ -23,7 +23,12 @@ export type AuditAction =
   | "vault_import_finished"
   | "vault_import_read_token"
   | "vault_import_abort"
-  | "session_link_minted";
+  | "session_link_minted"
+  // T-446 handover (vault-handover.ts). The note is {vault_id, handover}: two server ids, never an address or a name.
+  | "vault_handover_offered"
+  | "vault_handover_withdrawn"
+  | "vault_handover_given"
+  | "vault_handover_received";
 
 /** Stable per-account key that is not the user id itself. */
 export function auditTargetHash(userId: string): Promise<string> {

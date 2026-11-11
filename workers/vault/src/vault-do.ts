@@ -1312,6 +1312,7 @@ export class VaultDO extends DurableObject {
       if (apiPath === "/internal/config") return this.handleInternalConfig(request);
       if (apiPath === "/internal/health") return this.handleInternalHealth(request);
       if (apiPath === "/internal/keys/revoke") return this.handleKeyRevoke(request);
+      if (apiPath === "/internal/handover-cut") return this.handleHandoverCut(request);
       if (apiPath === "/internal/keys/used") {
         if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
         return json({ used: await this.appKeys.lastUsed() });
@@ -1634,6 +1635,10 @@ export class VaultDO extends DurableObject {
     if (auth.jti && (await this.appKeys.isRevoked(auth.jti))) {
       return { error: json({ error: "Unauthorized", message: "this key has been revoked" }, 401) };
     }
+    // Handover (T-446): the previous owner's tokens from before the handover are refused here.
+    if (await this.appKeys.refuses(auth)) {
+      return { error: json({ error: "Unauthorized", message: "this token's account no longer owns this vault" }, 401) };
+    }
     if (auth.jti && auth.clientId === APP_KEY_CLIENT_ID) await this.appKeys.noteUse(auth.jti, auth.exp);
     return auth;
   }
@@ -1649,6 +1654,27 @@ export class VaultDO extends DurableObject {
       await this.ctx.storage.delete(SEED_PENDING_KEY);
     }
     this.seedChecked = true;
+  }
+
+  /**
+   * POST /api/internal/handover-cut {sub, before} — identity's push when this vault is handed to another account
+   * (T-446): refuse the previous owner's tokens issued at or before `before` (ISO), on every door, from the next
+   * request. Idempotent.
+   */
+  private async handleHandoverCut(request: Request): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    let body: { sub?: unknown; before?: unknown };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return json({ error: "Bad request", message: "send {sub, before}" }, 400);
+    }
+    const at = typeof body.before === "string" ? Date.parse(body.before) : NaN;
+    if (typeof body.sub !== "string" || !body.sub || body.sub === "operator" || Number.isNaN(at)) {
+      return json({ error: "Bad request", message: "send {sub, before}" }, 400);
+    }
+    await this.appKeys.cutOwner(body.sub, Math.floor(at / 1000));
+    return json({ cut: true });
   }
 
   /** POST /api/internal/keys/revoke {jti, expires_at} — identity's push when the owner revokes an app key (T-414). */
@@ -2802,7 +2828,7 @@ export class VaultDO extends DurableObject {
       // (ENVIRONMENT=test) to keep the integration suite hermetic — the tracker
       // is unit-tested with an injected fetcher, and staging exercises the live
       // path. A null jti (operator bearer) is never revocable.
-      if (att.jti && (await this.appKeys.isRevoked(att.jti))) {
+      if (await this.appKeys.refuses(att)) {
         this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
         continue;
       }
@@ -2910,7 +2936,7 @@ export class VaultDO extends DurableObject {
       return;
     }
     // App-key door (T-414): a key revoked at this vault can't open or keep a socket.
-    if (result.auth.jti && (await this.appKeys.isRevoked(result.auth.jti))) {
+    if (await this.appKeys.refuses(result.auth)) {
       this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
       return;
     }
@@ -2950,6 +2976,7 @@ export class VaultDO extends DurableObject {
       scopeRaw: auth.scopes,
       exp: auth.exp,
       jti: auth.jti,
+      iat: auth.iat ?? null,
       actor: auth.actor,
       via: auth.via,
       clientId: auth.clientId,
@@ -2986,7 +3013,7 @@ export class VaultDO extends DurableObject {
       return;
     }
     // App-key door (T-414): a key revoked at this vault can't open or keep a socket.
-    if (result.auth.jti && (await this.appKeys.isRevoked(result.auth.jti))) {
+    if (await this.appKeys.refuses(result.auth)) {
       this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
       return;
     }
@@ -3005,6 +3032,7 @@ export class VaultDO extends DurableObject {
       scopeRaw: auth.scopes,
       exp: auth.exp,
       jti: auth.jti,
+      iat: auth.iat ?? null,
       actor: auth.actor,
       via: auth.via,
       clientId: auth.clientId,

@@ -24,9 +24,12 @@ export const SEED_PENDING_KEY = "welcome_seed_pending";
 export const KEY_USE_INTERVAL_MS = 60_000;
 const REVOKED_KEY = "app_keys_revoked";
 const USED_KEY = "app_keys_used";
+/** DO key (T-446): previous owners cut by a handover, subject → epoch seconds; see {@link AppKeyLedger.cutOwner}. */
+const OWNER_CUTS_KEY = "owner_cuts";
 
 export class AppKeyLedger {
   private revoked: Record<string, string> | null = null; // jti → expires_at (ISO)
+  private cuts: Record<string, number> | null = null; // previous owner's sub → cut (epoch s)
   private used: Record<string, { at: string; exp: number | null }> | null = null; // jti → last use, key's exp (s)
 
   constructor(private readonly storage: DurableObjectStorage) {}
@@ -76,5 +79,32 @@ export class AppKeyLedger {
   /** jti → last use (ISO), for identity's key list. */
   async lastUsed(): Promise<Record<string, string>> {
     return Object.fromEntries(Object.entries(await this.usedMap()).map(([k, v]) => [k, v.at]));
+  }
+
+  private async cutsMap(): Promise<Record<string, number>> {
+    this.cuts ??= (await this.storage.get<Record<string, number>>(OWNER_CUTS_KEY)) ?? {};
+    return this.cuts;
+  }
+
+  /**
+   * A handover (T-446): every token whose subject is the vault's previous owner and that was issued at or before
+   * `before` (epoch seconds) is refused here from now on — an app key, an OAuth access token, a vault token the
+   * account minted, a socket already open. Idempotent; a later cut for the same subject only moves forward.
+   * Tokens that subject is issued AFTER the cut pass (identity mints only for a vault's current owner, so those
+   * exist only if the vault comes back to them). Kept for good: one small entry per handover.
+   */
+  async cutOwner(sub: string, before: number): Promise<void> {
+    const map = await this.cutsMap();
+    if ((map[sub] ?? -Infinity) >= before) return;
+    map[sub] = before;
+    await this.storage.put(OWNER_CUTS_KEY, map);
+  }
+
+  /** Whether this vault refuses a token: its key was revoked here, or its subject was cut by a handover. */
+  async refuses(t: { jti: string | null; actor: string | null; iat?: number | null }): Promise<boolean> {
+    if (t.jti && (await this.isRevoked(t.jti))) return true;
+    if (!t.actor) return false;
+    const cut = (await this.cutsMap())[t.actor];
+    return cut !== undefined && (t.iat == null || t.iat <= cut);
   }
 }

@@ -88,6 +88,11 @@ export interface AuthResult {
    * revocation that lands AFTER the socket authed).
    */
   jti: string | null;
+  /**
+   * The JWT's `iat` (epoch SECONDS), or null/absent (operator bearer / no iat). A handover's owner cut (T-446,
+   * app-keys.ts `refuses`) refuses the previous owner's tokens issued at or before the cut.
+   */
+  iat?: number | null;
 }
 
 /**
@@ -554,9 +559,11 @@ export async function authenticateVaultToken(
   // The signature is already verified (validateHubJwt above); decoding the
   // payload for `exp` is safe. `jti` is surfaced by scope-guard's claims.
   let exp: number | null = null;
+  let iat: number | null = null;
   try {
     const payload = decodeJwt(token);
     exp = typeof payload.exp === "number" ? payload.exp : null;
+    iat = typeof payload.iat === "number" ? payload.iat : null;
   } catch {
     exp = null;
   }
@@ -581,6 +588,7 @@ export async function authenticateVaultToken(
       clientId: claims.clientId ?? null,
       exp,
       jti: claims.jti ?? null,
+      iat,
     },
   };
 }
