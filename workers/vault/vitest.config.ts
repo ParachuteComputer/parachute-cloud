@@ -24,7 +24,7 @@ function jsToTsResolver() {
 }
 
 /**
- * TWO PROJECTS, one `bun x vitest run` (T-318 money switch). The vault DO reads
+ * FOUR PROJECTS, one `bun x vitest run` (T-318 money switch). The vault DO reads
  * BILLING_MODE from its env, and a DO's env can't vary per test — so the suite
  * runs twice-shaped:
  *   - `vault`           — everything, under BILLING_MODE="paid": the frozen
@@ -34,7 +34,7 @@ function jsToTsResolver() {
  *                         (the deployed default): a stored `frozen: true`
  *                         must not block writes.
  */
-function project(name: string, billingMode: "paid" | "open_beta", files: { include?: string[]; exclude?: string[] }) {
+function project(name: string, billingMode: "paid" | "open_beta", files: { include?: string[]; exclude?: string[] }, ownRuntime = false) {
   return defineWorkersProject({
     plugins: [jsToTsResolver()],
     resolve: {
@@ -73,6 +73,8 @@ function project(name: string, billingMode: "paid" | "open_beta", files: { inclu
               // test/row-cost.test.ts: extra vault sizes to meter (e.g. "5000,50000"); empty in CI.
               ROW_METER_SIZES: process.env.ROW_METER_SIZES ?? "",
               ROW_METER_TOP: process.env.ROW_METER_TOP ?? "",
+              // Different bindings make a different runtime: the pool reuses one workerd for projects configured alike.
+              ...(ownRuntime ? { TEST_RUNTIME: name } : {}),
             },
           },
         },
@@ -84,8 +86,16 @@ function project(name: string, billingMode: "paid" | "open_beta", files: { inclu
 export default defineConfig({
   test: {
     projects: [
-      project("vault", "paid", { exclude: [...configDefaults.exclude, "test/open-beta/**"] }),
+      // The paid suite in two runtimes, by file name. One workerd holds every vault its files make and every test
+      // file's copy of the worker's modules; all of it in one sat at the heap limit ("JavaScript heap out of memory"
+      // on about a third of `next`'s runs, and on every run once the worker grew by the history import).
+      project("vault", "paid", { include: ["test/[a-h]*.test.ts"], exclude: [...configDefaults.exclude, "test/history-graft.test.ts"] }, true),
+      project("vault-2", "paid", { include: ["test/[i-z]*.test.ts"], exclude: [...configDefaults.exclude] }, true),
       project("vault-open-beta", "open_beta", { include: ["test/open-beta/**/*.test.ts"] }),
+      // Its own runtime (T-450): every project is one workerd whose vaults stay in memory for the whole run, and the
+      // main project already sits near the heap limit. This file makes some fifty vaults; added to that run it ended
+      // "JavaScript heap out of memory" in CI. Same bindings as "vault".
+      project("vault-history-graft", "paid", { include: ["test/history-graft.test.ts"] }, true),
     ],
   },
 });

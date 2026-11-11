@@ -3,9 +3,10 @@
  * `packages/hub/src/account-keys.ts`, with the same wire shapes so one client works against a box, Parachute
  * Cloud and a single-owner deploy on your own Cloudflare:
  *
- *   POST   /account/keys          {name, vault, can: "read"|"write", expires_in?}
+ *   POST   /account/keys          {name, vault, can: "read"|"write", expires_in?, on_behalf_of?: true}
  *                                 → 201 {name, vault, can, status, scopes, token, created_at, expires_at, last_used_at, revoked_at}
  *   GET    /account/keys          → 200 {keys: [{name, vault, can, status, created_at, expires_at, last_used_at, revoked_at}]}
+ *                                 (`on_behalf_of: true` is added, on the mint answer and in the list, only on a key that has it)
  *   DELETE /account/keys/<name>   → 200 {name, revoked_at}   (idempotent; 404 for a name this account doesn't have)
  *
  * What holds it safe:
@@ -27,6 +28,15 @@
  *   - **It outlives a signing-key rotation**: the key row records its `kid`, and JWKS keeps a retired signing key
  *     while a live app key needs it (signing-keys.ts).
  *
+ * The write stamp (Parachute 0.9.1, as on the box): every key's name and kind are signed into it as a top-level `key`
+ * claim (`{name, kind: "app"}`), so a 0.9 vault stamps its writes `via key:<name>` and its revisions with the kind.
+ * With `on_behalf_of: true` the owner also lets the key write on behalf of people it names: the token carries
+ * `permissions.acts_for: "<name>"` and a write may say who it is for, stamped `by <name>:<id>` (core `write-stamp.ts`).
+ * The key's name is that prefix, so it must fit the prefix rule. Only the owner's own account token reaches this
+ * route (`ownerGate`), so neither an app key nor an OAuth app can grant it, and OAuth consent never does. The grant is
+ * stored on the key's registry row (`tokens.permissions`, the column the box uses), which is what the list reads.
+ * A 0.8 vault worker refuses a token carrying `acts_for` (fail closed) rather than ignore it.
+ *
  * Long-lived: one year by default and at most; `expires_in` (seconds) can shorten it.
  */
 import { requireAccount, readJsonBody } from "./account-api.ts";
@@ -42,7 +52,22 @@ export const APP_KEY_MAX_TTL_SECONDS = 365 * 24 * 60 * 60;
 export const APP_KEY_MIN_TTL_SECONDS = 60;
 export const APP_KEY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const VAULT_NAME_RE = /^[a-z0-9][a-z0-9-]{1,62}$/;
-const BODY_FIELDS = new Set(["name", "vault", "can", "expires_in"]);
+const BODY_FIELDS = new Set(["name", "vault", "can", "expires_in", "on_behalf_of"]);
+/**
+ * The on-behalf-of prefix rule, the twin of core `write-stamp.ts` (ON_BEHALF_PREFIX_RE, RESERVED_PREFIXES) and the
+ * box's hub `keys.ts` onBehalfNameProblem: the key's name becomes the prefix of every "by" it stamps.
+ */
+const ON_BEHALF_PREFIX_RE = /^[a-z0-9.-]{1,64}$/;
+const RESERVED_PREFIXES: readonly string[] = [
+  "nostr", "key", "grant", "agent", "applet", "token", "operator", "migrate", "surface", "mcp", "api",
+];
+export function onBehalfNameProblem(name: string): string | null {
+  if (!ON_BEHALF_PREFIX_RE.test(name)) {
+    return `a key that writes on behalf of others is named for the prefix its writes carry ("by ${name}:<id>"), so its name is 1 to 64 lowercase letters, digits, '.' and '-': e.g. "fernhill-portal"`;
+  }
+  if (RESERVED_PREFIXES.includes(name)) return `"${name}" is reserved (${RESERVED_PREFIXES.join(", ")}); a key that writes on behalf of others needs another name`;
+  return null;
+}
 /** How long the list waits for one vault's last-use answer before showing what D1 has. */
 const LAST_USED_TIMEOUT_MS = 3000;
 
@@ -55,6 +80,18 @@ interface AppKeyRow {
   expires_at: string;
   last_used_at: string | null;
   revoked_at: string | null;
+  /** The registry row's permissions JSON (`{"acts_for": "<name>"}` on a key with the on-behalf-of grant). */
+  permissions: string | null;
+}
+
+function actsFor(permissions: string | null): string | null {
+  if (!permissions) return null;
+  try {
+    const v = (JSON.parse(permissions) as { acts_for?: unknown }).acts_for;
+    return typeof v === "string" ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 const err = (status: number, error: string, message: string) =>
@@ -72,12 +109,14 @@ function view(r: AppKeyRow, now: Date) {
     expires_at: r.expires_at,
     last_used_at: r.last_used_at,
     revoked_at: r.revoked_at,
+    // Present only on a key that may write on behalf of others, so every other key's shape is unchanged.
+    ...(actsFor(r.permissions) !== null ? { on_behalf_of: true } : {}),
   };
 }
 
 // The registry's revocation (vault delete, account delete, a family sweep) also ends an app key: read it live.
 const ROWS_SQL = `SELECT a.name, a.jti, a.vault_name, a.can, a.created_at, a.expires_at, a.last_used_at,
-         COALESCE(a.revoked_at, t.revoked_at) AS revoked_at
+         COALESCE(a.revoked_at, t.revoked_at) AS revoked_at, t.permissions
     FROM app_keys a LEFT JOIN tokens t ON t.jti = a.jti
    WHERE a.user_id = ?`;
 
@@ -106,7 +145,7 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
   const body = await readJsonBody(req);
   const extra = Object.keys(body).filter((k) => !BODY_FIELDS.has(k));
   if (extra.length) {
-    return err(400, "invalid_request", `unknown field(s): ${extra.join(", ")}; an app key takes name, vault, can and expires_in`);
+    return err(400, "invalid_request", `unknown field(s): ${extra.join(", ")}; an app key takes name, vault, can, expires_in and on_behalf_of`);
   }
   const { name, vault, can, expires_in } = body;
   if (typeof name !== "string" || !APP_KEY_NAME_RE.test(name)) {
@@ -117,6 +156,14 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
   }
   if (can !== "read" && can !== "write") {
     return err(400, "invalid_scope", 'can: "read" or "write"; an app key is never admin');
+  }
+  const onBehalf = body.on_behalf_of;
+  if (onBehalf !== undefined && typeof onBehalf !== "boolean") {
+    return err(400, "invalid_request", 'on_behalf_of: true lets the key write on behalf of people it names (stamped "by <name>:<id>"); false or absent, it writes as you');
+  }
+  if (onBehalf === true) {
+    const problem = onBehalfNameProblem(name);
+    if (problem) return err(400, "invalid_name", problem);
   }
   let ttl = APP_KEY_MAX_TTL_SECONDS;
   if (expires_in !== undefined) {
@@ -134,6 +181,7 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
   }
 
   const scopes = can === "write" ? [`vault:${vault}:read`, `vault:${vault}:write`] : [`vault:${vault}:read`];
+  const permissions = onBehalf === true ? { acts_for: name } : null;
   const now = deps.now?.() ?? new Date();
   const signed = await signAccessToken(db, {
     sub: userId,
@@ -146,16 +194,18 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
     permissions: { app_key: name },
     ttlSeconds: ttl,
     now: () => now,
+    key: { name, kind: "app" },
+    ...(permissions ? { permissions } : {}),
   });
   const createdAt = now.toISOString();
   try {
     await db.batch([
       db
         .prepare(
-          `INSERT INTO tokens (jti, user_id, subject, client_id, scopes, expires_at, created_at, created_via)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'app_key')`,
+          `INSERT INTO tokens (jti, user_id, subject, client_id, scopes, expires_at, created_at, created_via, permissions)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'app_key', ?)`,
         )
-        .bind(signed.jti, userId, name, APP_KEY_CLIENT_ID, scopes.join(" "), signed.expiresAt, createdAt),
+        .bind(signed.jti, userId, name, APP_KEY_CLIENT_ID, scopes.join(" "), signed.expiresAt, createdAt, permissions ? JSON.stringify(permissions) : null),
       db
         .prepare(
           `INSERT INTO app_keys (user_id, name, jti, vault_name, can, kid, created_at, expires_at)
@@ -178,6 +228,7 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
     expires_at: signed.expiresAt,
     last_used_at: null,
     revoked_at: null,
+    permissions: permissions ? JSON.stringify(permissions) : null,
   };
   return ok({ ...view(row, now), scopes, token: signed.token }, 201);
 }

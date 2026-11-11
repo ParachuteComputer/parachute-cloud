@@ -562,6 +562,19 @@ export async function authenticateVaultToken(
     };
   }
 
+  // ON-BEHALF-OF (Parachute 0.9.1, T-446). Identity mints `permissions.acts_for` on an app key its owner let write
+  // on behalf of others. This worker doesn't stamp "by" from the request, so serving the key would write its
+  // custodial writes as the owner, unstamped. Refuse it (core write-stamp.ts: the grant rides in `permissions` so a
+  // vault that doesn't know it refuses the key). The 0.9 vault worker enforces it instead.
+  if (claims.permissions && "acts_for" in claims.permissions) {
+    console.warn("[auth] JWT rejected: permissions.acts_for is set but this vault cannot stamp on-behalf-of writes");
+    return {
+      ok: false,
+      reason: "unauthorized",
+      message: "token may write on behalf of others, which this vault does not support yet",
+    };
+  }
+
   // Write-attribution axis 2 — the NIP-98 signing pubkey, when present.
   // Fail-soft; see `parsePrincipalPubkey`.
   const principalPubkey = parsePrincipalPubkey(claims.permissions);

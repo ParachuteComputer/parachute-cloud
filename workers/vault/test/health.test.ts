@@ -242,6 +242,8 @@ describe("health sink — bounds", () => {
     expect(routeOf("/api/subscribe", true)).toBe("subscribe-ws");
     expect(routeOf("/api/whatever-a-caller-types", false)).toBe("api:other");
     expect(routeOf("/api/internal/anything", false)).toBe("internal:other");
+    expect(routeOf("/api/internal/history-import/finish", false)).toBe("internal:history-import");
+    expect(routeOf("/api/internal/history-digest", false)).toBe("internal:history-digest");
     expect(routeOf("/api/internal/health", false)).toBeNull();
     expect(routeOf("/__test/fail-next", false)).toBeNull();
     expect(routerFailureKind(new Error("Durable Object's isolate exceeded its CPU time limit and was reset."))).toBe("cpu_limit");
