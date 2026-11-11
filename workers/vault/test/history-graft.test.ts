@@ -97,7 +97,7 @@ async function makeBox(specs: NoteSpec[], run = RUN): Promise<string> {
 
 /** The client's batches, read out of the box DO. */
 async function boxBatches(box: string, opts: { dryRun?: boolean; targetBytes?: number; maxNotes?: number } = {}): Promise<GraftBatch[]> {
-  return runInDurableObject(stub(box), async (inst: any) => planBatches(inst.store.db, opts).batches.map((b) => b.batch));
+  return runInDurableObject<DurableObject, GraftBatch[]>(stub(box), async (inst: any) => planBatches(inst.store.db, opts).batches.map((b) => b.batch));
 }
 
 /** The cloud vault: the same notes, at the box's current state, no history. */
@@ -125,7 +125,7 @@ async function graft(v: string, batch: GraftBatch): Promise<{ status: number; bo
 
 /** Everything the import may touch, counted; plus the full `notes` rows. */
 async function snapshot(v: string): Promise<any> {
-  return runInDurableObject(stub(v), async (inst: any) => {
+  return runInDurableObject<DurableObject, any>(stub(v), async (inst: any) => {
     const db = inst.store.db;
     const n = (sql: string) => db.prepare(sql).get().n;
     return {
@@ -185,7 +185,7 @@ describe("operator history import (vault side)", () => {
     expect(((await (await op(cloud, `/api/notes/${B.id}/imports/0`)).json()) as any).content).toBe("b once");
 
     // The compacted note: deltas arrive as deltas on a whole base, and every version reads back exactly.
-    const deltas = await runInDurableObject(stub(cloud), async (inst: any) =>
+    const deltas = await runInDurableObject<DurableObject, any>(stub(cloud), async (inst: any) =>
       inst.store.db.prepare("SELECT COUNT(*) AS n FROM note_blobs d JOIN note_blobs b ON b.hash = d.delta_of WHERE d.encoding = 'fossil-delta' AND b.encoding IS NULL").get().n,
     );
     expect(deltas).toBeGreaterThan(0);
@@ -326,7 +326,7 @@ describe("operator history import (vault side)", () => {
     const res = await graft(cloud, wrong);
     expect(res.status).toBe(200);
     expect(Object.fromEntries(res.body.notes.map((n: any) => [n.id, n.outcome]))).toEqual({ [A.id]: "digest_mismatch", [B.id]: "grafted" });
-    const mid: any = await runInDurableObject(stub(cloud), async (inst: any) => ({
+    const mid: any = await runInDurableObject<DurableObject, any>(stub(cloud), async (inst: any) => ({
       versions: inst.store.db.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").get(A.id).n,
       receipt: inst.store.db.prepare("SELECT COUNT(*) AS n FROM history_import_receipts WHERE note_id = ?").get(A.id).n,
       orphanBlobs: inst.store.db.prepare("SELECT COUNT(*) AS n FROM note_blobs b WHERE NOT EXISTS (SELECT 1 FROM note_versions v WHERE v.content_hash = b.hash) AND NOT EXISTS (SELECT 1 FROM note_blobs d WHERE d.delta_of = b.hash)").get().n,
@@ -348,7 +348,7 @@ describe("operator history import (vault side)", () => {
 
     // Imported rows with no receipt: refused.
     const unreceipted = await makeCloud([current(A)]);
-    await runInDurableObject(stub(unreceipted), async (inst: any) => {
+    await runInDurableObject<DurableObject, any>(stub(unreceipted), async (inst: any) => {
       const db = inst.store.db;
       db.prepare("INSERT INTO note_blobs (hash, content, byte_size) VALUES (?, 'x', 1)").run(hashContent("x"));
       db.prepare("INSERT INTO note_versions (note_id, version_ix, content_hash, superseded_at, op, content_len) VALUES (?, -1, ?, '2020-01-01', 'import', 1)").run(A.id, hashContent("x"));
@@ -378,7 +378,7 @@ describe("operator history import (vault side)", () => {
     const st: any = await (await op(cloud, "/api/internal/history-import")).json();
     expect(st).toMatchObject({ keep_all: true, imported_versions: 2, native_versions: 2, refs: 2, runs: [{ run_id: RUN.run_id, status: "applying", receipts: 1 }] });
 
-    const kept = await runInDurableObject(stub(cloud), async (inst: any) => {
+    const kept = await runInDurableObject<DurableObject, any>(stub(cloud), async (inst: any) => {
       // A cold load applies the policy again, before the load-time maintenance.
       inst.store.setHistoryPolicy(undefined);
       inst.stateLoaded = false;
@@ -391,7 +391,7 @@ describe("operator history import (vault side)", () => {
     expect(kept).toEqual({ imported: 2, all: 154 });
 
     const plain = await makeCloud([current(A)]);
-    const pruned = await runInDurableObject(stub(plain), async (inst: any) => {
+    const pruned = await runInDurableObject<DurableObject, any>(stub(plain), async (inst: any) => {
       for (let i = 0; i < 150; i++) await inst.store.updateNote(A.id, { content: `edit ${i}`, force: true });
       return inst.store.db.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").get(A.id).n;
     });
@@ -423,7 +423,7 @@ describe("operator history import (vault side)", () => {
     const [batch] = await boxBatches(box);
     const cloud = await makeCloud([current(A), current(B), current(C)]);
     expect((await graft(cloud, batch!)).body.totals.grafted).toBe(3);
-    const local = await runInDurableObject(stub(box), async (inst: any) => {
+    const local = await runInDurableObject<DurableObject, ReturnType<typeof readBoxNote>[]>(stub(box), async (inst: any) => {
       const run = readBoxRun(inst.store.db);
       return [A, B, C].map((s) => readBoxNote(inst.store.db, s.id, run));
     });
@@ -434,7 +434,7 @@ describe("operator history import (vault side)", () => {
     }
     expect(dg.notes.at(-1)).toMatchObject({ found: false, versions: 0, content_ok: true });
 
-    await runInDurableObject(stub(cloud), async (inst: any) => {
+    await runInDurableObject<DurableObject, any>(stub(cloud), async (inst: any) => {
       inst.store.db.prepare("UPDATE note_blobs SET content = 'damaged' WHERE hash = ?").run(hashContent("b once"));
     });
     const dg2: any = await (await post(cloud, "/internal/history-digest", query)).json();
@@ -454,7 +454,7 @@ describe("operator history import (vault side)", () => {
   it("splits a box into batches that each carry their blobs, bases included", async () => {
     const box = await makeBox([A, B, C]);
     // A delta's base whose own version was pruned on the box: no version names it, only the delta needs it.
-    const dropped: number[] = await runInDurableObject(stub(box), async (inst: any) => {
+    const dropped = await runInDurableObject<DurableObject, number[]>(stub(box), async (inst: any) => {
       const db = inst.store.db;
       const baseHash = db.prepare("SELECT delta_of AS h FROM note_blobs WHERE encoding = 'fossil-delta' LIMIT 1").get().h;
       const ixs = db.prepare("SELECT version_ix FROM note_versions WHERE note_id = ? AND content_hash = ?").all(C.id, baseHash).map((r: any) => r.version_ix);
