@@ -255,5 +255,7 @@ describe("one multi-vault door: a key read on A and write on B", () => {
     const w = await a.tool(legacy, "create-note", { vault: o.B, path: "x", content: "y" });
     expect(w.ok).toBe(false);
     expect(a.hops.length).toBe(1);
+    // Its tool list is the three tools it had before, and nothing else.
+    expect((await a.tools(legacy)).map((t) => t.name).sort()).toEqual(["create-vault", "list-vaults", "query-notes"]);
   });
 });

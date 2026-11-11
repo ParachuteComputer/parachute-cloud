@@ -192,6 +192,27 @@ export async function resolveCoverage(
   return { covered: "listed", vaults, names: vaults.map((v) => v.name), create: grant.create };
 }
 
+/**
+ * THE LEVEL SEAM (0.9.1 "one multi-vault door"): the level this key (or connection) has on this vault, from its own
+ * grant — `null` when the grant doesn't name it. Every hop the account door mints is held to it: a read hop never
+ * asks for more than read, a write hop needs `write` here and asks for exactly write, and nothing through this door
+ * ever asks for admin (the bridge write-clamp in vault-call.ts refuses it too). The person's own role on the vault
+ * plays no part, and neither does the grant's highest level on another vault.
+ *
+ * OWNERSHIP is a separate check ({@link resolveCoverage}): call this only for a vault already in the live coverage.
+ * The 1.0 grants (core `contracts/suites/door-v1`) replace this one function; nothing else reads levels.
+ *
+ * A level-less grant (the Wave A `account:<id>:vaults` family) reads as `read`, exactly what it reached before.
+ */
+export function keyLevelOnVault(grant: AccountConnectionGrant, vault: string): ComposedVaultVerb | null {
+  const named = grant.vaults.get(vault) ?? null;
+  const all = grant.wildcard;
+  if (named === null) return all;
+  if (all === null) return named;
+  // Both: the token carries both scopes, so it holds the higher of the two (never more than it carries).
+  return COMPOSED_VERB_RANK[all] > COMPOSED_VERB_RANK[named] ? all : named;
+}
+
 /** The per-call context the tool executors run against. */
 export interface AccountToolContext {
   db: D1Database;
@@ -209,6 +230,12 @@ export interface AccountToolContext {
    * VERIFIED event; {@link principalAttributionClaims} is the only producer.
    */
   principal: AttributionPrincipal;
+  /**
+   * The named key this connection is (`{name, kind}`), from the account token's signed `key` claim — set only on a
+   * multi-vault key minted at `POST /account/keys {vaults}`. Every write hop carries it, so the vault stamps the
+   * write `via key:<name>` exactly as if the key had written there itself. Absent for an OAuth connection.
+   */
+  key?: { name: string; kind: "person" | "agent" | "app" | "service" };
 }
 
 /** A single account-MCP tool: a pure definition + an executor that throws
@@ -217,6 +244,8 @@ export interface AccountMcpTool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /** The executor returns the vault's own MCP `result` (content blocks), passed through untouched. */
+  passThrough?: boolean;
   execute(args: Record<string, unknown>, ctx: AccountToolContext): Promise<unknown>;
 }
 
@@ -227,7 +256,8 @@ const listVaultsTool: AccountMcpTool = {
   description:
     "List the vaults this account can reach through the connection — the granted, currently-owned vaults. " +
     "Returns each vault's name, URL, creation time, and latest recorded storage usage, plus whether the grant " +
-    "covers ALL of the account's vaults or a specific listed subset.",
+    "covers ALL of the account's vaults or a specific listed subset, and this connection's level on each " +
+    "(read, write or admin; a write needs write).",
   inputSchema: { type: "object", properties: {}, additionalProperties: false },
   async execute(_args, ctx) {
     const coverage = await resolveCoverage(ctx.db, ctx.accountId, ctx.grant);
@@ -236,6 +266,7 @@ const listVaultsTool: AccountMcpTool = {
       const row = usage.get(v.name);
       return {
         name: v.name,
+        level: keyLevelOnVault(ctx.grant, v.name),
         vault_id: v.vaultId,
         url: vaultAdvertisedUrl(v.name, ctx.deps),
         created_at: v.createdAt,
@@ -476,6 +507,135 @@ const queryNotesTool: AccountMcpTool = {
   },
 };
 
-/** The account-MCP tool set — EXACTLY three tools (Wave A). Order is stable so
+// --- writes: the vault's own note tools, one named vault at a time -------------
+
+/** How long a write hop may take before the door gives up on it. */
+export const WRITE_TIMEOUT_MS = 30_000;
+
+/** "fern (read), bake (write)": the vaults this connection reaches and its level on each, for a refusal. */
+function reachList(coverage: Coverage, grant: AccountConnectionGrant): string {
+  return coverage.names.map((n) => `${n} (${keyLevelOnVault(grant, n)})`).join(", ") || "none";
+}
+
+/**
+ * Resolve the vault a write names: it must be named, be EXACTLY one of the live coverage names (no case folding, no
+ * path tricks — the name is compared as a whole string, never parsed), and carry `write` or more at the level seam.
+ * Every refusal names the vaults the connection reaches and its level on each.
+ */
+async function writableVault(tool: string, args: Record<string, unknown>, ctx: AccountToolContext): Promise<string> {
+  const coverage = await resolveCoverage(ctx.db, ctx.accountId, ctx.grant);
+  const named = args.vault;
+  if (typeof named !== "string" || named.length === 0) {
+    throw new AccountToolError(
+      "vault_required",
+      `${tool} needs \`vault\`: the vault to write to. This connection reaches ${reachList(coverage, ctx.grant)}.`,
+      { vaults: Object.fromEntries(coverage.names.map((n) => [n, keyLevelOnVault(ctx.grant, n)])) },
+    );
+  }
+  if (!coverage.names.includes(named)) {
+    throw new AccountToolError(
+      "vault_not_covered",
+      `Vault "${named}" is not among the vaults this connection reaches: ${reachList(coverage, ctx.grant)}.`,
+    );
+  }
+  const level = keyLevelOnVault(ctx.grant, named);
+  if (level === null || COMPOSED_VERB_RANK[level] < COMPOSED_VERB_RANK.write) {
+    throw new AccountToolError(
+      "vault_read_only",
+      `This connection can only read "${named}", so ${tool} is refused there. It reaches ${reachList(coverage, ctx.grant)}.`,
+    );
+  }
+  return named;
+}
+
+/**
+ * One account-door write tool: the vault's own MCP tool of the same name, reached through one hop at `write`
+ * (never the person's role, never admin), stamped with the key. The arguments (less `vault`) go to the vault
+ * unchanged, so the engine's own schema and checks decide what a write may be; its answer comes back unchanged.
+ */
+function writeTool(name: string, description: string): AccountMcpTool {
+  return {
+    name,
+    description,
+    inputSchema: {
+      type: "object",
+      properties: {
+        vault: {
+          type: "string",
+          description: "The vault to write to, exactly as list-vaults names it. Required: a write always names its vault.",
+        },
+      },
+      required: ["vault"],
+      additionalProperties: true,
+    },
+    passThrough: true,
+    async execute(args, ctx) {
+      const vault = await writableVault(name, args, ctx);
+      const { vault: _named, ...rest } = args;
+      const attribution = principalAttributionClaims(ctx.principal);
+      const res = await callVaultApi(ctx.db, ctx.deps, {
+        userId: ctx.accountId,
+        vaultName: vault,
+        method: "POST",
+        apiPath: "/mcp",
+        verb: "write",
+        clientId: ACCOUNT_TOKEN_CLIENT_ID,
+        extraHeaders: { accept: "application/json, text/event-stream" },
+        jsonBody: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: rest } },
+        signal: AbortSignal.timeout(WRITE_TIMEOUT_MS),
+        ...(attribution?.permissions !== undefined ? { permissions: attribution.permissions } : {}),
+        ...(ctx.key ? { key: ctx.key } : {}),
+      });
+      type RpcAnswer = { result?: unknown; error?: { message?: unknown; data?: unknown } };
+      let body: RpcAnswer | null = null;
+      try {
+        body = (await res.json()) as RpcAnswer;
+      } catch {
+        // Not JSON-RPC: refused below.
+      }
+      if (body?.error) {
+        const data = (body.error.data ?? {}) as Record<string, unknown>;
+        const type = typeof data.error_type === "string" ? data.error_type : "vault_error";
+        throw new AccountToolError(type, `${vault}: ${String(body.error.message ?? "the vault refused the write")}`, { vault });
+      }
+      if (!res.ok || !body || body.result === undefined) {
+        throw new AccountToolError("vault_unavailable", `${vault}: the vault answered ${res.status}; nothing is known to be written.`, { vault });
+      }
+      return body.result;
+    },
+  };
+}
+
+const WRITE_TOOLS: readonly AccountMcpTool[] = [
+  writeTool(
+    "create-note",
+    "Create a note (or several) in ONE vault, named by `vault`. Takes the same arguments as that vault's own " +
+      "create-note. Needs write on that vault; list-vaults shows this connection's level on each.",
+  ),
+  writeTool(
+    "update-note",
+    "Update a note in ONE vault, named by `vault`. Takes the same arguments as that vault's own update-note. " +
+      "Needs write on that vault.",
+  ),
+  writeTool(
+    "delete-note",
+    "Delete a note in ONE vault, named by `vault`. Takes the same arguments as that vault's own delete-note. " +
+      "Needs write on that vault.",
+  ),
+];
+
+/** Whether this connection holds write (or more) on any vault — the write tools are listed only then, so a read-only
+ *  connection (every Wave A level-less grant among them) sees exactly the three tools it saw before. */
+export function grantCanWrite(grant: AccountConnectionGrant): boolean {
+  const atLeastWrite = (v: ComposedVaultVerb | null) => v !== null && COMPOSED_VERB_RANK[v] >= COMPOSED_VERB_RANK.write;
+  return atLeastWrite(grant.wildcard) || [...grant.vaults.values()].some(atLeastWrite);
+}
+
+/** The tools this connection is shown: the three Wave A tools, plus the note writes when it can write somewhere. */
+export function toolsFor(grant: AccountConnectionGrant): readonly AccountMcpTool[] {
+  return grantCanWrite(grant) ? ACCOUNT_MCP_TOOLS : ACCOUNT_MCP_TOOLS.filter((t) => !t.passThrough);
+}
+
+/** The account-MCP tool set: the three Wave A tools, then the note writes (0.9.1). Order is stable so
  *  `tools/list` is deterministic. */
-export const ACCOUNT_MCP_TOOLS: readonly AccountMcpTool[] = [listVaultsTool, createVaultTool, queryNotesTool];
+export const ACCOUNT_MCP_TOOLS: readonly AccountMcpTool[] = [listVaultsTool, createVaultTool, queryNotesTool, ...WRITE_TOOLS];
