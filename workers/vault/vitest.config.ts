@@ -34,7 +34,7 @@ function jsToTsResolver() {
  *                         (the deployed default): a stored `frozen: true`
  *                         must not block writes.
  */
-function project(name: string, billingMode: "paid" | "open_beta", files: { include?: string[]; exclude?: string[] }) {
+function project(name: string, billingMode: "paid" | "open_beta", files: { include?: string[]; exclude?: string[] }, ownRuntime = false) {
   return defineWorkersProject({
     plugins: [jsToTsResolver()],
     resolve: {
@@ -54,6 +54,8 @@ function project(name: string, billingMode: "paid" | "open_beta", files: { inclu
           // instead uses a UNIQUE vault name → a fresh DO (idFromName), so state
           // never crosses tests without the snapshot machinery.
           isolatedStorage: false,
+          // A project that must not share a workerd with another runs alone, one file at a time.
+          ...(ownRuntime ? { singleWorker: true } : {}),
           wrangler: { configPath: "./wrangler.toml" },
           miniflare: {
             // Conformance-test bindings. TEST_JWKS lets the auth matrix run
@@ -73,6 +75,8 @@ function project(name: string, billingMode: "paid" | "open_beta", files: { inclu
               // test/row-cost.test.ts: extra vault sizes to meter (e.g. "5000,50000"); empty in CI.
               ROW_METER_SIZES: process.env.ROW_METER_SIZES ?? "",
               ROW_METER_TOP: process.env.ROW_METER_TOP ?? "",
+              // Different bindings make a different runtime: the pool reuses one workerd for projects configured alike.
+              ...(ownRuntime ? { TEST_RUNTIME: name } : {}),
             },
           },
         },
@@ -89,7 +93,7 @@ export default defineConfig({
       // Its own runtime (T-450): every project is one workerd whose vaults stay in memory for the whole run, and the
       // main project already sits near the heap limit. This file makes some fifty vaults; added to that run it ended
       // "JavaScript heap out of memory" in CI. Same bindings as "vault".
-      project("vault-history-graft", "paid", { include: ["test/history-graft.test.ts"] }),
+      project("vault-history-graft", "paid", { include: ["test/history-graft.test.ts"] }, true),
     ],
   },
 });
