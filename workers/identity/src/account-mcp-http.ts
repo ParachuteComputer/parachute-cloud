@@ -33,6 +33,7 @@ import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import { validateAccountToken } from "./account-auth.ts";
 import {
   toolsFor,
+  grantCanWrite,
   type AccountConnectionGrant,
   type AccountToolContext,
   AccountToolError,
@@ -290,13 +291,15 @@ async function handleToolCall(
   }
 }
 
-function instructions(): string {
+function instructions(canWrite: boolean): string {
   return (
     "The Parachute account MCP — one connection across your vaults. " +
-    "Use list-vaults to see the vaults this connection can reach, create-vault to add one, " +
-    "query-notes to search across them (omit `vault` to fan out, pass it to target one), and create-note, " +
-    "update-note and delete-note to write to one vault, which every write must name in `vault`. " +
-    "Each vault is reached at this connection's own level on it (list-vaults shows it): a write needs write there."
+    "Use list-vaults to see the vaults this connection can reach and its level on each, create-vault to add one, " +
+    "and query-notes to search across them (omit `vault` to fan out, pass it to target one)" +
+    (canWrite
+      ? ". create-note, update-note and delete-note write to one vault, which every write must name in `vault`; " +
+        "a write needs write on that vault."
+      : ". This connection reads; it does not write.")
   );
 }
 
@@ -313,7 +316,7 @@ async function handleOne(m: JsonRpcMessage, ctx: AccountToolContext): Promise<Js
           protocolVersion,
           capabilities: { tools: {} },
           serverInfo: { name: "parachute-account", version: "0.1.0" },
-          instructions: instructions(),
+          instructions: instructions(grantCanWrite(ctx.grant)),
         });
       }
       case "tools/list":
@@ -448,7 +451,7 @@ async function handleModern(m: JsonRpcMessage, ctx: AccountToolContext): Promise
       reply = result(id, {
         supportedVersions: ALL_SUPPORTED_VERSIONS,
         capabilities: { tools: {} },
-        instructions: instructions(),
+        instructions: instructions(grantCanWrite(ctx.grant)),
         ttlMs: MODERN_CACHE_TTL_MS,
         cacheScope: "private",
       });

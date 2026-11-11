@@ -165,7 +165,7 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
   const body = await readJsonBody(req);
   const extra = Object.keys(body).filter((k) => !BODY_FIELDS.has(k));
   if (extra.length) {
-    return err(400, "invalid_request", `unknown field(s): ${extra.join(", ")}; an app key takes name, vault, can, expires_in and on_behalf_of`);
+    return err(400, "invalid_request", `unknown field(s): ${extra.join(", ")}; an app key takes name, vault, can, expires_in and on_behalf_of, or name, vaults and expires_in`);
   }
   const { name, vault, can, expires_in } = body;
   if (typeof name !== "string" || !APP_KEY_NAME_RE.test(name)) {

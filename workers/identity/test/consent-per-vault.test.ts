@@ -89,6 +89,18 @@ describe("consent per vault on the account door", () => {
     expect((await redeem(capped)).scope).toBe(`account:${p.id}:vaults:${p.A}:read`);
   });
 
+  test("levels set per vault while \"Any vault\" is still picked, or an access level other than read/write: no code (review r2)", async () => {
+    const p = await person();
+    const { clientId } = await seedApprovedClient();
+    const wildWithLevels = await consent(p.sessionId, clientId, { ...levels({ [p.A]: "none", [p.B]: "write" }), vault_mode: "wildcard", access_verb: "write" });
+    expect(wildWithLevels.code).toBeNull();
+    const adminVerb = await consent(p.sessionId, clientId, { ...levels({ [p.A]: "read" }), vault_mode: "specific", access_verb: "admin" });
+    expect(adminVerb.code).toBeNull();
+    // The page left as rendered (every select at read) with "Any vault" still connects, as before.
+    const plain = await consent(p.sessionId, clientId, { ...levels({ [p.A]: "read", [p.B]: "read", [p.C]: "read" }), vault_mode: "wildcard", access_verb: "read" });
+    expect((await redeem(plain)).scope).toBe(`account:${p.id}:vaults:*:read`);
+  });
+
   test("above write, someone else's vault, a name holding ':' or every vault at none: no code", async () => {
     const p = await person();
     const { id: other } = await seedUser(`client-42-${crypto.randomUUID().slice(0, 6)}@example.com`);

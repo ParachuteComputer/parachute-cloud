@@ -856,10 +856,22 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
 
     // Per-vault levels (0.9.1 "one multi-vault door"): each vault at none, read or write, chosen on this page.
     // Taken when the form says so (`account_vault_levels=1`) and the person did not pick "Any vault".
+    const postedVerb = form.get("access_verb");
+    if (postedVerb !== null && postedVerb !== "read" && postedVerb !== "write") {
+      return htmlError("Invalid request", "Choose a valid access level (read or read & write).", 400);
+    }
+    // "Any vault" with a vault's level changed from the page's default (read): the person set levels per vault but
+    // left the mode on every vault, so neither reading is safe to guess (review r2). Ask again; no code.
+    if (form.get("account_vault_levels") === "1" && String(form.get("vault_mode") ?? "") === "wildcard") {
+      const changed = [...form.keys()].some((k) => k.startsWith(VAULT_LEVEL_FIELD) && form.getAll(k).some((v) => v !== "read"));
+      if (changed) {
+        return htmlError("Choose how to connect", "You set a level for each vault but left “Any vault” picked. Go back and pick “Only the vaults you choose” to use those levels, or set them all back to Read.", 400);
+      }
+    }
     if (form.get("account_vault_levels") === "1" && String(form.get("vault_mode") ?? "") !== "wildcard") {
       // The page's "Read only" radio caps every vault at read (review r1: a person who picked it must never grant
       // write through a select left at a higher level). A form without the radio (the door contract's) is uncapped.
-      const cap = form.get("access_verb") === "read" ? "read" : "write";
+      const cap = postedVerb === "read" ? "read" : "write";
       const chosen = await perVaultConsentScopes(db, form, session.userId, params, cap);
       if (chosen instanceof Response) return chosen;
       if (form.get("vault_create") !== null) chosen.push(composedVaultCreateScope(session.userId));
