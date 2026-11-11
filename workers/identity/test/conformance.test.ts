@@ -1906,11 +1906,15 @@ describe("account-vaults (Wave A) — consent + narrowing + token/refresh", () =
     expect(html).toContain("See the vaults in this connection");
     // 2. "Create new vaults" — its own checkbox, CHECKED by default.
     expect(html).toContain('name="vault_create" value="1" checked');
-    // 3. Vault set — a mode radio, wildcard DEFAULT (checked); "only these" reveals boxes (all checked).
+    // 3. Vault set — a mode radio, wildcard DEFAULT (checked); "only the vaults you choose" holds one
+    // none/read/write select per vault (0.9.1), offering nothing above write.
     expect(html).toContain('name="vault_mode" value="wildcard" checked');
     expect(html).toContain('name="vault_mode" value="specific"');
-    expect(html).toContain('name="vault_include" value="alpha" checked');
-    expect(html).toContain('name="vault_include" value="beta" checked');
+    expect(html).toContain('name="account_vault_levels" value="1"');
+    for (const v of ["alpha", "beta"]) {
+      const sel = html.match(new RegExp(`<select name="vault_level:${v}"[^>]*>([\\s\\S]*?)</select>`))?.[1] ?? "";
+      expect([...sel.matchAll(/value="([^"]+)"/g)].map((m) => m[1])).toEqual(["none", "read", "write"]);
+    }
     expect(html).toContain("Any vault");
     expect(html).toContain("be part of this connection until you reconnect");
     // 4. Access level — the radio offers EXACTLY read + write; the admin ceiling

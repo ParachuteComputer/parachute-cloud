@@ -185,6 +185,54 @@ async function recordGrantAndRedirect(
   );
 }
 
+/** The per-vault consent fields: `vault_level:<vault>` = none | read | write, one per vault. */
+const VAULT_LEVEL_FIELD = "vault_level:";
+const CONSENT_LEVELS = new Set(["none", "read", "write"]);
+
+/**
+ * Compose the account-door grant from the per-vault consent fields. Every input is untrusted and re-checked here,
+ * fail-closed, and every refusal gives no code:
+ *   - a level other than none / read / write (admin among them) → 400;
+ *   - a field posted twice → 400 (no "last one wins");
+ *   - a vault the person doesn't own now (including a name holding ':' or shaped like a level, which no vault is
+ *     called) → `invalid_scope` back to the app;
+ *   - every vault at none → 400: there is nothing to connect.
+ * The account id is the session's, never a form value. A vault not posted is none.
+ */
+async function perVaultConsentScopes(
+  db: D1Database,
+  form: FormData,
+  userId: string,
+  params: AuthorizeParams,
+): Promise<string[] | Response> {
+  const owned = new Set((await listVaultsForOwner(db, userId)).map((v) => v.name));
+  const chosen: Array<[string, "read" | "write"]> = [];
+  const unowned: string[] = [];
+  const seen = new Set<string>();
+  for (const key of form.keys()) {
+    if (!key.startsWith(VAULT_LEVEL_FIELD) || seen.has(key)) continue;
+    seen.add(key);
+    const values = form.getAll(key);
+    const level = values.length === 1 && typeof values[0] === "string" ? values[0] : "";
+    if (!CONSENT_LEVELS.has(level)) {
+      return htmlError("Invalid request", "Choose none, read, or read & write for each vault.", 400);
+    }
+    const vault = key.slice(VAULT_LEVEL_FIELD.length);
+    if (!owned.has(vault)) {
+      unowned.push(vault);
+      continue;
+    }
+    if (level !== "none") chosen.push([vault, level as "read" | "write"]);
+  }
+  if (unowned.length > 0) {
+    return oauthErrorRedirect(params.redirectUri, "invalid_scope", `you do not own ${unowned.length > 1 ? "these vaults" : "the vault"}: ${unowned.join(", ")}`, params.state);
+  }
+  if (chosen.length === 0) {
+    return htmlError("Vault required", "Give this app read or read & write on at least one vault.", 400);
+  }
+  return chosen.map(([v, level]) => composedVaultScope(userId, v, level));
+}
+
 /**
  * The account-vaults request scopes in the set (Wave A). Called only AFTER the
  * wall gate ({@link findNonRequestableScopes}) has rejected every non-requestable
@@ -804,6 +852,15 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
   if (accountVaultsScopes.length > 0) {
     const refused = denyMixedOrForeignAccountVaults(accountVaultsScopes, scopes, session.userId, params);
     if (refused) return refused;
+
+    // Per-vault levels (0.9.1 "one multi-vault door"): each vault at none, read or write, chosen on this page.
+    // Taken when the form says so (`account_vault_levels=1`) and the person did not pick "Any vault".
+    if (form.get("account_vault_levels") === "1" && String(form.get("vault_mode") ?? "") !== "wildcard") {
+      const chosen = await perVaultConsentScopes(db, form, session.userId, params);
+      if (chosen instanceof Response) return chosen;
+      if (form.get("vault_create") !== null) chosen.push(composedVaultCreateScope(session.userId));
+      return recordGrantAndRedirect(db, params, chosen, session.userId, client, session.id, deps, replaceEarlier);
+    }
 
     // Access level — fail-closed verb whitelist. NEVER admin, never anything else.
     const verb = String(form.get("access_verb") ?? "");
