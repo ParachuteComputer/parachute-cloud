@@ -98,6 +98,26 @@ describe("a handover's owner cut at the vault", () => {
     expect((await call(v, "/api/notes?limit=1", await person(v, BAKERY))).status).toBe(401);
   });
 
+  it("ends a live stream the old owner opened before the handover", async () => {
+    const v = freshVault("handed");
+    const stream = await call(v, "/api/subscribe", await person(v, MARA));
+    expect(stream.status).toBe(200);
+    const reader = stream.body!.getReader();
+    await reader.read(); // the snapshot: the stream is open
+    expect((await cut(v, MARA)).status).toBe(200);
+    // The bakery writes; Mara's stream must have ended, not carry the write.
+    await call(v, "/api/notes", await person(v, BAKERY), { method: "POST", body: JSON.stringify({ content: "Fernhill rye (made up)" }) });
+    const seen: string[] = [];
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const r = await Promise.race([reader.read(), new Promise<null>((res) => setTimeout(() => res(null), Math.max(0, deadline - Date.now())))]);
+      if (r === null) throw new Error("stream still open after the handover");
+      if (r.done) break;
+      seen.push(new TextDecoder().decode(r.value));
+    }
+    expect(seen.join("")).not.toContain("Fernhill rye");
+  });
+
   it("a cut is the first party's alone, and a malformed one is refused", async () => {
     const v = freshVault("handed");
     const maraV = await person(v, MARA);

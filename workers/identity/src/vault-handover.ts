@@ -31,6 +31,7 @@
  */
 import { auditTargetHash } from "./account-audit.ts";
 import { requireAccount, readJsonBody } from "./account-api.ts";
+import { carriesDelegatedPrincipal } from "./account-session-link.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { randomBase64url } from "./crypto.ts";
 import { isUniqueViolation } from "./nostr-auth.ts";
@@ -158,8 +159,9 @@ async function gate(db: D1Database, req: Request, deps: OAuthDeps) {
   }
   const auth = await requireAccount(db, req, deps, "admin");
   if (!auth.ok) return auth;
-  if (auth.clientId !== ACCOUNT_TOKEN_CLIENT_ID) {
-    return { ok: false as const, response: err(403, "insufficient_scope", "a vault is handed over with your own account token, not an app's") };
+  // Not an app's account grant, and not a delegated principal (an admin key acting for the account).
+  if (auth.clientId !== ACCOUNT_TOKEN_CLIENT_ID || carriesDelegatedPrincipal(req)) {
+    return { ok: false as const, response: err(403, "insufficient_scope", "a vault is handed over with the account's own token, not an app's or an admin's") };
   }
   return auth;
 }
@@ -385,14 +387,15 @@ async function whyNot(db: D1Database, deps: OAuthDeps, offer: OfferRow, me: User
 }
 
 /**
- * A replayed accept: nothing changes in D1. While this account still owns the vault, the owner cut is pushed again
- * (idempotent), so a retry heals a push that failed the first time.
+ * A replayed accept: nothing changes in D1. The handover's push is sent again with its own time (idempotent, and the
+ * vault ignores it where a newer handover already spoke), so a retry heals a push that failed the first time, even
+ * after the vault has moved on.
  */
 async function answerReplay(db: D1Database, deps: OAuthDeps, offerId: string, me: string): Promise<Response> {
   const offer = (await db.prepare("SELECT * FROM vault_handovers WHERE id = ?").bind(offerId).first<OfferRow>())!;
   const vault = await getVault(db, offer.vault_name);
-  const stillMine = vault !== null && vault.vaultId === offer.vault_id && vault.ownerUserId === me;
-  const cutNow = stillMine ? await pushOwnerCut(db, deps, vault.name, offer.from_user_id, me, offer.closed_at!) : false;
+  const sameVault = vault !== null && vault.vaultId === offer.vault_id;
+  const cutNow = sameVault ? await pushOwnerCut(db, deps, vault.name, offer.from_user_id, me, offer.closed_at!) : false;
   return ok({ id: offer.id, vault: offer.vault_name, status: "accepted", already: true, accepted_at: offer.closed_at, cut_now: cutNow });
 }
 

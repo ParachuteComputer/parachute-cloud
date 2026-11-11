@@ -183,6 +183,18 @@ describe("handing a vault to another account in place", { timeout: 30_000 }, () 
     expect((await offer(a, bakery.auth, v, bakery.email)).status).toBe(404);
     const appAdmin = await accountBearer(mara.id, "some-oauth-app");
     expect((await offer(a, appAdmin, v, bakery.email)).status).toBe(403);
+    // An admin key acting for the account (a delegated principal on the token) can't hand the vault away either.
+    const delegated = await signAccessToken(env.DB, {
+      sub: mara.id,
+      scopes: [`account:${mara.id}:admin`],
+      audience: ACCOUNT_TOKEN_AUDIENCE,
+      clientId: ACCOUNT_TOKEN_CLIENT_ID,
+      issuer: ISSUER,
+      vaultScope: [],
+      ttlSeconds: 600,
+      permissions: { principal_pubkey: "b".repeat(64) },
+    });
+    expect((await offer(a, `Bearer ${delegated.token}`, v, bakery.email)).status).toBe(403);
     expect([401, 403]).toContain((await offer(a, `Bearer ${keyV.token}`, v, bakery.email)).status);
     expect((await offer(a, mara.auth, v, mara.email)).status).toBe(400); // to yourself
     expect((await offer(a, mara.auth, v, "not-an-address")).status).toBe(400);
