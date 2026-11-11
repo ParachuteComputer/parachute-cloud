@@ -23,6 +23,7 @@ import { describe, expect, it } from "vitest";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { beginImportRun, applyImportedNote, importTargetDigest } from "@openparachute/core/src/history-import.js";
 import { DEFAULT_HISTORY_POLICY, hashContent } from "@openparachute/core/src/history.js";
+import { encodeDelta } from "@openparachute/core/src/delta.js";
 import {
   HISTORY_IX_MAX,
   highestNativeIx,
@@ -664,6 +665,41 @@ describe("operator history import (vault side)", () => {
       const done = await post(cloud, "/internal/history-import/finish", { run_id: RUN.run_id, expect_receipts: 3 });
       expect(done.status).toBe(200);
       expect(await done.json()).toEqual({ run_id: RUN.run_id, status: "complete", receipts: 3 });
+    }
+  });
+
+  it("never stores a delta on a delta: a sent delta whose base is a delta here is stored whole", async () => {
+    const box = await makeBox([C]);
+    const [batch] = await boxBatches(box);
+    const delta = batch!.blobs.find((b) => b.encoding === "fossil-delta")!;
+    const baseHash = delta.delta_of!;
+    const base = batch!.blobs.find((b) => b.hash === baseHash)!;
+    expect(base.encoding).toBeNull();
+    const cloud = await makeCloud([current(C)]);
+    // The vault already holds the base, stored as a delta against another whole blob (as compaction leaves it).
+    await runInDurableObject<DurableObject, void>(stub(cloud), async (inst: any) => {
+      const db = inst.store.db;
+      const other = big(99);
+      db.prepare("INSERT INTO note_blobs (hash, content, byte_size, encoding, delta_of) VALUES (?, ?, ?, NULL, NULL)").run(hashContent(other), other, new TextEncoder().encode(other).byteLength);
+      const payload = encodeDelta(other, base.content);
+      db.prepare("INSERT INTO note_blobs (hash, content, byte_size, encoding, delta_of) VALUES (?, ?, ?, 'fossil-delta', ?)").run(baseHash, payload, new TextEncoder().encode(payload).byteLength, hashContent(other));
+    });
+    const res = await graft(cloud, batch!);
+    expect(res.status, JSON.stringify(res.body).slice(0, 300)).toBe(200);
+    expect(res.body.totals.grafted).toBe(1);
+    const stored = await runInDurableObject<DurableObject, any>(stub(cloud), async (inst: any) => ({
+      delta: inst.store.db.prepare("SELECT encoding, delta_of FROM note_blobs WHERE hash = ?").get(delta.hash),
+      deltaOnDelta: inst.store.db.prepare("SELECT COUNT(*) AS n FROM note_blobs d JOIN note_blobs b ON b.hash = d.delta_of WHERE d.encoding IS NOT NULL AND b.encoding IS NOT NULL").get().n,
+    }));
+    expect(stored).toEqual({ delta: { encoding: null, delta_of: null }, deltaOnDelta: 0 });
+    for (let i = 0; i < 12; i++) {
+      expect(((await (await op(cloud, `/api/notes/${C.id}/versions/${i}`)).json()) as any).content).toBe(big(i));
+    }
+    await runInDurableObject<DurableObject, void>(stub(cloud), async (inst: any) => {
+      expect(() => inst.store.compactHistory({ noteId: C.id, budgetMs: 5000, maxNotes: 1 })).not.toThrow();
+    });
+    for (let i = 0; i < 12; i++) {
+      expect(((await (await op(cloud, `/api/notes/${C.id}/versions/${i}`)).json()) as any).content).toBe(big(i));
     }
   });
 
