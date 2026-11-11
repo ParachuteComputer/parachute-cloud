@@ -1688,10 +1688,10 @@ export class VaultDO extends DurableObject {
     if (!subject(body.from) || !subject(body.to) || body.from === body.to || Number.isNaN(at)) {
       return json({ error: "Bad request", message: "send {from, to, at}" }, 400);
     }
-    await this.appKeys.handover(body.from, body.to, at);
-    // Streams authenticate once, at open: end them all so each reconnects through the door that now bars `from`.
-    // (A hibernated WebSocket is swept against the bar when the DO wakes.)
-    this.subManager?.closeAll();
+    // Streams authenticate once, at open: end them all so each reconnects through the door that now bars `from`
+    // (a hibernated WebSocket is swept against the bar when the DO wakes). Only when this push changed who is barred:
+    // a stale or replayed push must not become a way to drop the current owner's streams.
+    if (await this.appKeys.handover(body.from, body.to, at)) this.subManager?.closeAll();
     return json({ cut: true });
   }
 

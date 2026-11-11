@@ -101,9 +101,9 @@ export class AppKeyLedger {
    * already open). The new owner `to` is unbarred if an earlier handover barred it, but its tokens issued before
    * that earlier handover stay refused. Each subject keeps the time of the latest handover that named it, and an
    * older one never overrides a newer one, so pushes that arrive out of order or are replayed land the same way.
-   * Kept for good: one small entry per subject.
+   * Kept for good: one small entry per subject. True when the marks changed (a stale or repeated push changes nothing).
    */
-  async handover(from: string, to: string, at: number): Promise<void> {
+  async handover(from: string, to: string, at: number): Promise<boolean> {
     const map = await this.cutsMap();
     let changed = false;
     const out = map[from];
@@ -117,6 +117,7 @@ export class AppKeyLedger {
       changed = true;
     }
     if (changed) await this.storage.put(OWNER_CUTS_KEY, map);
+    return changed;
   }
 
   /** Whether this vault refuses a token: its key was revoked here, or a handover barred or cut its subject. */

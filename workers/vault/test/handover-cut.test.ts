@@ -118,6 +118,26 @@ describe("a handover's owner cut at the vault", () => {
     expect(seen.join("")).not.toContain("Fernhill rye");
   });
 
+  it("a stale or repeated push leaves the current owner's stream open", async () => {
+    const v = freshVault("handed");
+    const t0 = new Date();
+    expect((await cut(v, MARA, undefined, { at: t0 })).status).toBe(200);
+    const stream = await call(v, "/api/subscribe", await person(v, BAKERY));
+    const reader = stream.body!.getReader();
+    await reader.read(); // the snapshot
+    expect((await cut(v, MARA, undefined, { at: t0 })).status).toBe(200); // the same push again (a replayed accept)
+    await call(v, "/api/notes", await person(v, BAKERY), { method: "POST", body: JSON.stringify({ content: "Fernhill rye (made up)" }) });
+    let seen = "";
+    const deadline = Date.now() + 5000;
+    while (!seen.includes("Fernhill rye")) {
+      const r = await Promise.race([reader.read(), new Promise<null>((res) => setTimeout(() => res(null), Math.max(0, deadline - Date.now())))]);
+      if (r === null) throw new Error("no write seen on the owner's stream");
+      if (r.done) throw new Error("the owner's stream was closed by a stale push");
+      seen += new TextDecoder().decode(r.value);
+    }
+    await reader.cancel().catch(() => {});
+  });
+
   it("a cut is the first party's alone, and a malformed one is refused", async () => {
     const v = freshVault("handed");
     const maraV = await person(v, MARA);
