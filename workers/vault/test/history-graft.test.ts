@@ -24,7 +24,9 @@ import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { beginImportRun, applyImportedNote, importTargetDigest } from "@openparachute/core/src/history-import.js";
 import { DEFAULT_HISTORY_POLICY, hashContent } from "@openparachute/core/src/history.js";
 import {
+  HISTORY_IX_MAX,
   highestNativeIx,
+  historyDigest,
   planBatches,
   readBoxNote,
   readBoxRun,
@@ -402,6 +404,84 @@ describe("operator history import (vault side)", () => {
     // A strict envelope.
     expect((await graft(fresh, { ...batch!, extra: 1 } as any)).status).toBe(400);
     expect((await graft(fresh, { ...batch!, run: { ...batch!.run, run_id: "short" } })).status).toBe(400);
+  });
+
+  it("refuses a version index, an imported count or an import index past the bound; the note stays editable", async () => {
+    const box = await makeBox([A]);
+    const [batch] = await boxBatches(box);
+    const cloud = await makeCloud([current(A)]);
+    const before = await snapshot(cloud);
+    /** The batch with A's rows changed, its digest recomputed so only the bound can refuse it. */
+    const withA = (change: (a: GraftBatch["notes"][number]) => void): GraftBatch => {
+      const b = structuredClone(batch!);
+      const a = b.notes[0]!;
+      change(a);
+      a.digest = historyDigest(a.versions, a.refs);
+      return b;
+    };
+    const huge = withA((a) => {
+      a.versions.find((v) => v.version_ix === 1)!.version_ix = Number.MAX_SAFE_INTEGER;
+    });
+    const r1 = await graft(cloud, huge);
+    expect(r1.status, JSON.stringify(r1.body)).toBe(400);
+    expect(r1.body.error_type).toBe("invalid_request");
+    const justOver = withA((a) => {
+      a.versions.find((v) => v.version_ix === 1)!.version_ix = HISTORY_IX_MAX + 1;
+    });
+    expect((await graft(cloud, justOver)).status).toBe(400);
+    const count = withA((a) => {
+      a.receipt.imported_count = HISTORY_IX_MAX + 1;
+      a.receipt.pruned_imported = a.receipt.imported_count - a.receipt.retained_count;
+    });
+    expect((await graft(cloud, count)).status).toBe(400);
+    const importIx = withA((a) => {
+      a.refs[0]!.import_ix = HISTORY_IX_MAX + 1;
+    });
+    expect((await graft(cloud, importIx)).status).toBe(400);
+    expect(await snapshot(cloud)).toEqual(before);
+    // The note still takes an edit, and its next version lands where the engine expects.
+    const edit = await op(cloud, `/api/notes/${A.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ content: "a after", force: true }) });
+    expect(edit.status).toBe(200);
+    // At the bound itself, a native row is accepted.
+    const atBound = withA((a) => {
+      a.versions.find((v) => v.version_ix === 1)!.version_ix = HISTORY_IX_MAX;
+    });
+    const fresh = await makeCloud([current(A)]);
+    const ok = await graft(fresh, atBound);
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+    expect(ok.body.totals.grafted).toBe(1);
+  });
+
+  it("refuses up front a blob over the engine's version limit, and times that are not dates", async () => {
+    const box = await makeBox([A]);
+    const [batch] = await boxBatches(box);
+    const cloud = await makeCloud([current(A)]);
+    const before = await snapshot(cloud);
+    const tooBig = "x".repeat(2_000_001);
+    const oversized = structuredClone(batch!);
+    oversized.blobs.push({ hash: hashContent(tooBig), content: tooBig, byte_size: 2_000_001, encoding: null, delta_of: null });
+    const r = await graft(cloud, oversized);
+    expect(r.status, JSON.stringify(r.body).slice(0, 200)).toBe(400);
+    expect(r.body).toEqual({ error: "A blob does not match its hash", error_type: "blob_invalid", hash: hashContent(tooBig) });
+    const times: Array<[string, unknown]> = [
+      ["superseded_at", "not a date"],
+      ["superseded_at", "2020-01-01T00:00:00.000Z" + " ".repeat(30)],
+      ["created_at", "yesterday-ish"],
+      ["created_at", "x".repeat(41)],
+    ];
+    for (const [field, value] of times) {
+      const b = structuredClone(batch!);
+      (b.notes[0]!.versions[0] as any)[field] = value;
+      const res = await graft(cloud, b);
+      expect(res.status, `${field}=${String(value).slice(0, 20)}`).toBe(400);
+      expect(res.body.error_type).toBe("invalid_request");
+    }
+    expect(await snapshot(cloud)).toEqual(before);
+    // created_at may be null.
+    const nullCreated = structuredClone(batch!);
+    for (const v of nullCreated.notes[0]!.versions) v.created_at = null;
+    nullCreated.notes[0]!.digest = historyDigest(nullCreated.notes[0]!.versions, nullCreated.notes[0]!.refs);
+    expect((await graft(cloud, nullCreated)).body.totals.grafted).toBe(1);
   });
 
   it("a grafted vault keeps every imported row through 150 later edits; a plain vault still prunes", async () => {

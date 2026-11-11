@@ -121,6 +121,13 @@ export const GRAFT_MAX_NOTES = 5_000;
 export const GRAFT_MAX_VERSIONS = 50_000;
 export const GRAFT_MAX_BLOBS = 50_000;
 export const DIGEST_MAX_NOTES = 2_000;
+/**
+ * The highest native `version_ix`, `import_ix` and `receipt.imported_count` a
+ * batch may carry. The engine numbers a note's next version MAX(version_ix) + 1;
+ * a row near `Number.MAX_SAFE_INTEGER` would leave it no next number, and every
+ * later edit of the note would fail. Ten million is far past any real history.
+ */
+export const HISTORY_IX_MAX = 10_000_000;
 
 /**
  * A note's state as the box holds it, with the body's exported form beside it
@@ -181,6 +188,10 @@ const isStr = (v: unknown): v is string => typeof v === "string";
 const isStrOrNull = (v: unknown): v is string | null => v === null || typeof v === "string";
 const isCount = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
 const isIx = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v);
+/** At most {@link HISTORY_IX_MAX}: a native index, an import index, an imported count. */
+const isBounded = (v: unknown): v is number => isCount(v) && v <= HISTORY_IX_MAX;
+/** A time as the engine stores it: a short string `Date.parse` reads. */
+const isTime = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 40 && !Number.isNaN(Date.parse(v));
 
 function onlyKeys(o: Record<string, unknown>, keys: readonly string[], where: string): string | null {
   for (const k of Object.keys(o)) if (!keys.includes(k)) return `${where}: unknown field`;
@@ -226,17 +237,19 @@ function checkVersion(v: unknown): string | null {
   );
   if (bad) return bad;
   if (!isIx(v.version_ix)) return "version.version_ix: safe integer";
+  // Imported rows sit at -(import_ix + 1), so the import index bound holds them too.
+  if (v.version_ix > HISTORY_IX_MAX || v.version_ix < -(HISTORY_IX_MAX + 1)) return `version.version_ix: within -${HISTORY_IX_MAX + 1}..${HISTORY_IX_MAX}`;
   if (v.content_hash !== null && (!isStr(v.content_hash) || !HEX64.test(v.content_hash))) return "version.content_hash: 64 hex or null";
   if (!isStrOrNull(v.path)) return "version.path: string or null";
   if (!isStrOrNull(v.metadata)) return "version.metadata: string or null";
   if (!isStrOrNull(v.extension)) return "version.extension: string or null";
-  if (!isStr(v.superseded_at)) return "version.superseded_at: string";
+  if (!isTime(v.superseded_at)) return "version.superseded_at: a time (at most 40 characters)";
   if (!isStrOrNull(v.actor)) return "version.actor: string or null";
   if (!isStrOrNull(v.via)) return "version.via: string or null";
   if (!isStr(v.op)) return "version.op: string";
   if (!isCount(v.content_len)) return "version.content_len: whole number";
   if (v.encoding !== null && v.encoding !== "overflow") return "version.encoding: null or overflow";
-  if (!isStrOrNull(v.created_at)) return "version.created_at: string or null";
+  if (v.created_at !== null && !isTime(v.created_at)) return "version.created_at: a time (at most 40 characters) or null";
   return null;
 }
 
@@ -244,7 +257,7 @@ function checkRef(v: unknown): string | null {
   if (!isObj(v)) return "refs: each must be an object";
   const bad = onlyKeys(v, ["import_ix", "source_commit", "source_blob"], "ref");
   if (bad) return bad;
-  if (!isCount(v.import_ix)) return "ref.import_ix: whole number";
+  if (!isBounded(v.import_ix)) return `ref.import_ix: whole number up to ${HISTORY_IX_MAX}`;
   if (!isStr(v.source_commit) || v.source_commit.length === 0 || v.source_commit.length > 128) return "ref.source_commit: string";
   if (!isStr(v.source_blob) || v.source_blob.length === 0 || v.source_blob.length > 128) return "ref.source_blob: string";
   return null;
@@ -272,7 +285,7 @@ function checkNote(v: unknown): string | null {
   if (rBad) return rBad;
   if (!isStr(r.state_digest) || !HEX64.test(r.state_digest)) return "note.receipt.state_digest: 64 hex";
   for (const k of ["imported_count", "retained_count", "pruned_imported", "pruned_native"] as const) {
-    if (!isCount(r[k])) return `note.receipt.${k}: whole number`;
+    if (!isBounded(r[k])) return `note.receipt.${k}: whole number up to ${HISTORY_IX_MAX}`;
   }
   if (!isStr(r.completed_at)) return "note.receipt.completed_at: string";
   if (!Array.isArray(v.versions)) return "note.versions: array";

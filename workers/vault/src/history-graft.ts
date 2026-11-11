@@ -20,7 +20,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { refreshCompactState } from "@openparachute/core/src/history-compact-state.js";
-import { byteLength, getVersion, hashContent, readBlobContent } from "@openparachute/core/src/history.js";
+import { VERSION_MAX_BYTES, byteLength, getVersion, hashContent, readBlobContent } from "@openparachute/core/src/history.js";
 import { decodeDelta } from "@openparachute/core/src/delta.js";
 import {
   GRAFT_OUTCOMES,
@@ -94,7 +94,10 @@ export function storedDigest(db: GraftDb, id: string, throughIx: number): string
 }
 
 /**
- * Step 2: every blob checks out, or the request is refused whole. Returns each
+ * Step 2: every blob checks out, or the request is refused whole. A blob over
+ * the engine's {@link VERSION_MAX_BYTES} (stored or as its whole body) is
+ * refused here too: the engine never captures a version that large, and DO
+ * SQLite's row limit is close above it, so it would fail at the insert. Returns each
  * blob's logical byte length, and each delta's logical body (needed when its
  * base here turns out not to be whole, so it is stored whole instead).
  */
@@ -105,12 +108,12 @@ function verifyBlobs(db: GraftDb, blobs: GraftBlob[]): { ok: true; lengths: Map<
   for (const b of blobs) {
     if (b.encoding !== null) continue;
     const size = byteLength(b.content);
-    if (hashContent(b.content) !== b.hash || b.byte_size !== size) return { ok: false, hash: b.hash };
+    if (size > VERSION_MAX_BYTES || hashContent(b.content) !== b.hash || b.byte_size !== size) return { ok: false, hash: b.hash };
     lengths.set(b.hash, size);
   }
   for (const b of blobs) {
     if (b.encoding === null) continue;
-    if (b.byte_size !== byteLength(b.content)) return { ok: false, hash: b.hash };
+    if (b.byte_size !== byteLength(b.content) || b.byte_size > VERSION_MAX_BYTES) return { ok: false, hash: b.hash };
     let base: string | null = null;
     const sent = byHash.get(b.delta_of!);
     if (sent) {
@@ -126,8 +129,9 @@ function verifyBlobs(db: GraftDb, blobs: GraftBlob[]): { ok: true; lengths: Map<
     } catch {
       return { ok: false, hash: b.hash };
     }
-    if (hashContent(text) !== b.hash) return { ok: false, hash: b.hash };
-    lengths.set(b.hash, byteLength(text));
+    const length = byteLength(text);
+    if (length > VERSION_MAX_BYTES || hashContent(text) !== b.hash) return { ok: false, hash: b.hash };
+    lengths.set(b.hash, length);
     deltaBodies.set(b.hash, text);
   }
   return { ok: true, lengths, deltaBodies };
