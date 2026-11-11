@@ -32,6 +32,7 @@ import {
   readBoxBlobs,
   readBoxNote,
   readBoxRun,
+  receiptHolds,
   type GraftOutcome,
 } from "../workers/vault/src/history-graft-shared.ts";
 
@@ -55,8 +56,10 @@ export function localCounts(db: Database) {
   const run = readBoxRun(db);
   const ids = boxNoteIds(db);
   let largest = 0;
+  let stale = 0;
   for (const id of ids) {
     const note = readBoxNote(db, id, run);
+    if (!receiptHolds(note)) stale++;
     const blobs = readBoxBlobs(db, note.versions.flatMap((v) => (v.content_hash ? [v.content_hash] : [])));
     const bytes = Buffer.byteLength(JSON.stringify(note)) + blobs.reduce((s, b) => s + Buffer.byteLength(JSON.stringify(b)), 0);
     if (bytes > largest) largest = bytes;
@@ -69,6 +72,7 @@ export function localCounts(db: Database) {
     runs: n("SELECT COUNT(*) AS n FROM history_import_runs"),
     stored_bytes: n("SELECT COALESCE(SUM(byte_size), 0) AS n FROM note_blobs"),
     largest_note_bytes: largest,
+    stale_receipts: stale,
     note_limit_bytes: NOTE_MAX_BYTES,
   };
 }
@@ -140,7 +144,10 @@ async function sendAll(vault: string, dbPath: string, dryRun: boolean, refusedOu
   const db = openBox(dbPath);
   const d = door();
   // Every batch is built (and the 30 MiB note check made) before the first is sent.
-  const { batches, notes } = planBatches(db);
+  const { batches, notes, staleReceipts } = planBatches(db);
+  if (staleReceipts.length > 0) {
+    die(`${dryRun ? "plan" : "run"} ${vault}: ${staleReceipts.length} notes' receipts no longer match their rows (the box edited them after apply and pruned imported rows); nothing sent`);
+  }
   const totals = zeroTotals();
   const refused: string[] = [];
   let versions = 0;
@@ -239,7 +246,8 @@ if (import.meta.main) {
     const c = localCounts(openBox(a));
     console.log(
       `local: ${c.notes_with_history} notes with history, ${c.imported_rows} imported rows, ${c.native_rows} native rows, ${c.refs} refs, ${c.runs} run(s), ` +
-        `${(c.stored_bytes / 1048576).toFixed(1)} MiB stored, largest note ${(c.largest_note_bytes / 1048576).toFixed(2)} MiB (limit ${c.note_limit_bytes / 1048576})`,
+        `${(c.stored_bytes / 1048576).toFixed(1)} MiB stored, largest note ${(c.largest_note_bytes / 1048576).toFixed(2)} MiB (limit ${c.note_limit_bytes / 1048576}), ` +
+        `${c.stale_receipts} notes whose receipt no longer matches (must be 0)`,
     );
   } else if (cmd === "plan" && a && b) await sendAll(a, b, true, undefined);
   else if (cmd === "run" && a && b) await sendAll(a, b, false, flag(rest, "--refused-out") ?? die("run needs --refused-out FILE: digest and finish read it"));

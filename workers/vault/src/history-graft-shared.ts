@@ -425,6 +425,22 @@ export function readBoxBlobs(db: SqlLike, hashes: Iterable<string>): GraftBlob[]
 
 const jsonBytes = (v: unknown) => byteLength(JSON.stringify(v));
 
+/**
+ * Whether a note's receipt still describes its rows. Core sets the receipt's
+ * counts once, at `apply`; a box that kept editing afterwards may have pruned
+ * imported rows under its retention policy, and Cloud refuses such a note as
+ * `invalid`. The client checks this before sending anything.
+ */
+export function receiptHolds(note: GraftNote): boolean {
+  const negatives = note.versions.filter((v) => v.version_ix < 0);
+  const refIxs = new Set(note.refs.map((r) => r.import_ix));
+  return (
+    note.receipt.retained_count === negatives.length &&
+    note.refs.length === negatives.length &&
+    negatives.every((v) => refIxs.has(-v.version_ix - 1))
+  );
+}
+
 export interface PlannedBatch {
   batch: GraftBatch;
   /** The JSON size of `batch`, in bytes. */
@@ -442,7 +458,7 @@ export interface PlannedBatch {
 export function planBatches(
   db: SqlLike,
   opts: { targetBytes?: number; maxNotes?: number; noteMaxBytes?: number } = {},
-): { run: GraftRun; batches: PlannedBatch[]; notes: number } {
+): { run: GraftRun; batches: PlannedBatch[]; notes: number; staleReceipts: string[] } {
   const target = opts.targetBytes ?? BATCH_TARGET_BYTES;
   const maxNotes = opts.maxNotes ?? BATCH_MAX_NOTES;
   const noteMax = opts.noteMaxBytes ?? NOTE_MAX_BYTES;
@@ -454,6 +470,8 @@ export function planBatches(
   let notes: GraftNote[] = [];
   let blobs = new Map<string, GraftBlob>();
   let bytes = envelope;
+  let versions = 0;
+  const staleReceipts: string[] = [];
   const close = () => {
     if (notes.length === 0) return;
     // Bases first across the whole batch, not only within one note's share.
@@ -463,10 +481,12 @@ export function planBatches(
     notes = [];
     blobs = new Map();
     bytes = envelope;
+    versions = 0;
   };
   const ids = boxNoteIds(db);
   for (const id of ids) {
     const note = readBoxNote(db, id, boxRun);
+    if (!receiptHolds(note)) staleReceipts.push(id);
     const needed = readBoxBlobs(
       db,
       note.versions.flatMap((v) => (v.content_hash ? [v.content_hash] : [])),
@@ -474,9 +494,12 @@ export function planBatches(
     const noteBytes = jsonBytes(note) + 1;
     const alone = noteBytes + needed.reduce((s, b) => s + jsonBytes(b) + 1, 0);
     if (alone + envelope > noteMax) throw new Error(`one note's history is ${(alone / 1048576).toFixed(1)} MiB, over the ${(noteMax / 1048576).toFixed(0)} MiB a batch can carry`);
+    if (note.versions.length > GRAFT_MAX_VERSIONS || needed.length > GRAFT_MAX_BLOBS) throw new Error("one note has more versions or blobs than a batch can carry");
     const fresh = needed.filter((b) => !blobs.has(b.hash));
     const added = noteBytes + fresh.reduce((s, b) => s + jsonBytes(b) + 1, 0);
-    if (notes.length > 0 && (notes.length >= maxNotes || bytes + added > target)) {
+    const full =
+      notes.length >= maxNotes || bytes + added > target || versions + note.versions.length > GRAFT_MAX_VERSIONS || blobs.size + fresh.length > GRAFT_MAX_BLOBS;
+    if (notes.length > 0 && full) {
       close();
       for (const b of needed) blobs.set(b.hash, b);
       bytes += alone;
@@ -484,8 +507,9 @@ export function planBatches(
       for (const b of fresh) blobs.set(b.hash, b);
       bytes += added;
     }
+    versions += note.versions.length;
     notes.push(note);
   }
   close();
-  return { run, batches, notes: ids.length };
+  return { run, batches, notes: ids.length, staleReceipts };
 }

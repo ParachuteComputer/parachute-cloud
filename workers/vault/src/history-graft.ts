@@ -238,20 +238,31 @@ function tipHolds(note: GraftNote, live: { content: string | null; path: string 
  * transaction. `txn` is the DO's `transactionSync`. The caller wraps the whole
  * call in an outer transaction it rolls back for a dry run.
  */
-export function graftBatch(db: GraftDb, txn: SyncTxn, batch: GraftBatch): GraftResult {
+/**
+ * The batch-level refusals (a bad blob, a run id recorded with other fields),
+ * without writing. The DO runs it before turning keep-all on, so a refused
+ * batch changes nothing at all; {@link graftBatch} runs the same checks again
+ * in the same synchronous turn as its writes.
+ */
+export function precheckBatch(db: GraftDb, batch: GraftBatch): { ok: true } | { ok: false; status: number; body: Record<string, unknown> } {
   const checked = verifyBlobs(db, batch.blobs);
-  if (!checked.ok) {
-    return { ok: false, status: 400, body: { error: "A blob does not match its hash", error_type: "blob_invalid", hash: checked.hash } };
-  }
-  const existingRun = db.prepare("SELECT run_id, source_fingerprint, tip, options_digest FROM history_import_runs WHERE run_id = ?").get(batch.run.run_id) as
+  if (!checked.ok) return blobRefusal(checked.hash);
+  return runConflict(db, batch) ? runConflictRefusal() : { ok: true };
+}
+const blobRefusal = (hash: string) => ({ ok: false as const, status: 400, body: { error: "A blob does not match its hash", error_type: "blob_invalid", hash } });
+const runConflictRefusal = () => ({ ok: false as const, status: 409, body: { error: "This run id was recorded with other fields", error_type: "run_conflict" } });
+function runConflict(db: GraftDb, batch: GraftBatch): boolean {
+  const existing = db.prepare("SELECT source_fingerprint, tip, options_digest FROM history_import_runs WHERE run_id = ?").get(batch.run.run_id) as
     | { source_fingerprint: string; tip: string; options_digest: string }
     | null;
-  if (
-    existingRun &&
-    (existingRun.source_fingerprint !== batch.run.source_fingerprint || existingRun.tip !== batch.run.tip || existingRun.options_digest !== batch.run.options_digest)
-  ) {
-    return { ok: false, status: 409, body: { error: "This run id was recorded with other fields", error_type: "run_conflict" } };
-  }
+  return !!existing && (existing.source_fingerprint !== batch.run.source_fingerprint || existing.tip !== batch.run.tip || existing.options_digest !== batch.run.options_digest);
+}
+
+export function graftBatch(db: GraftDb, txn: SyncTxn, batch: GraftBatch): GraftResult {
+  const checked = verifyBlobs(db, batch.blobs);
+  if (!checked.ok) return blobRefusal(checked.hash);
+  if (runConflict(db, batch)) return runConflictRefusal();
+  const existingRun = !!db.prepare("SELECT 1 FROM history_import_runs WHERE run_id = ?").get(batch.run.run_id);
 
   const summary: GraftSummary = {
     dry_run: batch.dry_run === true,

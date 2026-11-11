@@ -112,6 +112,12 @@ every state load before maintenance): max 1,000,000 versions, 36,500 days, no
 per-note byte ceiling. Its history then grows with every edit and counts against
 the storage meter. No production run is part of this change.
 
+Before a run: stop editing on the box after `apply` (its retention may prune
+imported rows, and the client then refuses to send: `local` shows the count);
+`plan` first. The graft is not counted as the person writing and does not pass
+the plan's storage cap gate: a later `/ops/vault-import` retry would still
+replace the notes it sits behind, and a large graft can put a vault over its cap.
+
 ## Browser bundle and validation
 
 Cloud embeds the reviewed app history UI at App commit

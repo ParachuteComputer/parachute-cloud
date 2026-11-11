@@ -146,5 +146,11 @@ describe("history import payload builder (bun:sqlite box)", () => {
     const c = localCounts(box);
     expect(c).toMatchObject({ notes_with_history: 4, imported_rows: 3, refs: 3, runs: 1 });
     expect(c.native_rows).toBe(1 + 12 + 1);
+    expect(c.stale_receipts).toBe(0);
+    expect(planBatches(box).staleReceipts).toEqual([]);
+    // The box kept editing after apply and its retention pruned an imported row: caught before anything is sent.
+    box.prepare("DELETE FROM note_versions WHERE note_id = 'n-1-a' AND version_ix = -2").run();
+    expect(planBatches(box).staleReceipts).toEqual(["n-1-a"]);
+    expect(localCounts(box).stale_receipts).toBe(1);
   });
 });

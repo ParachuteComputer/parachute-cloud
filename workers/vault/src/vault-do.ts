@@ -98,7 +98,7 @@ import {
   restoreFromTar,
 } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
-import { digestNotes, finishRun, graftBatch, graftStatus } from "./history-graft.js";
+import { digestNotes, finishRun, graftBatch, graftStatus, precheckBatch } from "./history-graft.js";
 import { GRAFT_MAX_BODY_BYTES, GRAFT_OUTCOMES, parseDigestQuery, parseGraftBatch } from "./history-graft-shared.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, withCloudGuideText, type WelcomeSeedResult } from "./welcome.js";
 import {
@@ -2267,8 +2267,9 @@ export class VaultDO extends DurableObject {
    * GET — the history import's status, counts only.
    *
    * The lock: after the body is read, the only `await` is the keep-all flag's
-   * put, which happens before any vault state is read; from the first read to
-   * the answer everything is synchronous, so no other request interleaves, and
+   * put (on the first real batch, after a read-only precheck that refuses a
+   * bad blob or a conflicting run first); from the graft's first read to the
+   * answer everything is synchronous, so no other request interleaves, and
    * each note is its own transaction. A dry run runs the very same code inside
    * an outer `transactionSync` that is then rolled back (DO transactions nest as
    * savepoints: an inner rollback undoes only its note, the outer one undoes
@@ -2306,7 +2307,11 @@ export class VaultDO extends DurableObject {
     const batch = parsed.value;
     const dry = batch.dry_run === true;
     if (!dry && !this.historyKeepAll) {
-      // Keep-all is on, durably, before the first imported row can land.
+      // A batch the vault refuses whole must leave it exactly as it was, keep-all flag included.
+      const pre = precheckBatch(this.shim, batch);
+      if (!pre.ok) return json(pre.body, pre.status);
+      // Keep-all is on, durably, before the first imported row can land. (graftBatch checks again below, in the
+      // same synchronous turn as its writes: this await is the only one after the body is read.)
       await this.ctx.storage.put(HISTORY_KEEP_ALL_KEY, true);
       this.historyKeepAll = true;
       this.applyHistoryPolicy();

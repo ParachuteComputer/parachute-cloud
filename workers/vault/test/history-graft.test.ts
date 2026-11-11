@@ -319,6 +319,8 @@ describe("operator history import (vault side)", () => {
     expect(bad.status).toBe(400);
     expect(bad.body).toEqual({ error: "A blob does not match its hash", error_type: "blob_invalid", hash: whole.hash });
     expect(await snapshot(cloud)).toEqual(empty);
+    // Refused whole, so not even the keep-all flag is set.
+    expect(((await (await op(cloud, "/api/internal/history-import")).json()) as any).keep_all).toBe(false);
 
     // A wrong digest: that note is rolled back whole, the other grafts.
     const wrong = structuredClone(batch!);
