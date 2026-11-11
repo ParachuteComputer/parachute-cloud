@@ -98,6 +98,7 @@ import {
   restoreFromTar,
 } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
+import { APP_KEY_CLIENT_ID, AppKeyLedger, SEED_PENDING_KEY } from "./app-keys.js";
 import { digestNotes, finishRun, graftBatch, graftStatus } from "./history-graft.js";
 import { GRAFT_MAX_BODY_BYTES, GRAFT_OUTCOMES, HISTORY_IMPORT_CAP_SHARE, parseDigestQuery, parseGraftBatch } from "./history-graft-shared.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, withCloudGuideText, type WelcomeSeedResult } from "./welcome.js";
@@ -557,6 +558,10 @@ export class VaultDO extends DurableObject {
   // In-memory caches of DO-storage state (a warm DO keeps these across
   // requests; loaded lazily on first fetch).
   private config: VaultConfigState | null = null;
+  /** App keys revoked here and their last use (app-keys.ts; T-414). */
+  private appKeys: AppKeyLedger;
+  /** Whether the pending welcome seed has been looked at in this warm instance (seedIfPending). */
+  private seedChecked = false;
   private r2Bytes = 0;
   private stateLoaded = false;
 
@@ -656,6 +661,7 @@ export class VaultDO extends DurableObject {
     super(ctx, env);
     this.env = env;
     this.attachmentTickets = new DoAttachmentTicketProvider(ctx.storage);
+    this.appKeys = new AppKeyLedger(ctx.storage);
     const version = versionLabel(env.CF_VERSION_METADATA);
     this.health = new HealthSink(ctx.storage, version);
     this.logFields = { version, vaultId: ctx.id.toString() };
@@ -858,7 +864,7 @@ export class VaultDO extends DurableObject {
     const vaultName = decodeURIComponent(m[1]!);
     const rest = m[2] ?? "";
     if (rest === "/api/internal/import-status") {
-      const auth = await authenticateVaultRequest(request, this.env, vaultName);
+      const auth = await this.authenticate(request, vaultName);
       if ("error" in auth) return auth.error;
       const forbidden = this.internalForbidden(auth, vaultName);
       if (forbidden) return forbidden;
@@ -866,7 +872,7 @@ export class VaultDO extends DurableObject {
     }
     const bearerless = rest.startsWith("/tickets/") || (rest === "/api/subscribe" && isWebSocketUpgrade(request));
     if (!bearerless) {
-      const auth = await authenticateVaultRequest(request, this.env, vaultName);
+      const auth = await this.authenticate(request, vaultName);
       if ("error" in auth) {
         await request.body?.cancel().catch(() => {});
         return auth.error;
@@ -951,6 +957,34 @@ export class VaultDO extends DurableObject {
     // (authenticateVaultRequest + internalForbidden) — neither depends on DO
     // state, so hoisting them ahead of ensureState changes nothing about what
     // they enforce.
+    // Bare create (T-414) — POST /api/internal/bare, dispatched BEFORE ensureState for the reason destroy is:
+    // ensureState seeds the welcome notes on whatever request first materializes the vault, so the marker has to
+    // land first. Identity sends it as a new vault's first request; on a vault that already materialized it
+    // answers 409 and changes nothing (a seeded vault is never emptied by this). Same first-party gate.
+    if (rest === "/api/internal/bare") {
+      const bareAuth = await authenticateVaultRequest(request, this.env, vaultName);
+      if ("error" in bareAuth) return bareAuth.error;
+      const bareForbidden = this.internalForbidden(bareAuth, vaultName);
+      if (bareForbidden) return bareForbidden;
+      if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+      // A destroyed instance (e.g. a failed bare create's undo, then a quick retry) stays gone, as everywhere else.
+      if (this.destroyed) return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
+      // Bare is allowed while nothing has been seeded: a vault never woken, or one only woken (seed pending,
+      // e.g. by a stranger's request). A vault that was seeded, or written to, is refused and left as it is.
+      const hasConfig = (await this.ctx.storage.get("config")) !== undefined;
+      const pending = (await this.ctx.storage.get<boolean>(SEED_PENDING_KEY)) === true;
+      const seeded = (await this.ctx.storage.get<boolean>(WELCOME_SEEDED_KEY)) === true;
+      // Idempotent: a repeat call (identity retrying after a lost response) on a vault that is bare and still
+      // unmaterialized answers as the first did.
+      if (seeded && !hasConfig) return json({ bare: true });
+      if (seeded || (hasConfig && !pending)) {
+        return json({ error: "Conflict", error_type: "already_materialized", message: "this vault already exists; bare applies only at create" }, 409);
+      }
+      await this.ctx.storage.put(WELCOME_SEEDED_KEY, true);
+      await this.ctx.storage.delete(SEED_PENDING_KEY);
+      this.seedChecked = true;
+      return json({ bare: true });
+    }
     if (rest === "/api/internal/destroy") {
       const destroyAuth = await authenticateVaultRequest(request, this.env, vaultName);
       if ("error" in destroyAuth) return destroyAuth.error;
@@ -1126,7 +1160,7 @@ export class VaultDO extends DurableObject {
     // WWW-Authenticate challenge so a bare 401 walks the client to discovery
     // (design §3.1). Dispatched before the `/api/` gate — MCP is a sibling of it.
     if (rest === "/mcp" || rest.startsWith("/mcp/")) {
-      const mauth = await authenticateVaultRequest(request, this.env, vaultName);
+      const mauth = await this.authenticate(request, vaultName);
       if ("error" in mauth) {
         const headers = new Headers(mauth.error.headers);
         headers.set("WWW-Authenticate", mcpWwwAuthenticate(request, vaultName));
@@ -1177,7 +1211,7 @@ export class VaultDO extends DurableObject {
     // quota is not a secret from them, and the smoke/console read it here.
     if (rest === "" || rest === "/") {
       if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
-      const auth = await authenticateVaultRequest(request, this.env, vaultName);
+      const auth = await this.authenticate(request, vaultName);
       if ("error" in auth) return auth.error;
       if (closed) return accountClosed(request);
       const caps = this.capsCapability();
@@ -1223,7 +1257,7 @@ export class VaultDO extends DurableObject {
     }
 
     // Health is read-only + cheap; still requires read scope like the bun vault.
-    const auth = await authenticateVaultRequest(request, this.env, vaultName);
+    const auth = await this.authenticate(request, vaultName);
     if ("error" in auth) return auth.error;
     if (closed && !apiPath.startsWith("/internal/")) return accountClosed(request);
 
@@ -1293,6 +1327,11 @@ export class VaultDO extends DurableObject {
       if (forbidden) return forbidden;
       if (apiPath === "/internal/config") return this.handleInternalConfig(request);
       if (apiPath === "/internal/health") return this.handleInternalHealth(request);
+      if (apiPath === "/internal/keys/revoke") return this.handleKeyRevoke(request);
+      if (apiPath === "/internal/keys/used") {
+        if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+        return json({ used: await this.appKeys.lastUsed() });
+      }
       if (apiPath === "/internal/snapshot") return this.handleSnapshot(request, vaultName);
       if (apiPath === "/internal/snapshots") return this.handleListSnapshots(request, vaultName);
       if (apiPath === "/internal/restore") return this.handleRestore(request, vaultName);
@@ -1442,7 +1481,10 @@ export class VaultDO extends DurableObject {
       // claim ("the DO comes into existence on first access"), so the vault-as-
       // data first exists HERE, and this DO is the single writer for it.
       // Existing vaults are untouched — they all carry a stored config already.
-      await this.maybeSeedWelcome();
+      // T-414: the seed waits for the first AUTHENTICATED request (`authenticate` → seedIfPending), not this
+      // wake: any request wakes a DO, a stranger's included, and a wake that seeded would let anyone who guesses
+      // a name fill it with the guides before its owner's `bare` create could say no. Until then it is pending.
+      await this.ctx.storage.put(SEED_PENDING_KEY, true);
     }
     this.r2Bytes = (await this.ctx.storage.get<number>(R2_METER_KEY)) ?? 0;
     this.transcribeMinutes = (await this.ctx.storage.get<number>(TRANSCRIBE_MINUTES_KEY)) ?? 0;
@@ -1607,6 +1649,51 @@ export class VaultDO extends DurableObject {
       attachment_bytes: caps.attachment_bytes,
       attachments_enabled: caps.attachment_bytes > 0,
     };
+  }
+
+  /**
+   * Every tenant door's authentication (REST, MCP, the landing, the import gate): the token checks of
+   * `authenticateVaultRequest`, then the app-key door (T-414) — a key revoked HERE is refused at once, and an app
+   * key's use is noted for "last used" (app-keys.ts).
+   */
+  private async authenticate(request: Request, vaultName: string): Promise<{ error: Response } | AuthResult> {
+    const auth = await authenticateVaultRequest(request, this.env, vaultName);
+    if ("error" in auth) return auth;
+    await this.seedIfPending();
+    if (auth.jti && (await this.appKeys.isRevoked(auth.jti))) {
+      return { error: json({ error: "Unauthorized", message: "this key has been revoked" }, 401) };
+    }
+    if (auth.jti && auth.clientId === APP_KEY_CLIENT_ID) await this.appKeys.noteUse(auth.jti, auth.exp);
+    return auth;
+  }
+
+  /**
+   * The welcome seed for a vault first woken by any request (T-414): runs on the first request that authenticates
+   * (so a stranger's wake can't seed it, and a bare create can still follow), then never again.
+   */
+  private async seedIfPending(): Promise<void> {
+    if (this.seedChecked) return;
+    if ((await this.ctx.storage.get<boolean>(SEED_PENDING_KEY)) === true) {
+      await this.maybeSeedWelcome();
+      await this.ctx.storage.delete(SEED_PENDING_KEY);
+    }
+    this.seedChecked = true;
+  }
+
+  /** POST /api/internal/keys/revoke {jti, expires_at} — identity's push when the owner revokes an app key (T-414). */
+  private async handleKeyRevoke(request: Request): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    let body: { jti?: unknown; expires_at?: unknown };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return json({ error: "Bad request", message: "send {jti, expires_at}" }, 400);
+    }
+    if (typeof body.jti !== "string" || !body.jti || typeof body.expires_at !== "string" || Number.isNaN(Date.parse(body.expires_at))) {
+      return json({ error: "Bad request", message: "send {jti, expires_at}" }, 400);
+    }
+    await this.appKeys.revoke(body.jti, body.expires_at);
+    return json({ revoked: true });
   }
 
   /**
@@ -2945,6 +3032,10 @@ export class VaultDO extends DurableObject {
       // (ENVIRONMENT=test) to keep the integration suite hermetic — the tracker
       // is unit-tested with an injected fetcher, and staging exercises the live
       // path. A null jti (operator bearer) is never revocable.
+      if (att.jti && (await this.appKeys.isRevoked(att.jti))) {
+        this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
+        continue;
+      }
       if (att.jti && issuer && this.env.ENVIRONMENT !== "test") {
         try {
           if (await revocationTracker.isRevoked(issuer, att.jti)) {
@@ -3048,6 +3139,11 @@ export class VaultDO extends DurableObject {
       this.closeWs(ws, result.reason === "vault_scope_mismatch" ? WS_CLOSE.FORBIDDEN : WS_CLOSE.UNAUTHORIZED, result.reason);
       return;
     }
+    // App-key door (T-414): a key revoked at this vault can't open or keep a socket.
+    if (result.auth.jti && (await this.appKeys.isRevoked(result.auth.jti))) {
+      this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
+      return;
+    }
     // Closed account (T-318): the upgrade is accepted like any vault's (a
     // refused upgrade would tell a stranger the account is closed), so the
     // refusal lands here, once the token checks out. Read AFTER the await, so
@@ -3117,6 +3213,11 @@ export class VaultDO extends DurableObject {
     const result = await authenticateVaultToken(token, this.env, vaultName);
     if (!result.ok) {
       this.closeWs(ws, result.reason === "vault_scope_mismatch" ? WS_CLOSE.FORBIDDEN : WS_CLOSE.UNAUTHORIZED, result.reason);
+      return;
+    }
+    // App-key door (T-414): a key revoked at this vault can't open or keep a socket.
+    if (result.auth.jti && (await this.appKeys.isRevoked(result.auth.jti))) {
+      this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
       return;
     }
     // Closed account (T-318): same refusal as authenticatePendingSocket.

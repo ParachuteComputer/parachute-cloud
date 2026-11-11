@@ -56,7 +56,11 @@ export function computeKid(publicKeyPem: string): Promise<string> {
  * return it. `retire + insert` runs as a D1 batch (atomic) so a partial failure
  * can't leave the DB with zero active keys.
  */
-export async function rotateSigningKey(db: D1Database, now: () => Date = () => new Date()): Promise<SigningKey> {
+export async function rotateSigningKey(
+  db: D1Database,
+  now: () => Date = () => new Date(),
+  opts: { compromised?: boolean } = {},
+): Promise<SigningKey> {
   const { publicKey, privateKey } = await generateKeyPair(SIGNING_ALGORITHM, {
     modulusLength: 2048,
     extractable: true,
@@ -68,6 +72,11 @@ export async function rotateSigningKey(db: D1Database, now: () => Date = () => n
 
   await db.batch([
     db.prepare("UPDATE signing_keys SET retired_at = ? WHERE retired_at IS NULL").bind(stamp),
+    // A compromised key (T-414) leaves JWKS at once, even while app keys it signed are live: those keys stop
+    // verifying and must be minted again. An ordinary rotation keeps it while they live.
+    ...(opts.compromised
+      ? [db.prepare("UPDATE signing_keys SET compromised_at = ? WHERE retired_at = ? AND compromised_at IS NULL").bind(stamp, stamp)]
+      : []),
     db
       .prepare(
         `INSERT INTO signing_keys (kid, public_key_pem, private_key_pem, algorithm, created_at, retired_at)
@@ -98,9 +107,35 @@ export async function getActiveSigningKey(
 }
 
 /**
+ * Mark a signing key compromised, by kid (T-414): it leaves JWKS at once, even if it was retired long ago and app
+ * keys it signed are still live (they stop verifying and must be minted again). If it is the active key, a fresh
+ * one replaces it in the same step. Returns false for an unknown kid.
+ */
+export async function markSigningKeyCompromised(
+  db: D1Database,
+  kid: string,
+  now: () => Date = () => new Date(),
+): Promise<boolean> {
+  const row = await db.prepare("SELECT retired_at FROM signing_keys WHERE kid = ?").bind(kid).first<{ retired_at: string | null }>();
+  if (!row) return false;
+  if (row.retired_at === null) {
+    await rotateSigningKey(db, now, { compromised: true });
+    return true;
+  }
+  await db
+    .prepare("UPDATE signing_keys SET compromised_at = COALESCE(compromised_at, ?) WHERE kid = ?")
+    .bind(now().toISOString(), kid)
+    .run();
+  return true;
+}
+
+/**
  * Public keys to advertise on `/.well-known/jwks.json`: every active key plus
  * any retired key within `JWKS_RETENTION_MS`. Older retired rows stay for audit
- * but drop out of JWKS.
+ * but drop out of JWKS — except a retired key that still signs a live app key
+ * (migration 0030, T-414): an app key lives up to a year, so a rotation must not
+ * silently end it. Revoking or expiring the app key (in either table) lets its signing key go, and a rotation
+ * marked compromised (`rotateSigningKey(db, now, {compromised: true})`) drops the key at once regardless.
  */
 export async function getAllPublicKeys(
   db: D1Database,
@@ -110,10 +145,13 @@ export async function getAllPublicKeys(
   const res = await db
     .prepare(
       `SELECT * FROM signing_keys
-       WHERE retired_at IS NULL OR retired_at >= ?
+       WHERE compromised_at IS NULL
+         AND (retired_at IS NULL OR retired_at >= ?
+              OR kid IN (SELECT a.kid FROM app_keys a JOIN tokens t ON t.jti = a.jti
+                          WHERE a.revoked_at IS NULL AND t.revoked_at IS NULL AND a.expires_at > ?))
        ORDER BY created_at DESC`,
     )
-    .bind(cutoff)
+    .bind(cutoff, now().toISOString())
     .all<Row>();
   return (res.results ?? []).map(rowToKey);
 }

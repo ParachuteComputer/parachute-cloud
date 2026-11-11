@@ -6,6 +6,9 @@
  * Deps come from config (env.ISSUER / env.VAULT_BASE_DOMAIN), not the request
  * origin — the cloud issuer is a fixed configured origin.
  */
+import { markSigningKeyCompromised } from "./signing-keys.ts";
+import { handleAccountKeyMint, handleAccountKeyRevoke, handleAccountKeysList } from "./account-keys.ts";
+import { handleAccountPubkeyLink, handleAccountPubkeyUnlink, handleAccountPubkeysList } from "./account-pubkeys.ts";
 import { Hono } from "hono";
 import type { Env } from "./env.ts";
 import {
@@ -350,6 +353,13 @@ app.post("/account/token", (c) => handleAccountToken(c.env.DB, c.req.raw, depsFo
 // then the vault worker's destroy, then the identity D1 sweep). account-api.ts.
 app.get("/account/session", (c) => handleAccountSession(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/summary", (c) => handleAccountSummary(c.env.DB, c.req.raw, depsFor(c.env)));
+// T-414 (0.9.1): named app keys and linked Nostr keys (account-keys.ts, account-pubkeys.ts).
+app.get("/account/keys", (c) => handleAccountKeysList(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/keys", (c) => handleAccountKeyMint(c.env.DB, c.req.raw, depsFor(c.env)));
+app.delete("/account/keys/:name", (c) => handleAccountKeyRevoke(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/account/pubkeys", (c) => handleAccountPubkeysList(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/pubkeys", (c) => handleAccountPubkeyLink(c.env.DB, c.req.raw, depsFor(c.env)));
+app.delete("/account/pubkeys/:pubkey", (c) => handleAccountPubkeyUnlink(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/vaults", (c) => handleAccountVaultsList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/vaults", (c) => handleAccountVaultCreate(c.env.DB, c.req.raw, depsFor(c.env)));
 // The account door's import (T-431, account-import.ts): an owner brings a vault in with one credential. No other
@@ -575,6 +585,19 @@ app.post("/ops/health/collect", async (c) => {
   if (refused) return refused;
   const only = c.req.queries("vault")?.slice(0, 99);
   return c.json(await collectVaultHealth(c.env, depsFor(c.env), only?.length ? { onlyVaults: only } : {}));
+});
+
+// Mark a signing key compromised (T-414, signing-keys.ts markSigningKeyCompromised): body {kid}. It leaves JWKS at
+// once, even while app keys it signed are live (an ordinary rotation keeps it for them); if it was the active key a
+// fresh one replaces it. Bearer OPS_RUN_TOKEN. Unset → 404.
+app.post("/ops/signing-key-compromised", async (c) => {
+  const refused = await opsBearerRefusal(c.env.OPS_RUN_TOKEN, c.req.raw);
+  if (refused === null) return c.notFound();
+  if (refused) return refused;
+  const body = (await c.req.json().catch(() => ({}))) as { kid?: unknown };
+  if (typeof body.kid !== "string" || !body.kid) return c.json({ error: "invalid_request", message: "send {kid}" }, 400);
+  const found = await markSigningKeyCompromised(c.env.DB, body.kid);
+  return found ? c.json({ kid: body.kid, compromised: true }) : c.json({ error: "not_found" }, 404);
 });
 
 // Re-run the backups of the vaults whose backups are stale (T-318): bearer
