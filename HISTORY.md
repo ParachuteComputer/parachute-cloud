@@ -133,8 +133,9 @@ The graft is not counted as the person writing, and internal routes skip the
 plan's cap gate, so the door has its own: the whole batch runs in one
 transaction, and a batch that grafts a note and would leave the database above
 90% of the vault's cap is rolled back whole and answered
-`413 history_import_over_cap` with the sizes. Batches before it stay. A retry
-that grafts nothing is answered as usual. `plan` adds up each dry batch's growth and fails when the
+`413 history_import_over_cap` with the sizes. Batches before it stay. A batch
+that grafts nothing (a retry, or every note refused) is rolled back too, so it
+leaves the vault exactly as it was, and is answered as usual. `plan` adds up each dry batch's growth and fails when the
 projection passes 90% of the cap; `run` stops at that 413. A vault with no plan
 caps pushed is held to what its whole-storage cap leaves once its files are
 counted, so every vault is guarded. A batch that grafts into a run already

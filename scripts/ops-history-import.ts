@@ -248,7 +248,7 @@ async function sendAll(vault: string, dbPath: string, dryRun: boolean, refusedOu
     const p = projectStorage(sizes);
     console.log(
       `${verb} ${vault}: database ${mib(p.start)} MiB now, projected ${mib(p.projected)} MiB` +
-        (p.cap === null ? ", no cap" : ` of ${(p.cap / 1048576).toFixed(0)} MiB`),
+        (p.cap === null ? ", cap not reported" : ` of ${(p.cap / 1048576).toFixed(0)} MiB`),
     );
     // The vault refuses only a batch that grafts: a re-plan with nothing left to graft passes.
     if (p.over && totals.grafted > 0) die(`${verb} ${vault}: the projection is past ${CAP_SHARE * 100}% of the notes cap: the vault would refuse the batches that cross it. Raise the cap first.`);

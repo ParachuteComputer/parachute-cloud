@@ -2373,12 +2373,11 @@ export class VaultDO extends DurableObject {
         if (!result.ok) return; // refused before any write
         bytesAfter = Number(sql.databaseSize);
         if (dry) throw rollback;
-        // Only a batch that grafts a note leaves anything behind: a blob stays only when a grafted version holds it
-        // (the rest are dropped again), and the run row goes with a batch that grafts nothing. So a retry or a batch
-        // of refused notes is answered as usual, whatever freed pages did to the file size, and a batch that grafts
-        // is refused past the share.
-        const adds = result.summary.totals.grafted > 0;
-        if (adds && bytesAfter > notesCap * HISTORY_IMPORT_CAP_SHARE) {
+        // A batch that grafts nothing leaves nothing, by construction: it is rolled back like a dry run (its answer
+        // is already made). So a retry or a batch of refused notes is answered as usual and cannot grow the vault,
+        // and only a batch that grafts is measured against the share.
+        if (result.summary.totals.grafted === 0) throw rollback;
+        if (bytesAfter > notesCap * HISTORY_IMPORT_CAP_SHARE) {
           overCap = true;
           throw rollback;
         }

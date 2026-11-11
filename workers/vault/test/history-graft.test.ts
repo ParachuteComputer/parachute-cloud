@@ -619,9 +619,8 @@ describe("operator history import (vault side)", () => {
     const missing = await post(other, "/internal/history-import?dry_run=true", batch!);
     expect(missing.status).toBe(400);
 
-    // A batch that grafts nothing writes its blobs and drops them again. The guard is on growth, not on grafted
-    // notes; measured here, DO SQLite gives the dropped pages back, so such a batch leaves the file as it was and is
-    // answered (on a vault already near its cap).
+    // A batch that grafts nothing leaves the vault exactly as it was (it is rolled back like a dry run), so it is
+    // answered even on a vault already near its cap, and the file size does not move.
     const nearly = await makeCloud([{ id: "unrelated", path: "Other", body: "other" }]);
     const nearlyBefore = await dbSize(nearly);
     await pushCaps(nearly, Math.floor(nearlyBefore / 0.95));

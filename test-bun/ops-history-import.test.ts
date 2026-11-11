@@ -322,7 +322,7 @@ describe("the operator client (scripts/ops-history-import.ts) against a made-up 
         blobs: String(b.blobs.length),
       });
     });
-    expect(r.out).toContain("no cap");
+    expect(r.out).toContain("cap not reported");
     expect(r.out).not.toContain(EMAIL);
   });
 
