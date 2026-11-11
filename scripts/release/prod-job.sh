@@ -189,6 +189,10 @@ for d in "" /file /status /read-token /finish /abort; do
   c=""; for i in $(seq 1 10); do c="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -X POST "$ISSUER/ops/vault-import$d")"; [ "$c" = 401 ] || [ "$(left)" -le 0 ] && break; sleep 3; done
   chk "POST /ops/vault-import$d without a bearer" "$c" 401
 done
+for d in "" /status /digest /finish; do
+  c=""; for i in $(seq 1 10); do c="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -X POST "$ISSUER/ops/history-import$d")"; [ "$c" = 401 ] || [ "$(left)" -le 0 ] && break; sleep 3; done
+  chk "POST /ops/history-import$d without a bearer" "$c" 401
+done
 oh="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "$ISSUER/ops/health")"   # 404 while its token is unset, 401 once set
 chk "GET /ops/health without a bearer (401 or 404)" "$([ "$oh" = 401 ] || [ "$oh" = 404 ] && echo refused || echo "$oh")" refused
 wk="$(curl -s --max-time 10 "$MY/.well-known/parachute-account" | python3 -I -c 'import json,sys

@@ -380,6 +380,19 @@ async function main() {
         `status ${r.status}`,
       );
     }
+    // The operator history import (T-450): same bearer, same refusal.
+    for (const door of ["", "/status", "/digest", "/finish"]) {
+      const r = await fetch(`${IDENTITY}/ops/history-import${door}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ vault_name: "smoke-prod-probe", dry_run: true }),
+      });
+      assert(
+        r.status === 404 || r.status === 401,
+        `PRODUCTION: /ops/history-import${door} without a bearer is refused (404 unset / 401 set)`,
+        `status ${r.status}`,
+      );
+    }
     // The canary token door (L6-03) mints a read token: never without its bearer.
     const opsCanary = await fetch(`${IDENTITY}/ops/canary-token`, { method: "POST" });
     assert(
