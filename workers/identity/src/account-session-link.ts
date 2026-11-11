@@ -69,7 +69,7 @@ const err = (status: number, error: string, message: string, headers: Record<str
  * ANY `permissions` claim covers that and any future delegated principal, fail closed. When door/0.9 takes this,
  * `requireAccount`'s `adminPubkey` is the same fact; this check needs no change there.
  */
-function carriesDelegatedPrincipal(req: Request): boolean {
+export function carriesDelegatedPrincipal(req: Request): boolean {
   // The same bearer `requireAccount` just validated (one parser), read again for this claim only.
   const token = bearerToken(req);
   if (!token) return true;

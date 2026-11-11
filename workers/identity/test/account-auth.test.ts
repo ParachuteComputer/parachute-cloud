@@ -266,7 +266,7 @@ describe("account-vaults at /oauth/authorize — renders consent, not refused (l
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('data-testid="account-vaults"');
-    expect(html).toContain('name="vault_include" value="work" checked');
+    expect(html).toContain('name="vault_level:work"');
   });
 });
 

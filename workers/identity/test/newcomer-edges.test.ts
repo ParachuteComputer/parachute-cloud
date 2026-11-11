@@ -79,8 +79,8 @@ describe("the consent screen speaks plainly", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     const list = html.match(/<ul class="scopes">([\s\S]*?)<\/ul>/)?.[1] ?? "";
-    expect(list).toContain("Read your vault notes");
-    expect(list).toContain("Create and edit your vault notes");
+    expect(list).toContain("Read the whole vault garden-notes: every note, tag and attachment, and its settings");
+    expect(list).toContain("Read the whole vault garden-notes, and create, edit and delete");
     expect(list).not.toContain("vault:garden-notes:read");
     expect(list).not.toContain("vault:garden-notes:write");
     expect(list).toContain("scribe:read");
@@ -94,7 +94,7 @@ describe("the consent screen speaks plainly", () => {
     const labels = describeScopes(["vault:garden-notes:read", "vault:herbs:write", "vault:read"]).map((s) => s.label);
     expect(labels[0]).toContain("garden-notes");
     expect(labels[1]).toContain("herbs");
-    expect(labels[2]).toBe("Read your vault notes");
+    expect(labels[2]).toBe("Read the whole vault: every note, tag and attachment, and its settings");
   });
 });
 

@@ -96,6 +96,7 @@ import { runSnapshotSweep } from "./snapshots.ts";
 import { runUsageRollup } from "./usage.ts";
 import { handleAccountSession } from "./account-session.ts";
 import { handleAccountSessionLink } from "./account-session-link.ts";
+import { handleHandoverAccept, handleHandoverOffer, handleHandoversList, handleHandoverWithdraw } from "./vault-handover.ts";
 import { handleAccountToken } from "./account-token.ts";
 import {
   handleAccountHandleCheck,
@@ -367,6 +368,11 @@ app.post("/account/session-link", (c) => {
   if (!deps.ownerPubkey) return c.notFound();
   return handleAccountSessionLink(c.env.DB, c.req.raw, deps);
 });
+// T-446: hand a vault to another account in place (vault-handover.ts). Bearer (the owner's account token).
+app.post("/account/vaults/:name/handover", (c) => handleHandoverOffer(c.env.DB, c.req.raw, depsFor(c.env)));
+app.delete("/account/vaults/:name/handover", (c) => handleHandoverWithdraw(c.env.DB, c.req.raw, depsFor(c.env)));
+app.get("/account/handovers", (c) => handleHandoversList(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/account/handovers/:id/accept", (c) => handleHandoverAccept(c.env.DB, c.req.raw, depsFor(c.env)));
 app.get("/account/pubkeys", (c) => handleAccountPubkeysList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/pubkeys", (c) => handleAccountPubkeyLink(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/pubkeys/:pubkey", (c) => handleAccountPubkeyUnlink(c.env.DB, c.req.raw, depsFor(c.env)));

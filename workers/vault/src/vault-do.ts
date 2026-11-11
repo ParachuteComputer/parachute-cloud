@@ -995,11 +995,26 @@ export class VaultDO extends DurableObject {
       this.seedChecked = true;
       return json({ bare: true });
     }
+    // Handover (T-446) — POST /api/internal/handover-cut, dispatched here, ahead of the tenant door's bar check:
+    // the push for a vault handed BACK is minted for its returning owner, whom the earlier handover barred. Same
+    // first-party gate as every /internal/* route.
+    if (rest === "/api/internal/handover-cut") {
+      const cutAuth = await authenticateVaultRequest(request, this.env, vaultName);
+      if ("error" in cutAuth) return cutAuth.error;
+      const cutForbidden = this.internalForbidden(cutAuth, vaultName);
+      if (cutForbidden) return cutForbidden;
+      if (this.destroyed) return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
+      return this.handleHandoverCut(request);
+    }
     if (rest === "/api/internal/destroy") {
       const destroyAuth = await authenticateVaultRequest(request, this.env, vaultName);
       if ("error" in destroyAuth) return destroyAuth.error;
       const destroyForbidden = this.internalForbidden(destroyAuth, vaultName);
       if (destroyForbidden) return destroyForbidden;
+      // A delete the previous owner started just before a handover (T-446) must not land after it.
+      if (await this.appKeys.refuses(destroyAuth)) {
+        return json({ error: "Unauthorized", message: "this token's account no longer owns this vault" }, 401);
+      }
       return this.handleDestroy(request, vaultName);
     }
     // STAGING/DEV-ONLY purge probe (T-318 delete proof) — GET
@@ -1683,6 +1698,10 @@ export class VaultDO extends DurableObject {
     if (auth.jti && (await this.appKeys.isRevoked(auth.jti))) {
       return { error: json({ error: "Unauthorized", message: "this key has been revoked" }, 401) };
     }
+    // Handover (T-446): the previous owner's tokens from before the handover are refused here.
+    if (await this.appKeys.refuses(auth)) {
+      return { error: json({ error: "Unauthorized", message: "this token's account no longer owns this vault" }, 401) };
+    }
     if (auth.jti && auth.clientId === APP_KEY_CLIENT_ID) await this.appKeys.noteUse(auth.jti, auth.exp);
     return auth;
   }
@@ -1698,6 +1717,31 @@ export class VaultDO extends DurableObject {
       await this.ctx.storage.delete(SEED_PENDING_KEY);
     }
     this.seedChecked = true;
+  }
+
+  /**
+   * POST /api/internal/handover-cut {from, to, at} — identity's push when this vault is handed from one account to
+   * another (T-446): bar `from`'s tokens on every door from the next request, unbar `to` (app-keys.ts `handover`).
+   * Idempotent, and order-safe by `at` (ISO).
+   */
+  private async handleHandoverCut(request: Request): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    let body: { from?: unknown; to?: unknown; at?: unknown };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return json({ error: "Bad request", message: "send {from, to, at}" }, 400);
+    }
+    const at = typeof body.at === "string" ? Date.parse(body.at) : NaN;
+    const subject = (x: unknown): x is string => typeof x === "string" && x.length > 0 && x !== "operator";
+    if (!subject(body.from) || !subject(body.to) || body.from === body.to || Number.isNaN(at)) {
+      return json({ error: "Bad request", message: "send {from, to, at}" }, 400);
+    }
+    // Streams authenticate once, at open: end them all so each reconnects through the door that now bars `from`
+    // (a hibernated WebSocket is swept against the bar when the DO wakes). Only when this push changed who is barred:
+    // a stale or replayed push must not become a way to drop the current owner's streams.
+    if (await this.appKeys.handover(body.from, body.to, at)) this.subManager?.closeAll();
+    return json({ cut: true });
   }
 
   /** POST /api/internal/keys/revoke {jti, expires_at} — identity's push when the owner revokes an app key (T-414). */
@@ -3052,7 +3096,7 @@ export class VaultDO extends DurableObject {
       // (ENVIRONMENT=test) to keep the integration suite hermetic — the tracker
       // is unit-tested with an injected fetcher, and staging exercises the live
       // path. A null jti (operator bearer) is never revocable.
-      if (att.jti && (await this.appKeys.isRevoked(att.jti))) {
+      if (await this.appKeys.refuses(att)) {
         this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
         continue;
       }
@@ -3160,7 +3204,7 @@ export class VaultDO extends DurableObject {
       return;
     }
     // App-key door (T-414): a key revoked at this vault can't open or keep a socket.
-    if (result.auth.jti && (await this.appKeys.isRevoked(result.auth.jti))) {
+    if (await this.appKeys.refuses(result.auth)) {
       this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
       return;
     }
@@ -3200,6 +3244,7 @@ export class VaultDO extends DurableObject {
       scopeRaw: auth.scopes,
       exp: auth.exp,
       jti: auth.jti,
+      iat: auth.iat ?? null,
       actor: auth.actor,
       via: auth.via,
       clientId: auth.clientId,
@@ -3236,7 +3281,7 @@ export class VaultDO extends DurableObject {
       return;
     }
     // App-key door (T-414): a key revoked at this vault can't open or keep a socket.
-    if (result.auth.jti && (await this.appKeys.isRevoked(result.auth.jti))) {
+    if (await this.appKeys.refuses(result.auth)) {
       this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "token revoked");
       return;
     }
@@ -3255,6 +3300,7 @@ export class VaultDO extends DurableObject {
       scopeRaw: auth.scopes,
       exp: auth.exp,
       jti: auth.jti,
+      iat: auth.iat ?? null,
       actor: auth.actor,
       via: auth.via,
       clientId: auth.clientId,
