@@ -98,6 +98,8 @@ import {
   restoreFromTar,
 } from "./restore.js";
 import type { ExportEngineOptions } from "@openparachute/core/src/portable-md.js";
+import { digestNotes, finishRun, graftBatch, graftStatus } from "./history-graft.js";
+import { GRAFT_MAX_BODY_BYTES, GRAFT_OUTCOMES, parseDigestQuery, parseGraftBatch } from "./history-graft-shared.js";
 import { WELCOME_SEEDED_KEY, seedWelcome, withCloudGuideText, type WelcomeSeedResult } from "./welcome.js";
 import {
   SEED_PACK_NAMES,
@@ -349,6 +351,20 @@ export interface ImportStateRecord {
  * attached, a tag, a link, the description), and it is checked under the lock.
  */
 const WRITTEN_SINCE_IMPORT_KEY = "written_since_import";
+
+/**
+ * DO-storage flag (T-450): this vault received an operator history import, so
+ * it keeps ALL its history. Core's default policy (100 versions / 180 days /
+ * 8 MiB per note) would prune the imported rows on the note's next edit. Its own
+ * key, not a field of `config`: `config` is the platform's plan object (PUT
+ * /api/internal/config merges the pushed fields into it and writes the whole
+ * object back; a replay rewrites it for the description), and a retention
+ * promise to the owner should not ride on any of those paths. Set once, never
+ * cleared (a destroy wipes it with everything else).
+ */
+const HISTORY_KEEP_ALL_KEY = "history_keep_all";
+/** The policy a keep-all vault runs, merged over core's defaults by `resolveHistoryPolicy`. */
+export const HISTORY_KEEP_ALL_POLICY = { max_versions: 1_000_000, max_age_days: 36500, max_bytes_per_note: null } as const;
 
 /** How long an import waits for in-flight requests to finish before its replay. */
 const IMPORT_DRAIN_MAX_MS = 60_000;
@@ -1284,6 +1300,9 @@ export class VaultDO extends DurableObject {
       if (apiPath === "/internal/import-status") return this.handleImportStatus(request);
       if (apiPath === "/internal/import-file") return this.handleImportFile(request, vaultName);
       if (apiPath === "/internal/import-check") return this.handleImportCheck(request, vaultName);
+      if (apiPath === "/internal/history-import") return this.handleHistoryImport(request);
+      if (apiPath === "/internal/history-import/finish") return this.handleHistoryImportFinish(request);
+      if (apiPath === "/internal/history-digest") return this.handleHistoryDigest(request);
       return json({ error: "Not found" }, 404);
     }
 
@@ -1428,6 +1447,10 @@ export class VaultDO extends DurableObject {
     this.r2Bytes = (await this.ctx.storage.get<number>(R2_METER_KEY)) ?? 0;
     this.transcribeMinutes = (await this.ctx.storage.get<number>(TRANSCRIBE_MINUTES_KEY)) ?? 0;
     this.transcribeMonth = (await this.ctx.storage.get<string>(TRANSCRIBE_MONTH_KEY)) ?? "";
+    // Before anything can capture, prune or compact (the maintenance below, any
+    // write): a keep-all vault must never run one step under the default policy.
+    this.historyKeepAll = (await this.ctx.storage.get<boolean>(HISTORY_KEEP_ALL_KEY)) === true;
+    this.applyHistoryPolicy();
     this.stateLoaded = true;
     // Once per loaded instance, using core's bounded defaults. No separate
     // recurring alarm: idle vaults stay asleep, and transcription/embedding
@@ -2088,6 +2111,14 @@ export class VaultDO extends DurableObject {
     }
   }
 
+  /** Mirror of {@link HISTORY_KEEP_ALL_KEY}, loaded by ensureState before the store is used. */
+  private historyKeepAll = false;
+
+  /** Put the store on the policy this vault runs: keep-all after a history import, else core's defaults. */
+  private applyHistoryPolicy(): void {
+    this.store.setHistoryPolicy(this.historyKeepAll ? HISTORY_KEEP_ALL_POLICY : undefined);
+  }
+
   /** Cache of {@link WRITTEN_SINCE_IMPORT_KEY}; undefined until first read in this instance. */
   private writtenSinceImport: boolean | undefined;
 
@@ -2228,6 +2259,122 @@ export class VaultDO extends DurableObject {
       written_since_import: await this.isWritten(),
       r2_bytes: this.r2Bytes,
     });
+  }
+
+  /**
+   * POST /api/internal/history-import — graft a batch of a box's note history
+   * behind the notes' current state (T-450; history-graft.ts has the rules).
+   * GET — the history import's status, counts only.
+   *
+   * The lock: after the body is read, the only `await` is the keep-all flag's
+   * put, which happens before any vault state is read; from the first read to
+   * the answer everything is synchronous, so no other request interleaves, and
+   * each note is its own transaction. A dry run runs the very same code inside
+   * an outer `transactionSync` that is then rolled back (DO transactions nest as
+   * savepoints: an inner rollback undoes only its note, the outer one undoes
+   * everything), so it reports exactly what a real run would.
+   *
+   * Never marks the vault written (internal paths skip markWritten), fires no
+   * hook or live event, never touches a `notes` row.
+   */
+  private async handleHistoryImport(request: Request): Promise<Response> {
+    if (request.method === "GET") {
+      return json({
+        ...graftStatus(this.shim),
+        keep_all: this.historyKeepAll,
+        database_bytes: Number(this.raw().databaseSize),
+        notes_cap_bytes: this.planCaps()?.notes_bytes ?? null,
+      });
+    }
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    const tooLarge = () =>
+      json({ error: `A history batch is at most ${GRAFT_MAX_BODY_BYTES / 1048576} MiB`, error_type: "history_import_too_large" }, 413);
+    const declared = Number(request.headers.get("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > GRAFT_MAX_BODY_BYTES) {
+      await request.body?.cancel().catch(() => {});
+      return tooLarge();
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(new TextDecoder().decode(await readCappedBody(request, GRAFT_MAX_BODY_BYTES)));
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) return tooLarge();
+      return json({ error: "Body is not JSON", error_type: "invalid_request" }, 400);
+    }
+    const parsed = parseGraftBatch(raw);
+    if (!parsed.ok) return json({ error: parsed.error, error_type: "invalid_request" }, 400);
+    const batch = parsed.value;
+    const dry = batch.dry_run === true;
+    if (!dry && !this.historyKeepAll) {
+      // Keep-all is on, durably, before the first imported row can land.
+      await this.ctx.storage.put(HISTORY_KEEP_ALL_KEY, true);
+      this.historyKeepAll = true;
+      this.applyHistoryPolicy();
+    }
+    // ---- synchronous from here to the answer ----
+    const txn = <T,>(fn: () => T): T => this.ctx.storage.transactionSync(fn);
+    let result: ReturnType<typeof graftBatch>;
+    if (dry) {
+      const rollback = new Error("dry run");
+      let out: ReturnType<typeof graftBatch> | undefined;
+      try {
+        txn(() => {
+          out = graftBatch(this.shim, txn, batch);
+          throw rollback;
+        });
+      } catch (err) {
+        if (err !== rollback) throw err;
+      }
+      result = out!;
+    } else {
+      result = graftBatch(this.shim, txn, batch);
+    }
+    if (!result.ok) {
+      console.log(`event=history_import_refused status=${result.status} error_type=${String(result.body.error_type)}`);
+      return json(result.body, result.status);
+    }
+    const s = result.summary;
+    console.log(
+      `event=history_import dry_run=${dry} notes=${s.notes.length} ` +
+        GRAFT_OUTCOMES.map((o) => `${o}=${s.totals[o]}`).join(" ") +
+        ` blobs_written=${s.blobs_written} versions_written=${s.versions_written} shifted_notes=${s.shifted_notes}`,
+    );
+    return json({
+      ...s,
+      database_bytes: Number(this.raw().databaseSize),
+      notes_cap_bytes: this.planCaps()?.notes_bytes ?? null,
+    });
+  }
+
+  /** POST /api/internal/history-import/finish — `{ run_id, expect_receipts }`: the run is complete when it holds exactly those receipts. Idempotent. */
+  private async handleHistoryImportFinish(request: Request): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
+    if (
+      !body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).some((k) => k !== "run_id" && k !== "expect_receipts") ||
+      typeof body.run_id !== "string" || !/^[0-9a-f]{64}$/.test(body.run_id) ||
+      typeof body.expect_receipts !== "number" || !Number.isSafeInteger(body.expect_receipts) || body.expect_receipts < 0
+    ) {
+      return json({ error: "Body is { run_id: 64 hex, expect_receipts: whole number }", error_type: "invalid_request" }, 400);
+    }
+    const out = finishRun(this.shim, body.run_id, body.expect_receipts);
+    return json(out.body, out.status);
+  }
+
+  /** POST /api/internal/history-digest — `{ notes: [{ id, through_ix }] }`: digests and a real read of every body. Read-only. */
+  private async handleHistoryDigest(request: Request): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    let raw: unknown;
+    try {
+      raw = JSON.parse(new TextDecoder().decode(await readCappedBody(request, 1024 * 1024)));
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) return json({ error: "Body over 1 MiB", error_type: "invalid_request" }, 413);
+      return json({ error: "Body is not JSON", error_type: "invalid_request" }, 400);
+    }
+    const parsed = parseDigestQuery(raw);
+    if (!parsed.ok) return json({ error: parsed.error, error_type: "invalid_request" }, 400);
+    return json({ notes: digestNotes(this.shim, parsed.value) });
   }
 
   /** The import replay proper, under the import lock (see {@link underImportLock}). */
