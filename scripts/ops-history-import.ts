@@ -57,7 +57,11 @@ function die(msg: string): never {
 }
 
 export function openBox(path: string): Database {
-  return new Database(path, { readonly: true });
+  const db = new Database(path, { readonly: true });
+  // Another handle on the file (whatever wrote it, just closing) makes a first read fail "database is locked"
+  // outright; wait for it instead. Seen once in CI, where a test's own handle was still letting go.
+  db.exec("PRAGMA busy_timeout = 10000");
+  return db;
 }
 
 /** Counts from the box DB alone. */
