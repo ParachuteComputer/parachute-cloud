@@ -148,6 +148,42 @@ describe("consent per vault on the account door", () => {
     // This door refuses it outright: the replaced grant's refresh family is gone.
     expect(res.status, await res.clone().text()).toBe(400);
   });
+
+  // The two holes a reviewer found on the box's account door (core #72, after 71129c52), held here as contracts.
+  test("after a narrower consent, the earlier consent's refresh token is refused; an equal consent leaves it, and the new one refreshes", async () => {
+    const p = await person();
+    const { clientId } = await seedApprovedClient();
+    const wide = levels({ [p.A]: "write", [p.B]: "read" });
+    const first = await redeem(await consent(p.sessionId, clientId, wide));
+    // The same choice again: nothing moved, so the earlier refresh token still works.
+    await redeem(await consent(p.sessionId, clientId, wide));
+    const same = await handleToken(db(), tokenReq({ grant_type: "refresh_token", refresh_token: first.refresh_token, client_id: clientId }), deps());
+    expect(same.status, await same.clone().text()).toBe(200);
+    const rotated = (await same.json()) as { refresh_token: string };
+    // Narrower: A read, B none.
+    const second = await redeem(await consent(p.sessionId, clientId, levels({ [p.A]: "read", [p.B]: "none" })));
+    expect(second.scope).toBe(`account:${p.id}:vaults:${p.A}:read`);
+    const stale = await handleToken(db(), tokenReq({ grant_type: "refresh_token", refresh_token: rotated.refresh_token, client_id: clientId }), deps());
+    expect(stale.status, await stale.clone().text()).toBe(400);
+    const fresh = await handleToken(db(), tokenReq({ grant_type: "refresh_token", refresh_token: second.refresh_token, client_id: clientId }), deps());
+    expect(fresh.status, await fresh.clone().text()).toBe(200);
+    expect(((await fresh.json()) as { scope: string }).scope).toBe(`account:${p.id}:vaults:${p.A}:read`);
+  });
+
+  test("every vault at none gives no code, and the next plain ask shows the page again instead of replaying the earlier levels", async () => {
+    const p = await person();
+    const { clientId } = await seedApprovedClient();
+    expect((await redeem(await consent(p.sessionId, clientId, levels({ [p.A]: "read" })))).scope).toBe(`account:${p.id}:vaults:${p.A}:read`);
+    const none = await consent(p.sessionId, clientId, levels({ [p.A]: "none", [p.B]: "none", [p.C]: "none" }));
+    expect(none.code).toBeNull();
+    const { challenge } = await makePkce();
+    const q = { client_id: clientId, redirect_uri: REDIRECT_URI, response_type: "code", scope: "account:vaults", code_challenge: challenge, code_challenge_method: "S256", state: "s" };
+    const next = await handleAuthorizeGet(db(), authorizeGetReq(q, p.sessionId), deps());
+    expect(next.status, next.headers.get("location") ?? "").toBe(200);
+    const html = await next.text();
+    expect(html).toContain('name="account_vault_levels" value="1"');
+    expect(bridgeTarget(html) ?? "").not.toContain("code=");
+  });
 });
 
 describe("Connect says what it reads", () => {
