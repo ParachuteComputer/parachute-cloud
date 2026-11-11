@@ -92,6 +92,8 @@ export interface WsAttachment {
   exp: number | null;
   /** JWT `jti` or null — the sweep's revocation check. */
   jti: string | null;
+  /** JWT `iat` (epoch SECONDS) or null/absent — the sweep's handover-cut check (T-446). */
+  iat?: number | null;
   actor: string | null;
   via: string | null;
   clientId: string | null;
