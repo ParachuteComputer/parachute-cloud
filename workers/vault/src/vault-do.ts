@@ -2303,6 +2303,12 @@ export class VaultDO extends DurableObject {
       });
     }
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    // A dry run is said beside the batch, so the identity door can pass the batch's bytes through untouched.
+    const dryFlag = new URL(request.url).searchParams.get("dry_run");
+    if (dryFlag !== null && dryFlag !== "true" && dryFlag !== "false") {
+      return json({ error: 'dry_run must be "true" or "false"', error_type: "invalid_request" }, 400);
+    }
+    const dry = dryFlag === "true";
     const tooLarge = () =>
       json({ error: `A history batch is at most ${GRAFT_MAX_BODY_BYTES / 1048576} MiB`, error_type: "history_import_too_large" }, 413);
     const declared = Number(request.headers.get("content-length") ?? "");
@@ -2320,7 +2326,6 @@ export class VaultDO extends DurableObject {
     const parsed = parseGraftBatch(raw);
     if (!parsed.ok) return json({ error: parsed.error, error_type: "invalid_request" }, 400);
     const batch = parsed.value;
-    const dry = batch.dry_run === true;
     const notesCap = this.planCaps()?.notes_bytes ?? null;
 
     // ---- synchronous from here to the answer ----

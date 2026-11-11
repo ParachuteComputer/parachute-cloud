@@ -7,10 +7,14 @@
  * record. Bearer `OPS_RUN_TOKEN` (ops-vault-import.ts's): unset → null, and the
  * router answers its plain 404.
  *
- *   POST /ops/history-import          JSON: email, confirm, vault_name, reference, dry_run?, batch.
- *                                     Forwards one batch; answers the vault's per-note outcomes.
- *   POST /ops/history-import/status   JSON: vault_name. Runs, receipts and row counts.
- *   POST /ops/history-import/digest   JSON: vault_name, notes. Per-note digests and a real read of every body.
+ *   POST /ops/history-import          multipart: email, confirm, vault_name, reference, dry_run?, run_id,
+ *                                     notes, versions, blobs (the counts the client states), and one file
+ *                                     part `batch` (the batch's JSON). Forwards the batch's bytes untouched
+ *                                     (this door never parses them; the vault checks everything) and
+ *                                     answers the vault's per-note outcomes.
+ *   POST /ops/history-import/status   JSON: email, confirm, vault_name, reference. Runs, receipts and row counts.
+ *   POST /ops/history-import/digest   JSON: email, confirm, vault_name, reference, notes. Per-note digests and a
+ *                                     real read of every body.
  *   POST /ops/history-import/finish   JSON: email, confirm, vault_name, reference, run_id, expect_receipts,
  *                                     dry_run?. The run is complete once it holds exactly those receipts.
  *
@@ -21,10 +25,15 @@
  * only ever adds version rows behind a note whose state matches the box's, and
  * refuses the rest note by note.
  *
- * The address goes in the body, is checked twice (as the erase door asks), and
- * is never logged. Each batch that writes, and each finish, writes an
- * `account_audit` row first (vault, reference, a short run id, counts; never a
- * note id), and the door refuses rather than act unrecorded. The account purge
+ * Every door takes the same consent: the address in the body, checked twice
+ * (as the erase door asks) and never logged, a reference, and the vault, which
+ * the account (in good standing) must own. Each batch that writes, and each
+ * finish, writes an `account_audit` row first (vault, reference, a short run id,
+ * counts; never a note id), and the door refuses rather than act unrecorded. A
+ * batch's counts in that row are the ones the client stated (`stated_*`): this
+ * door does not open the batch, so it cannot check them; the log line after
+ * the vault answers carries the vault's real totals. Status and digest only
+ * read, and write no row. The account purge
  * scrubs the vault name and reference from those rows (account-audit.ts).
  */
 import { opsBearerRefusal } from "./ops-daily.ts";
@@ -35,12 +44,17 @@ import { getUserByEmail } from "./users.ts";
 import { callVaultApi } from "./vault-call.ts";
 import { type Vault, getVault } from "./vaults.ts";
 
-/** The vault's own cap on one batch (history-graft-shared.ts GRAFT_MAX_BODY_BYTES), plus the fields around it. */
-export const MAX_HISTORY_BATCH_BYTES = 32 * 1024 * 1024;
-const ENVELOPE_OVERHEAD = 64 * 1024;
-const IMPORT_FIELDS = ["email", "confirm", "vault_name", "reference", "dry_run", "batch"];
-const FINISH_FIELDS = ["email", "confirm", "vault_name", "reference", "dry_run", "run_id", "expect_receipts"];
+/** The vault's own cap on one batch (history-graft-shared.ts GRAFT_MAX_BODY_BYTES). */
+export const MAX_HISTORY_BATCH_BYTES = 16 * 1024 * 1024;
+/** Room for the multipart framing and the small fields around a full-size batch. */
+const FORM_OVERHEAD = 64 * 1024;
+const IMPORT_FIELDS: ReadonlySet<string> = new Set(["email", "confirm", "vault_name", "reference", "dry_run", "run_id", "notes", "versions", "blobs", "batch"]);
+const CONSENT_FIELDS = ["email", "confirm", "vault_name", "reference"];
+const FINISH_FIELDS = [...CONSENT_FIELDS, "dry_run", "run_id", "expect_receipts"];
 const NO_STORE = { "content-type": "application/json", "cache-control": "no-store" };
+const RUN_ID = /^[0-9a-f]{64}$/;
+/** A stated count: a plain whole number, as a form field. */
+const COUNT = /^(?:0|[1-9][0-9]{0,8})$/;
 
 function tooLarge(): Response {
   return refuse(413, "history_import_too_large", `A batch is at most ${MAX_HISTORY_BATCH_BYTES / 1048576} MiB. Nothing changed.`);
@@ -49,9 +63,10 @@ function tooLarge(): Response {
 /** The body as JSON, read with a ceiling (a declared length is checked first; an undeclared one while reading). */
 async function cappedJson(req: Request, cap: number): Promise<Record<string, unknown> | Response> {
   const declared = Number(req.headers.get("content-length") ?? "");
+  const over = () => refuse(413, "request_too_large", `This body is at most ${cap / 1048576} MiB. Nothing changed.`);
   if (Number.isFinite(declared) && declared > cap) {
     await req.body?.cancel().catch(() => {});
-    return tooLarge();
+    return over();
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -63,7 +78,7 @@ async function cappedJson(req: Request, cap: number): Promise<Record<string, unk
       total += value.byteLength;
       if (total > cap) {
         await reader.cancel().catch(() => {});
-        return tooLarge();
+        return over();
       }
       chunks.push(value);
     }
@@ -91,12 +106,9 @@ function unknownFields(body: Record<string, unknown>, allowed: string[]): Respon
 
 /**
  * The account named by address (twice) and reference, in good standing, and the
- * vault it must own: everything the two writing doors check before they act.
+ * vault it must own: what every door here checks before it acts or reads.
  */
 async function ownedVault(env: Env, body: Record<string, unknown>): Promise<{ vault: Vault; reference: string; userId: string } | Response> {
-  if (body.dry_run !== undefined && typeof body.dry_run !== "boolean") {
-    return refuse(400, "invalid_request", "dry_run must be true or false (a JSON boolean). Nothing changed.");
-  }
   const who = identify(body.email, body.confirm, body.reference);
   if (who instanceof Response) return who;
   const name = namedVault(body.vault_name);
@@ -125,46 +137,89 @@ async function forward(env: Env, deps: OAuthDeps, vault: Vault, method: "GET" | 
   return new Response(res.body, { status: res.status, headers: NO_STORE });
 }
 
-/** Counts for the audit row and the log line, from a batch the vault will check in full. */
-function batchCounts(batch: unknown): { run: string; notes: number; versions: number; blobs: number } | null {
-  if (!batch || typeof batch !== "object" || Array.isArray(batch)) return null;
-  const b = batch as Record<string, unknown>;
-  const run = b.run as Record<string, unknown> | undefined;
-  if (!run || typeof run !== "object" || typeof run.run_id !== "string" || !Array.isArray(b.notes) || !Array.isArray(b.blobs)) return null;
-  let versions = 0;
-  for (const n of b.notes) {
-    const v = (n as Record<string, unknown> | null)?.versions;
-    if (!Array.isArray(v)) return null;
-    versions += v.length;
+/** The vault's answer to a batch, read for the log line only (it passes through as it is). */
+function vaultTotals(text: string): string {
+  try {
+    const b = JSON.parse(text) as { notes?: unknown[]; totals?: Record<string, number>; versions_written?: number; blobs_written?: number; database_bytes?: number; error_type?: string };
+    if (b.error_type) return `error_type=${String(b.error_type).slice(0, 40)}`;
+    const notes = Array.isArray(b.notes) ? b.notes.length : 0;
+    const grafted = Number(b.totals?.grafted ?? 0);
+    return `notes=${notes} grafted=${grafted} versions_written=${Number(b.versions_written ?? 0)} blobs_written=${Number(b.blobs_written ?? 0)} database_bytes=${Number(b.database_bytes ?? 0)} not_grafted=${notes - grafted}`;
+  } catch {
+    return "answer=unreadable";
   }
-  return { run: run.run_id.slice(0, 12), notes: b.notes.length, versions, blobs: b.blobs.length };
 }
 
 export async function handleOpsHistoryImportPost(env: Env, req: Request, deps: OAuthDeps): Promise<Response | null> {
   const refused = await opsBearerRefusal(env.OPS_RUN_TOKEN, req);
   if (refused !== undefined) return refused;
-  const body = await cappedJson(req, MAX_HISTORY_BATCH_BYTES + ENVELOPE_OVERHEAD);
-  if (body instanceof Response) return body;
-  const extra = unknownFields(body, IMPORT_FIELDS);
-  if (extra) return extra;
-  const counts = batchCounts(body.batch);
-  if (!counts) return refuse(400, "invalid_request", "batch must be { run, blobs, notes } (scripts/ops-history-import.ts builds it). Nothing changed.");
-  if ("dry_run" in (body.batch as Record<string, unknown>)) {
-    // One place for it: a dry_run inside the batch would be silently overridden here.
-    return refuse(400, "invalid_request", "dry_run goes beside batch, not inside it. Nothing changed.");
+  const declared = Number(req.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > MAX_HISTORY_BATCH_BYTES + FORM_OVERHEAD) {
+    await req.body?.cancel().catch(() => {});
+    return tooLarge();
   }
-  const target = await ownedVault(env, body);
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch {
+    return refuse(400, "invalid_request", "body must be multipart/form-data (scripts/ops-history-import.ts sends it). Nothing changed.");
+  }
+  const unknown = [...new Set(form.keys())].filter((k) => !IMPORT_FIELDS.has(k));
+  if (unknown.length > 0) {
+    return refuse(400, "invalid_request", `unknown field(s): ${unknown.slice(0, 5).map((k) => JSON.stringify(k.slice(0, 40))).join(", ")}. Nothing changed.`);
+  }
+  const text = (k: string): string | null => {
+    const v = form.get(k);
+    return typeof v === "string" ? v : null;
+  };
+  const dryRaw = form.get("dry_run");
+  if (dryRaw !== null && dryRaw !== "true" && dryRaw !== "false") return refuse(400, "invalid_request", 'dry_run must be "true" or "false". Nothing changed.');
+  const dryRun = dryRaw === "true";
+  const runId = text("run_id");
+  if (runId === null || !RUN_ID.test(runId)) return refuse(400, "invalid_request", "run_id: the box run's id, 64 hex. Nothing changed.");
+  const stated: Record<"notes" | "versions" | "blobs", number> = { notes: 0, versions: 0, blobs: 0 };
+  for (const k of ["notes", "versions", "blobs"] as const) {
+    const v = text(k);
+    if (v === null || !COUNT.test(v)) return refuse(400, "invalid_request", `${k}: the batch's count, a whole number. Nothing changed.`);
+    stated[k] = Number(v);
+  }
+  const file = form.get("batch");
+  if (file === null || typeof file === "string") return refuse(400, "invalid_request", "batch: the batch's JSON, as a file part. Nothing changed.");
+  const batch = file as unknown as Blob;
+  if (batch.size === 0) return refuse(400, "invalid_request", "batch: empty. Nothing changed.");
+  if (batch.size > MAX_HISTORY_BATCH_BYTES) return tooLarge();
+  const target = await ownedVault(env, { email: text("email"), confirm: text("confirm"), reference: text("reference"), vault_name: text("vault_name") });
   if (target instanceof Response) return target;
   const { vault, reference, userId } = target;
-  const dryRun = body.dry_run === true;
+  const run = runId.slice(0, 12);
+  const counts = `stated_notes=${stated.notes} stated_versions=${stated.versions} stated_blobs=${stated.blobs}`;
   if (!dryRun) {
-    await audit(env, deps, "history_import_batch", userId, { vault: vault.name, reference, run: counts.run, notes: counts.notes, versions: counts.versions, blobs: counts.blobs });
+    await audit(env, deps, "history_import_batch", userId, {
+      vault: vault.name,
+      reference,
+      run,
+      stated_notes: stated.notes,
+      stated_versions: stated.versions,
+      stated_blobs: stated.blobs,
+    });
   }
-  const res = await forward(env, deps, vault, "POST", "/api/internal/history-import", { ...(body.batch as Record<string, unknown>), dry_run: dryRun });
-  console.log(
-    `event=ops_history_import user=${userId} vault=${vault.name} run=${counts.run} dry_run=${dryRun} notes=${counts.notes} versions=${counts.versions} blobs=${counts.blobs} status=${res.status}`,
-  );
-  return res;
+  // The batch's bytes go on as they came; the vault parses and checks all of it, and refuses a batch carrying its own dry_run.
+  const res = await callVaultApi(env.DB, deps, {
+    userId: vault.ownerUserId,
+    vaultName: vault.name,
+    method: "POST",
+    apiPath: `/api/internal/history-import${dryRun ? "?dry_run=true" : ""}`,
+    verb: "admin",
+    rawBody: batch,
+    rawContentType: "application/json",
+  }).catch(() => null);
+  if (!res) {
+    console.log(`event=ops_history_import user=${userId} vault=${vault.name} run=${run} dry_run=${dryRun} ${counts} status=502`);
+    return refuse(502, "vault_unreachable", "The vault did not answer. Retry: the door is idempotent.");
+  }
+  const answer = await res.text();
+  console.log(`event=ops_history_import user=${userId} vault=${vault.name} run=${run} dry_run=${dryRun} ${counts} status=${res.status} ${vaultTotals(answer)}`);
+  return new Response(answer, { status: res.status, headers: NO_STORE });
 }
 
 export async function handleOpsHistoryImportStatus(env: Env, req: Request, deps: OAuthDeps): Promise<Response | null> {
@@ -172,13 +227,11 @@ export async function handleOpsHistoryImportStatus(env: Env, req: Request, deps:
   if (refused !== undefined) return refused;
   const body = await jsonBody(req);
   if (body instanceof Response) return body;
-  const extra = unknownFields(body, ["vault_name"]);
+  const extra = unknownFields(body, CONSENT_FIELDS);
   if (extra) return extra;
-  const name = namedVault(body.vault_name);
-  if (name instanceof Response) return name;
-  const vault = await getVault(env.DB, name);
-  if (!vault) return refuse(404, "vault_not_found", "No vault has this name.");
-  return forward(env, deps, vault, "GET", "/api/internal/history-import");
+  const target = await ownedVault(env, body);
+  if (target instanceof Response) return target;
+  return forward(env, deps, target.vault, "GET", "/api/internal/history-import");
 }
 
 export async function handleOpsHistoryImportDigest(env: Env, req: Request, deps: OAuthDeps): Promise<Response | null> {
@@ -186,14 +239,12 @@ export async function handleOpsHistoryImportDigest(env: Env, req: Request, deps:
   if (refused !== undefined) return refused;
   const body = await cappedJson(req, 1024 * 1024);
   if (body instanceof Response) return body;
-  const extra = unknownFields(body, ["vault_name", "notes"]);
+  const extra = unknownFields(body, [...CONSENT_FIELDS, "notes"]);
   if (extra) return extra;
-  const name = namedVault(body.vault_name);
-  if (name instanceof Response) return name;
   if (!Array.isArray(body.notes)) return refuse(400, "invalid_request", "notes must be a list of { id, through_ix }.");
-  const vault = await getVault(env.DB, name);
-  if (!vault) return refuse(404, "vault_not_found", "No vault has this name.");
-  return forward(env, deps, vault, "POST", "/api/internal/history-digest", { notes: body.notes });
+  const target = await ownedVault(env, body);
+  if (target instanceof Response) return target;
+  return forward(env, deps, target.vault, "POST", "/api/internal/history-digest", { notes: body.notes });
 }
 
 export async function handleOpsHistoryImportFinish(env: Env, req: Request, deps: OAuthDeps): Promise<Response | null> {
@@ -203,7 +254,10 @@ export async function handleOpsHistoryImportFinish(env: Env, req: Request, deps:
   if (body instanceof Response) return body;
   const extra = unknownFields(body, FINISH_FIELDS);
   if (extra) return extra;
-  if (typeof body.run_id !== "string" || !/^[0-9a-f]{64}$/.test(body.run_id)) return refuse(400, "invalid_request", "run_id: 64 hex. Nothing changed.");
+  if (body.dry_run !== undefined && typeof body.dry_run !== "boolean") {
+    return refuse(400, "invalid_request", "dry_run must be true or false (a JSON boolean). Nothing changed.");
+  }
+  if (typeof body.run_id !== "string" || !RUN_ID.test(body.run_id)) return refuse(400, "invalid_request", "run_id: 64 hex. Nothing changed.");
   const expect = body.expect_receipts;
   if (typeof expect !== "number" || !Number.isSafeInteger(expect) || expect < 0) return refuse(400, "invalid_request", "expect_receipts must be a whole number. Nothing changed.");
   const target = await ownedVault(env, body);

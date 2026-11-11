@@ -95,9 +95,9 @@ export interface GraftNote {
   digest: string;
 }
 
+/** One batch. A dry run is said beside it (the vault door's `?dry_run=true`), never inside it. */
 export interface GraftBatch {
   run: GraftRun;
-  dry_run?: boolean;
   blobs: GraftBlob[];
   notes: GraftNote[];
 }
@@ -116,7 +116,7 @@ export const GRAFT_OUTCOMES = [
 export type GraftOutcome = (typeof GRAFT_OUTCOMES)[number];
 
 /** Request caps (the door refuses past them; the client stays well under). */
-export const GRAFT_MAX_BODY_BYTES = 32 * 1024 * 1024;
+export const GRAFT_MAX_BODY_BYTES = 16 * 1024 * 1024;
 export const GRAFT_MAX_NOTES = 5_000;
 export const GRAFT_MAX_VERSIONS = 50_000;
 export const GRAFT_MAX_BLOBS = 50_000;
@@ -146,10 +146,10 @@ export function tipOf(live: { content: string | null; path: string | null; exten
 }
 
 /** The client's batch shape: close at about this much JSON, or this many notes. */
-export const BATCH_TARGET_BYTES = 6 * 1024 * 1024;
+export const BATCH_TARGET_BYTES = 4 * 1024 * 1024;
 export const BATCH_MAX_NOTES = 400;
 /** One note (with every blob it needs) over this can't go in any batch: abort before sending anything. */
-export const NOTE_MAX_BYTES = 30 * 1024 * 1024;
+export const NOTE_MAX_BYTES = 14 * 1024 * 1024;
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const GIT_TIP = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -304,10 +304,10 @@ function checkNote(v: unknown): string | null {
 /** The door's step 1. Any failure → 400 `invalid_request`, nothing written. */
 export function parseGraftBatch(v: unknown): Parsed<GraftBatch> {
   if (!isObj(v)) return { ok: false, error: "body must be a JSON object" };
-  for (const k of Object.keys(v)) if (!["run", "dry_run", "blobs", "notes"].includes(k)) return { ok: false, error: "unknown top-level field" };
+  if ("dry_run" in v) return { ok: false, error: "dry_run goes beside the batch (?dry_run=true), not inside it" };
+  for (const k of Object.keys(v)) if (!["run", "blobs", "notes"].includes(k)) return { ok: false, error: "unknown top-level field" };
   const runBad = checkRun(v.run);
   if (runBad) return { ok: false, error: runBad };
-  if (v.dry_run !== undefined && typeof v.dry_run !== "boolean") return { ok: false, error: "dry_run: boolean" };
   if (!Array.isArray(v.blobs)) return { ok: false, error: "blobs: array" };
   if (!Array.isArray(v.notes)) return { ok: false, error: "notes: array" };
   if (v.notes.length > GRAFT_MAX_NOTES) return { ok: false, error: `notes: at most ${GRAFT_MAX_NOTES}` };
@@ -335,7 +335,7 @@ export function parseGraftBatch(v: unknown): Parsed<GraftBatch> {
   }
   return {
     ok: true,
-    value: { run: v.run as GraftRun, ...(v.dry_run !== undefined ? { dry_run: v.dry_run as boolean } : {}), blobs: [...blobs.values()], notes: v.notes as GraftNote[] },
+    value: { run: v.run as GraftRun, blobs: [...blobs.values()], notes: v.notes as GraftNote[] },
   };
 }
 

@@ -125,9 +125,10 @@ async function graft(v: string, batch: GraftBatch): Promise<{ status: number; bo
   const r = await post(v, "/internal/history-import", batch);
   return { status: r.status, body: await r.json() };
 }
-/** The same batch as a dry run. */
-async function graftDry(v: string, batch: GraftBatch): Promise<{ status: number; body: any }> {
-  return graft(v, { ...batch, dry_run: true });
+/** The same batch as a dry run: the vault reads `dry_run` from the query, never from the batch. */
+async function graftDry(v: string, batch: GraftBatch, flag = "true"): Promise<{ status: number; body: any }> {
+  const r = await post(v, `/internal/history-import?dry_run=${flag}`, batch);
+  return { status: r.status, body: await r.json() };
 }
 
 /** Everything the import may touch, counted; plus the full `notes` rows. */
@@ -341,13 +342,21 @@ describe("operator history import (vault side)", () => {
     const empty = await snapshot(cloud);
 
     // Dry run: the same outcomes, nothing written, keep-all not turned on.
-    const dry = await graft(cloud, { ...batch!, dry_run: true });
+    const dry = await graftDry(cloud, batch!);
     expect(dry.status).toBe(200);
     expect(dry.body).toMatchObject({ dry_run: true, totals: { grafted: 2 } });
     expect(dry.body.versions_written).toBeGreaterThan(0);
     expect(await snapshot(cloud)).toEqual(empty);
     const st0: any = await (await op(cloud, "/api/internal/history-import")).json();
     expect(st0).toMatchObject({ runs: [], imported_versions: 0, keep_all: false });
+    // dry_run travels beside the batch (the query), never inside it; and only as true or false.
+    const inside = await graft(cloud, { ...batch!, dry_run: true } as GraftBatch);
+    expect(inside.status).toBe(400);
+    expect(inside.body.error_type).toBe("invalid_request");
+    expect((await graftDry(cloud, batch!, "yes")).status).toBe(400);
+    expect(await snapshot(cloud)).toEqual(empty);
+    const explicit = await makeCloud([current(A), current(B)]);
+    expect((await graftDry(explicit, batch!, "false")).body).toMatchObject({ dry_run: false, totals: { grafted: 2 } });
 
     // A tampered blob: 400, nothing written.
     const tampered = structuredClone(batch!);
