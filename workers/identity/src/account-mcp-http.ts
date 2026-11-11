@@ -32,7 +32,8 @@
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import { validateAccountToken } from "./account-auth.ts";
 import {
-  ACCOUNT_MCP_TOOLS,
+  toolsFor,
+  grantCanWrite,
   type AccountConnectionGrant,
   type AccountToolContext,
   AccountToolError,
@@ -185,7 +186,7 @@ function bearerToken(req: Request): string | null {
 }
 
 type AuthResult =
-  | { ok: true; accountId: string; grant: AccountConnectionGrant; user: User }
+  | { ok: true; accountId: string; grant: AccountConnectionGrant; user: User; key?: AccountToolContext["key"] }
   | { ok: false; status: 401 | 403; error: string; message: string };
 
 /**
@@ -237,7 +238,15 @@ async function authenticate(db: D1Database, req: Request, deps: OAuthDeps): Prom
     return { ok: false, status: 401, error: "account_suspended", message: "this account is suspended" };
   }
 
-  return { ok: true, accountId, grant, user };
+  return { ok: true, accountId, grant, user, ...keyClaimOf(validated.token.payload) };
+}
+
+const KEY_KINDS = new Set(["person", "agent", "app", "service"]);
+/** The signed `key` claim of a multi-vault key (account-keys.ts), if the token carries a well-formed one. */
+function keyClaimOf(payload: Record<string, unknown>): { key?: AccountToolContext["key"] } {
+  const k = payload.key as { name?: unknown; kind?: unknown } | undefined;
+  if (!k || typeof k !== "object" || typeof k.name !== "string" || typeof k.kind !== "string" || !KEY_KINDS.has(k.kind)) return {};
+  return { key: { name: k.name, kind: k.kind as NonNullable<AccountToolContext["key"]>["kind"] } };
 }
 
 /** An auth-failure Response: `{error, error_description}` JSON + the RFC 9728
@@ -260,7 +269,7 @@ async function handleToolCall(
 ): Promise<JsonRpcMessage> {
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
-  const tool = ACCOUNT_MCP_TOOLS.find((t) => t.name === name);
+  const tool = toolsFor(ctx.grant).find((t) => t.name === name);
   // Unknown tool → in-band tool error (not a JSON-RPC error), mirroring the
   // vault door — callers can't distinguish "hidden tool" from "no such tool".
   if (!tool) {
@@ -268,6 +277,8 @@ async function handleToolCall(
   }
   try {
     const out = await tool.execute(args, ctx);
+    // A write tool hands back the vault's own MCP result (its content blocks), untouched.
+    if (tool.passThrough) return result(id, out);
     return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
   } catch (err) {
     // A structured business failure → JSON-RPC error carrying `error_type` (the
@@ -280,12 +291,15 @@ async function handleToolCall(
   }
 }
 
-function instructions(): string {
+function instructions(canWrite: boolean): string {
   return (
     "The Parachute account MCP — one connection across your vaults. " +
-    "Use list-vaults to see the vaults this connection can reach, create-vault to add one, " +
-    "and query-notes to search across them (omit `vault` to fan out, pass it to target one). " +
-    "Reads and writes are scoped to the vaults you granted and currently own."
+    "Use list-vaults to see the vaults this connection can reach and its level on each, create-vault to add one, " +
+    "and query-notes to search across them (omit `vault` to fan out, pass it to target one)" +
+    (canWrite
+      ? ". create-note, update-note and delete-note write to one vault, which every write must name in `vault`; " +
+        "a write needs write on that vault."
+      : ". This connection reads; it does not write.")
   );
 }
 
@@ -302,12 +316,12 @@ async function handleOne(m: JsonRpcMessage, ctx: AccountToolContext): Promise<Js
           protocolVersion,
           capabilities: { tools: {} },
           serverInfo: { name: "parachute-account", version: "0.1.0" },
-          instructions: instructions(),
+          instructions: instructions(grantCanWrite(ctx.grant)),
         });
       }
       case "tools/list":
         return result(id, {
-          tools: ACCOUNT_MCP_TOOLS.map((t) => ({
+          tools: toolsFor(ctx.grant).map((t) => ({
             name: t.name,
             description: t.description,
             inputSchema: t.inputSchema,
@@ -437,7 +451,7 @@ async function handleModern(m: JsonRpcMessage, ctx: AccountToolContext): Promise
       reply = result(id, {
         supportedVersions: ALL_SUPPORTED_VERSIONS,
         capabilities: { tools: {} },
-        instructions: instructions(),
+        instructions: instructions(grantCanWrite(ctx.grant)),
         ttlMs: MODERN_CACHE_TTL_MS,
         cacheScope: "private",
       });
@@ -562,6 +576,7 @@ export async function handleAccountMcp(db: D1Database, req: Request, deps: OAuth
     // "nostr" and the verified event pubkey here; until then hop tokens
     // carry no permissions.principal_pubkey (cloud#278).
     principal: { authKind: "bearer" },
+    ...(auth.key ? { key: auth.key } : {}),
   };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];

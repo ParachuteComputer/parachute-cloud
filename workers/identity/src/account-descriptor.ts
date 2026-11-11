@@ -146,7 +146,8 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // such section.
     capabilities,
     // The account-level MCP endpoint (Wave A PR3) — one connection across the
-    // account's vaults (list-vaults / create-vault / query-notes). Advertised at
+    // account's vaults (list-vaults / create-vault / query-notes, plus create-note /
+    // update-note / delete-note for a connection that can write somewhere). Advertised at
     // the FRONT DOOR origin (`my.` in prod, self-referential in staging), where
     // the endpoint actually lands, NOT `iss` (which stays `cloud.` through Phase
     // 4). Its RFC 9728 PRM sits at `<frontDoor>/.well-known/oauth-protected-

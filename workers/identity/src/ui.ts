@@ -342,7 +342,7 @@ export interface ConsentProps {
    * four visible controls (see `renderAccountVaultsBlock`): an always-on "see the
    * vaults" line (no control), a CHECKED-by-default "Create new vaults" checkbox
    * (`vault_create`), a vault-set mode radio (`vault_mode` — wildcard DEFAULT vs a
-   * specific set of `vault_include` boxes), and an access-level radio (`access_verb`
+   * specific set, each vault at its own `vault_level:<vault>` none/read/write), and an access-level radio (`access_verb`
    * — read | write DEFAULT, NEVER admin: the ceiling). Mutually exclusive with the
    * vault-picker / verb-selector branch (a mixed account+vault request is refused
    * upstream). The submit RE-VALIDATES server-side (verb ∈ {read,write}, every
@@ -390,8 +390,11 @@ function scopeLabel(scope: string): string {
   // closed "Technical details", so the sentence is where a person reads it.
   const named = scope.match(/^vault:([^:]+):(read|write|admin)$/);
   const inVault = named ? ` in ${named[1]}` : "";
-  if (scope === "vault:read" || named?.[2] === "read") return `Read your vault notes${inVault}`;
-  if (scope === "vault:write" || named?.[2] === "write") return `Create and edit your vault notes${inVault}`;
+  // Connect says what it reads (0.9.1, the box's words): a read reaches the WHOLE vault, so the sentence never
+  // claims less than the grant allows; a write starts with that read.
+  const vaultName = named ? ` ${named[1]}` : "";
+  if (scope === "vault:read" || named?.[2] === "read") return `Read the whole vault${vaultName}: every note, tag and attachment, and its settings`;
+  if (scope === "vault:write" || named?.[2] === "write") return `Read the whole vault${vaultName}, and create, edit and delete its notes, tags and attachments`;
   if (scope === "vault:admin" || named?.[2] === "admin") return `Full administrative access to your vault${inVault}`;
   // Wave A account-vaults connection scope: the un-narrowed request form
   // (`account:vaults`) and the consent-bound blanket (`account:<id>:vaults`).
@@ -449,8 +452,8 @@ function renderVerbSelector(selector: OwnerVerbSelector): string {
   return `<fieldset class="verbsel">
            <legend>Access level</legend>
            <p class="muted" style="margin:.3rem 0 0;font-size:.84rem">This app asked for ${asked} access. Because you own this vault, you can grant a different level.</p>
-           ${option("read", "Read only", "View notes, tags, and attachments.")}
-           ${option("write", "Read & write", "Create, edit, and delete notes, tags, and attachments.")}
+           ${option("read", "Read only", "Read the whole vault: every note, tag and attachment, and its settings.")}
+           ${option("write", "Read & write", "Read the whole vault, and create, edit and delete its notes, tags and attachments.")}
            ${option("admin", "Full admin", "Everything above, plus vault config and minting tokens.")}
          </fieldset>`;
 }
@@ -469,16 +472,18 @@ function renderVerbSelector(selector: OwnerVerbSelector): string {
  *      tool already refuses without it). Checked-by-default also means a
  *      re-consent PRESERVES the create capability unless the owner unchecks it.
  *   3. Vault set — a mode RADIO (`vault_mode`): "Any vault — current and future"
- *      (wildcard, DEFAULT) vs "Only these vaults" (a fixed set of `vault_include`
- *      boxes, all checked when shown). The MODE decides, not the box count:
- *      "only these" with every box checked emits the SPECIFIC fixed set, NOT the
- *      wildcard. The copy states the future-vaults difference.
+ *      (wildcard, DEFAULT) vs "Only the vaults you choose" (0.9.1: one select per
+ *      vault, `vault_level:<vault>` = none | read | write, posted with
+ *      `account_vault_levels=1`). The MODE decides: "only" with every vault at
+ *      write emits the SPECIFIC fixed set, NOT the wildcard. The copy states the
+ *      future-vaults difference. (The pre-0.9.1 `vault_include` + `access_verb`
+ *      form is still accepted, so a page open across the deploy still submits.)
  *   4. Access level — a RADIO (`access_verb`): "Read only" vs "Read & write"
  *      (DEFAULT). NO admin option, EVER — the ceiling (per-vault admin stays the
  *      separate owner-elected tier-3 path). The server also whitelists the verb.
  *
- * NO inline script (the strict consent CSP admits none), so the per-vault boxes
- * are always in the DOM under "Only these vaults" — the server simply ignores
+ * NO inline script (the strict consent CSP admits none), so the per-vault selects
+ * are always in the DOM under "Only the vaults you choose" — the server simply ignores
  * them when `vault_mode=wildcard`. NO billing / vault-delete / token-mint control
  * ever appears here. The submit RE-VALIDATES everything server-side
  * (`handleConsentSubmit` — verb whitelist, ownership, id=session.userId), so this
@@ -489,10 +494,15 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
   if (consent.ownedVaults.length === 0) {
     return `<p class="muted" data-testid="account-vaults-none" style="margin:.85rem 0 0">You don't have a vault yet — <a href="/console">create one</a>, then reconnect to grant access.</p>`;
   }
-  const boxes = consent.ownedVaults
+  // One row per vault: none, read or write (0.9.1 "one multi-vault door"). Posted as `vault_level:<vault>`; the
+  // submit re-checks every name against ownership and every level against none/read/write.
+  const rows = consent.ownedVaults
     .map(
       (name) =>
-        `<label class="vaultopt"><input type="checkbox" name="vault_include" value="${esc(name)}" checked> <span>${esc(name)}</span></label>`,
+        `<label class="vaultopt" style="display:flex;gap:.6rem;align-items:center"><span style="min-width:8rem">${esc(name)}</span>` +
+        `<select name="vault_level:${esc(name)}" class="field" style="width:auto;margin:0">` +
+        `<option value="none">None</option><option value="read" selected>Read</option><option value="write">Read &amp; write</option>` +
+        `</select></label>`,
     )
     .join("\n");
   const opt = (name: string, value: string, title: string, desc: string, checked: boolean): string =>
@@ -500,7 +510,8 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
                <input type="${name === "vault_create" ? "checkbox" : "radio"}" name="${name}" value="${value}"${checked ? " checked" : ""}>
                <span class="verbopt-body"><span class="verbopt-title">${title}</span><span class="verbopt-desc">${esc(desc)}</span></span>
              </label>`;
-  return `<fieldset class="vaultinclude" data-testid="account-vaults">
+  return `<input type="hidden" name="account_vault_levels" value="1">
+         <fieldset class="vaultinclude" data-testid="account-vaults">
            <legend>What this connection can do</legend>
            <p class="verbopt" data-testid="account-vaults-list" style="margin:.35rem 0 0">
              <span class="verbopt-body"><span class="verbopt-title">See the vaults in this connection</span><span class="verbopt-desc">Listing your vaults is part of connecting — always included.</span></span>
@@ -508,15 +519,16 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
            ${opt("vault_create", "1", "Create new vaults", "Let this app create new vaults in your account. Uncheck to withhold.", true)}
            <div data-testid="account-vaults-set" style="margin:1rem 0 0">
              <p class="verbopt-title" style="margin:0 0 .2rem">Which vaults</p>
-             ${opt("vault_mode", "wildcard", "Any vault — current and future", "Every vault you own now, plus any you create later.", true)}
-             ${opt("vault_mode", "specific", "Only these vaults", "A fixed set. A vault you create later won't be part of this connection until you reconnect.", false)}
-             <div data-testid="account-vaults-boxes" style="margin:.5rem 0 0 1.7rem">${boxes}</div>
+             ${opt("vault_mode", "wildcard", "Any vault — current and future", "Every vault you own now, plus any you create later, at the access level below.", true)}
+             ${opt("vault_mode", "specific", "Only the vaults you choose, each at its own level", "None, read or read & write for each (never above the access level below). A vault you create later won't be part of this connection until you reconnect.", false)}
+             <div data-testid="account-vaults-boxes" style="margin:.5rem 0 0 1.7rem">${rows}</div>
            </div>
            <fieldset class="verbsel" data-testid="account-vaults-access" style="margin-top:1rem">
              <legend>Access level</legend>
-             ${opt("access_verb", "read", "Read only", "View notes, tags, and attachments.", false)}
-             ${opt("access_verb", "write", "Read &amp; write", "View, create, edit, and delete notes, tags, and attachments.", true)}
+             ${opt("access_verb", "read", "Read only", "Read the whole vault: every note, tag and attachment, and its settings.", false)}
+             ${opt("access_verb", "write", "Read &amp; write", "Read the whole vault, and create, edit and delete its notes, tags and attachments.", true)}
            </fieldset>
+           <p class="muted" data-testid="account-vaults-reads" style="margin:.8rem 0 0">Read means the whole vault: every note, tag and attachment, and its settings. Read &amp; write reads the whole vault too. What this app reads from your vaults goes to the company that runs it.</p>
          </fieldset>`;
 }
 
@@ -551,6 +563,7 @@ export function renderConsent(props: ConsentProps): string {
        ${unverified ? unverifiedLabel() : ""}
        <p class="lead" data-testid="consent-ask">${ask}</p>
        <ul class="scopes">${scopeList}</ul>
+       ${!accountVaults && scopeDescriptions.some((d) => /^vault:/.test(d.scope)) ? `<p class="muted" data-testid="consent-reads-go" style="margin:.4rem 0 0">What this app reads from your vault goes to the company that runs it.</p>` : ""}
        ${returnsToLine(params.redirectUri)}
        <form method="post" action="/oauth/authorize">
          <input type="hidden" name="__action" value="consent">
