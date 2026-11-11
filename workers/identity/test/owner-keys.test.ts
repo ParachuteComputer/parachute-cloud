@@ -558,11 +558,11 @@ describe("the write stamp on app keys (key claim, on_behalf_of)", () => {
     expect(r.status).toBe(201);
     const c = decodeJwtPayload(r.json.token);
     expect(c.key).toEqual({ name: "arcade-worker", kind: "app" });
-    expect(c.permissions).toBeUndefined();
+    expect(c.permissions).toEqual({ app_key: "arcade-worker" }); // door/0.9 keeps T-430's claim beside `key`
     expect("on_behalf_of" in r.json).toBe(false);
     const off = await mint(a, bearer, { name: "plain", vault: "arcade", can: "write", on_behalf_of: false });
     expect(off.status).toBe(201);
-    expect(decodeJwtPayload(off.json.token).permissions).toBeUndefined();
+    expect(decodeJwtPayload(off.json.token).permissions).toEqual({ app_key: "plain" });
     const listed = (await a.call("/account/keys", { auth: bearer })).json.keys as Record<string, unknown>[];
     expect(listed.every((k) => !("on_behalf_of" in k))).toBe(true);
   });
@@ -574,7 +574,7 @@ describe("the write stamp on app keys (key claim, on_behalf_of)", () => {
     expect(r.status).toBe(201);
     expect(r.json.on_behalf_of).toBe(true);
     const c = decodeJwtPayload(r.json.token);
-    expect(c.permissions).toEqual({ acts_for: "fernhill-portal" });
+    expect(c.permissions).toEqual({ app_key: "fernhill-portal", acts_for: "fernhill-portal" });
     expect(c.key).toEqual({ name: "fernhill-portal", kind: "app" });
     await mint(a, bearer, { name: "other", vault: "arcade", can: "read" });
     const byName = async () =>

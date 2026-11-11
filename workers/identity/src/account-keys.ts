@@ -190,12 +190,13 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
     clientId: APP_KEY_CLIENT_ID,
     issuer: deps.issuer,
     vaultScope: [vault],
-    // The vault names this key's writes `key:<name>` (vault auth.ts parseAppKeyName; T-430).
-    permissions: { app_key: name },
+    // The key's name twice: `permissions.app_key` for a vault worker that reads only that (T-430), and the top-level
+    // `key` claim the 0.9.1 engine reads (core write-stamp.ts parseKeyClaim, as the box mints it), with its kind. The
+    // owner's on-behalf-of grant rides beside app_key in `permissions`.
+    permissions: { app_key: name, ...(permissions ?? {}) },
     ttlSeconds: ttl,
     now: () => now,
     key: { name, kind: "app" },
-    ...(permissions ? { permissions } : {}),
   });
   const createdAt = now.toISOString();
   try {
