@@ -254,6 +254,14 @@ describe("history import payload builder (bun:sqlite box)", () => {
     const victim = box.prepare("SELECT hash FROM note_blobs WHERE encoding = 'deflate' LIMIT 1").get() as { hash: string };
     box.prepare("UPDATE note_blobs SET content = ? WHERE hash = ?").run(new Uint8Array([1, 2, 3]), victim.hash);
     expect(() => planBatches(box)).toThrow(/does not decode/);
+    const delta = box.prepare("SELECT hash FROM note_blobs WHERE encoding = 'fossil-delta-z' LIMIT 1").get() as { hash: string };
+    const fresh = await makeBox();
+    compressBlobs(fresh);
+    fresh.prepare("UPDATE note_blobs SET content = ? WHERE hash = ?").run(new Uint8Array([9, 9, 9]), delta.hash);
+    expect(() => planBatches(fresh)).toThrow(/compressed delta in the box DB does not decode/);
+    const other = await makeBox();
+    other.prepare("UPDATE note_blobs SET encoding = 'zstd' WHERE hash = ?").run(victim.hash);
+    expect(() => planBatches(other)).toThrow(/unknown encoding/);
   });
 
   // The door reads what it holds through the engine's own read path, so this needs an engine pin that reads the
