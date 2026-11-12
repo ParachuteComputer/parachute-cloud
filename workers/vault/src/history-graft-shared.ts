@@ -12,7 +12,8 @@
  * Counts, hashes and ids travel; nothing here logs a body, path or metadata.
  */
 import { canonicalJson, importObservationDigest } from "@openparachute/core/src/history-import.js";
-import { byteLength, hashContent } from "@openparachute/core/src/history.js";
+import { VERSION_MAX_BYTES, byteLength, hashContent } from "@openparachute/core/src/history.js";
+import { inflateRawSync } from "node:zlib";
 import { supportsInlineFrontmatter } from "@openparachute/core/src/portable-md.js";
 
 /** The run row of the box's import (core `ImportRun`). */
@@ -23,7 +24,11 @@ export interface GraftRun {
   options_digest: string;
 }
 
-/** One `note_blobs` row as the box stores it: whole, or a depth-one delta against a whole blob. */
+/**
+ * One blob on the wire: whole text, or a base64 Fossil delta against a whole blob (depth one). These are the two
+ * encodings every engine reads, so a box that stores its blobs compressed (`deflate`, `fossil-delta-z`, T-460) sends
+ * them decoded into these (readBoxBlobs), and the door's own maintenance pass compresses them again.
+ */
 export interface GraftBlob {
   hash: string;
   content: string;
@@ -469,7 +474,10 @@ export function highestNativeIx(versions: readonly Pick<GraftVersion, "version_i
  * whole: the box DB is damaged, and nothing should be sent.
  */
 export function readBoxBlobs(db: SqlLike, hashes: Iterable<string>): GraftBlob[] {
-  const get = (h: string) => db.prepare("SELECT hash, content, byte_size, encoding, delta_of FROM note_blobs WHERE hash = ?").get(h) as GraftBlob | null;
+  const get = (h: string) => {
+    const row = db.prepare("SELECT hash, content, byte_size, encoding, delta_of FROM note_blobs WHERE hash = ?").get(h) as StoredBlobRow | null;
+    return row ? toWireBlob(row) : null;
+  };
   const whole = new Map<string, GraftBlob>();
   const deltas = new Map<string, GraftBlob>();
   for (const h of hashes) {
@@ -578,4 +586,58 @@ export function planBatches(
   }
   close();
   return { run, batches, notes: ids.length, staleReceipts };
+}
+
+/** A `note_blobs` row as SQLite hands it back: a BLOB is a Uint8Array under bun, an ArrayBuffer in a DO. */
+export interface StoredBlobRow {
+  hash: string;
+  content: string | Uint8Array | ArrayBuffer;
+  byte_size: number;
+  encoding: string | null;
+  delta_of: string | null;
+}
+/** Whether a stored blob holds a whole body: NULL (text) or `deflate` (T-460). Engine core's `isWhole`. */
+export function isStoredWhole(encoding: string | null): boolean {
+  return encoding === null || encoding === "deflate";
+}
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+function inflate(content: StoredBlobRow["content"], maxBytes: number): Uint8Array {
+  if (typeof content === "string") throw new Error("a compressed blob holds text, not bytes");
+  return inflateRawSync(content instanceof Uint8Array ? content : new Uint8Array(content), { maxOutputLength: maxBytes });
+}
+/** The body a stored whole blob holds, or null when it isn't whole or doesn't decode. */
+export function storedWholeText(row: Pick<StoredBlobRow, "content" | "encoding">): string | null {
+  try {
+    if (row.encoding === null) return typeof row.content === "string" ? row.content : strictUtf8.decode(new Uint8Array(row.content as ArrayBuffer));
+    if (row.encoding === "deflate") return strictUtf8.decode(inflate(row.content, VERSION_MAX_BYTES));
+  } catch {
+    return null;
+  }
+  return null;
+}
+/**
+ * A stored blob in a wire encoding: `deflate` becomes whole text, `fossil-delta-z` becomes the base64 of the same
+ * raw delta (same base), and the two old encodings pass as they are. Throws on an encoding it doesn't know or a blob
+ * that doesn't decode: the box DB is damaged, and nothing should be sent.
+ */
+export function toWireBlob(row: StoredBlobRow): GraftBlob {
+  if (row.encoding === null || row.encoding === "fossil-delta") {
+    if (typeof row.content !== "string") throw new Error("a blob in the box DB holds bytes where text belongs");
+    return { hash: row.hash, content: row.content, byte_size: row.byte_size, encoding: row.encoding, delta_of: row.delta_of };
+  }
+  if (row.encoding === "deflate") {
+    const text = storedWholeText(row);
+    if (text === null) throw new Error("a compressed blob in the box DB does not decode");
+    return { hash: row.hash, content: text, byte_size: byteLength(text), encoding: null, delta_of: null };
+  }
+  if (row.encoding === "fossil-delta-z") {
+    let b64: string;
+    try {
+      b64 = Buffer.from(inflate(row.content, VERSION_MAX_BYTES + 65_536)).toString("base64");
+    } catch {
+      throw new Error("a compressed delta in the box DB does not decode");
+    }
+    return { hash: row.hash, content: b64, byte_size: b64.length, encoding: "fossil-delta", delta_of: row.delta_of };
+  }
+  throw new Error("a blob in the box DB has an unknown encoding");
 }
