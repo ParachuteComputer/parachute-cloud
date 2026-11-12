@@ -12,9 +12,10 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deflateRawSync } from "node:zlib";
 import { SqliteStore } from "../workers/vault/node_modules/@openparachute/core/src/store.js";
 import { applyImportedNote, beginImportRun, importTargetDigest } from "../workers/vault/node_modules/@openparachute/core/src/history-import.js";
-import { DEFAULT_HISTORY_POLICY, hashContent } from "../workers/vault/node_modules/@openparachute/core/src/history.js";
+import { DEFAULT_HISTORY_POLICY, hashContent, readBlobContent } from "../workers/vault/node_modules/@openparachute/core/src/history.js";
 import {
   BATCH_MAX_NOTES,
   EMPTY_OBSERVATIONS_DIGEST,
@@ -69,6 +70,39 @@ async function makeBox(opts: { complete?: boolean; secondRun?: boolean } = {}): 
   if (opts.secondRun) beginImportRun(db as never, { ...RUN, run_id: hashContent("another run") });
   return db;
 }
+
+/**
+ * Re-store a box's blobs as an engine with T-460's encodings would: every whole blob deflated, every base64 delta as
+ * its raw bytes deflated (same base). Returns how many deltas it re-stored.
+ */
+function compressBlobs(db: Database): number {
+  const rows = db.prepare("SELECT hash, content, encoding FROM note_blobs").all() as { hash: string; content: string; encoding: string | null }[];
+  let deltas = 0;
+  for (const r of rows) {
+    const bytes = r.encoding === null ? new TextEncoder().encode(r.content) : Buffer.from(r.content, "base64");
+    const z = deflateRawSync(bytes);
+    db.prepare("UPDATE note_blobs SET content = ?, byte_size = ?, encoding = ? WHERE hash = ?")
+      .run(z, z.byteLength, r.encoding === null ? "deflate" : "fossil-delta-z", r.hash);
+    if (r.encoding !== null) deltas++;
+  }
+  return deltas;
+}
+
+/** Whether the pinned engine reads a deflated blob (T-460 release A, core's blob-codec.ts). */
+const ENGINE_READS_COMPRESSED = (() => {
+  const db = new Database(":memory:");
+  new SqliteStore(db as never);
+  const z = deflateRawSync(new TextEncoder().encode("probe"));
+  db.prepare("INSERT INTO note_blobs (hash, content, byte_size, encoding) VALUES (?, ?, ?, 'deflate')").run(hashContent("probe"), z, z.byteLength);
+  try {
+    return readBlobContent(db as never, hashContent("probe")) === "probe";
+  } catch {
+    return false;
+  } finally {
+    db.close();
+  }
+})();
+if (!ENGINE_READS_COMPRESSED) console.warn("[t460] the pinned engine does not read compressed blobs: one door test is skipped");
 
 /** A made-up cloud vault: the same notes at the box's current state, no history. */
 async function makeCloud(box: Database): Promise<Database> {
@@ -190,6 +224,53 @@ describe("history import payload builder (bun:sqlite box)", () => {
     expect(compareDigest({ versions: 1, digest: "x" }, undefined, true)).toBe("refused_earlier");
     expect(compareDigest({ versions: 1, digest: "x" }, { found: false, versions: 0, digest: "y", content_ok: true }, false)).toBe("not_on_cloud");
     expect(compareDigest({ versions: 1, digest: "x" }, { found: true, versions: 1, digest: "x", content_ok: false }, false)).toBe("unreadable");
+  });
+
+  // T-460: an engine that stores blobs compressed (deflate, fossil-delta-z). The wire keeps the two old encodings,
+  // so a box on that engine must send exactly what an older box would have sent.
+  it("a box whose blobs are stored compressed sends the same batches, which graft and digest equal", async () => {
+    const box = await makeBox();
+    const before = planBatches(box);
+    const deltas = compressBlobs(box);
+    expect(deltas).toBeGreaterThan(0);
+    expect(box.prepare("SELECT COUNT(*) AS n FROM note_blobs WHERE encoding IS NULL OR encoding = 'fossil-delta'").get()).toEqual({ n: 0 });
+    const after = planBatches(box);
+    expect(after).toEqual(before);
+    for (const { batch } of after.batches) for (const b of batch.blobs) expect(typeof b.content).toBe("string");
+    const cloud = await makeCloud(box);
+    const txn = <T,>(fn: () => T): T => cloud.transaction(fn)();
+    for (const { batch } of planBatches(box, { maxNotes: 1 }).batches) {
+      const r = graftBatch(cloud as never, txn, batch);
+      expect(r.ok && r.summary.totals.grafted).toBe(1);
+    }
+    const notes = after.batches[0]!.batch.notes;
+    const answers = digestNotes(cloud as never, { notes: notes.map((n) => ({ id: n.id, through_ix: highestNativeIx(n.versions) })) });
+    expect(answers.map((x, i) => compareDigest({ versions: notes[i]!.versions.length, digest: notes[i]!.digest }, x, false))).toEqual(["equal", "equal", "equal", "equal"]);
+  });
+
+  it("a compressed box blob that doesn't decode stops the plan before anything is sent", async () => {
+    const box = await makeBox();
+    compressBlobs(box);
+    const victim = box.prepare("SELECT hash FROM note_blobs WHERE encoding = 'deflate' LIMIT 1").get() as { hash: string };
+    box.prepare("UPDATE note_blobs SET content = ? WHERE hash = ?").run(new Uint8Array([1, 2, 3]), victim.hash);
+    expect(() => planBatches(box)).toThrow(/does not decode/);
+  });
+
+  // The door reads what it holds through the engine's own read path, so this needs an engine pin that reads the
+  // compressed encodings (core's T-460 release A). On an older pin it is skipped, and says so.
+  it.skipIf(!ENGINE_READS_COMPRESSED)("the door takes a delta whose base it already holds compressed: stored as a delta, not refused or re-wholed", async () => {
+    const box = await makeBox();
+    const { batch } = planBatches(box, { maxNotes: 1 }).batches.find((p) => p.batch.notes[0]!.id === "n-3-c")!;
+    const delta = batch.blobs.find((b) => b.encoding === "fossil-delta")!;
+    const base = batch.blobs.find((b) => b.hash === delta.delta_of)!;
+    const cloud = await makeCloud(box);
+    // The base is already in this vault, deflated, as the door's maintenance pass leaves it; the batch leaves it out.
+    cloud.prepare("INSERT INTO note_blobs (hash, content, byte_size, encoding, delta_of) VALUES (?, ?, ?, 'deflate', NULL)")
+      .run(base.hash, deflateRawSync(new TextEncoder().encode(base.content)), 0);
+    const trimmed = { ...batch, blobs: batch.blobs.filter((b) => b.hash !== base.hash) };
+    const r = graftBatch(cloud as never, <T,>(fn: () => T): T => cloud.transaction(fn)(), trimmed);
+    expect(r.ok && r.summary.totals.grafted).toBe(1);
+    expect(cloud.prepare("SELECT encoding, delta_of FROM note_blobs WHERE hash = ?").get(delta.hash)).toEqual({ encoding: "fossil-delta", delta_of: base.hash });
   });
 
   it("refuses a box whose run is unfinished or not alone, and a note too big for any batch", async () => {
