@@ -26,6 +26,8 @@ import {
   GRAFT_OUTCOMES,
   highestNativeIx,
   historyDigest,
+  isStoredWhole,
+  storedWholeText,
   type DigestAnswer,
   type DigestQuery,
   type GraftBatch,
@@ -34,6 +36,7 @@ import {
   type GraftOutcome,
   type GraftRef,
   type GraftVersion,
+  type StoredBlobRow,
 } from "./history-graft-shared.js";
 
 /** The slice of the DO shim (and of `bun:sqlite`) this module uses. */
@@ -124,8 +127,9 @@ function verifyBlobs(
     if (sent) {
       if (sent.encoding === null) base = sent.content;
     } else {
-      const row = db.prepare("SELECT content, encoding FROM note_blobs WHERE hash = ?").get(b.delta_of) as { content: string; encoding: string | null } | null;
-      if (row && row.encoding === null && hashContent(row.content) === b.delta_of) base = row.content;
+      const row = db.prepare("SELECT content, encoding FROM note_blobs WHERE hash = ?").get(b.delta_of) as Pick<StoredBlobRow, "content" | "encoding"> | null;
+      const text = row ? storedWholeText(row) : null;
+      if (text !== null && hashContent(text) === b.delta_of) base = text;
     }
     if (base === null) return { ok: false, hash: b.hash };
     let text: string;
@@ -161,7 +165,7 @@ function insertBlobs(db: GraftDb, blobs: GraftBlob[], deltaBodies: Map<string, s
   for (const b of blobs) {
     if (b.encoding === null || has.get(b.hash)) continue;
     const base = has.get(b.delta_of) as { encoding: string | null } | null;
-    if (base && base.encoding === null) {
+    if (base && isStoredWhole(base.encoding)) {
       insert.run(b.hash, b.content, b.byte_size, b.encoding, b.delta_of);
     } else {
       const text = deltaBodies.get(b.hash)!;
