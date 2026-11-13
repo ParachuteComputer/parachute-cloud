@@ -368,7 +368,7 @@ describe("restore — tar plumbing (unit)", () => {
       { name: "data/table.csv", text: "a,b" },
     ]);
     expect(source.readSchemaFiles()).toEqual([{ name: "project.yaml", text: "name: project" }]);
-    expect(source.readNotesMetaFiles()).toEqual(["id: n2"]);
+    expect(source.readNotesMetaFiles()).toEqual([{ name: "n2.yaml", text: "id: n2" }]);
     expect(source.listContentFiles()).toEqual(["data/table.csv", "notes/first.md"]);
     expect(source.readContentFile("notes/first.md")).toBe("content");
     expect(source.attachmentsEnabled).toBe(false);

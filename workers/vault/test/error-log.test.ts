@@ -13,7 +13,7 @@
  */
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
+import { READABLE_SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 import { redactMessage, serverErrorLine, stackFrames } from "../src/error-log.ts";
 import { createNote, freshVault, mintToken, op } from "./helpers.ts";
 import { SELF } from "cloudflare:test";
@@ -128,7 +128,7 @@ describe("a vault DO that cannot boot", () => {
     // (Two calls: an abort in the same turn would also roll the stamp back.)
     const stub = () => env.VAULT.get(env.VAULT.idFromName(v));
     await runInDurableObject(stub(), async (_inst, state) => {
-      state.storage.sql.exec("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", SCHEMA_VERSION + 1, new Date().toISOString());
+      state.storage.sql.exec("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", READABLE_SCHEMA_VERSION + 1, new Date().toISOString());
     });
     // abort() resets the object; the call that made it rejects by design.
     await runInDurableObject(stub(), async (_inst, state) => state.abort("test: reset the object")).catch(() => {});

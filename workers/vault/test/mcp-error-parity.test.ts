@@ -41,7 +41,8 @@ function error(body: any, code: number, error_type: string) {
 describe("B5 MCP domain error parity", () => {
   it("P1 legacy QueryError is structured", async () => {
     const f = await fixture();
-    const b = await f.call("query-notes", { metadata: { [f.vault]: { eq: "x" } } });
+    // Since 0.9.2 a plain list scans an unindexed field (with a warning); aggregate still refuses one.
+    const b = await f.call("query-notes", { aggregate: { op: "count", group_by: f.vault } });
     expect(error(b, -32602, "invalid_query").code).toBe("FIELD_NOT_INDEXED");
   });
   it("P2 invalid cursor is structured", async () => {

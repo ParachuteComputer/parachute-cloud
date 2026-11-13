@@ -234,7 +234,7 @@ export class TarImportSource implements ImportSource {
     return out.sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  readNotesMetaFiles(): string[] {
+  readNotesMetaFiles(): Array<{ name: string; text: string }> {
     const dir = `${SIDECAR_DIR}/notes-meta/`;
     const out: Array<{ name: string; text: string }> = [];
     for (const [name, bytes] of this.files) {
@@ -243,7 +243,7 @@ export class TarImportSource implements ImportSource {
         out.push({ name: rest, text: this.dec.decode(bytes) });
       }
     }
-    return out.sort((a, b) => a.name.localeCompare(b.name)).map((e) => e.text);
+    return out.sort((a, b) => a.name.localeCompare(b.name));
   }
 
   listContentFiles(): string[] {

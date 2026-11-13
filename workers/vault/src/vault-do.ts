@@ -33,8 +33,12 @@ import {
 } from "./auth.js";
 import { NO_TAG_SCOPE } from "./rest/parse.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
+import { headOf, withValidators } from "@openparachute/core/src/http-validators.js";
+
+/** One record by id or path, on either REST door: `/vault/<v>/api/notes/<x>` or `/vault/<v>/api/records/<x>`. */
+const ONE_RECORD = /^\/vault\/[^/]+\/api\/(notes|records)\/[^/]+$/;
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
-import { recordsDoor, recordsRoute, withNotesDeprecation } from "./rest/records.js";
+import { RECORDS_REQUESTS, TYPES_REQUESTS, recordsDoor, recordsRoute, withNotesDeprecation } from "./rest/records.js";
 import { handleDeletedNotes, handleHistoryCompact } from "./rest/history.js";
 import { handleTags, handleFindPath } from "./rest/tags.js";
 import { handleDoctor } from "./rest/doctor.js";
@@ -50,7 +54,8 @@ import {
 } from "./caps.js";
 import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./rest/storage-constants.js";
 import { handleMcp } from "./mcp.js";
-import { HealthSink, errorClass, responseOutcome, routeOf, utcDay, versionLabel } from "./health.js";
+import { HealthSink, NameCounts, clientOf, errorClass, responseOutcome, routeOf, utcDay, versionLabel } from "./health.js";
+import { restRouteName, typesRouteName } from "@openparachute/core/src/name-routes.js";
 import { logServerError } from "./error-log.js";
 import { mcpWwwAuthenticate } from "./discovery.js";
 import { handleSubscribe } from "./live/subscribe.js";
@@ -666,6 +671,7 @@ export class VaultDO extends DurableObject {
     this.appKeys = new AppKeyLedger(ctx.storage);
     const version = versionLabel(env.CF_VERSION_METADATA);
     this.health = new HealthSink(ctx.storage, version);
+    this.names = new NameCounts(ctx.storage, version);
     this.logFields = { version, vaultId: ctx.id.toString() };
     // The shim carries `ctx.storage` (not just `.sql`) so its `transactionSync`
     // can delegate to the real DO transaction primitive — the free
@@ -757,6 +763,16 @@ export class VaultDO extends DurableObject {
     // door/0.9: /api/records and /api/types run as their /api/notes and /api/tags twins, in record words
     // (rest/records.ts); a direct /api/notes answer says it is leaving.
     const path = new URL(request.url).pathname;
+    // 0.9.3 (core http-validators.ts, as a box answers): one record's GET carries an ETag and Last-Modified, and HEAD
+    // on it is that GET without the body, on both doors.
+    if (ONE_RECORD.test(path)) {
+      if (request.method === "HEAD") return headOf(await this.fetch(new Request(request.url, { method: "GET", headers: request.headers })));
+      if (request.method === "GET") return withValidators(await this.fetchOne(request, path));
+    }
+    return this.fetchOne(request, path);
+  }
+
+  private async fetchOne(request: Request, path: string): Promise<Response> {
     const records = recordsRoute(path);
     try {
       // Counted BEFORE the records door reads the body: the import lock checked above must not see a request that
@@ -848,6 +864,14 @@ export class VaultDO extends DurableObject {
 
   /** The vault's health counter sink (T-411); see health.ts. */
   private readonly health: HealthSink;
+  /** Old and new names in use, per client (health.ts NameCounts, T-456). */
+  private readonly names: NameCounts;
+
+  /** Count one name's use by this request's client, unless the vault is gone (its storage must stay empty). */
+  private async countNameUse(name: string, kind: "old" | "new", request: Request, auth: { via: string | null }): Promise<void> {
+    if (!this.stateLoaded || this.destroyed) return;
+    await this.names.count(name, kind, clientOf(request, auth.via));
+  }
 
   /** What every server-side error line names (error-log.ts): the worker version and the DO's id, never the vault's name. */
   private readonly logFields: { version: string; vaultId: string };
@@ -1230,6 +1254,7 @@ export class VaultDO extends DurableObject {
         },
         (subject, outcome) => this.health.record(subject, outcome),
         (tool, err) => logServerError("mcp_tool_error", err, { ...this.logFields, tool }),
+        (name, kind) => void this.countNameUse(name, kind, request, mauth),
       );
     }
 
@@ -1295,6 +1320,15 @@ export class VaultDO extends DurableObject {
     // checked before any route runs, so a refused request writes nothing. On-behalf-of never opens access.
     const stamp = restWriteStamp(request, apiPath, auth);
     if ("refusal" in stamp) return stamp.refusal;
+    // Name use (T-456), the routes a box counts: /api/notes is the old name, /api/records and /api/types the new.
+    if (TYPES_REQUESTS.has(request)) await this.countNameUse(typesRouteName(request.method, apiPath), "new", request, auth);
+    else {
+      const route = restRouteName(request.method, apiPath);
+      if (route) {
+        if (RECORDS_REQUESTS.has(request)) await this.countNameUse(route.replace(" /api/notes", " /api/records"), "new", request, auth);
+        else await this.countNameUse(route, "old", request, auth);
+      }
+    }
 
     // REST scope gate — mirrors bun's routing.ts: GET/HEAD/OPTIONS → read,
     // other methods → write, EXCEPT the enumerated tag-schema mutations
@@ -1801,7 +1835,7 @@ export class VaultDO extends DurableObject {
     if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
     const since = new URL(request.url).searchParams.get("since") ?? utcDay(new Date(Date.now() - 86_400_000));
     if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) return json({ error: "since must be YYYY-MM-DD" }, 400);
-    return json({ version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since) });
+    return json({ version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since), names: await this.names.read(since) });
   }
 
   /**

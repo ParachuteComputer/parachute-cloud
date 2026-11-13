@@ -240,13 +240,13 @@ describe("account MCP — transport rules", () => {
 // --- tools/list = exactly the three tools ------------------------------------
 
 describe("account MCP — tools/list", () => {
-  test("lists EXACTLY list-vaults, create-vault, query-notes", async () => {
+  test("a read-only connection lists EXACTLY list-vaults, create-vault, query-records, and query-notes (its old name)", async () => {
     const id = await seedOwner("tl@example.com");
     const { token } = await mintVaultsToken(id, { blanket: true });
     const res = await handleAccountMcp(db(), mcpReq(token, rpc("tools/list")), mcpDeps());
     const { body } = await callJson(res);
     const names = body.result.tools.map((t: any) => t.name).sort();
-    expect(names).toEqual(["create-vault", "list-vaults", "query-notes"]);
+    expect(names).toEqual(["create-vault", "list-vaults", "query-notes", "query-records"]);
     for (const t of body.result.tools) {
       expect(typeof t.description).toBe("string");
       expect(t.inputSchema).toBeTruthy();

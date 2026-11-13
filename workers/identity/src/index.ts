@@ -50,6 +50,7 @@ import { handleOpsDailyGet, handleOpsHealthGet, handleOpsSnapshotRunPost, health
 import { bumpOpsCounter } from "./ops-counters.ts";
 import { vaultHash } from "./health-report.ts";
 import { bufferHealth, bumpHealth, collectVaultHealth, flushHealthBuffer, httpOutcome, identityRouteGroup, takeHealthNotes } from "./health-counters.ts";
+import { callVaultApi } from "./vault-call.ts";
 import { handleAdminDeleteGet, handleAdminDeletePost } from "./admin-delete.ts";
 import { handleOpsAccountDeletePost } from "./ops-account-delete.ts";
 import {
@@ -444,7 +445,17 @@ app.post("/account/billing/checkout", (c) => handleAccountBillingCheckoutPost(c.
 // what answers, so it can never fall through to the SPA shell); the handler
 // itself does the POST-only JSON-RPC framing (GET→405, DELETE→200, OPTIONS
 // preflight). Wildcard CORS + WWW-Authenticate exposed live inside the handler.
-app.all("/account/mcp", (c) => handleAccountMcp(c.env.DB, c.req.raw, depsFor(c.env)));
+app.all("/account/mcp", (c) => handleAccountMcp(c.env.DB, c.req.raw, depsFor(c.env), {
+  env: c.env,
+  // No ExecutionContext (a direct app.request in tests): the count still runs, unheld.
+  waitUntil: (p) => {
+    try {
+      c.executionCtx.waitUntil(p);
+    } catch {
+      void p;
+    }
+  },
+}));
 
 // --- operator admin console (Wave 4c) ---
 // EVERY route (GET and POST) resolves the session and requires role='operator'
@@ -542,6 +553,20 @@ app.post("/__test/health-collect", async (c) => {
   const only = c.req.queries("vault")?.slice(0, 99) ?? [];
   if (only.length === 0) return c.json({ error: "name at least one ?vault=" }, 400);
   return c.json(await collectVaultHealth(c.env, deps, { onlyVaults: only }));
+});
+// Staging/dev-only (T-456): one vault's name use per client (vault health.ts NameCounts), read the way the health
+// collection reads the vault (first-party, admin). Same gate as the hooks around it: 404 off the allowlist.
+app.get("/__test/names", async (c) => {
+  const deps = depsFor(c.env);
+  if (!deps.exposeDevLinks) return c.notFound();
+  const name = c.req.query("vault") ?? "";
+  const row = await c.env.DB.prepare("SELECT owner_user_id FROM vaults WHERE name = ?").bind(name).first<{ owner_user_id: string }>();
+  if (!row) return c.json({ error: "no such vault" }, 404);
+  const since = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+  const res = await callVaultApi(c.env.DB, deps, { userId: row.owner_user_id, vaultName: name, method: "GET", apiPath: `/api/internal/health?since=${since}`, verb: "admin" });
+  if (!res.ok) return c.json({ error: `vault answered ${res.status}` }, 502);
+  const body = (await res.json()) as { names?: unknown };
+  return c.json({ vault: name, names: body.names ?? {} });
 });
 app.get("/__test/health-report", async (c) => {
   if (!depsFor(c.env).exposeDevLinks) return c.notFound();

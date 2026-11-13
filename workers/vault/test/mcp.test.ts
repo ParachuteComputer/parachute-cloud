@@ -3,6 +3,10 @@ import { describe, it, expect } from "vitest";
 import { DEFAULT_VAULT_DESCRIPTION } from "@openparachute/core/src/seed-packs.js";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { serverInstruction } from "../src/mcp.ts";
+import type { VaultProjection } from "@openparachute/core/src/vault-projection.js";
+
+/** A vault with nothing declared, for the instruction's own unit checks. */
+const EMPTY_PROJECTION = { tags: [], indexed_fields: [], query_hints: [], map: { total_notes: 0, tags: [], paths: [] } } as unknown as VaultProjection;
 import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
 
 /**
@@ -641,13 +645,13 @@ describe("MCP — vault-info (server-layer override)", () => {
     // INTERNAL_ERROR with no reachable repair path.
     it("serverInstruction tolerates an already-poisoned (non-string) description", () => {
       for (const poison of [123, { a: 1 }, ["x"], true]) {
-        const out = serverInstruction("poisoned", poison as unknown as string | null);
+        const out = serverInstruction("poisoned", poison as unknown as string | null, undefined, EMPTY_PROJECTION);
         expect(typeof out).toBe("string");
         expect(out).toContain("poisoned");
       }
       // …and still renders a legitimate description.
-      expect(serverInstruction("v", "  A curated vault.  ")).toContain("A curated vault.");
-      expect(serverInstruction("v", null)).toContain("Parachute vault");
+      expect(serverInstruction("v", "  A curated vault.  ", undefined, EMPTY_PROJECTION)).toContain("A curated vault.");
+      expect(serverInstruction("v", null, undefined, EMPTY_PROJECTION)).toContain('Parachute Vault "v"');
     });
   });
 });

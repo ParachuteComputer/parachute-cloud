@@ -49,7 +49,7 @@ import { normalizePath } from "@openparachute/core/src/paths.js";
 import * as linkOps from "@openparachute/core/src/links.js";
 import { getUnresolvedLinksForNote, getUnresolvedLinksForNotes, getAmbiguousLinksForNote, getAmbiguousLinksForNotes, resolveOrQueueLink, resolveStructuredLinkNote, unresolvedLinkWarning, ambiguousLinkWarning, getContentWikilinkWarnings } from "@openparachute/core/src/wikilinks.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
-import { foldTypeFilter, holdTypes, markTypes, prepareCallTypes, refreshTypes } from "@openparachute/core/src/tag-kind.js";
+import { foldTypeFilter, holdTypes, markTypes, prepareCallTypes, refreshTypes, refuseTypesInTags } from "@openparachute/core/src/tag-kind.js";
 import { RECORDS_REFUSALS, RECORDS_REQUESTS } from "./records.js";
 import type { ValidationWarning } from "@openparachute/core/src/schema-defaults.js";
 import { embeddingsPendingWarning, ignoredParamWarning, collectUnknownTagWarnings, computeSearchDidYouMean, searchDidYouMeanWarning, truncatedResultsWarning, type QueryWarning } from "@openparachute/core/src/query-warnings.js";
@@ -260,6 +260,24 @@ export async function handleNotes(
   // A records body the translator refused: answered here, after auth, before anything is written (rest/records.ts).
   const refused = RECORDS_REFUSALS.get(req);
   if (refused) return refused;
+  // The record door's `tags` hold plain labels (SPEC §2.4): a type's name there is refused with the fix, 422, as a box
+  // answers (core tag-kind.ts refuseTypesInTags). Read-only, before anything is written. /api/notes keeps 0.8's way.
+  const mode = !RECORDS_REQUESTS.has(req) ? null : req.method === "POST" && (subpath === "" || subpath === "/") ? "create" : req.method === "PATCH" && /^\/[^/]+$/.test(subpath) ? "update" : null;
+  if (mode) {
+    let call: unknown = null;
+    try {
+      call = await req.clone().json();
+    } catch {} // not JSON: the handler answers it as it would
+    if (call && typeof call === "object" && !Array.isArray(call)) {
+      try {
+        refuseTypesInTags(store.db as any, call as Record<string, unknown>, mode);
+      } catch (err) {
+        const e = err as { message?: string; error_type?: string; field?: string; hint?: string };
+        // Any other refusal (a malformed call) is the handler's to answer, in its own words.
+        if (e?.error_type === "tag_kind") return json({ error: e.message, error_type: "tag_kind", ...(e.field ? { field: e.field } : {}), ...(e.hint ? { hint: e.hint } : {}) }, 422);
+      }
+    }
+  }
   try {
     // door/0.9: `?type=` on /api/records is query-records' `type`, folded by the engine (subtypes, and with ?tag all of
     // them; a plain tag refused). /api/notes gains nothing new (SPEC §5.1).

@@ -24,11 +24,11 @@
 # After deploying:  bun scripts/smoke-staging.ts   (the FULL smoke — it creates
 # throwaway accounts/vaults, which is exactly what staging is for)
 set -euo pipefail
-# door/0.9 (T-430): Parachute Cloud stays on the 0.8 engine. A checkout pinned to a 0.9 engine deploys only through
-# deploy/personal/ (its own worker names on its own account), never to parachute-* workers.
+# The engine lines staging takes: 0.8 (next), and 0.9 (door/0.9, T-456: Cloud staging proves the 0.9 door against the
+# box's contracts before any production plan). Production stays on 0.8: deploy-prod.sh still refuses a 0.9 pin.
 case "$(. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/core-source.env"; echo "$PARACHUTE_CORE_VERSION")" in
-  0.8.*) ;;
-  *) echo "refused: this checkout pins a non-0.8 engine; Parachute Cloud deploys from next (deploy/personal/ for door/0.9)" >&2; exit 2 ;;
+  0.8.* | 0.9.*) ;;
+  *) echo "refused: this checkout pins an engine staging doesn't take (0.8 or 0.9 only)" >&2; exit 2 ;;
 esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -85,17 +85,24 @@ bunx wrangler deploy --env staging
 # --- identity worker (OAuth issuer on the STAGING D1) ------------------------
 cd "$ROOT/workers/identity"
 bunx wrangler d1 migrations apply parachute-identity-staging --remote --env staging
-bun scripts/seed-dev-user.ts                                    # .dev-secrets -> scripts/seed-dev-user.sql (also grandfathers vault "demo")
-# The seed goes through `--command`, NOT `--file`: wrangler sends a remote
-# `--file` to D1's /import API (init -> R2 upload -> ingest), which the scoped
-# deploy key refuses (401 "Authentication error [code: 10000]", T-413 staging
-# train). `--command` uses D1's /query API, the same path `d1 migrations apply`
-# just used above with the same key (wrangler sends each migration file's full
-# text as one command). The SQL is the file's bytes, unchanged; it is two small
-# statements, far below any argv limit.
-SEED_SQL="$(cat ./scripts/seed-dev-user.sql)"
-bunx wrangler d1 execute parachute-identity-staging --remote --env staging --command="$SEED_SQL"
-unset SEED_SQL
+# The dev user (and the grandfathered "demo" vault) is seeded from the gitignored .dev-secrets. A deploy from a
+# checkout without that file leaves the staging dev user as it is (re-seeding would change its password under the
+# smoke runs that hold the old one).
+if [ -f .dev-secrets ]; then
+  bun scripts/seed-dev-user.ts                                    # .dev-secrets -> scripts/seed-dev-user.sql (also grandfathers vault "demo")
+  # The seed goes through `--command`, NOT `--file`: wrangler sends a remote
+  # `--file` to D1's /import API (init -> R2 upload -> ingest), which the scoped
+  # deploy key refuses (401 "Authentication error [code: 10000]", T-413 staging
+  # train). `--command` uses D1's /query API, the same path `d1 migrations apply`
+  # just used above with the same key (wrangler sends each migration file's full
+  # text as one command). The SQL is the file's bytes, unchanged; it is two small
+  # statements, far below any argv limit.
+  SEED_SQL="$(cat ./scripts/seed-dev-user.sql)"
+  bunx wrangler d1 execute parachute-identity-staging --remote --env staging --command="$SEED_SQL"
+  unset SEED_SQL
+else
+  echo "no workers/identity/.dev-secrets: the staging dev user is left as it is"
+fi
 
 # --- propagation guard (cloud#174 fix, the rc.92 incident) -------------------
 # `wrangler deploy` returning success means the upload was ACCEPTED — it does

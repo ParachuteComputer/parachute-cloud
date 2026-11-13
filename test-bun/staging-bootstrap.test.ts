@@ -131,10 +131,10 @@ describe("staging-bootstrap.sh against a fake Cloudflare", () => {
   test("deploy-staging.sh refuses before any install or call while the D1 id is the placeholder or disagrees", () => {
     const fx = fixture();
     cpSync(join(ROOT, "scripts/deploy-staging.sh"), join(fx.root, "scripts/deploy-staging.sh"));
-    // door/0.9: deploy-staging.sh first refuses a non-0.8 engine pin. This checkout's own pin is refused that way;
-    // the D1 checks below are Parachute Cloud's, so they run with an 0.8 pin beside the script.
+    // deploy-staging.sh first refuses an engine line staging doesn't take (0.8 and 0.9 only, T-456); then the D1
+    // checks run, on this checkout's own pin (0.9 on door/0.9) and on an 0.8 one.
     const pin = join(fx.root, "scripts/core-source.env");
-    cpSync(join(ROOT, "scripts/core-source.env"), pin);
+    writeFileSync(pin, 'PARACHUTE_CORE_VERSION="1.0.0"\n');
     const deploy = () => {
       const env: Record<string, string> = { ...(process.env as Record<string, string>), PATH: `${fx.bin}:${process.env.PATH}`, FAKE_CF: fx.cf };
       const p = Bun.spawnSync(["bash", join(fx.root, "scripts/deploy-staging.sh")], { env, cwd: fx.t });
@@ -142,11 +142,13 @@ describe("staging-bootstrap.sh against a fake Cloudflare", () => {
     };
     let r = deploy();
     expect(r.code).toBe(2);
-    expect(r.out).toContain("refused: this checkout pins a non-0.8 engine");
-    writeFileSync(pin, 'PARACHUTE_CORE_VERSION="0.8.0-pre.2"\n');
-    r = deploy(); // as committed: the placeholder
-    expect(r.code).toBe(2);
-    expect(r.out).toContain("staging-bootstrap.sh");
+    expect(r.out).toContain("refused: this checkout pins an engine staging doesn't take");
+    for (const pinned of [readFileSync(join(ROOT, "scripts/core-source.env"), "utf8"), 'PARACHUTE_CORE_VERSION="0.8.0-pre.2"\n']) {
+      writeFileSync(pin, pinned);
+      r = deploy(); // as committed: the placeholder
+      expect(r.code).toBe(2);
+      expect(r.out).toContain("staging-bootstrap.sh");
+    }
     const f = join(fx.root, "scripts/staging-account.env"); // the env file names an id the toml does not
     writeFileSync(f, readFileSync(f, "utf8").replace(/^STAGING_D1_ID=.*$/m, `STAGING_D1_ID=${FAKE_UUID}`));
     r = deploy();
