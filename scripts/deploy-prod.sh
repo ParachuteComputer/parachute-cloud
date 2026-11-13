@@ -26,8 +26,9 @@
 # After deploying:  bun scripts/smoke-prod.ts   (READ-ONLY checks — the full
 # account/vault-creating smoke belongs on staging: scripts/smoke-staging.ts)
 set -euo pipefail
-# door/0.9 (T-430): Parachute Cloud stays on the 0.8 engine. A checkout pinned to a 0.9 engine deploys only through
-# deploy/personal/ (its own worker names on its own account), never to parachute-* workers.
+# door/0.9 (T-430, T-456): Parachute Cloud production stays on the 0.8 engine until Aaron's rollout. A checkout pinned
+# to a 0.9 engine deploys to Cloud staging (deploy-staging.sh) or through deploy/personal/, never to production.
+# test-bun/deploy-prod-pin.test.ts holds this refusal.
 case "$(. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/core-source.env"; echo "$PARACHUTE_CORE_VERSION")" in
   0.8.*) ;;
   *) echo "refused: this checkout pins a non-0.8 engine; Parachute Cloud deploys from next (deploy/personal/ for door/0.9)" >&2; exit 2 ;;

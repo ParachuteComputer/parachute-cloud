@@ -176,16 +176,19 @@ export const WRITE_GATES: Readonly<Record<string, WriteGateClass | Readonly<Reco
 };
 
 /** Which gate a call meets (see {@link WRITE_GATES}). */
+const GATE_CLASSES: ReadonlySet<unknown> = new Set<WriteGateClass>(["notes", "attachments", "open"]);
 export function writeGateFor(name: string, args: Record<string, unknown>): WriteGateClass {
   if (name === "vault-info") return args.description !== undefined ? "notes" : "open";
-  const entry = WRITE_GATES[name];
-  if (entry === undefined) return "notes";
-  if (typeof entry === "string") return entry;
+  // Own properties only, and only one of the three classes: `constructor` or `__proto__` must never read as open.
+  const entry = Object.hasOwn(WRITE_GATES, name) ? WRITE_GATES[name] : undefined;
+  if (typeof entry === "string") return GATE_CLASSES.has(entry) ? entry : "notes";
+  if (!entry || typeof entry !== "object") return "notes";
   const action = args.action ?? (name === "manage-types" ? "update" : undefined);
-  // attachment-url with no action, or an action no tool takes: the surface refuses it before anything runs, so it
-  // meets no meter; any other unnamed action is gated.
+  // attachment-url with no action: the surface refuses it before anything runs, so it meets no meter; any other
+  // unnamed or non-string action is gated.
   if (action === undefined && name === "attachment-url") return "open";
-  return (typeof action === "string" && Object.hasOwn(entry, action) ? entry[action] : undefined) ?? "notes";
+  const cls = typeof action === "string" && Object.hasOwn(entry, action) ? entry[action] : undefined;
+  return GATE_CLASSES.has(cls) ? (cls as WriteGateClass) : "notes";
 }
 
 /** The upload mint's tool name before 0.9, still listed. */

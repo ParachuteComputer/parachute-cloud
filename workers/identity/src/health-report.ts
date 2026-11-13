@@ -439,6 +439,10 @@ function addAll(into: Compared, from: Compared): void {
 }
 
 export async function buildHealthReport(data: HealthData, opts: { day: string; environment: string }): Promise<HealthReport> {
+  // Name use (`name:<name>`, T-456: the account door's old and new names by client) is a measurement, not health: a
+  // shift from old names to new ones, or a new client, is the move 1.0 waits for, never a regression.
+  const health = (r: HealthRow) => !r.subject.startsWith("name:");
+  data = { ...data, days: data.days.filter(health), versions: data.versions.filter(health) };
   const day = opts.day;
   const hashes = new Map<string, string>();
   for (const v of new Set([...data.days, ...data.versions].map((r) => r.vault))) if (v !== "-") hashes.set(v, await vaultHash(v));

@@ -555,13 +555,16 @@ app.post("/__test/health-collect", async (c) => {
   return c.json(await collectVaultHealth(c.env, deps, { onlyVaults: only }));
 });
 // Staging/dev-only (T-456): one vault's name use per client (vault health.ts NameCounts), read the way the health
-// collection reads the vault (first-party, admin). Same gate as the hooks around it: 404 off the allowlist.
+// collection reads the vault (first-party, admin). Same gate as the hooks around it: 404 off the allowlist. Unlike
+// them it names a vault by name and answers with its client labels (an app key's name among them) without a bearer:
+// staging debris only, which is why it never answers off the allowlist. An unknown vault is 422, so production's
+// 404 (pinned in smoke-prod) can only be the gate.
 app.get("/__test/names", async (c) => {
   const deps = depsFor(c.env);
   if (!deps.exposeDevLinks) return c.notFound();
   const name = c.req.query("vault") ?? "";
   const row = await c.env.DB.prepare("SELECT owner_user_id FROM vaults WHERE name = ?").bind(name).first<{ owner_user_id: string }>();
-  if (!row) return c.json({ error: "no such vault" }, 404);
+  if (!row) return c.json({ error: "no such vault" }, 422);
   const since = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
   const res = await callVaultApi(c.env.DB, deps, { userId: row.owner_user_id, vaultName: name, method: "GET", apiPath: `/api/internal/health?since=${since}`, verb: "admin" });
   if (!res.ok) return c.json({ error: `vault answered ${res.status}` }, 502);
