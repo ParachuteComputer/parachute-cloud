@@ -33,7 +33,7 @@ import {
 } from "./auth.js";
 import { NO_TAG_SCOPE } from "./rest/parse.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
-import { headOf, withValidators } from "@openparachute/core/src/http-validators.js";
+import { withValidators } from "@openparachute/core/src/http-validators.js";
 
 /** One record by id or path, on either REST door: `/vault/<v>/api/notes/<x>` or `/vault/<v>/api/records/<x>`. */
 const ONE_RECORD = /^\/vault\/[^/]+\/api\/(notes|records)\/[^/]+$/;
@@ -766,7 +766,16 @@ export class VaultDO extends DurableObject {
     // 0.9.3 (core http-validators.ts, as a box answers): one record's GET carries an ETag and Last-Modified, and HEAD
     // on it is that GET without the body, on both doors.
     if (ONE_RECORD.test(path)) {
-      if (request.method === "HEAD") return headOf(await this.fetch(new Request(request.url, { method: "GET", headers: request.headers })));
+      // HEAD answers with the GET response itself, body and all, and the runtime sends no body for a HEAD. A Response
+      // made with an empty body (core headOf) loses its Content-Length on Cloudflare's edge (seen on staging, T-456);
+      // a body of known length keeps it.
+      if (request.method === "HEAD") {
+        const get = await this.fetch(new Request(request.url, { method: "GET", headers: request.headers }));
+        const bytes = await get.arrayBuffer();
+        const h = new Headers(get.headers);
+        h.set("content-length", String(bytes.byteLength));
+        return new Response(bytes, { status: get.status, statusText: get.statusText, headers: h });
+      }
       if (request.method === "GET") return withValidators(await this.fetchOne(request, path));
     }
     return this.fetchOne(request, path);
