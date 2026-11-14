@@ -33,6 +33,11 @@ describe("tool hints and ChatGPT's note read (T-456)", () => {
     expect(byName.get("vault-info")!.readOnlyHint).toBe(false);
     expect(byName.get("query-records")!.readOnlyHint).toBe(true);
     expect(byName.get("delete-record")).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    // A writer can upload with attachment-url but can't set the description with vault-info.
+    const write = await mintToken({ vault: v, scopes: `vault:${v}:write vault:${v}:read` });
+    const writeHints = new Map(((await rpc(v, write, "tools/list")).result.tools as Tool[]).map((t) => [t.name, t.annotations!]));
+    expect({ attachmentUrl: writeHints.get("attachment-url")?.readOnlyHint, vaultInfo: writeHints.get("vault-info")?.readOnlyHint }).toEqual({ attachmentUrl: false, vaultInfo: true });
+    expect({ attachmentUrl: byName.get("attachment-url")?.readOnlyHint, read: readTools.find((t) => t.name === "attachment-url")?.annotations?.readOnlyHint }).toEqual({ attachmentUrl: false, read: true });
   });
 
   it("a note read by id also goes out as structuredContent, the old name's nudge inside; a list doesn't", async () => {
