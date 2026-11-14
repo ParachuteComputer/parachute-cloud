@@ -128,6 +128,18 @@ describe("the report rules", () => {
     expect((await report(afterDeploy, { vault: cur })).worse).toEqual([]);
   });
 
+  test("name use (the account door's old and new names, by client) is never a finding (T-456)", async () => {
+    // A connector moving to the new names, and a new client appearing: what 1.0 waits for, not a regression.
+    const rows: HealthRow[] = [
+      row({ source: "identity", vault: "-", day: PRIOR, subject: "name:account_query-records", outcome: "new:claude", n: 25 }),
+      row({ source: "identity", vault: "-", subject: "name:account_query-records", outcome: "new:claude", n: 10 }),
+      row({ source: "identity", vault: "-", subject: "name:account_query-records", outcome: "new:key:agent", n: 15 }),
+      row({ source: "identity", vault: "-", day: PRIOR, subject: "name:account_query-notes", outcome: "old:claude", n: 10 }),
+      row({ source: "identity", vault: "-", subject: "name:account_query-notes", outcome: "old:chatgpt", n: 12 }),
+    ];
+    expect((await report(rows)).worse).toEqual([]);
+  });
+
   test("every vault's requests turning into 401s at once is caught at fleet level", async () => {
     const rows: HealthRow[] = [];
     for (let i = 0; i < 10; i++) {

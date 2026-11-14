@@ -225,15 +225,21 @@ export function routerFailureKind(err: unknown): string | null {
 
 export class HealthSink {
   private day = "";
-  private counters: DayCounters | null = null;
+  protected counters: DayCounters | null = null;
   private loading: Promise<void> | null = null;
   private prunedFor = "";
+  private readonly prefix: string;
+  private readonly maxKeys: number;
 
   constructor(
     private readonly storage: DurableObjectStorage,
     private readonly version: string,
-    private readonly now: () => Date = () => new Date(),
-  ) {}
+    protected readonly now: () => Date = () => new Date(),
+    opts: { prefix?: string; maxKeys?: number } = {},
+  ) {
+    this.prefix = opts.prefix ?? HEALTH_PREFIX;
+    this.maxKeys = opts.maxKeys ?? HEALTH_MAX_KEYS;
+  }
 
   /** Add `by` to `subject|outcome` for today under this version. Never throws. */
   async record(subject: string, outcome: string, by = 1): Promise<void> {
@@ -243,14 +249,14 @@ export class HealthSink {
       const counters = this.counters!;
       const v = (counters[this.version] ??= {});
       let key = `${clean(subject)}|${clean(outcome)}`;
-      if (v[key] === undefined && countKeys(counters) >= HEALTH_MAX_KEYS) {
+      if (v[key] === undefined && countKeys(counters) >= this.maxKeys) {
         key = isServerOutcome(clean(outcome)) ? OVERFLOW_SERVER_KEY : OVERFLOW_KEY;
       }
       v[key] = (v[key] ?? 0) + by;
       // Not awaited: the object's output gate still holds the response until
       // the write is durable, and puts made in the same turn (an MCP call's
       // request + tool counts) coalesce into one write.
-      this.storage.put(HEALTH_PREFIX + day, counters).catch((err) => {
+      this.storage.put(this.prefix + day, counters).catch((err) => {
         console.warn(`event=health_record_failed error=${errorClass(err)}`);
       });
       if (this.prunedFor !== day) {
@@ -264,17 +270,17 @@ export class HealthSink {
 
   /** Every stored day from `sinceDay` on (inclusive), oldest first. */
   async read(sinceDay: string): Promise<Record<string, DayCounters>> {
-    const rows = await this.storage.list<DayCounters>({ prefix: HEALTH_PREFIX, start: HEALTH_PREFIX + sinceDay });
+    const rows = await this.storage.list<DayCounters>({ prefix: this.prefix, start: this.prefix + sinceDay });
     const out: Record<string, DayCounters> = {};
-    for (const [k, v] of rows) out[k.slice(HEALTH_PREFIX.length)] = v;
+    for (const [k, v] of rows) out[k.slice(this.prefix.length)] = v;
     return out;
   }
 
-  private async load(day: string): Promise<void> {
+  protected async load(day: string): Promise<void> {
     if (this.day === day && this.counters) return;
     if (!this.loading) {
       this.loading = (async () => {
-        const stored = await this.storage.get<DayCounters>(HEALTH_PREFIX + day);
+        const stored = await this.storage.get<DayCounters>(this.prefix + day);
         this.counters = stored ?? {};
         this.day = day;
       })().finally(() => {
@@ -287,7 +293,7 @@ export class HealthSink {
 
   private async prune(today: string): Promise<void> {
     const cutoff = utcDay(new Date(Date.parse(`${today}T00:00:00Z`) - HEALTH_KEEP_DAYS * 86_400_000));
-    const old = await this.storage.list({ prefix: HEALTH_PREFIX, end: HEALTH_PREFIX + cutoff });
+    const old = await this.storage.list({ prefix: this.prefix, end: this.prefix + cutoff });
     if (old.size > 0) await this.storage.delete([...old.keys()]);
   }
 }
@@ -296,4 +302,52 @@ function countKeys(c: DayCounters): number {
   let n = 0;
   for (const v of Object.values(c)) n += Object.keys(v).length;
   return n;
+}
+
+/**
+ * Which names agents and apps still use, per client (T-456; ROADMAP 0.9.0 "Counters on cloud, and per client"): every
+ * call to an old, note-named MCP tool or parameter and every request to a note-named REST route, under `old`; the
+ * record names under `new`. 1.0 removes the old names and waits on these counts. The names are the engine's own
+ * (core mcp-surface.ts `onUse`, core name-routes.ts), the same a box writes to its usage log.
+ *
+ * A key is `name:<name>|<old|new>:<client>`. The client is the app key's own name (`key:<name>`, chosen by the vault's
+ * owner), else the first product token of the request's User-Agent (`ua:claude-user`): MCP over stateless HTTP sends
+ * `clientInfo.name` on `initialize` only, so a call carries nothing better. Both are caller-chosen text, so: reduced
+ * to the counters' small alphabet and 32 characters, at most {@link NAMES_MAX_CLIENTS} clients a day (the rest count
+ * as `other`), and at most {@link NAMES_MAX_KEYS} keys a day (then one overflow key). Names and counts only, never a
+ * value, a path or a query.
+ *
+ * Its own DO key-value sink (`names:<day>`), beside the health counters and never in the vault's SQLite, so a flood of
+ * names can't push a server error out of the health counts.
+ */
+export const NAMES_PREFIX = "names:";
+export const NAMES_MAX_KEYS = 256;
+export const NAMES_MAX_CLIENTS = 16;
+
+export class NameCounts extends HealthSink {
+  constructor(storage: DurableObjectStorage, version: string, now: () => Date = () => new Date()) {
+    super(storage, version, now, { prefix: NAMES_PREFIX, maxKeys: NAMES_MAX_KEYS });
+  }
+
+  /** Count one use of `name` by `client`. Never throws. */
+  async count(name: string, kind: "old" | "new", client: string): Promise<void> {
+    try {
+      await this.load(utcDay(this.now()));
+      const c = clean(client, 32);
+      const seen = new Set<string>();
+      for (const v of Object.values(this.counters ?? {})) for (const k of Object.keys(v)) if (!k.startsWith("overflow|")) seen.add(k.slice(k.indexOf("|") + 1).replace(/^(old|new):/, ""));
+      seen.delete("other"); // the overflow label is not one of the 16
+      const who = seen.has(c) || seen.size < NAMES_MAX_CLIENTS ? c : "other";
+      await this.record(`name:${name}`, `${kind}:${who}`);
+    } catch (err) {
+      console.warn(`event=names_record_failed error=${errorClass(err)}`);
+    }
+  }
+}
+
+/** The client a request's names are counted under (see {@link NameCounts}). */
+export function clientOf(req: Request, via: string | null | undefined): string {
+  if (typeof via === "string" && via.startsWith("key:")) return clean(via, 32);
+  const product = (req.headers.get("user-agent") ?? "").trim().split(/[\s/;(]/)[0] ?? "";
+  return product ? clean(`ua:${product}`, 32) : "unknown";
 }

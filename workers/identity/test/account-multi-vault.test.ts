@@ -20,6 +20,7 @@ import worker from "../src/index.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "../src/account-token.ts";
 import { signAccessToken } from "../src/tokens.ts";
 import { ISSUER, decodeJwtPayload, seedUser, seedVault } from "./helpers.ts";
+import { flushHealthBuffer } from "../src/health-counters.ts";
 
 type Hop = { url: string; vault: string; claims: Record<string, any>; body: any };
 
@@ -256,6 +257,47 @@ describe("one multi-vault door: a key read on A and write on B", () => {
     expect(w.ok).toBe(false);
     expect(a.hops.length).toBe(1);
     // Its tool list is the three tools it had before, and nothing else.
-    expect((await a.tools(legacy)).map((t) => t.name).sort()).toEqual(["create-vault", "list-vaults", "query-notes"]);
+    expect((await a.tools(legacy)).map((t) => t.name).sort()).toEqual(["create-vault", "list-vaults", "query-notes", "query-records"]);
+  });
+});
+
+describe("the account door on record names (T-456)", () => {
+  test("query-records fans out over /api/records; the record writes reach the vault's record tools; old names still work", async () => {
+    const a = app();
+    const o = await owner();
+    const minted = await a.call("/account/keys", { method: "POST", auth: o.owner, body: { name: "records-sync", vaults: { [o.A]: "read", [o.B]: "write" } } });
+    expect(minted.status, minted.text).toBe(201);
+    const key: string = minted.json.token;
+    const names = (await a.tools(key)).map((t) => t.name);
+    // The record names first, then the old names, kept through 0.9.
+    expect(names).toEqual(["list-vaults", "create-vault", "query-records", "create-record", "update-record", "delete-record", "query-notes", "create-note", "update-note", "delete-note"]);
+
+    const q = await a.tool(key, "query-records", { type: "invoice", fields: { status: { eq: "open" } }, limit: 5 });
+    expect(q.ok).toBe(true);
+    const reads = a.hops.filter((h) => new URL(h.url).pathname.endsWith("/api/records"));
+    expect(reads.map((h) => h.vault).sort()).toEqual([o.A, o.B].sort());
+    const qs = new URL(reads[0]!.url).searchParams;
+    expect(qs.get("type")).toBe("invoice");
+    expect(JSON.parse(qs.get("metadata")!)).toEqual({ status: { eq: "open" } });
+    expect(Object.keys((q as { value: { results: unknown[] } }).value.results[0] as object).sort()).toEqual(["records", "vault"]);
+
+    const w = await a.tool(key, "create-record", { vault: o.B, path: "client-42/r", body: "Fernhill" });
+    expect(w.ok).toBe(true);
+    const hop = a.hops.find((h) => h.vault === o.B && new URL(h.url).pathname.endsWith("/mcp"))!;
+    expect(hop.body.params).toEqual({ name: "create-record", arguments: { path: "client-42/r", body: "Fernhill" } });
+    expect((await a.tool(key, "create-record", { vault: o.A, body: "x" })).ok).toBe(false); // read on A
+    expect((await a.tool(key, "create-note", { vault: o.B, path: "client-42/n", content: "old" })).ok).toBe(true);
+    expect((await a.tool(key, "query-notes", { vault: o.B })).ok).toBe(true);
+
+    // Each name is counted, old and new, under the key's kind (never its name or the caller's text).
+    await new Promise((r) => setTimeout(r, 50));
+    await flushHealthBuffer(env as never);
+    const rows = await env.DB.prepare("SELECT subject, outcome, SUM(n) AS n FROM health_counters WHERE subject LIKE 'name:account%' GROUP BY subject, outcome").all<{ subject: string; outcome: string; n: number }>();
+    const got = Object.fromEntries((rows.results ?? []).map((r) => [`${r.subject}|${r.outcome}`, r.n]));
+    expect(Object.keys(got), JSON.stringify(got)).toContain("name:account_query-records|new:key:app");
+    expect(got["name:account_query-records|new:key:app"]).toBeGreaterThanOrEqual(1);
+    expect(got["name:account_create-record|new:key:app"]).toBeGreaterThanOrEqual(2);
+    expect(got["name:account_create-note|old:key:app"]).toBeGreaterThanOrEqual(1);
+    expect(got["name:account_query-notes|old:key:app"]).toBeGreaterThanOrEqual(1);
   });
 });

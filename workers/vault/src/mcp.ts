@@ -35,13 +35,14 @@
  */
 import type { Database } from "bun:sqlite";
 import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.js";
-import { buildVaultProjection, attachmentsInstructionBlock, connectionReach } from "@openparachute/core/src/vault-projection.js";
+import { buildVaultProjection, connectionReach, projectionToMarkdown, type VaultProjection } from "@openparachute/core/src/vault-projection.js";
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
 import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
 import { applyOnBehalf } from "./rest/write-stamp.js";
-import { recordWords, shape09, toolHelp } from "./mcp-09.js";
+import { NOTE_TOOL_NAMES, recordWords } from "@openparachute/core/src/mcp-records.js";
+import { recordErrorData, shapeRecordSurface, typedMessage } from "@openparachute/core/src/mcp-surface.js";
 import { errorClass, toolErrorOutcome } from "./health.js";
 
 // Transcribed from the SDK's types.js so negotiation matches byte-for-byte.
@@ -132,55 +133,66 @@ function requiredVerbForTool(tool: { requiredVerb?: VaultVerb }): VaultVerb {
 export type McpWriteGate = () => Response | null;
 
 /**
- * MCP tools whose REST equivalent is a DELETE. The REST cap/frozen gate exempts
- * DELETE (a tenant at the cap — or an expired/frozen one — must always be able
- * to delete their way back down; the frozen floor leaves reads + export + DELETE
- * untouched, see caps.ts). We mirror that here so MCP is neither stricter nor
- * looser than REST: read-class tools AND these delete-class tools pass through
- * the gate; every other forward-mutating write/admin tool is gated.
- */
-// door/0.9: delete-record is delete-note under its record name; manage-types {action: "delete"} is delete-tag's.
-const DELETE_CLASS_TOOLS = new Set(["delete-note", "delete-tag", "delete-record"]);
-
-/**
- * The attachment-ticket upload mint (`core/src/mcp.ts`'s
- * `request-attachment-upload`) is `requiredVerb: "write"` but must NOT run
- * through the generic {@link isGatedWrite} → `writeGate()` path: that gate
- * checks the NOTES meter (`capBlockIfFull`), and a mint is an ATTACHMENT
- * write — it needs the attachment meter's own ladder (frozen →
- * `attachments_not_included` → attachment cap), exactly the one REST's
- * storage upload and the ticket spend route run (`caps.ts`,
- * `attachment-tickets.ts`). See `handleToolCall`'s dedicated branch.
- */
-const ATTACHMENT_UPLOAD_MINT_TOOL = "request-attachment-upload";
-
-/** The upload mint under either name: the old tool, or 0.9's `attachment-url {action: "upload"}` (door/0.9). */
-function isAttachmentUploadMint(name: string, args: Record<string, unknown>): boolean {
-  return name === ATTACHMENT_UPLOAD_MINT_TOOL || (name === "attachment-url" && args.action === "upload");
-}
-
-/** A forward-mutating tool (create/update/prune) — the class the REST
- *  POST/PATCH/PUT cap+frozen gate covers. Read tools, DELETE-class tools, and
- *  the attachment-upload mint (which runs its OWN gate — see
- *  {@link ATTACHMENT_UPLOAD_MINT_TOOL}) are exempt, so this is the exact
- *  "should the NOTES write gate run" predicate.
+ * The frozen-tenant gate by (tool, action), every tool this door can list (T-456). All MCP is POST JSON-RPC, so the
+ * paywall can't live at the HTTP layer: each call is classed here before it runs, the same way REST classes a
+ * request by method.
  *
- *  vault-info is the one read-verb tool that can ALSO mutate: it is
- *  `requiredVerb: "read"` (a read-only caller must keep the stats projection and
- *  reads stay sacred on a frozen vault), but a call carrying `description`
- *  UPDATES the vault description — a real write. So gate it exactly when
- *  `description` is present. The inner SCOPE check (`vault:admin` — the 0.7.1
- *  re-tier) lives in overrideVaultInfo; this is the paywall/cap half (frozen →
- *  402, cap-full → 413), mirroring the REST write path. */
-function isGatedWrite(tool: McpToolDef, args: Record<string, unknown>): boolean {
-  if (tool.name === "vault-info") return args.description !== undefined;
-  if (isAttachmentUploadMint(tool.name, args)) return false;
-  // attachment-url {download} is a read; manage-types {delete} is delete-tag (exempt like REST DELETE).
-  if (tool.name === "attachment-url") return false;
-  if (tool.name === "manage-types" && args.action === "delete") return false;
-  if (tool.name === "manage-types") return true;
-  return requiredVerbForTool(tool) !== "read" && !DELETE_CLASS_TOOLS.has(tool.name);
+ *   - `notes`: a forward write (create, update, rename, merge, prune, migrate, a description change). It meets the
+ *     REST POST/PATCH/PUT gate: frozen → 402 `plan_required`, the notes meter full → 413 `storage_cap_exceeded`.
+ *   - `attachments`: the upload mint (`request-attachment-upload`, `attachment-url {action: "upload"}`). It meets the
+ *     attachment meter's own ladder at mint (frozen → `attachments_not_included` → the attachment cap), as REST's
+ *     storage upload and the ticket spend route do (caps.ts, attachment-tickets.ts); see handleToolCall.
+ *   - `open`: a read, or a delete. REST leaves GET and DELETE untouched: a frozen or full vault must always be
+ *     readable, exportable and able to delete its way back down.
+ *
+ * A tool that dispatches on `action` is classed per action (manage-types defaults to `update`, as the engine does).
+ * vault-info is a read unless the call carries `description`. A tool or action this table doesn't name is gated as
+ * `notes`: a new write can't slip past the paywall, and test/write-gate.test.ts fails until it is named here.
+ */
+export type WriteGateClass = "notes" | "attachments" | "open";
+export const WRITE_GATES: Readonly<Record<string, WriteGateClass | Readonly<Record<string, WriteGateClass>>>> = {
+  "query-records": "open",
+  "create-record": "notes",
+  "update-record": "notes",
+  "delete-record": "open",
+  "list-types": "open",
+  doctor: "open",
+  "read-attachment": "open",
+  "attachment-url": { upload: "attachments", download: "open" },
+  "manage-types": { update: "notes", rename: "notes", merge: "notes", delete: "open", prune: "notes", migrate: "notes" },
+  "query-notes": "open",
+  "create-note": "notes",
+  "update-note": "notes",
+  "delete-note": "open",
+  "list-tags": "open",
+  "find-path": "open",
+  "update-tag": "notes",
+  "rename-tag": "notes",
+  "merge-tags": "notes",
+  "delete-tag": "open",
+  "prune-schema": "notes",
+  "request-attachment-upload": "attachments",
+  "request-attachment-download": "open",
+};
+
+/** Which gate a call meets (see {@link WRITE_GATES}). */
+const GATE_CLASSES: ReadonlySet<unknown> = new Set<WriteGateClass>(["notes", "attachments", "open"]);
+export function writeGateFor(name: string, args: Record<string, unknown>): WriteGateClass {
+  if (name === "vault-info") return args.description !== undefined ? "notes" : "open";
+  // Own properties only, and only one of the three classes: `constructor` or `__proto__` must never read as open.
+  const entry = Object.hasOwn(WRITE_GATES, name) ? WRITE_GATES[name] : undefined;
+  if (typeof entry === "string") return GATE_CLASSES.has(entry) ? entry : "notes";
+  if (!entry || typeof entry !== "object") return "notes";
+  const action = args.action ?? (name === "manage-types" ? "update" : undefined);
+  // attachment-url with no action: the surface refuses it before anything runs, so it meets no meter; any other
+  // unnamed or non-string action is gated.
+  if (action === undefined && name === "attachment-url") return "open";
+  const cls = typeof action === "string" && Object.hasOwn(entry, action) ? entry[action] : undefined;
+  return GATE_CLASSES.has(cls) ? (cls as WriteGateClass) : "notes";
 }
+
+/** The upload mint's tool name before 0.9, still listed. */
+const ATTACHMENT_UPLOAD_MINT_TOOL = "request-attachment-upload";
 
 /**
  * Convert a REST cap/frozen Response (402 `plan_required` / 413
@@ -197,44 +209,40 @@ async function gateError(id: JsonRpcId, blocked: Response): Promise<JsonRpcMessa
 }
 
 /**
- * The connect-time server instruction (bun sends the vault's projection as the
- * MCP `instructions`; the vault teaches the AI how to use it). Cloud v1 sends a
- * faithful-but-simple brief built from the vault description — the rich schema
- * projection (`buildVaultProjection`) is a documented follow-up; the
- * connector-critical bytes are the discovery chain + tool list, not this text.
+ * The connect-time server instruction: the same brief a box sends (core `projectionToMarkdown`, from the vault's own
+ * projection, in record words), so a model connecting here is told the same things: the vault's name and addresses,
+ * where to start, its types and indexed fields, how to query, how files move, and how to script it. Only the
+ * scripting line is this door's own: keys are made in the account here, not with a box's `parachute` command.
  *
- * The Attachments orientation paragraph rides the SAME core helper bun's
- * `projectionToMarkdown` folds in (`attachmentsInstructionBlock`, D0/§2a of
- * the design) — one source for the sentence teaching `request-attachment-
- * upload`/`-download`, so the two doors can't drift on it even though cloud
- * doesn't (yet) adopt the full projection. `ticketsEnabled: true`
- * unconditionally — this door always wires an `AttachmentTicketProvider`
- * (see `VaultDO`'s constructor), same as bun.
+ * `description` is the vault's own text. cloud#87: a non-string one (a vault poisoned before both write doors checked
+ * the type) degrades to no description inside the engine's renderer, so the vault can still be connected to and
+ * repaired; `initialize` is the first frame, and a throw here would leave the AI no way in.
  *
- * `reach` (0.9.1, SPEC §3.4) is the engine's own sentence for what this
- * connection can read (`connectionReachFor`), on the line right under the one
- * that names the vault. Omitted: no line.
+ * `reach` (0.9.1, SPEC §3.4) is the engine's sentence for what this connection can read (`connectionReachFor`), on
+ * the line under the one that names the vault.
  */
-export function serverInstruction(vaultName: string, description: string | null, reach?: string): string {
-  const base =
-    `Parachute vault "${vaultName}" — an agent-native knowledge graph of records, types, tags, and links. ` +
-    `Read with query-records; write with create-record / update-record; see and change types with list-types / ` +
-    `manage-types; orient with vault-info (vault-info {help: "<tool>"} gives any tool's every parameter).`;
-  // cloud#87 — defensive `typeof`, not decoration: this is the DETONATION site
-  // for a non-string description. `description?.trim()` on a number throws, and
-  // `initialize` catches every throw into a -32603 INTERNAL_ERROR, so a poisoned
-  // vault could not be CONNECTED to at all — and `initialize` is the first frame,
-  // so the connected AI never reaches a tool that could repair it. Both cloud
-  // write doors now reject a non-string at the execute (overrideVaultInfo /
-  // rest/vault.ts), but a vault poisoned BEFORE this shipped — or through a door
-  // that still carries the unchecked cast (the bun vault's mcp-tools.ts still
-  // does, cloud#87 is only half-closed) — must still be able to reconnect. A
-  // non-string degrades to "no description": the vault connects with the base
-  // brief instead of refusing the session.
-  const d = typeof description === "string" ? description.trim() : undefined;
-  const named = reach ? `${base}\n${reach}` : base;
-  const head = d ? `${d}\n\n${named}` : named;
-  return `${head}\n\n${recordWords(attachmentsInstructionBlock({ ticketsEnabled: true, ticketTool: "attachment-url" }))}`;
+export function serverInstruction(
+  vaultName: string,
+  description: string | null,
+  reach: string | undefined,
+  projection: VaultProjection,
+  attachments: { readEnabled: boolean } = { readEnabled: true },
+): string {
+  return projectionToMarkdown({
+    vaultName,
+    description,
+    projection,
+    // Addresses relative to the origin the client connected through: one vault answers on several hosts (u., my.,
+    // the root /mcp), and the brief must be the same on each (test/root-mcp.test.ts). vault-info names the full URLs.
+    coordinates: { hubOrigin: "", hubOriginKnown: false },
+    // This door always wires an AttachmentTicketProvider (VaultDO's constructor); read-attachment when bytes are wired.
+    attachments: { ticketsEnabled: true, readEnabled: attachments.readEnabled, ticketTool: "attachment-url" },
+    words: recordWords,
+    ...(reach ? { reach } : {}),
+    scripting:
+      `For a script or cron job, make a key for this vault in your account (\`POST /account/keys {name, vault: "${vaultName}", can: "read"}\`, ` +
+      `or the app's keys page) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/scripting/`,
+  });
 }
 
 /**
@@ -245,6 +253,12 @@ export function connectionReachFor(auth: AuthResult, vaultName: string): string 
   const level = hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
   return connectionReach(level, auth.scoped_tags);
 }
+
+/**
+ * Auto hybrid search on cloud when a vault hasn't chosen (core's HYBRID_AUTO_DEFAULT is on for a box): off until the
+ * embed call and vector scan per question-shaped search are measured at cloud vault sizes (ROADMAP, cloud parity).
+ */
+export const CLOUD_HYBRID_AUTO_DEFAULT = false;
 
 /**
  * Server-layer context the DO supplies so vault-info can build a REAL projection
@@ -269,6 +283,9 @@ export interface VaultInfoContext {
    *  the caller's `as string` cast to hide it; cloud#87 replaced that cast with a
    *  real check, so the seam now states the type it actually accepts. */
   updateDescription: (description: string | null) => void | Promise<void>;
+  /** This vault's own `search.auto_hybrid` (rest/vault.ts), read at each search; cloud's default when unset is off
+   *  ({@link CLOUD_HYBRID_AUTO_DEFAULT}). */
+  hybridAuto?: () => boolean | null | undefined;
 }
 
 /** Public-facing origin, honoring a proxy's X-Forwarded-* (Cloudflare sets Host).
@@ -292,7 +309,7 @@ function publicOrigin(req: Request): string {
  * vault (the inner check here — vault-info stays `requiredVerb: "read"` so
  * read-only callers keep the stats projection; admin, not write, per the 0.7.1
  * write/admin re-tier — description is curation) and (2) is separately routed
- * through the #82 write gate at the dispatch layer (`isGatedWrite` treats
+ * through the #82 write gate at the dispatch layer (`writeGateFor` treats
  * vault-info-with-`description` as a gated write → a frozen vault refuses with the
  * SAME 402 `plan_required` shape as create-note; a plain read carries no
  * `description`, skips the gate, and works on a frozen vault — reads stay sacred).
@@ -312,13 +329,7 @@ function overrideVaultInfo(
   if (!vaultInfo) return;
 
   vaultInfo.execute = async (params) => {
-    // `help` (0.9): a tool's full reference, which the short tools/list descriptions point to.
-    if (params.help !== undefined) {
-      if (params.description !== undefined && params.description !== null) {
-        throw Object.assign(new Error("vault-info: pass help or description, not both."), { error_type: "invalid_query", field: "help", hint: "two calls" });
-      }
-      return toolHelp(String(params.help));
-    }
+    // `help` is answered by the engine's 0.9 surface (shapeRecordSurface) before this runs.
     let description = opts.description;
 
     if (params.description !== undefined) {
@@ -330,7 +341,7 @@ function overrideVaultInfo(
       // Without this a `vault:read`/`vault:write` token could slip a
       // higher-tier mutation past a tool the outer gate considers a read.
       // (The frozen/cap paywall is applied at the dispatch layer — see
-      // isGatedWrite/handleToolCall — so this only guards SCOPE.)
+      // writeGateFor/handleToolCall — so this only guards SCOPE.)
       //
       // The REST door matches since T-419 (audit L3-01): `PATCH /api/vault` with a `description` needs admin too
       // (vault-do.ts), so this check is a real boundary, not an advisory one.
@@ -582,6 +593,7 @@ function visibleTools(
   auth: AuthResult,
   attachmentTickets: { provider: AttachmentTicketProvider; urlBase: string },
   attachmentBytes?: AttachmentBytesProvider,
+  hybridAuto?: () => boolean | null | undefined,
 ): McpToolDef[] {
   // Write-attribution: refine the credential class to the `mcp` channel, but
   // keep `operator` and `nostr:<pubkey>` — each names something more specific
@@ -592,6 +604,10 @@ function visibleTools(
   const writeContext = { actor: auth.actor, via: refineMcpVia(auth.via) };
   const tools = generateMcpTools(store, {
     writeContext,
+    // 0.9.3 auto hybrid: a question-shaped search with no search_mode also asks the meaning index. Off on cloud unless
+    // the vault turns it on (CLOUD_HYBRID_AUTO_DEFAULT): each such search is a Workers AI embed call plus a scan of the
+    // candidates' vectors inside the vault's Durable Object, not yet measured at cloud sizes.
+    hybridAuto: () => hybridAuto?.() ?? CLOUD_HYBRID_AUTO_DEFAULT,
     attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
     // read-attachment (the engine adds the tool only when a door wires bytes): ranged R2 reads. Without it an AI
     // app on this door could list a note's files but not look at one, which it can on a box.
@@ -603,9 +619,19 @@ function visibleTools(
   return tools;
 }
 
-/** The caller's tools: the 0.9 surface (mcp-09.ts), filtered to what its scopes permit for THIS vault. */
-function scopedTools(tools: McpToolDef[], vaultName: string, auth: AuthResult): McpToolDef[] {
-  return shape09(tools, vaultName, auth).filter((t) => hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)));
+/**
+ * The caller's tools: the engine's 0.9 surface (core mcp-surface.ts, the same one a box builds), filtered to what its
+ * scopes permit for THIS vault. Cloud has no in-vault token tool and no tag-scoped passes, so it passes neither.
+ */
+function scopedTools(store: Store, tools: McpToolDef[], vaultName: string, auth: AuthResult, countName?: NameCount): McpToolDef[] {
+  const shaped = shapeRecordSurface(tools, {
+    db: store.db as unknown as Parameters<typeof shapeRecordSurface>[1]["db"],
+    vaultName,
+    hasVerb: (verb) => hasScopeForVault(auth.scopes, vaultName, verb),
+    // Old and new names, as a box counts them (`mcp <tool>`, `mcp <tool> <param>`): the DO adds the client.
+    ...(countName ? { onUse: (name: string, kind: "old" | "new") => countName(`mcp ${name}`, kind) } : {}),
+  });
+  return shaped.filter((t) => hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)));
 }
 
 /**
@@ -622,6 +648,9 @@ const noRecord: HealthRecord = async () => {};
  * for server-class errors; a refusal the tool makes on purpose is not logged.
  */
 export type ToolCrashLog = (tool: string, err: unknown) => void;
+
+/** Counts one use of an old or new name (health.ts NameCounts); the DO knows the request's client. */
+export type NameCount = (name: string, kind: "old" | "new") => void;
 const noLog: ToolCrashLog = () => {};
 
 async function handleToolCall(
@@ -652,7 +681,8 @@ async function handleToolCall(
     await record(subject, "forbidden");
     return result(id, { content: [{ type: "text", text: "Error: Forbidden: attachment-url {action: \"upload\"} needs write on this vault." }], isError: true });
   }
-  if (isAttachmentUploadMint(name, args)) {
+  const gate = writeGateFor(name, args);
+  if (gate === "attachments") {
     // The attachment gate ladder, AT MINT, against the caller's DECLARED
     // size — an agent learns `plan_required`/`attachments_not_included`/
     // `storage_cap_exceeded` before ever curling (D7 of the design). Only
@@ -668,7 +698,7 @@ async function handleToolCall(
         return gateError(id, blocked);
       }
     }
-  } else if (isGatedWrite(tool, args)) {
+  } else if (gate === "notes") {
     // The paywall + cap gate — a forward-mutating verb (create/update/prune) gets
     // the SAME frozen-then-cap enforcement the REST write path applies; read-class
     // AND delete-class verbs pass through (REST exempts both). MCP is the flagship
@@ -695,7 +725,11 @@ async function handleToolCall(
     // A server-class fault also leaves one log line (the count alone has no cause).
     if (outcome.startsWith("exception:")) logCrash(name, err);
     await record(subject, outcome);
-    if (domain) return rpcError(id, domain.code, message, domain.data);
+    if (domain) {
+      // As a box answers (core mcp-surface.ts): the message names its kind, and a record tool's data is in record words.
+      const data = NOTE_TOOL_NAMES[name] && domain.data ? recordErrorData(domain.data as Record<string, unknown>) : domain.data;
+      return rpcError(id, domain.code, typedMessage(message, data as Record<string, unknown> | undefined), data);
+    }
     return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
   }
 }
@@ -709,8 +743,8 @@ async function handleOne(
     tools: McpToolDef[];
     vaultName: string;
     description: string | null;
-    /** What this connection can read (`connectionReachFor`), for the instructions. */
-    reach: string;
+    /** The connect-time brief (`serverInstruction`), built only when a client asks for it. */
+    instructions: () => string;
     writeGate: McpWriteGate;
     attachmentMintGate: (declaredBytes: number) => Response | null;
     record?: HealthRecord;
@@ -732,7 +766,7 @@ async function handleOne(
           protocolVersion,
           capabilities: { tools: {} },
           serverInfo: { name: `parachute-vault/${ctx.vaultName}`, version: "0.1.0" },
-          instructions: serverInstruction(ctx.vaultName, ctx.description, ctx.reach),
+          instructions: ctx.instructions(),
         });
       }
       case "tools/list":
@@ -894,7 +928,7 @@ async function handleModern(m: JsonRpcMessage, ctx: Parameters<typeof handleOne>
       reply = result(id, {
         supportedVersions: ALL_SUPPORTED_VERSIONS,
         capabilities: { tools: {} },
-        instructions: serverInstruction(ctx.vaultName, ctx.description, ctx.reach),
+        instructions: ctx.instructions(),
         ttlMs: MODERN_CACHE_TTL_MS,
         cacheScope: "private",
       });
@@ -948,6 +982,7 @@ export async function handleMcp(
   },
   record: HealthRecord = noRecord,
   logCrash: ToolCrashLog = noLog,
+  countName?: NameCount,
 ): Promise<Response> {
   if (req.method === "DELETE") return new Response(null, { status: 200 });
   if (req.method !== "POST") {
@@ -1022,22 +1057,26 @@ export async function handleMcp(
   // calls for; bun derives it the same way, `mcp-tools.ts`'s `ticketUrlBase`).
   const origin = publicOrigin(req);
   const ticketUrlBase = `${origin.replace(/\/$/, "")}/vault/${vaultName}`;
-  const all = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes);
+  const all = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes, vaultInfo.hybridAuto);
   // Wire the server-layer vault-info override onto core's tools (core ships a
   // placeholder execute — "must be configured by the server layer"), then the
   // 0.9 shape and the scope filter. Parity with bun's mcp-tools.ts: override
   // first, so the record surface wraps the real vault-info.
   overrideVaultInfo(all, { vaultName, auth, description, origin, ctx: vaultInfo });
-  const tools = scopedTools(all, vaultName, auth);
+  const tools = scopedTools(store, all, vaultName, auth, countName);
   // The write stamp (rest/write-stamp.ts): a key with the owner's on-behalf-of grant names who a write is for with
   // `on_behalf_of`; the call runs on the same tools built for that "by", with the token's own scopes.
   applyOnBehalf(tools, auth, (by) => {
     const forBy: AuthResult = { ...auth, actor: by, acts_for: null };
-    const twin = visibleTools(store, vaultName, forBy, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes);
+    const twin = visibleTools(store, vaultName, forBy, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes, vaultInfo.hybridAuto);
     overrideVaultInfo(twin, { vaultName, auth: forBy, description, origin, ctx: vaultInfo });
-    return scopedTools(twin, vaultName, forBy);
+    return scopedTools(store, twin, vaultName, forBy, countName);
   });
-  const ctx = { tools, vaultName, description, reach: connectionReachFor(auth, vaultName), writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
+  const instructions = () =>
+    serverInstruction(vaultName, description, connectionReachFor(auth, vaultName), buildVaultProjection(store.db as never, { includeStats: true }), {
+      readEnabled: tickets.bytes !== undefined,
+    });
+  const ctx = { tools, vaultName, description, instructions, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));

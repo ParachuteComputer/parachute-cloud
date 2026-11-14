@@ -10,7 +10,7 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import type { DurableObject } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
+import { READABLE_SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 import { probeCanaryVault, type CanarySend } from "../../identity/src/canary-probe.ts";
 import { base, createNote, freshVault, mintToken } from "./helpers.ts";
 
@@ -59,7 +59,7 @@ describe("canary probe against a real vault DO", () => {
     await runInDurableObject<DurableObject, void>(stubFor(v), async (inst: any) => {
       inst.ctx.storage.sql.exec(
         "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
-        SCHEMA_VERSION + 1,
+        READABLE_SCHEMA_VERSION + 1,
         new Date().toISOString(),
       );
     });

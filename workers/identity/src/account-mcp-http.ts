@@ -32,6 +32,7 @@
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import { validateAccountToken } from "./account-auth.ts";
 import {
+  ACCOUNT_OLD_NAMES,
   toolsFor,
   grantCanWrite,
   type AccountConnectionGrant,
@@ -41,6 +42,9 @@ import {
 } from "./account-mcp.ts";
 import { type OAuthDeps, frontDoorOrigin, jsonResponse } from "./oauth-shared.ts";
 import { type User, getUserById } from "./users.ts";
+import { getClient } from "./clients.ts";
+import type { Env } from "./env.ts";
+import { bufferHealth, connectorClass } from "./health-counters.ts";
 
 // --- transport constants (transcribed from workers/vault/src/mcp.ts) ---------
 
@@ -186,7 +190,7 @@ function bearerToken(req: Request): string | null {
 }
 
 type AuthResult =
-  | { ok: true; accountId: string; grant: AccountConnectionGrant; user: User; key?: AccountToolContext["key"] }
+  | { ok: true; accountId: string; grant: AccountConnectionGrant; user: User; key?: AccountToolContext["key"]; clientId?: string | null }
   | { ok: false; status: 401 | 403; error: string; message: string };
 
 /**
@@ -238,7 +242,8 @@ async function authenticate(db: D1Database, req: Request, deps: OAuthDeps): Prom
     return { ok: false, status: 401, error: "account_suspended", message: "this account is suspended" };
   }
 
-  return { ok: true, accountId, grant, user, ...keyClaimOf(validated.token.payload) };
+  const clientId = typeof validated.token.payload.client_id === "string" ? validated.token.payload.client_id : null;
+  return { ok: true, accountId, grant, user, clientId, ...keyClaimOf(validated.token.payload) };
 }
 
 const KEY_KINDS = new Set(["person", "agent", "app", "service"]);
@@ -275,6 +280,9 @@ async function handleToolCall(
   if (!tool) {
     return result(id, { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true });
   }
+  // Name use (T-456): the old note names and their record names, counted so 1.0 can drop the old ones on real use.
+  if (ACCOUNT_OLD_NAMES[name]) ctx.countName?.(name, "old");
+  else if (Object.values(ACCOUNT_OLD_NAMES).includes(name)) ctx.countName?.(name, "new");
   try {
     const out = await tool.execute(args, ctx);
     // A write tool hands back the vault's own MCP result (its content blocks), untouched.
@@ -295,11 +303,12 @@ function instructions(canWrite: boolean): string {
   return (
     "The Parachute account MCP — one connection across your vaults. " +
     "Use list-vaults to see the vaults this connection can reach and its level on each, create-vault to add one, " +
-    "and query-notes to search across them (omit `vault` to fan out, pass it to target one)" +
+    "and query-records to search across them (omit `vault` to fan out, pass it to target one)" +
     (canWrite
-      ? ". create-note, update-note and delete-note write to one vault, which every write must name in `vault`; " +
+      ? ". create-record, update-record and delete-record write to one vault, which every write must name in `vault`; " +
         "a write needs write on that vault."
-      : ". This connection reads; it does not write.")
+      : ". This connection reads; it does not write.") +
+    " The note-named tools are the same tools under their 0.8 names, until 1.0."
   );
 }
 
@@ -486,7 +495,41 @@ async function handleModern(m: JsonRpcMessage, ctx: AccountToolContext): Promise
  * path from ever falling through to the SPA shell (it already sits under the
  * `/account/*` run_worker_first rule; this handler is what answers, not a 404).
  */
-export async function handleAccountMcp(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+/**
+ * Count an account-door name under `name:account <tool>` with `<old|new>:<client>`, in the identity worker's health
+ * counters (names and counts only). The client is never the caller's own text: a key's kind (`key:agent`), else the
+ * connector's class from what the issuer registered for its OAuth client (health-counters.ts connectorClass:
+ * claude, chatgpt, …, other). One client lookup per request, only when a name is counted.
+ */
+function nameCounter(counting: AccountMcpCounting, db: D1Database, auth: { key?: AccountToolContext["key"]; clientId?: string | null }): (tool: string, kind: "old" | "new") => void {
+  let client: Promise<string> | null = null;
+  const clientOf = async (): Promise<string> => {
+    if (auth.key) return `key:${auth.key.kind}`;
+    if (!auth.clientId) return "unknown";
+    try {
+      return connectorClass(auth.clientId, (await getClient(db, auth.clientId))?.redirectUris ?? null);
+    } catch {
+      return "unknown";
+    }
+  };
+  return (tool, kind) => {
+    client ??= clientOf();
+    counting.waitUntil(
+      client.then((who) => {
+        const flush = bufferHealth(counting.env, [{ subject: `name:account ${tool}`, outcome: `${kind}:${who}` }]);
+        return flush ?? undefined;
+      }).catch(() => {}),
+    );
+  };
+}
+
+/** Where the account door counts its names: the identity worker's health counters, and the response's waitUntil. */
+export interface AccountMcpCounting {
+  env: Partial<Env>;
+  waitUntil: (p: Promise<unknown>) => void;
+}
+
+export async function handleAccountMcp(db: D1Database, req: Request, deps: OAuthDeps, counting?: AccountMcpCounting): Promise<Response> {
   if (req.method === "OPTIONS") return preflight();
 
   // Auth gate — BEFORE any JSON-RPC (or method framing): a bare/invalid/wrong
@@ -577,6 +620,7 @@ export async function handleAccountMcp(db: D1Database, req: Request, deps: OAuth
     // carry no permissions.principal_pubkey (cloud#278).
     principal: { authKind: "bearer" },
     ...(auth.key ? { key: auth.key } : {}),
+    ...(counting ? { countName: nameCounter(counting, db, auth) } : {}),
   };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];

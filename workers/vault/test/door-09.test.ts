@@ -117,7 +117,7 @@ describe("door/0.9 MCP: the record door", () => {
     expect(both.out.message).toContain("help or description");
     expect((await call(v, "vault-info", { help: "query-records", description: null })).ok).toBe(true);
     const mt = await call(v, "vault-info", { help: "manage-types" });
-    expect(Object.keys(mt.out.actions)).toEqual(["update", "rename", "merge", "delete", "prune"]);
+    expect(Object.keys(mt.out.actions)).toEqual(["update", "rename", "merge", "delete", "prune", "migrate"]);
   });
 
   it("initialize's brief speaks record words", async () => {

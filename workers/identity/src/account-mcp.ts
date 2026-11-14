@@ -240,6 +240,8 @@ export interface AccountToolContext {
    * write `via key:<name>` exactly as if the key had written there itself. Absent for an OAuth connection.
    */
   key?: { name: string; kind: "person" | "agent" | "app" | "service" };
+  /** Count one use of an account-door tool name, old or new (T-456; account-mcp-http.ts). */
+  countName?: (tool: string, kind: "old" | "new") => void;
 }
 
 /** A single account-MCP tool: a pure definition + an executor that throws
@@ -356,7 +358,7 @@ const createVaultTool: AccountMcpTool = {
 
 /** One vault's contribution to a fan-out — either its notes payload or an
  *  isolated error (a failed vault never fails the whole call). */
-type VaultQueryEntry = { vault: string; notes: unknown } | { vault: string; error: string };
+type VaultQueryEntry = { vault: string; notes: unknown } | { vault: string; records: unknown } | { vault: string; error: string };
 
 /**
  * Build the vault REST `/api/notes` query string from the Wave A common subset
@@ -391,6 +393,18 @@ function buildNotesQuery(args: Record<string, unknown>): string {
 }
 
 /**
+ * The `/api/records` query string for query-records, in record words (the vault's records door, rest/records.ts):
+ * `search`, `type` (a type and its subtypes), `tag` (plain labels), `fields` (field filters, the notes door's
+ * `metadata`), and `limit`, clamped as {@link buildNotesQuery} clamps it.
+ */
+function buildRecordsQuery(args: Record<string, unknown>): string {
+  const p = new URLSearchParams(buildNotesQuery({ ...args, metadata: args.fields }));
+  const types = Array.isArray(args.type) ? args.type : typeof args.type === "string" ? [args.type] : [];
+  for (const t of types) if (typeof t === "string" && t.length > 0) p.append("type", t);
+  return p.toString();
+}
+
+/**
  * Query ONE vault through the bridge mint. Throws on transport/timeout (the
  * caller's `Promise.allSettled` converts that to an isolated `{ vault, error }`);
  * returns a `{ vault, error }` for a non-2xx (the vault answered, unhappily) and
@@ -404,13 +418,14 @@ async function queryOneVault(
   vaultName: string,
   args: Record<string, unknown>,
   permissions?: Record<string, unknown>,
+  door: "notes" | "records" = "notes",
 ): Promise<VaultQueryEntry> {
-  const qs = buildNotesQuery(args);
+  const qs = door === "records" ? buildRecordsQuery(args) : buildNotesQuery(args);
   const res = await callVaultApi(db, deps, {
     userId: accountId,
     vaultName,
     method: "GET",
-    apiPath: qs ? `/api/notes?${qs}` : "/api/notes",
+    apiPath: qs ? `/api/${door}?${qs}` : `/api/${door}`,
     verb: "read",
     clientId: ACCOUNT_TOKEN_CLIENT_ID,
     signal: AbortSignal.timeout(FANOUT_TIMEOUT_MS),
@@ -426,8 +441,8 @@ async function queryOneVault(
     }
     return { vault: vaultName, error: detail };
   }
-  const notes = await res.json();
-  return { vault: vaultName, notes };
+  const answer = await res.json();
+  return door === "records" ? { vault: vaultName, records: answer } : { vault: vaultName, notes: answer };
 }
 
 /**
@@ -443,9 +458,10 @@ async function fanOut(
   targets: string[],
   args: Record<string, unknown>,
   permissions?: Record<string, unknown>,
+  door: "notes" | "records" = "notes",
 ): Promise<VaultQueryEntry[]> {
   const settled = await Promise.allSettled(
-    targets.map((name) => queryOneVault(db, deps, accountId, name, args, permissions)),
+    targets.map((name) => queryOneVault(db, deps, accountId, name, args, permissions, door)),
   );
   return settled.map((s, i) =>
     s.status === "fulfilled"
@@ -456,10 +472,7 @@ async function fanOut(
 
 const queryNotesTool: AccountMcpTool = {
   name: "query-notes",
-  description:
-    "Search notes across the account's vaults. Omit `vault` to fan the query out across every reachable vault " +
-    "(results are grouped per vault, not ranked across vaults); pass `vault` to target one. Wave A supports " +
-    "keyword `search`, `tag` and `metadata` filters, and `limit` (semantic search is per-vault only, not fanned out).",
+  description: oldNameOf("query-records"),
   inputSchema: {
     type: "object",
     properties: {
@@ -484,32 +497,72 @@ const queryNotesTool: AccountMcpTool = {
     additionalProperties: false,
   },
   async execute(args, ctx) {
-    const coverage = await resolveCoverage(ctx.db, ctx.accountId, ctx.grant);
-    let targets = coverage.names;
-    if (typeof args.vault === "string" && args.vault.length > 0) {
-      const wanted = args.vault.toLowerCase();
-      // Fail-closed: a `vault` outside the live coverage set is refused, never
-      // silently reached — the ownership seam applies to the targeted form too.
-      if (!coverage.names.includes(wanted)) {
-        throw new AccountToolError(
-          "vault_not_covered",
-          `Vault "${args.vault}" is not among your granted, currently-owned vaults.`,
-        );
-      }
-      targets = [wanted];
-    }
-    const attribution = principalAttributionClaims(ctx.principal);
-    const results = await fanOut(
-      ctx.db,
-      ctx.deps,
-      ctx.accountId,
-      targets,
-      args,
-      attribution?.permissions,
-    );
-    return { vaults_queried: targets, results };
+    return { ...(await runQuery(args, ctx, "notes")), deprecation: { tool: "query-notes", use: "query-records", removed_in: "1.0" } };
   },
 };
+
+/** The account door's tools under their 0.9 names; the old note names stay listed through 0.9 (gone in 1.0). */
+function oldNameOf(use: string): string {
+  return `Old name of ${use}: the same tool, under the name 0.8 used. Use ${use}. Works until 1.0.`;
+}
+
+const queryRecordsTool: AccountMcpTool = {
+  name: "query-records",
+  description:
+    "Search records across the account's vaults. Omit `vault` to fan the query out across every reachable vault " +
+    "(results are grouped per vault, not ranked across vaults); pass `vault` to target one. Takes keyword " +
+    "`search`, a `type` (and its subtypes), `tag` labels, `fields` filters and `limit` (meaning search is per vault, " +
+    "not fanned out).",
+  inputSchema: {
+    type: "object",
+    properties: {
+      vault: {
+        type: "string",
+        description:
+          "Target a single vault by name. Must be one of the account's granted, currently-owned vaults. Omit to query all.",
+      },
+      search: { type: "string", description: "Full-text keyword query." },
+      type: {
+        type: ["string", "array"],
+        items: { type: "string" },
+        description: "Records of this type (and its subtypes).",
+      },
+      tag: {
+        type: ["string", "array"],
+        items: { type: "string" },
+        description: "Restrict to records carrying this tag (or any of these tags).",
+      },
+      fields: {
+        type: "object",
+        description: "Field filters, e.g. {\"status\":{\"eq\":\"open\"}} (applies to non-search queries).",
+      },
+      limit: { type: "number", description: "Maximum records per vault (default 50)." },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, ctx) {
+    return runQuery(args, ctx, "records");
+  },
+};
+
+/**
+ * query-records and query-notes (its old name): the live coverage set, or the one covered vault `vault` names
+ * (anything else is refused, never silently reached), fanned out through the bridge mint, grouped per vault.
+ */
+async function runQuery(args: Record<string, unknown>, ctx: AccountToolContext, door: "notes" | "records") {
+  const coverage = await resolveCoverage(ctx.db, ctx.accountId, ctx.grant);
+  let targets = coverage.names;
+  if (typeof args.vault === "string" && args.vault.length > 0) {
+    const wanted = args.vault.toLowerCase();
+    if (!coverage.names.includes(wanted)) {
+      throw new AccountToolError("vault_not_covered", `Vault "${args.vault}" is not among your granted, currently-owned vaults.`);
+    }
+    targets = [wanted];
+  }
+  const attribution = principalAttributionClaims(ctx.principal);
+  const results = await fanOut(ctx.db, ctx.deps, ctx.accountId, targets, args, attribution?.permissions, door);
+  return { vaults_queried: targets, results };
+}
 
 // --- writes: the vault's own note tools, one named vault at a time -------------
 
@@ -612,34 +665,56 @@ function writeTool(name: string, description: string): AccountMcpTool {
 
 const WRITE_TOOLS: readonly AccountMcpTool[] = [
   writeTool(
-    "create-note",
-    "Create a note (or several) in ONE vault, named by `vault`. Takes the same arguments as that vault's own " +
-      "create-note. Needs write on that vault; list-vaults shows this connection's level on each.",
+    "create-record",
+    "Create a record (or several) in ONE vault, named by `vault`. Takes the same arguments as that vault's own " +
+      "create-record. Needs write on that vault; list-vaults shows this connection's level on each.",
   ),
   writeTool(
-    "update-note",
-    "Update a note in ONE vault, named by `vault`. Takes the same arguments as that vault's own update-note. " +
+    "update-record",
+    "Update a record in ONE vault, named by `vault`. Takes the same arguments as that vault's own update-record. " +
       "Needs write on that vault.",
   ),
   writeTool(
-    "delete-note",
-    "Delete a note in ONE vault, named by `vault`. Takes the same arguments as that vault's own delete-note. " +
+    "delete-record",
+    "Delete a record in ONE vault, named by `vault`. Takes the same arguments as that vault's own delete-record. " +
       "Needs write on that vault.",
   ),
 ];
 
+/** The old note-named writes (0.9.1's), still listed through 0.9: the vault's own old tools, answered as before. */
+const OLD_WRITE_TOOLS: readonly AccountMcpTool[] = [
+  writeTool("create-note", oldNameOf("create-record")),
+  writeTool("update-note", oldNameOf("update-record")),
+  writeTool("delete-note", oldNameOf("delete-record")),
+];
+
+/** The account door's old names and the name each is counted against (T-456): 1.0 removes them on these counts. */
+export const ACCOUNT_OLD_NAMES: Readonly<Record<string, string>> = {
+  "query-notes": "query-records",
+  "create-note": "create-record",
+  "update-note": "update-record",
+  "delete-note": "delete-record",
+};
+
 /** Whether this connection holds write (or more) on any vault — the write tools are listed only then, so a read-only
- *  connection (every Wave A level-less grant among them) sees exactly the three tools it saw before. */
+ *  connection (every Wave A level-less grant among them) sees only the read tools: list-vaults, create-vault, query-records and query-notes. */
 export function grantCanWrite(grant: AccountConnectionGrant): boolean {
   const atLeastWrite = (v: ComposedVaultVerb | null) => v !== null && COMPOSED_VERB_RANK[v] >= COMPOSED_VERB_RANK.write;
   return atLeastWrite(grant.wildcard) || [...grant.vaults.values()].some(atLeastWrite);
 }
 
-/** The tools this connection is shown: the three Wave A tools, plus the note writes when it can write somewhere. */
+/** The tools this connection is shown: the read tools, plus the record writes (and their old note names) when it can write somewhere. */
 export function toolsFor(grant: AccountConnectionGrant): readonly AccountMcpTool[] {
   return grantCanWrite(grant) ? ACCOUNT_MCP_TOOLS : ACCOUNT_MCP_TOOLS.filter((t) => !t.passThrough);
 }
 
-/** The account-MCP tool set: the three Wave A tools, then the note writes (0.9.1). Order is stable so
+/** The account-MCP tool set: list-vaults, create-vault, the record tools, then their old note names. Order is stable so
  *  `tools/list` is deterministic. */
-export const ACCOUNT_MCP_TOOLS: readonly AccountMcpTool[] = [listVaultsTool, createVaultTool, queryNotesTool, ...WRITE_TOOLS];
+export const ACCOUNT_MCP_TOOLS: readonly AccountMcpTool[] = [
+  listVaultsTool,
+  createVaultTool,
+  queryRecordsTool,
+  ...WRITE_TOOLS,
+  queryNotesTool,
+  ...OLD_WRITE_TOOLS,
+];

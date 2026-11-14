@@ -51,6 +51,8 @@ function toolFor(method: string): string {
  */
 /** The /api/notes requests that are /api/records twins (only these take `?type=`). Set here, read by handleNotes. */
 export const RECORDS_REQUESTS = new WeakSet<Request>();
+/** The /api/tags requests that are /api/types twins: counted under the new name (vault-do.ts). */
+export const TYPES_REQUESTS = new WeakSet<Request>();
 /**
  * A records body the translator refused (an old word beside its new one): the refusal, answered by handleNotes, so
  * after auth (an anonymous caller still gets 401 first) and before anything is written.
@@ -104,6 +106,7 @@ export async function recordsDoor(request: Request, route: { kind: "records" | "
   }
   const twin = new Request(out.toString(), { method: request.method, headers, body });
   if (route.kind === "records") RECORDS_REQUESTS.add(twin);
+  else TYPES_REQUESTS.add(twin);
   if (refusal) RECORDS_REFUSALS.set(twin, refusal);
   const res = await inner(twin);
   if (route.kind === "types") return res;

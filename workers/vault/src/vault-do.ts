@@ -33,8 +33,12 @@ import {
 } from "./auth.js";
 import { NO_TAG_SCOPE } from "./rest/parse.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
+import { withValidators } from "@openparachute/core/src/http-validators.js";
+
+/** One record by id or path, on either REST door: `/vault/<v>/api/notes/<x>` or `/vault/<v>/api/records/<x>`. */
+const ONE_RECORD = /^\/vault\/[^/]+\/api\/(notes|records)\/[^/]+$/;
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
-import { recordsDoor, recordsRoute, withNotesDeprecation } from "./rest/records.js";
+import { RECORDS_REQUESTS, TYPES_REQUESTS, recordsDoor, recordsRoute, withNotesDeprecation } from "./rest/records.js";
 import { handleDeletedNotes, handleHistoryCompact } from "./rest/history.js";
 import { handleTags, handleFindPath } from "./rest/tags.js";
 import { handleDoctor } from "./rest/doctor.js";
@@ -49,8 +53,9 @@ import {
   usedBytes,
 } from "./caps.js";
 import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./rest/storage-constants.js";
-import { handleMcp } from "./mcp.js";
-import { HealthSink, errorClass, responseOutcome, routeOf, utcDay, versionLabel } from "./health.js";
+import { CLOUD_HYBRID_AUTO_DEFAULT, handleMcp } from "./mcp.js";
+import { HealthSink, NameCounts, clientOf, errorClass, responseOutcome, routeOf, utcDay, versionLabel } from "./health.js";
+import { restRouteName, typesRouteName } from "@openparachute/core/src/name-routes.js";
 import { logServerError } from "./error-log.js";
 import { mcpWwwAuthenticate } from "./discovery.js";
 import { handleSubscribe } from "./live/subscribe.js";
@@ -220,6 +225,9 @@ type VaultConfigState = {
   createdAt: string;
   audio_retention: "keep" | "until_transcribed" | "never";
   auto_transcribe: { enabled: boolean };
+  /** 0.9.3: the vault's own choice for auto hybrid search (PATCH /api/vault config.search); absent follows
+   *  CLOUD_HYBRID_AUTO_DEFAULT. */
+  search?: { auto_hybrid: boolean };
   /** Legacy single summed cap (pre-two-meter). Kept for back-compat: applies
    *  only when `caps` is absent. */
   cap_bytes?: number;
@@ -666,6 +674,7 @@ export class VaultDO extends DurableObject {
     this.appKeys = new AppKeyLedger(ctx.storage);
     const version = versionLabel(env.CF_VERSION_METADATA);
     this.health = new HealthSink(ctx.storage, version);
+    this.names = new NameCounts(ctx.storage, version);
     this.logFields = { version, vaultId: ctx.id.toString() };
     // The shim carries `ctx.storage` (not just `.sql`) so its `transactionSync`
     // can delegate to the real DO transaction primitive — the free
@@ -757,6 +766,25 @@ export class VaultDO extends DurableObject {
     // door/0.9: /api/records and /api/types run as their /api/notes and /api/tags twins, in record words
     // (rest/records.ts); a direct /api/notes answer says it is leaving.
     const path = new URL(request.url).pathname;
+    // 0.9.3 (core http-validators.ts, as a box answers): one record's GET carries an ETag and Last-Modified, and HEAD
+    // on it is that GET without the body, on both doors.
+    if (ONE_RECORD.test(path)) {
+      // HEAD answers with the GET response itself, body and all, and the runtime sends no body for a HEAD. A Response
+      // made with an empty body (core headOf) loses its Content-Length on Cloudflare's edge (seen on staging, T-456);
+      // a body of known length keeps it.
+      if (request.method === "HEAD") {
+        const get = await this.fetch(new Request(request.url, { method: "GET", headers: request.headers }));
+        const bytes = await get.arrayBuffer();
+        const h = new Headers(get.headers);
+        h.set("content-length", String(bytes.byteLength));
+        return new Response(bytes, { status: get.status, statusText: get.statusText, headers: h });
+      }
+      if (request.method === "GET") return withValidators(await this.fetchOne(request, path));
+    }
+    return this.fetchOne(request, path);
+  }
+
+  private async fetchOne(request: Request, path: string): Promise<Response> {
     const records = recordsRoute(path);
     try {
       // Counted BEFORE the records door reads the body: the import lock checked above must not see a request that
@@ -848,6 +876,18 @@ export class VaultDO extends DurableObject {
 
   /** The vault's health counter sink (T-411); see health.ts. */
   private readonly health: HealthSink;
+  /** Old and new names in use, per client (health.ts NameCounts, T-456). */
+  private readonly names: NameCounts;
+
+  /** Count one name's use by this request's client, unless the vault is gone (its storage must stay empty). */
+  // A call through the account door is counted twice, on purpose: there under `name:account <tool>` and the caller's
+  // client class (identity health counters), here under `name:mcp …`/`name:rest …` and this hop's client. The client
+  // id alone can't tell a hop from a direct call (POST /account/vaults/:name/token mints the same id), so neither is
+  // dropped; read the two sinks apart.
+  private async countNameUse(name: string, kind: "old" | "new", request: Request, auth: { via: string | null }): Promise<void> {
+    if (!this.stateLoaded || this.destroyed) return;
+    await this.names.count(name, kind, clientOf(request, auth.via));
+  }
 
   /** What every server-side error line names (error-log.ts): the worker version and the DO's id, never the vault's name. */
   private readonly logFields: { version: string; vaultId: string };
@@ -1222,6 +1262,7 @@ export class VaultDO extends DurableObject {
             this.config!.description = description;
             return this.ctx.storage.put("config", this.config);
           },
+          hybridAuto: () => this.config?.search?.auto_hybrid,
         },
         {
           provider: this.attachmentTickets,
@@ -1230,6 +1271,7 @@ export class VaultDO extends DurableObject {
         },
         (subject, outcome) => this.health.record(subject, outcome),
         (tool, err) => logServerError("mcp_tool_error", err, { ...this.logFields, tool }),
+        (name, kind) => void this.countNameUse(name, kind, request, mauth),
       );
     }
 
@@ -1295,6 +1337,15 @@ export class VaultDO extends DurableObject {
     // checked before any route runs, so a refused request writes nothing. On-behalf-of never opens access.
     const stamp = restWriteStamp(request, apiPath, auth);
     if ("refusal" in stamp) return stamp.refusal;
+    // Name use (T-456), the routes a box counts: /api/notes is the old name, /api/records and /api/types the new.
+    if (TYPES_REQUESTS.has(request)) await this.countNameUse(typesRouteName(request.method, apiPath), "new", request, auth);
+    else {
+      const route = restRouteName(request.method, apiPath);
+      if (route) {
+        if (RECORDS_REQUESTS.has(request)) await this.countNameUse(route.replace(" /api/notes", " /api/records"), "new", request, auth);
+        else await this.countNameUse(route, "old", request, auth);
+      }
+    }
 
     // REST scope gate — mirrors bun's routing.ts: GET/HEAD/OPTIONS → read,
     // other methods → write, EXCEPT the enumerated tag-schema mutations
@@ -1325,7 +1376,10 @@ export class VaultDO extends DurableObject {
     // parse isn't a description write (the handler then fails on it, as before).
     const isDescriptionWrite = request.method === "PATCH" && apiPath === "/vault" &&
       await request.clone().json().then(
-        (b: unknown) => b !== null && typeof b === "object" && !Array.isArray(b) && "description" in b,
+        // The vault's search settings are vault-wide too (config.search, 0.9.3): admin, as on a box.
+        (b: unknown) =>
+          b !== null && typeof b === "object" && !Array.isArray(b) &&
+          ("description" in b || ((b as { config?: unknown }).config !== null && typeof (b as { config?: unknown }).config === "object" && "search" in ((b as { config: object }).config))),
         () => false,
       );
     const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDeletedList || isDescriptionWrite
@@ -1440,6 +1494,7 @@ export class VaultDO extends DurableObject {
         description: this.config!.description ?? undefined,
         audio_retention: this.config!.audio_retention,
         auto_transcribe: this.config!.auto_transcribe,
+        ...(this.config!.search ? { search: this.config!.search } : {}),
       };
       const descriptionBefore = cfg.description;
       const res = await handleVault(
@@ -1452,6 +1507,8 @@ export class VaultDO extends DurableObject {
           if (cfg.description !== descriptionBefore) this.config!.description = cfg.description ?? null;
           this.config!.audio_retention = cfg.audio_retention ?? "keep";
           this.config!.auto_transcribe = { enabled: cfg.auto_transcribe?.enabled ?? false };
+          if (cfg.search) this.config!.search = cfg.search;
+          else delete this.config!.search;
           void this.ctx.storage.put("config", this.config);
         },
         // Cross-door capability parity: the SAME transcription object the bare
@@ -1461,6 +1518,7 @@ export class VaultDO extends DurableObject {
         // Same parity for the semantic-search capability (C2, EXPERIMENTAL) —
         // self-host's routes.ts declares `embeddings` on /api/vault too.
         await this.embeddingCapability(),
+        hasScopeForVault(auth.scopes, vaultName, "admin") ? { hybridAutoDefault: CLOUD_HYBRID_AUTO_DEFAULT } : undefined,
       );
       return res;
     }
@@ -1801,7 +1859,7 @@ export class VaultDO extends DurableObject {
     if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
     const since = new URL(request.url).searchParams.get("since") ?? utcDay(new Date(Date.now() - 86_400_000));
     if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) return json({ error: "since must be YYYY-MM-DD" }, 400);
-    return json({ version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since) });
+    return json({ version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since), names: await this.names.read(since) });
   }
 
   /**

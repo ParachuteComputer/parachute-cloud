@@ -304,7 +304,10 @@ describe("rows a create, a wake and a tagged query cost (T-412)", () => {
     // 18,880 read, at 2,000 notes.)
     expect(small.wakeWritten, "wake writes").toBe(0);
     expect(large.wakeWritten, "wake writes").toBe(0);
-    expect(large.wakeRead, "wake reads").toBeLessThan(500);
+    // 0.9.3's fast path also checks the search index's `fields` column and insert trigger in sqlite_master (core
+    // schema.ts unnumberedStepsDone): a fixed ~150 rows more, the same at any size (T-456 pin bump: 639 at both 240
+    // and 2,000 notes).
+    expect(large.wakeRead, "wake reads").toBeLessThan(700);
     expect(large.wakeRead - small.wakeRead, "a wake's reads grow with the vault").toBeLessThan(20);
     // A tag filter beside an indexed equality reads per hit, not per note under the tag. (Unfixed: 2,114 rows
     // for 37 hits among 1,800 tagged notes.)

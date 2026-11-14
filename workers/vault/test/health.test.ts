@@ -165,7 +165,8 @@ describe("health counters — what a vault's requests leave behind", () => {
     expect(destroyed.status).toBe(200);
     expect((await op(v, "/api/notes")).status).toBe(410);
     const keys = await runInDurableObject(doStub(v), async (_inst, state) => [...(await state.storage.list()).keys()]);
-    expect(keys.filter((k) => k.startsWith("health:"))).toEqual([]);
+    // Nothing at all is left: the health counters, the name counts (T-456) and every other key.
+    expect(keys).toEqual([]);
   });
 });
 

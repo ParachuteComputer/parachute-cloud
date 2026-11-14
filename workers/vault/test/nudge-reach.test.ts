@@ -89,7 +89,7 @@ describe("0.9.1: the instructions say what this connection can read", () => {
       const lines = await said(v, token);
       const at = lines.findIndex((l) => l.startsWith("This connection can"));
       expect(lines[at]).toBe(connectionReach(level, null));
-      expect(lines[at - 1]).toContain(`Parachute vault "${v}"`);
+      expect(lines[at - 1]).toContain(`Parachute Vault "${v}"`);
     });
   }
 
@@ -103,6 +103,7 @@ describe("0.9.1: the instructions say what this connection can read", () => {
     const auth = { scopes: ["vault:v:read"], scoped_tags: ["fernhill"] } as unknown as AuthResult;
     const reach = connectionReachFor(auth, "v");
     expect(reach).toBe(connectionReach("read", ["fernhill"]));
-    expect(serverInstruction("v", null, reach).split("\n")[1]).toBe(reach);
+    const empty = { tags: [], indexed_fields: [], query_hints: [], map: { total_notes: 0, tags: [], paths: [] } } as never;
+    expect(serverInstruction("v", null, reach, empty).split("\n")[1]).toBe(reach);
   });
 });

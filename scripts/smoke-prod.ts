@@ -327,6 +327,9 @@ async function main() {
     assert(hCollect.status === 404, "PRODUCTION: /__test/health-collect does not exist (404)", `status ${hCollect.status}`);
     const hReport = await fetch(`${IDENTITY}/__test/health-report`);
     assert(hReport.status === 404, "PRODUCTION: /__test/health-report does not exist (404)", `status ${hReport.status}`);
+    // …and the name-use read (T-456).
+    const names = await fetch(`${IDENTITY}/__test/names?vault=x`);
+    assert(names.status === 404, "PRODUCTION: /__test/names does not exist (404)", `status ${names.status}`);
     // And its operator doors never answer without their bearer.
     const opsHealth = await fetch(`${IDENTITY}/ops/health`);
     assert(

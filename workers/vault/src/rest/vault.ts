@@ -13,6 +13,8 @@ export type VaultConfigLike = {
   description?: string;
   audio_retention?: "keep" | "until_transcribed" | "never";
   auto_transcribe?: { enabled?: boolean };
+  /** 0.9.3: this vault's own choice for auto hybrid search; absent follows the door's default. */
+  search?: { auto_hybrid: boolean };
 };
 
 const VALID_AUDIO_RETENTION = ["keep", "until_transcribed", "never"] as const;
@@ -49,6 +51,8 @@ export async function handleVault(
    * there too). GET-only.
    */
   embeddings?: { enabled: boolean; provider?: string; model?: string },
+  /** An admin's GET also shows the vault's search settings (as a box's does); the effective auto hybrid value. */
+  admin?: { hybridAutoDefault: boolean },
 ): Promise<Response> {
   const url = new URL(req.url);
 
@@ -56,6 +60,7 @@ export async function handleVault(
     const result: Record<string, unknown> = vaultResponse(vaultConfig);
     if (transcription) result.transcription = transcription;
     if (embeddings) result.embeddings = embeddings;
+    if (admin) result.search = { auto_hybrid: vaultConfig.search?.auto_hybrid ?? admin.hybridAutoDefault };
     // Front-door structural map — ALWAYS included, mirroring bun's handleVault
     // (routes.ts, contracts-brief C1.2). Cloud has no tag-scoped tokens
     // (NO_TAG_SCOPE everywhere), so the unscoped call is always correct here.
@@ -77,7 +82,7 @@ export async function handleVault(
       // (cloud#87). Typing it honestly makes the runtime check below mandatory
       // rather than optional.
       description?: unknown;
-      config?: { audio_retention?: string; auto_transcribe?: { enabled?: unknown } };
+      config?: { audio_retention?: string; auto_transcribe?: { enabled?: unknown }; search?: { auto_hybrid?: unknown } | null };
     };
     let dirty = false;
 
@@ -149,6 +154,28 @@ export async function handleVault(
         );
       }
       vaultConfig.auto_transcribe = { ...vaultConfig.auto_transcribe, enabled };
+      dirty = true;
+    }
+
+    // search.auto_hybrid (0.9.3), as a box takes it: true/false is this vault's choice, null follows the door's default.
+    // Vault-wide, so admin only (vault-do.ts gates a PATCH carrying config.search at admin before this runs).
+    if (body.config?.search !== undefined) {
+      const v = body.config.search?.auto_hybrid;
+      if (v !== null && typeof v !== "boolean") {
+        return json(
+          {
+            error: "invalid_search_auto_hybrid",
+            error_type: "invalid_search_auto_hybrid",
+            field: "config.search.auto_hybrid",
+            got: v,
+            message: "search.auto_hybrid must be a boolean, or null to follow the default",
+            hint: "pass true, false or null",
+          },
+          400,
+        );
+      }
+      if (v === null) delete vaultConfig.search;
+      else vaultConfig.search = { auto_hybrid: v };
       dirty = true;
     }
 

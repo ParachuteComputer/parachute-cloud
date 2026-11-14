@@ -2,7 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import type { DurableObject } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { createNote, freshVault, op } from "./helpers.ts";
-import { NewerSchemaError, SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
+import { NewerSchemaError, READABLE_SCHEMA_VERSION, SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 import { DoSqliteStore } from "../src/store-do.ts";
 import { ROLLBACK_ENGINE, ROLLBACK_ENGINE_DDL } from "./fixtures/engine-ddl-f147e34.ts";
 
@@ -69,14 +69,15 @@ describe("engine upgrade on an existing vault DO", () => {
     await createNote(v, { content: "x" });
     await runInDurableObject<DurableObject, void>(stubFor(v), async (inst: any) => {
       const sql: SqlStorage = inst.ctx.storage.sql;
-      sql.exec("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", SCHEMA_VERSION + 1, new Date().toISOString());
+      // Above the newest schema this engine reads (T-460: it opens one schema past its own).
+      sql.exec("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", READABLE_SCHEMA_VERSION + 1, new Date().toISOString());
       const before = versions(sql);
       const masterBefore = master(sql);
       expect(() => new DoSqliteStore(inst.shim, inst.ctx.storage)).toThrow(NewerSchemaError);
       expect(versions(sql)).toEqual(before);
       expect(master(sql)).toEqual(masterBefore);
       // Leave the DO usable for nothing else in this file: unique name, discarded.
-      sql.exec("DELETE FROM schema_version WHERE version = ?", SCHEMA_VERSION + 1);
+      sql.exec("DELETE FROM schema_version WHERE version = ?", READABLE_SCHEMA_VERSION + 1);
     });
   });
 
@@ -101,6 +102,17 @@ describe("engine upgrade on an existing vault DO", () => {
       // path lookups), and keeps SCHEMA_VERSION, so the rollback engine still opens the vault (no NewerSchemaError)
       // and SQLite keeps the extra index current under its writes. Nothing else may differ.
       const additive = new Set(["idx_notes_path_nocase"]);
+      // door/0.9, 0.9.3 (core #93, search finds words in field values, no SCHEMA_VERSION bump): one table
+      // (notes_field_text), one view (notes_fts_source), a `fields` column on notes_fts and its three triggers rebuilt
+      // to fill it. Rollback rehearsed (T-456, scripts/engine-rollback-rehearsal.ts): Cloud's 0.8 engine (core
+      // 53f956f) opens a vault this engine wrote, finds, writes, edits and deletes notes through the new triggers, and
+      // SQLite's and FTS5's integrity checks pass; back on this engine, its writes are found by body and field words.
+      const search093 = new Set(["notes_field_text", "notes_fts_source", "notes_fts", "notes_fts_insert", "notes_fts_update", "notes_fts_delete"]);
+      for (const name of search093) {
+        const o = engine.find((x: any) => x.name === name) as any;
+        expect(o, name).toBeTruthy();
+        if (name !== "notes_field_text") expect(String(o.sql), name).toMatch(/\bfields?\b/);
+      }
       // door/0.9 (T-318 §8a): 0.9's engine adds one column, tags.kind, with no SCHEMA_VERSION bump (core schema.ts
       // ensureTagKinds). The rollback engines name every column they write, so they still open and write the vault;
       // a row they add has no kind and is read by the same rule (tag-kind.ts KIND_SQL). Nothing else may differ.
@@ -114,7 +126,9 @@ describe("engine upgrade on an existing vault DO", () => {
       expect(String(revisions.sql)).toMatch(/\bvia_kind\s+TEXT,/);
       const tags = engine.find((o: any) => o.name === "tags") as any;
       expect(String(tags.sql)).toMatch(/\bkind TEXT\n\)$/);
-      expect(engine.filter((o: any) => !additive.has(String(o.name))).map(withoutKind)).toEqual(ROLLBACK_ENGINE_DDL.objects);
+      expect(engine.filter((o: any) => !additive.has(String(o.name)) && !search093.has(String(o.name))).map(withoutKind)).toEqual(
+        ROLLBACK_ENGINE_DDL.objects.filter((o) => !search093.has(o.name)),
+      );
       expect(engine.filter((o: any) => additive.has(String(o.name)))).toEqual([
         {
           type: "index",
