@@ -250,6 +250,9 @@ describe("account MCP — tools/list", () => {
     for (const t of body.result.tools) {
       expect(typeof t.description).toBe("string");
       expect(t.inputSchema).toBeTruthy();
+      // T-456: each tool says what it does (MCP annotations), so a client can tell a read from a change.
+      expect({ tool: t.name, hints: Object.keys(t.annotations ?? {}).sort() }).toEqual({ tool: t.name, hints: ["destructiveHint", "idempotentHint", "openWorldHint", "readOnlyHint"] });
+      expect({ tool: t.name, readOnly: t.annotations.readOnlyHint }).toEqual({ tool: t.name, readOnly: t.name !== "create-vault" });
     }
   });
 });

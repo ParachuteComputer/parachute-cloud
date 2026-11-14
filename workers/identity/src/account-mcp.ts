@@ -244,12 +244,33 @@ export interface AccountToolContext {
   countName?: (tool: string, kind: "old" | "new") => void;
 }
 
+/**
+ * MCP tool annotations (T-456, as the box's account door, parachute-core packages/hub/src/account-mcp.ts): what a tool
+ * does, so a client can tell a read from a change. With none, ChatGPT treats every tool as a write and asks before each
+ * read. Honest, not generous: a client may skip asking for a read-only tool.
+ */
+export interface AccountToolAnnotations {
+  readOnlyHint: boolean;
+  destructiveHint: boolean;
+  idempotentHint: boolean;
+  openWorldHint: boolean;
+}
+const READ_ONLY: AccountToolAnnotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+/**
+ * A write tool's hints are the vault's own for that tool at `write` (the level the hop runs at): parachute-core
+ * mcp-annotations.ts, where create-* and update-* can overwrite and delete-* removes. This worker doesn't build
+ * against the engine, so they are restated here; account-mcp.test.ts holds them to the vault worker's list.
+ */
+const CHANGE: AccountToolAnnotations = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
+const REMOVE: AccountToolAnnotations = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false };
+
 /** A single account-MCP tool: a pure definition + an executor that throws
  *  {@link AccountToolError} on a business failure. */
 export interface AccountMcpTool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  annotations: AccountToolAnnotations;
   /** The executor returns the vault's own MCP `result` (content blocks), passed through untouched. */
   passThrough?: boolean;
   execute(args: Record<string, unknown>, ctx: AccountToolContext): Promise<unknown>;
@@ -259,6 +280,7 @@ export interface AccountMcpTool {
 
 const listVaultsTool: AccountMcpTool = {
   name: "list-vaults",
+  annotations: READ_ONLY,
   description:
     "List the vaults this account can reach through the connection — the granted, currently-owned vaults. " +
     "Returns each vault's name, URL, creation time, and latest recorded storage usage, plus whether the grant " +
@@ -287,6 +309,8 @@ const listVaultsTool: AccountMcpTool = {
 
 const createVaultTool: AccountMcpTool = {
   name: "create-vault",
+  // Adds a vault; never overwrites one (a taken name is refused).
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   description:
     "Create a new vault under this account. Returns the new vault's name and URL. " +
     "The vault is subject to the account's plan vault-count limit.",
@@ -472,6 +496,7 @@ async function fanOut(
 
 const queryNotesTool: AccountMcpTool = {
   name: "query-notes",
+  annotations: READ_ONLY,
   description: oldNameOf("query-records"),
   inputSchema: {
     type: "object",
@@ -508,6 +533,7 @@ function oldNameOf(use: string): string {
 
 const queryRecordsTool: AccountMcpTool = {
   name: "query-records",
+  annotations: READ_ONLY,
   description:
     "Search records across the account's vaults. Omit `vault` to fan the query out across every reachable vault " +
     "(results are grouped per vault, not ranked across vaults); pass `vault` to target one. Takes keyword " +
@@ -614,6 +640,7 @@ function writeTool(name: string, description: string): AccountMcpTool {
   return {
     name,
     description,
+    annotations: name.startsWith("delete-") ? REMOVE : CHANGE,
     inputSchema: {
       type: "object",
       properties: {

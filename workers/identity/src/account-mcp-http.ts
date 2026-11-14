@@ -334,6 +334,7 @@ async function handleOne(m: JsonRpcMessage, ctx: AccountToolContext): Promise<Js
             name: t.name,
             description: t.description,
             inputSchema: t.inputSchema,
+            annotations: t.annotations,
           })),
         });
       case "tools/call":

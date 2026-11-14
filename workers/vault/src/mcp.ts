@@ -43,6 +43,8 @@ import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from 
 import { applyOnBehalf } from "./rest/write-stamp.js";
 import { NOTE_TOOL_NAMES, recordWords } from "@openparachute/core/src/mcp-records.js";
 import { recordErrorData, shapeRecordSurface, typedMessage } from "@openparachute/core/src/mcp-surface.js";
+import { toolAnnotations, type McpLevel } from "@openparachute/core/src/mcp-annotations.js";
+import { mcpCallResult } from "@openparachute/core/src/mcp-result.js";
 import { errorClass, toolErrorOutcome } from "./health.js";
 
 // Transcribed from the SDK's types.js so negotiation matches byte-for-byte.
@@ -716,9 +718,9 @@ async function handleToolCall(
     const out = await tool.execute(args);
     await record(subject, "ok");
     // A tool may shape its own content blocks (read-attachment returns a real image block); every other tool's
-    // result is one text block of JSON. The same rule as the box's MCP layer (parachute-core src/mcp-http.ts).
-    const content = tool.resultContent ? tool.resultContent(out) : [{ type: "text" as const, text: JSON.stringify(out, null, 2) }];
-    return result(id, { content });
+    // result is one text block of JSON, plus `structuredContent` where ChatGPT would read it as `{}` (a note by id;
+    // T-456, core mcp-result.ts). The same call as the box's MCP layer (parachute-core src/mcp-http.ts).
+    return result(id, mcpCallResult(tool, out));
   } catch (err) {
     const domain = mapDomainError(err);
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -743,6 +745,8 @@ async function handleOne(
   m: JsonRpcMessage,
   ctx: {
     tools: McpToolDef[];
+    /** The connection's level on this vault, for the tools' MCP annotations (two tools' hints follow it). */
+    level: McpLevel;
     vaultName: string;
     description: string | null;
     /** The connect-time brief (`serverInstruction`), built only when a client asks for it. */
@@ -774,7 +778,9 @@ async function handleOne(
       case "tools/list":
         await record("mcp:tools/list", "ok");
         return result(id, {
-          tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
+          // T-456: each tool says what it does to the vault (core mcp-annotations.ts, the box's table), so a client can
+          // tell a read from a change: ChatGPT's "Allow read-only tools" otherwise asks before every read.
+          tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, annotations: toolAnnotations(t.name, ctx.level) })),
         });
       case "tools/call":
         return handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate, record, logCrash);
@@ -1078,7 +1084,9 @@ export async function handleMcp(
     serverInstruction(vaultName, description, connectionReachFor(auth, vaultName), buildVaultProjection(store.db as never, { includeStats: true }), {
       readEnabled: tickets.bytes !== undefined,
     });
-  const ctx = { tools, vaultName, description, instructions, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
+  // The connection's level here (cloud has no tag-scoped passes, so an admin scope is a vault-wide admin).
+  const level: McpLevel = hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
+  const ctx = { tools, level, vaultName, description, instructions, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));
