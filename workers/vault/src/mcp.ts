@@ -255,6 +255,12 @@ export function connectionReachFor(auth: AuthResult, vaultName: string): string 
 }
 
 /**
+ * Auto hybrid search on cloud when a vault hasn't chosen (core's HYBRID_AUTO_DEFAULT is on for a box): off until the
+ * embed call and vector scan per question-shaped search are measured at cloud vault sizes (ROADMAP, cloud parity).
+ */
+export const CLOUD_HYBRID_AUTO_DEFAULT = false;
+
+/**
  * Server-layer context the DO supplies so vault-info can build a REAL projection
  * and persist description updates. core's vault-info `execute` is a placeholder
  * ("vault-info must be configured by the server layer", core/src/mcp.ts) that
@@ -277,6 +283,9 @@ export interface VaultInfoContext {
    *  the caller's `as string` cast to hide it; cloud#87 replaced that cast with a
    *  real check, so the seam now states the type it actually accepts. */
   updateDescription: (description: string | null) => void | Promise<void>;
+  /** This vault's own `search.auto_hybrid` (rest/vault.ts), read at each search; cloud's default when unset is off
+   *  ({@link CLOUD_HYBRID_AUTO_DEFAULT}). */
+  hybridAuto?: () => boolean | null | undefined;
 }
 
 /** Public-facing origin, honoring a proxy's X-Forwarded-* (Cloudflare sets Host).
@@ -584,6 +593,7 @@ function visibleTools(
   auth: AuthResult,
   attachmentTickets: { provider: AttachmentTicketProvider; urlBase: string },
   attachmentBytes?: AttachmentBytesProvider,
+  hybridAuto?: () => boolean | null | undefined,
 ): McpToolDef[] {
   // Write-attribution: refine the credential class to the `mcp` channel, but
   // keep `operator` and `nostr:<pubkey>` — each names something more specific
@@ -594,6 +604,10 @@ function visibleTools(
   const writeContext = { actor: auth.actor, via: refineMcpVia(auth.via) };
   const tools = generateMcpTools(store, {
     writeContext,
+    // 0.9.3 auto hybrid: a question-shaped search with no search_mode also asks the meaning index. Off on cloud unless
+    // the vault turns it on (CLOUD_HYBRID_AUTO_DEFAULT): each such search is a Workers AI embed call plus a scan of the
+    // candidates' vectors inside the vault's Durable Object, not yet measured at cloud sizes.
+    hybridAuto: () => hybridAuto?.() ?? CLOUD_HYBRID_AUTO_DEFAULT,
     attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
     // read-attachment (the engine adds the tool only when a door wires bytes): ranged R2 reads. Without it an AI
     // app on this door could list a note's files but not look at one, which it can on a box.
@@ -1043,7 +1057,7 @@ export async function handleMcp(
   // calls for; bun derives it the same way, `mcp-tools.ts`'s `ticketUrlBase`).
   const origin = publicOrigin(req);
   const ticketUrlBase = `${origin.replace(/\/$/, "")}/vault/${vaultName}`;
-  const all = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes);
+  const all = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes, vaultInfo.hybridAuto);
   // Wire the server-layer vault-info override onto core's tools (core ships a
   // placeholder execute — "must be configured by the server layer"), then the
   // 0.9 shape and the scope filter. Parity with bun's mcp-tools.ts: override
@@ -1054,7 +1068,7 @@ export async function handleMcp(
   // `on_behalf_of`; the call runs on the same tools built for that "by", with the token's own scopes.
   applyOnBehalf(tools, auth, (by) => {
     const forBy: AuthResult = { ...auth, actor: by, acts_for: null };
-    const twin = visibleTools(store, vaultName, forBy, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes);
+    const twin = visibleTools(store, vaultName, forBy, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes, vaultInfo.hybridAuto);
     overrideVaultInfo(twin, { vaultName, auth: forBy, description, origin, ctx: vaultInfo });
     return scopedTools(store, twin, vaultName, forBy, countName);
   });

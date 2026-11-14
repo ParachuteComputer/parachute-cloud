@@ -53,7 +53,7 @@ import {
   usedBytes,
 } from "./caps.js";
 import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./rest/storage-constants.js";
-import { handleMcp } from "./mcp.js";
+import { CLOUD_HYBRID_AUTO_DEFAULT, handleMcp } from "./mcp.js";
 import { HealthSink, NameCounts, clientOf, errorClass, responseOutcome, routeOf, utcDay, versionLabel } from "./health.js";
 import { restRouteName, typesRouteName } from "@openparachute/core/src/name-routes.js";
 import { logServerError } from "./error-log.js";
@@ -225,6 +225,9 @@ type VaultConfigState = {
   createdAt: string;
   audio_retention: "keep" | "until_transcribed" | "never";
   auto_transcribe: { enabled: boolean };
+  /** 0.9.3: the vault's own choice for auto hybrid search (PATCH /api/vault config.search); absent follows
+   *  CLOUD_HYBRID_AUTO_DEFAULT. */
+  search?: { auto_hybrid: boolean };
   /** Legacy single summed cap (pre-two-meter). Kept for back-compat: applies
    *  only when `caps` is absent. */
   cap_bytes?: number;
@@ -1259,6 +1262,7 @@ export class VaultDO extends DurableObject {
             this.config!.description = description;
             return this.ctx.storage.put("config", this.config);
           },
+          hybridAuto: () => this.config?.search?.auto_hybrid,
         },
         {
           provider: this.attachmentTickets,
@@ -1372,7 +1376,10 @@ export class VaultDO extends DurableObject {
     // parse isn't a description write (the handler then fails on it, as before).
     const isDescriptionWrite = request.method === "PATCH" && apiPath === "/vault" &&
       await request.clone().json().then(
-        (b: unknown) => b !== null && typeof b === "object" && !Array.isArray(b) && "description" in b,
+        // The vault's search settings are vault-wide too (config.search, 0.9.3): admin, as on a box.
+        (b: unknown) =>
+          b !== null && typeof b === "object" && !Array.isArray(b) &&
+          ("description" in b || ((b as { config?: unknown }).config !== null && typeof (b as { config?: unknown }).config === "object" && "search" in ((b as { config: object }).config))),
         () => false,
       );
     const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDeletedList || isDescriptionWrite
@@ -1487,6 +1494,7 @@ export class VaultDO extends DurableObject {
         description: this.config!.description ?? undefined,
         audio_retention: this.config!.audio_retention,
         auto_transcribe: this.config!.auto_transcribe,
+        ...(this.config!.search ? { search: this.config!.search } : {}),
       };
       const descriptionBefore = cfg.description;
       const res = await handleVault(
@@ -1499,6 +1507,8 @@ export class VaultDO extends DurableObject {
           if (cfg.description !== descriptionBefore) this.config!.description = cfg.description ?? null;
           this.config!.audio_retention = cfg.audio_retention ?? "keep";
           this.config!.auto_transcribe = { enabled: cfg.auto_transcribe?.enabled ?? false };
+          if (cfg.search) this.config!.search = cfg.search;
+          else delete this.config!.search;
           void this.ctx.storage.put("config", this.config);
         },
         // Cross-door capability parity: the SAME transcription object the bare
@@ -1508,6 +1518,7 @@ export class VaultDO extends DurableObject {
         // Same parity for the semantic-search capability (C2, EXPERIMENTAL) —
         // self-host's routes.ts declares `embeddings` on /api/vault too.
         await this.embeddingCapability(),
+        hasScopeForVault(auth.scopes, vaultName, "admin") ? { hybridAutoDefault: CLOUD_HYBRID_AUTO_DEFAULT } : undefined,
       );
       return res;
     }
