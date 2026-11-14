@@ -86,7 +86,7 @@ jobs:
                   exit 1 ;;
                 missing)
                   if [ "$WAIT_FOR_MISSING" != true ]; then
-                    echo "::error::$SHA has no \"$name\" check. CI runs on pull requests and on pushes to main and next."
+                    echo "::error::$SHA has no \"$name\" check. CI runs on pull requests and on pushes to main, next and door/0.9."
                     exit 1
                   fi
                   waiting=1 ;;

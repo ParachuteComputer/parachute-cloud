@@ -16,6 +16,8 @@ function run(version: string): { code: number | null; out: string; calls: string
   cpSync(join(ROOT, "scripts/deploy-prod.sh"), join(t, "scripts/deploy-prod.sh"));
   writeFileSync(join(t, "scripts/core-source.env"), `PARACHUTE_CORE_VERSION="${version}"\n`);
   const log = join(t, "calls.log");
+  // The script's first step after the check: logged, so "got past the check" is a call, not just no refusal.
+  writeFileSync(join(t, "scripts/materialize-vault-core.sh"), `echo "materialize-vault-core" >> "${log}"\nexit 1\n`);
   for (const tool of ["bun", "bunx", "wrangler", "npx", "git", "curl", "node"]) {
     writeFileSync(join(t, "bin", tool), `#!/usr/bin/env bash\necho "${tool} $*" >> "${log}"\nexit 1\n`);
     chmodSync(join(t, "bin", tool), 0o755);
@@ -30,13 +32,13 @@ describe("deploy-prod.sh and the engine line", () => {
     expect(own).not.toBe("");
     const r = run(own);
     expect(r.out, own).not.toContain(REFUSED);
-    expect(r.code, own).not.toBe(2);
+    expect(r.calls, own).toContain("materialize-vault-core");
   });
   test("0.9 and 0.8 pins get past the refusal", () => {
     for (const v of ["0.9.0-pre.1", "0.9.3", "0.8.0-pre.3"]) {
       const r = run(v);
       expect(r.out, v).not.toContain(REFUSED);
-      expect(r.code, v).not.toBe(2);
+      expect(r.calls, v).toContain("materialize-vault-core");
     }
   });
   test("any other engine line is refused before any call", () => {
