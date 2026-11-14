@@ -1228,7 +1228,9 @@ export class VaultDO extends DurableObject {
       const mauth = await this.authenticate(request, vaultName);
       if ("error" in mauth) {
         const headers = new Headers(mauth.error.headers);
-        headers.set("WWW-Authenticate", mcpWwwAuthenticate(request, vaultName));
+        // The challenge walks a client with no usable token to sign-in; a 403 (a token for this vault that grants
+        // nothing here, or another vault's pin) is not fixed by signing in again the same way.
+        if (mauth.error.status === 401) headers.set("WWW-Authenticate", mcpWwwAuthenticate(request, vaultName));
         return new Response(mauth.error.body, { status: mauth.error.status, headers });
       }
       if (closed) return accountClosed(request);
@@ -1385,7 +1387,7 @@ export class VaultDO extends DurableObject {
     const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDeletedList || isDescriptionWrite
       ? "admin"
       : verbForMethod(request.method);
-    if (requiredVerb !== "read" && !hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
+    if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
       return insufficientScope(requiredVerb, vaultName, auth.scopes);
     }
 
@@ -1926,7 +1928,8 @@ export class VaultDO extends DurableObject {
       const since = utcDay(new Date(Date.now() - 86_400_000));
       return json({
         ...shape(),
-        health: { version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since) },
+        // The name counts ride along (T-456): identity copies them into D1 as `name:` rows (health-counters.ts).
+        health: { version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since), names: await this.names.read(since) },
       });
     }
     if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
@@ -3258,7 +3261,7 @@ export class VaultDO extends DurableObject {
   ): Promise<void> {
     const result = await authenticateVaultToken(token, this.env, vaultName);
     if (!result.ok) {
-      this.closeWs(ws, result.reason === "vault_scope_mismatch" ? WS_CLOSE.FORBIDDEN : WS_CLOSE.UNAUTHORIZED, result.reason);
+      this.closeWs(ws, result.reason === "unauthorized" ? WS_CLOSE.UNAUTHORIZED : WS_CLOSE.FORBIDDEN, result.reason);
       return;
     }
     // App-key door (T-414): a key revoked at this vault can't open or keep a socket.
@@ -3335,7 +3338,7 @@ export class VaultDO extends DurableObject {
   ): Promise<void> {
     const result = await authenticateVaultToken(token, this.env, vaultName);
     if (!result.ok) {
-      this.closeWs(ws, result.reason === "vault_scope_mismatch" ? WS_CLOSE.FORBIDDEN : WS_CLOSE.UNAUTHORIZED, result.reason);
+      this.closeWs(ws, result.reason === "unauthorized" ? WS_CLOSE.UNAUTHORIZED : WS_CLOSE.FORBIDDEN, result.reason);
       return;
     }
     // App-key door (T-414): a key revoked at this vault can't open or keep a socket.

@@ -142,6 +142,21 @@ describe("internal config — authorization matrix", () => {
     expect(body.used_bytes).toBe(body.db_bytes + body.r2_bytes);
   });
 
+  it("GET carries the vault's name counts beside its health counters, for the nightly copy into D1 (T-456)", async () => {
+    const v = freshVault("ic");
+    await createNote(v, { content: "named" });
+    const reader = await mintToken({ vault: v, scopes: `vault:${v}:read` });
+    const listed = await SELF.fetch(`${base(v)}/api/notes`, { headers: { authorization: `Bearer ${reader}`, "user-agent": "NameProbe/1.0" } });
+    expect(listed.status).toBe(200);
+    const res = await SELF.fetch(`${base(v)}/api/internal/config`, {
+      headers: { authorization: `Bearer ${await firstPartyToken(v)}` },
+    });
+    const body = (await res.json()) as any;
+    const keys = Object.values(body.health.names as Record<string, Record<string, Record<string, number>>>)
+      .flatMap((byVersion) => Object.values(byVersion).flatMap((k) => Object.keys(k)));
+    expect(keys.some((k) => k.startsWith("name:") && k.endsWith("|old:ua:nameprobe"))).toBe(true);
+  });
+
   it("GET reports notes_changed_24h — a count of notes written in the last day (the identity daily ops line)", async () => {
     const v = freshVault("ic");
     await createNote(v, { content: "first" });

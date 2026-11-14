@@ -136,7 +136,23 @@ export interface HealthReport {
   /** Server errors shown but not counted as worse (rule 1's bar not reached, or not rising). */
   otherServerErrors: Finding[];
   backups: { ok: number; failed: number };
+  /**
+   * Name use on the report's day (T-456): calls by old, note-named tools and routes, and by the record names, and the
+   * clients still on old names, most first (at most {@link NAMES_TOP}). 1.0 removes the old names and waits on these.
+   * Vaults and the account door apart: a call through the account door is counted by both, under different names.
+   * A measurement, never a finding, and not in the public verdict.
+   */
+  names: { vaults: NameUse; account: NameUse };
   text: string;
+}
+
+const NAMES_TOP = 5;
+
+/** One sink's name use on a day: calls by old names, by new names, and old by client. */
+export interface NameUse {
+  old: number;
+  new: number;
+  oldByClient: Array<[string, number]>;
 }
 
 // Thresholds, named once.
@@ -438,10 +454,31 @@ function addAll(into: Compared, from: Compared): void {
   }
 }
 
+/** A day's `name:` rows (outcome `old:<client>` or `new:<client>`) summed: old, new, and old by client. */
+function nameUse(rows: HealthRow[]): NameUse {
+  let old = 0;
+  let neu = 0;
+  const byClient = new Map<string, number>();
+  for (const r of rows) {
+    const colon = r.outcome.indexOf(":");
+    const kind = colon > 0 ? r.outcome.slice(0, colon) : r.outcome;
+    if (kind === "new") neu += r.n;
+    else if (kind === "old") {
+      old += r.n;
+      const client = r.outcome.slice(colon + 1) || "unknown";
+      byClient.set(client, (byClient.get(client) ?? 0) + r.n);
+    }
+  }
+  const oldByClient = [...byClient.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, NAMES_TOP);
+  return { old, new: neu, oldByClient };
+}
+
 export async function buildHealthReport(data: HealthData, opts: { day: string; environment: string }): Promise<HealthReport> {
   // Name use (`name:<name>`, T-456: the account door's old and new names by client) is a measurement, not health: a
   // shift from old names to new ones, or a new client, is the move 1.0 waits for, never a regression.
   const health = (r: HealthRow) => !r.subject.startsWith("name:");
+  const named = data.days.filter((r) => r.day === opts.day && !health(r));
+  const names = { vaults: nameUse(named.filter((r) => r.source === "vault")), account: nameUse(named.filter((r) => r.source !== "vault")) };
   data = { ...data, days: data.days.filter(health), versions: data.versions.filter(health) };
   const day = opts.day;
   const hashes = new Map<string, string>();
@@ -488,6 +525,7 @@ export async function buildHealthReport(data: HealthData, opts: { day: string; e
     worse: result.worse,
     otherServerErrors: result.other,
     backups,
+    names,
     text: "",
   };
   report.text = renderHealthText(report);
@@ -534,6 +572,13 @@ export function renderHealthText(r: HealthReport): string {
     );
   }
   if (r.windows.deploy.length === 0) lines.push("deploy: no earlier version in the counters yet");
+  const nameLine = (label: string, u: NameUse) => {
+    if (u.old + u.new === 0) return;
+    const top = u.oldByClient.map(([c, n]) => `${c} ${n}`).join(", ");
+    lines.push(`${label}: old ${u.old}${top ? ` (${top})` : ""} · new ${u.new}`);
+  };
+  nameLine("names on vaults", r.names.vaults);
+  nameLine("names at the account door", r.names.account);
   if (r.worse.length) {
     lines.push("", "WORSE");
     for (const f of r.worse) lines.push(`- ${f.who} · ${f.subject} · ${f.detail} [${f.window}]`);

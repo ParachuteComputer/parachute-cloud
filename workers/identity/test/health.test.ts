@@ -659,6 +659,50 @@ describe("what gets counted, and as what", () => {
     expect(parseVaultHealth(undefined, "vid")).toBeNull();
   });
 
+  test("a vault's name counts are kept as name: rows, never as health, capped per day (T-456)", () => {
+    const keys: Record<string, number> = {
+      "name:mcp_query-notes|old:ua:claude-user": 4,
+      "name:rest_get_/api/records|new:key:my-own-agent": 2,
+      "name:rest_get_/api/records|new:key:another-agent": 3,
+      "overflow|names": 1,
+      "x|y": -1,
+    };
+    for (let i = 0; i < 300; i++) keys[`name:mcp_t${i}|new:ua:c`] = 1;
+    const parsed = parseVaultHealth(
+      { days: { [DAY]: { v1: { "http:notes|2xx": 3 } } }, names: { [DAY]: { v1: keys } } },
+      "vid",
+    )!;
+    const names = parsed.rows.filter((r) => r.subject.startsWith("name:"));
+    expect(parsed.rows.filter((r) => !r.subject.startsWith("name:")).map((r) => r.subject)).toEqual(["http:notes"]);
+    expect(names.find((r) => r.subject === "name:mcp_query-notes")).toMatchObject({ outcome: "old:ua:claude-user", n: 4, vault: "vid" });
+    expect(names.some((r) => r.subject === "name:overflow")).toBe(true); // the sink's overflow key stays a name row
+    // An app key's name stays on the vault: two keys' rows become one `key` row, summed.
+    expect(names.filter((r) => r.subject === "name:rest_get_/api/records")).toMatchObject([{ outcome: "new:key", n: 5 }]);
+    expect(JSON.stringify(parsed.rows)).not.toContain("agent");
+    expect(names.length).toBe(256); // 257 kept (NAMES_MAX_KEYS plus overflow), the two key rows summed into one
+  });
+
+  test("the report says which names are still in use, old and new, by client, and never counts them as worse (T-456)", async () => {
+    const rows: HealthRow[] = [
+      ...normalDay("vault-id-a", DAY),
+      row({ subject: "name:mcp_query-notes", outcome: "old:ua:chatgpt", n: 12 }),
+      row({ subject: "name:mcp_query-notes", outcome: "old:ua:claude-user", n: 3 }),
+      row({ vault: "vault-id-b", subject: "name:rest_get_/api/notes", outcome: "old:ua:chatgpt", n: 5 }),
+      row({ subject: "name:mcp_query-records", outcome: "new:ua:claude-user", n: 30 }),
+      row({ source: "identity", vault: "-", subject: "name:account_query-records", outcome: "new:claude", n: 7 }),
+      row({ day: PRIOR, subject: "name:mcp_query-notes", outcome: "old:ua:chatgpt", n: 99 }),
+    ];
+    const r = await report(rows);
+    expect(r.worse).toEqual([]);
+    expect(r.names).toEqual({
+      vaults: { old: 20, new: 30, oldByClient: [["ua:chatgpt", 17], ["ua:claude-user", 3]] },
+      account: { old: 0, new: 7, oldByClient: [] },
+    });
+    expect(r.text).toContain("names on vaults: old 20 (ua:chatgpt 17, ua:claude-user 3) · new 30");
+    expect(r.text).toContain("names at the account door: old 0 · new 7");
+    expect(publicVerdict(r)).toBe("health: ok");
+  });
+
   test("the token endpoint counts a refresh per connector class, after the response", async () => {
     const { id: user } = await seedUser("health-oauth@example.com");
     await seedVault("hoauth", user);
@@ -757,7 +801,11 @@ describe("collection and the daily line", () => {
   test("the nightly rollup copies each vault's counters under its opaque id, idempotently", async () => {
     const { id: owner } = await seedUser("health-roll@example.com");
     await seedVault("hroll-zq7name", owner);
-    const block = { version: "v1", days: { [DAY]: { v1: { "http:notes|2xx": 7, "http:notes|5xx:500": 2 } } } };
+    const block = {
+      version: "v1",
+      days: { [DAY]: { v1: { "http:notes|2xx": 7, "http:notes|5xx:500": 2 } } },
+      names: { [DAY]: { v1: { "name:mcp_query-notes|old:ua:claude-user": 5 } } },
+    };
     interceptConfig("hroll-zq7name", block);
     interceptConfig("hroll-zq7name", block);
     const now = new Date();
@@ -768,7 +816,11 @@ describe("collection and the daily line", () => {
       .vault_id;
     const loaded = await loadHealthData(env.DB, DAY);
     const rows = loaded.days.filter((r) => r.vault === vid);
-    expect(rows.map((r) => `${r.subject}|${r.outcome}=${r.n}`).sort()).toEqual(["http:notes|2xx=7", "http:notes|5xx:500=2"]);
+    expect(rows.map((r) => `${r.subject}|${r.outcome}=${r.n}`).sort()).toEqual([
+      "http:notes|2xx=7",
+      "http:notes|5xx:500=2",
+      "name:mcp_query-notes|old:ua:claude-user=5",
+    ]);
     expect(loaded.live.vault).toBe("v1");
     const r = await buildHealthReport(loaded, { day: DAY, environment: "production" });
     expect(JSON.stringify(r)).not.toContain("zq7name");

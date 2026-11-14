@@ -106,13 +106,14 @@ export interface AuthResult {
 /**
  * Result of authenticating a raw token (the transport-agnostic core of
  * {@link authenticateVaultRequest}). The WS binding maps a failure onto a close
- * code (unauthorized → 4401, vault_scope_mismatch → 4403); the request path
+ * code (unauthorized → 4401, vault_scope_mismatch and insufficient_scope → 4403); the request path
  * maps it onto the exact 401/403 response bodies (below).
  */
 export type TokenAuthResult =
   | { ok: true; auth: AuthResult }
   | { ok: false; reason: "unauthorized"; message: string }
-  | { ok: false; reason: "vault_scope_mismatch"; vaultScope: string[] };
+  | { ok: false; reason: "vault_scope_mismatch"; vaultScope: string[] }
+  | { ok: false; reason: "insufficient_scope"; scopes: string[] };
 
 function isVerb(s: string): s is VaultVerb {
   return s === "read" || s === "write" || s === "admin";
@@ -521,6 +522,15 @@ export async function authenticateVaultToken(
     return { ok: false, reason: "vault_scope_mismatch", vaultScope: claims.vaultScope };
   }
 
+  // The read gate (T-456). The audience names this vault, but a token grants only what its scopes name: one with no
+  // `vault:<this vault>:<verb>` (no scope, non-vault scopes, another vault's, an unknown verb) grants nothing here.
+  // Refused for every door at once (REST, MCP, export, the live streams), rather than at each door: before this,
+  // `permission` below summarised "no write scope" as "read" and the REST gate only checked writes, so such a token
+  // read the whole vault. The request path answers with the box's REST refusal (403 insufficient_scope, the method's scope).
+  if (!hasScopeForVault(claims.scopes, vaultName, "read")) {
+    return { ok: false, reason: "insufficient_scope", scopes: claims.scopes };
+  }
+
   const permission: "full" | "read" =
     hasScopeForVault(claims.scopes, vaultName, "write") ? "full" : "read";
 
@@ -672,6 +682,14 @@ export async function authenticateVaultRequest(
         { status: 403 },
       ),
     };
+  }
+  // The refusal names the scope the request needed at least: on REST the method's, as the box's generic REST gate
+  // does (routing.ts; a scopeless POST needs write). MCP is always a POST but opens on read, so it names read. (The
+  // box's admin-only routes name admin there; this names the method's verb. Only the scope named differs, and no
+  // mint path makes such a token.)
+  if (result.reason === "insufficient_scope") {
+    const mcp = /\/mcp(\/|$)/.test(new URL(req.url).pathname);
+    return { error: insufficientScope(mcp ? "read" : verbForMethod(req.method), vaultName, result.scopes) };
   }
   return unauthorized(result.message);
 }

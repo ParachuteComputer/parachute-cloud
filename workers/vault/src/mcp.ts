@@ -255,8 +255,9 @@ export function connectionReachFor(auth: AuthResult, vaultName: string): string 
 }
 
 /**
- * Auto hybrid search on cloud when a vault hasn't chosen (core's HYBRID_AUTO_DEFAULT is on for a box): off until the
- * embed call and vector scan per question-shaped search are measured at cloud vault sizes (ROADMAP, cloud parity).
+ * Auto hybrid search on cloud when a vault hasn't chosen (core's HYBRID_AUTO_DEFAULT is on for a box): off. Measured
+ * (T-456): the embed is cheap, but the engine's vector read grows with the square of the vault (6.4 M rows a question
+ * at 24,000 notes); turn it on once core reads vectors by key (about 3 rows a note).
  */
 export const CLOUD_HYBRID_AUTO_DEFAULT = false;
 
@@ -606,7 +607,8 @@ function visibleTools(
     writeContext,
     // 0.9.3 auto hybrid: a question-shaped search with no search_mode also asks the meaning index. Off on cloud unless
     // the vault turns it on (CLOUD_HYBRID_AUTO_DEFAULT): each such search is a Workers AI embed call plus a scan of the
-    // candidates' vectors inside the vault's Durable Object, not yet measured at cloud sizes.
+    // candidates' vectors inside the vault's Durable Object. Measured (T-456): the engine's vector read re-reads every vector
+    // per batch of 99 ids (46k rows at 2,000 notes, 6.4 M at 24,000), so it stays off until core reads them by key.
     hybridAuto: () => hybridAuto?.() ?? CLOUD_HYBRID_AUTO_DEFAULT,
     attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
     // read-attachment (the engine adds the tool only when a door wires bytes): ranged R2 reads. Without it an AI
