@@ -1385,7 +1385,7 @@ export class VaultDO extends DurableObject {
     const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDeletedList || isDescriptionWrite
       ? "admin"
       : verbForMethod(request.method);
-    if (requiredVerb !== "read" && !hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
+    if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
       return insufficientScope(requiredVerb, vaultName, auth.scopes);
     }
 
@@ -3258,7 +3258,7 @@ export class VaultDO extends DurableObject {
   ): Promise<void> {
     const result = await authenticateVaultToken(token, this.env, vaultName);
     if (!result.ok) {
-      this.closeWs(ws, result.reason === "vault_scope_mismatch" ? WS_CLOSE.FORBIDDEN : WS_CLOSE.UNAUTHORIZED, result.reason);
+      this.closeWs(ws, result.reason === "unauthorized" ? WS_CLOSE.UNAUTHORIZED : WS_CLOSE.FORBIDDEN, result.reason);
       return;
     }
     // App-key door (T-414): a key revoked at this vault can't open or keep a socket.
@@ -3335,7 +3335,7 @@ export class VaultDO extends DurableObject {
   ): Promise<void> {
     const result = await authenticateVaultToken(token, this.env, vaultName);
     if (!result.ok) {
-      this.closeWs(ws, result.reason === "vault_scope_mismatch" ? WS_CLOSE.FORBIDDEN : WS_CLOSE.UNAUTHORIZED, result.reason);
+      this.closeWs(ws, result.reason === "unauthorized" ? WS_CLOSE.UNAUTHORIZED : WS_CLOSE.FORBIDDEN, result.reason);
       return;
     }
     // App-key door (T-414): a key revoked at this vault can't open or keep a socket.
