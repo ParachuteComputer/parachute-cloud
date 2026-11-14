@@ -298,11 +298,22 @@ export function parseVaultHealth(raw: unknown, vaultId: string): { rows: HealthR
   const live = typeof liveRaw === "string" && liveRaw.length > 0 ? clean(liveRaw, 40) : null;
   const rows = blockRows(days, vaultId, HEALTH_MAX_KEYS_PER_DAY, (s) => s);
   // Name use (T-456, the vault's `names:<day>` sink): the same shape, kept as `name:` rows, which the health report
-  // reads as a measurement and never as health. A key that doesn't already start with `name:` (the sink's overflow
+  // reads as a measurement and never as health. Rows that differ only in an app key's name are summed below. A key that doesn't already start with `name:` (the sink's overflow
   // key) gets the prefix, so nothing from this block can land among the health subjects.
   const names = (raw as { names?: unknown }).names;
   if (names && typeof names === "object") {
-    rows.push(...blockRows(names, vaultId, NAMES_MAX_KEYS_PER_DAY, (s) => (s.startsWith("name:") ? s : `name:${s}`)));
+    // An app key's own name (`key:<name>`, chosen by the vault's owner) stays on the vault: D1 and the report keep
+    // only that it was an app key, summed (the D1 write replaces a row, so two keys' rows must be one row first). A
+    // User-Agent's product token (`ua:claude-user`) names a client program and is kept.
+    const merged = new Map<string, HealthRow>();
+    for (const r of blockRows(names, vaultId, NAMES_MAX_KEYS_PER_DAY, (s) => (s.startsWith("name:") ? s : `name:${s}`))) {
+      const outcome = r.outcome.replace(/^(old|new):key:.*$/, "$1:key");
+      const k = [r.day, r.version, r.subject, outcome].join("|");
+      const cur = merged.get(k);
+      if (cur) cur.n += r.n;
+      else merged.set(k, { ...r, outcome });
+    }
+    rows.push(...merged.values());
   }
   return { rows, live };
 }

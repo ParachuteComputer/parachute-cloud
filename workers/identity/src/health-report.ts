@@ -137,15 +137,23 @@ export interface HealthReport {
   otherServerErrors: Finding[];
   backups: { ok: number; failed: number };
   /**
-   * Name use on the report's day (T-456): calls by old, note-named tools and routes, and by the record names, across
-   * every vault and the account door; the clients still on old names, most first (at most {@link NAMES_TOP}). 1.0
-   * removes the old names and waits on these. A measurement, never a finding, and not in the public verdict.
+   * Name use on the report's day (T-456): calls by old, note-named tools and routes, and by the record names, and the
+   * clients still on old names, most first (at most {@link NAMES_TOP}). 1.0 removes the old names and waits on these.
+   * Vaults and the account door apart: a call through the account door is counted by both, under different names.
+   * A measurement, never a finding, and not in the public verdict.
    */
-  names: { old: number; new: number; oldByClient: Array<[string, number]> };
+  names: { vaults: NameUse; account: NameUse };
   text: string;
 }
 
 const NAMES_TOP = 5;
+
+/** One sink's name use on a day: calls by old names, by new names, and old by client. */
+export interface NameUse {
+  old: number;
+  new: number;
+  oldByClient: Array<[string, number]>;
+}
 
 // Thresholds, named once.
 const NEW_SERVER_MIN = 3;
@@ -447,7 +455,7 @@ function addAll(into: Compared, from: Compared): void {
 }
 
 /** A day's `name:` rows (outcome `old:<client>` or `new:<client>`) summed: old, new, and old by client. */
-function nameUse(rows: HealthRow[]): HealthReport["names"] {
+function nameUse(rows: HealthRow[]): NameUse {
   let old = 0;
   let neu = 0;
   const byClient = new Map<string, number>();
@@ -469,7 +477,8 @@ export async function buildHealthReport(data: HealthData, opts: { day: string; e
   // Name use (`name:<name>`, T-456: the account door's old and new names by client) is a measurement, not health: a
   // shift from old names to new ones, or a new client, is the move 1.0 waits for, never a regression.
   const health = (r: HealthRow) => !r.subject.startsWith("name:");
-  const names = nameUse(data.days.filter((r) => r.day === opts.day && !health(r)));
+  const named = data.days.filter((r) => r.day === opts.day && !health(r));
+  const names = { vaults: nameUse(named.filter((r) => r.source === "vault")), account: nameUse(named.filter((r) => r.source !== "vault")) };
   data = { ...data, days: data.days.filter(health), versions: data.versions.filter(health) };
   const day = opts.day;
   const hashes = new Map<string, string>();
@@ -563,10 +572,13 @@ export function renderHealthText(r: HealthReport): string {
     );
   }
   if (r.windows.deploy.length === 0) lines.push("deploy: no earlier version in the counters yet");
-  if (r.names.old + r.names.new > 0) {
-    const top = r.names.oldByClient.map(([c, n]) => `${c} ${n}`).join(", ");
-    lines.push(`names: old ${r.names.old}${top ? ` (${top})` : ""} · new ${r.names.new}`);
-  }
+  const nameLine = (label: string, u: NameUse) => {
+    if (u.old + u.new === 0) return;
+    const top = u.oldByClient.map(([c, n]) => `${c} ${n}`).join(", ");
+    lines.push(`${label}: old ${u.old}${top ? ` (${top})` : ""} · new ${u.new}`);
+  };
+  nameLine("names on vaults", r.names.vaults);
+  nameLine("names at the account door", r.names.account);
   if (r.worse.length) {
     lines.push("", "WORSE");
     for (const f of r.worse) lines.push(`- ${f.who} · ${f.subject} · ${f.detail} [${f.window}]`);

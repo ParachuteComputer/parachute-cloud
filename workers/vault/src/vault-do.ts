@@ -1228,7 +1228,9 @@ export class VaultDO extends DurableObject {
       const mauth = await this.authenticate(request, vaultName);
       if ("error" in mauth) {
         const headers = new Headers(mauth.error.headers);
-        headers.set("WWW-Authenticate", mcpWwwAuthenticate(request, vaultName));
+        // The challenge walks a client with no usable token to sign-in; a 403 (a token for this vault that grants
+        // nothing here, or another vault's pin) is not fixed by signing in again the same way.
+        if (mauth.error.status === 401) headers.set("WWW-Authenticate", mcpWwwAuthenticate(request, vaultName));
         return new Response(mauth.error.body, { status: mauth.error.status, headers });
       }
       if (closed) return accountClosed(request);

@@ -9,7 +9,7 @@ import { base, createNote, freshVault, mintToken } from "./helpers.ts";
  * gate checked only writes, and the coarse `permission` summary turned "no write scope" into "read", so such a token
  * read the whole vault. No mint path makes one today; this pins that one never reads.
  *
- * The REST answer is the box's (parachute-core routing.ts): 403 insufficient_scope, `required_scope: vault:read`.
+ * The REST answer is the box's (parachute-core routing.ts): 403 insufficient_scope, naming the method's scope.
  */
 const SCOPELESS: Array<{ label: string; scopes: (v: string) => string }> = [
   { label: "no scope at all", scopes: () => "" },
@@ -64,6 +64,14 @@ describe("read gate — a vault-audience token with no scope for this vault read
         expect(JSON.stringify(body)).not.toContain("a secret");
       }
 
+      const post = await SELF.fetch(`${base(v)}/api/notes`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "no" }),
+      });
+      expect(post.status, "POST /api/notes").toBe(403);
+      expect(((await post.json()) as any).required_scope, "POST names the write scope, as the box does").toBe("vault:write");
+
       const exp = await get(v, "/api/export", token);
       expect(exp.status, "GET /api/export").toBe(403);
       expect(await exp.text()).not.toContain("a secret");
@@ -73,6 +81,8 @@ describe("read gate — a vault-audience token with no scope for this vault read
       });
       expect(await call.clone().text(), "MCP query-notes").not.toContain("a secret");
       expect(call.status, "MCP").toBe(403);
+      // Signing in again the same way doesn't fix a 403, so MCP sends no sign-in challenge with it (a 401 does).
+      expect(call.headers.get("www-authenticate"), "MCP challenge").toBeNull();
 
       const ws = await wsClose(v, token);
       expect(ws.code, "the live socket").toBe(WS_CLOSE.FORBIDDEN);

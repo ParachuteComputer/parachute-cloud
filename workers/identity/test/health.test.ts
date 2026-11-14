@@ -660,7 +660,13 @@ describe("what gets counted, and as what", () => {
   });
 
   test("a vault's name counts are kept as name: rows, never as health, capped per day (T-456)", () => {
-    const keys: Record<string, number> = { "name:mcp_query-notes|old:ua:claude-user": 4, "name:rest_get_/api/records|new:key:agent": 2, "overflow|names": 1, "x|y": -1 };
+    const keys: Record<string, number> = {
+      "name:mcp_query-notes|old:ua:claude-user": 4,
+      "name:rest_get_/api/records|new:key:my-own-agent": 2,
+      "name:rest_get_/api/records|new:key:another-agent": 3,
+      "overflow|names": 1,
+      "x|y": -1,
+    };
     for (let i = 0; i < 300; i++) keys[`name:mcp_t${i}|new:ua:c`] = 1;
     const parsed = parseVaultHealth(
       { days: { [DAY]: { v1: { "http:notes|2xx": 3 } } }, names: { [DAY]: { v1: keys } } },
@@ -670,7 +676,10 @@ describe("what gets counted, and as what", () => {
     expect(parsed.rows.filter((r) => !r.subject.startsWith("name:")).map((r) => r.subject)).toEqual(["http:notes"]);
     expect(names.find((r) => r.subject === "name:mcp_query-notes")).toMatchObject({ outcome: "old:ua:claude-user", n: 4, vault: "vid" });
     expect(names.some((r) => r.subject === "name:overflow")).toBe(true); // the sink's overflow key stays a name row
-    expect(names.length).toBe(257); // NAMES_MAX_KEYS (256) plus the overflow key
+    // An app key's name stays on the vault: two keys' rows become one `key` row, summed.
+    expect(names.filter((r) => r.subject === "name:rest_get_/api/records")).toMatchObject([{ outcome: "new:key", n: 5 }]);
+    expect(JSON.stringify(parsed.rows)).not.toContain("agent");
+    expect(names.length).toBe(256); // 257 kept (NAMES_MAX_KEYS plus overflow), the two key rows summed into one
   });
 
   test("the report says which names are still in use, old and new, by client, and never counts them as worse (T-456)", async () => {
@@ -685,8 +694,12 @@ describe("what gets counted, and as what", () => {
     ];
     const r = await report(rows);
     expect(r.worse).toEqual([]);
-    expect(r.names).toEqual({ old: 20, new: 37, oldByClient: [["ua:chatgpt", 17], ["ua:claude-user", 3]] });
-    expect(r.text).toContain("names: old 20 (ua:chatgpt 17, ua:claude-user 3) · new 37");
+    expect(r.names).toEqual({
+      vaults: { old: 20, new: 30, oldByClient: [["ua:chatgpt", 17], ["ua:claude-user", 3]] },
+      account: { old: 0, new: 7, oldByClient: [] },
+    });
+    expect(r.text).toContain("names on vaults: old 20 (ua:chatgpt 17, ua:claude-user 3) · new 30");
+    expect(r.text).toContain("names at the account door: old 0 · new 7");
     expect(publicVerdict(r)).toBe("health: ok");
   });
 

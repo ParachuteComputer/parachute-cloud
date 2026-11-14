@@ -526,7 +526,7 @@ export async function authenticateVaultToken(
   // `vault:<this vault>:<verb>` (no scope, non-vault scopes, another vault's, an unknown verb) grants nothing here.
   // Refused for every door at once (REST, MCP, export, the live streams), rather than at each door: before this,
   // `permission` below summarised "no write scope" as "read" and the REST gate only checked writes, so such a token
-  // read the whole vault. The request path answers with the box's REST refusal (403 insufficient_scope, vault:read).
+  // read the whole vault. The request path answers with the box's REST refusal (403 insufficient_scope, the method's scope).
   if (!hasScopeForVault(claims.scopes, vaultName, "read")) {
     return { ok: false, reason: "insufficient_scope", scopes: claims.scopes };
   }
@@ -683,7 +683,10 @@ export async function authenticateVaultRequest(
       ),
     };
   }
-  if (result.reason === "insufficient_scope") return { error: insufficientScope("read", vaultName, result.scopes) };
+  // The refusal names the method's scope, as the box's REST gate does (routing.ts): a scopeless POST needs write.
+  if (result.reason === "insufficient_scope") {
+    return { error: insufficientScope(verbForMethod(req.method), vaultName, result.scopes) };
+  }
   return unauthorized(result.message);
 }
 
