@@ -259,7 +259,7 @@ const READ_ONLY: AccountToolAnnotations = { readOnlyHint: true, destructiveHint:
 /**
  * A write tool's hints are the vault's own for that tool at `write` (the level the hop runs at): parachute-core
  * mcp-annotations.ts, where create-* and update-* can overwrite and delete-* removes. This worker doesn't build
- * against the engine, so they are restated here; account-mcp.test.ts holds them to the vault worker's list.
+ * against the engine, so they are restated here; account-door-hints.test.ts holds them to the engine's table.
  */
 const CHANGE: AccountToolAnnotations = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
 const REMOVE: AccountToolAnnotations = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false };
