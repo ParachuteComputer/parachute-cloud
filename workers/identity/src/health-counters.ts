@@ -296,6 +296,22 @@ export function parseVaultHealth(raw: unknown, vaultId: string): { rows: HealthR
   if (!days || typeof days !== "object") return null;
   const liveRaw = (raw as { version?: unknown }).version;
   const live = typeof liveRaw === "string" && liveRaw.length > 0 ? clean(liveRaw, 40) : null;
+  const rows = blockRows(days, vaultId, HEALTH_MAX_KEYS_PER_DAY, (s) => s);
+  // Name use (T-456, the vault's `names:<day>` sink): the same shape, kept as `name:` rows, which the health report
+  // reads as a measurement and never as health. A key that doesn't already start with `name:` (the sink's overflow
+  // key) gets the prefix, so nothing from this block can land among the health subjects.
+  const names = (raw as { names?: unknown }).names;
+  if (names && typeof names === "object") {
+    rows.push(...blockRows(names, vaultId, NAMES_MAX_KEYS_PER_DAY, (s) => (s.startsWith("name:") ? s : `name:${s}`)));
+  }
+  return { rows, live };
+}
+
+/** The vault's own cap on name keys a day (health.ts NAMES_MAX_KEYS, 256) plus its one overflow key. */
+export const NAMES_MAX_KEYS_PER_DAY = 257;
+
+/** One `{day: {version: {"subject|outcome": n}}}` block into rows, strictly (see {@link parseVaultHealth}). */
+function blockRows(days: object, vaultId: string, maxPerDay: number, subjectOf: (s: string) => string): HealthRow[] {
   const rows: HealthRow[] = [];
   for (const [day, versions] of Object.entries(days as Record<string, unknown>)) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !versions || typeof versions !== "object") continue;
@@ -303,7 +319,7 @@ export function parseVaultHealth(raw: unknown, vaultId: string): { rows: HealthR
     for (const [version, keys] of Object.entries(versions as Record<string, unknown>)) {
       if (!keys || typeof keys !== "object") continue;
       for (const [key, n] of Object.entries(keys as Record<string, unknown>)) {
-        if (kept >= HEALTH_MAX_KEYS_PER_DAY) break;
+        if (kept >= maxPerDay) break;
         const bar = key.indexOf("|");
         if (bar <= 0 || typeof n !== "number" || !Number.isInteger(n) || n < 0) continue;
         rows.push({
@@ -311,7 +327,7 @@ export function parseVaultHealth(raw: unknown, vaultId: string): { rows: HealthR
           source: "vault",
           version: clean(version, 40),
           vault: vaultId,
-          subject: clean(key.slice(0, bar)),
+          subject: subjectOf(clean(key.slice(0, bar))),
           outcome: clean(key.slice(bar + 1)),
           n,
         });
@@ -319,7 +335,7 @@ export function parseVaultHealth(raw: unknown, vaultId: string): { rows: HealthR
       }
     }
   }
-  return { rows, live };
+  return rows;
 }
 
 /**

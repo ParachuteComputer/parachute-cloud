@@ -1926,7 +1926,8 @@ export class VaultDO extends DurableObject {
       const since = utcDay(new Date(Date.now() - 86_400_000));
       return json({
         ...shape(),
-        health: { version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since) },
+        // The name counts ride along (T-456): identity copies them into D1 as `name:` rows (health-counters.ts).
+        health: { version: versionLabel(this.env.CF_VERSION_METADATA), days: await this.health.read(since), names: await this.names.read(since) },
       });
     }
     if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
