@@ -81,6 +81,7 @@ describe("read gate — a vault-audience token with no scope for this vault read
       });
       expect(await call.clone().text(), "MCP query-notes").not.toContain("a secret");
       expect(call.status, "MCP").toBe(403);
+      expect(((await call.clone().json()) as any).required_scope, "MCP opens on read, so it names read").toBe("vault:read");
       // Signing in again the same way doesn't fix a 403, so MCP sends no sign-in challenge with it (a 401 does).
       expect(call.headers.get("www-authenticate"), "MCP challenge").toBeNull();
 

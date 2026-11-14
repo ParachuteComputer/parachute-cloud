@@ -683,9 +683,13 @@ export async function authenticateVaultRequest(
       ),
     };
   }
-  // The refusal names the method's scope, as the box's REST gate does (routing.ts): a scopeless POST needs write.
+  // The refusal names the scope the request needed at least: on REST the method's, as the box's generic REST gate
+  // does (routing.ts; a scopeless POST needs write). MCP is always a POST but opens on read, so it names read. (The
+  // box's admin-only routes name admin there; this names the method's verb. Only the scope named differs, and no
+  // mint path makes such a token.)
   if (result.reason === "insufficient_scope") {
-    return { error: insufficientScope(verbForMethod(req.method), vaultName, result.scopes) };
+    const mcp = /\/mcp(\/|$)/.test(new URL(req.url).pathname);
+    return { error: insufficientScope(mcp ? "read" : verbForMethod(req.method), vaultName, result.scopes) };
   }
   return unauthorized(result.message);
 }
