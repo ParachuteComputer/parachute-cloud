@@ -25,7 +25,7 @@
 # throwaway accounts/vaults, which is exactly what staging is for)
 set -euo pipefail
 # The engine lines staging takes: 0.8 (next), and 0.9 (door/0.9, T-456: Cloud staging proves the 0.9 door against the
-# box's contracts before any production plan). Production stays on 0.8: deploy-prod.sh still refuses a 0.9 pin.
+# box's contracts before any production plan). deploy-prod.sh takes 0.9 too (production deploys from door/0.9, Aaron 11-14).
 case "$(. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/core-source.env"; echo "$PARACHUTE_CORE_VERSION")" in
   0.8.* | 0.9.*) ;;
   *) echo "refused: this checkout pins an engine staging doesn't take (0.8 or 0.9 only)" >&2; exit 2 ;;
