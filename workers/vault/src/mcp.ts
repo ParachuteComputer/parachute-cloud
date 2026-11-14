@@ -255,8 +255,9 @@ export function connectionReachFor(auth: AuthResult, vaultName: string): string 
 }
 
 /**
- * Auto hybrid search on cloud when a vault hasn't chosen (core's HYBRID_AUTO_DEFAULT is on for a box): off until the
- * embed call and vector scan per question-shaped search are measured at cloud vault sizes (ROADMAP, cloud parity).
+ * Auto hybrid search on cloud when a vault hasn't chosen (core's HYBRID_AUTO_DEFAULT is on for a box): off. Measured
+ * (T-456): the embed is cheap, but the engine's vector read grows with the square of the vault (6.4 M rows a question
+ * at 24,000 notes); turn it on once core reads vectors by key (about 3 rows a note).
  */
 export const CLOUD_HYBRID_AUTO_DEFAULT = false;
 
