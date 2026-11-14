@@ -46,6 +46,15 @@ describe("name use per client", () => {
     expect(JSON.stringify(n)).not.toContain("old name");
   });
 
+  it("a hop from the account door is not counted again (the account door counted the call)", async () => {
+    const v = freshVault();
+    await createNote(v, { content: "materialize" });
+    const before = await names(v);
+    const hop = await mintToken({ vault: v, scopes: `vault:${v}:write vault:${v}:read`, clientId: "parachute-account" });
+    expect((await mcpCall(v, hop, "", "create-note", { content: "through the account door" })).status).toBe(200);
+    expect(await names(v)).toEqual(before);
+  });
+
   it("a flood of 600 made-up clients is capped: at most 16 clients a day, then `other`", async () => {
     const v = freshVault();
     await createNote(v, { content: "materialize" });

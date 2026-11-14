@@ -336,6 +336,7 @@ export class NameCounts extends HealthSink {
       const c = clean(client, 32);
       const seen = new Set<string>();
       for (const v of Object.values(this.counters ?? {})) for (const k of Object.keys(v)) if (!k.startsWith("overflow|")) seen.add(k.slice(k.indexOf("|") + 1).replace(/^(old|new):/, ""));
+      seen.delete("other"); // the overflow label is not one of the 16
       const who = seen.has(c) || seen.size < NAMES_MAX_CLIENTS ? c : "other";
       await this.record(`name:${name}`, `${kind}:${who}`);
     } catch (err) {

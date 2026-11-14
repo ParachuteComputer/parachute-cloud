@@ -35,6 +35,9 @@ import { NO_TAG_SCOPE } from "./rest/parse.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { withValidators } from "@openparachute/core/src/http-validators.js";
 
+/** The client id the account door's hops carry (identity account-token.ts ACCOUNT_TOKEN_CLIENT_ID). */
+const ACCOUNT_DOOR_CLIENT_ID = "parachute-account";
+
 /** One record by id or path, on either REST door: `/vault/<v>/api/notes/<x>` or `/vault/<v>/api/records/<x>`. */
 const ONE_RECORD = /^\/vault\/[^/]+\/api\/(notes|records)\/[^/]+$/;
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
@@ -877,8 +880,11 @@ export class VaultDO extends DurableObject {
   private readonly names: NameCounts;
 
   /** Count one name's use by this request's client, unless the vault is gone (its storage must stay empty). */
-  private async countNameUse(name: string, kind: "old" | "new", request: Request, auth: { via: string | null }): Promise<void> {
+  private async countNameUse(name: string, kind: "old" | "new", request: Request, auth: { via: string | null; clientId?: string | null }): Promise<void> {
     if (!this.stateLoaded || this.destroyed) return;
+    // A hop from the account door (identity account-mcp.ts) was counted there, under the account door's name and the
+    // caller's client class; counting it here too would add a second, client-less use of the same call.
+    if (auth.clientId === ACCOUNT_DOOR_CLIENT_ID) return;
     await this.names.count(name, kind, clientOf(request, auth.via));
   }
 

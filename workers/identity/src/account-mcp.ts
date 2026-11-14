@@ -472,7 +472,7 @@ async function fanOut(
 
 const queryNotesTool: AccountMcpTool = {
   name: "query-notes",
-  description: OLD_NAME("query-notes", "query-records"),
+  description: oldNameOf("query-records"),
   inputSchema: {
     type: "object",
     properties: {
@@ -497,35 +497,12 @@ const queryNotesTool: AccountMcpTool = {
     additionalProperties: false,
   },
   async execute(args, ctx) {
-    const coverage = await resolveCoverage(ctx.db, ctx.accountId, ctx.grant);
-    let targets = coverage.names;
-    if (typeof args.vault === "string" && args.vault.length > 0) {
-      const wanted = args.vault.toLowerCase();
-      // Fail-closed: a `vault` outside the live coverage set is refused, never
-      // silently reached — the ownership seam applies to the targeted form too.
-      if (!coverage.names.includes(wanted)) {
-        throw new AccountToolError(
-          "vault_not_covered",
-          `Vault "${args.vault}" is not among your granted, currently-owned vaults.`,
-        );
-      }
-      targets = [wanted];
-    }
-    const attribution = principalAttributionClaims(ctx.principal);
-    const results = await fanOut(
-      ctx.db,
-      ctx.deps,
-      ctx.accountId,
-      targets,
-      args,
-      attribution?.permissions,
-    );
-    return { vaults_queried: targets, results, deprecation: { tool: "query-notes", use: "query-records", removed_in: "1.0" } };
+    return { ...(await runQuery(args, ctx, "notes")), deprecation: { tool: "query-notes", use: "query-records", removed_in: "1.0" } };
   },
 };
 
 /** The account door's tools under their 0.9 names; the old note names stay listed through 0.9 (gone in 1.0). */
-function OLD_NAME(old: string, use: string): string {
+function oldNameOf(use: string): string {
   return `Old name of ${use}: the same tool, under the name 0.8 used. Use ${use}. Works until 1.0.`;
 }
 
@@ -564,23 +541,28 @@ const queryRecordsTool: AccountMcpTool = {
     additionalProperties: false,
   },
   async execute(args, ctx) {
-    const coverage = await resolveCoverage(ctx.db, ctx.accountId, ctx.grant);
-    let targets = coverage.names;
-    if (typeof args.vault === "string" && args.vault.length > 0) {
-      const wanted = args.vault.toLowerCase();
-      if (!coverage.names.includes(wanted)) {
-        throw new AccountToolError(
-          "vault_not_covered",
-          `Vault "${args.vault}" is not among your granted, currently-owned vaults.`,
-        );
-      }
-      targets = [wanted];
-    }
-    const attribution = principalAttributionClaims(ctx.principal);
-    const results = await fanOut(ctx.db, ctx.deps, ctx.accountId, targets, args, attribution?.permissions, "records");
-    return { vaults_queried: targets, results };
+    return runQuery(args, ctx, "records");
   },
 };
+
+/**
+ * query-records and query-notes (its old name): the live coverage set, or the one covered vault `vault` names
+ * (anything else is refused, never silently reached), fanned out through the bridge mint, grouped per vault.
+ */
+async function runQuery(args: Record<string, unknown>, ctx: AccountToolContext, door: "notes" | "records") {
+  const coverage = await resolveCoverage(ctx.db, ctx.accountId, ctx.grant);
+  let targets = coverage.names;
+  if (typeof args.vault === "string" && args.vault.length > 0) {
+    const wanted = args.vault.toLowerCase();
+    if (!coverage.names.includes(wanted)) {
+      throw new AccountToolError("vault_not_covered", `Vault "${args.vault}" is not among your granted, currently-owned vaults.`);
+    }
+    targets = [wanted];
+  }
+  const attribution = principalAttributionClaims(ctx.principal);
+  const results = await fanOut(ctx.db, ctx.deps, ctx.accountId, targets, args, attribution?.permissions, door);
+  return { vaults_queried: targets, results };
+}
 
 // --- writes: the vault's own note tools, one named vault at a time -------------
 
@@ -701,9 +683,9 @@ const WRITE_TOOLS: readonly AccountMcpTool[] = [
 
 /** The old note-named writes (0.9.1's), still listed through 0.9: the vault's own old tools, answered as before. */
 const OLD_WRITE_TOOLS: readonly AccountMcpTool[] = [
-  writeTool("create-note", OLD_NAME("create-note", "create-record")),
-  writeTool("update-note", OLD_NAME("update-note", "update-record")),
-  writeTool("delete-note", OLD_NAME("delete-note", "delete-record")),
+  writeTool("create-note", oldNameOf("create-record")),
+  writeTool("update-note", oldNameOf("update-record")),
+  writeTool("delete-note", oldNameOf("delete-record")),
 ];
 
 /** The account door's old names and the name each is counted against (T-456): 1.0 removes them on these counts. */
@@ -715,18 +697,18 @@ export const ACCOUNT_OLD_NAMES: Readonly<Record<string, string>> = {
 };
 
 /** Whether this connection holds write (or more) on any vault — the write tools are listed only then, so a read-only
- *  connection (every Wave A level-less grant among them) sees exactly the three tools it saw before. */
+ *  connection (every Wave A level-less grant among them) sees only the read tools: list-vaults, create-vault, query-records and query-notes. */
 export function grantCanWrite(grant: AccountConnectionGrant): boolean {
   const atLeastWrite = (v: ComposedVaultVerb | null) => v !== null && COMPOSED_VERB_RANK[v] >= COMPOSED_VERB_RANK.write;
   return atLeastWrite(grant.wildcard) || [...grant.vaults.values()].some(atLeastWrite);
 }
 
-/** The tools this connection is shown: the three Wave A tools, plus the note writes when it can write somewhere. */
+/** The tools this connection is shown: the read tools, plus the record writes (and their old note names) when it can write somewhere. */
 export function toolsFor(grant: AccountConnectionGrant): readonly AccountMcpTool[] {
   return grantCanWrite(grant) ? ACCOUNT_MCP_TOOLS : ACCOUNT_MCP_TOOLS.filter((t) => !t.passThrough);
 }
 
-/** The account-MCP tool set: the three Wave A tools, then the note writes (0.9.1). Order is stable so
+/** The account-MCP tool set: list-vaults, create-vault, the record tools, then their old note names. Order is stable so
  *  `tools/list` is deterministic. */
 export const ACCOUNT_MCP_TOOLS: readonly AccountMcpTool[] = [
   listVaultsTool,
