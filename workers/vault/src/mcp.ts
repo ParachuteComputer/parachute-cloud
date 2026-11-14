@@ -257,13 +257,14 @@ export function connectionReachFor(auth: AuthResult, vaultName: string): string 
 }
 
 /**
- * Auto hybrid search on cloud when a vault hasn't chosen: on, as on a box (core's HYBRID_AUTO_DEFAULT). It was off
- * until core fixed two costs (T-456, T-463; p09-lock evidence/hybrid): the vector read grew with the square of the
- * vault (core #120 reads vectors by key, about 3 rows a note), and a question held every candidate's vector at once,
- * near a Durable Object's 128 MB at 24,000 notes (core #124 scores each batch as it reads it). A vault's admin can
- * still turn it off (PATCH /api/vault {config: {search: {auto_hybrid: false}}}).
+ * Auto hybrid search on cloud when a vault hasn't chosen (core's HYBRID_AUTO_DEFAULT is on for a box): off. Core #120
+ * (vectors read by key) and #124 (each batch scored as it is read) fixed the row count and the memory: on staging at
+ * core 909843f a 24,000-note vault answers every question with no error. But a question still costs a Workers AI embed
+ * and a scan that grows with the vault: auto-on median 389-549 ms at 10,000 notes and 664 ms at 24,000, against
+ * 57-70 ms off (T-456, 11-14, p09-lock evidence/hybrid/2026-11-14). The gate for turning it on was under ~300 ms at
+ * 10,000 notes, so it stays off; a vault's admin can turn it on (PATCH /api/vault {config: {search: {auto_hybrid}}}).
  */
-export const CLOUD_HYBRID_AUTO_DEFAULT = true;
+export const CLOUD_HYBRID_AUTO_DEFAULT = false;
 
 /**
  * Server-layer context the DO supplies so vault-info can build a REAL projection
@@ -288,7 +289,7 @@ export interface VaultInfoContext {
    *  the caller's `as string` cast to hide it; cloud#87 replaced that cast with a
    *  real check, so the seam now states the type it actually accepts. */
   updateDescription: (description: string | null) => void | Promise<void>;
-  /** This vault's own `search.auto_hybrid` (rest/vault.ts), read at each search; cloud's default when unset is on
+  /** This vault's own `search.auto_hybrid` (rest/vault.ts), read at each search; cloud's default when unset is off
    *  ({@link CLOUD_HYBRID_AUTO_DEFAULT}). */
   hybridAuto?: () => boolean | null | undefined;
 }
@@ -610,8 +611,8 @@ function visibleTools(
   const tools = generateMcpTools(store, {
     writeContext,
     // 0.9.3 auto hybrid: a question-shaped search with no search_mode also asks the meaning index (a Workers AI embed
-    // call plus a batched scan of the candidates' vectors in the vault's DO). On unless the vault turns it off
-    // (CLOUD_HYBRID_AUTO_DEFAULT).
+    // call plus a batched scan of the candidates' vectors in the vault's DO). Off on cloud unless the vault turns it on
+    // (CLOUD_HYBRID_AUTO_DEFAULT, measured there).
     hybridAuto: () => hybridAuto?.() ?? CLOUD_HYBRID_AUTO_DEFAULT,
     attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
     // read-attachment (the engine adds the tool only when a door wires bytes): ranged R2 reads. Without it an AI
