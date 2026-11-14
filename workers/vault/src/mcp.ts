@@ -43,6 +43,8 @@ import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from 
 import { applyOnBehalf } from "./rest/write-stamp.js";
 import { NOTE_TOOL_NAMES, recordWords } from "@openparachute/core/src/mcp-records.js";
 import { recordErrorData, shapeRecordSurface, typedMessage } from "@openparachute/core/src/mcp-surface.js";
+import { toolAnnotations, type McpLevel } from "@openparachute/core/src/mcp-annotations.js";
+import { mcpCallResult } from "@openparachute/core/src/mcp-result.js";
 import { errorClass, toolErrorOutcome } from "./health.js";
 
 // Transcribed from the SDK's types.js so negotiation matches byte-for-byte.
@@ -255,9 +257,12 @@ export function connectionReachFor(auth: AuthResult, vaultName: string): string 
 }
 
 /**
- * Auto hybrid search on cloud when a vault hasn't chosen (core's HYBRID_AUTO_DEFAULT is on for a box): off. Measured
- * (T-456): the embed is cheap, but the engine's vector read grows with the square of the vault (6.4 M rows a question
- * at 24,000 notes); turn it on once core reads vectors by key (about 3 rows a note).
+ * Auto hybrid search on cloud when a vault hasn't chosen (core's HYBRID_AUTO_DEFAULT is on for a box): off. Core #120
+ * (vectors read by key) and #124 (each batch scored as it is read) fixed the row count and the memory: on staging at
+ * core 909843f a 24,000-note vault answers every question with no error. But a question still costs a Workers AI embed
+ * and a scan that grows with the vault: auto-on median 389-549 ms at 10,000 notes and 664 ms at 24,000, against
+ * 57-70 ms off (T-456, 11-14, p09-lock evidence/hybrid/2026-11-14). The gate for turning it on was under ~300 ms at
+ * 10,000 notes, so it stays off; a vault's admin can turn it on (PATCH /api/vault {config: {search: {auto_hybrid}}}).
  */
 export const CLOUD_HYBRID_AUTO_DEFAULT = false;
 
@@ -605,10 +610,9 @@ function visibleTools(
   const writeContext = { actor: auth.actor, via: refineMcpVia(auth.via) };
   const tools = generateMcpTools(store, {
     writeContext,
-    // 0.9.3 auto hybrid: a question-shaped search with no search_mode also asks the meaning index. Off on cloud unless
-    // the vault turns it on (CLOUD_HYBRID_AUTO_DEFAULT): each such search is a Workers AI embed call plus a scan of the
-    // candidates' vectors inside the vault's Durable Object. Measured (T-456): the engine's vector read re-reads every vector
-    // per batch of 99 ids (46k rows at 2,000 notes, 6.4 M at 24,000), so it stays off until core reads them by key.
+    // 0.9.3 auto hybrid: a question-shaped search with no search_mode also asks the meaning index (a Workers AI embed
+    // call plus a batched scan of the candidates' vectors in the vault's DO). Off on cloud unless the vault turns it on
+    // (CLOUD_HYBRID_AUTO_DEFAULT, measured there).
     hybridAuto: () => hybridAuto?.() ?? CLOUD_HYBRID_AUTO_DEFAULT,
     attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
     // read-attachment (the engine adds the tool only when a door wires bytes): ranged R2 reads. Without it an AI
@@ -716,9 +720,9 @@ async function handleToolCall(
     const out = await tool.execute(args);
     await record(subject, "ok");
     // A tool may shape its own content blocks (read-attachment returns a real image block); every other tool's
-    // result is one text block of JSON. The same rule as the box's MCP layer (parachute-core src/mcp-http.ts).
-    const content = tool.resultContent ? tool.resultContent(out) : [{ type: "text" as const, text: JSON.stringify(out, null, 2) }];
-    return result(id, { content });
+    // result is one text block of JSON, plus `structuredContent` where ChatGPT would read it as `{}` (a note by id;
+    // T-456, core mcp-result.ts). The same call as the box's MCP layer (parachute-core src/mcp-http.ts).
+    return result(id, mcpCallResult(tool, out));
   } catch (err) {
     const domain = mapDomainError(err);
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -743,6 +747,8 @@ async function handleOne(
   m: JsonRpcMessage,
   ctx: {
     tools: McpToolDef[];
+    /** The connection's level on this vault, for the tools' MCP annotations (two tools' hints follow it). */
+    level: McpLevel;
     vaultName: string;
     description: string | null;
     /** The connect-time brief (`serverInstruction`), built only when a client asks for it. */
@@ -774,7 +780,9 @@ async function handleOne(
       case "tools/list":
         await record("mcp:tools/list", "ok");
         return result(id, {
-          tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
+          // T-456: each tool says what it does to the vault (core mcp-annotations.ts, the box's table), so a client can
+          // tell a read from a change: ChatGPT's "Allow read-only tools" otherwise asks before every read.
+          tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, annotations: toolAnnotations(t.name, ctx.level) })),
         });
       case "tools/call":
         return handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate, record, logCrash);
@@ -1078,7 +1086,9 @@ export async function handleMcp(
     serverInstruction(vaultName, description, connectionReachFor(auth, vaultName), buildVaultProjection(store.db as never, { includeStats: true }), {
       readEnabled: tickets.bytes !== undefined,
     });
-  const ctx = { tools, vaultName, description, instructions, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
+  // The connection's level here (cloud has no tag-scoped passes, so an admin scope is a vault-wide admin).
+  const level: McpLevel = hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
+  const ctx = { tools, level, vaultName, description, instructions, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));
