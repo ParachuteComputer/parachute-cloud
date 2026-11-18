@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# scripts/release/prod-job.sh: THE production deploy, as a sealed-card job (T-413). Production deploys from `next` this
-# way until Aaron decides about `main` (deploy-prod.yml deploys the default branch, which is far behind; don't use it).
+# scripts/release/prod-job.sh: THE production deploy, as a sealed-card job (T-413). Production deploys from `door/0.9`,
+# Cloud's trunk from the 0.9 move on (Aaron, 11-14), this way: a short-lived key per job on Aaron's card. deploy-prod.yml
+# has no working key (its standing token was refused on 11-17, and production keeps no standing key in GitHub).
 # It ships the commit staging proved to both production workers through scripts/deploy-prod.sh unchanged (its health
 # gate, D1 migrations, identity then vault, the edge-propagation wait), then read-only checks and smoke-prod.ts. Any
 # failure after a worker changed rolls BOTH back to the versions production ran before (EXPECT_LIVE_*; it refuses to
@@ -17,14 +18,22 @@
 # failed and rolled back (proven); 2 refused, nothing changed; 3 the health gate said something got worse, nothing
 # deployed; 4 a rollback that could not be proven: the "!!" lines give the commands to run by hand. Nothing secret
 # printed. Rehearsed by T-413's harness (fake wrangler, curl, sealed CLI; the real deploy-prod.sh).
+# Inputs by env, each checked against production before anything changes: EXPECT_LIVE_VAULT / EXPECT_LIVE_IDENTITY (the
+# versions production runs, the rollback targets) and PROD_LIVE (the commit they were built from, for check-triggers.sh);
+# HEALTH_GATE_ACK: worse findings someone has already looked at and judged not to be this deploy's business, one
+# "who|subject|kind" per line, "|reason" added when the finding has one (the full report's --json fields). The gate
+# then passes only if every worse finding is one of them, and deploy-prod.sh gets HEALTH_GATE=ack for its own read of
+# the gate seconds later; anything else worse stops the job as before (exit 3). The full report stays in
+# <evidence dir>/private (0700); the log gets counts only.
 set -uo pipefail
 CLOUD="$(cd "${1:?usage: prod-job.sh <cloud checkout> <sha> <evidence dir> <staging evidence dir>}" && pwd)"
 WANT="${2:?sha}"; EVID="$(mkdir -p "${3:?evidence dir}" && cd "$3" && pwd)"; STG="$(cd "${4:?staging evidence dir}" && pwd)"
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # scripts/release: this script, the key shim, the checks
-CF_ACCOUNT=d5d7c8646c3b69ce9f16bfd12ecbe98a; PROD_LIVE=423362e
-# What production runs now: cloud next 423362e, deployed 11-03 19:09 UTC (t318-review2-fixes evidence/prod-423362e).
-OLD_VAULT="${EXPECT_LIVE_VAULT:-1bc2cef3-c851-47a3-8845-051f9b48950f}"
-OLD_ID="${EXPECT_LIVE_IDENTITY:-faffb93d-b6bc-4830-a483-fff22aec6876}"
+CF_ACCOUNT=d5d7c8646c3b69ce9f16bfd12ecbe98a
+# What production runs by default: cloud next b77fc25, deployed 11-11 14:32 UTC (T-451; still live 11-18).
+PROD_LIVE="${PROD_LIVE:-b77fc25}"
+OLD_VAULT="${EXPECT_LIVE_VAULT:-7a62e925-0b2c-4b6c-9d5c-0fb0eab55b35}"
+OLD_ID="${EXPECT_LIVE_IDENTITY:-2037efa6-7066-417e-83f0-19ce9e52198f}"
 ISSUER=https://cloud.parachute.computer; MY=https://my.parachute.computer; VH=https://u.parachute.computer
 WINDOW_S="${WINDOW_S:-600}"
 # The broker refuses a mint with under 60 s left and revokes every key 30 s before the window ends; a mint can take
@@ -33,7 +42,7 @@ KEY_MARGIN_S=180
 export PY="${PY:-$HOME/REPOS/hermes-agent/.venv/bin/python}"
 export TMPDIR="${TMPDIR:-$HOME/.cache/parachute-release-tmp}"; export WRANGLER_LOG_PATH="$TMPDIR/wrangler-logs-prod"
 export PATH="$R:$HOME/.bun/bin:$PATH" CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT" WRANGLER_SEND_METRICS=false WRANGLER_LOG_SANITIZE=true
-export SHIM_LOG="$EVID/keys.log" DEPLOYED_LOG="$EVID/deployed.txt" WANT_SHA="$WANT" DEPLOY_MESSAGE="T-413 cloud next ${WANT:0:7}"
+export SHIM_LOG="$EVID/keys.log" DEPLOYED_LOG="$EVID/deployed.txt" WANT_SHA="$WANT" DEPLOY_MESSAGE="prod-job: cloud ${WANT:0:7}"
 mkdir -p "$TMPDIR"; : > "$DEPLOYED_LOG"
 APP="$CLOUD/../parachute-app"; OPF="${OPERATOR_EMAIL_FILE:?OPERATOR_EMAIL_FILE: a file holding only DEV_USER_EMAIL=<the production operator address>}"; DS="$CLOUD/workers/identity/.dev-secrets"
 T0=$(date +%s)
@@ -67,6 +76,7 @@ SPA_REF="$(. "$CLOUD/scripts/spa-source.env"; echo "$SPA_APP_REF")"; SPA_WANT="$
 [ "$(git -C "$APP" rev-parse HEAD)" = "$SPA_REF" ] || refuse "app checkout is not the SPA pin"
 [ -z "$(git -C "$APP" status --porcelain | grep -v '^ M meta.json$')" ] || refuse "app checkout has changes beyond meta.json"
 git -C "$APP" checkout -- meta.json   # the app build rewrites it; build-spa.sh would refuse the checkout
+git -C "$CLOUD" cat-file -e "$PROD_LIVE^{commit}" 2>/dev/null || refuse "PROD_LIVE $PROD_LIVE is no commit this checkout has"
 bash "$R/check-triggers.sh" "$CLOUD" "$PROD_LIVE" "$WANT" > "$EVID/check-triggers.txt" || refuse "routes/crons/DO migrations changed since $PROD_LIVE"
 # Staging proved this code: every suite passed on a deploy of a commit whose difference from this one is only the
 # smoke scripts and the package version line (nothing that reaches a worker bundle).
@@ -100,7 +110,7 @@ echo "before: parachute-vault-do ${LV:-?}, parachute-identity ${LI:-?}, edge ${E
 [ "$LV" = "$OLD_VAULT" ] && [ "$LI" = "$OLD_ID" ] && [ "$E0" = "$OLD_ID" ] \
   || refuse "production is not on ${PROD_LIVE}'s versions (vault $OLD_VAULT, identity $OLD_ID): look first; set EXPECT_LIVE_VAULT/EXPECT_LIVE_IDENTITY only after checking"
 
-# rollback <why>: both workers back to 423362e's versions under ONE key (vault first: the deploy's order, reversed),
+# rollback <why>: both workers back to PROD_LIVE's versions under ONE key (vault first: the deploy's order, reversed),
 # no reads before it (rolling back a worker that never moved is a harmless new deployment of the same version), then
 # proof: the edge serves the old identity and the vault reads back old. Exit 1 when proven, 4 when not.
 rollback() {
@@ -111,7 +121,7 @@ rollback() {
     for pair in "$@"; do
       set -- $pair; done_=0
       for i in 1 2 3; do
-        if (cd "$3" && "$rb" wrangler rollback "$2" --name "$1" -m "T-413: a check failed; back to 423362e" -y) > /dev/null 2>&1; then
+        if (cd "$3" && "$rb" wrangler rollback "$2" --name "$1" -m "prod-job: a check failed; back to the versions before" -y) > /dev/null 2>&1; then
           echo "$1 rolled back to $2"; done_=1; break; fi
         sleep 5
       done
@@ -139,7 +149,26 @@ wait_edge() { local end=$(( $(date +%s) + $2 )); while :; do [ "$(edge)" = "$1" 
 # --- the health gate, read on its own first: an unreadable report must stop us, not wave the deploy through ---
 unset HEALTH_GATE
 step "1. health gate (read-only D1 SELECTs; verdict and counts only)"
-(cd "$CLOUD" && timeout -k 10 150 bun scripts/health-report.ts --d1 parachute-identity --gate --public) > "$EVID/health-gate.txt" 2>&1; G=$?
+if [ -z "${HEALTH_GATE_ACK:-}" ]; then
+  (cd "$CLOUD" && timeout -k 10 150 bun scripts/health-report.ts --d1 parachute-identity --gate --public) > "$EVID/health-gate.txt" 2>&1; G=$?
+else
+  # One read, in full: the report and its findings go to a private folder (0700), the log gets counts only.
+  P="$EVID/private"; mkdir -p "$P" && chmod 700 "$P" && rm -f "$P/health.json" || refuse "could not make $P"
+  (cd "$CLOUD" && timeout -k 10 150 bun scripts/health-report.ts --d1 parachute-identity --gate --json "$P/health.json") > "$P/health.txt" 2>&1; G=$?
+  chmod 600 "$P/health.txt" "$P/health.json" 2>/dev/null
+  if [ $G = 0 ] || [ $G = 3 ]; then
+    ACK="$(HEALTH_GATE_ACK="$HEALTH_GATE_ACK" python3 -I -c 'import json,os,sys
+ack={l.strip() for l in os.environ["HEALTH_GATE_ACK"].splitlines() if l.strip()}
+w=json.load(open(sys.argv[1]))["worse"]
+left=[f for f in w if "|".join([f["who"],f["subject"],f["kind"]]+([f["reason"]] if f.get("reason") else [])) not in ack]
+print(len(w), len(left))' "$P/health.json" 2>/dev/null)"
+    read -r NW NLEFT <<<"$ACK"
+    if [ -z "${NLEFT:-}" ]; then G=1; echo "health: the full report's findings could not be read" > "$EVID/health-gate.txt"
+    elif [ "$NW" = 0 ]; then echo "health: ok" > "$EVID/health-gate.txt"
+    else echo "health: worse: $NW findings, $(( NW - NLEFT )) of them acknowledged (HEALTH_GATE_ACK), $NLEFT not" > "$EVID/health-gate.txt"; fi
+    if [ $G = 3 ] && [ "${NLEFT:-}" = 0 ]; then G=0; export HEALTH_GATE=ack; fi   # for deploy-prod.sh's own read
+  else echo "health: the report could not be read (exit $G)" > "$EVID/health-gate.txt"; fi
+fi
 cat "$EVID/health-gate.txt" | tail -3
 case $G in
   0) ;;
