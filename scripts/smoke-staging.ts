@@ -2600,13 +2600,16 @@ async function main() {
         `status ${initRes.status}`,
       );
 
-      // tools/list — EXACTLY the three tools.
+      // tools/list — EXACTLY the 0.9 account tools for a connection that can write (account-mcp.ts ACCOUNT_MCP_TOOLS):
+      // list-vaults, create-vault, the record tools and their old note names.
+      const ACCOUNT_TOOLS_09 =
+        "create-note,create-record,create-vault,delete-note,delete-record,list-vaults,query-notes,query-records,update-note,update-record";
       const listRes = await accountMcpCall(blanket.access, { jsonrpc: "2.0", id: 2, method: "tools/list" });
       const listJson = (await listRes.json()) as any;
       const toolNames = (listJson.result?.tools ?? []).map((t: any) => t.name).sort();
       assert(
-        listRes.status === 200 && toolNames.length === 3 && toolNames.join(",") === "create-vault,list-vaults,query-notes",
-        "account-mcp: tools/list → EXACTLY 3 tools (create-vault, list-vaults, query-notes)",
+        listRes.status === 200 && toolNames.join(",") === ACCOUNT_TOOLS_09,
+        "account-mcp: tools/list → EXACTLY the 10 account tools (vaults, records, old note names)",
         toolNames.join(","),
       );
 
