@@ -65,7 +65,7 @@ function unverifiedJtiOf(token: string): string | null {
   }
 }
 
-export async function handleRevoke(db: D1Database, req: Request, _deps: OAuthDeps): Promise<Response> {
+export async function handleRevoke(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   // Same malformed-body guard as handleToken: a throw here would skip the
   // route-level wildcard-CORS wrapper (#35).
   let form: FormData;
@@ -88,7 +88,8 @@ export async function handleRevoke(db: D1Database, req: Request, _deps: OAuthDep
   const authFailure = await authenticateClient(client, req, form, bodyClientId);
   if (authFailure) return authFailure;
 
-  const now = new Date();
+  // The issuer's clock: it now decides which tokens and codes still count as live.
+  const now = deps.now?.() ?? new Date();
   let row: RefreshTokenRow | null = hint === "access_token" ? null : await findRefreshToken(db, token);
   if (!row) {
     const jti = unverifiedJtiOf(token);
