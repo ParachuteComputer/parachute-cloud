@@ -3,9 +3,18 @@
  * unknown token (§2.2 — no existence disclosure). Tries the refresh-token hash
  * first (the common case), then falls back to an unverified JWT-jti decode for
  * access tokens. A token owned by a different client is collapsed to 200 with
- * the row left live.
+ * the row left live and nothing else changed.
+ *
+ * Revoking a live token also takes back the grant behind it, per vault scope
+ * (RFC 7009 §2.1, "the underlying authorization grant"): each
+ * `vault:<name>:<verb>` it carried that no other live token of the same user
+ * and client still carries leaves the (user, client) grant, so the next ask
+ * for it shows the consent page again (`dropVaultScopesNoLiveTokenHolds`).
+ * The token revocation runs first and on its own; the grant step is best
+ * effort and never changes the 200.
  */
 import { getClient, verifyClientSecret, type OAuthClient } from "./clients.ts";
+import { dropVaultScopesNoLiveTokenHolds } from "./grants.ts";
 import { findRefreshToken, findTokenRowByJti, type RefreshTokenRow } from "./tokens.ts";
 import { type OAuthDeps, jsonResponse } from "./oauth-shared.ts";
 
@@ -92,6 +101,20 @@ export async function handleRevoke(db: D1Database, req: Request, _deps: OAuthDep
   }
   if (row && !row.revokedAt) {
     await db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").bind(now.toISOString(), row.jti).run();
+    // No first-party exemption here (unlike the Connected apps list and
+    // Disconnect): this is the client giving back its own token, and the
+    // Parachute app is exactly the client that asks per vault and revokes.
+    if (row.userId && row.expiresAt > now.toISOString()) {
+      try {
+        const dropped = await dropVaultScopesNoLiveTokenHolds(db, row.userId, row.clientId, row.jti, row.scopes, now);
+        // Ids and a count only: no scopes, no token material.
+        if (dropped.length > 0) {
+          console.log(`event=grant_narrowed_on_revoke user=${row.userId} client=${row.clientId} dropped=${dropped.length}`);
+        }
+      } catch (err) {
+        console.error(`event=grant_narrow_on_revoke_failed client=${row.clientId} error=${err instanceof Error ? err.name : "unknown"}`);
+      }
+    }
   }
   return new Response(null, { status: 200 });
 }
