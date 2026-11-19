@@ -28,6 +28,11 @@
  * same D1 batch as the grant write. See `recordGrant` for why the trigger is
  * "moved" rather than "narrowed", and why it belongs here and not in the
  * consent handler.
+ *
+ * A REVOKE NARROWS TOO. `/oauth/revoke` takes back the named vault scopes no
+ * live token of that user + client still holds
+ * ({@link dropVaultScopesNoLiveTokenHolds}), so the grant follows the live
+ * tokens and a given-back verb asks for consent again.
  */
 import { parseComposedAccountScope } from "@openparachute/door-contract";
 import { prepareRevokeClientTokens } from "./tokens.ts";

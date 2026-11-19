@@ -15,6 +15,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import worker from "../src/index.ts";
 import { findGrant, recordGrant } from "../src/grants.ts";
+import { handleRevoke } from "../src/oauth-revoke.ts";
 import { signRefreshToken } from "../src/tokens.ts";
 import {
   ISSUER,
@@ -22,6 +23,7 @@ import {
   authorizeGetReq,
   bridgeTarget,
   consentReq,
+  deps,
   makePkce,
   revokeReq,
   seedApprovedClient,
@@ -212,5 +214,54 @@ describe("/oauth/revoke ends the grant behind the token (vault scopes no live to
     expect(await findGrant(env.DB, userId, clientId)).toEqual(before);
     expect((await ask(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`)).outcome).toBe("skipped");
     expect((await refresh(clientId, pair.refresh_token)).status).toBe(200);
+  });
+
+  test("a consent that lands between the grant read and the write is not overwritten (the write is on the row it read)", async () => {
+    const { userId, vault, other, sessionId } = await setup("race");
+    const { clientId } = await seedApprovedClient({ clientName: "Applet" });
+    const rw = await connect(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`);
+    const readAsk = await ask(clientId, sessionId, `vault:${vault}:read`);
+    await exchange(clientId, readAsk.code!, readAsk.verifier);
+
+    // Just before the revoke's first grant write, another consent adds a vault.
+    let raced = false;
+    const racingDb = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            const stmt = target.prepare(sql);
+            if (raced || !sql.startsWith("UPDATE grants SET scopes")) return stmt;
+            raced = true;
+            return new Proxy(stmt, {
+              get(s, p) {
+                if (p === "bind") {
+                  return (...args: unknown[]) => {
+                    const bound = s.bind(...args);
+                    return {
+                      run: async () => {
+                        await recordGrant(env.DB, userId, clientId, [`vault:${other}:read`]);
+                        return bound.run();
+                      },
+                    };
+                  };
+                }
+                const v = Reflect.get(s, p);
+                return typeof v === "function" ? v.bind(s) : v;
+              },
+            });
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+
+    const res = await handleRevoke(racingDb, revokeReq({ token: rw.refresh_token, client_id: clientId }), deps());
+    expect(res.status).toBe(200);
+    expect(raced).toBe(true);
+    // Write went, the racing consent's vault stayed.
+    expect((await findGrant(env.DB, userId, clientId))?.scopes.sort()).toEqual(
+      [`vault:${other}:read`, `vault:${vault}:read`].sort(),
+    );
   });
 });
