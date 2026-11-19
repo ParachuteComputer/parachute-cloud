@@ -241,44 +241,70 @@ describe("/oauth/revoke ends the grant behind the token (vault scopes no live to
     await exchange(clientId, readAsk.code!, readAsk.verifier);
 
     // Just before the revoke's first grant write, another consent adds a vault.
-    let raced = false;
-    const racingDb = new Proxy(env.DB, {
-      get(target, prop) {
-        if (prop === "prepare") {
-          return (sql: string) => {
-            const stmt = target.prepare(sql);
-            if (raced || !sql.startsWith("UPDATE grants SET scopes")) return stmt;
-            raced = true;
-            return new Proxy(stmt, {
-              get(s, p) {
-                if (p === "bind") {
-                  return (...args: unknown[]) => {
-                    const bound = s.bind(...args);
-                    return {
-                      run: async () => {
-                        await recordGrant(env.DB, userId, clientId, [`vault:${other}:read`]);
-                        return bound.run();
-                      },
-                    };
-                  };
-                }
-                const v = Reflect.get(s, p);
-                return typeof v === "function" ? v.bind(s) : v;
-              },
-            });
-          };
-        }
-        const v = Reflect.get(target, prop);
-        return typeof v === "function" ? v.bind(target) : v;
-      },
-    });
-
-    const res = await handleRevoke(racingDb, revokeReq({ token: rw.refresh_token, client_id: clientId }), deps());
+    const racing = raceBeforeGrantWrite(() => recordGrant(env.DB, userId, clientId, [`vault:${other}:read`]));
+    const res = await handleRevoke(racing.db, revokeReq({ token: rw.refresh_token, client_id: clientId }), deps());
     expect(res.status).toBe(200);
-    expect(raced).toBe(true);
+    expect(racing.raced()).toBe(true);
     // Write went, the racing consent's vault stayed.
     expect((await findGrant(env.DB, userId, clientId))?.scopes.sort()).toEqual(
       [`vault:${other}:read`, `vault:${vault}:read`].sort(),
     );
   });
+
+  test("a code issued between the read and the write keeps the grant behind it (no token the grant doesn't cover)", async () => {
+    const { userId, vault, sessionId } = await setup("coderace");
+    const { clientId } = await seedApprovedClient({ clientName: "Applet" });
+    const rw = await connect(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`);
+
+    // The revoke is about to delete the grant (its only token); another device's
+    // ask is covered by the grant as it still stands and gets a code first.
+    let pending: Awaited<ReturnType<typeof ask>> | undefined;
+    const racing = raceBeforeGrantWrite(async () => {
+      pending = await ask(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`);
+    });
+    await handleRevoke(racing.db, revokeReq({ token: rw.refresh_token, client_id: clientId }), deps());
+    expect(racing.raced()).toBe(true);
+    expect(pending?.outcome).toBe("skipped");
+
+    expect((await findGrant(env.DB, userId, clientId))?.scopes.sort()).toEqual(
+      [`vault:${vault}:read`, `vault:${vault}:write`].sort(),
+    );
+    await exchange(clientId, pending!.code!, pending!.verifier);
+  });
 });
+
+/** A DB whose first grant write (UPDATE or DELETE) runs `before` just before it executes. */
+function raceBeforeGrantWrite(before: () => Promise<unknown>): { db: D1Database; raced: () => boolean } {
+  let raced = false;
+  const db = new Proxy(env.DB, {
+    get(target, prop) {
+      if (prop === "prepare") {
+        return (sql: string) => {
+          const stmt = target.prepare(sql);
+          if (raced || !/^(UPDATE grants SET scopes|DELETE FROM grants)/.test(sql)) return stmt;
+          raced = true;
+          return new Proxy(stmt, {
+            get(s, p) {
+              if (p === "bind") {
+                return (...args: unknown[]) => {
+                  const bound = s.bind(...args);
+                  return {
+                    run: async () => {
+                      await before();
+                      return bound.run();
+                    },
+                  };
+                };
+              }
+              const v = Reflect.get(s, p);
+              return typeof v === "function" ? v.bind(s) : v;
+            },
+          });
+        };
+      }
+      const v = Reflect.get(target, prop);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+  return { db, raced: () => raced };
+}

@@ -304,10 +304,14 @@ export async function revokeGrant(db: D1Database, userId: string, clientId: stri
  * what it is about to carry.
  *
  * Same write discipline as `recordGrant` and Disconnect: the write lands only
- * on the row it read (UPDATE/DELETE … WHERE scopes = <read>); on a miss it
- * re-reads the grant AND the live tokens and tries again, up to four times,
- * then gives up and leaves the grant as it is (wider than the tokens, which
- * is how it was before this existed). Returns the scopes it removed.
+ * on the row it read (UPDATE/DELETE … WHERE scopes = <read> AND granted_at =
+ * <read>), and only while nothing holds a removed scope, checked in the same
+ * statement; on a miss it re-reads the grant AND the holders and tries again,
+ * up to four times, then gives up and leaves the grant as it is (wider than
+ * the tokens, which is how it was before this existed). Returns the scopes it
+ * removed. One window stays open: an exchange between its code being stamped
+ * used and its token row being inserted (oauth-token.ts) holds nothing this
+ * can see, so that token can end up wider than the grant.
  */
 export async function dropVaultScopesNoLiveTokenHolds(
   db: D1Database,
@@ -320,34 +324,48 @@ export async function dropVaultScopesNoLiveTokenHolds(
   const candidates = new Set(revokedScopes.filter((s) => vaultScopeName(s) !== null));
   if (candidates.size === 0) return [];
   const nowIso = now.toISOString();
+  // What still holds a scope: another live token row, or an unspent code. The
+  // same predicate is read below to decide, and re-checked inside the write.
+  const liveTokens =
+    "FROM tokens t WHERE t.user_id = ? AND t.client_id = ? AND t.jti <> ? AND t.revoked_at IS NULL AND t.expires_at > ?";
+  const unspentCodes = "FROM auth_codes c WHERE c.user_id = ? AND c.client_id = ? AND c.used_at IS NULL AND c.expires_at > ?";
+  const holderBinds = [userId, clientId, revokedJti, nowIso, userId, clientId, nowIso];
   for (let attempt = 0; attempt < 4; attempt++) {
-    const grant = await findGrantRow(db, userId, clientId);
+    const [grantRes, liveRes] = await db.batch([
+      db
+        .prepare("SELECT user_id, client_id, scopes, granted_at FROM grants WHERE user_id = ? AND client_id = ?")
+        .bind(userId, clientId),
+      db.prepare(`SELECT t.scopes ${liveTokens} UNION ALL SELECT c.scopes ${unspentCodes}`).bind(...holderBinds),
+    ]);
+    const grant = (grantRes?.results as GrantRow[] | undefined)?.[0];
     if (!grant) return [];
-    // `jti <> ?` keeps this right whether or not the caller has already marked the row revoked.
-    const live = await db
-      .prepare(
-        `SELECT scopes FROM tokens WHERE user_id = ? AND client_id = ? AND jti <> ? AND revoked_at IS NULL AND expires_at > ?
-         UNION ALL
-         SELECT scopes FROM auth_codes WHERE user_id = ? AND client_id = ? AND used_at IS NULL AND expires_at > ?`,
-      )
-      .bind(userId, clientId, revokedJti, nowIso, userId, clientId, nowIso)
-      .all<{ scopes: string }>();
     const held = new Set<string>();
-    for (const r of live.results ?? []) for (const s of r.scopes.split(" ")) if (s) held.add(s);
+    for (const r of (liveRes?.results ?? []) as Array<{ scopes: string }>) {
+      for (const s of r.scopes.split(" ")) if (s) held.add(s);
+    }
     const scopes = grant.scopes.split(" ").filter((s) => s.length > 0);
-    const removed = scopes.filter((s) => candidates.has(s) && !held.has(s));
-    if (removed.length === 0) return [];
-    const remaining = scopes.filter((s) => !removed.includes(s));
+    const removed = new Set(scopes.filter((s) => candidates.has(s) && !held.has(s)));
+    if (removed.size === 0) return [];
+    const remaining = scopes.filter((s) => !removed.has(s));
+    // Guarded on the row as read (scopes AND granted_at, so a same-scope
+    // re-consent also counts as a change) and on nothing having come to hold
+    // a removed scope since the read: a code issued in between (its INSERT is
+    // itself guarded on the grant, auth-codes.ts issueGrantedAuthCode) makes
+    // this miss and re-read, rather than leave a token the grant doesn't cover.
+    const guard = `user_id = ? AND client_id = ? AND scopes = ? AND granted_at = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(?) j
+         WHERE EXISTS (SELECT 1 ${liveTokens} AND instr(' ' || t.scopes || ' ', ' ' || j.value || ' ') > 0)
+            OR EXISTS (SELECT 1 ${unspentCodes} AND instr(' ' || c.scopes || ' ', ' ' || j.value || ' ') > 0)
+      )`;
+    const guardBinds = [userId, clientId, grant.scopes, grant.granted_at, JSON.stringify([...removed]), ...holderBinds];
     const write =
       remaining.length === 0
-        ? db
-            .prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ? AND scopes = ?")
-            .bind(userId, clientId, grant.scopes)
-        : db
-            .prepare("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ? AND scopes = ?")
-            .bind(remaining.join(" "), userId, clientId, grant.scopes);
+        ? db.prepare(`DELETE FROM grants WHERE ${guard}`).bind(...guardBinds)
+        : db.prepare(`UPDATE grants SET scopes = ? WHERE ${guard}`).bind(remaining.join(" "), ...guardBinds);
     const res = await write.run();
-    if ((res.meta.changes ?? 0) === 1) return removed;
+    if ((res.meta.changes ?? 0) === 1) return [...removed];
   }
+  console.log(`event=grant_narrow_on_revoke_gave_up user=${userId} client=${clientId}`);
   return [];
 }
