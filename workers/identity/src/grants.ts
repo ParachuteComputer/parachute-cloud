@@ -30,12 +30,14 @@
  * consent handler.
  *
  * A REVOKE NARROWS TOO. `/oauth/revoke` takes back the named vault scopes no
- * live token of that user + client still holds
- * ({@link dropVaultScopesNoLiveTokenHolds}), so the grant follows the live
- * tokens and a given-back verb asks for consent again.
+ * other live token (or unspent code) of that user + client still holds
+ * ({@link dropVaultScopesNoLiveTokenHolds}), so a given-back verb asks for
+ * consent again. Only that endpoint does this: rotation, a replay's family
+ * revoke and expiry leave the grant as recorded.
  */
 import { parseComposedAccountScope } from "@openparachute/door-contract";
 import { prepareRevokeClientTokens } from "./tokens.ts";
+import { vaultScopeName } from "./vaults.ts";
 
 /**
  * A vault-family account scope the re-consent REPLACES rather than unions — every
@@ -276,14 +278,6 @@ export async function revokeGrant(db: D1Database, userId: string, clientId: stri
   await db.prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?").bind(userId, clientId).run();
 }
 
-const VAULT_VERBS = new Set(["read", "write", "admin"]);
-
-/** A named per-vault scope, `vault:<name>:<verb>`. The unnamed `vault:<verb>` and every account/module form are not. */
-function isNamedVaultScope(scope: string): boolean {
-  const parts = scope.split(":");
-  return parts.length === 3 && parts[0] === "vault" && parts[1] !== "" && VAULT_VERBS.has(parts[2]!);
-}
-
 /**
  * After a token is revoked, take back the vault scopes its grant no longer
  * stands behind (RFC 7009 §2.1: revoking a token may also revoke "the
@@ -303,7 +297,11 @@ function isNamedVaultScope(scope: string): boolean {
  *
  * Live is what `prepareRevokeClientTokens` means by it: `revoked_at IS NULL
  * AND expires_at > now`. Access and refresh tokens share one row and jti
- * (oauth-token.ts), so one row per authorization.
+ * (oauth-token.ts), so one row per authorization. An unspent, unexpired auth
+ * code of the same user + client counts as holding its scopes too: it is a
+ * token about to be minted (a consent approved on another device a moment
+ * ago, a skip-consent code not yet exchanged), and the grant should not drop
+ * what it is about to carry.
  *
  * Same write discipline as `recordGrant` and Disconnect: the write lands only
  * on the row it read (UPDATE/DELETE … WHERE scopes = <read>); on a miss it
@@ -319,17 +317,20 @@ export async function dropVaultScopesNoLiveTokenHolds(
   revokedScopes: readonly string[],
   now: Date,
 ): Promise<string[]> {
-  const candidates = new Set(revokedScopes.filter(isNamedVaultScope));
+  const candidates = new Set(revokedScopes.filter((s) => vaultScopeName(s) !== null));
   if (candidates.size === 0) return [];
   const nowIso = now.toISOString();
   for (let attempt = 0; attempt < 4; attempt++) {
     const grant = await findGrantRow(db, userId, clientId);
     if (!grant) return [];
+    // `jti <> ?` keeps this right whether or not the caller has already marked the row revoked.
     const live = await db
       .prepare(
-        "SELECT scopes FROM tokens WHERE user_id = ? AND client_id = ? AND jti <> ? AND revoked_at IS NULL AND expires_at > ?",
+        `SELECT scopes FROM tokens WHERE user_id = ? AND client_id = ? AND jti <> ? AND revoked_at IS NULL AND expires_at > ?
+         UNION ALL
+         SELECT scopes FROM auth_codes WHERE user_id = ? AND client_id = ? AND used_at IS NULL AND expires_at > ?`,
       )
-      .bind(userId, clientId, revokedJti, nowIso)
+      .bind(userId, clientId, revokedJti, nowIso, userId, clientId, nowIso)
       .all<{ scopes: string }>();
     const held = new Set<string>();
     for (const r of live.results ?? []) for (const s of r.scopes.split(" ")) if (s) held.add(s);

@@ -216,6 +216,23 @@ describe("/oauth/revoke ends the grant behind the token (vault scopes no live to
     expect((await refresh(clientId, pair.refresh_token)).status).toBe(200);
   });
 
+  test("an unspent code still holds its scopes: a consent approved a moment ago is not taken back", async () => {
+    const { userId, vault, sessionId } = await setup("code");
+    const { clientId } = await seedApprovedClient({ clientName: "Applet" });
+    const rw = await connect(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`);
+    // Another device got a read+write code (covered, no consent page) and hasn't exchanged it yet.
+    const pending = await ask(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`);
+    expect(pending.outcome).toBe("skipped");
+
+    await revoke(rw.refresh_token, clientId, "refresh_token");
+
+    expect((await findGrant(env.DB, userId, clientId))?.scopes.sort()).toEqual(
+      [`vault:${vault}:read`, `vault:${vault}:write`].sort(),
+    );
+    const minted = await exchange(clientId, pending.code!, pending.verifier);
+    expect(minted.scope.split(" ").sort()).toEqual([`vault:${vault}:read`, `vault:${vault}:write`].sort());
+  });
+
   test("a consent that lands between the grant read and the write is not overwritten (the write is on the row it read)", async () => {
     const { userId, vault, other, sessionId } = await setup("race");
     const { clientId } = await seedApprovedClient({ clientName: "Applet" });
