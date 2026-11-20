@@ -125,10 +125,14 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     // in-app), but the field must be honest for any client that does.
     auth: { methods: ["magic_link"], signin_path: "/login" },
     signup_path: "/signup",
-    // `app_client_id` is deliberately NOT advertised here (hub-parity P3,
-    // Q-approved C4-C5 §7.6): the hosted flow never OAuths its home door. The
-    // APP_CLIENT_ID constant stays exported below — the C5 seeded client and
-    // any cross-origin native flow still use it; only the advertisement goes.
+    // `app_client_id` (T-476, #421): the Parachute app (Android, Mac) OAuths this
+    // door, and migration 0033 seeds its reserved client, so the descriptor says
+    // which id it is, as the shared contract's optional field means ("present
+    // only when the door has a reserved client"). The app reads it and signs in
+    // as Parachute instead of registering itself (DCR, "Vault app", unverified).
+    // Hub-parity P3 had dropped it while no client was seeded and the hosted SPA
+    // was the only first-party client (it never OAuths its home door).
+    app_client_id: APP_CLIENT_ID,
     // Cloud v1: create yes; rename NO (the vault name is the immutable global
     // slug / DO address / URL); delete YES since cloud#226 — `DELETE
     // /account/vaults/<name>` is a real teardown (vault-worker destroy, then the

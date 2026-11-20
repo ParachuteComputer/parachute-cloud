@@ -114,6 +114,37 @@ async function setup(prefix: string) {
   return { userId, vault, other, sessionId };
 }
 
+/** The Parachute app's reserved client (migration 0033), pointed at this suite's return address (test storage only). */
+async function seedParachuteApp(): Promise<string> {
+  await env.DB.prepare(
+    `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, scopes, client_name, registered_at, status, same_hub)
+     VALUES ('parachute-app', NULL, ?, '', 'Parachute', ?, 'approved', 0)
+     ON CONFLICT(client_id) DO UPDATE SET redirect_uris = excluded.redirect_uris`,
+  ).bind(JSON.stringify([REDIRECT_URI]), new Date().toISOString()).run();
+  return "parachute-app";
+}
+
+describe("the Parachute app's reserved client (T-476, #421)", () => {
+  test("is a connected app the person sees and can disconnect, and a covered ask still shows the page", async () => {
+    const { userId, vault, sessionId } = await setup("pa");
+    const clientId = await seedParachuteApp();
+    const pair = await connect(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`);
+    // listed, by its name
+    const list = await api("GET", `/account/vaults/${vault}/connections`, await accountBearer(userId, "read"));
+    const conns = ((await list.json()) as { connections: Array<Record<string, unknown>> }).connections;
+    expect(conns.map((c) => [c.client_id, c.client_name])).toEqual([["parachute-app", "Parachute"]]);
+    // its id is public and its loopback anyone's: a grant that covers the ask never skips the page
+    const { challenge } = await makePkce();
+    const again = await worker.fetch(authorizeGetReq({ client_id: clientId, redirect_uri: REDIRECT_URI, response_type: "code", scope: `vault:${vault}:read`, code_challenge: challenge, code_challenge_method: "S256" }, sessionId), env);
+    expect(again.status).toBe(200);
+    expect(await again.text()).toContain('data-testid="consent-ask"');
+    // and Disconnect ends it: the refresh token is dead
+    const res = await api("DELETE", `/account/vaults/${vault}/connections/${clientId}`, await accountBearer(userId, "admin"));
+    expect(((await res.json()) as { disconnected: boolean }).disconnected).toBe(true);
+    expect((await refresh(clientId, pair.refresh_token)).status).toBe(400);
+  });
+});
+
 describe("GET /account/vaults/<name>/connections", () => {
   test("lists the app connected to this vault — name, when, last used, access — and nothing for another vault", async () => {
     const { userId, vault, other, sessionId } = await setup("ls");

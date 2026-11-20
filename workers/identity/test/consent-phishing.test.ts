@@ -225,12 +225,28 @@ describe("F2: /oauth/register reserves Parachute's name for first-party registra
     expect(returnsTo(html)).toContain("<code>https://myhub.example</code>");
   });
 
-  test("Parachute's own reserved client ids (operator-seeded, e.g. the native app) are not labelled unverified", async () => {
-    const uri = "computer.parachute.app:/oauth/callback";
-    await registerClient(env.DB, { clientId: "parachute-app", redirectUris: [uri], clientName: "Parachute", status: "approved" });
+  test("the Parachute app's reserved client (migration 0033) is named Parachute and not labelled unverified (#421)", async () => {
+    const uri = "http://127.0.0.1:47219/oauth/callback";
     const html = await consentHtml("parachute-app", uri, "native-first-party@example.com");
+    expect(html).toContain("Connect Parachute");
+    expect(html).not.toContain("Vault app");
     expect(html).not.toContain('data-testid="consent-unverified"');
-    expect(returnsTo(html)).toContain("an app on this device");
+    expect(returnsTo(html)).toContain("<code>http://127.0.0.1:47219</code>");
+  });
+
+  test("the reserved client sends a code only to the app's own loopback: any other return address is refused", async () => {
+    for (const uri of ["http://127.0.0.1:47220/oauth/callback", "http://127.0.0.1:47219/elsewhere", EVIL]) {
+      const html = await consentHtml("parachute-app", uri, `native-other-${uri.length}@example.com`).catch((e: unknown) => String(e));
+      expect(html).not.toContain("Connect Parachute");
+    }
+  });
+
+  test("a registration can't take the app's name or id, even with its exact loopback return address", async () => {
+    const res = await register({ client_name: "Parachute", redirect_uris: ["http://127.0.0.1:47219/oauth/callback"] });
+    expect(res.status).toBe(400);
+    const named = await register({ client_name: "Vault app", redirect_uris: ["http://127.0.0.1:47219/oauth/callback"] });
+    expect(named.status).toBe(201);
+    expect(((await named.json()) as { client_id: string }).client_id).not.toBe("parachute-app");
   });
 
   test("clients already registered under a Parachute-like name are untouched", async () => {

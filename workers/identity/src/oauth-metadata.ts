@@ -42,6 +42,8 @@ export function authorizationServerMetadata(deps: OAuthDeps): Response {
       response_types_supported: ["code"],
       grant_types_supported: ["authorization_code", "refresh_token"],
       code_challenge_methods_supported: ["S256"],
+      // RFC 9207: every code redirect carries `iss` (oauth-authorize.ts issueAuthCodeRedirect)
+      authorization_response_iss_parameter_supported: true,
       token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
       scopes_supported: ADVERTISED_SCOPES,
     },

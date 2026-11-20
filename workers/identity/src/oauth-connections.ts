@@ -45,7 +45,10 @@ import { prepareRevokeClientTokens } from "./tokens.ts";
 import { userOwnsVault } from "./vaults.ts";
 
 /** Parachute's own clients — never shown as a "connected app". */
-const FIRST_PARTY_CLIENTS = new Set([CONSOLE_CLIENT_ID, APP_CLIENT_ID, ACCOUNT_TOKEN_CLIENT_ID]);
+const FIRST_PARTY_CLIENTS = new Set([CONSOLE_CLIENT_ID, ACCOUNT_TOKEN_CLIENT_ID]);
+/** Clients Parachute vouches for on the Allow screen: its own, and the Parachute app's reserved id. The app is listed
+ *  as a connected app (it holds vault tokens on every device the person signs in on), so it can be disconnected. */
+const VOUCHED_CLIENTS = new Set([...FIRST_PARTY_CLIENTS, APP_CLIENT_ID]);
 
 /**
  * Whether Parachute can vouch for this client on the Allow screen (T-419,
@@ -58,7 +61,7 @@ const FIRST_PARTY_CLIENTS = new Set([CONSOLE_CLIENT_ID, APP_CLIENT_ID, ACCOUNT_T
  * origin", and outside a browser anyone with an account can send that header.
  */
 export function isVouchedClient(client: OAuthClient, firstPartyOrigins: readonly string[]): boolean {
-  return FIRST_PARTY_CLIENTS.has(client.clientId) || redirectsAreFirstParty(client.redirectUris, firstPartyOrigins);
+  return VOUCHED_CLIENTS.has(client.clientId) || redirectsAreFirstParty(client.redirectUris, firstPartyOrigins);
 }
 
 const VERB_RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };

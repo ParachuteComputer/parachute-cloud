@@ -30,6 +30,7 @@ import {
   retireSupersededConnections,
 } from "./oauth-connections.ts";
 import { GrantWriteConflictError, isCoveredByGrant, recordGrant } from "./grants.ts";
+import { APP_CLIENT_ID } from "./account-descriptor.ts";
 import { listVaultsForOwner, unownedNamedVaults, userOwnsVault } from "./vaults.ts";
 import {
   SESSION_COOKIE,
@@ -377,6 +378,9 @@ async function issueAuthCodeRedirect(
   const u = new URL(params.redirectUri);
   u.searchParams.set("code", code.code);
   if (params.state) u.searchParams.set("state", params.state);
+  // RFC 9207: who sent this code. A public client whose return address other servers share (the Parachute app's
+  // loopback) tells a code from this issuer apart from one a stranger's server sent it on to (a mix-up).
+  u.searchParams.set("iss", deps.issuer);
   return redirectResponse(u.toString());
 }
 
@@ -494,9 +498,12 @@ async function authorizeCore(
   if (ownershipDenied) return ownershipDenied;
 
   // Skip-consent when a prior grant covers the request. Unnamed vault verbs
-  // always render consent (the vault choice isn't recorded literally).
+  // always render consent (the vault choice isn't recorded literally). Never for
+  // the Parachute app's reserved id: it is public (the descriptor names it) and
+  // returns to a loopback any program on the device can hold, so a covered grant
+  // would hand that program a code with no page (RFC 8252 §8.6).
   const hasUnnamedVault = unnamedVaultVerbs(requestedScopes).length > 0;
-  if (!hasUnnamedVault && (await isCoveredByGrant(db, session.userId, client.clientId, requestedScopes))) {
+  if (!hasUnnamedVault && client.clientId !== APP_CLIENT_ID && (await isCoveredByGrant(db, session.userId, client.clientId, requestedScopes))) {
     const redirect = await issueAuthCodeRedirect(db, params, requestedScopes, session.userId, session.id, deps);
     if (redirect) return redirect;
     // Disconnected between the grant read and the code insert: ask again.
