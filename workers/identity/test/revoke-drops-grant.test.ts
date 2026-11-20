@@ -126,12 +126,14 @@ async function setup(prefix: string) {
   return { userId, vault, other, sessionId };
 }
 
-/** The Parachute app's own pinned client id (first-party; no exemption from this). */
+/** The Parachute app's own pinned client id (first-party; no exemption from this). Migration 0033 seeds it with the
+ *  app's loopback; here it returns to this suite's address (the test's own storage, rolled back after it). */
 async function seedAppClient(): Promise<string> {
   const clientId = "parachute-app";
   await env.DB.prepare(
-    `INSERT OR IGNORE INTO clients (client_id, client_secret_hash, redirect_uris, scopes, client_name, registered_at, status, same_hub)
-     VALUES (?, NULL, ?, '', 'Parachute', ?, 'approved', 0)`,
+    `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, scopes, client_name, registered_at, status, same_hub)
+     VALUES (?, NULL, ?, '', 'Parachute', ?, 'approved', 0)
+     ON CONFLICT(client_id) DO UPDATE SET redirect_uris = excluded.redirect_uris`,
   )
     .bind(clientId, JSON.stringify([REDIRECT_URI]), new Date().toISOString())
     .run();

@@ -120,11 +120,9 @@ describe("discovery endpoints", () => {
     expect(checkAccountDescriptor(md, { issuer: ISSUER, door: "cloud" })).toEqual([]);
     // Cloud's door-specific values.
     expect(md.signup_path).toBe("/signup");
-    // hub-parity P3: the descriptor no longer advertises app_client_id (the
-    // hosted flow never OAuths its home door) — the APP_CLIENT_ID constant
-    // stays exported for the C5 seeded client + cross-origin native flows, only
-    // the advertisement is gone.
-    expect(md.app_client_id).toBeUndefined();
+    // T-476 (#421): the Parachute app's reserved client (migration 0033) is
+    // advertised, so the app signs in as Parachute rather than registering itself.
+    expect(md.app_client_id).toBe("parachute-app");
     // hub-parity P3: the auth block — magic-link-first sign-in, the /login
     // ceremony that also carries password + next.
     expect(md.auth).toEqual({ methods: ["magic_link"], signin_path: "/login" });
