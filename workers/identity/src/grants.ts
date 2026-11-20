@@ -28,9 +28,16 @@
  * same D1 batch as the grant write. See `recordGrant` for why the trigger is
  * "moved" rather than "narrowed", and why it belongs here and not in the
  * consent handler.
+ *
+ * A REVOKE NARROWS TOO. `/oauth/revoke` takes back the named vault scopes no
+ * other live token (or unspent code) of that user + client still holds
+ * ({@link dropVaultScopesNoLiveTokenHolds}), so a given-back verb asks for
+ * consent again. Only that endpoint does this: rotation, a replay's family
+ * revoke and expiry leave the grant as recorded.
  */
 import { parseComposedAccountScope } from "@openparachute/door-contract";
 import { prepareRevokeClientTokens } from "./tokens.ts";
+import { vaultScopeName } from "./vaults.ts";
 
 /**
  * A vault-family account scope the re-consent REPLACES rather than unions — every
@@ -269,4 +276,96 @@ export async function isCoveredByGrant(
 /** Delete the standing consent for (user, client). Brings consent back. */
 export async function revokeGrant(db: D1Database, userId: string, clientId: string): Promise<void> {
   await db.prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?").bind(userId, clientId).run();
+}
+
+/**
+ * After a token is revoked, take back the vault scopes its grant no longer
+ * stands behind (RFC 7009 §2.1: revoking a token may also revoke "the
+ * underlying authorization grant"). For each named `vault:<name>:<verb>` in
+ * `revokedScopes`, if no OTHER live token row of this user + client carries
+ * that exact scope, it leaves the (user, client) grant; the row is deleted
+ * when nothing is left. So "revoke" means the hub asks again next time: an
+ * app that gives back write (asks for read alone, keeps that token, revokes
+ * the read+write one) is shown the consent page the next time it asks for
+ * write, instead of skipping it on the UNION of everything it was ever given.
+ *
+ * Only named vault scopes move. Account-family scopes (`account:<id>:…`,
+ * including module grants), the unnamed `vault:<verb>` and anything else stay
+ * as recorded. They narrow by their own paths: the account-vaults consent
+ * re-elects every time and family-replaces (`recordGrant`), and Disconnect
+ * drops an account-wide grant whole.
+ *
+ * Live is what `prepareRevokeClientTokens` means by it: `revoked_at IS NULL
+ * AND expires_at > now`. Access and refresh tokens share one row and jti
+ * (oauth-token.ts), so one row per authorization. An unspent, unexpired auth
+ * code of the same user + client counts as holding its scopes too: it is a
+ * token about to be minted (a consent approved on another device a moment
+ * ago, a skip-consent code not yet exchanged), and the grant should not drop
+ * what it is about to carry.
+ *
+ * Same write discipline as `recordGrant` and Disconnect: the write lands only
+ * on the row it read (UPDATE/DELETE … WHERE scopes = <read> AND granted_at =
+ * <read>), and only while nothing holds a removed scope, checked in the same
+ * statement; on a miss it re-reads the grant AND the holders and tries again,
+ * up to four times, then gives up and leaves the grant as it is (wider than
+ * the tokens, which is how it was before this existed). Returns the scopes it
+ * removed. One window stays open: an exchange between its code being stamped
+ * used and its token row being inserted (oauth-token.ts) holds nothing this
+ * can see, so that token can end up wider than the grant.
+ */
+export async function dropVaultScopesNoLiveTokenHolds(
+  db: D1Database,
+  userId: string,
+  clientId: string,
+  revokedJti: string,
+  revokedScopes: readonly string[],
+  now: Date,
+): Promise<string[]> {
+  const candidates = new Set(revokedScopes.filter((s) => vaultScopeName(s) !== null));
+  if (candidates.size === 0) return [];
+  const nowIso = now.toISOString();
+  // What still holds a scope: another live token row, or an unspent code. The
+  // same predicate is read below to decide, and re-checked inside the write.
+  const liveTokens =
+    "FROM tokens t WHERE t.user_id = ? AND t.client_id = ? AND t.jti <> ? AND t.revoked_at IS NULL AND t.expires_at > ?";
+  const unspentCodes = "FROM auth_codes c WHERE c.user_id = ? AND c.client_id = ? AND c.used_at IS NULL AND c.expires_at > ?";
+  const holderBinds = [userId, clientId, revokedJti, nowIso, userId, clientId, nowIso];
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const [grantRes, liveRes] = await db.batch([
+      db
+        .prepare("SELECT user_id, client_id, scopes, granted_at FROM grants WHERE user_id = ? AND client_id = ?")
+        .bind(userId, clientId),
+      db.prepare(`SELECT t.scopes ${liveTokens} UNION ALL SELECT c.scopes ${unspentCodes}`).bind(...holderBinds),
+    ]);
+    const grant = (grantRes?.results as GrantRow[] | undefined)?.[0];
+    if (!grant) return [];
+    const held = new Set<string>();
+    for (const r of (liveRes?.results ?? []) as Array<{ scopes: string }>) {
+      for (const s of r.scopes.split(" ")) if (s) held.add(s);
+    }
+    const scopes = grant.scopes.split(" ").filter((s) => s.length > 0);
+    const removed = new Set(scopes.filter((s) => candidates.has(s) && !held.has(s)));
+    if (removed.size === 0) return [];
+    const remaining = scopes.filter((s) => !removed.has(s));
+    // Guarded on the row as read (scopes AND granted_at, so a same-scope
+    // re-consent also counts as a change) and on nothing having come to hold
+    // a removed scope since the read: a code issued in between (its INSERT is
+    // itself guarded on the grant, auth-codes.ts issueGrantedAuthCode) makes
+    // this miss and re-read, rather than leave a token the grant doesn't cover.
+    const guard = `user_id = ? AND client_id = ? AND scopes = ? AND granted_at = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(?) j
+         WHERE EXISTS (SELECT 1 ${liveTokens} AND instr(' ' || t.scopes || ' ', ' ' || j.value || ' ') > 0)
+            OR EXISTS (SELECT 1 ${unspentCodes} AND instr(' ' || c.scopes || ' ', ' ' || j.value || ' ') > 0)
+      )`;
+    const guardBinds = [userId, clientId, grant.scopes, grant.granted_at, JSON.stringify([...removed]), ...holderBinds];
+    const write =
+      remaining.length === 0
+        ? db.prepare(`DELETE FROM grants WHERE ${guard}`).bind(...guardBinds)
+        : db.prepare(`UPDATE grants SET scopes = ? WHERE ${guard}`).bind(remaining.join(" "), ...guardBinds);
+    const res = await write.run();
+    if ((res.meta.changes ?? 0) === 1) return [...removed];
+  }
+  console.log(`event=grant_narrow_on_revoke_gave_up user=${userId} client=${clientId}`);
+  return [];
 }
