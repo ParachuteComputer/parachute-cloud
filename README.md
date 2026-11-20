@@ -1,49 +1,32 @@
 # Parachute Cloud
 
-The managed cloud offering from **Open Parachute PBC**. Pay us, get a working Parachute stack — your own URL at `<you>.parachute.computer`, your hub running, your vault waiting, your transcription pipeline attached. Sixty seconds from sign-up to writing.
+Parachute is your own vault that any AI can read and write, and an app that shows you what is in it. **Parachute
+Cloud runs it for you**: sign up with an email at [my.parachute.computer](https://my.parachute.computer/console), and
+each of your vaults has its address for an AI, `https://my.parachute.computer/vault/<name>/mcp`. Using it and building
+on it: [parachute.computer/docs](https://parachute.computer/docs/) (Cloud:
+[docs/run/cloud](https://parachute.computer/docs/run/cloud/)). Pricing: [parachute.computer/pricing](https://parachute.computer/pricing/).
 
-> **Status:** Phase 0 scaffold. Nothing is deployed yet. The product surface lives at [`parachute.computer/cloud`](https://parachute.computer/cloud) (when it exists); this repo is the control plane that provisions and bills.
+This repo is the hosted door, from Open Parachute PBC. The vault engine is the same as on a server of your own
+(`@openparachute/core`, from [parachute-core](https://github.com/ParachuteComputer/parachute-core)); this repo runs it
+on Cloudflare and adds accounts, sign-in and billing.
 
-## What you get
+## How it runs
 
-A dedicated VM with the full Tier 1 Parachute stack pre-installed:
+- **`workers/vault/`**: one Durable Object per vault, whose SQLite is the vault, behind an edge router: the REST
+  routes, the MCP endpoint, live queries, files in R2, export.
+- **`workers/identity/`**: the OAuth issuer (`cloud.parachute.computer`), the account pages and `/account/*` API,
+  billing (Stripe), and the operators' jobs. Accounts live in D1.
+- **`src/`**: the control plane of an earlier design (a machine per person on Fly), dormant since 2026-07. Not
+  deployed; kept to harvest from.
 
-- **`parachute-hub`** — your portal, your OAuth issuer, your service catalog at `<you>.parachute.computer`.
-- **`parachute-vault`** — your knowledge vault. Notes, tags, wikilinks, MCP tools. Same engine as self-hosted.
-- **`parachute-scribe`** — voice transcription. Same engine as self-hosted.
-- **`parachute-notes`** — the PWA. Capture from your phone, keep working offline.
+The MCP tools and REST routes are held to a server of your own's by a shared test: `scripts/door-parity.sh` runs
+parachute-core's door contracts against both workers and compares the answers with a box's.
 
-Same code as the open-source self-hosted distribution. We just operate it for you.
+## Working on it
 
-## Who it's for
+[CLAUDE.md](CLAUDE.md) has the commands, the deploy and smoke scripts, and the gotchas. Production deploys happen
+only from `scripts/deploy-prod.sh` by the people who own the account.
 
-People who want Parachute working without having to install Bun, run a daemon, manage a Tailscale tunnel, or babysit a VPS. You sign up, you pay, you write. We run the machine.
+## Licence
 
-If you'd rather run it yourself: [`parachute-hub`](https://github.com/ParachuteComputer/parachute-hub) is the right starting point — same code, free forever, AGPL-3.0.
-
-## Pricing (working draft)
-
-Pricing not finalized. Working sketch from the cloud-shape design doc:
-
-| Tier | Price | What you get |
-|---|---|---|
-| **Starter** | ~$15/mo | Tier 1 stack, scribe metered |
-| **Pro** | ~$30/mo | Larger scribe quota, custom domain |
-
-Final numbers land before public launch.
-
-## What's not in the cloud (Tier 2)
-
-`paraclaw` — the Parachute distribution of Claude Code with vault integration — runs on **your own dev machine** and federates back to your cloud hub for identity and memory. It's the "agent layer," distinct from the "personal-knowledge layer" that runs in the cloud. See the [`paraclaw`](https://github.com/ParachuteComputer/paraclaw) repo when it's public.
-
-## How it works (for the curious)
-
-The control plane in this repo provisions a Fly Machine per tenant, runs a first-boot bootstrap that installs the configured modules onto a bind-mounted persistent volume, points DNS at the machine, and hands you a URL. Stripe handles billing; Anthropic OAuth (or email/password / Google / GitHub) handles signup.
-
-The provider underneath is an implementation detail. You see "Parachute Computer." We see Fly today, possibly something else tomorrow. Migrations between providers are our job, not yours.
-
-Architectural rationale lives in `parachute-vault/docs/design/2026-04-29-parachute-cloud-shape.md`.
-
-## License
-
-AGPL-3.0.
+AGPL-3.0 ([LICENSE](LICENSE)).
