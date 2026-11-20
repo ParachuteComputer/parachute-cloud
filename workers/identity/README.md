@@ -20,7 +20,7 @@ pinned by the conformance corpus.
 | `GET/POST /oauth/authorize` | PKCE-S256 auth-code flow + login/consent |
 | `POST /oauth/token` | `authorization_code` + `refresh_token` (rotation + grace + family revoke) |
 | `POST /oauth/register` | RFC 7591 DCR (`none` + `client_secret_post`) |
-| `POST /oauth/revoke` | RFC 7009 (always 200) |
+| `POST /oauth/revoke` | RFC 7009 (always 200); a live token's `vault:<name>:<verb>` scopes no other live token of that user + client holds leave the grant, so the next ask shows consent |
 
 Token response: `{access_token, token_type:"Bearer", expires_in:900,
 refresh_token, scope, services}`. The `services` catalog maps `vault` /
