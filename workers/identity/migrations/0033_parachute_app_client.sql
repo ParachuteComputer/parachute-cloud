@@ -4,10 +4,10 @@
 -- DCR always mints a random UUID). Before this, the app registered as "Vault app" (the name "Parachute" is reserved)
 -- and every consent page said "Unverified app".
 --
--- Its one return address is the app's own loopback catcher (src-tauri, port 47219). What stays true of any native app:
--- another program on the same device listening on that port while Parachute isn't could start a sign-in under this
--- id; the person still signs in and allows it on Cloud's own page, and the page says it returns to "an app on this
--- device". The same exposure the self-hosted names in oauth-register.ts already accept.
+-- Its one return address is the app's own loopback (http://127.0.0.1:47219/oauth/callback). The app catches it in its
+-- webview; nothing listens on that port, so any program on the device could hold it, and the id is public (the
+-- descriptor names it). So this id is never given a code without the consent page (oauth-authorize.ts), every code
+-- carries iss (RFC 9207) for the app to check, and it is listed under Connected apps, where Disconnect ends it.
 --
 -- INSERT OR IGNORE: an operator-seeded row (or a later migration's) is never overwritten. Approved: no review queue.
 INSERT OR IGNORE INTO clients (client_id, client_secret_hash, redirect_uris, scopes, client_name, registered_at, status, same_hub)
