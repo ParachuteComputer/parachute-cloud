@@ -111,6 +111,12 @@ describe("discovery endpoints", () => {
     expect(Array.isArray(body.jtis)).toBe(true);
   });
 
+  test("the authorization server says each code carries who sent it (RFC 9207 iss)", async () => {
+    const res = await app.fetch(new Request(`${ISSUER}/.well-known/oauth-authorization-server`), env);
+    const md = (await res.json()) as Record<string, unknown>;
+    expect(md.authorization_response_iss_parameter_supported).toBe(true);
+  });
+
   test("parachute-account descriptor (C4) conforms to the shared contract", async () => {
     const res = await app.fetch(new Request(`${ISSUER}/.well-known/parachute-account`), env);
     expect(res.status).toBe(200);

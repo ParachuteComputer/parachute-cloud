@@ -88,8 +88,11 @@ async function ask(
   const { verifier, challenge } = await makePkce();
   const res = await worker.fetch(authorizeGetReq(authorizeQuery(clientId, scope, challenge), sessionId), env);
   if (res.status === 302) {
-    const code = new URL(res.headers.get("location")!).searchParams.get("code");
+    const back = new URL(res.headers.get("location")!);
+    const code = back.searchParams.get("code");
     expect(code).toBeTruthy();
+    // RFC 9207: the code says who sent it
+    expect(back.searchParams.get("iss")).toBe(ISSUER);
     return { outcome: "skipped", code: code!, verifier };
   }
   expect(res.status).toBe(200);
@@ -147,17 +150,19 @@ describe("/oauth/revoke ends the grant behind the token (vault scopes no live to
       const clientId = kind === "a registered app" ? (await seedApprovedClient({ clientName: "Applet" })).clientId : await seedAppClient();
       const rw = await connect(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`);
 
-      // The app asks for read alone: the grant covers it, no consent page.
+      // The app asks for read alone: the grant covers it, no consent page. The Parachute app's public reserved id is
+      // always asked (oauth-authorize.ts): the person approves the narrower ask.
+      const app = kind !== "a registered app";
       const readAsk = await ask(clientId, sessionId, `vault:${vault}:read`);
-      expect(readAsk.outcome).toBe("skipped");
-      const ro = await exchange(clientId, readAsk.code!, readAsk.verifier);
+      expect(readAsk.outcome).toBe(app ? "consent" : "skipped");
+      const ro = app ? await connect(clientId, sessionId, `vault:${vault}:read`) : await exchange(clientId, readAsk.code!, readAsk.verifier);
 
       // …then revokes the read+write token (RFC 7009, the refresh token).
       await revoke(rw.refresh_token, clientId, "refresh_token");
 
       expect((await findGrant(env.DB, userId, clientId))?.scopes).toEqual([`vault:${vault}:read`]);
       expect((await ask(clientId, sessionId, `vault:${vault}:read vault:${vault}:write`)).outcome).toBe("consent");
-      expect((await ask(clientId, sessionId, `vault:${vault}:read`)).outcome).toBe("skipped");
+      expect((await ask(clientId, sessionId, `vault:${vault}:read`)).outcome).toBe(app ? "consent" : "skipped");
       // The token it kept still works.
       expect((await refresh(clientId, ro.refresh_token)).status).toBe(200);
     });
