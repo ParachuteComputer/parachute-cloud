@@ -20,6 +20,8 @@ const deployed = Object.fromEntries(
 );
 const ID = deployed.IDENTITY!.replace(/\/$/, "");
 const VAULT = deployed.VAULT!.replace(/\/$/, "");
+// The address the door gives out: its public name when it has one (PUBLIC, T-335), else the identity's own origin.
+const PUBLIC = (deployed.PUBLIC || ID).replace(/\/$/, "");
 const owner = existsSync(join(privateDir, "owner.key")) ? readSecret(join(privateDir, "owner.key")) : null;
 // ADMIN_KEY_FILE: the admin's own key file where it lives (a real deploy: never copied into the private dir).
 const admin = readSecret(process.env.ADMIN_KEY_FILE || join(privateDir, "admin.key"));
@@ -126,16 +128,17 @@ res(!!vaultToken, "vault-token", `mint ${vt.status}`);
   );
 }
 
-// 4b. One address (T-476): the door gives out its own origin for vaults, and a vault answers there, as the app needs
+// 4b. One address (T-476): the door gives out its own address for vaults (its public name when it has one, T-335), and
+// a vault answers on the origin asked here too, as the app needs
 {
   const d = await j(`${ID}/.well-known/parachute-account`);
   const template = String(d.body?.vault_url_template ?? "");
   const q = await j(`${ID}/vault/${vaultName}/api/records?type=episode`, { token: vaultToken });
   const rows = Array.isArray(q.body) ? q.body : q.body?.records ?? [];
   res(
-    template === `${ID}/vault/{name}` && q.status === 200 && rows.length === 1,
+    template === `${PUBLIC}/vault/{name}` && q.status === 200 && rows.length === 1,
     "one-address",
-    `vault_url_template on the door: ${template.startsWith(ID)}, records through the door ${q.status} → ${rows.length}`,
+    `vault_url_template is ${PUBLIC === ID ? "the door's own" : "the public name's"}: ${template === `${PUBLIC}/vault/{name}`}, records through the door ${q.status} → ${rows.length}`,
   );
 }
 

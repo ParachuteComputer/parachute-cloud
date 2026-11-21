@@ -16,11 +16,15 @@ pilot (`arcade-parachute-*`, T-335).
   is untouched.
 - **Closed**: no sign-up mail is ever sent (no mail binding), billing is off (no Stripe), the owner starts on
   `OWNER_PLAN` (default `power`: 10 vaults, 50 GiB of attachments).
-- **One address**: `https://<PREFIX>-identity.<sub>.workers.dev` (or `IDENTITY_DOMAIN`, when set) is your Parachute. Sign-in, the account, every
+- **One address**: `https://<PREFIX>-identity.<sub>.workers.dev` (and `PUBLIC_DOMAIN`, when set) is your Parachute. Sign-in, the account, every
   vault (`/vault/<name>`, its REST and `/mcp`) and the root `/mcp` (every vault an AI may reach) answer there; the
   identity worker hands `/vault/*` and `/mcp` to the vault worker over their service binding. The vault worker's own address still works for anything already pointed at it.
-- **workers.dev** by default; a custom domain is optional (`VAULT_DOMAIN`, `IDENTITY_DOMAIN`, each a Custom Domain on
-  a zone of the same account).
+- **workers.dev** always; one public name is optional (`PUBLIC_DOMAIN`, a host on a zone of the same account). The
+  identity worker takes it as a Custom Domain, so the whole door answers there too (`/mcp`, `/account/mcp`,
+  `/vault/<name>/…`), and it becomes the address the door gives out for vaults. The issuer stays the workers.dev
+  identity (sign-in and consent happen there, as Cloud's happen at `cloud.` while people connect at `my.`), so every
+  token, key and connection made before keeps working at both names. The Parachute app takes the issuer's address
+  (below).
 - **Backups**: every night at 04:00 UTC each vault is snapshotted into R2 (`<PREFIX>-vault`, under
   `vault-<name>/snapshots/`) with 14 daily, 8 weekly and 12 monthly kept. Attachments live in the same bucket.
   Restore is one call (below), always into a new vault.
@@ -36,7 +40,7 @@ WORKERS_SUBDOMAIN=           # <sub>.workers.dev; blank: asked of the account du
 OWNER_PUBKEY=npub1...        # or 64 hex; "rehearsal": a made-up key made by the deploy (staging only)
 ADMIN_PUBKEYS=npub1...       # comma- or space-separated; "rehearsal" as above
 OWNER_PLAN=power             # entry | standard | plus | power
-# VAULT_DOMAIN=vault.example.com  IDENTITY_DOMAIN=id.example.com   (optional)
+# PUBLIC_DOMAIN=parachute.example.com   (optional: one public name, on the identity worker)
 ```
 
 Beside it, `private/` (0700) holds what is never printed: the ops token the deploy makes, and a rehearsal's keys.
@@ -53,13 +57,18 @@ bun deploy/personal/smoke.ts <evidence>/deployed.env <private dir> <evidence>/SU
 ```
 
 An API token instead of `wrangler login` needs, on that account: Workers Scripts Edit, D1 Edit and Workers R2 Storage
-Edit (set `WORKERS_SUBDOMAIN` in the profile if the token can't read it). A custom domain (`VAULT_DOMAIN`,
-`IDENTITY_DOMAIN`) also needs that zone's Workers Routes Edit and DNS Edit. The smoke needs the profile's own keys in
+Edit (set `WORKERS_SUBDOMAIN` in the profile if the token can't read it). A public name
+(`PUBLIC_DOMAIN`) also needs that zone's DNS Edit. The smoke needs the profile's own keys in
 `private/` (`owner.key`, `admin.key`), so it runs as is only on a rehearsal profile.
 
 **In a sealed job** (Uni's way): the job needs three templates on the profile's account: `d1-write`, `r2-admin`,
 `workers-scripts-write`, and every wrangler call gets its own short-lived child key through `./wr`
-(`sealed job --payload <job.json> -- bash deploy/personal/deploy.sh …`).
+(`sealed job --payload <job.json> -- bash deploy/personal/deploy.sh …`). With `PUBLIC_DOMAIN` the job is one template
+instead, `worker-app` with the name's zone (the job's `zone_id`): it holds the three above plus DNS on that zone, and
+every wrangler call takes a `worker-app` child. Run without a terminal, wrangler replaces a DNS record already on the
+name, so back that record up first if the name was in use. Taking the name off again is not a redeploy (wrangler
+leaves a Custom Domain in place): delete it through the API (`DELETE /accounts/<id>/workers/domains/<domain id>`), then
+redeploy without `PUBLIC_DOMAIN`.
 
 The deploy is idempotent: run it again to upgrade in place. It refuses a non-0.9 engine pin, a dirty checkout, a
 Parachute Cloud account and any `parachute-*` or `arcade-parachute*` prefix.
@@ -90,6 +99,8 @@ may send `Parachute-On-Behalf-Of: client-42` (on MCP, the write tool's `on_behal
 On a phone or the desktop app, with your key in the app (Settings → your key; paste your nsec under Advanced): type
 your Parachute's address (the identity one), choose **Mine**, **Sign in**. The app signs one request with the key
 (`POST /account/token`), opens a one-time sign-in link, and you allow it on the consent page. This needs an app build that includes ParachuteComputer/parachute#136 (merged 2026-11-21); an older one says "This hub doesn't take a key to sign in".
+With a public name, the app still takes the identity's workers.dev address: it accepts only a hub that names itself
+as the issuer, and the issuer stays workers.dev.
 
 In a browser tab (the web build) there is no key, and this door sends no mail, so its sign-in page's email link goes
 nowhere. Open a browser session first with the session link below, then sign in from the web build.
