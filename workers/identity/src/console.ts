@@ -89,7 +89,8 @@ import {
   canStartCheckout,
   entitlementPlanFor,
   livePlan,
-  vaultLimitPlan,
+  activeVaultLimitOverride,
+  vaultLimitFor,
   isPaidTier,
   isPlanId,
   planEntitlement,
@@ -463,11 +464,12 @@ async function renderConsoleFor(
       // Trial/expired with no live subscription → the tier chooser + promo box
       // render; a paid tier gets Manage-billing; a live sub gets neither.
       canCheckout: canStartCheckout(user.plan),
-      // At (or over — grandfathered) the plan's vault count: the create form
+      // At (or over — grandfathered) the account's vault limit (vaultLimitFor): the create form
       // gives way to the friendly at-cap note. The POST handler is the real
       // gate; this just keeps the UI honest.
-      atVaultCap: cards.length >= PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))].vault_count,
+      atVaultCap: cards.length >= vaultLimitFor(user, billingModeOf(deps)),
       pendingPlan: user.pendingPlan,
+      vaultLimitOverride: activeVaultLimitOverride(user, billingModeOf(deps)),
       // Operators get the quiet Admin header link (the surface itself 404s
       // for everyone else — admin.ts).
       isOperator: user.role === "operator",
@@ -698,9 +700,8 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   // with no vaults has vault_count=0, so 0 >= 0 always refuses here with the
   // at-cap message even though they've never made a vault. Give them a distinct
   // "pick a plan to create your first vault" path instead of the cap wall.
-  const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
-  if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-    return fail(vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
+  if ((await countVaultsForOwner(db, user.id)) >= vaultLimitFor(user, billingModeOf(deps))) {
+    return fail(vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan, user.vaultLimitOverride));
   }
   try {
     const vault = await createVault(db, rawName, user.id, deps.now?.() ?? new Date());
@@ -848,7 +849,7 @@ async function importFailureResponse(
  *
  * The user-facing trust boundary mirrors the create door (an import CREATES a
  * vault): session + CSRF + same-origin + vault-name validation identical to
- * create + the plan vault-count cap (expired, vault_count 0, is refused here
+ * create + the account's vault limit (vaultLimitFor; expired, 0, is refused here
  * exactly as create refuses it). Then: create (or, for a retry, REUSE) the
  * target vault → push the plan cap → forward the tar to the target DO's
  * `POST /api/internal/import` through the mint seam (first-party admin,
@@ -910,7 +911,7 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
     return consoleError(db, req, deps, user, importTooLargeMessage());
   }
 
-  // Reuse-or-create, the plan's vault count, the forward and the retry gate are the account door's too
+  // Reuse-or-create, the account's vault limit, the forward and the retry gate are the account door's too
   // (import-door.ts). A failed import never frees the name: the row stays this caller's and a retry converges.
   const result = await importAsOwner(db, deps, user, rawName, buf, startedMs);
   if (result.kind === "name_taken") return consoleError(db, req, deps, user, "That vault name is already taken.");
@@ -1013,7 +1014,7 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
   if (!spec.restore) return routerNotFound();
   // The new vault a restore makes counts against the same limit as any other
   // creation (a former Power subscriber keeps ten in open beta).
-  const vaultLimit = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))].vault_count;
+  const vaultLimit = vaultLimitFor(user, billingModeOf(deps));
 
   const form = await req.formData();
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
@@ -1076,10 +1077,10 @@ export async function restoreSnapshotCore(
     return { ok: false, status: 409, error: "no_name", message: "Couldn't claim a name for the restored vault. Please try again tomorrow." };
   }
   if (!reuse) {
-    // Restore creates a NEW vault — it counts against the plan's vault limit
+    // Restore creates a NEW vault — it counts against the account's vault limit (vaultLimitFor)
     // exactly like any other creation (same `>=` grandfathering rule).
     if ((await countVaultsForOwner(db, user.id)) >= vaultLimit) {
-      return { ok: false, status: 409, error: "vault_limit", message: restoreAtCapMessage(user.plan, billingModeOf(deps), user.pendingPlan) };
+      return { ok: false, status: 409, error: "vault_limit", message: restoreAtCapMessage(user.plan, billingModeOf(deps), user.pendingPlan, user.vaultLimitOverride) };
     }
     try {
       // Flagged so a retry after a failed replay may reuse it (cleared below).

@@ -971,6 +971,28 @@ describe("restore POST", () => {
     expect(await res.text()).toContain("already taken");
   });
 
+  test("the operator's vault limit replaces the plan's count (T-505): below it refuses, above it restores", async () => {
+    const { id: tightId } = await seedUser("rp-override-tight@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'plus', vault_limit_override = 2 WHERE id = ?").bind(tightId).run();
+    for (let i = 0; i < 2; i++) await seedVault(`rp-ovt-${i}`, tightId);
+    const tightEntry = wireEntry("rp-ovt-0", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-ovt-0", tightEntry);
+    const refused = await (await app.fetch(restoreReq({ vault: "rp-ovt-0", key: tightEntry.key }, sessionCookie(await seedSession(tightId))), env)).text();
+    expect(refused).toContain("your account is at its 2-vault limit");
+    expect(await env.DB.prepare("SELECT 1 AS one FROM vaults WHERE name = ?").bind(restoredVaultName("rp-ovt-0", new Date())).first()).toBeNull();
+
+    // Plus counts 5; with 5 owned and an override of 6 the restore goes through.
+    const { id: roomyId } = await seedUser("rp-override-roomy@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'plus', vault_limit_override = 6 WHERE id = ?").bind(roomyId).run();
+    for (let i = 0; i < 5; i++) await seedVault(`rp-ovr-${i}`, roomyId);
+    const entry = wireEntry("rp-ovr-0", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-ovr-0", entry);
+    const target = restoredVaultName("rp-ovr-0", new Date());
+    interceptRestoreFlow(target);
+    const res = await quietly(async () => app.fetch(restoreReq({ vault: "rp-ovr-0", key: entry.key }, sessionCookie(await seedSession(roomyId))), env));
+    expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(target)}`);
+  });
+
   test("at the plan's vault cap → the friendly refusal; NO vault created, NO DO call", async () => {
     const { id: userId } = await seedUser("rp-cap@example.com");
     await env.DB.prepare("UPDATE users SET plan = 'plus' WHERE id = ?").bind(userId).run();
@@ -1178,6 +1200,26 @@ describe("GET /account/vaults/<name>/snapshots and POST …/restore", () => {
     interceptRestoreFlow(target);
     const res = await quietly(async () => accountCall("/account/vaults/acct-rp2/restore", admin, "POST", { key: entry.key }));
     expect(res.status).toBe(201);
+  });
+
+  test("the operator's vault limit replaces the plan's count here too (T-505): below it refuses, above it restores", async () => {
+    const { id: tightId } = await seedUser("acct-rp-ovt@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'plus', vault_limit_override = 1 WHERE id = ?").bind(tightId).run();
+    await seedVault("acct-rp-ovt", tightId);
+    await seedMirrorRow("acct-rp-ovt", wireEntry("acct-rp-ovt", "2026-07-01T04:00:00.000Z"));
+    const refused = await accountCall("/account/vaults/acct-rp-ovt/restore", await accountToken(tightId, "admin"), "POST", {});
+    expect(refused.status).toBe(409);
+    expect((await refused.json()) as any).toMatchObject({ error: "vault_limit", message: expect.stringContaining("your account is at its 1-vault limit") });
+
+    // Plus counts 5; with 5 owned and an override of 6 the restore goes through.
+    const { id: roomyId } = await seedUser("acct-rp-ovr@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'plus', vault_limit_override = 6 WHERE id = ?").bind(roomyId).run();
+    for (let i = 0; i < 5; i++) await seedVault(`acct-rp-ovr-${i}`, roomyId);
+    await seedMirrorRow("acct-rp-ovr-0", wireEntry("acct-rp-ovr-0", "2026-07-01T04:00:00.000Z"));
+    const target = restoredVaultName("acct-rp-ovr-0", new Date());
+    interceptRestoreFlow(target);
+    const res = await quietly(async () => accountCall("/account/vaults/acct-rp-ovr-0/restore", await accountToken(roomyId, "admin"), "POST", {}));
+    expect(res.status, await res.clone().text()).toBe(201);
   });
 
   test("a vault with no snapshot yet says so", async () => {

@@ -50,7 +50,7 @@ async function seedOperator(email = "operator@example.com"): Promise<{ id: strin
 }
 
 const ADMIN_GETS = ["/admin", "/admin/users", "/admin/vaults", "/admin/daily.json"];
-const ADMIN_POSTS = ["/admin/users/plan", "/admin/users/suspend", "/admin/users/delete"];
+const ADMIN_POSTS = ["/admin/users/plan", "/admin/users/suspend", "/admin/users/vault-limit", "/admin/users/delete"];
 
 // --- the role gate -----------------------------------------------------------
 

@@ -18,6 +18,7 @@ import {
   formatPlanBytes,
   formatUsageBytes,
   isCompPlan,
+  livePlan,
   planLabel,
 } from "./plans.ts";
 import type { DigestStats } from "./ops.ts";
@@ -200,6 +201,8 @@ export interface AdminUserRow {
   /** A scheduled downgrade (pending_plan), or null. */
   pendingPlan: string | null;
   vaultCount: number;
+  /** The operator's vault limit for this account (migration 0033), or null when the plan's count applies. */
+  vaultLimitOverride?: number | null;
   checklistDone: number;
   /** Account deletion requested (T-318) — the 24h undo window is running. */
   deletedAt?: string | null;
@@ -267,6 +270,19 @@ export function renderAdminUsers(props: AdminUsersProps): string {
           <input type="hidden" name="page" value="${current}">
           <button class="rowbtn" type="submit">${u.suspendedAt ? "Un-suspend" : "Suspend"}</button>
         </form>`;
+      // The vault-limit lever: a whole number replaces the plan's count at every door that makes a vault; Clear brings
+      // the plan's count back (admin.ts handleAdminSetVaultLimitPost).
+      const hasLimit = u.vaultLimitOverride !== null && u.vaultLimitOverride !== undefined;
+      const limitField = (label: string, input: boolean) => `<form class="inline" method="post" action="/admin/users/vault-limit">
+          <input type="hidden" name="__csrf" value="${esc(csrfToken)}">
+          <input type="hidden" name="user_id" value="${esc(u.id)}">
+          <input type="hidden" name="page" value="${current}">
+          ${input ? `<input type="number" name="vault_limit" min="0" max="1000" step="1" required placeholder="limit" aria-label="Vault limit for ${esc(u.email)}" style="width:4.5em">` : `<input type="hidden" name="vault_limit" value="">`}
+          <button class="rowbtn" type="submit">${label}</button>
+        </form>`;
+      const limitForm = u.deletedAt ? "" : `${limitField("Set vault limit", true)}${hasLimit ? ` ${limitField("Clear limit", false)}` : ""}`;
+      // The limit is shown as stored; when the ended plan holds the account at zero (paid mode), the badge says so.
+      const limitIdle = hasLimit && livePlan(u.plan, billingMode) === "expired";
       const flags = [
         u.role === "operator" ? `<span class="badge badge-on">operator</span>` : "",
         u.suspendedAt ? `<span class="badge badge-warn">suspended ${esc(u.suspendedAt.slice(0, 10))}</span>` : "",
@@ -285,9 +301,9 @@ export function renderAdminUsers(props: AdminUsersProps): string {
         <td>${esc(u.email)}${flags ? `<br>${flags}` : ""}</td>
         <td>${esc(adminPlanLabel(u.plan, billingMode))}</td>
         <td>${esc(u.createdAt.slice(0, 10))}</td>
-        <td style="text-align:right">${u.vaultCount}</td>
+        <td style="text-align:right">${u.vaultCount}${hasLimit ? `<br><span class="badge" data-testid="vault-limit-override" title="Set by an operator; replaces the plan's vault count">limit ${u.vaultLimitOverride}${limitIdle ? " (idle: plan ended)" : ""}</span>` : ""}</td>
         <td style="text-align:right">${u.checklistDone}/${CHECKLIST_ITEMS.length}</td>
-        <td>${planForm} ${suspendForm}${u.deletedAt ? "" : ` <a class="rowbtn" style="text-decoration:none" href="/admin/users/delete?user_id=${encodeURIComponent(u.id)}">Delete&hellip;</a>`}</td>
+        <td>${planForm} ${suspendForm} ${limitForm}${u.deletedAt ? "" : ` <a class="rowbtn" style="text-decoration:none" href="/admin/users/delete?user_id=${encodeURIComponent(u.id)}">Delete&hellip;</a>`}</td>
       </tr>`;
     })
     .join("\n");
@@ -297,7 +313,7 @@ export function renderAdminUsers(props: AdminUsersProps): string {
      ${adminHeader("Users", "users")}
      ${banner(notice, error)}
      <div class="card">
-       <p class="muted" style="margin:.1rem 0 .3rem">${totalUsers} account${totalUsers === 1 ? "" : "s"}, newest first. Plan is the comp lever (caps push to the vaults immediately); suspend blocks sign-in without touching vault data.</p>
+       <p class="muted" style="margin:.1rem 0 .3rem">${totalUsers} account${totalUsers === 1 ? "" : "s"}, newest first. Plan is the comp lever (caps push to the vaults immediately); a vault limit replaces the plan's vault count for that account; suspend blocks sign-in without touching vault data.</p>
        <div class="tablewrap"><table class="fleet">
          <thead><tr><th>Email</th><th>Plan</th><th>Created</th><th style="text-align:right">Vaults</th><th style="text-align:right">Checklist</th><th>Actions</th></tr></thead>
          <tbody>${rows || `<tr><td colspan="6" class="muted">No users on this page.</td></tr>`}</tbody>
