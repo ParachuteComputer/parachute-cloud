@@ -48,7 +48,7 @@ your subdomain). From a clean checkout of `door/0.9`:
 
 ```bash
 bun install                                                    # "Failed to install 2 packages" is expected: deploy.sh fetches them
-bun deploy/personal/nip98.ts keygen <profile dir>/private/owner.key   # a key if you have none (outside the repo): prints OWNER_PUBKEY
+mkdir -p <profile dir>/private && bun deploy/personal/nip98.ts keygen <profile dir>/private/owner.key   # a key if you have none: prints OWNER_PUBKEY
 bunx wrangler login                                            # or export CLOUDFLARE_API_TOKEN=… (below)
 bash deploy/personal/deploy.sh <profile.env> <evidence dir>    # about a minute; prints both addresses
 bun deploy/personal/smoke.ts <evidence>/deployed.env <private dir> <evidence>/SUMMARY.txt   # optional, keyless
