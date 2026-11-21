@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # deploy/personal/deploy.sh PROFILE [EVIDENCE_DIR]: deploy the personal door (door/0.9) to the profile's own Cloudflare
-# account, inside ONE sealed job (README.md; the card's templates: d1-write, r2-admin, workers-scripts-write). Each
-# wrangler call gets its own short-lived child key through ./wr. Idempotent: run it again to upgrade in place.
+# account: with your own wrangler sign-in (`wrangler login`, or CLOUDFLARE_API_TOKEN), or inside ONE sealed job
+# (README.md; the card's templates: d1-write, r2-admin, workers-scripts-write), where each wrangler call gets its own
+# short-lived child key through ./wr. Idempotent: run it again to upgrade in place.
 #   1 refusals: the job's account is the profile's, never a Parachute account; the engine pin is 0.9; clean checkout
 #   2 the workers.dev subdomain (asked of the account unless the profile names it)
 #   3 R2 bucket <PREFIX>-vault (attachments and the nightly snapshots), created if missing
@@ -26,7 +27,12 @@ fail() { echo "failed: $*" >&2; exit 1; }
 
 # --- 1 refusals ---
 ACCOUNT_ID="$(tr 'A-F' 'a-f' <<<"$ACCOUNT_ID")"
-[ "$(tr 'A-F' 'a-f' <<<"${UNI_SEALED_ACCOUNT_ID:-}")" = "$ACCOUNT_ID" ] || die "the job's account is not the profile's ACCOUNT_ID"
+# Inside a sealed job its account must be the profile's; without one, wrangler runs as you are signed in, on the profile's.
+if [ -n "${UNI_SEALED_ACCOUNT_ID:-}" ]; then
+  [ "$(tr 'A-F' 'a-f' <<<"$UNI_SEALED_ACCOUNT_ID")" = "$ACCOUNT_ID" ] || die "the job's account is not the profile's ACCOUNT_ID"
+else
+  export CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID"
+fi
 case "$ACCOUNT_ID" in
   d5d7c8646c3b69ce9f16bfd12ecbe98a|5b543fa4332a619203356ae1418af504) die "a Parachute Cloud account: the personal door never deploys there" ;;
 esac

@@ -41,15 +41,24 @@ OWNER_PLAN=power             # entry | standard | plus | power
 
 Beside it, `private/` (0700) holds what is never printed: the ops token the deploy makes, and a rehearsal's keys.
 
-## Deploy (one sealed job)
+## Deploy
 
-The job needs three templates on the profile's account: `d1-write`, `r2-admin`, `workers-scripts-write`. Every
-wrangler call gets its own short-lived child key through `./wr`.
+You need [Bun](https://bun.sh) 1.4+, git, and a Cloudflare account with a workers.dev subdomain (dashboard: Workers →
+your subdomain). From a clean checkout of `door/0.9`:
 
 ```bash
-bash deploy/personal/deploy.sh <profile.env> <evidence dir>    # inside: sealed job --payload <job.json> -- ...
-bun deploy/personal/smoke.ts <evidence>/deployed.env <private dir> <evidence>/SUMMARY.txt   # keyless, after
+bunx wrangler login                                            # or export CLOUDFLARE_API_TOKEN=… (below)
+bash deploy/personal/deploy.sh <profile.env> <evidence dir>    # about a minute; prints both addresses
+bun deploy/personal/smoke.ts <evidence>/deployed.env <private dir> <evidence>/SUMMARY.txt   # optional, keyless
 ```
+
+An API token instead of `wrangler login` needs, on that account: Workers Scripts Edit, D1 Edit, Workers R2 Storage
+Edit (and Account Settings Read, or set `WORKERS_SUBDOMAIN` in the profile). The smoke needs the profile's own keys in
+`private/` (`owner.key`, `admin.key`), so it runs as is only on a rehearsal profile.
+
+**In a sealed job** (Uni's way): the job needs three templates on the profile's account: `d1-write`, `r2-admin`,
+`workers-scripts-write`, and every wrangler call gets its own short-lived child key through `./wr`
+(`sealed job --payload <job.json> -- bash deploy/personal/deploy.sh …`).
 
 The deploy is idempotent: run it again to upgrade in place. It refuses a non-0.9 engine pin, a dirty checkout, a
 Parachute Cloud account and any `parachute-*` or `arcade-parachute*` prefix.
@@ -111,8 +120,8 @@ page goes straight to the consent screen.
 ## More vaults
 
 `OWNER_PLAN` sets the owner's vault count (`power`: 10). You are the operator here, so you can raise it (or lower it;
-existing vaults are never touched) with the same lever Parachute Cloud's operators use, one D1 update inside a sealed
-job with `d1-write`, from the checkout you deployed from, after your first sign-in:
+existing vaults are never touched) with the same lever Parachute Cloud's operators use: one D1 update, with your
+wrangler sign-in (or in a sealed job with `d1-write`), from the checkout you deployed from, after your first sign-in:
 
 ```bash
 bash deploy/personal/vault-limit.sh <profile.env> 25      # or `plan` to go back to OWNER_PLAN's count

@@ -2,7 +2,8 @@
 # deploy/personal/vault-limit.sh PROFILE N|plan: set the owner's own vault limit (0..1000), or `plan` to clear it and go
 # back to OWNER_PLAN's count. The same lever an operator pulls on Parachute Cloud (users.vault_limit_override, T-505):
 # on your own door you are the operator, so it is one D1 update. Existing vaults are never touched; only a new vault
-# past the limit is refused. Run it inside a sealed job with d1-write (./wr), from the checkout you deployed from (it
+# past the limit is refused. Run it with your wrangler sign-in or inside a sealed job with d1-write (./wr), from the
+# checkout you deployed from (it
 # reads that deploy's workers/identity/wrangler.personal.gen.toml), after the owner has signed in once (the sign-in
 # makes the account).
 set -euo pipefail
@@ -11,6 +12,7 @@ PROFILE="${1:?profile}"; WANT="${2:?a number 0..1000, or plan}"
 # shellcheck disable=SC1090
 . "$PROFILE"
 : "${PREFIX:?profile: PREFIX}" "${OWNER_PUBKEY:?profile: OWNER_PUBKEY}"
+[ -n "${UNI_SEALED_ACCOUNT_ID:-}" ] || export CLOUDFLARE_ACCOUNT_ID="${ACCOUNT_ID:?profile: ACCOUNT_ID}"
 case "$WANT" in plan) VAL=NULL ;; *) [[ "$WANT" =~ ^[0-9]{1,4}$ ]] && [ "$WANT" -le 1000 ] || { echo "refused: a limit is 0..1000, or plan" >&2; exit 2; }; VAL="$WANT" ;; esac
 PRIVATE="${PRIVATE_DIR:-$(dirname "$PROFILE")/private}"
 if [ "$OWNER_PUBKEY" = rehearsal ]; then OWNER="$(bun "$HERE/nip98.ts" pubkey "$PRIVATE/owner.key")"; else OWNER="$(bun "$HERE/nip98.ts" hex "$OWNER_PUBKEY")"; fi
