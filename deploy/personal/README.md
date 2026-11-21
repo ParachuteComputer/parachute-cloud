@@ -89,7 +89,7 @@ may send `Parachute-On-Behalf-Of: client-42` (on MCP, the write tool's `on_behal
 
 On a phone or the desktop app, with your key in the app (Settings → your key; paste your nsec under Advanced): type
 your Parachute's address (the identity one), choose **Mine**, **Sign in**. The app signs one request with the key
-(`POST /account/token`), opens a one-time sign-in link, and you allow it on the consent page (app 0.9.1 on, T-476).
+(`POST /account/token`), opens a one-time sign-in link, and you allow it on the consent page. This needs an app build that includes ParachuteComputer/parachute#136 (merged 2026-11-21); an older one says "This hub doesn't take a key to sign in".
 
 In a browser tab (the web build) there is no key, and this door sends no mail, so its sign-in page's email link goes
 nowhere. Open a browser session first with the session link below, then sign in from the web build.
