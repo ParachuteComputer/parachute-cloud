@@ -837,7 +837,6 @@ export function countsAs5xx(req: Request, status: number, env: Partial<Env>): bo
   const url = new URL(req.url);
   const backstop = /^\/(vault|mcp)(\/|$)/.test(url.pathname);
   if (!backstop) return true;
-  // A single-owner door answers /vault/* itself (vaultOrBackstop): a 5xx there is the vault's, and counts.
   // A single-owner door hands /vault/* and /mcp to its vault worker (vaultOrBackstop): a 5xx there is the vault's.
   if (forwardsVaults(env)) return true;
   try {
