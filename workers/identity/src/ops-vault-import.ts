@@ -51,7 +51,7 @@ import { forwardImport } from "./import-forward.ts";
 import { opsBearerRefusal } from "./ops-daily.ts";
 import type { Env } from "./env.ts";
 import { type OAuthDeps, billingModeOf } from "./oauth-shared.ts";
-import { entitlementPlanFor, planEntitlement, vaultLimitFor } from "./plans.ts";
+import { activeVaultLimitOverride, entitlementPlanFor, planEntitlement, vaultLimitFor } from "./plans.ts";
 import { signAccessToken } from "./tokens.ts";
 import { type User, getUserByEmail } from "./users.ts";
 import { EMAIL_RE } from "./validation.ts";
@@ -159,7 +159,8 @@ export async function handleOpsVaultImportPost(env: Env, req: Request, deps: OAu
   const vaultsOwned = await countVaultsForOwner(env.DB, user.id);
   const vaultLimit = vaultLimitFor(user, billingModeOf(deps));
   if (!retry && vaultsOwned >= vaultLimit) {
-    return refuse(409, "vault_cap", `This account is at its limit of ${vaultLimit} vaults. Nothing changed.`, { vaults_owned: vaultsOwned, vault_limit: vaultLimit });
+    const whose = activeVaultLimitOverride(user, billingModeOf(deps)) === null ? `its plan's ${vaultLimit} vaults` : `its limit of ${vaultLimit} vaults`;
+    return refuse(409, "vault_cap", `This account is at ${whose}. Nothing changed.`, { vaults_owned: vaultsOwned, vault_limit: vaultLimit });
   }
   if (retry) {
     const inUse = await refuseIfInUse(env, deps, existing);

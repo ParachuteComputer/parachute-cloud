@@ -222,7 +222,11 @@ describe("the create doors honour the override", () => {
     const tight = await account("power", 3, 3);
     const refused = await opsImport(tight.email, uniq("ops"));
     expect(refused.status).toBe(409);
-    expect(refused.body).toMatchObject({ error: "vault_cap", vaults_owned: 3, vault_limit: 3 });
+    expect(refused.body).toMatchObject({ error: "vault_cap", vaults_owned: 3, vault_limit: 3, message: "This account is at its limit of 3 vaults. Nothing changed." });
+
+    // No override: today's wording, word for word.
+    const plain = await account("entry", 1, null);
+    expect((await opsImport(plain.email, uniq("ops"))).body.message).toBe("This account is at its plan's 1 vaults. Nothing changed.");
   });
 
   test("console create", async () => {
@@ -325,6 +329,8 @@ describe("POST /admin/users/vault-limit — only an operator sets or clears it",
       const res = await post({ user_id: target.id, vault_limit: bad }, cookie);
       expect(res.headers.get("location"), bad).toBe("/admin/users?err=vault-limit");
     }
+    // A request without the field is refused, not read as a clear.
+    expect((await post({ user_id: target.id }, cookie)).headers.get("location")).toBe("/admin/users?err=vault-limit");
     expect((await getUserById(env.DB, target.id))!.vaultLimitOverride).toBe(7);
     expect((await post({ user_id: "no-such-user", vault_limit: "3" }, cookie)).headers.get("location")).toBe("/admin/users?err=not-found");
   });

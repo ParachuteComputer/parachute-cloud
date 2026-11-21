@@ -372,7 +372,10 @@ export async function handleAdminSetVaultLimitPost(db: D1Database, req: Request,
   if (ctx instanceof Response) return ctx;
   const { operator, form, back } = ctx;
 
-  const raw = String(form.get("vault_limit") ?? "");
+  const field = form.get("vault_limit");
+  // A missing field is a malformed request, never a clear: only an explicit empty value (the Clear button) clears.
+  if (typeof field !== "string") return back("err=vault-limit");
+  const raw = field;
   // Digits only: no sign, decimal, exponent or padding slips through Number().
   if (raw !== "" && (!/^\d{1,4}$/.test(raw) || Number(raw) > MAX_VAULT_LIMIT_OVERRIDE)) return back("err=vault-limit");
   const limit = raw === "" ? null : Number(raw);
