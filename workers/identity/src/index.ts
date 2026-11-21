@@ -195,6 +195,9 @@ app.get("/.well-known/parachute-account", (c) => accountDescriptor(depsFor(c.env
 // for the `account:vaults` connection scope. Sits under the `/.well-known`
 // ceremony prefix, so it is already run-worker-first (no manifest change).
 app.get("/.well-known/oauth-protected-resource/account/mcp", (c) => accountMcpProtectedResource(depsFor(c.env)));
+// A single-owner door's vaults answer on this origin (vaultOrBackstop, below), and so do their RFC 9728 documents.
+app.get("/.well-known/oauth-protected-resource/vault/*", (c) => (forwardsVaults(c.env) ? vaultOrBackstop(c) : c.notFound()));
+app.get("/.well-known/oauth-authorization-server/vault/*", (c) => (forwardsVaults(c.env) ? vaultOrBackstop(c) : c.notFound()));
 
 // --- OAuth ---
 // CORS is applied at the route so success AND error paths carry it: wildcard on
@@ -696,8 +699,29 @@ function vaultRouteMissing(): Response {
     { status: 503 },
   );
 }
-app.all("/vault", vaultRouteMissing);
-app.all("/vault/*", vaultRouteMissing);
+/**
+ * A single-owner door's one address (T-476). The own-Cloudflare door runs on workers.dev, where no zone route can put
+ * `/vault/*` in front of this worker the way Cloud's my. origin does, and the Parachute app holds one address per
+ * Parachute: it sends tokens only to the hub it signed in to (app `vault/parachute.ts` describe). So on a door with
+ * OWNER_PUBKEY and the VAULT_SERVICE binding, this worker hands `/vault/*` (and the two RFC 9728 path-inserted
+ * discovery documents under it) to the vault worker over the binding, unchanged but for the Cookie header: the vault
+ * authenticates by bearer only, and this origin's session cookie is never the vault's to read. The vault worker routes
+ * by path and names the origin it was asked on (discovery.ts), so the whole door answers on this one origin, as my.
+ * does on Cloud, and the vault worker's same-origin hardening (attachment types, nosniff) is the one it has there.
+ * The personal deploy advertises it (VAULT_PUBLIC_ORIGIN = ISSUER). Parachute Cloud (no OWNER_PUBKEY) keeps the 503.
+ */
+function forwardsVaults(env: Env): Fetcher | null {
+  return env.VAULT_SERVICE && depsFor(env).ownerPubkey ? env.VAULT_SERVICE : null;
+}
+function vaultOrBackstop(c: { env: Env; req: { raw: Request } }): Response | Promise<Response> {
+  const vault = forwardsVaults(c.env);
+  if (!vault) return vaultRouteMissing();
+  const req = new Request(c.req.raw);
+  req.headers.delete("cookie");
+  return vault.fetch(req);
+}
+app.all("/vault", vaultOrBackstop);
+app.all("/vault/*", vaultOrBackstop);
 
 /**
  * The /mcp defensive backstop (route-manifest.ts DEFENSIVE_PREFIXES),
