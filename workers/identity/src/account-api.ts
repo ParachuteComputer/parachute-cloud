@@ -12,7 +12,7 @@
  * WRAP, DON'T REIMPLEMENT. These handlers drive the SAME machinery the
  * cookie-authed console already runs, only the outer auth boundary differs
  * (Bearer account token here vs session cookie + CSRF + same-origin there):
- *   - create → `createVault` + the plan vault-count cap (PLAN_SPECS /
+ *   - create → `createVault` + the account's vault limit (vaultLimitFor /
  *     countVaultsForOwner, IDENTICAL to handleCreateVaultPost) + `pushVaultCap`;
  *   - list   → `listVaultsForOwner` + the daily rollup's `vault_usage` rows;
  *   - mint   → the `vault-call.ts` first-party mint seam's `signAccessToken`,
@@ -56,7 +56,8 @@ import {
   TIER_PRICE_MONTHLY_USD,
   entitlementPlanFor,
   livePlan,
-  vaultLimitPlan,
+  activeVaultLimitOverride,
+  vaultLimitFor,
   OPEN_BETA_LONG,
   planLabel,
   isPaidTier,
@@ -309,7 +310,8 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
   } = {
     tier: live,
     label: mode === "open_beta" ? planLabel(live, mode) : live === "trial" ? "Free trial" : PLAN_SPECS[live].label,
-    vault_limit: spec.vault_count,
+    // The operator's limit for this account when set (T-505), else the effective tier's count.
+    vault_limit: activeVaultLimitOverride(user, mode) ?? spec.vault_count,
     vaults_used: vaults.length,
     storage_used_bytes: storageUsed,
     // The effective tier's total (notes + attachment) budget — the same sum the
@@ -466,7 +468,7 @@ export async function handleAccountHandleClaim(db: D1Database, req: Request, dep
  * Create a vault and return a ready-to-use vault token, so the app lands the
  * user straight IN the new vault with zero extra OAuth round-trips (the D2
  * hinge). Wraps the SAME create path the console's `handleCreateVaultPost` runs:
- * the plan vault-count cap (IDENTICAL gate — a Bearer create is refused at-cap
+ * the account's vault limit (vaultLimitFor; IDENTICAL gate — a Bearer create is refused at-cap
  * exactly as a cookie create is), `createVault` (slug + reserved + PK-collision
  * validation), and the best-effort `pushVaultCap`. Then it additionally mints a
  * `vault:<name>:{read,write}` token (aud-pinned, `client_id="parachute-account"`
@@ -485,9 +487,8 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   // `>=` grandfathers users already over a cap (they keep every vault they own;
   // only NEW creation is refused). An expired plan has vault_count=0, so it is
   // refused here with the same at-cap message the console gives.
-  const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
-  if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-    return restError(403, "vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
+  if ((await countVaultsForOwner(db, user.id)) >= vaultLimitFor(user, billingModeOf(deps))) {
+    return restError(403, "vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan, user.vaultLimitOverride));
   }
 
   const body = await readJsonBody(req);
@@ -807,7 +808,8 @@ export async function handleAccountVaultSnapshots(db: D1Database, req: Request, 
  * vault, `<name>-restored-<date>[-n]`; the old vault is never touched. The console's restore (console.ts
  * restoreSnapshotCore) behind the account token instead of a session, so a key-only owner (NIP-98 sign-in, no
  * cookie) has the same one-step restore. Account admin, first-party account token only (like /account/keys: an
- * OAuth app granted account scope can't replay a vault), the plan's restore entitlement, ownership, a known key.
+ * OAuth app granted account scope can't replay a vault), the plan's restore entitlement, ownership, a known key, and the
+ * account's vault limit (plans.ts vaultLimitFor) for the new vault.
  */
 export async function handleAccountVaultRestore(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
   const auth = await requireAccount(db, req, deps, "admin");
@@ -828,7 +830,7 @@ export async function handleAccountVaultRestore(db: D1Database, req: Request, de
   if (!key) key = ((await listSnapshotsForVaults(db, [name])).get(name) ?? [])[0]?.key ?? "";
   if (!key) return restError(404, "no_snapshot", `"${name}" has no snapshot yet (the first is taken at 04:00 UTC after it is made).`);
   if (!(await isKnownSnapshot(db, name, key))) return restError(404, "unknown_snapshot", "that restore point isn't one of this vault's");
-  const vaultLimit = PLAN_SPECS[vaultLimitPlan(auth.user.plan, auth.user.pendingPlan, mode)].vault_count;
+  const vaultLimit = vaultLimitFor(auth.user, mode);
   const r = await restoreSnapshotCore(db, deps, auth.user, name, key, vaultLimit);
   if (!r.ok) return restError(r.status, r.error, r.message);
   return Response.json({ vault: r.target, restored_from: { vault: name, key } }, { status: 201, headers: { "cache-control": "no-store" } });
