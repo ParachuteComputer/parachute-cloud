@@ -14,7 +14,7 @@
  *
  * What holds it safe:
  *   - **The gate is vault create's**: `account:<id>:admin`. An import makes a new vault and nothing else.
- *   - **Never into a vault that holds anything**, never frees a name on failure, the plan's vault count applies:
+ *   - **Never into a vault that holds anything**, never frees a name on failure, the account's vault limit applies (vaultLimitFor):
  *     all of it is `importAsOwner` (import-door.ts), the console's own path.
  *   - **A file only fills a hole.** `import-file` reaches the vault's `/api/internal/import-file`, which stores bytes
  *     only at a path an attachment row of that vault already names, only when the sha256 given matches the bytes,

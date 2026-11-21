@@ -486,6 +486,33 @@ export function vaultLimitPlan(plan: PlanId, pendingPlan: PlanId | null, mode: B
   return mode === "open_beta" ? entitlementPlanFor(plan, pendingPlan, mode) : livePlan(plan, mode);
 }
 
+/** What {@link vaultLimitFor} reads off an account (a `User` fits). */
+export interface VaultLimitHolder {
+  plan: PlanId;
+  pendingPlan: PlanId | null;
+  /** The operator's limit (migration 0033); null = the plan's count. */
+  vaultLimitOverride: number | null;
+}
+
+/**
+ * The operator's limit when it applies, else null. It applies whenever it is set, except on the ended plan in paid
+ * mode: that account's writes are frozen, so it gets no new vaults whatever the override says (open beta lifts the
+ * ended plan to the beta, and the override applies there as everywhere else).
+ */
+export function activeVaultLimitOverride(user: VaultLimitHolder, mode: BillingMode): number | null {
+  if (user.vaultLimitOverride === null) return null;
+  return livePlan(user.plan, mode) === "expired" ? null : user.vaultLimitOverride;
+}
+
+/**
+ * How many vaults an account may own before a NEW one is refused — the one number every door that makes a vault
+ * compares against (`owned >= limit` refuses; existing vaults are never touched), and the number the console, the
+ * account summary and the refusals show. The operator's override (T-505) when it applies, else the plan's count.
+ */
+export function vaultLimitFor(user: VaultLimitHolder, mode: BillingMode): number {
+  return activeVaultLimitOverride(user, mode) ?? PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, mode)].vault_count;
+}
+
 /** The entitlement pushed to every vault DO for a plan (vault-call.ts). */
 export function planEntitlement(plan: PlanId): VaultEntitlement {
   const spec = PLAN_SPECS[plan];
@@ -546,13 +573,15 @@ export function formatUsageBytes(n: number): string {
 
 /** The console plan line — entitlement-descriptive. trial/expired read
  *  distinctly; paid tiers read "<Label> plan — N vaults, NOTES + ATTACH". */
-export function planLine(plan: PlanId, mode: BillingMode): string {
+export function planLine(plan: PlanId, mode: BillingMode, vaultLimit: number | null = null): string {
   plan = livePlan(plan, mode);
   const spec = PLAN_SPECS[plan];
   if (plan === "expired") {
     return "Trial ended — your notes are safe to read and export; pick a plan to write again";
   }
-  const vaults = `${spec.vault_count} vault${spec.vault_count === 1 ? "" : "s"}`;
+  // `vaultLimit`: the account's own count when an operator set one (vaultLimitFor); else the plan's.
+  const count = vaultLimit ?? spec.vault_count;
+  const vaults = `${count} vault${count === 1 ? "" : "s"}`;
   const attach =
     spec.attachment_bytes > 0 ? ` + ${formatPlanBytes(spec.attachment_bytes)} attachments` : " (notes only)";
   // "across your vaults" — storage is a POOLED total shared across every vault
@@ -646,8 +675,17 @@ export function trialBannerLine(tierLabel: string, isDefault: boolean, daysLeft:
  * The friendly refusal when a restore would need a vault slot the plan doesn't
  * have (restore always creates a NEW vault — it never overwrites).
  */
-export function restoreAtCapMessage(plan: PlanId, mode: BillingMode, pendingPlan: PlanId | null = null): string {
-  const limit = PLAN_SPECS[vaultLimitPlan(plan, pendingPlan, mode)].vault_count;
+export function restoreAtCapMessage(
+  plan: PlanId,
+  mode: BillingMode,
+  pendingPlan: PlanId | null = null,
+  vaultLimitOverride: number | null = null,
+): string {
+  const holder = { plan, pendingPlan, vaultLimitOverride };
+  const limit = vaultLimitFor(holder, mode);
+  if (activeVaultLimitOverride(holder, mode) !== null) {
+    return `Restoring creates a new vault, and your account is at its ${limit}-vault limit. Free up a slot first, or write hello@parachute.computer.`;
+  }
   plan = livePlan(plan, mode);
   const spec = { ...PLAN_SPECS[plan], vault_count: limit };
   if (mode === "open_beta" && plan === "trial") {
@@ -661,8 +699,18 @@ export function restoreAtCapMessage(plan: PlanId, mode: BillingMode, pendingPlan
  * (grandfathered) see the same message: they keep everything they have — the
  * cap only refuses NEW creation until they're under it.
  */
-export function vaultCapMessage(plan: PlanId, mode: BillingMode, pendingPlan: PlanId | null = null): string {
-  const limit = PLAN_SPECS[vaultLimitPlan(plan, pendingPlan, mode)].vault_count;
+export function vaultCapMessage(
+  plan: PlanId,
+  mode: BillingMode,
+  pendingPlan: PlanId | null = null,
+  vaultLimitOverride: number | null = null,
+): string {
+  const holder = { plan, pendingPlan, vaultLimitOverride };
+  const limit = vaultLimitFor(holder, mode);
+  if (activeVaultLimitOverride(holder, mode) !== null) {
+    // The operator set this account's limit (T-505): it is the account's, not the plan's.
+    return `Your account includes ${limit} vault${limit === 1 ? "" : "s"} — that's the current ceiling. Need more? Write hello@parachute.computer.`;
+  }
   plan = livePlan(plan, mode);
   const spec = { ...PLAN_SPECS[plan], vault_count: limit };
   if (mode === "open_beta" && plan === "trial") {

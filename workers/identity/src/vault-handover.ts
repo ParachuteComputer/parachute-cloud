@@ -36,7 +36,7 @@ import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { randomBase64url } from "./crypto.ts";
 import { isUniqueViolation } from "./nostr-auth.ts";
 import { billingModeOf, jsonResponse, type OAuthDeps } from "./oauth-shared.ts";
-import { PLAN_SPECS, entitlementPlanFor, isEntitled, planEntitlement, vaultCapMessage, vaultLimitPlan } from "./plans.ts";
+import { entitlementPlanFor, isEntitled, planEntitlement, vaultCapMessage, vaultLimitFor } from "./plans.ts";
 import { getUserById, type User } from "./users.ts";
 import { EMAIL_RE, normalizeEmail } from "./validation.ts";
 import { CAP_PUSH_MAX_ATTEMPTS, callVaultApi, pushVaultCap } from "./vault-call.ts";
@@ -313,7 +313,7 @@ export async function handleHandoverAccept(db: D1Database, req: Request, deps: O
   if (refusal) return refusal;
 
   const vault = (await getVault(db, offer.vault_name))!;
-  const limit = PLAN_SPECS[vaultLimitPlan(me.plan, me.pendingPlan, billingModeOf(deps))].vault_count;
+  const limit = vaultLimitFor(me, billingModeOf(deps));
   const nowIso = nowOf(deps).toISOString();
   const nonce = randomBase64url(16);
   const closedHere = { sql: "EXISTS (SELECT 1 FROM vault_handovers WHERE id = ? AND close_nonce = ?)", binds: [offer.id, nonce] };
@@ -378,10 +378,9 @@ async function whyNot(db: D1Database, deps: OAuthDeps, offer: OfferRow, me: User
     return err(409, "offer_unavailable", "This vault can no longer be handed over by the account that offered it.");
   }
   if (vault.importPendingAt !== null) return err(409, "vault_busy", "This vault is still being imported or restored; accept once that finishes.");
-  const spec = PLAN_SPECS[vaultLimitPlan(me.plan, me.pendingPlan, billingModeOf(deps))];
   const owned = (await db.prepare("SELECT COUNT(*) AS n FROM vaults WHERE owner_user_id = ?").bind(me.id).first<number>("n")) ?? 0;
-  if (owned >= spec.vault_count) {
-    return err(403, "vault_limit_reached", `${vaultCapMessage(me.plan, billingModeOf(deps), me.pendingPlan)} The offer stays open until it expires, so you can accept once you have room.`);
+  if (owned >= vaultLimitFor(me, billingModeOf(deps))) {
+    return err(403, "vault_limit_reached", `${vaultCapMessage(me.plan, billingModeOf(deps), me.pendingPlan, me.vaultLimitOverride)} The offer stays open until it expires, so you can accept once you have room.`);
   }
   return null;
 }

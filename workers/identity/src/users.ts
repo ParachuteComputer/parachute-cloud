@@ -128,6 +128,11 @@ export interface User {
    * `getOwnerHandle` (handles.ts). Written only by `claimHandle`.
    */
   ownerId: string | null;
+  /**
+   * The operator's vault limit for this account (migration 0033); null = the plan's vault count. Set only at
+   * POST /admin/users/vault-limit. Read through plans.ts `vaultLimitFor`, never compared directly.
+   */
+  vaultLimitOverride: number | null;
 }
 
 interface Row {
@@ -152,6 +157,7 @@ interface Row {
   payment_failed_at: string | null;
   payment_failed_count: number;
   owner_id: string | null;
+  vault_limit_override: number | null;
 }
 
 function rowToUser(r: Row): User {
@@ -180,6 +186,7 @@ function rowToUser(r: Row): User {
     paymentFailedAt: r.payment_failed_at,
     paymentFailedCount: r.payment_failed_count,
     ownerId: r.owner_id,
+    vaultLimitOverride: r.vault_limit_override ?? null,
   };
 }
 
@@ -326,6 +333,7 @@ export async function createUser(
     // A fresh account holds no handle — claiming is optional + Settings-
     // initiated (migration 0022); the INSERT omits owner_id (column default NULL).
     ownerId: null,
+    vaultLimitOverride: null,
   };
 }
 
@@ -403,6 +411,11 @@ export async function rehashPasswordIfUnchanged(
  */
 export async function setUserPlan(db: D1Database, userId: string, plan: PlanId): Promise<void> {
   await db.prepare("UPDATE users SET plan = ? WHERE id = ?").bind(plan, userId).run();
+}
+
+/** Set (a whole number) or clear (null) the operator's vault limit for an account (migration 0033). admin.ts only. */
+export async function setUserVaultLimitOverride(db: D1Database, userId: string, limit: number | null): Promise<void> {
+  await db.prepare("UPDATE users SET vault_limit_override = ? WHERE id = ?").bind(limit, userId).run();
 }
 
 /**

@@ -302,6 +302,23 @@ describe("handing a vault to another account in place", { timeout: 30_000 }, () 
     expect((await accept(a, bakery.auth, o.json.id)).status).toBe(200);
   });
 
+  test("the receiver's operator vault limit replaces its plan's count at accept (T-505)", async () => {
+    const { a, mara, bakery, v } = await scene();
+    const o = await offer(a, mara.auth, v, bakery.email);
+    // A trial in paid mode counts five; the operator holds this account to none.
+    await env.DB.prepare("UPDATE users SET vault_limit_override = 0 WHERE id = ?").bind(bakery.id).run();
+    const r = await accept(a, bakery.auth, o.json.id);
+    expect(r.status).toBe(403);
+    expect(r.json.error).toBe("vault_limit_reached");
+    expect(r.json.message).toContain("Your account includes 0 vaults");
+    expect((await owner(v))!.owner_user_id).toBe(mara.id);
+    // Entry counts one and the bakery already owns one; an override of two lets the vault in.
+    await env.DB.prepare("UPDATE users SET plan = 'entry', pending_plan = NULL, plan_downgrade_at = NULL, vault_limit_override = 2 WHERE id = ?").bind(bakery.id).run();
+    await seedVault(uniq("bakery-own"), bakery.id);
+    expect((await accept(a, bakery.auth, o.json.id)).status).toBe(200);
+    expect((await owner(v))!.owner_user_id).toBe(bakery.id);
+  });
+
   test("a suspended or deleting account can't hand over or receive", async () => {
     const { a, mara, bakery, v } = await scene();
     const o = await offer(a, mara.auth, v, bakery.email);
