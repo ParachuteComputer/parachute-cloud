@@ -16,6 +16,9 @@ pilot (`arcade-parachute-*`, T-335).
   is untouched.
 - **Closed**: no sign-up mail is ever sent (no mail binding), billing is off (no Stripe), the owner starts on
   `OWNER_PLAN` (default `power`: 10 vaults, 50 GiB of attachments).
+- **One address**: `https://<PREFIX>-identity.<sub>.workers.dev` is your Parachute. Sign-in, the account, every
+  vault (`/vault/<name>`, its REST and `/mcp`) answer there; the identity worker hands `/vault/*` to the vault worker
+  over their service binding. The vault worker's own address still works for anything already pointed at it.
 - **workers.dev** by default; a custom domain is optional (`VAULT_DOMAIN`, `IDENTITY_DOMAIN`, each a Custom Domain on
   a zone of the same account).
 - **Backups**: every night at 04:00 UTC each vault is snapshotted into R2 (`<PREFIX>-vault`, under
@@ -61,7 +64,7 @@ curl -K acct.curl https://<identity>/account/keys -d '{"name":"podcast-studio","
 ```
 
 The app keeps that key (a year, one vault, read or write, never admin) and calls
-`https://<PREFIX>-vault.<sub>.workers.dev/vault/podcast/api/records` or `/mcp`. Its writes are named
+`https://<PREFIX>-identity.<sub>.workers.dev/vault/podcast/api/records` or `/mcp`. Its writes are named
 (`createdVia: key:podcast-studio`). `DELETE /account/keys/podcast-studio` stops it on its next request.
 One key can also cover several vaults, each at its own level (0.9.1): send `"vaults": {"podcast": "write", "notes":
 "read"}` instead of `vault` and `can`. That key opens the account door (`https://<identity>/account/mcp`), not a
@@ -71,6 +74,15 @@ An app that writes for other people (a client portal) can be let say whom each w
 `"on_behalf_of": true` (its name is then lowercase letters, digits, `.` and `-`, e.g. `fernhill-portal`). Its writes
 may send `Parachute-On-Behalf-Of: client-42` (on MCP, the write tool's `on_behalf_of`) and are stamped
 `createdBy: fernhill-portal:client-42`. A key without it that sends one is refused (403 `on_behalf_not_allowed`).
+
+## Sign in from the Parachute app
+
+On a phone or the desktop app, with your key in the app (Settings → your key; paste your nsec under Advanced): type
+your Parachute's address (the identity one), choose **Mine**, **Sign in**. The app signs one request with the key
+(`POST /account/token`), opens a one-time sign-in link, and you allow it on the consent page (app 0.9.1 on, T-476).
+
+In a browser tab (the web build) there is no key, and this door sends no mail, so its sign-in page's email link goes
+nowhere. Open a browser session first with the session link below, then sign in from the web build.
 
 ## Connect an app that signs in through a browser (a Claude connector)
 
@@ -95,6 +107,28 @@ page goes straight to the consent screen.
 - `OWNER_PUBKEY` must stay set: it is what opens this route. On Parachute Cloud the route does not exist.
 - Keep `APP_ORIGIN` unset or equal to the issuer: the link is built on the issuer, and consent on another origin
   would not see the cookie.
+
+## More vaults
+
+`OWNER_PLAN` sets the owner's vault count (`power`: 10). You are the operator here, so you can raise it (or lower it;
+existing vaults are never touched) with the same lever Parachute Cloud's operators use, one D1 update inside a sealed
+job with `d1-write`, from the checkout you deployed from, after your first sign-in:
+
+```bash
+bash deploy/personal/vault-limit.sh <profile.env> 25      # or `plan` to go back to OWNER_PLAN's count
+```
+
+## What this door doesn't do yet
+
+It runs Parachute Cloud's workers, so it has Cloud's gaps (T-476 walk, 11-21):
+- **Add a pack** in the app stops with "This vault's server doesn't let Parachute make types yet": making a type
+  takes admin here, until Cloud's engine pin carries core's write-defines-types rule (core #134, #139). An AI or
+  script holding an admin vault token can make the types.
+- **Published records have no public page**: a record marked published stays readable only to you and your keys,
+  and the app gives no link.
+- **Changes** doesn't list deleted records (the deleted list is admin-only here); put-back works for edits.
+- The refusal at the vault limit still says to write to Parachute's mail address: on your own door, use
+  `vault-limit.sh`.
 
 ## Restore (one line)
 
