@@ -934,6 +934,28 @@ describe("restore POST", () => {
     expect(await res.text()).toContain("already taken");
   });
 
+  test("the operator's vault limit replaces the plan's count (T-505): below it refuses, above it restores", async () => {
+    const { id: tightId } = await seedUser("rp-override-tight@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'plus', vault_limit_override = 2 WHERE id = ?").bind(tightId).run();
+    for (let i = 0; i < 2; i++) await seedVault(`rp-ovt-${i}`, tightId);
+    const tightEntry = wireEntry("rp-ovt-0", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-ovt-0", tightEntry);
+    const refused = await (await app.fetch(restoreReq({ vault: "rp-ovt-0", key: tightEntry.key }, sessionCookie(await seedSession(tightId))), env)).text();
+    expect(refused).toContain("your account is at its 2-vault limit");
+    expect(await env.DB.prepare("SELECT 1 AS one FROM vaults WHERE name = ?").bind(restoredVaultName("rp-ovt-0", new Date())).first()).toBeNull();
+
+    // Plus counts 5; with 5 owned and an override of 6 the restore goes through.
+    const { id: roomyId } = await seedUser("rp-override-roomy@example.com");
+    await env.DB.prepare("UPDATE users SET plan = 'plus', vault_limit_override = 6 WHERE id = ?").bind(roomyId).run();
+    for (let i = 0; i < 5; i++) await seedVault(`rp-ovr-${i}`, roomyId);
+    const entry = wireEntry("rp-ovr-0", "2026-07-02T04:00:00.000Z");
+    await seedMirrorRow("rp-ovr-0", entry);
+    const target = restoredVaultName("rp-ovr-0", new Date());
+    interceptRestoreFlow(target);
+    const res = await quietly(async () => app.fetch(restoreReq({ vault: "rp-ovr-0", key: entry.key }, sessionCookie(await seedSession(roomyId))), env));
+    expect(res.headers.get("location")).toBe(`/console?restored=${encodeURIComponent(target)}`);
+  });
+
   test("at the plan's vault cap → the friendly refusal; NO vault created, NO DO call", async () => {
     const { id: userId } = await seedUser("rp-cap@example.com");
     await env.DB.prepare("UPDATE users SET plan = 'plus' WHERE id = ?").bind(userId).run();

@@ -1,0 +1,13 @@
+-- 0033: an operator-set vault limit per account (T-505). One additive, nullable column; nothing existing changes, and no
+-- existing row is rewritten.
+--
+-- users.vault_limit_override  NULL for every account (as before): the plan's vault count applies (plans.ts
+--                             PLAN_SPECS.vault_count through vaultLimitPlan). A whole number 0..1000, set only by an
+--                             operator at POST /admin/users/vault-limit, replaces that count at every door that makes a
+--                             new vault (console create and restore, account REST create, account MCP create-vault,
+--                             account and console import, operator import, handover accept) and in what those doors and
+--                             the console say the limit is. One rule, in one place: plans.ts vaultLimitFor. An ended
+--                             plan in paid mode stays at zero whatever this says (its writes are frozen). Clearing it
+--                             (NULL) brings back the plan's count. Existing vaults are never touched: `>=` still only
+--                             refuses NEW vaults, so lowering it below what an account owns keeps every vault it has.
+ALTER TABLE users ADD COLUMN vault_limit_override INTEGER;

@@ -486,6 +486,13 @@ export function vaultLimitPlan(plan: PlanId, pendingPlan: PlanId | null, mode: B
   return mode === "open_beta" ? entitlementPlanFor(plan, pendingPlan, mode) : livePlan(plan, mode);
 }
 
+export function vaultLimitFor(
+  user: { plan: PlanId; pendingPlan: PlanId | null; vaultLimitOverride: number | null },
+  mode: BillingMode,
+): number {
+  return PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, mode)].vault_count;
+}
+
 /** The entitlement pushed to every vault DO for a plan (vault-call.ts). */
 export function planEntitlement(plan: PlanId): VaultEntitlement {
   const spec = PLAN_SPECS[plan];
@@ -661,7 +668,7 @@ export function restoreAtCapMessage(plan: PlanId, mode: BillingMode, pendingPlan
  * (grandfathered) see the same message: they keep everything they have — the
  * cap only refuses NEW creation until they're under it.
  */
-export function vaultCapMessage(plan: PlanId, mode: BillingMode, pendingPlan: PlanId | null = null): string {
+export function vaultCapMessage(plan: PlanId, mode: BillingMode, pendingPlan: PlanId | null = null, _override: number | null = null): string {
   const limit = PLAN_SPECS[vaultLimitPlan(plan, pendingPlan, mode)].vault_count;
   plan = livePlan(plan, mode);
   const spec = { ...PLAN_SPECS[plan], vault_count: limit };
