@@ -32,7 +32,7 @@ A profile is a small env file kept **outside** this public repo (it names an acc
 ```bash
 ACCOUNT_ID=<32 hex>          # the Cloudflare account; the deploy refuses to run on any other (or on Parachute's)
 PREFIX=aaron-parachute       # workers <PREFIX>-vault and <PREFIX>-identity, D1 <PREFIX>-identity, R2 <PREFIX>-vault
-WORKERS_SUBDOMAIN=           # <sub>.workers.dev; blank: asked of the account during the deploy
+WORKERS_SUBDOMAIN=           # <sub>.workers.dev; blank: asked of the account during the deploy (needs an API token)
 OWNER_PUBKEY=npub1...        # or 64 hex; "rehearsal": a made-up key made by the deploy (staging only)
 ADMIN_PUBKEYS=npub1...       # comma- or space-separated; "rehearsal" as above
 OWNER_PLAN=power             # entry | standard | plus | power
@@ -47,11 +47,14 @@ You need [Bun](https://bun.sh) 1.4+, git, and a Cloudflare account with a worker
 your subdomain). From a clean checkout of `door/0.9`:
 
 ```bash
+bun install                                                    # "Failed to install 2 packages" is expected: deploy.sh fetches them
+mkdir -p <profile dir>/private && bun deploy/personal/nip98.ts keygen <profile dir>/private/owner.key   # a key if you have none: prints OWNER_PUBKEY
 bunx wrangler login                                            # or export CLOUDFLARE_API_TOKEN=… (below)
 bash deploy/personal/deploy.sh <profile.env> <evidence dir>    # about a minute; prints both addresses
 bun deploy/personal/smoke.ts <evidence>/deployed.env <private dir> <evidence>/SUMMARY.txt   # optional, keyless
 ```
 
+With `wrangler login`, put `WORKERS_SUBDOMAIN` in the profile: the lookup needs an API token.
 An API token instead of `wrangler login` needs, on that account: Workers Scripts Edit, D1 Edit and Workers R2 Storage
 Edit (set `WORKERS_SUBDOMAIN` in the profile if the token can't read it). A custom domain (`VAULT_DOMAIN`,
 `IDENTITY_DOMAIN`) also needs that zone's Workers Routes Edit and DNS Edit. The smoke needs the profile's own keys in
@@ -87,8 +90,9 @@ may send `Parachute-On-Behalf-Of: client-42` (on MCP, the write tool's `on_behal
 
 ## Sign in from the Parachute app
 
-On a phone or the desktop app, with your key in the app (Settings → your key; paste your nsec under Advanced): type
-your Parachute's address (the identity one), choose **Mine**, **Sign in**. The app signs one request with the key
+On a phone or the desktop app, with your key in the app (on its first screen, **Advanced: paste a secret key**: an nsec
+or the 64 hex `keygen` wrote): type your Parachute's address (the identity one), choose **Mine**, **Sign in with your
+key**. The app signs one request with the key
 (`POST /account/token`), opens a one-time sign-in link, and you allow it on the consent page. This needs an app build that includes ParachuteComputer/parachute#136 (merged 2026-11-21); an older one says "This hub doesn't take a key to sign in".
 
 In a browser tab (the web build) there is no key, and this door sends no mail, so its sign-in page's email link goes
