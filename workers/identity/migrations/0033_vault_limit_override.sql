@@ -10,4 +10,7 @@
 --                             plan in paid mode stays at zero whatever this says (its writes are frozen). Clearing it
 --                             (NULL) brings back the plan's count. Existing vaults are never touched: `>=` still only
 --                             refuses NEW vaults, so lowering it below what an account owns keeps every vault it has.
-ALTER TABLE users ADD COLUMN vault_limit_override INTEGER;
+--                             The CHECK holds every writer (a script, a manual UPDATE) to the same whole number 0..1000
+--                             the admin lever accepts, so the gates never compare against -1 or 2.5.
+ALTER TABLE users ADD COLUMN vault_limit_override INTEGER
+  CHECK (vault_limit_override IS NULL OR (typeof(vault_limit_override) = 'integer' AND vault_limit_override BETWEEN 0 AND 1000));

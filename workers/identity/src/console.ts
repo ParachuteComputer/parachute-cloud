@@ -464,7 +464,7 @@ async function renderConsoleFor(
       // Trial/expired with no live subscription → the tier chooser + promo box
       // render; a paid tier gets Manage-billing; a live sub gets neither.
       canCheckout: canStartCheckout(user.plan),
-      // At (or over — grandfathered) the plan's vault count: the create form
+      // At (or over — grandfathered) the account's vault limit (vaultLimitFor): the create form
       // gives way to the friendly at-cap note. The POST handler is the real
       // gate; this just keeps the UI honest.
       atVaultCap: cards.length >= vaultLimitFor(user, billingModeOf(deps)),
@@ -849,7 +849,7 @@ async function importFailureResponse(
  *
  * The user-facing trust boundary mirrors the create door (an import CREATES a
  * vault): session + CSRF + same-origin + vault-name validation identical to
- * create + the plan vault-count cap (expired, vault_count 0, is refused here
+ * create + the account's vault limit (vaultLimitFor; expired, 0, is refused here
  * exactly as create refuses it). Then: create (or, for a retry, REUSE) the
  * target vault → push the plan cap → forward the tar to the target DO's
  * `POST /api/internal/import` through the mint seam (first-party admin,
@@ -911,7 +911,7 @@ export async function handleImportPost(db: D1Database, req: Request, deps: OAuth
     return consoleError(db, req, deps, user, importTooLargeMessage());
   }
 
-  // Reuse-or-create, the plan's vault count, the forward and the retry gate are the account door's too
+  // Reuse-or-create, the account's vault limit, the forward and the retry gate are the account door's too
   // (import-door.ts). A failed import never frees the name: the row stays this caller's and a retry converges.
   const result = await importAsOwner(db, deps, user, rawName, buf, startedMs);
   if (result.kind === "name_taken") return consoleError(db, req, deps, user, "That vault name is already taken.");
@@ -1059,7 +1059,7 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
     return consoleError(db, req, deps, user, "Couldn't claim a name for the restored vault. Please try again tomorrow.");
   }
   if (!reuse) {
-    // Restore creates a NEW vault — it counts against the plan's vault limit
+    // Restore creates a NEW vault — it counts against the account's vault limit (vaultLimitFor)
     // exactly like any other creation (same `>=` grandfathering rule).
     if ((await countVaultsForOwner(db, user.id)) >= vaultLimit) {
       return consoleError(db, req, deps, user, restoreAtCapMessage(user.plan, billingModeOf(deps), user.pendingPlan, user.vaultLimitOverride));

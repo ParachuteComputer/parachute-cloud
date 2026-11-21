@@ -9,7 +9,7 @@
  *     attempt at this same import failed. Any other existing name, the owner's or anyone's, is "taken".
  *   - **A failed import never frees the name.** The vault's Durable Object may hold the uploaded notes; a freed
  *     name could be claimed by another account. The row stays the caller's; a retry converges (blow-away replay).
- *   - **The plan's vault count applies** to a new vault exactly as on create.
+ *   - **The account's vault limit applies** (vaultLimitFor) to a new vault exactly as on create.
  *   - **An error is not proof it failed**: `forwardImport` asks the vault how this attempt went before saying so.
  */
 import { forwardImport, logForwardFailed } from "./import-forward.ts";

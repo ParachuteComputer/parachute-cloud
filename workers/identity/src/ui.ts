@@ -1177,7 +1177,7 @@ export interface ConsoleProps {
    * rather than claiming a misleading zero.
    */
   totalUsedBytes?: number | null;
-  /** At/over the plan's vault count → the create form yields to the at-cap note. */
+  /** At/over the account's vault limit (plans.ts vaultLimitFor) → the create form yields to the at-cap note. */
   atVaultCap: boolean;
   /** The stored pending plan, so the at-cap note names the real limit (a former Power subscriber keeps ten). */
   pendingPlan?: PlanId | null;
@@ -1857,7 +1857,7 @@ export function renderConsole(props: ConsoleProps): string {
   }
 
   const list = vaults.map((v) => vaultCard(v, csrfToken, plan)).join("\n");
-  // At the plan's vault cap the create form yields to the friendly note (the
+  // At the account's vault limit the create form yields to the friendly note (the
   // POST handler enforces regardless — this keeps the door honest). An error
   // still renders inside whichever card is shown.
   const createCard = atVaultCap

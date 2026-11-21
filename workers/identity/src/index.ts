@@ -309,7 +309,7 @@ app.post("/console/vaults/restore", (c) => handleRestorePost(c.env.DB, c.req.raw
 // with Content-Disposition: attachment — no token ever lands in a URL.
 app.post("/console/vaults/export", (c) => handleExportPost(c.env.DB, c.req.raw, depsFor(c.env)));
 // The import door (the other half of the export door): session + CSRF + vault-
-// name validation + plan vault-count cap (an import CREATES a vault), then the
+// name validation + the account's vault limit (an import CREATES a vault), then the
 // uploaded tar is forwarded to the new vault's DO via the internal-import mint
 // seam. A failed forward rolls the vault row back. Multipart form upload.
 app.post("/console/vaults/import", (c) => handleImportPost(c.env.DB, c.req.raw, depsFor(c.env)));

@@ -18,6 +18,7 @@ import {
   formatPlanBytes,
   formatUsageBytes,
   isCompPlan,
+  livePlan,
   planLabel,
 } from "./plans.ts";
 import type { DigestStats } from "./ops.ts";
@@ -279,7 +280,9 @@ export function renderAdminUsers(props: AdminUsersProps): string {
           ${input ? `<input type="number" name="vault_limit" min="0" max="1000" step="1" required placeholder="limit" aria-label="Vault limit for ${esc(u.email)}" style="width:4.5em">` : `<input type="hidden" name="vault_limit" value="">`}
           <button class="rowbtn" type="submit">${label}</button>
         </form>`;
-      const limitForm = `${limitField("Set vault limit", true)}${hasLimit ? ` ${limitField("Clear limit", false)}` : ""}`;
+      const limitForm = u.deletedAt ? "" : `${limitField("Set vault limit", true)}${hasLimit ? ` ${limitField("Clear limit", false)}` : ""}`;
+      // The limit is shown as stored; when the ended plan holds the account at zero (paid mode), the badge says so.
+      const limitIdle = hasLimit && livePlan(u.plan, billingMode) === "expired";
       const flags = [
         u.role === "operator" ? `<span class="badge badge-on">operator</span>` : "",
         u.suspendedAt ? `<span class="badge badge-warn">suspended ${esc(u.suspendedAt.slice(0, 10))}</span>` : "",
@@ -298,7 +301,7 @@ export function renderAdminUsers(props: AdminUsersProps): string {
         <td>${esc(u.email)}${flags ? `<br>${flags}` : ""}</td>
         <td>${esc(adminPlanLabel(u.plan, billingMode))}</td>
         <td>${esc(u.createdAt.slice(0, 10))}</td>
-        <td style="text-align:right">${u.vaultCount}${hasLimit ? `<br><span class="badge" data-testid="vault-limit-override" title="Set by an operator; replaces the plan's vault count">limit ${u.vaultLimitOverride}</span>` : ""}</td>
+        <td style="text-align:right">${u.vaultCount}${hasLimit ? `<br><span class="badge" data-testid="vault-limit-override" title="Set by an operator; replaces the plan's vault count">limit ${u.vaultLimitOverride}${limitIdle ? " (idle: plan ended)" : ""}</span>` : ""}</td>
         <td style="text-align:right">${u.checklistDone}/${CHECKLIST_ITEMS.length}</td>
         <td>${planForm} ${suspendForm} ${limitForm}${u.deletedAt ? "" : ` <a class="rowbtn" style="text-decoration:none" href="/admin/users/delete?user_id=${encodeURIComponent(u.id)}">Delete&hellip;</a>`}</td>
       </tr>`;

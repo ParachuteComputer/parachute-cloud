@@ -12,7 +12,7 @@
  * WRAP, DON'T REIMPLEMENT. These handlers drive the SAME machinery the
  * cookie-authed console already runs, only the outer auth boundary differs
  * (Bearer account token here vs session cookie + CSRF + same-origin there):
- *   - create → `createVault` + the plan vault-count cap (PLAN_SPECS /
+ *   - create → `createVault` + the account's vault limit (vaultLimitFor /
  *     countVaultsForOwner, IDENTICAL to handleCreateVaultPost) + `pushVaultCap`;
  *   - list   → `listVaultsForOwner` + the daily rollup's `vault_usage` rows;
  *   - mint   → the `vault-call.ts` first-party mint seam's `signAccessToken`,
@@ -463,7 +463,7 @@ export async function handleAccountHandleClaim(db: D1Database, req: Request, dep
  * Create a vault and return a ready-to-use vault token, so the app lands the
  * user straight IN the new vault with zero extra OAuth round-trips (the D2
  * hinge). Wraps the SAME create path the console's `handleCreateVaultPost` runs:
- * the plan vault-count cap (IDENTICAL gate — a Bearer create is refused at-cap
+ * the account's vault limit (vaultLimitFor; IDENTICAL gate — a Bearer create is refused at-cap
  * exactly as a cookie create is), `createVault` (slug + reserved + PK-collision
  * validation), and the best-effort `pushVaultCap`. Then it additionally mints a
  * `vault:<name>:{read,write}` token (aud-pinned, `client_id="parachute-account"`

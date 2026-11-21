@@ -329,6 +329,27 @@ describe("POST /admin/users/vault-limit — only an operator sets or clears it",
     expect((await post({ user_id: "no-such-user", vault_limit: "3" }, cookie)).headers.get("location")).toBe("/admin/users?err=not-found");
   });
 
+  test("the users page says when an ended plan holds the account at zero; a deleting account gets no form", async () => {
+    const cookie = await operatorCookie();
+    const ended = await account("expired", 0, 5);
+    const deleting = await account("standard", 0, null);
+    await env.DB.prepare("UPDATE users SET deleted_at = ? WHERE id = ?").bind(new Date().toISOString(), deleting.id).run();
+    const page = await (await app.fetch(new Request(`${ISSUER}/admin/users`, { headers: { cookie } }), env)).text();
+    const rowOf = (email: string) => page.split('<tr data-testid="admin-user-row">').find((r) => r.includes(email))!;
+    expect(rowOf(ended.email)).toContain("limit 5 (idle: plan ended)");
+    expect(rowOf(deleting.email)).not.toContain('action="/admin/users/vault-limit"');
+    expect(rowOf(ended.email)).toContain('action="/admin/users/vault-limit"');
+  });
+
+  test("the column itself refuses what the lever refuses (migration 0033's CHECK)", async () => {
+    const target = await account("standard", 0, null);
+    for (const bad of [-1, 1001, 2.5]) {
+      await expect(env.DB.prepare("UPDATE users SET vault_limit_override = ? WHERE id = ?").bind(bad, target.id).run(), String(bad)).rejects.toThrow(/CHECK/);
+    }
+    await env.DB.prepare("UPDATE users SET vault_limit_override = 0 WHERE id = ?").bind(target.id).run();
+    expect((await getUserById(env.DB, target.id))!.vaultLimitOverride).toBe(0);
+  });
+
   test("anyone else gets the router's 404 and nothing changes — including the account raising its own limit", async () => {
     const target = await account("standard", 0, null);
     const own = cookieFor(await seedSession(target.id));
