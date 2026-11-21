@@ -126,6 +126,19 @@ res(!!vaultToken, "vault-token", `mint ${vt.status}`);
   );
 }
 
+// 4b. One address (T-476): the door gives out its own origin for vaults, and a vault answers there, as the app needs
+{
+  const d = await j(`${ID}/.well-known/parachute-account`);
+  const template = String(d.body?.vault_url_template ?? "");
+  const q = await j(`${ID}/vault/${vaultName}/api/records?type=episode`, { token: vaultToken });
+  const rows = Array.isArray(q.body) ? q.body : q.body?.records ?? [];
+  res(
+    template === `${ID}/vault/{name}` && q.status === 200 && rows.length === 1,
+    "one-address",
+    `vault_url_template on the door: ${template.startsWith(ID)}, records through the door ${q.status} → ${rows.length}`,
+  );
+}
+
 // 5. MCP: the record tools lead, create-record and query-records round trip
 {
   const list = await mcp(vaultName, vaultToken, "tools/list", {});

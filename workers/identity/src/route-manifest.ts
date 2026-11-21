@@ -108,7 +108,10 @@ export const SUBTREE_ONLY_PREFIXES = ["/account"] as const;
  * claims the path (so Static Assets' SPA fallback can't shadow it), and the
  * registered handler (index.ts `vaultRouteMissing`) answers `503 route_missing`
  * — never the SPA shell, which would look like a working (but empty) vault to
- * an API/MCP client instead of an honest failure.
+ * an API/MCP client instead of an honest failure. On a single-owner door
+ * (OWNER_PUBKEY + VAULT_SERVICE, T-476) the same handler hands the request to
+ * the vault worker instead: workers.dev has no zone route, so the identity
+ * origin is the door's one address.
  *
  * `/mcp`: on my.parachute.computer, `/mcp*` is meant to be intercepted by a
  * Cloudflare ZONE ROUTE that dispatches straight to the VAULT worker

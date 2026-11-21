@@ -1,6 +1,7 @@
 // NIP-98 for the personal door (T-430): sign one HTTP request with a Nostr key, and sign in with it.
 //   bun deploy/personal/nip98.ts keygen <secret-file>             a new key; prints its pubkey (hex), secret to the file (0600)
 //   bun deploy/personal/nip98.ts pubkey <secret-file>             the key's pubkey (hex)
+//   bun deploy/personal/nip98.ts hex <npub or 64 hex>              a public key as 64 lowercase hex
 //   bun deploy/personal/nip98.ts token <identity-origin> <secret-file> [out-file]
 //                                                                 sign in (POST /account/token); the 10-minute account
 //                                                                 token goes to out-file (0600), never to stdout; an
@@ -91,6 +92,8 @@ if (import.meta.main) {
     writeFileSync(a, hex(secret) + "\n", { mode: 0o600 });
     chmodSync(a, 0o600);
     console.log(pubkeyOf(secret));
+  } else if (cmd === "hex" && a) {
+    console.log(/^[0-9a-f]{64}$/i.test(a) ? a.toLowerCase() : hex(bech32Bytes(a, "npub")));
   } else if (cmd === "pubkey" && a) {
     console.log(pubkeyOf(readSecret(a)));
   } else if (cmd === "token" && a && b) {
@@ -106,7 +109,7 @@ if (import.meta.main) {
       console.log(`account token (10 min) in ${c}`);
     } else console.log("signed in (pass an out-file to keep the token)");
   } else {
-    console.error("usage: nip98.ts keygen <secret-file> | pubkey <secret-file> | token <identity-origin> <secret-file> [out-file]");
+    console.error("usage: nip98.ts keygen <secret-file> | pubkey <secret-file> | hex <npub> | token <identity-origin> <secret-file> [out-file]");
     process.exit(2);
   }
 }
