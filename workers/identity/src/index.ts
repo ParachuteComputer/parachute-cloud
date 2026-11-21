@@ -201,6 +201,7 @@ app.get("/.well-known/parachute-account", (c) => accountDescriptor(depsFor(c.env
 app.get("/.well-known/oauth-protected-resource/account/mcp", (c) => accountMcpProtectedResource(depsFor(c.env)));
 // A single-owner door's vaults answer on this origin (vaultOrBackstop, below), and so do their RFC 9728 documents.
 app.get("/.well-known/oauth-protected-resource/vault/*", (c) => (forwardsVaults(c.env) ? vaultOrBackstop(c) : c.notFound()));
+app.get("/.well-known/oauth-protected-resource/mcp", (c) => (forwardsVaults(c.env) ? vaultOrBackstop(c) : c.notFound()));
 app.get("/.well-known/oauth-authorization-server/vault/*", (c) => (forwardsVaults(c.env) ? vaultOrBackstop(c) : c.notFound()));
 
 // --- OAuth ---
@@ -747,9 +748,9 @@ function vaultRouteMissing(): Response {
 function forwardsVaults(env: Partial<Env>): Fetcher | null {
   return env.VAULT_SERVICE && parseOwnerPubkey(env.OWNER_PUBKEY) ? env.VAULT_SERVICE : null;
 }
-async function vaultOrBackstop(c: { env: Env; req: { raw: Request } }): Promise<Response> {
+async function vaultOrBackstop(c: { env: Env; req: { raw: Request } }, backstop: () => Response = vaultRouteMissing): Promise<Response> {
   const vault = forwardsVaults(c.env);
-  if (!vault) return vaultRouteMissing();
+  if (!vault) return backstop();
   const req = new Request(c.req.raw);
   req.headers.delete("cookie");
   try {
@@ -761,8 +762,8 @@ async function vaultOrBackstop(c: { env: Env; req: { raw: Request } }): Promise<
     return Response.json({ error: "vault_unavailable", error_type: "vault_unavailable", message: "The vault didn't answer." }, { status: 502 });
   }
 }
-app.all("/vault", vaultOrBackstop);
-app.all("/vault/*", vaultOrBackstop);
+app.all("/vault", (c) => vaultOrBackstop(c));
+app.all("/vault/*", (c) => vaultOrBackstop(c));
 
 /**
  * The /mcp defensive backstop (route-manifest.ts DEFENSIVE_PREFIXES),
@@ -795,8 +796,10 @@ function mcpRouteMissing(): Response {
     { status: 503 },
   );
 }
-app.all("/mcp", mcpRouteMissing);
-app.all("/mcp/*", mcpRouteMissing);
+// A single-owner door's one address carries the vault worker's root MCP too (every vault the person lets an AI reach;
+// T-476), the way my. does on Cloud; anywhere else this stays the backstop.
+app.all("/mcp", (c) => vaultOrBackstop(c, mcpRouteMissing));
+app.all("/mcp/*", (c) => vaultOrBackstop(c, mcpRouteMissing));
 
 /**
  * Serve the SPA shell (index.html) through the Static Assets binding (P1.1),
@@ -859,7 +862,7 @@ app.get("/", (c) => {
  * MCP/vault scanners hit those all day and would page the operator for
  * nothing. On the canonical vault host (VAULT_PUBLIC_ORIGIN, my. in
  * production) the same 503 means the zone route broke — that one counts. On a
- * single-owner door, which hands /vault/* to the vault worker itself
+ * single-owner door, which hands /vault/* and /mcp to the vault worker itself
  * (vaultOrBackstop, T-476), every 5xx there is the vault's and counts.
  */
 export function countsAs5xx(req: Request, status: number, env: Partial<Env>): boolean {
@@ -867,9 +870,8 @@ export function countsAs5xx(req: Request, status: number, env: Partial<Env>): bo
   const url = new URL(req.url);
   const backstop = /^\/(vault|mcp)(\/|$)/.test(url.pathname);
   if (!backstop) return true;
-  // A single-owner door answers /vault/* itself (vaultOrBackstop): a 5xx there is the vault's, and counts. Its /mcp
-  // stays the by-design backstop, even though the door advertises its own origin for vaults (VAULT_PUBLIC_ORIGIN).
-  if (forwardsVaults(env)) return /^\/vault(\/|$)/.test(url.pathname);
+  // A single-owner door hands /vault/* and /mcp to its vault worker (vaultOrBackstop): a 5xx there is the vault's.
+  if (forwardsVaults(env)) return true;
   try {
     return env.VAULT_PUBLIC_ORIGIN ? new URL(env.VAULT_PUBLIC_ORIGIN).host === url.host : false;
   } catch {

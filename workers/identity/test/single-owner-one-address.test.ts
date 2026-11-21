@@ -80,6 +80,17 @@ describe("a single-owner door answers for its vaults on its own origin (T-476)",
     ]);
   });
 
+  test("the root MCP (every vault an AI may reach) and its document answer on the door too", async () => {
+    const { fetcher, seen } = vaultStub();
+    const e = singleOwner(fetcher);
+    for (const path of ["/mcp", "/.well-known/oauth-protected-resource/mcp"]) {
+      const res = await worker.fetch(new Request(`${ISSUER}${path}`, { method: path === "/mcp" ? "POST" : "GET", headers: { cookie: "parachute_id_session=s3cret" } }), e);
+      expect(res.status, path).toBe(200);
+    }
+    expect(seen.map((r) => new URL(r.url).pathname)).toEqual(["/mcp", "/.well-known/oauth-protected-resource/mcp"]);
+    expect(seen.every((r) => r.headers.get("cookie") === null)).toBe(true);
+  });
+
   test("the door's own documents stay its own", async () => {
     const { fetcher, seen } = vaultStub();
     const res = await worker.fetch(new Request(`${ISSUER}/.well-known/oauth-protected-resource/account/mcp`), singleOwner(fetcher));
@@ -119,9 +130,9 @@ describe("what the forward keeps (review round 1)", () => {
     const req = new Request(`${ISSUER}/vault/home/api/records`);
     expect(countsAs5xx(req, 500, singleOwner(fetcher))).toBe(true);
     expect(countsAs5xx(req, 503, { ...env, VAULT_PUBLIC_ORIGIN: undefined } as Env)).toBe(false);
-    // the personal deploy advertises its own origin for vaults: a scanner's /mcp there is still the backstop, not a page
+    // the personal deploy advertises its own origin and hands /mcp to the vault too: a 5xx on either is the vault's
     const door = { ...singleOwner(fetcher), VAULT_PUBLIC_ORIGIN: ISSUER } as Env;
-    expect(countsAs5xx(new Request(`${ISSUER}/mcp`), 503, door)).toBe(false);
+    expect(countsAs5xx(new Request(`${ISSUER}/mcp`), 500, door)).toBe(true);
     expect(countsAs5xx(new Request(`${ISSUER}/vault/home/mcp`), 500, door)).toBe(true);
   });
 });
@@ -142,6 +153,16 @@ describe("Parachute Cloud, and a door without the binding, keep the backstop", (
       VAULT_SERVICE: fetcher,
     } as Env);
     expect(res.status).toBe(404);
+    expect(seen).toHaveLength(0);
+  });
+
+  test("no OWNER_PUBKEY: /mcp is the 503 mcp_route_missing and its document a 404, as before", async () => {
+    const { fetcher, seen } = vaultStub();
+    const e = { ...env, VAULT_SERVICE: fetcher } as Env;
+    const res = await worker.fetch(new Request(`${ISSUER}/mcp`, { method: "POST" }), e);
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as { error_type: string }).error_type).toBe("mcp_route_missing");
+    expect((await worker.fetch(new Request(`${ISSUER}/.well-known/oauth-protected-resource/mcp`), e)).status).toBe(404);
     expect(seen).toHaveLength(0);
   });
 
