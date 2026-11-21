@@ -35,8 +35,9 @@ else case "${1:-}" in d1) TPL=d1-write ;; r2) TPL=r2-admin ;; *) TPL=workers-scr
 here="$PWD"; out="$(mktemp)"; err="$(mktemp)"; tries="${WR_TRIES:-8}"
 for i in $(seq 1 "$tries"); do
   if [ "${1:-}" = --api ]; then
+    # the header on stdin (-H @-, printf is a builtin): the key never enters curl's argv, where ps would show it
     (cd "$HOME/Code/uni-ops" && "$PY" -I "$SEALED" job-child "$TPL" -- bash -c \
-      'curl -fsS -H "Authorization: Bearer $(cat <&"$UNI_SEALED_FD")" "https://api.cloudflare.com/client/v4/accounts/$UNI_SEALED_ACCOUNT_ID/$0"' "$2") >"$out" 2>"$err"
+      'printf "Authorization: Bearer %s\n" "$(cat <&"$UNI_SEALED_FD")" | curl -fsS -H @- "https://api.cloudflare.com/client/v4/accounts/$UNI_SEALED_ACCOUNT_ID/$0"' "$2") >"$out" 2>"$err"
   else
     (cd "$HOME/Code/uni-ops" && "$PY" -I "$SEALED" job-child "$TPL" -- \
       bash -c 'cd "$0"; CLOUDFLARE_ACCOUNT_ID="$UNI_SEALED_ACCOUNT_ID" CLOUDFLARE_API_TOKEN="$(cat <&"$UNI_SEALED_FD")" CI=1 WRANGLER_SEND_METRICS=false exec "$1" wrangler "${@:2}"' "$here" "$REAL" "$@") >"$out" 2>"$err" < "${WR_STDIN_FILE:-/dev/null}"

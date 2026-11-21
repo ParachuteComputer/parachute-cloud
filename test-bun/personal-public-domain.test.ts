@@ -136,6 +136,32 @@ describe("wr's child key template", () => {
     expect(ask(["--api", "workers/subdomain"])).toBe("workers-scripts-write");
   });
 
+  it("keeps the child key out of curl's argv for --api (header on stdin)", () => {
+    // The broker stand-in hands the command a made-up key on a file descriptor, as job-child does; a stand-in curl
+    // records its argv and stdin.
+    const key = "made-up-key-" + "k".repeat(20);
+    const keyFile = join(dir, "child.key");
+    writeFileSync(keyFile, key);
+    const seen = join(dir, "curl-seen");
+    const bin = join(dir, "bin");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "curl"), `#!/usr/bin/env bash\n{ printf 'ARGV %s\\n' "$*"; printf 'STDIN '; cat; } > ${JSON.stringify(seen)}\necho '{}'\n`);
+    chmodSync(join(bin, "curl"), 0o755);
+    const child = join(dir, "sealed-child.sh");
+    writeFileSync(child, `#!/usr/bin/env bash\nshift 5\nexec 9< ${JSON.stringify(keyFile)}\nUNI_SEALED_FD=9 exec "$@"\n`);
+    chmodSync(child, 0o755);
+    const r = Bun.spawnSync(["bash", join(ROOT, "deploy/personal/wr"), "--api", "workers/subdomain"], {
+      env: { ...process.env, HOME: home, UNI_SEALED_ACCOUNT_ID: "f".repeat(32), PY: child, WR_TRIES: "1", PATH: `${bin}:${process.env.PATH}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(r.exitCode).toBe(0);
+    const got = readFileSync(seen, "utf8");
+    expect(got).toContain("ARGV -fsS -H @- https://api.cloudflare.com/client/v4/accounts/" + "f".repeat(32) + "/workers/subdomain");
+    expect(got.split("STDIN")[0]).not.toContain(key);
+    expect(got).toContain("STDIN Authorization: Bearer " + key);
+  });
+
   it("uses WR_TEMPLATE for every call", () => {
     for (const args of [["d1", "list"], ["r2", "bucket", "create", "x"], ["deploy"], ["--api", "workers/subdomain"]]) {
       expect(ask(args, { WR_TEMPLATE: "worker-app" })).toBe("worker-app");
