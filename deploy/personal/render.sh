@@ -39,7 +39,7 @@ sub() {
   sed -e "s|@PREFIX@|$PREFIX|g" -e "s|@D1_ID@|$D1_ID|g" -e "s|@VAULT_HOST@|$VAULT_HOST|g" \
       -e "s|@VAULT_ORIGIN@|https://$VAULT_HOST|g" -e "s|@IDENTITY_ORIGIN@|$ID_ORIGIN|g" -e "s|@PUBLIC_ORIGIN@|$PUBLIC_ORIGIN|g" \
       -e "s|@OWNER_PUBKEY@|$OWNER_PUBKEY|g" -e "s|@ADMIN_PUBKEYS@|${ADMIN_PUBKEYS:-}|g" -e "s|@OWNER_PLAN@|$PLAN|g" \
-      -e "s|@VAULT_ROUTES@|routes = []|" -e "s|@IDENTITY_ROUTES@|$ID_ROUTES|" -e "s|@BOUND_ORIGINS@|$BOUND|" "$1"
+      -e "s|@IDENTITY_ROUTES@|$ID_ROUTES|" -e "s|@BOUND_ORIGINS@|$BOUND|" "$1"
 }
 sub "$HERE/vault.toml.tmpl" > "$ROOT/workers/vault/wrangler.personal.gen.toml"
 sub "$HERE/identity.toml.tmpl" > "$ROOT/workers/identity/wrangler.personal.gen.toml"

@@ -26,7 +26,7 @@ fail() { echo "failed: $*" >&2; exit 1; }
 : "${ACCOUNT_ID:?profile: ACCOUNT_ID}" "${PREFIX:?profile: PREFIX}" "${OWNER_PUBKEY:?profile: OWNER_PUBKEY}"
 
 # A public name (PUBLIC_DOMAIN) is a Custom Domain, a DNS record on its zone: inside a sealed job every child key is
-# then worker-app (Workers, D1, R2 on the account, DNS on the job's one zone), so the card is one template (README.md).
+# then worker-app (Workers, D1, R2 on the account, DNS and routes on the job's one zone), so the card is one template (README.md).
 # WR_TEMPLATE set by the caller wins.
 [ -z "${PUBLIC_DOMAIN:-}" ] || export WR_TEMPLATE="${WR_TEMPLATE:-worker-app}"
 

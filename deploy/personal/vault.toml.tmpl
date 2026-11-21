@@ -6,7 +6,8 @@ main = "src/index.ts"
 compatibility_date = "2025-07-01"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
-@VAULT_ROUTES@
+# never a route: on a public name the identity hands vault paths over (render.sh)
+routes = []
 
 [observability]
 enabled = true

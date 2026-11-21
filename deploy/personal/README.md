@@ -58,13 +58,13 @@ bun deploy/personal/smoke.ts <evidence>/deployed.env <private dir> <evidence>/SU
 
 An API token instead of `wrangler login` needs, on that account: Workers Scripts Edit, D1 Edit and Workers R2 Storage
 Edit (set `WORKERS_SUBDOMAIN` in the profile if the token can't read it). A public name
-(`PUBLIC_DOMAIN`) also needs that zone's DNS Edit. The smoke needs the profile's own keys in
+(`PUBLIC_DOMAIN`) also needs that zone's Workers Routes Edit and DNS Edit. The smoke needs the profile's own keys in
 `private/` (`owner.key`, `admin.key`), so it runs as is only on a rehearsal profile.
 
 **In a sealed job** (Uni's way): the job needs three templates on the profile's account: `d1-write`, `r2-admin`,
 `workers-scripts-write`, and every wrangler call gets its own short-lived child key through `./wr`
 (`sealed job --payload <job.json> -- bash deploy/personal/deploy.sh …`). With `PUBLIC_DOMAIN` the job is one template
-instead, `worker-app` with the name's zone (the job's `zone_id`): it holds the three above plus DNS on that zone, and
+instead, `worker-app` with the name's zone (the job's `zone_id`): it holds the three above plus DNS and Workers routes on that zone, and
 every wrangler call takes a `worker-app` child. Run without a terminal, wrangler replaces a DNS record already on the
 name, so back that record up first if the name was in use. Taking the name off again is not a redeploy (wrangler
 leaves a Custom Domain in place): delete it through the API (`DELETE /accounts/<id>/workers/domains/<domain id>`), then

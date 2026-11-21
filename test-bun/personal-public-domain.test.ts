@@ -15,7 +15,7 @@
  *     mid-deploy).
  */
 import { afterAll, describe, expect, it } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -115,10 +115,13 @@ describe("wr's child key template", () => {
   const stub = join(dir, "sealed-stub.sh");
   writeFileSync(stub, `#!/usr/bin/env bash\necho "$4" >> ${JSON.stringify(log)}\n`);
   chmodSync(stub, 0o755);
+  // wr runs the broker's CLI from $HOME/Code/uni-ops: a home of the test's own, so it runs where that folder doesn't exist
+  const home = join(dir, "home");
+  mkdirSync(join(home, "Code/uni-ops"), { recursive: true });
   const ask = (args: string[], extra: Record<string, string> = {}) => {
     writeFileSync(log, "");
     const r = Bun.spawnSync(["bash", join(ROOT, "deploy/personal/wr"), ...args], {
-      env: { ...process.env, UNI_SEALED_ACCOUNT_ID: "f".repeat(32), PY: stub, WR_TRIES: "1", ...extra },
+      env: { ...process.env, HOME: home, UNI_SEALED_ACCOUNT_ID: "f".repeat(32), PY: stub, WR_TRIES: "1", ...extra },
       stdout: "pipe",
       stderr: "pipe",
     });
