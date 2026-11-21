@@ -16,7 +16,7 @@ pilot (`arcade-parachute-*`, T-335).
   is untouched.
 - **Closed**: no sign-up mail is ever sent (no mail binding), billing is off (no Stripe), the owner starts on
   `OWNER_PLAN` (default `power`: 10 vaults, 50 GiB of attachments).
-- **One address**: `https://<PREFIX>-identity.<sub>.workers.dev` is your Parachute. Sign-in, the account, every
+- **One address**: `https://<PREFIX>-identity.<sub>.workers.dev` (or `IDENTITY_DOMAIN`, when set) is your Parachute. Sign-in, the account, every
   vault (`/vault/<name>`, its REST and `/mcp`) answer there; the identity worker hands `/vault/*` to the vault worker
   over their service binding. The vault worker's own address still works for anything already pointed at it.
 - **workers.dev** by default; a custom domain is optional (`VAULT_DOMAIN`, `IDENTITY_DOMAIN`, each a Custom Domain on

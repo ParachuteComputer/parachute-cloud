@@ -867,8 +867,9 @@ export function countsAs5xx(req: Request, status: number, env: Partial<Env>): bo
   const url = new URL(req.url);
   const backstop = /^\/(vault|mcp)(\/|$)/.test(url.pathname);
   if (!backstop) return true;
-  // A single-owner door answers /vault/* itself (vaultOrBackstop): a 5xx there is the vault's, and counts.
-  if (/^\/vault(\/|$)/.test(url.pathname) && forwardsVaults(env)) return true;
+  // A single-owner door answers /vault/* itself (vaultOrBackstop): a 5xx there is the vault's, and counts. Its /mcp
+  // stays the by-design backstop, even though the door advertises its own origin for vaults (VAULT_PUBLIC_ORIGIN).
+  if (forwardsVaults(env)) return /^\/vault(\/|$)/.test(url.pathname);
   try {
     return env.VAULT_PUBLIC_ORIGIN ? new URL(env.VAULT_PUBLIC_ORIGIN).host === url.host : false;
   } catch {

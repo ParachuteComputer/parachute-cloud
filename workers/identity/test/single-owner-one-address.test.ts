@@ -119,6 +119,10 @@ describe("what the forward keeps (review round 1)", () => {
     const req = new Request(`${ISSUER}/vault/home/api/records`);
     expect(countsAs5xx(req, 500, singleOwner(fetcher))).toBe(true);
     expect(countsAs5xx(req, 503, { ...env, VAULT_PUBLIC_ORIGIN: undefined } as Env)).toBe(false);
+    // the personal deploy advertises its own origin for vaults: a scanner's /mcp there is still the backstop, not a page
+    const door = { ...singleOwner(fetcher), VAULT_PUBLIC_ORIGIN: ISSUER } as Env;
+    expect(countsAs5xx(new Request(`${ISSUER}/mcp`), 503, door)).toBe(false);
+    expect(countsAs5xx(new Request(`${ISSUER}/vault/home/mcp`), 500, door)).toBe(true);
   });
 });
 

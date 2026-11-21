@@ -24,5 +24,5 @@ cd "$ROOT/workers/identity"
 SQL="UPDATE users SET vault_limit_override = $VAL WHERE deleted_at IS NULL AND (email = '$OWNER@nostr.invalid' OR id IN (SELECT user_id FROM user_pubkeys WHERE pubkey = '$OWNER'))"
 out="$("$HERE/wr" d1 execute "$PREFIX-identity" --remote --json -c "$CFG" --command "$SQL")"
 n="$(grep -o '"changes": *[0-9]*' <<<"$out" | head -1 | grep -o '[0-9]*$' || true)"
-[ "${n:-0}" -ge 1 ] || { echo "failed: no owner account yet (sign in once first)" >&2; exit 1; }
+[ "${n:-0}" -ge 1 ] || { echo "failed: no owner row updated (not signed in yet, or wrangler answered something unexpected: see above)" >&2; exit 1; }
 echo "vault limit: $WANT (owner ${OWNER:0:8}…)"
