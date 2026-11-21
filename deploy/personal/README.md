@@ -52,8 +52,9 @@ bash deploy/personal/deploy.sh <profile.env> <evidence dir>    # about a minute;
 bun deploy/personal/smoke.ts <evidence>/deployed.env <private dir> <evidence>/SUMMARY.txt   # optional, keyless
 ```
 
-An API token instead of `wrangler login` needs, on that account: Workers Scripts Edit, D1 Edit, Workers R2 Storage
-Edit (and Account Settings Read, or set `WORKERS_SUBDOMAIN` in the profile). The smoke needs the profile's own keys in
+An API token instead of `wrangler login` needs, on that account: Workers Scripts Edit, D1 Edit and Workers R2 Storage
+Edit (set `WORKERS_SUBDOMAIN` in the profile if the token can't read it). A custom domain (`VAULT_DOMAIN`,
+`IDENTITY_DOMAIN`) also needs that zone's Workers Routes Edit and DNS Edit. The smoke needs the profile's own keys in
 `private/` (`owner.key`, `admin.key`), so it runs as is only on a rehearsal profile.
 
 **In a sealed job** (Uni's way): the job needs three templates on the profile's account: `d1-write`, `r2-admin`,

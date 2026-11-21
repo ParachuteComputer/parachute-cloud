@@ -17,7 +17,8 @@ if [ -z "${UNI_SEALED_ACCOUNT_ID:-}" ]; then
   BUNX="${REAL_BUNX:-$(command -v bunx 2>/dev/null || echo "$HOME/.bun/bin/bunx")}"
   if [ "${1:-}" = --api ]; then
     [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || { echo "wr: --api needs CLOUDFLARE_API_TOKEN" >&2; exit 1; }
-    exec curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/$2"
+    # the token on stdin (-H @-), never in argv where ps would show it
+    exec curl -fsS -H @- "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/$2" <<<"Authorization: Bearer $CLOUDFLARE_API_TOKEN"
   fi
   if [ -n "${WR_STDIN_FILE:-}" ]; then exec env WRANGLER_SEND_METRICS=false "$BUNX" wrangler "$@" < "$WR_STDIN_FILE"; fi
   exec env WRANGLER_SEND_METRICS=false "$BUNX" wrangler "$@"

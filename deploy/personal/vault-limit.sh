@@ -12,7 +12,19 @@ PROFILE="${1:?profile}"; WANT="${2:?a number 0..1000, or plan}"
 # shellcheck disable=SC1090
 . "$PROFILE"
 : "${PREFIX:?profile: PREFIX}" "${OWNER_PUBKEY:?profile: OWNER_PUBKEY}"
-[ -n "${UNI_SEALED_ACCOUNT_ID:-}" ] || export CLOUDFLARE_ACCOUNT_ID="${ACCOUNT_ID:?profile: ACCOUNT_ID}"
+# The same refusals as deploy.sh and render.sh: the profile's own account only, never Parachute Cloud's, never a prefix
+# that could name a Parachute Cloud or Arcade database.
+ACCOUNT_ID="$(tr 'A-F' 'a-f' <<<"${ACCOUNT_ID:?profile: ACCOUNT_ID}")"
+case "$ACCOUNT_ID" in
+  d5d7c8646c3b69ce9f16bfd12ecbe98a|5b543fa4332a619203356ae1418af504) echo "refused: a Parachute Cloud account" >&2; exit 2 ;;
+esac
+[[ "$PREFIX" =~ ^[a-z][a-z0-9-]{2,40}[a-z0-9]$ ]] || { echo "refused: PREFIX must be lowercase letters, digits and -" >&2; exit 2; }
+case "$PREFIX" in parachute|parachute-*|arcade-parachute*|*-staging) echo "refused: PREFIX $PREFIX could name a Parachute Cloud or Arcade database" >&2; exit 2 ;; esac
+if [ -n "${UNI_SEALED_ACCOUNT_ID:-}" ]; then
+  [ "$(tr 'A-F' 'a-f' <<<"$UNI_SEALED_ACCOUNT_ID")" = "$ACCOUNT_ID" ] || { echo "refused: the job's account is not the profile's ACCOUNT_ID" >&2; exit 2; }
+else
+  export CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID"
+fi
 case "$WANT" in plan) VAL=NULL ;; *) [[ "$WANT" =~ ^[0-9]{1,4}$ ]] && [ "$WANT" -le 1000 ] || { echo "refused: a limit is 0..1000, or plan" >&2; exit 2; }; VAL="$WANT" ;; esac
 PRIVATE="${PRIVATE_DIR:-$(dirname "$PROFILE")/private}"
 if [ "$OWNER_PUBKEY" = rehearsal ]; then OWNER="$(bun "$HERE/nip98.ts" pubkey "$PRIVATE/owner.key")"; else OWNER="$(bun "$HERE/nip98.ts" hex "$OWNER_PUBKEY")"; fi
