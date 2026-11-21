@@ -43,6 +43,10 @@ ISSUER = "@IDENTITY_ORIGIN@"
 APP_ORIGIN = "@IDENTITY_ORIGIN@"
 VAULT_BASE_DOMAIN = "@VAULT_HOST@"
 VAULT_ORIGIN = "@VAULT_ORIGIN@"
+# One address (T-476): the vaults also answer on this origin (identity hands /vault/* to the vault worker over
+# VAULT_SERVICE), and this is the address the door gives out, so the Parachute app, which sends tokens only to the
+# hub it signed in to, can use them. VAULT_ORIGIN stays the vault worker's own, for the door's internal calls.
+VAULT_PUBLIC_ORIGIN = "@IDENTITY_ORIGIN@"
 ENVIRONMENT = "production"
 BILLING_MODE = "open_beta"
 OWNER_PUBKEY = "@OWNER_PUBKEY@"
