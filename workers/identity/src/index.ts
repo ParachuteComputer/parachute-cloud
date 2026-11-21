@@ -41,6 +41,7 @@ import {
   handleAdminOverviewGet,
   handleAdminSetPlanPost,
   handleAdminDailyJsonGet,
+  handleAdminSetVaultLimitPost,
   handleAdminSuspendPost,
   handleAdminUsersGet,
   handleAdminVaultsGet,
@@ -457,6 +458,7 @@ app.get("/admin/users", (c) => handleAdminUsersGet(c.env.DB, c.req.raw, depsFor(
 app.get("/admin/vaults", (c) => handleAdminVaultsGet(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/admin/users/plan", (c) => handleAdminSetPlanPost(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/admin/users/suspend", (c) => handleAdminSuspendPost(c.env.DB, c.req.raw, depsFor(c.env)));
+app.post("/admin/users/vault-limit", (c) => handleAdminSetVaultLimitPost(c.env.DB, c.req.raw, depsFor(c.env)));
 // The operator path for an emailed deletion request (T-318, admin-delete.ts):
 // a retype-the-email confirm step, then the SAME request path as self-service
 // (24h undo window + the holder's notice email), audit-logged with the operator.

@@ -14,6 +14,8 @@
  * impersonation; no delete. The levers:
  *   - set plan (free|parachute) — the comp lever; setUserPlan then
  *     applyPlanToVaults so storage caps push into the vault DOs immediately;
+ *   - vault limit — an account's own vault count, replacing the plan's at every door that makes a vault
+ *     (migration 0033, plans.ts vaultLimitFor); cleared, the plan's count applies again;
  *   - suspend / un-suspend — sessions die now (rows deleted + read-time
  *     refusal), login/magic answer neutrally without minting, OAuth tokens
  *     expire naturally, vault DATA untouched (migration 0011's contract).
@@ -25,7 +27,7 @@
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { sessionUser } from "./session-user.ts";
 import { deleteSessionsForUser } from "./sessions.ts";
-import { getUserById, setUserPlan, setUserSuspended, type User } from "./users.ts";
+import { getUserById, setUserPlan, setUserSuspended, setUserVaultLimitOverride, type User } from "./users.ts";
 import { coercePlanId, isCompPlan, isPlanId, planTotalBytes } from "./plans.ts";
 import { applyPlanToVaults } from "./vault-call.ts";
 import { collectDigestStats } from "./ops.ts";
@@ -92,12 +94,15 @@ const NOTICES: Record<string, string> = {
   "plan-partial": "Plan updated, but one or more vault cap pushes failed — they self-heal via the daily reconcilers, or re-run scripts/backfill-plans.ts.",
   suspended: "Account suspended — sessions invalidated; sign-in now answers neutrally. Vault data untouched; connected apps can't refresh, so their access ends within 15 minutes.",
   unsuspended: "Account un-suspended — sign-in works again.",
+  "vault-limit-set": "Vault limit set — it replaces the plan's count when this account makes, restores, imports or accepts a vault. Existing vaults are untouched.",
+  "vault-limit-cleared": "Vault limit cleared — the plan's count applies again.",
   "delete-requested": "Deletion requested — the account is closed now, the holder was emailed an undo link, and it is erased after 24 hours. Logged.",
 };
 const ERRORS: Record<string, string> = {
   csrf: "Your session expired. Please try again.",
   "not-found": "No such user.",
   invalid: "Invalid request.",
+  "vault-limit": "A vault limit is a whole number from 0 to 1000 (or empty, to clear it).",
   "self-suspend": "You can't suspend your own account (that would lock out this console).",
   "self-delete": "You can't delete your own account from here (that would lock out this console).",
   "already-deleting": "That account has already asked to be deleted.",
@@ -172,6 +177,7 @@ interface UserPageRow {
   payment_failed_at: string | null;
   payment_failed_count: number;
   pending_plan: string | null;
+  vault_limit_override: number | null;
   vault_count: number;
   checklist_done: number;
   deleted_at: string | null;
@@ -193,7 +199,7 @@ export async function handleAdminUsersGet(db: D1Database, req: Request, deps: OA
   const res = await db
     .prepare(
       `SELECT u.id, u.email, u.plan, u.role, u.created_at, u.suspended_at, u.drip_unsubscribed,
-         u.payment_failed_at, u.payment_failed_count, u.pending_plan, u.deleted_at,
+         u.payment_failed_at, u.payment_failed_count, u.pending_plan, u.deleted_at, u.vault_limit_override,
          (SELECT COUNT(*) FROM vaults v WHERE v.owner_user_id = u.id) AS vault_count,
          (SELECT COUNT(*) FROM user_checklist c WHERE c.user_id = u.id AND c.item <> 'hidden') AS checklist_done
        FROM users u
@@ -218,6 +224,7 @@ export async function handleAdminUsersGet(db: D1Database, req: Request, deps: OA
     // A scheduled downgrade (cancel_at_period_end / subscription deleted).
     pendingPlan: r.pending_plan,
     vaultCount: r.vault_count,
+    vaultLimitOverride: r.vault_limit_override,
     checklistDone: r.checklist_done,
     deletedAt: r.deleted_at,
   }));
@@ -348,6 +355,33 @@ export async function handleAdminSetPlanPost(db: D1Database, req: Request, deps:
   }
   console.log(`event=admin_plan_set user=${target.id} plan=${plan} vaults=${results.length}`);
   return back("notice=plan-updated");
+}
+
+/** The highest vault limit an operator can set: a guard against a typo, not a product limit. */
+export const MAX_VAULT_LIMIT_OVERRIDE = 1000;
+
+/**
+ * POST /admin/users/vault-limit — set (`vault_limit` = a whole number 0..1000) or clear (empty) an account's own vault
+ * limit (migration 0033). Same boundary as the comp lever (operator session, CSRF, same-origin, the target must exist)
+ * and the same audit: one event line naming the account and the operator. Nothing is pushed to the vault DOs: the count
+ * lives only here, read at each door that makes a vault (plans.ts vaultLimitFor). Lowering it below what the account
+ * owns keeps every vault it has; only new ones are refused.
+ */
+export async function handleAdminSetVaultLimitPost(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  const ctx = await actionContext(db, req, deps);
+  if (ctx instanceof Response) return ctx;
+  const { operator, form, back } = ctx;
+
+  const raw = String(form.get("vault_limit") ?? "");
+  // Digits only: no sign, decimal, exponent or padding slips through Number().
+  if (raw !== "" && (!/^\d{1,4}$/.test(raw) || Number(raw) > MAX_VAULT_LIMIT_OVERRIDE)) return back("err=vault-limit");
+  const limit = raw === "" ? null : Number(raw);
+  const target = await getUserById(db, String(form.get("user_id") ?? ""));
+  if (!target) return back("err=not-found");
+
+  await setUserVaultLimitOverride(db, target.id, limit);
+  console.log(`event=admin_vault_limit_set user=${target.id} limit=${limit ?? "plan"} was=${target.vaultLimitOverride ?? "plan"} by=${operator.id}`);
+  return back(limit === null ? "notice=vault-limit-cleared" : "notice=vault-limit-set");
 }
 
 /**

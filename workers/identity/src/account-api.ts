@@ -56,7 +56,8 @@ import {
   TIER_PRICE_MONTHLY_USD,
   entitlementPlanFor,
   livePlan,
-  vaultLimitPlan,
+  activeVaultLimitOverride,
+  vaultLimitFor,
   OPEN_BETA_LONG,
   planLabel,
   isPaidTier,
@@ -304,7 +305,8 @@ export async function handleAccountSummary(db: D1Database, req: Request, deps: O
   } = {
     tier: live,
     label: mode === "open_beta" ? planLabel(live, mode) : live === "trial" ? "Free trial" : PLAN_SPECS[live].label,
-    vault_limit: spec.vault_count,
+    // The operator's limit for this account when set (T-505), else the effective tier's count.
+    vault_limit: activeVaultLimitOverride(user, mode) ?? spec.vault_count,
     vaults_used: vaults.length,
     storage_used_bytes: storageUsed,
     // The effective tier's total (notes + attachment) budget — the same sum the
@@ -480,9 +482,8 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   // `>=` grandfathers users already over a cap (they keep every vault they own;
   // only NEW creation is refused). An expired plan has vault_count=0, so it is
   // refused here with the same at-cap message the console gives.
-  const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
-  if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-    return restError(403, "vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
+  if ((await countVaultsForOwner(db, user.id)) >= vaultLimitFor(user, billingModeOf(deps))) {
+    return restError(403, "vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan, user.vaultLimitOverride));
   }
 
   const body = await readJsonBody(req);

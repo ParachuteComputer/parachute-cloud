@@ -89,7 +89,8 @@ import {
   canStartCheckout,
   entitlementPlanFor,
   livePlan,
-  vaultLimitPlan,
+  activeVaultLimitOverride,
+  vaultLimitFor,
   isPaidTier,
   isPlanId,
   planEntitlement,
@@ -466,8 +467,9 @@ async function renderConsoleFor(
       // At (or over — grandfathered) the plan's vault count: the create form
       // gives way to the friendly at-cap note. The POST handler is the real
       // gate; this just keeps the UI honest.
-      atVaultCap: cards.length >= PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))].vault_count,
+      atVaultCap: cards.length >= vaultLimitFor(user, billingModeOf(deps)),
       pendingPlan: user.pendingPlan,
+      vaultLimitOverride: activeVaultLimitOverride(user, billingModeOf(deps)),
       // Operators get the quiet Admin header link (the surface itself 404s
       // for everyone else — admin.ts).
       isOperator: user.role === "operator",
@@ -698,9 +700,8 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   // with no vaults has vault_count=0, so 0 >= 0 always refuses here with the
   // at-cap message even though they've never made a vault. Give them a distinct
   // "pick a plan to create your first vault" path instead of the cap wall.
-  const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
-  if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-    return fail(vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
+  if ((await countVaultsForOwner(db, user.id)) >= vaultLimitFor(user, billingModeOf(deps))) {
+    return fail(vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan, user.vaultLimitOverride));
   }
   try {
     const vault = await createVault(db, rawName, user.id, deps.now?.() ?? new Date());
@@ -1013,7 +1014,7 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
   if (!spec.restore) return routerNotFound();
   // The new vault a restore makes counts against the same limit as any other
   // creation (a former Power subscriber keeps ten in open beta).
-  const vaultLimit = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))].vault_count;
+  const vaultLimit = vaultLimitFor(user, billingModeOf(deps));
 
   const form = await req.formData();
   if (!verifyCsrfToken(req, form) || !isSameOriginRequest(req, resolveBoundOrigins(deps))) {
@@ -1061,7 +1062,7 @@ export async function handleRestorePost(db: D1Database, req: Request, deps: OAut
     // Restore creates a NEW vault — it counts against the plan's vault limit
     // exactly like any other creation (same `>=` grandfathering rule).
     if ((await countVaultsForOwner(db, user.id)) >= vaultLimit) {
-      return consoleError(db, req, deps, user, restoreAtCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
+      return consoleError(db, req, deps, user, restoreAtCapMessage(user.plan, billingModeOf(deps), user.pendingPlan, user.vaultLimitOverride));
     }
     try {
       // Flagged so a retry after a failed replay may reuse it (cleared below).

@@ -1181,6 +1181,8 @@ export interface ConsoleProps {
   atVaultCap: boolean;
   /** The stored pending plan, so the at-cap note names the real limit (a former Power subscriber keeps ten). */
   pendingPlan?: PlanId | null;
+  /** The operator's vault limit for this account when it applies (plans.ts activeVaultLimitOverride), else null/absent. */
+  vaultLimitOverride?: number | null;
   /** Operator account → the quiet "Admin" header link (/admin). */
   isOperator?: boolean;
   /**
@@ -1795,7 +1797,7 @@ export function renderConsole(props: ConsoleProps): string {
   const planLead =
     !openBeta && plan === "trial" && trial
       ? `<span data-testid="trial-banner">${esc(trialBannerLine(trial.tierLabel, trial.isDefault, trial.daysLeft))}</span> <a href="#plans" data-testid="change-plan">Change plan</a>`
-      : esc(planLine(plan, mode));
+      : esc(planLine(plan, mode, props.vaultLimitOverride ?? null));
   const planHtml = `${planLead}${planUntilHtml}${usageHtml}${manageBillingHtml}`;
   // The always-visible plan cards — for checkout-eligible (trial/expired) users
   // only; a paid tier / live-sub account uses Manage billing and never sees it.
@@ -1861,7 +1863,7 @@ export function renderConsole(props: ConsoleProps): string {
   const createCard = atVaultCap
     ? `<div class="card" data-testid="vault-cap">
        <h2>Create a vault</h2>
-       <p class="muted" style="margin:.35rem 0 0">${esc(vaultCapMessage(plan, mode, props.pendingPlan ?? null))}</p>
+       <p class="muted" style="margin:.35rem 0 0">${esc(vaultCapMessage(plan, mode, props.pendingPlan ?? null, props.vaultLimitOverride ?? null))}</p>
        ${error ? `<div class="err">${esc(error)}</div>` : ""}
      </div>`
     : `<div class="card">

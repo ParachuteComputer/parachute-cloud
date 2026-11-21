@@ -14,7 +14,7 @@
  */
 import { forwardImport, logForwardFailed } from "./import-forward.ts";
 import { billingModeOf, type OAuthDeps } from "./oauth-shared.ts";
-import { PLAN_SPECS, entitlementPlanFor, planEntitlement, vaultCapMessage, vaultLimitPlan } from "./plans.ts";
+import { entitlementPlanFor, planEntitlement, vaultCapMessage, vaultLimitFor } from "./plans.ts";
 import type { User } from "./users.ts";
 import { pushVaultCap } from "./vault-call.ts";
 import {
@@ -57,9 +57,8 @@ export async function importAsOwner(
     vaultName = existing.name;
   } else {
     // `>=` grandfathers accounts already over a cap; an expired plan (count 0) is refused as on create.
-    const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
-    if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-      return { kind: "vault_limit", message: vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan) };
+    if ((await countVaultsForOwner(db, user.id)) >= vaultLimitFor(user, billingModeOf(deps))) {
+      return { kind: "vault_limit", message: vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan, user.vaultLimitOverride) };
     }
     try {
       // `importPending: true` stamps the flag in the insert itself, so a crash can't strand a flagless row.

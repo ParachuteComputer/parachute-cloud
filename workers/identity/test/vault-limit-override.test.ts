@@ -323,7 +323,7 @@ describe("POST /admin/users/vault-limit — only an operator sets or clears it",
     const target = await account("standard", 0, 7);
     for (const bad of ["-1", "1001", "2.5", "ten", "1e3", " 4"]) {
       const res = await post({ user_id: target.id, vault_limit: bad }, cookie);
-      expect(res.headers.get("location"), bad).toBe("/admin/users?err=invalid");
+      expect(res.headers.get("location"), bad).toBe("/admin/users?err=vault-limit");
     }
     expect((await getUserById(env.DB, target.id))!.vaultLimitOverride).toBe(7);
     expect((await post({ user_id: "no-such-user", vault_limit: "3" }, cookie)).headers.get("location")).toBe("/admin/users?err=not-found");

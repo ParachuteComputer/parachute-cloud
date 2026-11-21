@@ -45,11 +45,10 @@ import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { type AttributionPrincipal, principalAttributionClaims } from "./tokens.ts";
 import { type OAuthDeps, billingModeOf, vaultAdvertisedUrl } from "./oauth-shared.ts";
 import {
-  PLAN_SPECS,
   entitlementPlanFor,
   planEntitlement,
   vaultCapMessage,
-  vaultLimitPlan,
+  vaultLimitFor,
 } from "./plans.ts";
 import type { User } from "./users.ts";
 import { callVaultApi, pushVaultCap } from "./vault-call.ts";
@@ -316,9 +315,8 @@ const createVaultTool: AccountMcpTool = {
     // Plan vault-count gate — IDENTICAL to handleAccountVaultCreate / the
     // console's handleCreateVaultPost: `>=` grandfathers users already over a
     // cap (an expired plan has vault_count=0 → refused here).
-    const spec = PLAN_SPECS[vaultLimitPlan(user.plan, user.pendingPlan, billingModeOf(deps))];
-    if ((await countVaultsForOwner(db, user.id)) >= spec.vault_count) {
-      throw new AccountToolError("vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan));
+    if ((await countVaultsForOwner(db, user.id)) >= vaultLimitFor(user, billingModeOf(deps))) {
+      throw new AccountToolError("vault_limit_reached", vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan, user.vaultLimitOverride));
     }
 
     const rawName = typeof args.name === "string" ? args.name : "";
