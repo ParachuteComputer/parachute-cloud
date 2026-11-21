@@ -7,7 +7,7 @@
  */
 import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
-import worker from "../src/index.ts";
+import worker, { countsAs5xx } from "../src/index.ts";
 import { ISSUER } from "./helpers.ts";
 
 type Env = typeof env;
@@ -85,6 +85,40 @@ describe("a single-owner door answers for its vaults on its own origin (T-476)",
     const res = await worker.fetch(new Request(`${ISSUER}/.well-known/oauth-protected-resource/account/mcp`), singleOwner(fetcher));
     expect(res.status).toBe(200);
     expect(seen).toHaveLength(0);
+  });
+});
+
+describe("what the forward keeps (review round 1)", () => {
+  test("a WebSocket upgrade's 101 comes back with its socket (the live-query binding)", async () => {
+    const pair = new WebSocketPair();
+    pair[1].accept();
+    const fetcher = { fetch: async () => new Response(null, { status: 101, webSocket: pair[0] }) } as unknown as Fetcher;
+    const res = await worker.fetch(
+      new Request(`${ISSUER}/vault/home/api/subscribe`, { headers: { upgrade: "websocket" } }),
+      singleOwner(fetcher),
+    );
+    expect(res.status).toBe(101);
+    expect(res.webSocket).toBeTruthy();
+  });
+
+  test("a CORS preflight for a vault path reaches the vault worker", async () => {
+    const { fetcher, seen } = vaultStub();
+    await worker.fetch(new Request(`${ISSUER}/vault/home/api/records`, { method: "OPTIONS" }), singleOwner(fetcher));
+    expect(seen.map((r) => r.method)).toEqual(["OPTIONS"]);
+  });
+
+  test("a vault worker that throws is a 502 said as the vault's, not this worker's 500", async () => {
+    const fetcher = { fetch: async () => { throw new URIError("URI malformed"); } } as unknown as Fetcher;
+    const res = await worker.fetch(new Request(`${ISSUER}/vault/%E0%A4%A/x`), singleOwner(fetcher));
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as { error_type: string }).error_type).toBe("vault_unavailable");
+  });
+
+  test("a vault 5xx on a single-owner door counts toward the error signal; Cloud's backstop 503 still doesn't", () => {
+    const { fetcher } = vaultStub();
+    const req = new Request(`${ISSUER}/vault/home/api/records`);
+    expect(countsAs5xx(req, 500, singleOwner(fetcher))).toBe(true);
+    expect(countsAs5xx(req, 503, { ...env, VAULT_PUBLIC_ORIGIN: undefined } as Env)).toBe(false);
   });
 });
 

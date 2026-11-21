@@ -87,6 +87,7 @@ import {
   depsForEnv,
   frontDoorOrigin,
   oauthPreflight,
+  parseOwnerPubkey,
   withReflectedCors,
   withWildcardCors,
 } from "./oauth-shared.ts";
@@ -694,7 +695,7 @@ function vaultRouteMissing(): Response {
       error: "route_missing",
       error_type: "vault_route_missing",
       message:
-        "This identity worker never serves /vault/* directly — vault requests are meant to be intercepted by a platform-layer route (a Cloudflare zone route) pointed at the vault worker before they reach here. If you expected vault data at this URL, that route is missing or misconfigured on this origin.",
+        "This identity worker never serves /vault/* directly here (only a single-owner door hands it to its vault worker) — vault requests are meant to be intercepted by a platform-layer route (a Cloudflare zone route) pointed at the vault worker before they reach here. If you expected vault data at this URL, that route is missing or misconfigured on this origin.",
     },
     { status: 503 },
   );
@@ -710,15 +711,22 @@ function vaultRouteMissing(): Response {
  * does on Cloud, and the vault worker's same-origin hardening (attachment types, nosniff) is the one it has there.
  * The personal deploy advertises it (VAULT_PUBLIC_ORIGIN = ISSUER). Parachute Cloud (no OWNER_PUBKEY) keeps the 503.
  */
-function forwardsVaults(env: Env): Fetcher | null {
-  return env.VAULT_SERVICE && depsFor(env).ownerPubkey ? env.VAULT_SERVICE : null;
+function forwardsVaults(env: Partial<Env>): Fetcher | null {
+  return env.VAULT_SERVICE && parseOwnerPubkey(env.OWNER_PUBKEY) ? env.VAULT_SERVICE : null;
 }
-function vaultOrBackstop(c: { env: Env; req: { raw: Request } }): Response | Promise<Response> {
+async function vaultOrBackstop(c: { env: Env; req: { raw: Request } }): Promise<Response> {
   const vault = forwardsVaults(c.env);
   if (!vault) return vaultRouteMissing();
   const req = new Request(c.req.raw);
   req.headers.delete("cookie");
-  return vault.fetch(req);
+  try {
+    // Returned as is: a WebSocket upgrade's 101 keeps its socket (the live-query binding).
+    return await vault.fetch(req);
+  } catch {
+    // The vault worker threw (a malformed path it couldn't decode, say): the vault's failure, said as one, never this
+    // worker's own 500.
+    return Response.json({ error: "vault_unavailable", error_type: "vault_unavailable", message: "The vault didn't answer." }, { status: 502 });
+  }
 }
 app.all("/vault", vaultOrBackstop);
 app.all("/vault/*", vaultOrBackstop);
@@ -817,13 +825,17 @@ app.get("/", (c) => {
  * host where no vault zone route is meant to exist (cloud., app., workers.dev):
  * MCP/vault scanners hit those all day and would page the operator for
  * nothing. On the canonical vault host (VAULT_PUBLIC_ORIGIN, my. in
- * production) the same 503 means the zone route broke — that one counts.
+ * production) the same 503 means the zone route broke — that one counts. On a
+ * single-owner door, which hands /vault/* to the vault worker itself
+ * (vaultOrBackstop, T-476), every 5xx there is the vault's and counts.
  */
 export function countsAs5xx(req: Request, status: number, env: Partial<Env>): boolean {
   if (status < 500) return false;
   const url = new URL(req.url);
   const backstop = /^\/(vault|mcp)(\/|$)/.test(url.pathname);
   if (!backstop) return true;
+  // A single-owner door answers /vault/* itself (vaultOrBackstop): a 5xx there is the vault's, and counts.
+  if (/^\/vault(\/|$)/.test(url.pathname) && forwardsVaults(env)) return true;
   try {
     return env.VAULT_PUBLIC_ORIGIN ? new URL(env.VAULT_PUBLIC_ORIGIN).host === url.host : false;
   } catch {
