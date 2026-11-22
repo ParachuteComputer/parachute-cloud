@@ -56,8 +56,8 @@ describe("a write key defines a type over REST (PUT /api/types/:name)", () => {
     const read = await SELF.fetch(`${base(v)}/api/types/episode`, { headers: { Authorization: `Bearer ${a}` } });
     expect(read.status).toBe(200);
     expect(JSON.stringify(await read.json())).toMatch(/guest[\s\S]*number|number[\s\S]*guest/);
-    await runInDurableObject(env.VAULT.get(env.VAULT.idFromName(v)), async (inst: any) => {
-      const row = [...inst.ctx.storage.sql.exec("SELECT created_by, created_via FROM tags WHERE name = 'episode'")][0] as any;
+    await runInDurableObject(env.VAULT.get(env.VAULT.idFromName(v)), async (_inst, state) => {
+      const row = [...state.storage.sql.exec("SELECT created_by, created_via FROM tags WHERE name = 'episode'")][0] as any;
       expect(row.created_via).toBe("key:podcast-studio");
     });
   });
@@ -76,6 +76,19 @@ describe("a write key defines a type over REST (PUT /api/types/:name)", () => {
     expect((await put(v, a, "types/recipe", { parent_names: ["food"] })).status).toBe(403);
     expect((await put(v, a, "types/dish", { relationships: { serves: { target: "recipe" } } })).status).toBe(403);
     expect((await put(v, a, "types/_default", { fields: { x: { type: "string" } } })).status).toBe(403);
+    // the rest of what only admin may do to a type, on its own type too
+    expect((await put(v, a, "types/recipe", { fields: { cuisine: { type: "string" } }, replace_fields: true })).status).toBe(403);
+    expect((await put(v, a, "types/recipe", { kind: "tag" })).status).toBe(403);
+    expect((await put(v, a, "types/recipe", { fields: null })).status).toBe(403);
+    expect((await put(v, a, "types/recipe", { fields: ["not", "a", "map"] })).status).toBe(400);
+    // a plain label isn't a type nobody defined; nor is a name another type lists as its parent
+    const admin0 = await keyFor(v, "owner-setup", "admin");
+    expect((await put(v, admin0, "types/meal", { parent_names: ["food"] })).status).toBe(200);
+    expect((await put(v, a, "types/food", { fields: { x: { type: "string" } } })).status).toBe(403);
+    expect((await SELF.fetch(`${base(v)}/api/records`, { method: "POST", headers: { Authorization: `Bearer ${a}`, "Content-Type": "application/json" }, body: JSON.stringify({ body: "x", tags: ["pinned"] }) })).status).toBe(201);
+    expect((await put(v, a, "types/pinned", { fields: { x: { type: "string" } } })).status).toBe(403);
+    // deleting, renaming or merging types stays admin
+    expect((await SELF.fetch(`${base(v)}/api/types/recipe`, { method: "DELETE", headers: { Authorization: `Bearer ${a}` } })).status).toBe(403);
     // the old name stays admin, as on a box
     expect((await put(v, a, "tags/menu", { fields: { day: { type: "string" } } })).status).toBe(403);
     // read: no
