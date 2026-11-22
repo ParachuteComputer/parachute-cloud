@@ -3,15 +3,21 @@
  *
  * The box serves the same page (core packages/vault/src/routes.ts `handleViewNote`, routing.ts): a record is
  * published when it carries the `publish` tag or `metadata.published === true`, and a reader with no credential sees
- * only those. A credential that reads this whole vault sees an unpublished record too, as on the box; one narrowed
- * to some tags or types does not (it reads the page as a stranger does). Every other answer is the same plain 404,
- * so a stranger can't tell a missing record from a private one, nor a missing vault from either.
+ * only those. A credential that reads this whole vault sees an unpublished record too, as on the box; a credential
+ * with a tag scope (`scoped_tags`) reads the page as a stranger does. A reference is resolved among the records the
+ * reader may see (the box's resolveVisibleNote), so a private record never hides a published one, nor shows it
+ * exists by doing so. Every other answer is the same plain 404, so a stranger can't tell a missing record from a
+ * private one, nor a missing vault from either; another method is 405 for every vault alike.
  *
  * The renderer is the box's, ported as it is (no HTML from the record survives: everything is escaped, and a link
  * keeps its href only for http(s), mailto, # and /), and so is the page's CSP: no scripts at all.
  */
 import type { Note, Store } from "@openparachute/core/src/types.js";
+import { resolveVisibleNote } from "@openparachute/core/src/mcp.js";
 import { resolveNote } from "./rest/parse.js";
+
+/** `/view/<idOrPath>`: a published record's page. */
+export const VIEW_PATH = /^\/view\/(.+)$/;
 
 const PUBLISHED_TAG = "publish";
 
@@ -25,6 +31,10 @@ export function viewNotFound(): Response {
   return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
+export function viewMethodNotAllowed(): Response {
+  return new Response("Method Not Allowed", { status: 405, headers: { Allow: "GET, HEAD", "Cache-Control": "no-store" } });
+}
+
 /**
  * Answer a view of `idOrPath`. `wholeVault`: the request carried a credential that reads this whole vault.
  * Anything that fails to resolve (missing, ambiguous, a bad name) is the same 404 a private record gets: an
@@ -33,7 +43,9 @@ export function viewNotFound(): Response {
 export async function handleView(store: Store, idOrPath: string, wholeVault: boolean): Promise<Response> {
   let note: Note | null = null;
   try {
-    note = await resolveNote(store, idOrPath);
+    note = wholeVault
+      ? await resolveNote(store, idOrPath)
+      : resolveVisibleNote(store.db as unknown as Parameters<typeof resolveVisibleNote>[0], idOrPath, isPublished);
   } catch {
     note = null;
   }
@@ -93,6 +105,8 @@ ${renderMarkdown(note.content ?? "")}
       // A record can be unpublished at any time: no shared cache keeps serving it.
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
+      // The page can be opened with ?key= and carries outbound links: they never learn the address.
+      "Referrer-Policy": "no-referrer",
     },
   });
 }

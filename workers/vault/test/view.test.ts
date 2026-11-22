@@ -37,7 +37,8 @@ describe("a published record's page", () => {
     const missing = await view(v, `${priv.id}x`);
     expect(missing.status).toBe(404);
     const missingText = await missing.text();
-    for (const headers of [{}, { Authorization: "Bearer not-a-token" }]) {
+    const asks: Record<string, string>[] = [{}, { Authorization: "Bearer not-a-token" }];
+    for (const headers of asks) {
       const r = await view(v, priv.id, headers);
       expect(r.status).toBe(404);
       expect(await r.text()).toBe(missingText);
@@ -76,14 +77,50 @@ describe("a published record's page", () => {
     const v = freshVault("viewnone");
     const r = await view(v, "anything");
     expect(r.status).toBe(404);
-    await runInDurableObject(env.VAULT.get(env.VAULT.idFromName(v)), async (inst: any) => {
-      expect(await inst.ctx.storage.get("config")).toBeUndefined();
+    await runInDurableObject(env.VAULT.get(env.VAULT.idFromName(v)), async (_inst, state) => {
+      expect(await state.storage.get("config")).toBeUndefined();
     });
   });
 
-  it("only reads: another method is 405", async () => {
+  it("only reads: another method is 405, for a vault that exists and one nobody made alike", async () => {
     const v = freshVault("viewm");
     const n = await createNote(v, { path: "posts/m", content: "x", tags: ["publish"] });
-    expect((await view(v, n.id, {}, "POST")).status).toBe(405);
+    for (const method of ["POST", "PUT", "DELETE"]) {
+      expect((await view(v, n.id, {}, method)).status).toBe(405);
+      expect((await view(freshVault("viewmnone"), "x", {}, method)).status).toBe(405);
+    }
+  });
+
+  it("a private record never hides a published one, by title, path or extension", async () => {
+    const v = freshVault("viewshadow");
+    const bread = await createNote(v, { path: "posts/bread", content: "# Bread\n\npublished bread", tags: ["publish"] });
+    await createNote(v, { path: "drafts/bread-2", content: "# Bread\n\nprivate draft" });
+    const byTitle = await view(v, "Bread");
+    expect(byTitle.status).toBe(200);
+    expect(await byTitle.text()).toContain("published bread");
+    await createNote(v, { path: "posts/bread.txt", content: "private text", extension: "txt" });
+    const byPath = await view(v, encodeURIComponent("posts/bread"));
+    expect(byPath.status).toBe(200);
+    expect(await byPath.text()).toContain("published bread");
+    expect((await view(v, bread.id)).status).toBe(200);
+  });
+
+  it("while an import runs, the page answers as for a vault nobody made (no 401 naming it)", async () => {
+    const v = freshVault("viewimport");
+    const n = await createNote(v, { path: "posts/i", content: "x", tags: ["publish"] });
+    const stub = env.VAULT.get(env.VAULT.idFromName(v));
+    await runInDurableObject(stub, async (inst) => {
+      (inst as unknown as { importRun: string | null }).importRun = "import";
+    });
+    try {
+      const r = await view(v, n.id);
+      expect(r.status).toBe(404);
+      expect(await r.text()).toBe("Not Found");
+      expect((await view(v, n.id, {}, "POST")).status).toBe(405);
+    } finally {
+      await runInDurableObject(stub, async (inst) => {
+        (inst as unknown as { importRun: string | null }).importRun = null;
+      });
+    }
   });
 });

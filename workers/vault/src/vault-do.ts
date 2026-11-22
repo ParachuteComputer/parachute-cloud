@@ -32,10 +32,7 @@ import {
   type AuthResult,
 } from "./auth.js";
 import { NO_TAG_SCOPE } from "./rest/parse.js";
-import { handleView, viewNotFound } from "./view.js";
-
-/** `/view/<idOrPath>`: a published record's page (view.ts). */
-const VIEW_PATH = /^\/view\/(.+)$/;
+import { handleView, VIEW_PATH, viewMethodNotAllowed, viewNotFound } from "./view.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
 import { handleDeletedNotes, handleHistoryCompact } from "./rest/history.js";
@@ -875,6 +872,12 @@ export class VaultDO extends DurableObject {
       if (forbidden) return forbidden;
       return this.handleImportStatus(request);
     }
+    // A published record's page reads as it does for a vault that doesn't exist while an import runs (a 401 or 503
+    // would tell a stranger the vault exists).
+    if (VIEW_PATH.test(rest)) {
+      await request.body?.cancel().catch(() => {});
+      return request.method !== "GET" && request.method !== "HEAD" ? viewMethodNotAllowed() : viewNotFound();
+    }
     const bearerless = rest.startsWith("/tickets/") || (rest === "/api/subscribe" && isWebSocketUpgrade(request));
     if (!bearerless) {
       const auth = await this.authenticate(request, vaultName);
@@ -1046,16 +1049,20 @@ export class VaultDO extends DurableObject {
       return json({ armed: n });
     }
 
-    // Every OTHER route on an already-destroyed warm instance: 410, no
-    // writes, no ensureState (the same resurrection concern as above).
     // A published record's page (T-476, view.ts) answers anyone, so it must not tell a stranger which vaults exist,
-    // nor make one: a vault that was never made, or is gone, answers the same 404 a private record does, before
-    // ensureState would materialize it.
-    if (VIEW_PATH.test(rest) && (this.destroyed || !(await this.vaultExists()))) {
-      await request.body?.cancel().catch(() => {});
-      return viewNotFound();
+    // nor make one: another method is 405 for every vault alike, and a vault that was never made, or is gone, answers
+    // the same 404 a private record does, before ensureState would materialize it.
+    if (VIEW_PATH.test(rest)) {
+      const refused = request.method !== "GET" && request.method !== "HEAD" ? viewMethodNotAllowed()
+        : this.destroyed || !(await this.vaultExists()) ? viewNotFound() : null;
+      if (refused) {
+        await request.body?.cancel().catch(() => {});
+        return refused;
+      }
     }
 
+    // Every OTHER route on an already-destroyed warm instance: 410, no
+    // writes, no ensureState (the same resurrection concern as above).
     if (this.destroyed) {
       return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
     }
@@ -1163,10 +1170,6 @@ export class VaultDO extends DurableObject {
     // unpublished one, as on the box; no credential, a bad one, or a narrowed one reads as a stranger.
     const viewMatch = VIEW_PATH.exec(rest);
     if (viewMatch) {
-      if (request.method !== "GET" && request.method !== "HEAD") {
-        await request.body?.cancel().catch(() => {});
-        return new Response("Method Not Allowed", { status: 405, headers: { Allow: "GET, HEAD" } });
-      }
       if (closed) return viewNotFound();
       let idOrPath: string;
       try {
