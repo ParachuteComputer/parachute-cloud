@@ -154,11 +154,11 @@ later. It's off unless you turn it on.
   },
   {
     path: GETTING_STARTED_PATH,
-    from: `small welcome web and the \`capture\` tag the Notes surface uses; no other
-predefined tags or schema.`,
-    to: `small welcome web tagged \`guide\`; no other predefined tags or schema. (The
-Notes app tags new notes \`capture\` only if the person turns on its inbox option,
-"Tag new notes as an inbox".)`,
+    from: `small welcome web and the \`capture\` tag the Notes view
+uses; no predefined types.`,
+    to: `small welcome web tagged \`guide\`; no predefined types. (The Notes app tags
+new notes \`capture\` only if the person turns on its inbox option, "Tag new
+notes as an inbox".)`,
   },
 ];
 
