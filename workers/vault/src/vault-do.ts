@@ -38,6 +38,7 @@ import { noteWithinTagScope, scopeQueryParams, scrubResponseByScope, tagScopeFor
 import { resolveNote } from "./rest/parse.js";
 import { handleView, VIEW_PATH, viewMethodNotAllowed, viewNotFound } from "./view.js";
 import { normalizePath } from "@openparachute/core/src/paths.js";
+import { validateExtension } from "@openparachute/core/src/notes.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { withValidators } from "@openparachute/core/src/http-validators.js";
 
@@ -1852,19 +1853,17 @@ export class VaultDO extends DurableObject {
       });
       if (publishes) return tagScopeForbidden(raw);
       // Nor unpublish one by replacing it (an upsert with if_exists "replace" rewrites tags and metadata, so a key that
-      // can't set the flag would clear it): the box's wasPublished. Every item of a batch, at the path the handler
-      // would write (normalized as it does); a hidden or missing record is left to the handler's own answer.
-      const batchIfExists = body && typeof body === "object" && !Array.isArray(body) ? (body as { if_exists?: unknown }).if_exists : undefined;
+      // can't set the flag would clear it): the box's wasPublished. Every item of a batch, looked up exactly as the
+      // handler will (normalized path and extension, by path only); a lookup that fails is refused, not waved through.
       for (const it of items) {
-        const item = it && typeof it === "object" ? (it as { if_exists?: unknown; path?: unknown }) : null;
-        if (!item || (item.if_exists ?? batchIfExists) !== "replace" || typeof item.path !== "string") continue;
-        const target = normalizePath(item.path);
-        if (!target) continue;
+        const item = it && typeof it === "object" ? (it as { if_exists?: unknown; path?: unknown; extension?: unknown }) : null;
+        if (!item || item.if_exists !== "replace" || typeof item.path !== "string") continue;
         let existing = null;
         try {
-          existing = await resolveNote(this.store, target);
+          const target = normalizePath(item.path);
+          existing = target ? await this.store.getNoteByPath(target, item.extension !== undefined ? validateExtension(item.extension) : "md") : null;
         } catch {
-          existing = null;
+          return tagScopeForbidden(raw);
         }
         const wasPublished = !!existing && ((existing.tags ?? []).includes("publish") || (existing.metadata as { published?: unknown } | undefined)?.published === true);
         if (wasPublished && noteWithinTagScope(existing!, scope.allowed, scope.raw)) return tagScopeForbidden(raw);

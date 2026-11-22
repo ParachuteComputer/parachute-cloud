@@ -148,7 +148,7 @@ export function applyScopeWrappers(
     // A search runs without the engine's visible-only ranking (a temporary FTS table the Durable Object refuses) and
     // is filtered below; everything else (lists, cursor pages) keeps the engine's visibility.
     const isSearch = (typeof p?.search === "string" && p.search !== "") || p?.near_text !== undefined;
-    if (isSearch && p?.cursor !== undefined) return { error: "A search with a cursor isn't available to a key held to some types; page with offset.", error_type: "invalid_query", field: "cursor" };
+    if (isSearch && p?.cursor !== undefined) return { error: "A search with a cursor isn't available to a key held to some types; ask for a higher limit instead.", error_type: "invalid_query", field: "cursor" };
     const result: any = await (isSearch && searchQuery ? searchQuery(next) : orig(next));
     if (p?.aggregate && Array.isArray(result) && result.every((r: any) => r && typeof r === "object" && "group" in r && "value" in r && !("id" in r))) {
       return p.aggregate?.group_by === "tag" ? result.filter((r: any) => typeof r.group === "string" && tagVisibleInScope(r.group, allowed, raw)) : result;
