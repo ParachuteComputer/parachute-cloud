@@ -25,9 +25,11 @@ window with no card of its own; production keeps one card per deploy.
 
 ## Rolling production back past typed keys (T-476)
 
-`prod-job.sh`'s own rollback runs right after a deploy, before anyone could make a typed key, so it is safe. A rollback
-later, to any commit before door/0.9's T-476 stack (#437), is not: those vault workers don't know a typed key's grant
-(`permissions.grant`) and serve it as a whole-vault key at its level until it expires. Before such a rollback, check
+Any rollback to a commit before door/0.9's T-476 stack (#437) can serve a typed key as a whole-vault key at its level
+until it expires: those vault workers don't know a typed key's grant (`permissions.grant`). That includes
+`prod-job.sh`'s own rollback: the new identity worker is live for up to the job's window before it rolls back, and a
+typed key made then lasts a year. The risk is small but real. So after any such rollback (prod-job's included), and
+before any manual one, check
 `SELECT COUNT(*) FROM app_keys WHERE types IS NOT NULL AND revoked_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')` on the
 identity D1. If it isn't 0, revoke those keys first (each account's `DELETE /account/keys/<name>`; for one account,
 `deploy/personal/end-typed-keys.sh`), or roll back only to #437 or later, which refuse a typed key outright.

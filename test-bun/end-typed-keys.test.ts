@@ -5,7 +5,7 @@
  * isn't a readable key list, and every revoke that isn't a 200, is a FAIL with exit 1.
  */
 import { afterAll, describe, expect, it } from "bun:test";
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -97,6 +97,35 @@ describe("end-typed-keys.sh", () => {
     const r = await run({ list: () => (listed++ === 0 ? keysList([ai])() : Response.json({}, { status: 503 })) });
     expect(r.code).toBe(1);
     expect(r.out).not.toContain("PASS");
+  });
+
+  it("fails closed on a revoke that answers 200 while the list still shows the key live", async () => {
+    const r = await run({ list: keysList([ai]) });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("still live: ai-recipes");
+    expect(r.out).not.toContain("PASS");
+  });
+
+  it("fails closed on a revoke that isn't 200 even when the list then shows it ended", async () => {
+    let listed = 0;
+    const r = await run({ list: () => (listed++ === 0 ? keysList([ai])() : keysList([{ ...ai, status: "revoked" }])()), del: () => new Response("no", { status: 500 }) });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("revoking ai-recipes answered 500");
+    expect(r.out).not.toContain("PASS");
+  });
+
+  it("fails closed, with the reason, when the sign-in fails", async () => {
+    const stub = join(dir, "personal/nip98.ts");
+    const ok = readFileSync(stub, "utf8");
+    writeFileSync(stub, `console.error("this key isn't linked to the account"); process.exit(1);`);
+    try {
+      const r = await run({ list: keysList([]) });
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("FAIL end-typed-keys: sign-in");
+      expect(r.out).toContain("isn't linked");
+    } finally {
+      writeFileSync(stub, ok);
+    }
   });
 
   it("prints no token", async () => {
