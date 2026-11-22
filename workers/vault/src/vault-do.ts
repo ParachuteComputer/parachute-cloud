@@ -1326,7 +1326,9 @@ export class VaultDO extends DurableObject {
     // real on this door: a `vault:<name>:write` token keeps every genuine
     // write, and can never confer the admin tier it wasn't minted at.
     // A delete that erases history (`?erase_history=`, T-412) is admin like DELETE .../versions: any value but an
-    // absent or explicit false is gated here, and the handler refuses one it can't read. So is listing deleted notes.
+    // absent or explicit false is gated here, and the handler refuses one it can't read. Listing deleted notes takes
+    // write (T-476, core #135, as core's routing.ts): write may already delete a note and put it back by id, so it may
+    // list what it can put back (the app's Changes). A read pass can't put anything back, so it can't list.
     const eraseParam = request.method === "DELETE" && /^\/notes\/[^/]+$/.test(apiPath)
       ? new URL(request.url).searchParams.get("erase_history")
       : null;
@@ -1344,9 +1346,9 @@ export class VaultDO extends DurableObject {
         (b: unknown) => b !== null && typeof b === "object" && !Array.isArray(b) && "description" in b,
         () => false,
       );
-    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDeletedList || isDescriptionWrite
+    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDescriptionWrite
       ? "admin"
-      : verbForMethod(request.method);
+      : isDeletedList ? "write" : verbForMethod(request.method);
     if (requiredVerb !== "read" && !hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
       return insufficientScope(requiredVerb, vaultName, auth.scopes);
     }
