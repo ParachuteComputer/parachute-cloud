@@ -26,7 +26,7 @@ b = json.load(open(sys.argv[1]))
 keys = b.get("keys") if isinstance(b, dict) else None
 if not isinstance(keys, list): sys.exit("the key list has no keys")
 for k in keys:
-    if k.get("types") and k.get("status") == "active": print(k["name"])' "$T/keys.json"
+    if k.get("types") and k.get("status") not in ("revoked", "expired"): print(k["name"])' "$T/keys.json"
 }
 names=$(live) || fail "couldn't read the key list"
 if [ -z "$names" ]; then echo "PASS end-typed-keys (none live)"; exit 0; fi
@@ -38,4 +38,5 @@ for n in $names; do
 done
 left=$(live) || fail "couldn't read the key list after revoking"
 [ -z "$left" ] || fail "still live: $left"
+echo "a vault refuses an ended key at once, or at worst from its next revocation-list refresh"
 echo "PASS end-typed-keys ($(echo "$names" | wc -w) ended)"

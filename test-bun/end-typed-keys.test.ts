@@ -65,6 +65,15 @@ describe("end-typed-keys.sh", () => {
     expect(r.out).toContain("PASS end-typed-keys (1 ended)");
   });
 
+  it("leaves revoked and expired keys alone, and counts any other status as live", async () => {
+    let listed = 0;
+    const expired = { ...ai, name: "old-ai", status: "expired" };
+    const odd = { ...ai, name: "odd-ai", status: "paused" };
+    const r = await run({ list: () => (listed++ === 0 ? keysList([expired, odd, { ...ai, status: "revoked" }])() : keysList([expired, { ...odd, status: "revoked" }])()) });
+    expect(r.code).toBe(0);
+    expect(r.revoked).toEqual(["odd-ai"]);
+  });
+
   it("a trailing slash on the origin is the same door", async () => {
     let listed = 0;
     const r = await run({ list: () => (listed++ === 0 ? keysList([ai])() : keysList([])()) }, (b) => `${b}/`);
@@ -77,6 +86,7 @@ describe("end-typed-keys.sh", () => {
     ["a 500 that isn't JSON", () => new Response("upstream error", { status: 500 })],
     ["a 200 with no keys list", () => Response.json({ error: "something" })],
     ["an empty 200", () => new Response("", { status: 200 })],
+    ["a 500 whose body still has a keys list", () => Response.json({ keys: [] }, { status: 500 })],
   ] as const) {
     it(`fails closed on ${what}`, async () => {
       const r = await run({ list });
