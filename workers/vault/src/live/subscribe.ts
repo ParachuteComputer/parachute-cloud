@@ -43,6 +43,8 @@ export async function handleSubscribe(
   vaultName: string,
   tagScope: TagScopeCtx,
   manager: SubscriptionManager,
+  /** A typed key's grant (T-476): the stream closes once it is no longer in force. */
+  grant?: { id: string; inForce: () => boolean },
 ): Promise<Response> {
   if (req.method !== "GET") {
     return json({ error: "Method not allowed", message: "subscribe is GET-only" }, 405);
@@ -188,6 +190,7 @@ export async function handleSubscribe(
         matcher,
         tagScopeAllowed: tagScope.allowed,
         tagScopeRaw: tagScope.raw,
+        ...(grant ? { grant } : {}),
         sink,
       });
       if (!handle) {

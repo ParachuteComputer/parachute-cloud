@@ -41,6 +41,9 @@ import type { AttachmentTicketProvider } from "@openparachute/core/src/attachmen
 import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
 import { applyOnBehalf } from "./rest/write-stamp.js";
+import { tagScopeFor, tagVisibleInScope } from "./rest/tag-scope.js";
+import { getVaultMap, getVaultStats } from "@openparachute/core/src/notes.js";
+import { applyScopeWrappers, idVisibility, NARROWED_TOOLS, scopeVisibility } from "./mcp-tag-scope.js";
 import { NOTE_TOOL_NAMES, recordWords } from "@openparachute/core/src/mcp-records.js";
 import { recordErrorData, shapeRecordSurface, typedMessage } from "@openparachute/core/src/mcp-surface.js";
 import { toolAnnotations, type McpLevel } from "@openparachute/core/src/mcp-annotations.js";
@@ -245,6 +248,32 @@ export function serverInstruction(
       `For a script or cron job, make a key for this vault in your account (\`POST /account/keys {name, vault: "${vaultName}", can: "read"}\`, ` +
       `or the app's keys page) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/scripting/`,
   });
+}
+
+/**
+ * The vault's projection for the connect-time brief. For a typed key (T-476) only its own types and the fields they
+ * declare, counts over the records it can see, and no guide pointer or query hints (they could name what it can't
+ * see): the box's filterProjectionByScope, recomputing map and stats through the key's types.
+ */
+export function projectionFor(store: Store, auth: AuthResult): VaultProjection {
+  const projection = buildVaultProjection(store.db as never, { includeStats: true });
+  if (!auth.scoped_tags) return projection;
+  const scope = tagScopeFor(store, auth.scoped_tags);
+  const visible = (t: string) => tagVisibleInScope(t, scope.allowed, scope.raw);
+  const tagFilter = new Set(scope.allowed ?? []);
+  for (const r of store.db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[]) {
+    if (visible(r.tag_name)) tagFilter.add(r.tag_name);
+  }
+  const filter = { tagFilter: [...tagFilter] };
+  const { getting_started: _guide, ...rest } = projection;
+  return {
+    ...rest,
+    tags: projection.tags.filter((t) => visible(t.name)),
+    indexed_fields: projection.indexed_fields.map((f) => ({ ...f, tags: f.tags.filter(visible) })).filter((f) => f.tags.length > 0),
+    query_hints: [],
+    map: getVaultMap(store.db as never, filter),
+    stats: getVaultStats(store.db as never, filter),
+  };
 }
 
 /**
@@ -608,20 +637,45 @@ function visibleTools(
   // flattening it here would reintroduce the bug. Mirrors the bun vault's
   // `src/mcp-tools.ts`. (cloud#277)
   const writeContext = { actor: auth.actor, via: refineMcpVia(auth.via) };
+  // A typed key (T-476): its types are the session's scope. The engine narrows what it can (search, rollups, links,
+  // near walks, if_exists, references, files); mcp-tag-scope.ts wraps the rest; scopedTools lists only what is narrowed.
+  const scope = auth.scoped_tags ? tagScopeFor(store, auth.scoped_tags) : null;
+  const vis = scope ? scopeVisibility(scope) : undefined;
+  const idVis = scope ? idVisibility(store.db as never, scope) : undefined;
   const tools = generateMcpTools(store, {
     writeContext,
+    ...(vis && idVis
+      ? {
+          expandVisibility: vis,
+          nearTraversable: idVis,
+          ifExistsVisible: vis,
+          aggregateVisibility: vis,
+          searchVisibility: vis,
+          resolveVisibility: vis,
+          ambiguityVisible: idVis,
+          mayChangePublished: () => tagVisibleInScope("publish", scope!.allowed, scope!.raw),
+        }
+      : {}),
     // 0.9.3 auto hybrid: a question-shaped search with no search_mode also asks the meaning index (a Workers AI embed
     // call plus a batched scan of the candidates' vectors in the vault's DO). Off on cloud unless the vault turns it on
     // (CLOUD_HYBRID_AUTO_DEFAULT, measured there).
     hybridAuto: () => hybridAuto?.() ?? CLOUD_HYBRID_AUTO_DEFAULT,
-    attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
+    attachmentTickets: {
+      provider: attachmentTickets.provider,
+      vaultName,
+      urlBase: attachmentTickets.urlBase,
+      // A typed key's ticket names its grant and scope, and is spent only while both still hold (attachment-tickets.ts).
+      ...(vis ? { noteVisible: vis, scopedTags: auth.scoped_tags! } : {}),
+      ...(auth.grant ? { grant: auth.grant } : {}),
+    },
     // read-attachment (the engine adds the tool only when a door wires bytes): ranged R2 reads. Without it an AI
     // app on this door could list a note's files but not look at one, which it can on a box.
-    ...(attachmentBytes ? { attachmentBytes: { provider: attachmentBytes } } : {}),
+    ...(attachmentBytes ? { attachmentBytes: { provider: attachmentBytes, ...(vis ? { noteVisible: vis } : {}) } } : {}),
     // T-412: delete-note's erase_history is admin-only, like DELETE /notes/:id/versions. Core refuses it unless this
     // is set. Cloud has no tag-scoped passes, so an admin may also name a note already deleted.
     ...(hasScopeForVault(auth.scopes, vaultName, "admin") ? { eraseHistory: "all" as const } : {}),
   });
+  if (scope) applyScopeWrappers(tools, store, scope, !!auth.grant);
   return tools;
 }
 
@@ -638,10 +692,17 @@ function scopedTools(store: Store, tools: McpToolDef[], vaultName: string, auth:
     // carry, so write access may later add fields to a type it made (core type-write.ts). (The engine lists
     // manage-types to any write session; the stamp is what makes "a type you made" hold.)
     writer: { by: auth.actor, via: refineMcpVia(auth.via) },
+    // A typed key: the record surface's own type lookups see only its types (and it is refused manage-types anyway).
+    ...(auth.scoped_tags
+      ? (() => {
+          const sc = tagScopeFor(store, auth.scoped_tags!);
+          return { tagVisible: async () => (t: string) => tagVisibleInScope(t, sc.allowed, sc.raw) };
+        })()
+      : {}),
     // Old and new names, as a box counts them (`mcp <tool>`, `mcp <tool> <param>`): the DO adds the client.
     ...(countName ? { onUse: (name: string, kind: "old" | "new") => countName(`mcp ${name}`, kind) } : {}),
   });
-  return shaped.filter((t) => hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)));
+  return shaped.filter((t) => hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)) && (!auth.scoped_tags || NARROWED_TOOLS.has(t.name)));
 }
 
 /**
@@ -1087,7 +1148,7 @@ export async function handleMcp(
     return scopedTools(store, twin, vaultName, forBy, countName);
   });
   const instructions = () =>
-    serverInstruction(vaultName, description, connectionReachFor(auth, vaultName), buildVaultProjection(store.db as never, { includeStats: true }), {
+    serverInstruction(vaultName, description, connectionReachFor(auth, vaultName), projectionFor(store, auth), {
       readEnabled: tickets.bytes !== undefined,
     });
   // The connection's level here (cloud has no tag-scoped passes, so an admin scope is a vault-wide admin).

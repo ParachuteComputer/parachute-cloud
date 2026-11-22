@@ -1,0 +1,263 @@
+/**
+ * Typed keys on the cloud vault (T-476; core #140/#143, docs/SPEC-1.0-grants.md §7.3): a key for an AI that reaches
+ * only some types. The identity worker files the key's grant here (`PUT /api/grants/<key>`) and signs only its id
+ * into the token (`permissions.grant`); this vault reads the grant from its own table on every request and narrows
+ * the key to it. The journal is as if it didn't exist: by id, path, search, links, counts, types, history, a query
+ * naming it, MCP, the live socket and files; writes stay inside the key's types; everything that acts on the whole
+ * vault refuses it; ending the grant fails the key's next request. Made-up records only.
+ */
+import { SELF, env } from "cloudflare:test";
+import { describe, expect, it } from "vitest";
+import { base, createNote, freshVault, mintToken, op } from "./helpers.ts";
+
+const BOTH_ACCEPT = "application/json, text/event-stream";
+const ALL = ["read", "create", "update", "delete"];
+
+async function fileGrant(v: string, name: string, types: Record<string, string[]>) {
+  const r = await op(v, `/api/grants/${name}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grantee: `key:${name}`, types, expires_at: new Date(Date.now() + 86_400_000).toISOString() }),
+  });
+  expect(r.status, await r.clone().text()).toBe(201);
+}
+
+const typedKey = (v: string, name: string, write = true, grant: string = name) =>
+  mintToken({
+    vault: v,
+    scopes: write ? `vault:${v}:read vault:${v}:write` : `vault:${v}:read`,
+    clientId: "parachute-app-key",
+    key: { name, kind: "agent" },
+    permissions: { app_key: name, grant },
+  });
+
+const rest = (v: string, token: string, path: string, init: RequestInit = {}) =>
+  SELF.fetch(`${base(v)}/api${path}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${token}`, ...(init.body ? { "Content-Type": "application/json" } : {}), ...((init.headers as Record<string, string>) ?? {}) },
+  });
+
+async function rpc(v: string, token: string, method: string, params: unknown): Promise<{ status: number; body: any }> {
+  const res = await SELF.fetch(`${base(v)}/mcp`, {
+    method: "POST",
+    headers: { Accept: BOTH_ACCEPT, "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  return { status: res.status, body: res.status === 200 ? await res.json() : await res.text() };
+}
+const tool = async (v: string, token: string, name: string, args: Record<string, unknown>) => {
+  const r = await rpc(v, token, "tools/call", { name, arguments: args });
+  const m = r.body;
+  if (m.error) return { ok: false, text: JSON.stringify(m.error) };
+  const text = (m.result.content ?? []).map((c: any) => c.text ?? "").join("");
+  if (m.result.isError) return { ok: false, text };
+  const first = m.result.content.find((c: any) => c.type === "text")?.text ?? "";
+  let out: any = first;
+  try { out = JSON.parse(first); } catch {}
+  return { ok: !(out && typeof out === "object" && "error" in out), out, text };
+};
+
+/** The owner's vault: a recipe that links to a journal entry, the journal entry linking back, both edited once. */
+async function world(prefix: string) {
+  const v = freshVault(prefix);
+  for (const t of ["recipe", "journal"]) {
+    expect((await op(v, `/api/tags/${t}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind: "type", description: t }) })).status).toBe(200);
+  }
+  const j1 = await createNote(v, { path: "diary/today", content: "a private zqword entry", tags: ["journal"] });
+  const r1 = await createNote(v, { path: "food/soup", content: "soup, as in [[diary/today]]", tags: ["recipe"] });
+  await op(v, `/api/notes/${j1.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ links: { add: [{ target: r1.id, relationship: "mentions" }] }, force: true }) });
+  await op(v, `/api/notes/${r1.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: "soup, again, as in [[diary/today]]", force: true }) });
+  return { v, j1: j1.id as string, r1: r1.id as string };
+}
+
+describe("a key held to recipes, at the REST door", () => {
+  it("reads and adds recipes; the journal is as if it didn't exist", async () => {
+    const { v, j1, r1 } = await world("tkrest");
+    await fileGrant(v, "claude-a", { recipe: ALL });
+    const k = await typedKey(v, "claude-a");
+    const ids = async (path: string) => {
+      const r = await rest(v, k, path);
+      expect(r.status, path).toBe(200);
+      const b: any = await r.json();
+      return (Array.isArray(b) ? b : b.notes).map((n: any) => n.id).sort();
+    };
+    const made = await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ content: "bread", tags: ["recipe"] }) });
+    expect(made.status).toBe(201);
+    const bread = ((await made.json()) as any).id;
+    expect(await ids("/notes")).toEqual([r1, bread].sort());
+    // by id, by path, the same 404 as a missing record
+    expect((await rest(v, k, `/notes/${j1}`)).status).toBe(404);
+    expect((await rest(v, k, `/notes/${encodeURIComponent("diary/today")}`)).status).toBe(404);
+    expect((await rest(v, k, `/notes?id=${j1}`)).status).toBe(404);
+    // search, a query naming the hidden type, its exclusion
+    expect(await ids("/notes?search=zqword")).toEqual([]);
+    expect(await ids("/notes?tag=journal")).toEqual([]);
+    // links both ways and their count
+    const one: any = await (await rest(v, k, `/notes/${r1}?include_links=true&include_link_count=true`)).json();
+    expect(JSON.stringify(one.links ?? [])).not.toContain(j1);
+    expect(one.linkCount).toBe(0);
+    // the type list and the counts
+    const types = await rest(v, k, "/tags");
+    expect(JSON.stringify(await types.json())).not.toContain("journal");
+    const stats: any = await (await rest(v, k, "/vault?include_stats=true")).json();
+    expect(stats.stats.totalNotes).toBe(2);
+    expect(JSON.stringify(stats)).not.toContain("journal");
+    // history: no version is visible under a grant; a hidden record's is a missing one
+    expect(await (await rest(v, k, `/notes/${r1}/versions`)).json()).toEqual({ versions: [], total: 0 });
+    expect((await rest(v, k, `/notes/${j1}/versions`)).status).toBe(404);
+    expect((await rest(v, k, `/notes/${r1}/versions/0`)).status).toBe(404);
+    // writes stay inside recipes
+    expect((await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ content: "x", tags: ["journal"] }) })).status).toBe(403);
+    expect((await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ content: "x", tags: ["recipe", "journal"] }) })).status).toBe(403);
+    expect((await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ content: "untyped" }) })).status).toBe(403);
+    expect((await rest(v, k, `/notes/${j1}`, { method: "PATCH", body: JSON.stringify({ content: "overwritten", force: true }) })).status).toBe(404);
+    expect((await rest(v, k, `/notes/${j1}`, { method: "DELETE" })).status).toBe(404);
+    expect((await rest(v, k, `/notes/${bread}`, { method: "PATCH", body: JSON.stringify({ tags: { add: ["journal"] }, force: true }) })).status).toBe(403);
+    // the journal is as it was
+    expect(((await (await op(v, `/api/notes/${j1}`)).json()) as any).content).toContain("zqword");
+  });
+
+  it("a record of both types is read with only the type the key can see", async () => {
+    const { v } = await world("tkscrub");
+    const both = await createNote(v, { path: "food/both", content: "both", tags: ["recipe", "journal"] });
+    await fileGrant(v, "claude-s", { recipe: ALL });
+    const k = await typedKey(v, "claude-s");
+    const got: any = await (await rest(v, k, `/notes/${both.id}`)).json();
+    expect(got.tags).toEqual(["recipe"]);
+    const list = await (await rest(v, k, "/notes")).text();
+    expect(list).not.toContain("journal");
+  });
+
+  it("everything that acts on the whole vault refuses it", async () => {
+    const { v } = await world("tkwide");
+    await fileGrant(v, "claude-w", { recipe: ALL });
+    const k = await typedKey(v, "claude-w");
+    for (const [method, path] of [
+      ["GET", "/export"], ["GET", "/history/deleted"], ["GET", "/doctor"], ["GET", "/find-path?from=a&to=b"],
+      ["GET", "/storage/x"], ["GET", "/grants"], ["PUT", "/tags/recipe"], ["GET", "/notes?aggregate[group_by]=tag"],
+      ["POST", "/packs/core"], ["PATCH", "/vault"], ["GET", "/health"],
+    ] as const) {
+      const r = await rest(v, k, path, { method, ...(method === "PUT" || method === "PATCH" || method === "POST" ? { body: "{}" } : {}) });
+      expect(r.status, `${method} ${path}`).toBe(403);
+    }
+    // the type door's write is refused too (a narrowed key never defines types)
+    expect((await rest(v, k, "/types/recipe", { method: "PUT", body: JSON.stringify({ fields: { x: { type: "string" } } }) })).status).toBe(403);
+  });
+
+  it("a key that only reads recipes can't add one", async () => {
+    const { v, r1 } = await world("tkread");
+    await fileGrant(v, "claude-r", { recipe: ["read"] });
+    const k = await typedKey(v, "claude-r", true);
+    expect((await rest(v, k, `/notes/${r1}`)).status).toBe(200);
+    expect((await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ content: "x", tags: ["recipe"] }) })).status).toBe(403);
+  });
+});
+
+describe("a key held to recipes, at the MCP door", () => {
+  it("lists only what is narrowed; the journal isn't found by search, id, history or type list; writes stay in recipes", async () => {
+    const { v, j1, r1 } = await world("tkmcp");
+    await fileGrant(v, "claude-m", { recipe: ALL });
+    const k = await typedKey(v, "claude-m");
+    const init = await rpc(v, k, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } });
+    expect(JSON.stringify(init.body.result.instructions ?? "")).not.toContain("journal");
+    const names = ((await rpc(v, k, "tools/list", {})).body.result.tools as { name: string }[]).map((t) => t.name);
+    expect(names).toContain("query-records");
+    expect(names).toContain("create-record");
+    for (const wide of ["vault-info", "doctor", "manage-types", "find-path", "update-tag"]) expect(names).not.toContain(wide);
+    const found = await tool(v, k, "query-notes", { search: "zqword" });
+    expect(JSON.stringify(found.out)).not.toContain(j1);
+    const byId = await tool(v, k, "query-notes", { id: j1 });
+    expect(byId.text).not.toContain("zqword");
+    expect((await tool(v, k, "query-notes", { versions: { note_id: r1 } })).out).toEqual({ versions: [], total: 0 });
+    expect((await tool(v, k, "query-notes", { versions: { note_id: j1 } })).text).not.toContain("zqword");
+    const tags = await tool(v, k, "list-tags", {});
+    expect(tags.text).not.toContain("journal");
+    expect(tags.text).toContain("recipe");
+    const made = await tool(v, k, "create-note", { content: "made over MCP", tags: ["recipe"], path: "food/mcp" });
+    expect(made.ok, made.text).toBe(true);
+    const refused = await tool(v, k, "create-note", { content: "a journal entry", tags: ["journal"], path: "diary/mcp" });
+    expect(refused.ok).toBe(false);
+    expect((await op(v, `/api/notes/${encodeURIComponent("diary/mcp")}`)).status).toBe(404);
+    const records = await tool(v, k, "query-records", { type: "journal" });
+    expect(records.text).not.toContain(j1);
+  });
+});
+
+describe("ending the grant", () => {
+  it("fails the key's next request at REST and MCP; another key's grant, or none, never opens", async () => {
+    const { v, r1 } = await world("tkend");
+    await fileGrant(v, "claude-e", { recipe: ALL });
+    const k = await typedKey(v, "claude-e");
+    expect((await rest(v, k, `/notes/${r1}`)).status).toBe(200);
+    // a token naming another key's grant, or a grant never filed
+    expect((await rest(v, await typedKey(v, "someone-else", true, "claude-e"), `/notes/${r1}`)).status).toBe(401);
+    expect((await rest(v, await typedKey(v, "claude-x"), `/notes/${r1}`)).status).toBe(401);
+    // a vault admin reads the grant, and ends it
+    const g: any = await (await op(v, "/api/grants/claude-e")).json();
+    expect(g.state).toBe("in_force");
+    expect((await op(v, "/api/grants/claude-e", { method: "DELETE" })).status).toBe(200);
+    const after = await rest(v, k, `/notes/${r1}`);
+    expect(after.status).toBe(401);
+    expect(((await after.json()) as any).error).toBe("grant_ended");
+    expect((await rpc(v, k, "tools/list", {})).status).toBe(401);
+    expect(((await (await op(v, "/api/grants/claude-e")).json()) as any).state).toBe("revoked");
+    // an id is one grant for good: it can't be filed again
+    const again = await op(v, "/api/grants/claude-e", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ grantee: "key:claude-e", types: { recipe: ALL }, expires_at: new Date(Date.now() + 86_400_000).toISOString() }),
+    });
+    expect(again.status).toBe(409);
+  });
+
+  it("a file ticket minted under the grant is spent no more", async () => {
+    const { v, r1 } = await world("tkticket");
+    await fileGrant(v, "claude-t", { recipe: ALL });
+    const k = await typedKey(v, "claude-t");
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+    const mint = await tool(v, k, "request-attachment-upload", { note: r1, filename: "soup.png", mime_type: "image/png", size_bytes: bytes.length });
+    expect(mint.ok, mint.text).toBe(true);
+    const url = new URL(mint.out.url);
+    expect((await op(v, "/api/grants/claude-t", { method: "DELETE" })).status).toBe(200);
+    const spend = await SELF.fetch(`https://vault.test${url.pathname}`, { method: "PUT", headers: { "content-type": "image/png", "content-length": String(bytes.length) }, body: bytes });
+    expect(spend.status).toBe(404);
+  });
+
+  it("a grant is the owner's: a narrowed key can't read or file one", async () => {
+    const { v } = await world("tkown");
+    await fileGrant(v, "claude-o", { recipe: ALL });
+    const k = await typedKey(v, "claude-o");
+    expect((await rest(v, k, "/grants/claude-o")).status).toBe(403);
+    const writer = await mintToken({ vault: v, scopes: `vault:${v}:read vault:${v}:write` });
+    expect((await rest(v, writer, "/grants")).status).toBe(403);
+  });
+});
+
+describe("the live socket under a grant", () => {
+  it("sees only recipes, and closes when the grant ends", async () => {
+    const { v } = await world("tkws");
+    await fileGrant(v, "claude-l", { recipe: ALL });
+    const k = await typedKey(v, "claude-l");
+    const res = await SELF.fetch(`${base(v)}/api/subscribe`, { headers: { Upgrade: "websocket" } });
+    const ws = res.webSocket!;
+    ws.accept();
+    const frames: any[] = [];
+    let closed = false;
+    ws.addEventListener("message", (e: any) => frames.push(JSON.parse(e.data)));
+    ws.addEventListener("close", () => { closed = true; });
+    ws.send(JSON.stringify({ type: "auth", token: k }));
+    for (let i = 0; i < 100 && !frames.some((f) => f.type === "snapshot" && f.done); i++) await new Promise((r) => setTimeout(r, 50));
+    const snapshot = frames.filter((f) => f.type === "snapshot").flatMap((f) => f.notes);
+    expect(snapshot.length).toBeGreaterThan(0);
+    expect(JSON.stringify(snapshot)).not.toContain("journal");
+    await createNote(v, { content: "another private entry", tags: ["journal"] });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(JSON.stringify(frames)).not.toContain("another private entry");
+    expect((await op(v, "/api/grants/claude-l", { method: "DELETE" })).status).toBe(200);
+    for (let i = 0; i < 100 && !closed; i++) await new Promise((r) => setTimeout(r, 50));
+    expect(closed).toBe(true);
+  });
+});
+
+// keep env referenced (DO helpers in other files use it; this file reaches the vault only over SELF)
+void env;

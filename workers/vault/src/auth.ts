@@ -77,6 +77,14 @@ export interface AuthResult {
    */
   acts_for?: string | null;
   /**
+   * The grant this token is under (`permissions.grant`, core docs/SPEC-1.0-grants.md §7.2, T-476 typed keys): only
+   * its id, never its rules. The vault reads the grant from its own table on every request (grants.ts) and narrows
+   * this result to it, or refuses the request when the grant has ended. Null for a credential with no grant.
+   */
+  grant?: string | null;
+  /** The named key this token is (the `key` claim, or the 0.8 shape's `permissions.app_key`), or null. */
+  keyName?: string | null;
+  /**
    * The validated JWT's `client_id` claim (null for the operator bearer or a
    * token without one). The internal config seam gates on
    * {@link FIRST_PARTY_CLIENT_ID}; everything else ignores it.
@@ -462,9 +470,12 @@ export function refineMcpVia(via: string | null | undefined): string {
  * door/0.9's identity worker signs into every app key: a label, never a narrowing), and `scoped_tags` and `acts_for`,
  * which have their own handling below (scoped_tags is refused by name; acts_for is enforced, the on-behalf-of
  * stamp). Any other key is refused
- * (`authenticateVaultToken`). A door that starts enforcing a new key adds it here in the same change.
+ * (`authenticateVaultToken`). A door that starts enforcing a new key adds it here in the same change: `grant` (T-476,
+ * typed keys) is read below and enforced by the vault's grants table (grants.ts).
  */
-const KNOWN_PERMISSION_KEYS = new Set(["scoped_tags", "principal_pubkey", "acts_for", "app_key"]);
+const KNOWN_PERMISSION_KEYS = new Set(["scoped_tags", "principal_pubkey", "acts_for", "app_key", "grant"]);
+/** A grant's id (core grants.ts GRANT_ID_RE): the key's own name. */
+const GRANT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 
 function unknownPermissionKeys(permissions: Record<string, unknown> | undefined): string[] {
   if (!permissions) return [];
@@ -636,6 +647,20 @@ export async function authenticateVaultToken(
     }
     throw err;
   }
+  // TYPED KEYS (T-476, core #140): `permissions.grant` names the grant the vault keeps for this key; the vault reads
+  // its rules from its own table on every request (vault-do.ts authenticate → grants.ts). Fail closed on anything
+  // this vault can't hold: a malformed id, a grant without a named key (the grant is the key's own), or a grant
+  // beside the on-behalf-of permission (a typed key never acts for others: identity refuses that mint too).
+  const keyName = stampKey?.name ?? appKeyName;
+  let grant: string | null = null;
+  if (claims.permissions && "grant" in claims.permissions) {
+    const g = claims.permissions.grant;
+    if (typeof g !== "string" || !GRANT_ID_RE.test(g) || keyName === null || actsFor !== null) {
+      console.warn("[auth] JWT rejected: permissions.grant is malformed, names no key, or comes with acts_for");
+      return { ok: false, reason: "unauthorized", message: "token has a grant this vault can't hold" };
+    }
+    grant = g;
+  }
   if (stampKey !== null) rememberKeyKind(stampKey);
   // A key of the 0.8 shape (T-430: identity's `permissions.app_key` on an app-key token, no key claim) is an app key.
   else if (appKeyName !== null) rememberKeyKind({ name: appKeyName, kind: "app" });
@@ -672,6 +697,8 @@ export async function authenticateVaultToken(
         ? keyVia(stampKey.name)
         : principalPubkey !== null ? nostrVia(principalPubkey) : appKeyName !== null ? keyVia(appKeyName) : "api",
       acts_for: actsFor,
+      grant,
+      keyName,
       clientId: claims.clientId ?? null,
       exp,
       jti: claims.jti ?? null,

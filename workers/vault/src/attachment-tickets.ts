@@ -22,6 +22,7 @@
  * placement exactly: the ticket IS the credential, and a bearer-less
  * `curl` must be able to spend it.
  */
+import { noteWithinTagScope, tagScopeFor } from "./rest/tag-scope.js";
 import type {
   AttachmentTicket,
   AttachmentTicketProvider,
@@ -53,6 +54,9 @@ interface TicketRow extends Record<string, SqlStorageValue> {
   filename: string | null;
   transcribe: number | null;
   attachment_id: string | null;
+  /** A typed key's ticket (T-476): its grant id, and its types as JSON. Absent on a table made before them. */
+  grant_id: string | null;
+  scoped_tags: string | null;
 }
 
 function rowToTicket(r: TicketRow): AttachmentTicket {
@@ -68,6 +72,8 @@ function rowToTicket(r: TicketRow): AttachmentTicket {
     ...(r.filename !== null ? { filename: r.filename } : {}),
     ...(r.transcribe !== null ? { transcribe: r.transcribe === 1 } : {}),
     ...(r.attachment_id !== null ? { attachmentId: r.attachment_id } : {}),
+    ...(r.grant_id ? { grant: r.grant_id } : {}),
+    ...(r.scoped_tags ? { scopedTags: JSON.parse(r.scoped_tags) as string[] } : {}),
   };
 }
 
@@ -97,6 +103,11 @@ export class DoAttachmentTicketProvider implements AttachmentTicketProvider {
         attachment_id TEXT
       )
     `);
+    // T-476 (typed keys): a ticket remembers the grant and types it was minted under, so its spend re-checks both.
+    // Added by ALTER on a table that predates them; an older worker names its columns and ignores these.
+    const cols = new Set(this.storage.sql.exec<{ name: string }>("PRAGMA table_info(attachment_tickets)").toArray().map((c) => c.name));
+    if (!cols.has("grant_id")) this.storage.sql.exec("ALTER TABLE attachment_tickets ADD COLUMN grant_id TEXT");
+    if (!cols.has("scoped_tags")) this.storage.sql.exec("ALTER TABLE attachment_tickets ADD COLUMN scoped_tags TEXT");
   }
 
   /**
@@ -118,8 +129,8 @@ export class DoAttachmentTicketProvider implements AttachmentTicketProvider {
     this.storage.sql.exec(`DELETE FROM attachment_tickets WHERE expires_at < ?`, Date.now());
     this.storage.sql.exec(
       `INSERT INTO attachment_tickets
-         (id, kind, vault_name, created_at, expires_at, mime_type, size_bytes, note_id, filename, transcribe, attachment_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, kind, vault_name, created_at, expires_at, mime_type, size_bytes, note_id, filename, transcribe, attachment_id, grant_id, scoped_tags)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ticket.id,
       ticket.kind,
       ticket.vaultName,
@@ -131,6 +142,8 @@ export class DoAttachmentTicketProvider implements AttachmentTicketProvider {
       ticket.filename ?? null,
       ticket.transcribe === undefined ? null : ticket.transcribe ? 1 : 0,
       ticket.attachmentId ?? null,
+      ticket.grant ?? null,
+      ticket.scopedTags ? JSON.stringify(ticket.scopedTags) : null,
     );
   }
 
@@ -167,11 +180,18 @@ async function takeValidTicket(
   id: string,
   vaultName: string,
   kind: AttachmentTicket["kind"],
+  deps?: Pick<TicketSpendDeps, "grantInForce" | "store">,
 ): Promise<AttachmentTicket | null> {
   const ticket = await provider.take(id);
   if (!ticket) return null;
   if (ticket.kind !== kind || ticket.vaultName !== vaultName || ticket.expiresAt < Date.now()) {
     return null;
+  }
+  // A typed key's ticket (T-476): spent only while its grant is in force, and only for a record still in its types.
+  if (ticket.grant !== undefined && !(deps?.grantInForce?.(ticket.grant) ?? false)) return null;
+  if (ticket.scopedTags !== undefined) {
+    const note = ticket.noteId && deps?.store ? await deps.store.getNote(ticket.noteId) : null;
+    if (!note || !noteWithinTagScope(note, tagScopeFor(deps!.store, ticket.scopedTags).allowed, ticket.scopedTags)) return null;
   }
   return ticket;
 }
@@ -215,6 +235,8 @@ export interface TicketSpendDeps {
   /** The DO's written-since-import flag (T-379). Only a good ticket sets it: a
    *  stranger's guess at this bearerless route must not be able to stop a move. */
   markWritten: () => Promise<void>;
+  /** Is a typed key's grant still in force (T-476)? A ticket minted under one is spent only while it is. */
+  grantInForce?: (grant: string) => boolean;
 }
 
 function r2Key(vaultName: string, relativePath: string): string {
@@ -233,7 +255,7 @@ export async function handleTicketSpend(req: Request, ticketId: string, deps: Ti
 }
 
 async function handleUploadSpend(req: Request, ticketId: string, deps: TicketSpendDeps): Promise<Response> {
-  const ticket = await takeValidTicket(deps.provider, ticketId, deps.vaultName, "upload");
+  const ticket = await takeValidTicket(deps.provider, ticketId, deps.vaultName, "upload", deps);
   if (!ticket || !ticket.noteId || !ticket.filename || !ticket.mimeType) return ticketNotFound();
   await deps.markWritten();
 
@@ -365,7 +387,7 @@ async function handleUploadSpend(req: Request, ticketId: string, deps: TicketSpe
 }
 
 async function handleDownloadSpend(ticketId: string, deps: TicketSpendDeps): Promise<Response> {
-  const ticket = await takeValidTicket(deps.provider, ticketId, deps.vaultName, "download");
+  const ticket = await takeValidTicket(deps.provider, ticketId, deps.vaultName, "download", deps);
   if (!ticket || !ticket.attachmentId) return ticketNotFound();
 
   // The row can vanish between mint and spend (rare — a delete racing a

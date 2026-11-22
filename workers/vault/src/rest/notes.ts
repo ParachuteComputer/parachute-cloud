@@ -88,6 +88,15 @@ import { logStrictBypass } from "./shims.js";
 import { bodyWithPendingRestored, segmentPart } from "../transcription/pipeline.js";
 
 /**
+ * By note id, is a record visible under this scope (T-476: a typed key)? For the engine's link counts and ambiguous
+ * candidates, which count a link only when its other end is visible. Undefined when unscoped (the vault-wide path).
+ */
+function idVisibleFor(db: unknown, tagScope: TagScopeCtx): ((noteId: string) => boolean) | undefined {
+  if (tagScope.raw === null) return undefined;
+  return (noteId: string) => noteWithinTagScope({ tags: getNoteTags(db as Parameters<typeof getNoteTags>[0], noteId) }, tagScope.allowed, tagScope.raw);
+}
+
+/**
  * Runtime deps a handler needs beyond the store. `deleteObject` is provided by
  * the DO so the R2 delete AND the storage-meter decrement stay together in the
  * one place that owns the meter (see VaultDO.deleteObject).
@@ -443,13 +452,13 @@ async function handleNotesInner(
           // Same no-tag-scope-needed reasoning as broken_links above: an
           // ambiguous `target` never became a link, so no neighbor identity
           // is exposed — only the string this note's own reference named.
-          result.ambiguous_links = getAmbiguousLinksForNote(db, note.id);
+          result.ambiguous_links = getAmbiguousLinksForNote(db, note.id, idVisibleFor(db, tagScope));
         }
         if (parseBool(parseQuery(url, "include_attachments"), false)) {
           result.attachments = await store.getAttachments(note.id);
         }
         if (parseBool(parseQuery(url, "include_link_count"), false)) {
-          result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url)).get(note.id) ?? 0;
+          result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url), idVisibleFor(db, tagScope)).get(note.id) ?? 0;
         }
         return json(result);
       }
@@ -546,7 +555,7 @@ async function handleNotesInner(
             output = output.map((n: any) => filterMetadata(n, inclMeta));
           }
           if (parseBool(parseQuery(url, "include_link_count"), false)) {
-            const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url));
+            const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url), idVisibleFor(db, tagScope));
             for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
           }
           return jsonWithWarnings(output, semanticWarnings);
@@ -698,7 +707,7 @@ async function handleNotesInner(
           output = output.map((n: any) => filterMetadata(n, inclMeta));
         }
         if (parseBool(parseQuery(url, "include_link_count"), false)) {
-          const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url));
+          const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url), idVisibleFor(db, tagScope));
           for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
         }
         return jsonWithWarnings(output, searchWarnings);
@@ -901,7 +910,7 @@ async function handleNotesInner(
         output = output.map((n: any) => filterMetadata(n, inclMeta));
       }
       if (includeLinkCount) {
-        const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url));
+        const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url), idVisibleFor(db, tagScope));
         for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
       }
 
@@ -934,7 +943,7 @@ async function handleNotesInner(
           : null;
         // Same again for the ambiguity twin (vault#581), same non-leak logic.
         const ambiguousLinksByNote = includeAmbiguousLinks
-          ? getAmbiguousLinksForNotes(db, output.map((n: any) => n.id))
+          ? getAmbiguousLinksForNotes(db, output.map((n: any) => n.id), idVisibleFor(db, tagScope))
           : null;
         const enrichedOut: any[] = [];
         for (const n of output) {
@@ -1456,7 +1465,7 @@ async function handleNotesInner(
       result.attachments = await store.getAttachments(note.id);
     }
     if (parseBool(parseQuery(url, "include_link_count"), false)) {
-      result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url)).get(note.id) ?? 0;
+      result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url), idVisibleFor(db, tagScope)).get(note.id) ?? 0;
     }
     return json(result);
   }

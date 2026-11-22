@@ -42,7 +42,7 @@
  */
 import type { Note, Store } from "@openparachute/core/src/types.js";
 import type { DeletedNoteRef, HookEvent, HookRegistry, NoteHookPayload } from "@openparachute/core/src/hooks.js";
-import { noteWithinTagScope } from "../rest/tag-scope.js";
+import { noteWithinTagScope, scrubNoteTagsByScope } from "../rest/tag-scope.js";
 import type { LiveMatcher } from "@openparachute/core/src/live-match.js";
 
 /** Default per-vault concurrent-subscription cap. Over it → 503. */
@@ -71,6 +71,8 @@ interface Subscription {
   readonly matcher: LiveMatcher;
   readonly tagScopeAllowed: Set<string> | null;
   readonly tagScopeRaw: string[] | null;
+  /** The grant a typed key's subscription is under (T-476): its id, and whether it is in force now. */
+  readonly grant?: { id: string; inForce: () => boolean };
   readonly sink: SubscriptionSink;
   /** SSE tracks unflushed frames to bound DO memory; WS delegates to the runtime. */
   readonly tracksFlush: boolean;
@@ -184,6 +186,8 @@ export class SubscriptionManager {
     matcher: LiveMatcher;
     tagScopeAllowed: Set<string> | null;
     tagScopeRaw: string[] | null;
+    /** A typed key's grant (T-476): the subscription closes on the first event after the grant is no longer in force. */
+    grant?: { id: string; inForce: () => boolean };
     sink: SubscriptionSink;
     maxBuffered?: number;
     /** SSE (default true) tracks unflushed frames; WS passes false. */
@@ -203,6 +207,7 @@ export class SubscriptionManager {
       matcher: args.matcher,
       tagScopeAllowed: args.tagScopeAllowed,
       tagScopeRaw: args.tagScopeRaw,
+      ...(args.grant ? { grant: args.grant } : {}),
       sink: args.sink,
       tracksFlush: args.tracksFlush ?? true,
       countsTowardCap,
@@ -273,8 +278,16 @@ export class SubscriptionManager {
     for (const sub of this.subs) {
       if (sub.closed) continue;
       if (sub.vaultName !== vaultName) continue;
+      // A typed key's grant ended some way this vault wasn't told about directly: close on this event (T-476).
+      if (sub.grant && !sub.grant.inForce()) {
+        this.remove(sub);
+        continue;
+      }
 
       if (event === "deleted") {
+        // A narrowed subscription can't tell a hidden record's delete from a visible one's (the event has only its
+        // id), so it isn't told: naming the id would show a hidden record existed.
+        if (sub.tagScopeRaw !== null) continue;
         const ref = payload as DeletedNoteRef;
         this.emit(sub, "remove", { id: ref.id });
         continue;
@@ -285,7 +298,7 @@ export class SubscriptionManager {
       const matches = sub.matcher.match(note) && inScope;
 
       if (matches) {
-        this.emit(sub, "upsert", { note });
+        this.emit(sub, "upsert", { note: scrubNoteTagsByScope(note, sub.tagScopeAllowed, sub.tagScopeRaw) });
       } else if (event === "updated" && inScope) {
         this.emit(sub, "remove", { id: note.id });
       }
@@ -297,6 +310,11 @@ export class SubscriptionManager {
    * and re-authenticates) while keeping the hooks for the next ones. A handover (T-446) uses it so a stream the
    * previous owner opened before the handover doesn't keep receiving the new owner's writes.
    */
+  /** Close every subscription under grant `id` now (T-476: ending a typed key closes its live sockets at once). */
+  closeGrant(id: string): void {
+    for (const sub of Array.from(this.subs)) if (sub.grant?.id === id) this.remove(sub);
+  }
+
   closeAll(): void {
     for (const sub of Array.from(this.subs)) this.remove(sub);
   }

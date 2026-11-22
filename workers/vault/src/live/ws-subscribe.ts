@@ -97,6 +97,10 @@ export interface WsAttachment {
   actor: string | null;
   via: string | null;
   clientId: string | null;
+  /** A typed key's grant id and key name (T-476), and the types it is held to: a rehydrated socket keeps its scope. */
+  grant?: string | null;
+  keyName?: string | null;
+  scoped?: string[] | null;
   /** epoch ms the socket was accepted (the pending-auth deadline base). */
   connectedAt: number;
   /** Opaque per-socket id (logging / debugging). */
