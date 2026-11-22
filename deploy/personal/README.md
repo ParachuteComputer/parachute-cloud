@@ -145,23 +145,29 @@ bash deploy/personal/vault-limit.sh <profile.env> 25      # or `plan` to go back
 
 ## Keys for an AI, sharing and Changes (T-476)
 
-Since the T-476 door/0.9 stack (parachute-cloud #437 to #440), this door does what a Spark hub does here:
+Since the T-476 door/0.9 stack (parachute-cloud #437 to #441), this door does these as a Spark hub does (a typed
+key reads the public page as a stranger, which is stricter than a hub):
 - **A key for an AI that reaches only some types**: `POST /account/keys {name, vault, can, types: ["recipe"], kind:
   "agent"}`, or the app's Vault > Sharing. The vault keeps the grant and checks every request; the key sees and
   changes only those types, at REST, MCP, the live socket and files, and nothing that acts on the whole vault.
 - **One list of who reaches a vault**, and End: `GET /account/vaults/<vault>/statements` (every key and connected app),
-  `DELETE …/statements/<id>` (its next request fails).
+  `DELETE …/statements/<id>` (refused on its next request, or within a minute if the vault couldn't be told at once).
 - **Add a pack** with write access: write may make a type and add fields to a type it made (`PUT /api/types/<name>`,
   MCP `manage-types`).
 - **Changes lists deletes**: write access reads `GET /api/history/deleted` and puts a record back.
-- **A public page for published records**: `<vault>/view/<id>`, published records only, for anyone with the link.
+- **A public page for published records**: `https://<identity>/vault/<vault>/view/<id or path>`, published records only,
+  for anyone with the link.
 
-**Before rolling back** to a commit from before this stack (612f2b0 or older), end every typed key first: those vault
-workers don't know a typed key's grant and would serve it as a whole-vault key:
+**Before rolling back** to any commit before this stack (#437; for example door/0.9 at 0d0bf9e, 612f2b0 or 4f7bedf),
+end every typed key first: those vault workers don't know a typed key's grant and would serve it as a whole-vault
+key. Run it before the rollback, while this door is still live (an older identity worker doesn't list `types`), and
+make no typed key in between:
 
 ```bash
-bash deploy/personal/end-typed-keys.sh https://<identity> <your key file>     # exit 1 if any is left: don't roll back
+bash deploy/personal/end-typed-keys.sh https://<identity> <your key file>     # exit 1 if anything is unclear: don't roll back
 ```
+
+Rolling back to #437 or #438 needs nothing: those refuse a typed key outright.
 
 ## What this door doesn't do yet
 
