@@ -8,7 +8,7 @@
 #   3 R2 bucket <PREFIX>-vault (attachments and the nightly snapshots), created if missing
 #   4 D1 <PREFIX>-identity, created if missing; render the two wrangler configs
 #   5 vault worker; identity's D1 migrations; identity worker; its OPS_RUN_TOKEN (a random one, kept in PRIVATE)
-#   6 both /health answer 200
+#   6 both /health answer 200; with PUBLIC_DOMAIN, the name answers too: /health is identity's, /mcp the vault's
 # PRIVATE (default: <profile dir>/private, 0700) holds what must not be printed: the OPS token, and for a rehearsal
 # profile (OWNER_PUBKEY=rehearsal) made-up owner and admin keys. Nothing secret is printed.
 set -uo pipefail
@@ -24,6 +24,11 @@ fail() { echo "failed: $*" >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$PROFILE"
 : "${ACCOUNT_ID:?profile: ACCOUNT_ID}" "${PREFIX:?profile: PREFIX}" "${OWNER_PUBKEY:?profile: OWNER_PUBKEY}"
+
+# A public name (PUBLIC_DOMAIN) is a Custom Domain, a DNS record on its zone: inside a sealed job every child key is
+# then worker-app (Workers, D1, R2 on the account, DNS and routes on the job's one zone), so the card is one template (README.md).
+# WR_TEMPLATE set by the caller wins.
+[ -z "${PUBLIC_DOMAIN:-}" ] || export WR_TEMPLATE="${WR_TEMPLATE:-worker-app}"
 
 # --- 1 refusals ---
 ACCOUNT_ID="$(tr 'A-F' 'a-f' <<<"$ACCOUNT_ID")"
@@ -77,6 +82,8 @@ bash "$HERE/render.sh" "$RENDER_PROFILE" "$ID" "$SUB" || fail "render"
 step "D1 $PREFIX-identity ($ID)"
 
 # --- 5 deploy ---
+# With PUBLIC_DOMAIN the identity deploy also writes the name's Custom Domain. Wrangler, run without a terminal,
+# replaces a DNS record already on the name: back that record up first (the T-335 card's job does).
 run() { local o; o="$("$WR" "$@" 2>&1)"; local rc=$?; grep -vi token <<<"$o" | grep -E "workers.dev|Current Version ID|Uploaded|applied|No migrations|Success|✅|ERROR|✘" | cut -c1-160; return $rc; }
 cd "$ROOT/workers/vault"
 run deploy -c wrangler.personal.gen.toml --x-provision=false || fail "vault deploy"
@@ -87,12 +94,30 @@ WR_STDIN_FILE="$PRIVATE/ops-run-token" "$WR" secret put OPS_RUN_TOKEN -c wrangle
 step "deployed"
 
 # --- 6 health ---
-ID_ORIGIN="https://${IDENTITY_DOMAIN:-$PREFIX-identity.$SUB.workers.dev}"
-V_ORIGIN="https://${VAULT_DOMAIN:-$PREFIX-vault.$SUB.workers.dev}"
-for i in $(seq 1 30); do
-  a="$(curl -s -o /dev/null -w '%{http_code}' "$ID_ORIGIN/health")"; b="$(curl -s -o /dev/null -w '%{http_code}' "$V_ORIGIN/health")"
-  [ "$a" = 200 ] && [ "$b" = 200 ] && break; sleep 4
+ID_ORIGIN="https://$PREFIX-identity.$SUB.workers.dev"
+V_ORIGIN="https://$PREFIX-vault.$SUB.workers.dev"
+end=$(( $(date +%s) + 120 ))   # at most 120 s, never starting a round (two 10 s curls) it can't finish
+while :; do
+  a="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$ID_ORIGIN/health")"; b="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$V_ORIGIN/health")"
+  [ "$a" = 200 ] && [ "$b" = 200 ] && break
+  [ $(( $(date +%s) + 24 )) -le "$end" ] || break; sleep 4
 done
-printf 'IDENTITY=%s\nVAULT=%s\nPREFIX=%s\nD1_ID=%s\nCLOUD_SHA=%s\n' "$ID_ORIGIN" "$V_ORIGIN" "$PREFIX" "$ID" "$(git -C "$ROOT" rev-parse HEAD)" > "$EVID/deployed.env"
+printf 'IDENTITY=%s\nVAULT=%s\nPREFIX=%s\nD1_ID=%s\nCLOUD_SHA=%s\nPUBLIC=%s\n' "$ID_ORIGIN" "$V_ORIGIN" "$PREFIX" "$ID" "$(git -C "$ROOT" rev-parse HEAD)" \
+  "${PUBLIC_DOMAIN:+https://$PUBLIC_DOMAIN}" > "$EVID/deployed.env"
 [ "$a" = 200 ] && [ "$b" = 200 ] || fail "health: identity $a, vault $b"
 step "health: identity 200, vault 200 ($ID_ORIGIN, $V_ORIGIN)"
+# The public name: its certificate can take a minute or two. /health there is the identity's (the Custom Domain); /mcp
+# is the vault's, handed over by the identity (#428), whose 401 names the name's own discovery document.
+if [ -n "${PUBLIC_DOMAIN:-}" ]; then
+  # At most PUBLIC_WAIT_S (150 s): the card's key window must still hold a rollback after this.
+  P="https://$PUBLIC_DOMAIN"; want="resource_metadata=\"$P/.well-known/oauth-protected-resource/mcp\""
+  end=$(( $(date +%s) + ${PUBLIC_WAIT_S:-150} ))
+  while :; do
+    h="$(curl -s -m 5 "$P/health")"; m="$(curl -s -m 5 -o /dev/null -D - -X POST "$P/mcp" | tr -d '\r' | grep -i '^www-authenticate:')"
+    [[ "$h" == *'"service":"identity"'* && "$m" == *"$want"* ]] && break
+    [ $(( $(date +%s) + 14 )) -le "$end" ] || break; sleep 4   # another round (4 s + two 5 s curls) must end in time
+  done
+  [[ "$h" == *'"service":"identity"'* ]] || fail "public name: $P/health is not the identity worker's"
+  [[ "$m" == *"$want"* ]] || fail "public name: $P/mcp is not the vault worker's"
+  step "public name: $P/health is identity's, $P/mcp is the vault's"
+fi
