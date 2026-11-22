@@ -38,7 +38,7 @@ export async function handleHistoryCompact(req: Request, store: Store): Promise<
 }
 
 /**
- * GET /api/history/deleted — deleted notes that still have history, newest deletion first (T-412). Admin, gated at
+ * GET /api/history/deleted — deleted notes that still have history, newest deletion first (T-412). Write (T-476), gated at
  * the DO dispatch boundary; cloud has no tag-scoped passes. Same shape and bounds as the bun door
  * (packages/vault/src/routes.ts handleDeletedNotes).
  */
