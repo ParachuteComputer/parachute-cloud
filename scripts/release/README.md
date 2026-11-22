@@ -22,3 +22,33 @@ window with no card of its own; production keeps one card per deploy.
   `tools/job-prod-09.json`.
 - **Harness:** `tools/test/prod-job.test.sh` in the same worktree. It runs the real `deploy-prod.sh` with fake
   wrangler, curl, sealed CLI and smoke-prod, through every outcome (the health-gate ack among them).
+
+## Rolling production back past typed keys (T-476)
+
+Any rollback to a commit before door/0.9's T-476 stack (#437) can serve a typed key as a whole-vault key at its level
+until it expires: those vault workers don't know a typed key's grant (`permissions.grant`). That includes
+`prod-job.sh`'s own rollback: the new identity worker is live for up to the job's window before it rolls back, and a
+typed key made then lasts a year. The risk is small but real. So before any manual rollback, and after any such
+rollback (prod-job's included), count the live typed keys on the identity D1:
+
+```sql
+SELECT COUNT(*) FROM app_keys WHERE types IS NOT NULL AND revoked_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
+```
+
+If it isn't 0, end them in D1. These are the two D1 updates `DELETE /account/keys/<name>` makes, for every live typed
+key (the endpoint also tells the vault at once and ends the grant there; here the vault learns from the revocation
+list). Tokens come first, because their subquery reads `app_keys`:
+
+```sql
+UPDATE tokens SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE revoked_at IS NULL AND jti IN (SELECT jti FROM app_keys WHERE types IS NOT NULL AND revoked_at IS NULL);
+UPDATE app_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE types IS NOT NULL AND revoked_at IS NULL;
+```
+
+Every identity worker, old or new, lists a token with `revoked_at` as revoked, so this works after the rollback too.
+A vault refuses the key from its next revocation-list refresh. Then count again; it must be 0. Owners lose those keys
+and make new ones, under new names, after the next upgrade (a revoked key's name can't be used again). The alternative is to roll back only to #437 or later, which refuse a
+typed key outright.
+
+`deploy/personal/end-typed-keys.sh` is for one own-Cloudflare door, and only while its new identity worker is still
+live. After a rollback, an older worker's key list has no `types`, so the script finds nothing and passes.
+
