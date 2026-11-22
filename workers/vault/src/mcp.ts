@@ -634,6 +634,10 @@ function scopedTools(store: Store, tools: McpToolDef[], vaultName: string, auth:
     db: store.db as unknown as Parameters<typeof shapeRecordSurface>[1]["db"],
     vaultName,
     hasVerb: (verb) => hasScopeForVault(auth.scopes, vaultName, verb),
+    // T-476 (core #134): a type this session defines records its write stamp, the same two facts its record writes
+    // carry, so write access may later add fields to a type it made (core type-write.ts). The engine then lists
+    // manage-types to a write session, as a box does.
+    writer: { by: auth.actor, via: refineMcpVia(auth.via) },
     // Old and new names, as a box counts them (`mcp <tool>`, `mcp <tool> <param>`): the DO adds the client.
     ...(countName ? { onUse: (name: string, kind: "old" | "new") => countName(`mcp ${name}`, kind) } : {}),
   });

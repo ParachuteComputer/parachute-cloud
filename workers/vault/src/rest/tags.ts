@@ -5,6 +5,7 @@
  * no-ops (cloud tokens live in the Identity Worker, not the vault DB — see
  * ./shims.ts). Everything else is the shared wire contract.
  */
+import { stampTypeCreator, typeIsUndefined, writeTypeProblem, type TypeChange } from "@openparachute/core/src/type-write.js";
 import type { Store } from "@openparachute/core/src/types.js";
 import { stripTagHash, suggestSimilarTag } from "@openparachute/core/src/tag-hierarchy.js";
 import * as tagSchemaOps from "@openparachute/core/src/tag-schemas.js";
@@ -31,7 +32,8 @@ export async function handleTags(
   store: Store,
   subpath = "",
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
-  writeCtx: { actor: string | null; via: string | null } = { actor: null, via: null },
+  /** `typeWriteOnly`: a write credential without admin on `PUT /api/types/:name` (vault-do.ts, T-476). */
+  writeCtx: { actor: string | null; via: string | null; typeWriteOnly?: boolean } = { actor: null, via: null },
 ): Promise<Response> {
   const url = new URL(req.url);
 
@@ -280,6 +282,25 @@ export async function handleTags(
     };
     const replaceFields = body.replace_fields === true;
 
+    // T-476 (core #134/#139, docs/contracts/write-defines-types.md): a type defined here records who defined it, and a
+    // write credential without admin (only on `PUT /api/types/:name`, vault-do.ts) may make only what write may: a new
+    // type, or new fields on a type it made. The rule is the engine's (type-write.ts), as on a box and on MCP.
+    const typeDb = store.db as unknown as Parameters<typeof typeIsUndefined>[0];
+    const typeWriter = { by: writeCtx.actor, via: writeCtx.via };
+    if (writeCtx.typeWriteOnly) {
+      const change: TypeChange = {};
+      for (const k of ["description", "fields", "relationships", "parent_names", "kind", "replace_fields"] as const) {
+        if ((body as Record<string, unknown>)[k] !== undefined) change[k] = (body as Record<string, unknown>)[k];
+      }
+      const problem = writeTypeProblem(typeDb, putTagName, change, typeWriter, tagScope.allowed !== null);
+      if (problem) {
+        return problem.needsAdmin
+          ? json({ error: "Forbidden", error_type: "insufficient_scope", message: problem.message, required_scope: "vault:admin" }, 403)
+          : json({ error: problem.message, error_type: "invalid_type_change", message: problem.message }, 400);
+      }
+    }
+    const typeWasUndefined = typeIsUndefined(typeDb, putTagName);
+
     let relationshipsPatch: tagSchemaOps.TagRelationshipMap | null | undefined;
     if (body.relationships === null) {
       relationshipsPatch = null;
@@ -437,6 +458,7 @@ export async function handleTags(
       }
       throw err;
     }
+    stampTypeCreator(typeDb, putTagName, typeWriter, typeWasUndefined);
     return json(result);
   }
 

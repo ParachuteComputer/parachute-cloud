@@ -118,14 +118,17 @@ describe("engine upgrade on an existing vault DO", () => {
       // a row they add has no kind and is read by the same rule (tag-kind.ts KIND_SQL). Nothing else may differ.
       // 0.9.1's write stamp adds one more, note_versions.via_kind (core schema.ts ensureRevisionKeyKind), also with no
       // SCHEMA_VERSION bump: the rollback engines name the columns they read and write, so they ignore it.
+      // T-476 (core #134, write may define a type): two more on tags, created_by and created_via (who made a type, so
+      // write may add fields to a type it made), added by ALTER with no SCHEMA_VERSION bump (core schema.ts): the
+      // rollback engines name the columns they read and write, so they ignore them.
       const withoutKind = (o: any) =>
-        o.name === "tags" ? { ...o, sql: String(o.sql).replace(/,\s*(?:--[^\n]*\n\s*)*kind TEXT/, "") }
+        o.name === "tags" ? { ...o, sql: String(o.sql).replace(/, created_by TEXT, created_via TEXT\)$/, ")").replace(/,\s*(?:--[^\n]*\n\s*)*kind TEXT/, "") }
           : o.name === "note_versions" ? { ...o, sql: String(o.sql).replace(/\n\s*(?:--[^\n]*\n\s*)*via_kind\s+TEXT,/, "") }
           : o;
       const revisions = engine.find((o: any) => o.name === "note_versions") as any;
       expect(String(revisions.sql)).toMatch(/\bvia_kind\s+TEXT,/);
       const tags = engine.find((o: any) => o.name === "tags") as any;
-      expect(String(tags.sql)).toMatch(/\bkind TEXT\n\)$/);
+      expect(String(tags.sql)).toMatch(/\bkind TEXT\n, created_by TEXT, created_via TEXT\)$/);
       expect(engine.filter((o: any) => !additive.has(String(o.name)) && !search093.has(String(o.name))).map(withoutKind)).toEqual(
         ROLLBACK_ENGINE_DDL.objects.filter((o) => !search093.has(o.name)),
       );

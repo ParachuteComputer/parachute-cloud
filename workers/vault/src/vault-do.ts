@@ -1386,7 +1386,14 @@ export class VaultDO extends DurableObject {
           ("description" in b || ((b as { config?: unknown }).config !== null && typeof (b as { config?: unknown }).config === "object" && "search" in ((b as { config: object }).config))),
         () => false,
       );
-    const requiredVerb = isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDescriptionWrite
+    // T-476 (core #139, docs/contracts/write-defines-types.md "REST"): `PUT /api/types/:name`, the record door's, takes
+    // the rule MCP's manage-types has: a write credential without admin may define a new type, or add fields to one it
+    // made; the handler judges the change (core type-write.ts). `PUT /api/tags/:name` stays admin, as on a box.
+    const typeWriteOnly = TYPES_REQUESTS.has(request) && request.method === "PUT" && /^\/tags\/[^/]+$/.test(apiPath) &&
+      !hasScopeForVault(auth.scopes, vaultName, "admin") && hasScopeForVault(auth.scopes, vaultName, "write");
+    const requiredVerb = typeWriteOnly
+      ? "write"
+      : isTagSchemaMutation(request.method, apiPath) || isPackApply(request.method, apiPath) || isHistoryErase || isHistoryCompact || isDescriptionWrite
       ? "admin"
       : isDeletedList ? "write" : verbForMethod(request.method);
     if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
@@ -1472,7 +1479,7 @@ export class VaultDO extends DurableObject {
       return handleHistoryCompact(request, this.store);
     }
     if (apiPath.startsWith("/tags")) {
-      return handleTags(request, this.store, apiPath.slice(5), NO_TAG_SCOPE, writeCtx);
+      return handleTags(request, this.store, apiPath.slice(5), NO_TAG_SCOPE, { ...writeCtx, ...(typeWriteOnly ? { typeWriteOnly: true } : {}) });
     }
     if (apiPath === "/find-path") {
       return handleFindPath(request, this.store, NO_TAG_SCOPE);
