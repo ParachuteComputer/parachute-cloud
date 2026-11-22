@@ -672,13 +672,11 @@ async function handleNotesInner(
         }
         let rawResults: Note[];
         try {
-          rawResults = await store.searchNotes(search, {
-            tags: searchTags,
-            limit,
-            expand: tagExpand.expand,
-            // A typed key searches only what it can see (T-476): the limit counts visible records.
-            ...(tagScope.raw === null ? {} : { visible: (n: Note) => noteWithinTagScope(n, tagScope.allowed, tagScope.raw) }),
-          });
+          // A typed key's search runs as any search, and its results are filtered to its types below. Not the engine's
+          // `visible` option: that ranks inside a temporary FTS table, which a Durable Object's SQLite refuses
+          // (SQLITE_AUTH), so every search with a visible match failed (T-476 review r3). The limit counts before
+          // the scope, as the box's REST does.
+          rawResults = await store.searchNotes(search, { tags: searchTags, limit, expand: tagExpand.expand });
         } catch (e: any) {
           if (e && e.name === "QueryError") {
             return json(

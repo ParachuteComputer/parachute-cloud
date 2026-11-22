@@ -650,7 +650,8 @@ function visibleTools(
           nearTraversable: idVis,
           ifExistsVisible: vis,
           aggregateVisibility: vis,
-          searchVisibility: vis,
+          // No `searchVisibility`: the engine ranks a visible-only search inside a temporary FTS table, which a
+          // Durable Object's SQLite refuses; query-notes' wrapper filters a search's results instead (T-476 review r3).
           resolveVisibility: vis,
           ambiguityVisible: idVis,
           mayChangePublished: () => tagVisibleInScope("publish", scope!.allowed, scope!.raw),
