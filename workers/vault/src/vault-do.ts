@@ -23,6 +23,7 @@ import {
   FIRST_PARTY_CLIENT_ID,
   authenticateVaultRequest,
   authenticateVaultToken,
+  extractApiKey,
   hasScopeForVault,
   insufficientScope,
   isPackApply,
@@ -35,6 +36,7 @@ import { NO_TAG_SCOPE } from "./rest/parse.js";
 import { grantInForce, handleGrants, narrowToGrant } from "./grants.js";
 import { noteWithinTagScope, scrubResponseByScope, tagScopeFor, tagScopedVaultWideForbidden, tagVisibleInScope, type TagScopeCtx } from "./rest/tag-scope.js";
 import { resolveNote } from "./rest/parse.js";
+import { handleView, VIEW_PATH, viewMethodNotAllowed, viewNotFound } from "./view.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { withValidators } from "@openparachute/core/src/http-validators.js";
 
@@ -926,6 +928,12 @@ export class VaultDO extends DurableObject {
       if (forbidden) return forbidden;
       return this.handleImportStatus(request);
     }
+    // A published record's page reads as it does for a vault that doesn't exist while an import runs (a 401 or 503
+    // would tell a stranger the vault exists).
+    if (VIEW_PATH.test(rest)) {
+      await request.body?.cancel().catch(() => {});
+      return request.method !== "GET" && request.method !== "HEAD" ? viewMethodNotAllowed() : viewNotFound();
+    }
     const bearerless = rest.startsWith("/tickets/") || (rest === "/api/subscribe" && isWebSocketUpgrade(request));
     if (!bearerless) {
       const auth = await this.authenticate(request, vaultName);
@@ -1097,6 +1105,18 @@ export class VaultDO extends DurableObject {
       return json({ armed: n });
     }
 
+    // A published record's page (T-476, view.ts) answers anyone, so it must not tell a stranger which vaults exist,
+    // nor make one: another method is 405 for every vault alike, and a vault that was never made, or is gone, answers
+    // the same 404 a private record does, before ensureState would materialize it.
+    if (VIEW_PATH.test(rest)) {
+      const refused = request.method !== "GET" && request.method !== "HEAD" ? viewMethodNotAllowed()
+        : this.destroyed || !(await this.vaultExists()) ? viewNotFound() : null;
+      if (refused) {
+        await request.body?.cancel().catch(() => {});
+        return refused;
+      }
+    }
+
     // Every OTHER route on an already-destroyed warm instance: 410, no
     // writes, no ensureState (the same resurrection concern as above).
     if (this.destroyed) {
@@ -1202,6 +1222,25 @@ export class VaultDO extends DurableObject {
     // without ever holding this vault's own token. See
     // `request-attachment-upload`/`-download` (core/src/mcp.ts) for where
     // tickets are minted.
+    // A published record, for anyone with its link (view.ts). A credential that reads the whole vault also sees an
+    // unpublished one, as on the box; no credential, a bad one, or a narrowed one reads as a stranger.
+    const viewMatch = VIEW_PATH.exec(rest);
+    if (viewMatch) {
+      if (closed) return viewNotFound();
+      let idOrPath: string;
+      try {
+        idOrPath = decodeURIComponent(viewMatch[1]!);
+      } catch {
+        return viewNotFound();
+      }
+      let wholeVault = false;
+      if (request.headers.has("Authorization") || extractApiKey(request) !== null) {
+        const vauth = await this.authenticate(request, vaultName);
+        wholeVault = !("error" in vauth) && vauth.scoped_tags === null && hasScopeForVault(vauth.scopes, vaultName, "read");
+      }
+      return handleView(this.store, idOrPath, wholeVault);
+    }
+
     const ticketMatch = rest.match(/^\/tickets\/([^/]+)$/);
     if (ticketMatch) {
       // Closed: every ticket gets the uniform not-found answer an unknown,
