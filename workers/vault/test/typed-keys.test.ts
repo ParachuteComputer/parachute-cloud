@@ -469,13 +469,46 @@ describe("review round 3 (#439): a typed key searches, and can't unpublish by re
     expect(hidden.text).not.toContain("zqword");
   });
 
+  it("an MCP cursor walk never names a hidden record, and a search with a cursor is refused", async () => {
+    const { v } = await world("tkmcpcursor");
+    await fileGrant(v, "claude-mc", { recipe: ALL });
+    const k = await typedKey(v, "claude-mc");
+    // what the key may see, from the owner's side: every record the grant reaches
+    const visible = new Set(((await (await op(v, "/api/notes?tag=recipe&limit=500")).json()) as any[]).map((n) => n.id));
+    const all = ((await (await op(v, "/api/notes?limit=500")).json()) as any[]).map((n) => n.id);
+    expect(all.some((id) => !visible.has(id))).toBe(true);
+    let cursor = "";
+    const named: string[] = [];
+    for (let i = 0; i < all.length + 1; i++) {
+      const page = await tool(v, k, "query-notes", { cursor, limit: 1 });
+      expect(page.ok, page.text).toBe(true);
+      for (const n of page.out?.notes ?? []) named.push(n.id);
+      const c = page.out?.next_cursor;
+      if (!c) break;
+      named.push(JSON.parse(atob(c.replace(/-/g, "+").replace(/_/g, "/"))).last_id);
+      cursor = c;
+    }
+    expect(named.length).toBeGreaterThan(0);
+    for (const id of named) expect(visible.has(id), id).toBe(true);
+    const searchCursor = await tool(v, k, "query-notes", { search: "soup", cursor: "" });
+    expect(searchCursor.ok).toBe(false);
+  });
+
   it("a typed key can't unpublish a record by replacing it", async () => {
     const { v } = await world("tkunpub");
     const pub = await createNote(v, { path: "food/pub", content: "public soup", tags: ["recipe"], metadata: { published: true } });
     await fileGrant(v, "claude-up", { recipe: ALL });
     const k = await typedKey(v, "claude-up");
-    expect((await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ path: "food/pub", content: "replaced", tags: ["recipe"], if_exists: "replace" }) })).status).toBe(403);
-    expect((await rest(v, k, `/notes/${pub.id}`, { method: "PUT", body: JSON.stringify({ content: "replaced", tags: ["recipe"] }) })).status).toBe(403);
+    const post = (body: unknown) => rest(v, k, "/notes", { method: "POST", body: JSON.stringify(body) });
+    const replace = { content: "replaced", tags: ["recipe"], if_exists: "replace" };
+    expect((await post({ path: "food/pub", ...replace })).status).toBe(403);
+    // every spelling of the path the handler writes to, and the batch forms
+    for (const path of ["/food/pub", "food//pub", " food/pub"]) expect((await post({ path, ...replace })).status, path).toBe(403);
+    expect((await post({ notes: [{ path: "food/pub", ...replace }] })).status).toBe(403);
+    expect((await post({ notes: [{ path: "food/pub", content: "replaced", tags: ["recipe"] }], if_exists: "replace" })).status).toBe(403);
+    expect(((await (await op(v, `/api/notes/${pub.id}`)).json()) as any).metadata?.published).toBe(true);
+    // an update that only changes words can't unpublish, so it goes through
+    expect((await post({ path: "food/pub", content: "public soup, edited", tags: ["recipe"], if_exists: "update" })).status).toBeLessThan(300);
     expect(((await (await op(v, `/api/notes/${pub.id}`)).json()) as any).metadata?.published).toBe(true);
   });
 });

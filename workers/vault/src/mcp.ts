@@ -642,7 +642,7 @@ function visibleTools(
   const scope = auth.scoped_tags ? tagScopeFor(store, auth.scoped_tags) : null;
   const vis = scope ? scopeVisibility(scope) : undefined;
   const idVis = scope ? idVisibility(store.db as never, scope) : undefined;
-  const tools = generateMcpTools(store, {
+  const toolOpts: Parameters<typeof generateMcpTools>[1] = {
     writeContext,
     ...(vis && idVis
       ? {
@@ -650,8 +650,11 @@ function visibleTools(
           nearTraversable: idVis,
           ifExistsVisible: vis,
           aggregateVisibility: vis,
-          // No `searchVisibility`: the engine ranks a visible-only search inside a temporary FTS table, which a
-          // Durable Object's SQLite refuses; query-notes' wrapper filters a search's results instead (T-476 review r3).
+          // `searchVisibility` scopes the engine's cursor paging (its watermark follows visible records only). A
+          // search can't take it: the engine ranks a visible-only search inside a temporary FTS table, which a
+          // Durable Object's SQLite refuses; so a typed key's search runs on a second tool set without it, and
+          // query-notes' wrapper filters its results (mcp-tag-scope.ts, T-476 review r3 and the check after it).
+          searchVisibility: vis,
           resolveVisibility: vis,
           ambiguityVisible: idVis,
           mayChangePublished: () => tagVisibleInScope("publish", scope!.allowed, scope!.raw),
@@ -675,8 +678,12 @@ function visibleTools(
     // T-412: delete-note's erase_history is admin-only, like DELETE /notes/:id/versions. Core refuses it unless this
     // is set. Cloud has no tag-scoped passes, so an admin may also name a note already deleted.
     ...(hasScopeForVault(auth.scopes, vaultName, "admin") ? { eraseHistory: "all" as const } : {}),
-  });
-  if (scope) applyScopeWrappers(tools, store, scope, !!auth.grant);
+  };
+  const tools = generateMcpTools(store, toolOpts);
+  if (scope) {
+    const searchOnly = generateMcpTools(store, { ...toolOpts, searchVisibility: undefined }).find((t) => t.name === "query-notes");
+    applyScopeWrappers(tools, store, scope, !!auth.grant, searchOnly ? (p) => Promise.resolve(searchOnly.execute(p)) : undefined);
+  }
   return tools;
 }
 

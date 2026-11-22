@@ -71,7 +71,14 @@ function wrap(
 }
 
 /** Wrap the note tools for a session narrowed to `scope` (see the module note). `grant`: the session is a typed key's. */
-export function applyScopeWrappers(tools: McpToolDef[], store: Store, scope: TagScopeCtx, grant: boolean): void {
+export function applyScopeWrappers(
+  tools: McpToolDef[],
+  store: Store,
+  scope: TagScopeCtx,
+  grant: boolean,
+  /** query-notes built without the engine's searchVisibility: a search (text or meaning) runs there, filtered after. */
+  searchQuery?: (params: Record<string, unknown>) => Promise<unknown>,
+): void {
   if (scope.raw === null) return;
   const { allowed, raw } = scope;
   const db = store.db as unknown as Db;
@@ -138,7 +145,11 @@ export function applyScopeWrappers(tools: McpToolDef[], store: Store, scope: Tag
       const scoped = scopeQueryTag(p[key]);
       if (JSON.stringify(scoped) !== JSON.stringify(p[key])) next = { ...next, [key]: scoped };
     }
-    const result: any = await orig(next);
+    // A search runs without the engine's visible-only ranking (a temporary FTS table the Durable Object refuses) and
+    // is filtered below; everything else (lists, cursor pages) keeps the engine's visibility.
+    const isSearch = (typeof p?.search === "string" && p.search !== "") || p?.near_text !== undefined;
+    if (isSearch && p?.cursor !== undefined) return { error: "A search with a cursor isn't available to a key held to some types; page with offset.", error_type: "invalid_query", field: "cursor" };
+    const result: any = await (isSearch && searchQuery ? searchQuery(next) : orig(next));
     if (p?.aggregate && Array.isArray(result) && result.every((r: any) => r && typeof r === "object" && "group" in r && "value" in r && !("id" in r))) {
       return p.aggregate?.group_by === "tag" ? result.filter((r: any) => typeof r.group === "string" && tagVisibleInScope(r.group, allowed, raw)) : result;
     }
