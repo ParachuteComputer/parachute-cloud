@@ -355,6 +355,9 @@ describe("the public page under a grant (door/0.9 takes #436)", () => {
     const page = (id: string) => SELF.fetch(`${base(v)}/view/${id}`, { headers: { Authorization: `Bearer ${k}` } });
     expect((await page(pub.id)).status).toBe(200);
     expect((await page(r1)).status).toBe(404);
+  });
+});
+
 describe("review round 2 (#439, #440): more paths a typed key must not see through", () => {
   it("a search suggestion never comes from a hidden record's words", async () => {
     const { v } = await world("tksuggest");
