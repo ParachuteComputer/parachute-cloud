@@ -441,6 +441,18 @@ export function refineMcpVia(via: string | null | undefined): string {
  * the result onto their own error surface. Never touches the `Request` — a
  * WebSocket first-message auth has no header to read.
  */
+/**
+ * The `permissions` keys this vault knows: `principal_pubkey` (attribution) and `app_key` (the key's own name, which
+ * door/0.9's identity worker signs into every app key: a label, never a narrowing), and `scoped_tags` and `acts_for`,
+ * which it reads only to refuse them by name below. Any other key is refused (`authenticateVaultToken`).
+ */
+const KNOWN_PERMISSION_KEYS = new Set(["scoped_tags", "principal_pubkey", "acts_for", "app_key"]);
+
+function unknownPermissionKeys(permissions: Record<string, unknown> | undefined): string[] {
+  if (!permissions) return [];
+  return Object.keys(permissions).filter((k) => !KNOWN_PERMISSION_KEYS.has(k));
+}
+
 export async function authenticateVaultToken(
   token: string,
   env: Env,
@@ -501,6 +513,20 @@ export async function authenticateVaultToken(
 
   const permission: "full" | "read" =
     hasScopeForVault(claims.scopes, vaultName, "write") ? "full" : "read";
+
+  // A PERMISSION THIS VAULT DOESN'T KNOW (core docs/SPEC-1.0-grants.md §7.2, T-476): refused, never ignored. A field
+  // in `permissions` narrows what the token may do; served without enforcing it, the token would reach the whole
+  // vault while its holder believes it limited (a typed key's `grant` minted by a newer identity worker, after a
+  // rollback of this one). The box refuses the same way (core packages/vault/src/auth.ts ENFORCED_PERMISSION_KEYS).
+  const unknown = unknownPermissionKeys(claims.permissions);
+  if (unknown.length > 0) {
+    console.warn(`[auth] JWT rejected: permission key(s) this vault doesn't enforce: ${unknown.join(", ")}`);
+    return {
+      ok: false,
+      reason: "unauthorized",
+      message: `token carries permission key(s) this vault doesn't enforce: ${unknown.join(", ")}`,
+    };
+  }
 
   // TAG SCOPE (cloud#278). Read the claim for real instead of hardcoding
   // `null`. Both non-unscoped outcomes REJECT, because the cloud runtime has
