@@ -1,7 +1,7 @@
 /**
  * Deleting can forget, on the hosted door (T-412). Mirrors core's contracts/suites/safety/forget.test.ts: a plain
  * delete keeps its tombstone; `?erase_history=true` and MCP `delete-note` `erase_history` (admin) delete the note and
- * every version; `ids` deletes a list, resolved before anything goes; `GET /history/deleted` (admin) lists what plain
+ * every version; `ids` deletes a list, resolved before anything goes; `GET /history/deleted` (write, T-476) lists what plain
  * deletes left. Made-up notes only.
  */
 import { SELF } from "cloudflare:test";
@@ -86,9 +86,26 @@ describe("deleting can forget (T-412)", () => {
     const writer = await mintToken({ vault: v, scopes: `vault:${v}:read vault:${v}:write` });
     const rest = await asToken(v, writer, `/api/notes/${id}?erase_history=true`, { method: "DELETE" });
     expect(rest.status).toBe(403);
-    expect((await asToken(v, writer, "/api/history/deleted")).status).toBe(403);
     const mcpBody = await deleteNoteTool(v, writer, { ids: [id], erase_history: true });
     expect(() => toolResult(mcpBody)).toThrow(/insufficient_scope|admin/);
+    expect((await op(v, `/api/notes/${id}`)).status).toBe(200);
+  });
+
+  it("write may list what plain deletes left, to put one back; read may not (T-476, core #135)", async () => {
+    const v = freshVault("deletedw");
+    const id = await withHistory(v, "f/gone");
+    const writer = await mintToken({ vault: v, scopes: `vault:${v}:read vault:${v}:write` });
+    const reader = await mintToken({ vault: v, scopes: `vault:${v}:read` });
+    expect((await asToken(v, writer, `/api/notes/${id}`, { method: "DELETE" })).status).toBe(200);
+    const listed = await asToken(v, writer, "/api/history/deleted");
+    expect(listed.status).toBe(200);
+    expect(((await listed.json()) as any).notes.map((n: any) => n.id)).toContain(id);
+    const refused = await asToken(v, reader, "/api/history/deleted");
+    expect(refused.status).toBe(403);
+    expect(((await refused.json()) as any).required_scope).toBe("vault:write");
+    // and the writer puts it back by id, as the app's Changes does
+    const back = await asToken(v, writer, `/api/notes/${id}/restore`, { method: "POST", ...json({ version_ix: 0 }) });
+    expect(back.status).toBeLessThan(300);
     expect((await op(v, `/api/notes/${id}`)).status).toBe(200);
   });
 
