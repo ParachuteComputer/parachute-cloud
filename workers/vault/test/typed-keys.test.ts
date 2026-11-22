@@ -516,8 +516,12 @@ describe("review round 3 (#439): a typed key searches, and can't unpublish by re
     // a state transition on `published` sets the flag directly: refused both ways, at both REST doors
     const priv = await createNote(v, { path: "food/priv", content: "private soup", tags: ["recipe"] });
     for (const [door, id, from, to] of [["notes", pub.id, true, false], ["records", pub.id, true, false], ["notes", priv.id, null, true], ["records", priv.id, null, true]] as const) {
-      const r = await rest(v, k, `/${door}/${id}`, { method: "PATCH", body: JSON.stringify({ state_transition: { field: "published", from, to } }) });
-      expect(r.status, `${door} ${from}->${to}`).toBe(403);
+      for (const decoy of [{}, { notes: [] }]) {
+        const r = await rest(v, k, `/${door}/${id}`, { method: "PATCH", body: JSON.stringify({ state_transition: { field: "published", from, to }, ...decoy }) });
+        expect(r.status, `${door} ${from}->${to} ${JSON.stringify(decoy)}`).toBe(403);
+      }
+      const m = await rest(v, k, `/${door}/${id}`, { method: "PATCH", body: JSON.stringify({ metadata: { published: to }, force: true, notes: [] }) });
+      expect(m.status, `${door} metadata with a notes decoy`).toBe(403);
     }
     expect(((await (await op(v, `/api/notes/${pub.id}`)).json()) as any).metadata?.published).toBe(true);
     expect(((await (await op(v, `/api/notes/${priv.id}`)).json()) as any).metadata?.published).toBeUndefined();
