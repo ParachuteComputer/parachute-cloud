@@ -1846,7 +1846,11 @@ export class VaultDO extends DurableObject {
     if ((apiPath === "/notes" || one) && (request.method === "POST" || request.method === "PATCH" || request.method === "PUT")
       && !tagVisibleInScope("publish", scope.allowed, scope.raw)) {
       const body = await request.clone().json().catch(() => null) as unknown;
-      const items = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray((body as { notes?: unknown }).notes) ? (body as { notes: unknown[] }).notes : [body];
+      // Every shape a handler might read, together: the body itself (PATCH and a single POST read it whatever else it
+      // holds), a batch's `notes` and an array body. Checking all of them is never looser than the handler.
+      const items: unknown[] = [body];
+      if (Array.isArray(body)) items.push(...body);
+      else if (body && typeof body === "object" && Array.isArray((body as { notes?: unknown }).notes)) items.push(...(body as { notes: unknown[] }).notes);
       const publishes = items.some((it) => {
         if (!it || typeof it !== "object") return false;
         const { metadata: meta, state_transition: st } = it as { metadata?: unknown; state_transition?: unknown };
