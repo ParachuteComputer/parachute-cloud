@@ -1848,7 +1848,10 @@ export class VaultDO extends DurableObject {
       const body = await request.clone().json().catch(() => null) as unknown;
       const items = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray((body as { notes?: unknown }).notes) ? (body as { notes: unknown[] }).notes : [body];
       const publishes = items.some((it) => {
-        const meta = it && typeof it === "object" ? (it as { metadata?: unknown }).metadata : undefined;
+        if (!it || typeof it !== "object") return false;
+        const { metadata: meta, state_transition: st } = it as { metadata?: unknown; state_transition?: unknown };
+        // a state transition sets its field directly (PATCH's state_transition), so one on `published` is a publish too
+        if (st && typeof st === "object" && (st as { field?: unknown }).field === "published") return true;
         return !!meta && typeof meta === "object" && "published" in (meta as object);
       });
       if (publishes) return tagScopeForbidden(raw);
