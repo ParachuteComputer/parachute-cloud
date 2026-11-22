@@ -33,6 +33,7 @@ import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { appKeyRow, appKeyRows, MULTI_VAULT_KEY_VAULT, revokeAppKey, typesOf, vaultAdminCredential, withAnyOrigin } from "./account-keys.ts";
 import { disconnectVaultClient, listVaultConnections } from "./oauth-connections.ts";
 import { jsonResponse, type OAuthDeps } from "./oauth-shared.ts";
+import { ACCESS_TOKEN_TTL_SECONDS } from "./tokens.ts";
 import { callVaultApi } from "./vault-call.ts";
 import { userOwnsVault } from "./vaults.ts";
 
@@ -119,7 +120,6 @@ export async function vaultGrantRows(db: D1Database, userId: string, vault: stri
     app: c.client_name,
     client: c.client_id,
     ...(c.access === "admin" ? { admin: true } : {}),
-    ...(c.covers === "account" ? { covers: "account" } : {}),
     created_at: c.connected_at,
     last_used_at: c.last_used_at,
   }));
@@ -156,12 +156,14 @@ async function endRow(db: D1Database, deps: OAuthDeps, g: { accountId: string; o
     const conn = (await listVaultConnections(db, g.accountId, vault)).find((c) => c.client_id === clientId);
     if (!conn) return err(404, "not_found", `nothing called "${id}" reaches ${vault}`);
     if (!g.owner && conn.covers === "account") return err(403, "insufficient_scope", `"${id}" reaches every vault in the account: only the owner can end it`);
-    // Every token of this app for this account that is still alive: told to the vault after the disconnect, so each
-    // (an older access token from before a refresh included) is refused on its next request.
+    // Every token of this app whose access token could still be presented (minted within an access token's life; an
+    // older access token from before a refresh included), told to the vault after the disconnect, so each is refused
+    // on its next request. Older rows' access tokens have run out; the revocation list covers the refresh side.
+    const since = new Date(now.getTime() - ACCESS_TOKEN_TTL_SECONDS * 1000).toISOString();
     const live = (
       await db
-        .prepare("SELECT jti, expires_at FROM tokens WHERE user_id = ? AND client_id = ? AND expires_at > ?")
-        .bind(g.accountId, clientId, now.toISOString())
+        .prepare("SELECT jti, expires_at FROM tokens WHERE user_id = ? AND client_id = ? AND created_at > ? AND expires_at > ?")
+        .bind(g.accountId, clientId, since, now.toISOString())
         .all<{ jti: string; expires_at: string }>()
     ).results ?? [];
     const done = await disconnectVaultClient(db, g.accountId, vault, clientId, now);

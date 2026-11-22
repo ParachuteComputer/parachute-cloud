@@ -179,6 +179,24 @@ export function projectTagUpdate(
  * wherever the handler echoes a record (a read by id, a write's echo, a batch, links' ends), one place catches it.
  * Non-JSON and unscoped answers pass unchanged.
  */
+/**
+ * A visible record's `validation_status` without what names a type the reader can't see: a warning whose schema (or,
+ * for a conflict, the schema it lost to) is hidden, and hidden names in `schemas`; undefined when nothing visible is
+ * left (the record then reads as one with no schema). The box's rule (tag-scope.ts scrubValidationStatusByScope).
+ */
+export function scrubValidationStatusByScope<S extends { schemas?: string[]; warnings?: Array<{ schema?: string; loser_schema?: string }> }>(
+  status: S | null | undefined,
+  allowed: Set<string> | null,
+  raw: string[] | null,
+): S | undefined {
+  if (!status || raw === null) return status ?? undefined;
+  const visible = (t: unknown) => typeof t === "string" && tagVisibleInScope(t, allowed, raw);
+  const schemas = (status.schemas ?? []).filter(visible);
+  const warnings = (status.warnings ?? []).filter((w) => visible(w.schema) && (w.loser_schema === undefined || visible(w.loser_schema)));
+  if (schemas.length === 0 && warnings.length === 0) return undefined;
+  return { ...status, schemas, warnings };
+}
+
 export async function scrubResponseByScope(res: Response, scope: TagScopeCtx): Promise<Response> {
   if (scope.raw === null) return res;
   if (!(res.headers.get("content-type") ?? "").includes("application/json")) return res;
@@ -195,6 +213,11 @@ export async function scrubResponseByScope(res: Response, scope: TagScopeCtx): P
     const o = v as Record<string, unknown>;
     const out: Record<string, unknown> = {};
     for (const [k, x] of Object.entries(o)) out[k] = walk(x);
+    if (out.validation_status && typeof out.validation_status === "object") {
+      const v = scrubValidationStatusByScope(out.validation_status as { schemas?: string[]; warnings?: { schema?: string; loser_schema?: string }[] }, scope.allowed, scope.raw);
+      if (v === undefined) delete out.validation_status;
+      else out.validation_status = v;
+    }
     return typeof out.id === "string" && Array.isArray(out.tags) ? scrubNoteTagsByScope(out as { tags?: string[]; types?: string[] }, scope.allowed, scope.raw) : out;
   };
   const headers = new Headers(res.headers);

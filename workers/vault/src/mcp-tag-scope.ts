@@ -28,6 +28,7 @@ import {
   noteWithinTagScope,
   projectTagUpdate,
   scrubNoteTagsByScope,
+  scrubValidationStatusByScope,
   filterHydratedLinksByTagScope,
   tagsWithinScope,
   tagVisibleInScope,
@@ -93,6 +94,11 @@ export function applyScopeWrappers(tools: McpToolDef[], store: Store, scope: Tag
   const scrub = (n: any): any => {
     if (n && Array.isArray(n.links)) n.links = filterHydratedLinksByTagScope(n.links, allowed, raw);
     if (n && Array.isArray(n.warnings)) delete n.warnings;
+    if (n && n.validation_status) {
+      const v = scrubValidationStatusByScope(n.validation_status, allowed, raw);
+      if (v === undefined) delete n.validation_status;
+      else n.validation_status = v;
+    }
     return scrubNoteTagsByScope(n, allowed, raw);
   };
   const scrubWrite = (result: any): any => {

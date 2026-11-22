@@ -1318,7 +1318,8 @@ export class VaultDO extends DurableObject {
         // Semantic-search capability (C2, EXPERIMENTAL) — same placement +
         // shape as self-host's routes.ts `embeddings` field (capability.ts).
         embeddings: await this.embeddingCapability(),
-        stats: await this.store.getVaultStats(),
+        // A typed key (T-476): counted through its types only, as /api/vault does for it.
+        stats: auth.scoped_tags ? await this.scopedStats(this.scopeOf(auth)) : await this.store.getVaultStats(),
       });
     }
 
@@ -1794,8 +1795,10 @@ export class VaultDO extends DurableObject {
     const notFound = () => json({ error: "Not found", error_type: "not_found" }, 404);
     if (apiPath === "/notes" && request.method === "GET") {
       const url = new URL(request.url);
-      // A rollup counts vault-wide (no per-note filter can follow it): not for a typed key.
-      if ([...url.searchParams.keys()].some((k) => k === "aggregate" || k.startsWith("aggregate["))) return tagScopedVaultWideForbidden(raw);
+      // A rollup counts vault-wide, and the link-presence filters are decided over the whole vault's links (the box
+      // re-decides them per record over the key's own records; not ported): neither is for a typed key.
+      const wide = ["has_links", "has_broken_links", "has_ambiguous_links"];
+      if ([...url.searchParams.keys()].some((k) => k === "aggregate" || k.startsWith("aggregate[") || wide.includes(k))) return tagScopedVaultWideForbidden(raw);
       // A tag named in the query that the key can't see becomes a name nothing carries (the box's rule, vault#675):
       // the answer is then the same as for a tag that doesn't exist, so it can't tell which hidden ones do.
       let changed = false;
@@ -1836,17 +1839,19 @@ export class VaultDO extends DurableObject {
       if (!res.ok) return res;
       const body = (await res.json()) as Record<string, unknown>;
       const out: Record<string, unknown> = { name: body.name, description: body.description ?? null };
-      if (body.stats !== undefined) {
-        // Counted through the key's types only (and their `/` sub-tags in use), never vault-wide.
-        const tagFilter = new Set(scope.allowed ?? []);
-        for (const r of this.store.db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[]) {
-          if (tagVisibleInScope(r.tag_name, scope.allowed, scope.raw)) tagFilter.add(r.tag_name);
-        }
-        out.stats = await this.store.getVaultStats({ tagFilter: [...tagFilter] });
-      }
+      if (body.stats !== undefined) out.stats = await this.scopedStats(scope);
       return json(out);
     }
     return tagScopedVaultWideForbidden(raw);
+  }
+
+  /** A typed key's counts: through its types only (and their `/` sub-tags in use), never vault-wide. */
+  private async scopedStats(scope: TagScopeCtx) {
+    const tagFilter = new Set(scope.allowed ?? []);
+    for (const r of this.store.db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[]) {
+      if (tagVisibleInScope(r.tag_name, scope.allowed, scope.raw)) tagFilter.add(r.tag_name);
+    }
+    return this.store.getVaultStats({ tagFilter: [...tagFilter] });
   }
 
   private async authenticate(request: Request, vaultName: string): Promise<{ error: Response } | AuthResult> {

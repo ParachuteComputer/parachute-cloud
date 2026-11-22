@@ -190,7 +190,9 @@ async function takeValidTicket(
   // A typed key's ticket (T-476): spent only while its grant is in force, and only for a record still in its types.
   if (ticket.grant !== undefined && !(deps?.grantInForce?.(ticket.grant) ?? false)) return null;
   if (ticket.scopedTags !== undefined) {
-    const note = ticket.noteId && deps?.store ? await deps.store.getNote(ticket.noteId) : null;
+    // The record the ticket is for: an upload names it; a download names only the file, so find its record through it.
+    const noteId = ticket.noteId ?? (ticket.attachmentId && deps?.store ? (await deps.store.getAttachment(ticket.attachmentId))?.noteId : undefined);
+    const note = noteId && deps?.store ? await deps.store.getNote(noteId) : null;
     if (!note || !noteWithinTagScope(note, tagScopeFor(deps!.store, ticket.scopedTags).allowed, ticket.scopedTags)) return null;
   }
   return ticket;

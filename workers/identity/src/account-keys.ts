@@ -229,11 +229,11 @@ async function mintKey(db: D1Database, req: Request, deps: OAuthDeps, userId: st
   let types: string[] | null = null;
   if (body.types !== undefined) {
     const t = body.types;
-    if (!Array.isArray(t) || t.length === 0 || t.length > MAX_KEY_TYPES || t.some((x) => typeof x !== "string" || !TYPE_NAME_RE.test(x) || x === "*")) {
-      return err(400, "invalid_types", `types: 1 to ${MAX_KEY_TYPES} type names (printable, no spaces, not *); leave it out for a key that reaches the whole vault`);
+    if (!Array.isArray(t) || t.length === 0 || t.length > MAX_KEY_TYPES || t.some((x) => typeof x !== "string" || !TYPE_NAME_RE.test(x) || x === "*") || new Set(t).size !== t.length) {
+      return err(400, "invalid_request", `types: 1 to ${MAX_KEY_TYPES} different type names (printable, no spaces, not *); leave it out for a key that reaches the whole vault`);
     }
     if (onBehalf === true) return err(400, "invalid_request", "a key held to some types can't write on behalf of others");
-    types = [...new Set(t as string[])];
+    types = [...(t as string[])].sort();
   }
   let ttl = APP_KEY_MAX_TTL_SECONDS;
   if (expires_in !== undefined) {
@@ -276,6 +276,9 @@ async function mintKey(db: D1Database, req: Request, deps: OAuthDeps, userId: st
   if (types) {
     const verbs = can === "write" ? GRANT_VERBS_WRITE : GRANT_VERBS_READ;
     const filed = await callGrant(db, deps, userId, vault, "PUT", name, { grantee: `key:${name}`, types: Object.fromEntries(types.map((t) => [t, verbs])), expires_at: signed.expiresAt });
+    if (filed?.status === 409) {
+      return err(409, "name_taken", `the vault has held a grant called "${name}" before (an ended key's name is never reused); pick another`);
+    }
     if (!filed || (filed.status !== 201 && filed.status !== 200)) {
       return err(502, "grant_not_filed", `the vault couldn't keep this key's grant (${filed ? filed.status : "unreachable"}); no key was made`);
     }
@@ -296,11 +299,12 @@ async function mintKey(db: D1Database, req: Request, deps: OAuthDeps, userId: st
         .bind(userId, name, signed.jti, vault, can, signed.kid, createdAt, signed.expiresAt, types ? JSON.stringify(types) : null, keyKind === "agent" ? "agent" : null),
     ]);
   } catch (e) {
-    // A mint that doesn't finish ends the grant it filed (core #143): nothing may hold the rules for a key nobody has.
-    if (types) await callGrant(db, deps, userId, vault, "DELETE", name);
     // The batch is one transaction: a racing mint of the same name lost the PRIMARY KEY, and nothing was written.
-    // Any other failure is not about the name.
+    // The winner holds the same grant id (the vault answered "the same grant again"), so it is left alone (core
+    // account-keys.ts does the same). Any other failure ends the grant this mint filed (core #143): nothing may hold
+    // the rules for a key nobody has.
     if (isUniqueViolation(e)) return err(409, "name_taken", `a key called "${name}" already exists; pick another`);
+    if (types) await callGrant(db, deps, userId, vault, "DELETE", name);
     throw e;
   }
   const row: AppKeyRow = {
@@ -602,6 +606,10 @@ export async function vaultAdminCredential(db: D1Database, req: Request, deps: O
   if (!sub) return null;
   const user = await getUserById(db, sub);
   if (!user || user.deletedAt !== null || user.suspendedAt !== null) return null;
+  // The owner's gate holds here too (T-476 review): an account whose address isn't proven makes no keys, and a
+  // credential minted before the address owner claimed the account is the previous holder's (requireAccount's cut).
+  if (!user.emailVerified) return null;
+  if (payload.email_verified !== true) return null;
   if (!(await userOwnsVault(db, sub, vault))) return null;
   return { accountId: sub, vault };
 }

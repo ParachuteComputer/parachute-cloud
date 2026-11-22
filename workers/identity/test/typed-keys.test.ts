@@ -50,8 +50,9 @@ async function owner(email: string, vault: string) {
   const { id } = await seedUser(email);
   await seedVault(vault, id);
   const account = await signAccessToken(env.DB, { sub: id, scopes: [`account:${id}:admin`], audience: "account", clientId: "parachute-account", issuer: ISSUER, vaultScope: [] });
-  const vaultAdmin = (clientId: string) =>
-    signAccessToken(env.DB, { sub: id, scopes: [`vault:${vault}:read`, `vault:${vault}:write`, `vault:${vault}:admin`], audience: `vault.${vault}`, clientId, issuer: ISSUER, vaultScope: [vault] });
+  /** `emailVerified`: the stamp the token carries; null for none (a token minted before the stamp existed). */
+  const vaultAdmin = (clientId: string, emailVerified: boolean | null = true) =>
+    signAccessToken(env.DB, { sub: id, scopes: [`vault:${vault}:read`, `vault:${vault}:write`, `vault:${vault}:admin`], audience: `vault.${vault}`, clientId, issuer: ISSUER, vaultScope: [vault], ...(emailVerified !== null ? { emailVerified } : {}) });
   return { id, account: account.token, vaultAdmin };
 }
 
@@ -119,5 +120,61 @@ describe("typed keys at the identity worker", () => {
     expect(pre.headers.get("access-control-allow-credentials")).toBeNull();
     expect((await a.call("/account/vaults/tk-five/statements", { method: "POST", bearer: o.account, body: { event: {} } })).status).toBe(405);
     expect((await a.call("/account/vaults/tk-five/statements")).status).toBe(401);
+  });
+
+  test("a vault admin credential from before an account's address was proven, or of an unproven account, makes nothing", async () => {
+    const a = app();
+    const o = await owner("typed-6@example.com", "tk-six");
+    // minted while the account was unproven (or before this stamp existed): refused once the address is proven
+    for (const stamp of [false, null]) {
+      const old = await o.vaultAdmin("parachute-account", stamp);
+      expect((await a.call("/account/keys", { method: "POST", bearer: old.token, body: { name: `planted-${String(stamp)}`, vault: "tk-six", can: "write" } })).status).toBeGreaterThanOrEqual(401);
+      expect((await a.call("/account/vaults/tk-six/statements", { bearer: old.token })).status).toBeGreaterThanOrEqual(401);
+    }
+    // an account whose address isn't proven
+    await env.DB.prepare("UPDATE users SET email_verified = 0 WHERE id = ?").bind(o.id).run();
+    const fresh = await o.vaultAdmin("parachute-account", false);
+    expect((await a.call("/account/keys", { method: "POST", bearer: fresh.token, body: { name: "planted-unproven", vault: "tk-six", can: "write" } })).status).toBeGreaterThanOrEqual(401);
+    const keys = await env.DB.prepare("SELECT name FROM app_keys WHERE user_id = ?").bind(o.id).all<{ name: string }>();
+    expect((keys.results ?? []).map((k) => k.name)).toEqual([]);
+  });
+
+  test("a mint that loses the name to a racing mint leaves the winner's grant alone", async () => {
+    let userId = "";
+    const a = app(async (req) => {
+      if (req.method === "PUT") {
+        // the racing mint lands its row while this one is filing; the vault answers "the same grant again"
+        await env.DB.prepare("INSERT INTO app_keys (user_id, name, jti, vault_name, can, kid, created_at, expires_at) VALUES (?, 'race', 'jti-race', 'tk-seven', 'read', 'k', ?, ?)")
+          .bind(userId, new Date().toISOString(), new Date(Date.now() + 86_400_000).toISOString()).run();
+        return Response.json({}, { status: 200 });
+      }
+      return Response.json({});
+    });
+    const o = await owner("typed-7@example.com", "tk-seven");
+    userId = o.id;
+    const r = await a.call("/account/keys", { method: "POST", bearer: o.account, body: { name: "race", vault: "tk-seven", can: "read", types: ["recipe"] } });
+    expect(r.status).toBe(409);
+    expect(a.calls.map((c) => c.method)).toEqual(["PUT"]);
+  });
+
+  test("ending an OAuth app tells the vault only the tokens whose access could still be presented", async () => {
+    const a = app();
+    const o = await owner("typed-8@example.com", "tk-eight");
+    const client = "6b1c0e8e-0000-4000-8000-000000000008";
+    await env.DB.prepare("INSERT INTO clients (client_id, client_name, redirect_uris, created_at) VALUES (?, 'Made-up app', '[\"https://app.example/cb\"]', ?)").bind(client, new Date().toISOString()).run().catch(() => {});
+    await env.DB.prepare("INSERT INTO grants (user_id, client_id, scopes, granted_at) VALUES (?, ?, ?, ?)").bind(o.id, client, "vault:tk-eight:read vault:tk-eight:write", new Date().toISOString()).run();
+    const month = Date.now() + 30 * 86_400_000;
+    const row = (jti: string, createdAgoMs: number) =>
+      env.DB.prepare("INSERT INTO tokens (jti, user_id, subject, client_id, scopes, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .bind(jti, o.id, o.id, client, "vault:tk-eight:read vault:tk-eight:write", new Date(month).toISOString(), new Date(Date.now() - createdAgoMs).toISOString()).run();
+    await row("jti-now", 60_000);
+    await row("jti-old", 2 * 3600_000);
+    const listed = await a.call("/account/vaults/tk-eight/statements", { bearer: o.account });
+    const appRow = listed.json.grants.find((g: any) => g.client === client);
+    expect(appRow, JSON.stringify(listed.json)).toBeTruthy();
+    const ended = await a.call(`/account/vaults/tk-eight/statements/${encodeURIComponent(appRow.id)}`, { method: "DELETE", bearer: o.account });
+    expect(ended.status).toBe(200);
+    const pushed = a.calls.filter((c) => c.path.endsWith("/api/internal/keys/revoke")).map((c) => JSON.parse(c.body).jti);
+    expect(pushed).toEqual(["jti-now"]);
   });
 });

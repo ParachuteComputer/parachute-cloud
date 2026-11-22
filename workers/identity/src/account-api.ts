@@ -546,7 +546,7 @@ export async function handleAccountVaultCreate(db: D1Database, req: Request, dep
   await pushVaultCap(db, deps, user.id, name, planEntitlement(entitlementPlanFor(user.plan, user.pendingPlan, billingModeOf(deps))));
 
   const scopes = [`vault:${name}:read`, `vault:${name}:write`];
-  const minted = await mintVaultToken(db, deps, user.id, name, scopes);
+  const minted = await mintVaultToken(db, deps, user.id, name, scopes, user.emailVerified);
   return jsonResponse(
     {
       name,
@@ -735,7 +735,7 @@ export async function handleAccountVaultTokenMint(db: D1Database, req: Request, 
     return restError(400, "invalid_scope", `scopes must each be vault:${name}:{read,write,admin}`);
   }
 
-  const minted = await mintVaultToken(db, deps, auth.accountId, name, scopeResult.scopes);
+  const minted = await mintVaultToken(db, deps, auth.accountId, name, scopeResult.scopes, auth.user.emailVerified);
   return jsonResponse(
     {
       vault_token: minted.token,
@@ -769,6 +769,9 @@ async function mintVaultToken(
   userId: string,
   vaultName: string,
   scopes: string[],
+  /** The account's address proof when minted: a vault admin credential from before a claim is refused after it
+   *  (account-keys.ts vaultAdminCredential), as an account token is (requireAccount). */
+  emailVerified: boolean,
 ): Promise<{ token: string; expiresAt: string }> {
   const signed = await signAccessToken(db, {
     sub: userId,
@@ -779,6 +782,7 @@ async function mintVaultToken(
     vaultScope: [vaultName],
     ttlSeconds: ACCOUNT_VAULT_TOKEN_TTL_SECONDS,
     now: deps.now,
+    emailVerified,
   });
   return { token: signed.token, expiresAt: signed.expiresAt };
 }

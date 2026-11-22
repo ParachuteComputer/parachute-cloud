@@ -259,5 +259,92 @@ describe("the live socket under a grant", () => {
   });
 });
 
+describe("review round 1 (#439): the paths a typed key must not see through", () => {
+  it("the bare landing counts only its types", async () => {
+    const { v } = await world("tklanding");
+    await fileGrant(v, "claude-b", { recipe: ALL });
+    const k = await typedKey(v, "claude-b");
+    const r = await SELF.fetch(base(v), { headers: { Authorization: `Bearer ${k}` } });
+    expect(r.status).toBe(200);
+    const b: any = await r.json();
+    expect(b.stats.totalNotes).toBe(1);
+    expect(JSON.stringify(b)).not.toContain("journal");
+  });
+
+  it("an edit of a record that also carries a hidden type works, and neither strips nor probes it", async () => {
+    const { v } = await world("tkpatch");
+    const both = await createNote(v, { path: "food/both", content: "both", tags: ["recipe", "journal"] });
+    await fileGrant(v, "claude-p", { recipe: ALL });
+    const k = await typedKey(v, "claude-p");
+    const patch = (body: unknown) => rest(v, k, `/notes/${both.id}`, { method: "PATCH", body: JSON.stringify({ ...(body as object), force: true }) });
+    expect((await patch({ content: "edited" })).status).toBe(200);
+    const strip = await patch({ tags: { remove: ["journal"] } });
+    const guess = await patch({ tags: { remove: ["no-such-type"] } });
+    expect([strip.status, guess.status]).toEqual([403, 403]);
+    expect(((await (await op(v, `/api/notes/${both.id}`)).json()) as any).tags.sort()).toEqual(["journal", "recipe"]);
+  });
+
+  it("a write can't link into a hidden record, nor tell a hidden path from a missing one", async () => {
+    const { v, j1, r1 } = await world("tklinks");
+    await fileGrant(v, "claude-k", { recipe: ALL });
+    const k = await typedKey(v, "claude-k");
+    const before = ((await (await op(v, `/api/notes/${j1}?include_links=true`)).json()) as any).links?.length ?? 0;
+    const p = await rest(v, k, `/notes/${r1}`, { method: "PATCH", body: JSON.stringify({ links: { add: [{ target: "diary/today", relationship: "x" }, { target: "nope/none", relationship: "x" }] }, force: true }) });
+    expect(p.status).toBe(200);
+    const pw = JSON.stringify(await p.json());
+    expect(pw).toContain("nope/none");
+    expect(pw).toContain("diary/today");
+    const c = await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ content: "see [[diary/today]] and [[nope/zz]]", tags: ["recipe"] }) });
+    expect(c.status).toBe(201);
+    const cw = JSON.stringify(await c.json());
+    expect(cw).toContain("nope/zz");
+    expect(cw).toContain("diary/today");
+    const after = ((await (await op(v, `/api/notes/${j1}?include_links=true`)).json()) as any).links?.length ?? 0;
+    expect(after).toBe(before);
+    expect((await rest(v, k, "/notes?has_links=true")).status).toBe(403);
+  });
+
+  it("a hidden type's schema never shows in validation_status, at REST or MCP", async () => {
+    const { v } = await world("tkvalid");
+    expect((await op(v, "/api/tags/journal", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fields: { mood: { type: "string", required: true } } }) })).status).toBe(200);
+    const both = await createNote(v, { path: "food/both2", content: "both", tags: ["recipe", "journal"] });
+    await fileGrant(v, "claude-v", { recipe: ALL });
+    const k = await typedKey(v, "claude-v");
+    const got = await (await rest(v, k, `/notes/${both.id}`)).text();
+    expect(got).not.toContain("journal");
+    expect(got).not.toContain("mood");
+    const ignore = await (await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ path: "food/both2", tags: ["recipe"], if_exists: "ignore" }) })).text();
+    expect(ignore).not.toContain("mood");
+    const m = await tool(v, k, "query-records", { id: both.id });
+    expect(m.text).not.toContain("mood");
+    expect(m.text).not.toContain("journal");
+  });
+
+  it("the records door answers a hidden type's name as it answers a name that doesn't exist", async () => {
+    const { v } = await world("tkrecords");
+    await fileGrant(v, "claude-d", { recipe: ALL });
+    const k = await typedKey(v, "claude-d");
+    const hidden = await rest(v, k, "/records", { method: "POST", body: JSON.stringify({ body: "x", tags: ["journal"] }) });
+    const none = await rest(v, k, "/records", { method: "POST", body: JSON.stringify({ body: "x", tags: ["nonexistent"] }) });
+    expect(hidden.status).toBe(none.status);
+    expect(await hidden.text()).not.toContain("is a type");
+  });
+
+  it("a typed key downloads a file from a record it can see", async () => {
+    const { v, r1 } = await world("tkdownload");
+    await fileGrant(v, "claude-f", { recipe: ALL });
+    const k = await typedKey(v, "claude-f");
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 9, 8, 7, 6]);
+    const up = await tool(v, k, "request-attachment-upload", { note: r1, filename: "soup.png", mime_type: "image/png", size_bytes: bytes.length });
+    const put = await SELF.fetch(`https://vault.test${new URL(up.out.url).pathname}`, { method: "PUT", headers: { "content-type": "image/png", "content-length": String(bytes.length) }, body: bytes });
+    expect(put.status).toBe(201);
+    const attachmentId = ((await put.json()) as any).id ?? ((await (await op(v, `/api/notes/${r1}?include_attachments=true`)).json()) as any).attachments?.[0]?.id;
+    const down = await tool(v, k, "request-attachment-download", { attachment_id: attachmentId });
+    expect(down.ok, down.text).toBe(true);
+    const got = await SELF.fetch(`https://vault.test${new URL(down.out.url).pathname}`);
+    expect(got.status).toBe(200);
+  });
+});
+
 // keep env referenced (DO helpers in other files use it; this file reaches the vault only over SELF)
 void env;
