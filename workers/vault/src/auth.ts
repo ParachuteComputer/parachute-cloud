@@ -382,8 +382,8 @@ export class MalformedScopedTagsError extends Error {
  *
  *   1. Claim absent (no `permissions`, or no `scoped_tags` key), or explicitly
  *      `null`/`undefined` → `null` = UNSCOPED = full vault. This is today's
- *      shape for every cloud-issued token (`workers/identity/src/tokens.ts`
- *      signs no `permissions` at all), so this is the byte-identical path.
+ *      shape for every cloud-issued token (identity signs only `principal_pubkey`
+ *      and `acts_for` there, never `scoped_tags`), so this is the byte-identical path.
  *   2. A non-empty array of non-empty strings → that array. The token IS
  *      tag-scoped.
  *   3. Present but MALFORMED — a string, number, object, an array holding a
@@ -432,6 +432,19 @@ export function refineMcpVia(via: string | null | undefined): string {
   if (via === "operator") return "operator";
   if (typeof via === "string" && via.startsWith("nostr:")) return via;
   return "mcp";
+}
+
+/**
+ * The `permissions` keys this vault knows: `principal_pubkey` (attribution) and `app_key` (the key's own name, which
+ * door/0.9's identity worker signs into every app key: a label, never a narrowing), and `scoped_tags` and `acts_for`,
+ * which have their own handling below (on this 0.8 worker, named refusals). Any other key is refused
+ * (`authenticateVaultToken`). A door that starts enforcing a new key adds it here in the same change.
+ */
+const KNOWN_PERMISSION_KEYS = new Set(["scoped_tags", "principal_pubkey", "acts_for", "app_key"]);
+
+function unknownPermissionKeys(permissions: Record<string, unknown> | undefined): string[] {
+  if (!permissions) return [];
+  return Object.keys(permissions).filter((k) => !KNOWN_PERMISSION_KEYS.has(k));
 }
 
 /**
@@ -501,6 +514,20 @@ export async function authenticateVaultToken(
 
   const permission: "full" | "read" =
     hasScopeForVault(claims.scopes, vaultName, "write") ? "full" : "read";
+
+  // A PERMISSION THIS VAULT DOESN'T KNOW (core docs/SPEC-1.0-grants.md §7.2, T-476): refused, never ignored. A field
+  // in `permissions` narrows what the token may do; served without enforcing it, the token would reach the whole
+  // vault while its holder believes it limited (a typed key's `grant` minted by a newer identity worker, after a
+  // rollback of this one). The box refuses the same way (core packages/vault/src/auth.ts ENFORCED_PERMISSION_KEYS).
+  const unknown = unknownPermissionKeys(claims.permissions);
+  if (unknown.length > 0) {
+    console.warn(`[auth] JWT rejected: permission key(s) this vault doesn't enforce: ${unknown.join(", ")}`);
+    return {
+      ok: false,
+      reason: "unauthorized",
+      message: `token carries permission key(s) this vault doesn't enforce: ${unknown.join(", ")}`,
+    };
+  }
 
   // TAG SCOPE (cloud#278). Read the claim for real instead of hardcoding
   // `null`. Both non-unscoped outcomes REJECT, because the cloud runtime has
