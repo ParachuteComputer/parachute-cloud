@@ -346,6 +346,18 @@ describe("review round 1 (#439): the paths a typed key must not see through", ()
   });
 });
 
+describe("the public page under a grant (door/0.9 takes #436)", () => {
+  it("a typed key reads the page as a stranger: a published record yes, an unpublished one of its own type no", async () => {
+    const { v, r1 } = await world("tkview");
+    const pub = await createNote(v, { path: "food/public", content: "# Public soup", tags: ["recipe", "publish"] });
+    await fileGrant(v, "claude-pv", { recipe: ALL });
+    const k = await typedKey(v, "claude-pv");
+    const page = (id: string) => SELF.fetch(`${base(v)}/view/${id}`, { headers: { Authorization: `Bearer ${k}` } });
+    expect((await page(pub.id)).status).toBe(200);
+    expect((await page(r1)).status).toBe(404);
+  });
+});
+
 describe("review round 2 (#439, #440): more paths a typed key must not see through", () => {
   it("a search suggestion never comes from a hidden record's words", async () => {
     const { v } = await world("tksuggest");
