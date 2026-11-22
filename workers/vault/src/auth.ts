@@ -382,8 +382,8 @@ export class MalformedScopedTagsError extends Error {
  *
  *   1. Claim absent (no `permissions`, or no `scoped_tags` key), or explicitly
  *      `null`/`undefined` → `null` = UNSCOPED = full vault. This is today's
- *      shape for every cloud-issued token (`workers/identity/src/tokens.ts`
- *      signs no `permissions` at all), so this is the byte-identical path.
+ *      shape for every cloud-issued token (identity signs only `principal_pubkey`
+ *      and `acts_for` there, never `scoped_tags`), so this is the byte-identical path.
  *   2. A non-empty array of non-empty strings → that array. The token IS
  *      tag-scoped.
  *   3. Present but MALFORMED — a string, number, object, an array holding a
@@ -435,16 +435,10 @@ export function refineMcpVia(via: string | null | undefined): string {
 }
 
 /**
- * Authenticate a RAW token against `vaultName` (Bearer/X-API-Key/?key= value,
- * or a WS first-message auth token). Transport-agnostic: the request path
- * ({@link authenticateVaultRequest}) and the WS binding both call this and map
- * the result onto their own error surface. Never touches the `Request` — a
- * WebSocket first-message auth has no header to read.
- */
-/**
  * The `permissions` keys this vault knows: `principal_pubkey` (attribution) and `app_key` (the key's own name, which
  * door/0.9's identity worker signs into every app key: a label, never a narrowing), and `scoped_tags` and `acts_for`,
- * which it reads only to refuse them by name below. Any other key is refused (`authenticateVaultToken`).
+ * which have their own handling below (on this 0.8 worker, named refusals). Any other key is refused
+ * (`authenticateVaultToken`). A door that starts enforcing a new key adds it here in the same change.
  */
 const KNOWN_PERMISSION_KEYS = new Set(["scoped_tags", "principal_pubkey", "acts_for", "app_key"]);
 
@@ -453,6 +447,13 @@ function unknownPermissionKeys(permissions: Record<string, unknown> | undefined)
   return Object.keys(permissions).filter((k) => !KNOWN_PERMISSION_KEYS.has(k));
 }
 
+/**
+ * Authenticate a RAW token against `vaultName` (Bearer/X-API-Key/?key= value,
+ * or a WS first-message auth token). Transport-agnostic: the request path
+ * ({@link authenticateVaultRequest}) and the WS binding both call this and map
+ * the result onto their own error surface. Never touches the `Request` — a
+ * WebSocket first-message auth has no header to read.
+ */
 export async function authenticateVaultToken(
   token: string,
   env: Env,
