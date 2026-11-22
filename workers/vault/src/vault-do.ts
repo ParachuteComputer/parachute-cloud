@@ -22,6 +22,7 @@ import {
   FIRST_PARTY_CLIENT_ID,
   authenticateVaultRequest,
   authenticateVaultToken,
+  extractApiKey,
   hasScopeForVault,
   insufficientScope,
   isPackApply,
@@ -31,6 +32,10 @@ import {
   type AuthResult,
 } from "./auth.js";
 import { NO_TAG_SCOPE } from "./rest/parse.js";
+import { handleView, viewNotFound } from "./view.js";
+
+/** `/view/<idOrPath>`: a published record's page (view.ts). */
+const VIEW_PATH = /^\/view\/(.+)$/;
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { handleNotes, r2Key, type RestDeps } from "./rest/notes.js";
 import { handleDeletedNotes, handleHistoryCompact } from "./rest/history.js";
@@ -1043,6 +1048,14 @@ export class VaultDO extends DurableObject {
 
     // Every OTHER route on an already-destroyed warm instance: 410, no
     // writes, no ensureState (the same resurrection concern as above).
+    // A published record's page (T-476, view.ts) answers anyone, so it must not tell a stranger which vaults exist,
+    // nor make one: a vault that was never made, or is gone, answers the same 404 a private record does, before
+    // ensureState would materialize it.
+    if (VIEW_PATH.test(rest) && (this.destroyed || !(await this.vaultExists()))) {
+      await request.body?.cancel().catch(() => {});
+      return viewNotFound();
+    }
+
     if (this.destroyed) {
       return json({ error: "Gone", error_type: "vault_destroyed" }, 410);
     }
@@ -1146,6 +1159,29 @@ export class VaultDO extends DurableObject {
     // without ever holding this vault's own token. See
     // `request-attachment-upload`/`-download` (core/src/mcp.ts) for where
     // tickets are minted.
+    // A published record, for anyone with its link (view.ts). A credential that reads the whole vault also sees an
+    // unpublished one, as on the box; no credential, a bad one, or a narrowed one reads as a stranger.
+    const viewMatch = VIEW_PATH.exec(rest);
+    if (viewMatch) {
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        await request.body?.cancel().catch(() => {});
+        return new Response("Method Not Allowed", { status: 405, headers: { Allow: "GET, HEAD" } });
+      }
+      if (closed) return viewNotFound();
+      let idOrPath: string;
+      try {
+        idOrPath = decodeURIComponent(viewMatch[1]!);
+      } catch {
+        return viewNotFound();
+      }
+      let wholeVault = false;
+      if (request.headers.has("Authorization") || extractApiKey(request) !== null) {
+        const vauth = await this.authenticate(request, vaultName);
+        wholeVault = !("error" in vauth) && vauth.scoped_tags === null && hasScopeForVault(vauth.scopes, vaultName, "read");
+      }
+      return handleView(this.store, idOrPath, wholeVault);
+    }
+
     const ticketMatch = rest.match(/^\/tickets\/([^/]+)$/);
     if (ticketMatch) {
       // Closed: every ticket gets the uniform not-found answer an unknown,
