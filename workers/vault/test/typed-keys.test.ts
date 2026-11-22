@@ -490,8 +490,10 @@ describe("review round 3 (#439): a typed key searches, and can't unpublish by re
     }
     expect(named.length).toBeGreaterThan(0);
     for (const id of named) expect(visible.has(id), id).toBe(true);
-    const searchCursor = await tool(v, k, "query-notes", { search: "soup", cursor: "" });
-    expect(searchCursor.ok).toBe(false);
+    // a meaning search with a cursor: the engine would page it without the visibility, so the scope refuses it
+    const nearCursor = await tool(v, k, "query-notes", { near_text: "soup", cursor: "" });
+    expect(nearCursor.ok).toBe(false);
+    expect(nearCursor.text).toContain("held to some types");
   });
 
   it("a typed key can't unpublish a record by replacing it", async () => {
@@ -505,7 +507,11 @@ describe("review round 3 (#439): a typed key searches, and can't unpublish by re
     // every spelling of the path the handler writes to, and the batch forms
     for (const path of ["/food/pub", "food//pub", " food/pub"]) expect((await post({ path, ...replace })).status, path).toBe(403);
     expect((await post({ notes: [{ path: "food/pub", ...replace }] })).status).toBe(403);
-    expect((await post({ notes: [{ path: "food/pub", content: "replaced", tags: ["recipe"] }], if_exists: "replace" })).status).toBe(403);
+    // decoys that would steer a lookup other than the handler's: a sibling at the same path with another extension,
+    // and a record whose id is the path
+    expect((await post({ path: "food/pub", extension: "txt", content: "sibling", tags: ["recipe"] })).status).toBe(201);
+    expect((await post({ id: "food/pub", path: "food/decoy", content: "decoy", tags: ["recipe"] })).status).toBe(201);
+    expect((await post({ path: "food/pub", ...replace })).status).toBe(403);
     expect(((await (await op(v, `/api/notes/${pub.id}`)).json()) as any).metadata?.published).toBe(true);
     // an update that only changes words can't unpublish, so it goes through
     expect((await post({ path: "food/pub", content: "public soup, edited", tags: ["recipe"], if_exists: "update" })).status).toBeLessThan(300);
