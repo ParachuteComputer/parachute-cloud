@@ -125,6 +125,7 @@ import { handleStripeWebhookPost } from "./billing-webhook.ts";
 import { handlePromoRedeemPost } from "./promo.ts";
 import { handleAccountMcp, accountMcpProtectedResource } from "./account-mcp-http.ts";
 import { handleVaultConnectionDelete, handleVaultConnectionsList } from "./oauth-connections.ts";
+import { anyOriginPreflight, routeVaultGrants } from "./vault-grants.ts";
 import { spaCspForHtml } from "./spa-csp.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
@@ -368,6 +369,12 @@ app.get("/account/summary", (c) => handleAccountSummary(c.env.DB, c.req.raw, dep
 app.get("/account/keys", (c) => handleAccountKeysList(c.env.DB, c.req.raw, depsFor(c.env)));
 app.post("/account/keys", (c) => handleAccountKeyMint(c.env.DB, c.req.raw, depsFor(c.env)));
 app.delete("/account/keys/:name", (c) => handleAccountKeyRevoke(c.env.DB, c.req.raw, depsFor(c.env)));
+// T-476 typed keys: the app makes keys and reads who reaches a vault from its own origin, bearer only (any origin, no
+// credentials); and the one list of who reaches a vault, with End (vault-grants.ts).
+app.options("/account/keys", () => anyOriginPreflight());
+app.on(["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"], ["/account/vaults/:name/statements", "/account/vaults/:name/statements/:id"], async (c) =>
+  (await routeVaultGrants(c.env.DB, c.req.raw, depsFor(c.env))) ?? c.notFound(),
+);
 // T-442: a one-time browser sign-in link for a single-owner door's key-only owner (account-session-link.ts). Only
 // there: without OWNER_PUBKEY (Parachute Cloud) this is the router's own 404, the same as an unknown route.
 app.post("/account/session-link", (c) => {

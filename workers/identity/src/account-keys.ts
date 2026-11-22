@@ -47,7 +47,8 @@ import { composedVaultScope } from "@openparachute/door-contract";
 import { ACCOUNT_TOKEN_AUDIENCE } from "./account-auth.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { jsonResponse, type OAuthDeps } from "./oauth-shared.ts";
-import { signAccessToken } from "./tokens.ts";
+import { signAccessToken, validateAccessToken } from "./tokens.ts";
+import { getUserById } from "./users.ts";
 import { callVaultApi } from "./vault-call.ts";
 import { userOwnsVault } from "./vaults.ts";
 
@@ -56,7 +57,12 @@ export const APP_KEY_MAX_TTL_SECONDS = 365 * 24 * 60 * 60;
 export const APP_KEY_MIN_TTL_SECONDS = 60;
 export const APP_KEY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const VAULT_NAME_RE = /^[a-z0-9][a-z0-9-]{1,62}$/;
-const BODY_FIELDS = new Set(["name", "vault", "can", "expires_in", "on_behalf_of", "vaults"]);
+const BODY_FIELDS = new Set(["name", "vault", "can", "expires_in", "on_behalf_of", "vaults", "types", "kind"]);
+/** A type a key may be held to (core grants.ts): printable ASCII with no space, not `*`; at most 64 on one key. */
+const TYPE_NAME_RE = /^[!-~]{1,128}$/;
+const MAX_KEY_TYPES = 64;
+const GRANT_VERBS_READ = ["read"];
+const GRANT_VERBS_WRITE = ["read", "create", "update", "delete"];
 /** A multi-vault key's `vault_name`: no vault can be called this (VAULT_NAME_RE), so no one-vault path matches it. */
 export const MULTI_VAULT_KEY_VAULT = "*";
 /** At most this many vaults in one key (a plan's vault cap is far below it; this only bounds the token's size). */
@@ -92,6 +98,20 @@ interface AppKeyRow {
   permissions: string | null;
   /** A multi-vault key's `{vault: level}` JSON (migration 0032); null on a one-vault key. */
   vaults: string | null;
+  /** The JSON list of types a one-vault key is held to (migration 0034, T-476); null: the whole vault. */
+  types: string | null;
+  /** 'agent' for a key made for an AI (migration 0034); null: an app. */
+  kind: string | null;
+}
+
+export function typesOf(r: { types: string | null }): string[] | null {
+  if (!r.types) return null;
+  try {
+    const t = JSON.parse(r.types) as unknown;
+    return Array.isArray(t) && t.every((x) => typeof x === "string") ? (t as string[]) : null;
+  } catch {
+    return null;
+  }
 }
 
 function vaultsOf(r: AppKeyRow): Record<string, "read" | "write"> | null {
@@ -131,12 +151,15 @@ function view(r: AppKeyRow, now: Date) {
     revoked_at: r.revoked_at,
     // Present only on a key that may write on behalf of others, so every other key's shape is unchanged.
     ...(actsFor(r.permissions) !== null ? { on_behalf_of: true } : {}),
+    // T-476: the types a key is held to, and `kind: "agent"` on a key made for an AI; absent otherwise.
+    ...(typesOf(r) ? { types: typesOf(r) } : {}),
+    ...(r.kind === "agent" ? { kind: "agent" } : {}),
   };
 }
 
 // The registry's revocation (vault delete, account delete, a family sweep) also ends an app key: read it live.
 const ROWS_SQL = `SELECT a.name, a.jti, a.vault_name, a.can, a.created_at, a.expires_at, a.last_used_at,
-         COALESCE(a.revoked_at, t.revoked_at) AS revoked_at, t.permissions, a.vaults
+         COALESCE(a.revoked_at, t.revoked_at) AS revoked_at, t.permissions, a.vaults, a.types, a.kind
     FROM app_keys a LEFT JOIN tokens t ON t.jti = a.jti
    WHERE a.user_id = ?`;
 
@@ -159,9 +182,15 @@ async function ownerGate(db: D1Database, req: Request, deps: OAuthDeps, opts: { 
 }
 
 export async function handleAccountKeyMint(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
-  const auth = await ownerGate(db, req, deps, { mint: true });
-  if (!auth.ok) return auth.response;
-  const userId = auth.accountId;
+  // The owner, or (T-476) a vault's own admin credential, which makes keys for that vault alone (the app's Sharing
+  // screen holds one): never for another vault, never several vaults, never on behalf of others.
+  const vaultAdmin = await vaultAdminCredential(db, req, deps);
+  const auth = vaultAdmin ? { ok: true as const, accountId: vaultAdmin.accountId } : await ownerGate(db, req, deps, { mint: true });
+  if (!auth.ok) return withAnyOrigin(auth.response);
+  return withAnyOrigin(await mintKey(db, req, deps, auth.accountId, vaultAdmin?.vault ?? null));
+}
+
+async function mintKey(db: D1Database, req: Request, deps: OAuthDeps, userId: string, adminOf: string | null): Promise<Response> {
   const body = await readJsonBody(req);
   const extra = Object.keys(body).filter((k) => !BODY_FIELDS.has(k));
   if (extra.length) {
@@ -171,7 +200,17 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
   if (typeof name !== "string" || !APP_KEY_NAME_RE.test(name)) {
     return err(400, "invalid_name", "name: letters, digits, '.', '_' and '-', up to 80, starting with a letter or digit");
   }
-  if (body.vaults !== undefined) return mintMultiVaultKey(db, deps, userId, name, body);
+  const kind = body.kind;
+  if (kind !== undefined && kind !== "app" && kind !== "agent") {
+    return err(400, "invalid_request", 'kind: "agent" for a key made for an AI, or "app" (the default)');
+  }
+  if (adminOf !== null && (body.vaults !== undefined || body.on_behalf_of !== undefined || vault !== adminOf)) {
+    return err(403, "insufficient_scope", `this vault's admin credential makes keys for ${adminOf} alone, never on behalf of others; anything else is the owner's`);
+  }
+  if (body.vaults !== undefined) {
+    if (body.types !== undefined) return err(400, "invalid_request", "types: a key held to some types reaches one vault (vault and can)");
+    return mintMultiVaultKey(db, deps, userId, name, body);
+  }
   if (typeof vault !== "string" || !VAULT_NAME_RE.test(vault)) {
     return err(400, "invalid_request", "vault: the name of one of your vaults");
   }
@@ -185,6 +224,16 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
   if (onBehalf === true) {
     const problem = onBehalfNameProblem(name);
     if (problem) return err(400, "invalid_name", problem);
+  }
+  // T-476 typed keys: the types this key may reach in its vault (core grants.ts holds the rules there).
+  let types: string[] | null = null;
+  if (body.types !== undefined) {
+    const t = body.types;
+    if (!Array.isArray(t) || t.length === 0 || t.length > MAX_KEY_TYPES || t.some((x) => typeof x !== "string" || !TYPE_NAME_RE.test(x) || x === "*") || new Set(t).size !== t.length) {
+      return err(400, "invalid_request", `types: 1 to ${MAX_KEY_TYPES} different type names (printable, no spaces, not *); leave it out for a key that reaches the whole vault`);
+    }
+    if (onBehalf === true) return err(400, "invalid_request", "a key held to some types can't write on behalf of others");
+    types = [...(t as string[])].sort();
   }
   let ttl = APP_KEY_MAX_TTL_SECONDS;
   if (expires_in !== undefined) {
@@ -203,6 +252,7 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
 
   const scopes = can === "write" ? [`vault:${vault}:read`, `vault:${vault}:write`] : [`vault:${vault}:read`];
   const permissions = onBehalf === true ? { acts_for: name } : null;
+  const keyKind: "app" | "agent" = kind === "agent" ? "agent" : "app";
   const now = deps.now?.() ?? new Date();
   const signed = await signAccessToken(db, {
     sub: userId,
@@ -213,13 +263,26 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
     vaultScope: [vault],
     // The key's name twice: `permissions.app_key` for a vault worker that reads only that (T-430), and the top-level
     // `key` claim the 0.9.1 engine reads (core write-stamp.ts parseKeyClaim, as the box mints it), with its kind. The
-    // owner's on-behalf-of grant rides beside app_key in `permissions`.
-    permissions: { app_key: name, ...(permissions ?? {}) },
+    // owner's on-behalf-of grant rides beside app_key in `permissions`. A typed key carries only its grant's id
+    // (T-476): the vault reads the rules from its own table, and a vault that doesn't know `grant` refuses the key.
+    permissions: { app_key: name, ...(permissions ?? {}), ...(types ? { grant: name } : {}) },
     ttlSeconds: ttl,
     now: () => now,
-    key: { name, kind: "app" },
+    key: { name, kind: keyKind },
   });
   const createdAt = now.toISOString();
+  // A typed key's grant is filed at the vault before the key exists: the vault must hold the rules before anything
+  // can present the key. A vault that can't keep it means no key.
+  if (types) {
+    const verbs = can === "write" ? GRANT_VERBS_WRITE : GRANT_VERBS_READ;
+    const filed = await callGrant(db, deps, userId, vault, "PUT", name, { grantee: `key:${name}`, types: Object.fromEntries(types.map((t) => [t, verbs])), expires_at: signed.expiresAt });
+    if (filed?.status === 409) {
+      return err(409, "name_taken", `the vault has held a grant called "${name}" before (an ended key's name is never reused); pick another`);
+    }
+    if (!filed || (filed.status !== 201 && filed.status !== 200)) {
+      return err(502, "grant_not_filed", `the vault couldn't keep this key's grant (${filed ? filed.status : "unreachable"}); no key was made`);
+    }
+  }
   try {
     await db.batch([
       db
@@ -230,15 +293,18 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
         .bind(signed.jti, userId, name, APP_KEY_CLIENT_ID, scopes.join(" "), signed.expiresAt, createdAt, permissions ? JSON.stringify(permissions) : null),
       db
         .prepare(
-          `INSERT INTO app_keys (user_id, name, jti, vault_name, can, kid, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO app_keys (user_id, name, jti, vault_name, can, kid, created_at, expires_at, types, kind)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .bind(userId, name, signed.jti, vault, can, signed.kid, createdAt, signed.expiresAt),
+        .bind(userId, name, signed.jti, vault, can, signed.kid, createdAt, signed.expiresAt, types ? JSON.stringify(types) : null, keyKind === "agent" ? "agent" : null),
     ]);
   } catch (e) {
     // The batch is one transaction: a racing mint of the same name lost the PRIMARY KEY, and nothing was written.
-    // Any other failure is not about the name.
+    // The winner holds the same grant id (the vault answered "the same grant again"), so it is left alone (core
+    // account-keys.ts does the same). Any other failure ends the grant this mint filed (core #143): nothing may hold
+    // the rules for a key nobody has.
     if (isUniqueViolation(e)) return err(409, "name_taken", `a key called "${name}" already exists; pick another`);
+    if (types) await callGrant(db, deps, userId, vault, "DELETE", name);
     throw e;
   }
   const row: AppKeyRow = {
@@ -252,6 +318,8 @@ export async function handleAccountKeyMint(db: D1Database, req: Request, deps: O
     revoked_at: null,
     permissions: permissions ? JSON.stringify(permissions) : null,
     vaults: null,
+    types: types ? JSON.stringify(types) : null,
+    kind: keyKind === "agent" ? "agent" : null,
   };
   return ok({ ...view(row, now), scopes, token: signed.token }, 201);
 }
@@ -273,6 +341,7 @@ async function mintMultiVaultKey(
   if (body.vault !== undefined || body.can !== undefined || body.on_behalf_of !== undefined) {
     return err(400, "invalid_request", "a key takes either vault and can (one vault) or vaults (several), not both; on_behalf_of is for a one-vault key");
   }
+  const keyKind: "app" | "agent" = body.kind === "agent" ? "agent" : "app";
   const raw = body.vaults;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return err(400, "invalid_request", 'vaults: {"<vault>": "read" | "write", ...}');
@@ -316,7 +385,7 @@ async function mintMultiVaultKey(
     vaultScope: [],
     ttlSeconds: ttl,
     now: () => now,
-    key: { name, kind: "app" },
+    key: { name, kind: keyKind },
   });
   const createdAt = now.toISOString();
   const vaultsJson = JSON.stringify(levels);
@@ -330,10 +399,10 @@ async function mintMultiVaultKey(
         .bind(signed.jti, userId, name, APP_KEY_CLIENT_ID, scopes.join(" "), signed.expiresAt, createdAt),
       db
         .prepare(
-          `INSERT INTO app_keys (user_id, name, jti, vault_name, can, kid, created_at, expires_at, vaults)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO app_keys (user_id, name, jti, vault_name, can, kid, created_at, expires_at, vaults, kind)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .bind(userId, name, signed.jti, MULTI_VAULT_KEY_VAULT, can, signed.kid, createdAt, signed.expiresAt, vaultsJson),
+        .bind(userId, name, signed.jti, MULTI_VAULT_KEY_VAULT, can, signed.kid, createdAt, signed.expiresAt, vaultsJson, keyKind === "agent" ? "agent" : null),
     ]);
   } catch (e) {
     if (isUniqueViolation(e)) return err(409, "name_taken", `a key called "${name}" already exists; pick another`);
@@ -350,6 +419,8 @@ async function mintMultiVaultKey(
     revoked_at: null,
     permissions: null,
     vaults: vaultsJson,
+    types: null,
+    kind: keyKind === "agent" ? "agent" : null,
   };
   return ok({ ...view(row, now), scopes, token: signed.token }, 201);
 }
@@ -391,13 +462,17 @@ async function refreshLastUsed(db: D1Database, deps: OAuthDeps, userId: string, 
 }
 
 export async function handleAccountKeysList(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
+  // The whole list is the owner's: a vault's admin credential reads that vault's list (vault-grants.ts) instead.
+  if (await vaultAdminCredential(db, req, deps)) {
+    return withAnyOrigin(err(403, "insufficient_scope", "the account's keys are the owner's; this vault's admin credential lists who reaches its vault at /account/vaults/<vault>/statements"));
+  }
   const auth = await ownerGate(db, req, deps);
-  if (!auth.ok) return auth.response;
+  if (!auth.ok) return withAnyOrigin(auth.response);
   const now = deps.now?.() ?? new Date();
   const res = await db.prepare(`${ROWS_SQL} ORDER BY a.created_at, a.name`).bind(auth.accountId).all<AppKeyRow>();
   const rows = res.results ?? [];
   await refreshLastUsed(db, deps, auth.accountId, rows, now);
-  return ok({ keys: rows.map((r) => view(r, now)) });
+  return withAnyOrigin(ok({ keys: rows.map((r) => view(r, now)) }));
 }
 
 export async function handleAccountKeyRevoke(db: D1Database, req: Request, deps: OAuthDeps): Promise<Response> {
@@ -410,26 +485,46 @@ export async function handleAccountKeyRevoke(db: D1Database, req: Request, deps:
   } catch {
     return err(404, "key_not_found", "no such key");
   }
-  const row = await db.prepare(`${ROWS_SQL} AND a.name = ?`).bind(auth.accountId, name).first<AppKeyRow>();
+  const row = await appKeyRow(db, auth.accountId, name);
   if (!row) return err(404, "key_not_found", `you have no app key called "${name}"`);
+  return ok(await revokeAppKey(db, deps, auth.accountId, row));
+}
+
+/** One of this account's app keys by name, with its live revocation state; null when it has none by that name. */
+export async function appKeyRow(db: D1Database, userId: string, name: string): Promise<AppKeyRow | null> {
+  return db.prepare(`${ROWS_SQL} AND a.name = ?`).bind(userId, name).first<AppKeyRow>();
+}
+
+/** Every one of this account's app keys. */
+export async function appKeyRows(db: D1Database, userId: string): Promise<AppKeyRow[]> {
+  return (await db.prepare(`${ROWS_SQL} ORDER BY a.created_at, a.name`).bind(userId).all<AppKeyRow>()).results ?? [];
+}
+
+/**
+ * Revoke one app key (idempotent): the token row (the revocation list carries its jti), the key row, then the vault is
+ * told directly so its very next request is refused (`refused_now`), and a typed key's grant is ended there too
+ * (T-476), so the vault refuses it even reached some other way.
+ */
+export async function revokeAppKey(db: D1Database, deps: OAuthDeps, userId: string, row: AppKeyRow): Promise<{ name: string; revoked_at: string; refused_now: boolean }> {
+  const name = row.name;
   const stamp = (deps.now?.() ?? new Date()).toISOString();
   // Push to the vault only while the key is unexpired and the vault is still this account's: a first-party call must
   // never wake a destroyed vault or reach a vault name another account has since taken (that vault never knew the
   // key; the revocation list covers the rest).
   // The push is idempotent, so a retried revoke (whose first push failed) pushes again.
   const unexpired = row.expires_at > stamp && row.vault_name !== MULTI_VAULT_KEY_VAULT;
-  const stillOwned = unexpired && (await userOwnsVault(db, auth.accountId, row.vault_name));
+  const stillOwned = unexpired && (await userOwnsVault(db, userId, row.vault_name));
   await db.batch([
     db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL").bind(stamp, row.jti),
     db.prepare("UPDATE app_keys SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL").bind(stamp, row.jti),
   ]);
-  const after = await db.prepare(`${ROWS_SQL} AND a.name = ?`).bind(auth.accountId, name).first<AppKeyRow>();
+  const after = await appKeyRow(db, userId, name);
   // Tell the vault now, so the next request is refused rather than the one after its revocation cache refreshes.
   // Nothing to tell when it expired or its vault is gone; otherwise refused_now is what the vault said.
   let refusedNow = !stillOwned;
   if (stillOwned) try {
     const res = await callVaultApi(db, deps, {
-      userId: auth.accountId,
+      userId,
       vaultName: row.vault_name,
       method: "POST",
       apiPath: "/api/internal/keys/revoke",
@@ -443,5 +538,87 @@ export async function handleAccountKeyRevoke(db: D1Database, req: Request, deps:
     refusedNow = false;
   }
   if (stillOwned && !refusedNow) console.warn(`event=app_key_revoke_push_failed vault=${row.vault_name}`);
-  return ok({ name, revoked_at: after?.revoked_at ?? stamp, refused_now: refusedNow });
+  // A typed key's grant ends at the vault too: the token is already refused, and now the rules are gone.
+  if (stillOwned && typesOf(row)) {
+    const ended = await callGrant(db, deps, userId, row.vault_name, "DELETE", name);
+    if (!ended || (ended.status !== 200 && ended.status !== 404)) console.warn(`event=app_key_grant_end_failed vault=${row.vault_name}`);
+  }
+  return { name, revoked_at: after?.revoked_at ?? stamp, refused_now: refusedNow };
+}
+
+/** File (PUT) or end (DELETE) a key's grant at its vault, with the first-party admin hop; null when unreachable. */
+export async function callGrant(
+  db: D1Database,
+  deps: OAuthDeps,
+  userId: string,
+  vault: string,
+  method: "PUT" | "DELETE",
+  id: string,
+  body?: unknown,
+): Promise<Response | null> {
+  try {
+    const res = await callVaultApi(db, deps, {
+      userId,
+      vaultName: vault,
+      method,
+      apiPath: `/api/grants/${encodeURIComponent(id)}`,
+      verb: "admin",
+      ...(body === undefined ? {} : { jsonBody: body }),
+      signal: AbortSignal.timeout(LAST_USED_TIMEOUT_MS * 2),
+    });
+    await res.clone().body?.cancel().catch(() => {});
+    return res;
+  } catch {
+    return null;
+  }
+}
+
+/** The clients whose vault admin credential may manage that vault's keys: Parachute's own (the account door's hop
+ *  the owner mints, the app, the console), never an app that was granted admin over OAuth (it must not mint keys that
+ *  outlive its own grant, the same rule `ownerGate` holds for the account). */
+const VAULT_ADMIN_CLIENTS = new Set([ACCOUNT_TOKEN_CLIENT_ID, "parachute-app", "parachute-console"]);
+
+/**
+ * A vault's own admin credential (T-476, core vault-grants.ts ownerOrVaultAdmin): a token for one vault
+ * (`aud=vault.<v>`) holding `vault:<v>:admin`, minted for one of Parachute's own clients, narrowed by nothing, whose
+ * account still owns the vault. It manages that vault's keys: makes them (for that vault), lists who reaches it, and
+ * ends what reaches it alone. Null for anything else (the caller then tries the owner's gate).
+ */
+export async function vaultAdminCredential(db: D1Database, req: Request, deps: OAuthDeps): Promise<{ accountId: string; vault: string } | null> {
+  const m = /^Bearer\s+(\S+)$/i.exec(req.headers.get("authorization") ?? "");
+  if (!m) return null;
+  let payload: Record<string, unknown>;
+  try {
+    payload = (await validateAccessToken(db, m[1]!, deps.issuer)).payload as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const aud = Array.isArray(payload.aud) ? payload.aud[0] : payload.aud;
+  if (typeof aud !== "string" || !aud.startsWith("vault.")) return null;
+  const vault = aud.slice("vault.".length);
+  const scopes = typeof payload.scope === "string" ? payload.scope.split(/\s+/) : [];
+  if (!scopes.includes(`vault:${vault}:admin`)) return null;
+  if (typeof payload.client_id !== "string" || !VAULT_ADMIN_CLIENTS.has(payload.client_id)) return null;
+  // narrowed by nothing: any permission but the signer's pubkey (which only names who signed) counts as a narrowing
+  const perms = payload.permissions;
+  if (perms !== undefined && perms !== null && (typeof perms !== "object" || Array.isArray(perms) || Object.keys(perms).some((k) => k !== "principal_pubkey"))) return null;
+  const sub = typeof payload.sub === "string" && payload.sub ? payload.sub : null;
+  if (!sub) return null;
+  const user = await getUserById(db, sub);
+  if (!user || user.deletedAt !== null || user.suspendedAt !== null) return null;
+  // The owner's gate holds here too (T-476 review): an account whose address isn't proven makes no keys, and a
+  // credential minted before the address owner claimed the account is the previous holder's (requireAccount's cut).
+  if (!user.emailVerified) return null;
+  if (payload.email_verified !== true) return null;
+  if (!(await userOwnsVault(db, sub, vault))) return null;
+  return { accountId: sub, vault };
+}
+
+/** A bearer-only answer any origin may read (no credentials): the app calls these from its own origin (T-476). */
+export function withAnyOrigin(res: Response): Response {
+  const headers = new Headers(res.headers);
+  headers.set("access-control-allow-origin", "*");
+  headers.delete("access-control-allow-credentials");
+  headers.append("vary", "Origin");
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }

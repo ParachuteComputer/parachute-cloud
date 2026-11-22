@@ -83,9 +83,26 @@ import {
   filterHydratedLinksByTagScope,
   tagsWithinScope,
   tagScopeForbidden,
+  projectTagUpdate,
+  tagVisibleInScope,
 } from "./tag-scope.js";
 import { logStrictBypass } from "./shims.js";
 import { bodyWithPendingRestored, segmentPart } from "../transcription/pipeline.js";
+
+/**
+ * By note id, is a record visible under this scope (T-476: a typed key)? For the engine's link counts and ambiguous
+ * candidates, which count a link only when its other end is visible. Undefined when unscoped (the vault-wide path).
+ */
+function idVisibleFor(db: unknown, tagScope: TagScopeCtx): ((noteId: string) => boolean) | undefined {
+  if (tagScope.raw === null) return undefined;
+  return (noteId: string) => noteWithinTagScope({ tags: getNoteTags(db as Parameters<typeof getNoteTags>[0], noteId) }, tagScope.allowed, tagScope.raw);
+}
+
+/** The engine's link-visibility option for a write (T-476): a typed key never links into, nor learns of, a hidden record. */
+function linkOptFor(db: unknown, tagScope: TagScopeCtx): { linkVisible?: (noteId: string) => boolean } {
+  const linkVisible = idVisibleFor(db, tagScope);
+  return linkVisible ? { linkVisible } : {};
+}
 
 /**
  * Runtime deps a handler needs beyond the store. `deleteObject` is provided by
@@ -123,9 +140,13 @@ function invalidIfUpdatedAtResponse(): Response {
 function gateStrictWrite(
   store: Store,
   writeCtx: WriteCtx,
-  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown>; wasPublished?: boolean; defaultTags?: string[] },
+  tagScope: TagScopeCtx,
 ): void {
   enforceStrictWrite(store, shape, {
+    // T-476: a typed key that can't see the publish tag can't change metadata.published, counting what the type's
+    // schema defaults will fill in (the engine's rule; the box passes it the same way, routes.ts gateStrictWrite).
+    ...(tagScope.raw !== null ? { mayChangePublished: tagVisibleInScope("publish", tagScope.allowed, tagScope.raw) } : {}),
     bypass: writeCtx.bypassStrict === true,
     onBypass: (violations: ValidationWarning[]) => {
       logStrictBypass({
@@ -270,7 +291,10 @@ export async function handleNotes(
     } catch {} // not JSON: the handler answers it as it would
     if (call && typeof call === "object" && !Array.isArray(call)) {
       try {
-        refuseTypesInTags(store.db as any, call as Record<string, unknown>, mode);
+        // A typed key (T-476) is told about a type only when it can see it: a hidden one reads as a plain label (the
+        // scope then refuses it), never as "that is a type" (the box passes the same check, records-rest.ts).
+        const typeVisible = tagScope.raw === null ? undefined : (name: string) => tagVisibleInScope(name, tagScope.allowed, tagScope.raw);
+        refuseTypesInTags(store.db as any, call as Record<string, unknown>, mode, typeVisible);
       } catch (err) {
         const e = err as { message?: string; error_type?: string; field?: string; hint?: string };
         // Any other refusal (a malformed call) is the handler's to answer, in its own words.
@@ -336,6 +360,7 @@ export async function handleNotes(
       your_updated_at: e.expected_updated_at, expected_updated_at: e.expected_updated_at,
       path: e.note_path ?? null, note_id: e.note_id, message: e.message, hint: HINT_CONFLICT,
     }, 409);
+    if (e?.code === "PUBLISH_OUT_OF_SCOPE") return json({ error: "Forbidden", error_type: "tag_scope_violation", message: e.message }, 403);
     if (e?.code === "SCHEMA_VALIDATION") return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message, hint: HINT_SCHEMA_VALIDATION }, 422);
     if (e?.code === "PATH_CONFLICT") return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message, hint: HINT_PATH_CONFLICT }, 409);
     const ambig = ambiguousPathResponse(e);
@@ -437,19 +462,19 @@ async function handleNotesInner(
           // not a filter but an ADDITION (vault#239): it makes a reference
           // whose only candidates are invisible read as broken here, instead
           // of only once the last of them is deleted.
-          result.broken_links = getUnresolvedLinksForNote(db, note.id);
+          result.broken_links = getUnresolvedLinksForNote(db, note.id, idVisibleFor(db, tagScope));
         }
         if (parseBool(parseQuery(url, "include_ambiguous_links"), false)) {
           // Same no-tag-scope-needed reasoning as broken_links above: an
           // ambiguous `target` never became a link, so no neighbor identity
           // is exposed — only the string this note's own reference named.
-          result.ambiguous_links = getAmbiguousLinksForNote(db, note.id);
+          result.ambiguous_links = getAmbiguousLinksForNote(db, note.id, idVisibleFor(db, tagScope));
         }
         if (parseBool(parseQuery(url, "include_attachments"), false)) {
           result.attachments = await store.getAttachments(note.id);
         }
         if (parseBool(parseQuery(url, "include_link_count"), false)) {
-          result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url)).get(note.id) ?? 0;
+          result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url), idVisibleFor(db, tagScope)).get(note.id) ?? 0;
         }
         return json(result);
       }
@@ -546,7 +571,7 @@ async function handleNotesInner(
             output = output.map((n: any) => filterMetadata(n, inclMeta));
           }
           if (parseBool(parseQuery(url, "include_link_count"), false)) {
-            const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url));
+            const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url), idVisibleFor(db, tagScope));
             for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
           }
           return jsonWithWarnings(output, semanticWarnings);
@@ -652,6 +677,10 @@ async function handleNotesInner(
         }
         let rawResults: Note[];
         try {
+          // A typed key's search runs as any search, and its results are filtered to its types below. Not the engine's
+          // `visible` option: that ranks inside a temporary FTS table, which a Durable Object's SQLite refuses
+          // (SQLITE_AUTH), so every search with a visible match failed (T-476 review r3). The limit counts before
+          // the scope, as the box's REST does.
           rawResults = await store.searchNotes(search, { tags: searchTags, limit, expand: tagExpand.expand });
         } catch (e: any) {
           if (e && e.name === "QueryError") {
@@ -672,7 +701,8 @@ async function handleNotesInner(
         // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
         // FTS5-vocabulary scan) and ONLY computed on the already-rare
         // empty-result path, mirroring `unknown_tag`'s did_you_mean.
-        if (rawResults.length === 0) {
+        // Not for a typed key (T-476): the suggestion reads the whole vault's words, hidden records' included.
+        if (rawResults.length === 0 && tagScope.raw === null) {
           const suggestion = computeSearchDidYouMean(db, search);
           if (suggestion) {
             searchWarnings.push(searchDidYouMeanWarning(search, suggestion));
@@ -698,7 +728,7 @@ async function handleNotesInner(
           output = output.map((n: any) => filterMetadata(n, inclMeta));
         }
         if (parseBool(parseQuery(url, "include_link_count"), false)) {
-          const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url));
+          const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url), idVisibleFor(db, tagScope));
           for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
         }
         return jsonWithWarnings(output, searchWarnings);
@@ -813,13 +843,15 @@ async function handleNotesInner(
               ),
             ]
           : []),
-        ...collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()),
+        // Not for a typed key (T-476): a suggestion for an unknown tag reads the whole vault's names.
+        ...(tagScope.raw === null ? collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()) : []),
       ];
       let results: Note[];
       let nextCursor: string | null = null;
       try {
         if (hasCursorParam) {
-          const page = await store.queryNotesPaged(queryOpts);
+          // A typed key pages through the records it can see only (T-476): a cursor never names a hidden one.
+          const page = await store.queryNotesPaged(queryOpts, tagScope.raw === null ? undefined : (n: Note) => noteWithinTagScope(n, tagScope.allowed, tagScope.raw));
           results = page.notes;
           nextCursor = page.next_cursor;
         } else {
@@ -853,7 +885,10 @@ async function handleNotesInner(
       // "more may follow" signal, so a second warning would be redundant.
       // Explicit offset is also exempt (vault#601): the caller is already
       // paging, not hitting an accidental full default page.
-      if (!hasCursorParam && queryOpts.offset === undefined && results.length === queryOpts.limit) {
+      // A typed key (T-476) is told only about the records it can see: counted after its scope, never before (a
+      // hidden record filling the page would otherwise show it exists).
+      const shownCount = tagScope.raw === null ? results.length : filterNotesByTagScope(results, tagScope.allowed, tagScope.raw).length;
+      if (!hasCursorParam && queryOpts.offset === undefined && shownCount === queryOpts.limit) {
         queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
       }
 
@@ -901,7 +936,7 @@ async function handleNotesInner(
         output = output.map((n: any) => filterMetadata(n, inclMeta));
       }
       if (includeLinkCount) {
-        const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url));
+        const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url), idVisibleFor(db, tagScope));
         for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
       }
 
@@ -930,11 +965,11 @@ async function handleNotesInner(
         // filtering needed — a broken-link `target` never resolved to a
         // note, so there's no neighbor identity to leak.
         const brokenLinksByNote = includeBrokenLinks
-          ? getUnresolvedLinksForNotes(db, output.map((n: any) => n.id))
+          ? getUnresolvedLinksForNotes(db, output.map((n: any) => n.id), idVisibleFor(db, tagScope))
           : null;
         // Same again for the ambiguity twin (vault#581), same non-leak logic.
         const ambiguousLinksByNote = includeAmbiguousLinks
-          ? getAmbiguousLinksForNotes(db, output.map((n: any) => n.id))
+          ? getAmbiguousLinksForNotes(db, output.map((n: any) => n.id), idVisibleFor(db, tagScope))
           : null;
         const enrichedOut: any[] = [];
         for (const n of output) {
@@ -1058,7 +1093,7 @@ async function handleNotesInner(
         const incomingTags: string[] = item.tags ?? [];
         const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
         const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
-        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata });
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
 
         // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
         // core UPDATE on the tag/link mutation too, not just `updates` — a
@@ -1072,6 +1107,7 @@ async function handleNotesInner(
         if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
           result = await store.updateNote(existingNote.id, {
             ...updates,
+            ...linkOptFor(db, tagScope),
             actor: writeCtx.actor,
             via: writeCtx.via,
           });
@@ -1124,10 +1160,11 @@ async function handleNotesInner(
             continue;
           }
 
-          gateStrictWrite(store, writeCtx, { path: item.path, tags: item.tags, metadata: item.metadata });
+          gateStrictWrite(store, writeCtx, { path: item.path, tags: item.tags, metadata: item.metadata, defaultTags: item.tags }, tagScope);
           let note: Note;
           try {
             note = await store.createNote(item.content ?? "", {
+              ...linkOptFor(db, tagScope),
               id: item.id,
               path: item.path,
               tags: item.tags,
@@ -1179,7 +1216,7 @@ async function handleNotesInner(
         // surfaces a distinct `ambiguous_link` warning instead. Never silent.
         for (const { sourceId, links } of pendingLinks) {
           for (const link of links) {
-            const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+            const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship, idVisibleFor(db, tagScope));
             if (outcome.status === "resolved") {
               await store.createLink(sourceId, outcome.note_id, link.relationship);
             } else if (outcome.status === "ambiguous") {
@@ -1193,7 +1230,7 @@ async function handleNotesInner(
         // --- Content-wikilink warnings (vault#570) ---
         // Same forward-ref-aware timing as the structured-links pass above.
         for (const { noteId, content } of contentWikilinkNotes) {
-          for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+          for (const warning of getContentWikilinkWarnings(db, noteId, content, idVisibleFor(db, tagScope))) {
             pushLinkWarning(noteId, warning);
           }
         }
@@ -1413,7 +1450,7 @@ async function handleNotesInner(
       try {
         const version = "import_ix" in selector ? getImportedVersion(db, id, selector.import_ix) : await store.getNoteVersion(id, storageIndex);
         if (!version) return json({ error: "Not found", error_type: "not_found", ...("import_ix" in selector ? selector : {}) }, 404);
-        gateStrictWrite(store, writeCtx, { path: note ? note.path : latestTombstone(db, id)?.path, tags: note?.tags ?? [], metadata: version.metadata });
+        gateStrictWrite(store, writeCtx, { path: note ? note.path : latestTombstone(db, id)?.path, tags: note?.tags ?? [], metadata: version.metadata, wasPublished: (note?.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
         const restored = await store.restoreNoteVersion(id, storageIndex, {
           actor: writeCtx.actor, via: writeCtx.via,
           ...(body.if_updated_at !== undefined ? { if_updated_at: body.if_updated_at as string } : {}),
@@ -1456,7 +1493,7 @@ async function handleNotesInner(
       result.attachments = await store.getAttachments(note.id);
     }
     if (parseBool(parseQuery(url, "include_link_count"), false)) {
-      result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url)).get(note.id) ?? 0;
+      result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url), idVisibleFor(db, tagScope)).get(note.id) ?? 0;
     }
     return json(result);
   }
@@ -1494,8 +1531,9 @@ async function handleNotesInner(
             path: createOpts.path ?? undefined,
             tags: createOpts.tags,
             metadata: createOpts.metadata,
-          });
-          const createdNote = await store.createNote(content, createOpts);
+            defaultTags: createOpts.tags,
+          }, tagScope);
+          const createdNote = await store.createNote(content, { ...createOpts, ...linkOptFor(db, tagScope) });
           if (tagsArr.length > 0) await applySchemaDefaults(store, db, [createdNote.id], tagsArr);
           const linksAdd = (body.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
           // `unresolved_link` / `ambiguous_link` warnings (vault#555, vault#570)
@@ -1506,7 +1544,7 @@ async function handleNotesInner(
           const createWarnings: QueryWarning[] = [];
           if (linksAdd) {
             for (const link of linksAdd) {
-              const outcome = resolveOrQueueLink(db, createdNote.id, link.target, link.relationship);
+              const outcome = resolveOrQueueLink(db, createdNote.id, link.target, link.relationship, idVisibleFor(db, tagScope));
               if (outcome.status === "resolved") {
                 await store.createLink(createdNote.id, outcome.note_id, link.relationship, link.metadata);
               } else if (outcome.status === "ambiguous") {
@@ -1521,7 +1559,7 @@ async function handleNotesInner(
           // create path, so there's no batch-sibling forward-ref to wait for
           // — compute right away against the committed content.
           if (content) {
-            createWarnings.push(...getContentWikilinkWarnings(db, createdNote.id, content));
+            createWarnings.push(...getContentWikilinkWarnings(db, createdNote.id, content, idVisibleFor(db, tagScope)));
           }
           const finalNote = await store.getNote(createdNote.id);
           if (!finalNote) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
@@ -1542,10 +1580,11 @@ async function handleNotesInner(
         throw new NotFoundError(`Note not found: "${idOrPath}"`);
       }
       if (tagScope.allowed) {
-        const removed = new Set<string>((body.tags?.remove as string[] | undefined) ?? []);
-        const projected = new Set<string>((note.tags ?? []).filter((t) => !removed.has(t)));
-        for (const t of (body.tags?.add as string[] | undefined) ?? []) projected.add(t);
-        if (!tagsWithinScope([...projected], tagScope.allowed, tagScope.raw)) {
+        // The box's rule (routes.ts): the record must keep a tag in scope, and every tag this write attaches or
+        // detaches must be in scope. A hidden tag the record already carries is neither checked nor touched, so an
+        // edit can't tell whether one is there, nor strip it (T-476 review).
+        const { projected, added, removed } = projectTagUpdate(note.tags, body.tags?.add, body.tags?.remove);
+        if (!tagsWithinScope(projected, tagScope.allowed, tagScope.raw, added, removed)) {
           return tagScopeForbidden(tagScope.raw ?? []);
         }
       }
@@ -1696,7 +1735,7 @@ async function handleNotesInner(
         for (const t of (body.tags?.add as string[] | undefined) ?? []) projectedTags.add(t);
         const baseMeta = updates.metadata ?? ((note.metadata as Record<string, unknown>) ?? {});
         const projectedMeta = stBody !== undefined ? { ...baseMeta, [stBody.field as string]: stBody.to } : baseMeta;
-        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta });
+        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: (body.tags?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
       }
 
       // Content-wikilink warnings (vault#570) gate on the SAME condition
@@ -1714,7 +1753,7 @@ async function handleNotesInner(
       if (Object.keys(updates).length > 0 || hasTagMutation || hasLinkMutation) {
         updates.actor = writeCtx.actor;
         updates.via = writeCtx.via;
-        await store.updateNote(note.id, updates);
+        await store.updateNote(note.id, { ...updates, ...linkOptFor(db, tagScope) });
       }
 
       for (const { targetId, relationship } of resolvedLinksToRemove) {
@@ -1737,7 +1776,7 @@ async function handleNotesInner(
       const linkWarnings: QueryWarning[] = [];
       if (body.links?.add) {
         for (const link of body.links.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[]) {
-          const outcome = resolveOrQueueLink(db, note.id, link.target, link.relationship);
+          const outcome = resolveOrQueueLink(db, note.id, link.target, link.relationship, idVisibleFor(db, tagScope));
           if (outcome.status === "resolved") {
             await store.createLink(note.id, outcome.note_id, link.relationship, link.metadata);
           } else if (outcome.status === "ambiguous") {
@@ -1763,7 +1802,7 @@ async function handleNotesInner(
       // handles a single note (no batch-sibling forward-ref to wait for),
       // so compute right away against the committed content.
       if (contentChanged) {
-        linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content));
+        linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content, idVisibleFor(db, tagScope)));
       }
       const validated: any = attachValidationStatus(store, db, updatedNote);
       const linkMutated = body.links?.add !== undefined || body.links?.remove !== undefined;

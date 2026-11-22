@@ -32,6 +32,11 @@ import {
   type AuthResult,
 } from "./auth.js";
 import { NO_TAG_SCOPE } from "./rest/parse.js";
+import { grantInForce, handleGrants, narrowToGrant } from "./grants.js";
+import { noteWithinTagScope, scopeQueryParams, scrubResponseByScope, tagScopeFor, tagScopeForbidden, tagScopedVaultWideForbidden, tagVisibleInScope, type TagScopeCtx } from "./rest/tag-scope.js";
+import { resolveNote } from "./rest/parse.js";
+import { normalizePath } from "@openparachute/core/src/paths.js";
+import { validateExtension } from "@openparachute/core/src/notes.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
 import { withValidators } from "@openparachute/core/src/http-validators.js";
 
@@ -511,6 +516,7 @@ function hexOf(digest: ArrayBuffer | undefined): string {
 function vaultInUseResponse(): Response {
   return json({ error: "Someone has written in this vault since the import.", error_type: "vault_in_use" }, 409);
 }
+
 
 /** 503 while the import lock is held (T-318). The console re-checks via import-status. */
 function importInProgressResponse(): Response {
@@ -1217,6 +1223,8 @@ export class VaultDO extends DurableObject {
         refuseLateWrite: (key) => this.refuseLateWrite(vaultName, key),
         scheduleTranscription: () => this.scheduleTranscriptionAlarm(),
         markWritten: () => this.markWritten(),
+        // The grant id is the key's own name (identity files it so): in force for that key, here, now.
+        grantInForce: (grant) => grantInForce(this.store, grant, grant) !== null,
       });
     }
 
@@ -1310,7 +1318,8 @@ export class VaultDO extends DurableObject {
         // Semantic-search capability (C2, EXPERIMENTAL) — same placement +
         // shape as self-host's routes.ts `embeddings` field (capability.ts).
         embeddings: await this.embeddingCapability(),
-        stats: await this.store.getVaultStats(),
+        // A typed key (T-476): counted through its types only, as /api/vault does for it.
+        stats: auth.scoped_tags ? await this.scopedStats(this.scopeOf(auth)) : await this.store.getVaultStats(),
       });
     }
 
@@ -1339,6 +1348,15 @@ export class VaultDO extends DurableObject {
     // checked before any route runs, so a refused request writes nothing. On-behalf-of never opens access.
     const stamp = restWriteStamp(request, apiPath, auth);
     if ("refusal" in stamp) return stamp.refusal;
+    // A typed key (T-476): it reaches only the routes that are narrowed to its types; every other route acts on the
+    // whole vault and refuses it (deny by default, the box's tag-scoped refusal).
+    let scope: TagScopeCtx = NO_TAG_SCOPE;
+    if (auth.scoped_tags) {
+      scope = this.scopeOf(auth);
+      const gated = await this.grantedRestGate(request, apiPath, auth, scope);
+      if (gated instanceof Response) return gated;
+      if (gated) request = gated;
+    }
     // Name use (T-456), the routes a box counts: /api/notes is the old name, /api/records and /api/types the new.
     if (TYPES_REQUESTS.has(request)) await this.countNameUse(typesRouteName(request.method, apiPath), "new", request, auth);
     else {
@@ -1460,7 +1478,7 @@ export class VaultDO extends DurableObject {
     // snapshot → upsert/remove over text/event-stream; the DO's own subscription
     // manager fans out from the post-commit hook (design §3.1).
     if (apiPath === "/subscribe") {
-      return handleSubscribe(request, this.store, vaultName, NO_TAG_SCOPE, this.subManager);
+      return handleSubscribe(request, this.store, vaultName, scope, this.subManager, this.liveGrant(auth.grant, auth.keyName));
     }
 
     // Portable-markdown export — GET /api/export. Read-scoped; streams core's
@@ -1471,7 +1489,7 @@ export class VaultDO extends DurableObject {
     }
 
     if (apiPath.startsWith("/notes")) {
-      return handleNotes(request, this.store, apiPath.slice(6), deps, NO_TAG_SCOPE, writeCtx);
+      return scrubResponseByScope(await handleNotes(request, this.store, apiPath.slice(6), deps, scope, writeCtx), scope);
     }
     if (isDeletedList) return handleDeletedNotes(request, this.store);
     if (apiPath === "/history/compact") {
@@ -1479,7 +1497,7 @@ export class VaultDO extends DurableObject {
       return handleHistoryCompact(request, this.store);
     }
     if (apiPath.startsWith("/tags")) {
-      return handleTags(request, this.store, apiPath.slice(5), NO_TAG_SCOPE, { ...writeCtx, ...(typeWriteOnly ? { typeWriteOnly: true } : {}) });
+      return handleTags(request, this.store, apiPath.slice(5), scope, { ...writeCtx, ...(typeWriteOnly ? { typeWriteOnly: true } : {}) });
     }
     if (apiPath === "/find-path") {
       return handleFindPath(request, this.store, NO_TAG_SCOPE);
@@ -1498,6 +1516,9 @@ export class VaultDO extends DurableObject {
     // caller (via the identity worker's server-side mint, which mints admin).
     if (apiPath.startsWith("/packs/")) {
       return this.handleApplyPack(request, apiPath.slice(7));
+    }
+    if (apiPath === "/grants" || apiPath.startsWith("/grants/")) {
+      return handleGrants(request, this.store, apiPath.slice(7), vaultName, auth, (id) => this.subManager.closeGrant(id));
     }
     if (apiPath === "/vault") {
       const cfg: VaultConfigLike = {
@@ -1760,6 +1781,108 @@ export class VaultDO extends DurableObject {
    * `authenticateVaultRequest`, then the app-key door (T-414) — a key revoked HERE is refused at once, and an app
    * key's use is noted for "last used" (app-keys.ts).
    */
+  /**
+   * The routes a typed key reaches (T-476), each narrowed to its types; null lets the request go on to its handler
+   * with the key's scope, a Response answers it here. Everything not named is refused: it acts on the whole vault.
+   *
+   *   /notes (list, search, create), /notes/<id> (read, change, delete): the handlers apply the scope (rest/notes.ts).
+   *   /notes/<id>/versions[/<ix>]: no version records the types it had yet, so none is visible under a grant
+   *     (core docs/SPEC-1.0-grants.md §4.1); a record the key can't see is the same 404 as a missing one.
+   *   GET /tags (the type list), GET /subscribe (live), GET /vault (counts only what the key can see).
+   */
+  private async grantedRestGate(request: Request, apiPath: string, auth: AuthResult, scope: TagScopeCtx): Promise<Response | Request | null> {
+    const raw = auth.scoped_tags ?? [];
+    const notFound = () => json({ error: "Not found", error_type: "not_found" }, 404);
+    if (apiPath === "/notes" && request.method === "GET") {
+      const url = new URL(request.url);
+      // A rollup counts vault-wide, and the link-presence filters are decided over the whole vault's links (the box
+      // re-decides them per record over the key's own records; not ported): neither is for a typed key.
+      const wide = ["has_links", "has_broken_links", "has_ambiguous_links"];
+      if ([...url.searchParams.keys()].some((k) => k === "aggregate" || k.startsWith("aggregate[") || wide.includes(k))) return tagScopedVaultWideForbidden(raw);
+      return this.scopedQueryRequest(request, url, scope);
+    }
+    // Publishing makes a record anyone's to read (the public page): a typed key changes `metadata.published` only
+    // when it may see the publish tag, as it may attach that tag only then (the box's mayChangePublished rule).
+    const one = /^\/notes\/([^/]+)$/.exec(apiPath);
+    if ((apiPath === "/notes" || one) && (request.method === "POST" || request.method === "PATCH" || request.method === "PUT")
+      && !tagVisibleInScope("publish", scope.allowed, scope.raw)) {
+      const body = await request.clone().json().catch(() => null) as unknown;
+      // Every shape a handler might read, together: the body itself (PATCH and a single POST read it whatever else it
+      // holds), a batch's `notes` and an array body. Checking all of them is never looser than the handler.
+      const items: unknown[] = [body];
+      if (Array.isArray(body)) items.push(...body);
+      else if (body && typeof body === "object" && Array.isArray((body as { notes?: unknown }).notes)) items.push(...(body as { notes: unknown[] }).notes);
+      const publishes = items.some((it) => {
+        if (!it || typeof it !== "object") return false;
+        const { metadata: meta, state_transition: st } = it as { metadata?: unknown; state_transition?: unknown };
+        // a state transition sets its field directly (PATCH's state_transition), so one on `published` is a publish too
+        if (st && typeof st === "object" && (st as { field?: unknown }).field === "published") return true;
+        return !!meta && typeof meta === "object" && "published" in (meta as object);
+      });
+      if (publishes) return tagScopeForbidden(raw);
+      // Nor unpublish one by replacing it (an upsert with if_exists "replace" rewrites tags and metadata, so a key that
+      // can't set the flag would clear it): the box's wasPublished. Every item of a batch, looked up exactly as the
+      // handler will (normalized path and extension, by path only); a lookup that fails is refused, not waved through.
+      for (const it of items) {
+        const item = it && typeof it === "object" ? (it as { if_exists?: unknown; path?: unknown; extension?: unknown }) : null;
+        if (!item || item.if_exists !== "replace" || typeof item.path !== "string") continue;
+        let existing = null;
+        try {
+          const target = normalizePath(item.path);
+          existing = target ? await this.store.getNoteByPath(target, item.extension !== undefined ? validateExtension(item.extension) : "md") : null;
+        } catch {
+          return tagScopeForbidden(raw);
+        }
+        const wasPublished = !!existing && ((existing.tags ?? []).includes("publish") || (existing.metadata as { published?: unknown } | undefined)?.published === true);
+        if (wasPublished && noteWithinTagScope(existing!, scope.allowed, scope.raw)) return tagScopeForbidden(raw);
+      }
+    }
+    if (apiPath === "/notes") return null;
+    if (one) return null;
+    const history = /^\/notes\/([^/]+)\/versions(?:\/[^/]+)?$/.exec(apiPath);
+    if (history && request.method === "GET") {
+      let note = null;
+      try {
+        note = await resolveNote(this.store, decodeURIComponent(history[1]!));
+      } catch {
+        note = null;
+      }
+      if (!note || !noteWithinTagScope(note, scope.allowed, scope.raw)) return notFound();
+      return apiPath.endsWith("/versions") ? json({ versions: [], total: 0 }) : notFound();
+    }
+    if (request.method === "GET" && apiPath === "/tags") return null;
+    // Live (SSE): a hidden tag in the subscription's query matches nothing, as on the list.
+    if (request.method === "GET" && apiPath === "/subscribe") return this.scopedQueryRequest(request, new URL(request.url), scope);
+    if (request.method === "GET" && apiPath === "/vault") {
+      const res = await handleVault(request, this.store, { name: this.config!.name, description: this.config!.description ?? undefined }, () => {});
+      if (!res.ok) return res;
+      const body = (await res.json()) as Record<string, unknown>;
+      const out: Record<string, unknown> = { name: body.name, description: body.description ?? null };
+      if (body.stats !== undefined) out.stats = await this.scopedStats(scope);
+      return json(out);
+    }
+    return tagScopedVaultWideForbidden(raw);
+  }
+
+  /** A typed key's counts: through its types only (and their `/` sub-tags in use), never vault-wide. */
+  private async scopedStats(scope: TagScopeCtx) {
+    const tagFilter = new Set(scope.allowed ?? []);
+    for (const r of this.store.db.prepare("SELECT DISTINCT tag_name FROM note_tags").all() as { tag_name: string }[]) {
+      if (tagVisibleInScope(r.tag_name, scope.allowed, scope.raw)) tagFilter.add(r.tag_name);
+    }
+    return this.store.getVaultStats({ tagFilter: [...tagFilter] });
+  }
+
+  /** `request` with the query's hidden tags rewritten (rest/tag-scope.ts scopeQueryParams); null when none were. */
+  private scopedQueryRequest(request: Request, url: URL, scope: TagScopeCtx): Request | null {
+    const scoped = scopeQueryParams(url.searchParams, scope);
+    if (scoped === url.searchParams) return null;
+    url.search = scoped.toString();
+    const next = new Request(url.toString(), request);
+    if (RECORDS_REQUESTS.has(request)) RECORDS_REQUESTS.add(next);
+    return next;
+  }
+
   private async authenticate(request: Request, vaultName: string): Promise<{ error: Response } | AuthResult> {
     const auth = await authenticateVaultRequest(request, this.env, vaultName);
     if ("error" in auth) return auth;
@@ -1772,7 +1895,19 @@ export class VaultDO extends DurableObject {
       return { error: json({ error: "Unauthorized", message: "this token's account no longer owns this vault" }, 401) };
     }
     if (auth.jti && auth.clientId === APP_KEY_CLIENT_ID) await this.appKeys.noteUse(auth.jti, auth.exp);
-    return auth;
+    // A typed key (T-476): its grant is read from this vault's own table now, and the request is narrowed to it.
+    return narrowToGrant(auth, this.store, vaultName);
+  }
+
+  /** A typed key's tag scope, read from the hierarchy now; NO_TAG_SCOPE for every other credential. */
+  private scopeOf(auth: AuthResult): TagScopeCtx {
+    return auth.scoped_tags ? tagScopeFor(this.store, auth.scoped_tags) : NO_TAG_SCOPE;
+  }
+
+  /** A typed key's grant, for a live subscription: it closes once the grant is no longer in force. */
+  private liveGrant(grant: string | null | undefined, keyName: string | null | undefined): { id: string; inForce: () => boolean } | undefined {
+    if (!grant) return undefined;
+    return { id: grant, inForce: () => grantInForce(this.store, grant, keyName) !== null };
   }
 
   /**
@@ -3126,7 +3261,7 @@ export class VaultDO extends DurableObject {
         this.closeWs(ws, WS_CLOSE.PROTOCOL, "invalid subscription query");
         continue;
       }
-      const handle = this.registerWsSub(ws, matcher);
+      const handle = this.registerWsSub(ws, matcher, att);
       if (handle) this.wsSubs.set(ws, handle);
       else this.closeWs(ws, WS_CLOSE.PROTOCOL, "could not register subscription");
     }
@@ -3286,7 +3421,20 @@ export class VaultDO extends DurableObject {
       this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "account closed");
       return;
     }
-    const auth = result.auth;
+    // A typed key (T-476): its grant must be in force here, and the socket sees only its types.
+    const narrowed = narrowToGrant(result.auth, this.store, vaultName);
+    if ("error" in narrowed) {
+      this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "grant ended");
+      return;
+    }
+    const auth = narrowed;
+    const scope = this.scopeOf(auth);
+    // The socket's stored query, with hidden tags rewritten as on the list (and kept so for a rehydrated socket).
+    const scopedQ = scope.raw === null ? att.q : (() => {
+      const params = scopeQueryParams(new URLSearchParams(att.q.replace(/^\?/, "")), scope);
+      return `?${params.toString()}`;
+    })();
+    att = { ...att, q: scopedQ };
 
     const matcher = await this.buildMatcherFromQuery(att.q);
     if (!matcher) {
@@ -3299,7 +3447,7 @@ export class VaultDO extends DurableObject {
     let snapshotNotes;
     try {
       const raw = await this.store.queryNotes({ ...matcher.opts, limit: Number.MAX_SAFE_INTEGER, offset: undefined });
-      snapshotNotes = filterNotesByTagScope(raw, NO_TAG_SCOPE.allowed, NO_TAG_SCOPE.raw);
+      snapshotNotes = filterNotesByTagScope(raw, scope.allowed, scope.raw);
     } catch {
       this.closeWs(ws, WS_CLOSE.PROTOCOL, "snapshot query failed");
       return;
@@ -3318,10 +3466,13 @@ export class VaultDO extends DurableObject {
       actor: auth.actor,
       via: auth.via,
       clientId: auth.clientId,
+      grant: auth.grant ?? null,
+      keyName: auth.keyName ?? null,
+      scoped: auth.scoped_tags,
     };
     ws.serializeAttachment(ready);
 
-    const handle = this.registerWsSub(ws, matcher);
+    const handle = this.registerWsSub(ws, matcher, ready);
     if (!handle) {
       this.closeWs(ws, WS_CLOSE.PROTOCOL, "could not register subscription");
       return;
@@ -3360,7 +3511,17 @@ export class VaultDO extends DurableObject {
       this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "account closed");
       return;
     }
-    const auth = result.auth;
+    const narrowed = narrowToGrant(result.auth, this.store, vaultName);
+    if ("error" in narrowed) {
+      this.closeWs(ws, WS_CLOSE.UNAUTHORIZED, "grant ended");
+      return;
+    }
+    const auth = narrowed;
+    // A typed key's socket stays the same key's (T-476): another grant, or none where there was one, is a re-open.
+    if ((auth.grant ?? null) !== (att.grant ?? null) || JSON.stringify(auth.scoped_tags) !== JSON.stringify(att.scoped ?? null)) {
+      this.closeWs(ws, WS_CLOSE.FORBIDDEN, "re-auth changes the key's grant");
+      return;
+    }
     if (vaultVerbRank(auth.scopes, vaultName) > vaultVerbRank(att.scopeRaw ?? [], vaultName)) {
       this.closeWs(ws, WS_CLOSE.FORBIDDEN, "re-auth widens scope");
       return;
@@ -3381,12 +3542,16 @@ export class VaultDO extends DurableObject {
   /** Register a WS subscription with the manager (no manager-cap accounting — the
    *  WS cap is enforced at upgrade via getWebSockets; no flush tracking — the
    *  runtime bounds the socket's outgoing buffer). */
-  private registerWsSub(ws: WebSocket, matcher: LiveMatcher): SubscriptionHandle | null {
+  private registerWsSub(ws: WebSocket, matcher: LiveMatcher, att: WsAttachment): SubscriptionHandle | null {
+    // A typed key's socket (T-476): the types it is held to, and its grant, kept on the attachment across hibernation.
+    const scope = att.scoped ? tagScopeFor(this.store, att.scoped) : NO_TAG_SCOPE;
+    const grant = this.liveGrant(att.grant, att.keyName);
     return this.subManager.register({
       vaultName: this.config!.name,
       matcher,
-      tagScopeAllowed: NO_TAG_SCOPE.allowed,
-      tagScopeRaw: NO_TAG_SCOPE.raw,
+      tagScopeAllowed: scope.allowed,
+      tagScopeRaw: scope.raw,
+      ...(grant ? { grant } : {}),
       sink: new WsSink(ws),
       tracksFlush: false,
       countsTowardCap: false,
