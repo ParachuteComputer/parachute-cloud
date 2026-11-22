@@ -104,6 +104,11 @@ export interface CloudAccountCapabilities extends AccountCapabilities {
   connections: boolean;
   /** The whole-account door (`POST /account/delete` + `/account/undo-delete`). */
   account_delete: boolean;
+  /**
+   * A published record has a public page at `<vault url>/view/<idOrPath>` (T-476, vault worker view.ts), as on a box.
+   * The app gives a published record's link only where this is true; an older Cloud door has no such page.
+   */
+  published_view: boolean;
 }
 
 export function accountDescriptor(deps: OAuthDeps): Response {
@@ -115,6 +120,7 @@ export function accountDescriptor(deps: OAuthDeps): Response {
     vault_delete: true,
     account_delete: true,
     connections: true,
+    published_view: true,
   };
   const body: ParachuteAccountDescriptor & CloudMoneyFields = {
     issuer: iss,
