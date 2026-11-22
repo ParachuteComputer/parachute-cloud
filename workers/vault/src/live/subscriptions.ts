@@ -42,7 +42,7 @@
  */
 import type { Note, Store } from "@openparachute/core/src/types.js";
 import type { DeletedNoteRef, HookEvent, HookRegistry, NoteHookPayload } from "@openparachute/core/src/hooks.js";
-import { noteWithinTagScope, scrubNoteTagsByScope } from "../rest/tag-scope.js";
+import { noteWithinTagScope, scrubNoteTagsByScope, tagScopeFor } from "../rest/tag-scope.js";
 import type { LiveMatcher } from "@openparachute/core/src/live-match.js";
 
 /** Default per-vault concurrent-subscription cap. Over it → 503. */
@@ -294,11 +294,14 @@ export class SubscriptionManager {
       }
 
       const note = payload as Note;
-      const inScope = noteWithinTagScope(note, sub.tagScopeAllowed, sub.tagScopeRaw);
+      // A typed key's scope is read from the hierarchy now, at every event (a subtype moved after it subscribed is
+      // seen, or dropped, at once: the box's expandTokenTagScopeNow).
+      const allowed = sub.tagScopeRaw === null ? sub.tagScopeAllowed : tagScopeFor(store, sub.tagScopeRaw).allowed;
+      const inScope = noteWithinTagScope(note, allowed, sub.tagScopeRaw);
       const matches = sub.matcher.match(note) && inScope;
 
       if (matches) {
-        this.emit(sub, "upsert", { note: scrubNoteTagsByScope(note, sub.tagScopeAllowed, sub.tagScopeRaw) });
+        this.emit(sub, "upsert", { note: scrubNoteTagsByScope(note, allowed, sub.tagScopeRaw) });
       } else if (event === "updated" && inScope) {
         this.emit(sub, "remove", { id: note.id });
       }

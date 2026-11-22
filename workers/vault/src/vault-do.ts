@@ -34,7 +34,7 @@ import {
 } from "./auth.js";
 import { NO_TAG_SCOPE } from "./rest/parse.js";
 import { grantInForce, handleGrants, narrowToGrant } from "./grants.js";
-import { noteWithinTagScope, scrubResponseByScope, tagScopeFor, tagScopedVaultWideForbidden, tagVisibleInScope, type TagScopeCtx } from "./rest/tag-scope.js";
+import { noteWithinTagScope, scopeQueryParams, scrubResponseByScope, tagScopeFor, tagScopeForbidden, tagScopedVaultWideForbidden, tagVisibleInScope, type TagScopeCtx } from "./rest/tag-scope.js";
 import { resolveNote } from "./rest/parse.js";
 import { handleView, VIEW_PATH, viewMethodNotAllowed, viewNotFound } from "./view.js";
 import { filterNotesByTagScope } from "./rest/tag-scope.js";
@@ -517,8 +517,6 @@ function vaultInUseResponse(): Response {
   return json({ error: "Someone has written in this vault since the import.", error_type: "vault_in_use" }, 409);
 }
 
-/** A query tag a typed key can't see is rewritten to this, a name no record carries (the box's rule, vault#675). */
-const OUT_OF_SCOPE_QUERY_TAG = "\u0000out-of-scope";
 
 /** 503 while the import lock is held (T-318). The console re-checks via import-status. */
 function importInProgressResponse(): Response {
@@ -1838,28 +1836,22 @@ export class VaultDO extends DurableObject {
       // re-decides them per record over the key's own records; not ported): neither is for a typed key.
       const wide = ["has_links", "has_broken_links", "has_ambiguous_links"];
       if ([...url.searchParams.keys()].some((k) => k === "aggregate" || k.startsWith("aggregate[") || wide.includes(k))) return tagScopedVaultWideForbidden(raw);
-      // A tag named in the query that the key can't see becomes a name nothing carries (the box's rule, vault#675):
-      // the answer is then the same as for a tag that doesn't exist, so it can't tell which hidden ones do.
-      let changed = false;
-      for (const key of ["tag", "type", "exclude_tag", "exclude_tags"]) {
-        const values = url.searchParams.getAll(key);
-        if (values.length === 0) continue;
-        const scoped = values.map((v) => v.split(",").map((t) => {
-          const bare = t.trim().replace(/^#/, "");
-          if (bare === "" || tagVisibleInScope(bare, scope.allowed, scope.raw)) return t;
-          changed = true;
-          return OUT_OF_SCOPE_QUERY_TAG;
-        }).join(","));
-        url.searchParams.delete(key);
-        for (const v of scoped) url.searchParams.append(key, v);
-      }
-      if (!changed) return null;
-      const next = new Request(url.toString(), request);
-      if (RECORDS_REQUESTS.has(request)) RECORDS_REQUESTS.add(next);
-      return next;
+      return this.scopedQueryRequest(request, url, scope);
+    }
+    // Publishing makes a record anyone's to read (the public page): a typed key changes `metadata.published` only
+    // when it may see the publish tag, as it may attach that tag only then (the box's mayChangePublished rule).
+    const one = /^\/notes\/([^/]+)$/.exec(apiPath);
+    if ((apiPath === "/notes" || one) && (request.method === "POST" || request.method === "PATCH" || request.method === "PUT")
+      && !tagVisibleInScope("publish", scope.allowed, scope.raw)) {
+      const body = await request.clone().json().catch(() => null) as unknown;
+      const items = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray((body as { notes?: unknown }).notes) ? (body as { notes: unknown[] }).notes : [body];
+      const publishes = items.some((it) => {
+        const meta = it && typeof it === "object" ? (it as { metadata?: unknown }).metadata : undefined;
+        return !!meta && typeof meta === "object" && "published" in (meta as object);
+      });
+      if (publishes) return tagScopeForbidden(raw);
     }
     if (apiPath === "/notes") return null;
-    const one = /^\/notes\/([^/]+)$/.exec(apiPath);
     if (one) return null;
     const history = /^\/notes\/([^/]+)\/versions(?:\/[^/]+)?$/.exec(apiPath);
     if (history && request.method === "GET") {
@@ -1872,7 +1864,9 @@ export class VaultDO extends DurableObject {
       if (!note || !noteWithinTagScope(note, scope.allowed, scope.raw)) return notFound();
       return apiPath.endsWith("/versions") ? json({ versions: [], total: 0 }) : notFound();
     }
-    if (request.method === "GET" && (apiPath === "/tags" || apiPath === "/subscribe")) return null;
+    if (request.method === "GET" && apiPath === "/tags") return null;
+    // Live (SSE): a hidden tag in the subscription's query matches nothing, as on the list.
+    if (request.method === "GET" && apiPath === "/subscribe") return this.scopedQueryRequest(request, new URL(request.url), scope);
     if (request.method === "GET" && apiPath === "/vault") {
       const res = await handleVault(request, this.store, { name: this.config!.name, description: this.config!.description ?? undefined }, () => {});
       if (!res.ok) return res;
@@ -1891,6 +1885,16 @@ export class VaultDO extends DurableObject {
       if (tagVisibleInScope(r.tag_name, scope.allowed, scope.raw)) tagFilter.add(r.tag_name);
     }
     return this.store.getVaultStats({ tagFilter: [...tagFilter] });
+  }
+
+  /** `request` with the query's hidden tags rewritten (rest/tag-scope.ts scopeQueryParams); null when none were. */
+  private scopedQueryRequest(request: Request, url: URL, scope: TagScopeCtx): Request | null {
+    const scoped = scopeQueryParams(url.searchParams, scope);
+    if (scoped === url.searchParams) return null;
+    url.search = scoped.toString();
+    const next = new Request(url.toString(), request);
+    if (RECORDS_REQUESTS.has(request)) RECORDS_REQUESTS.add(next);
+    return next;
   }
 
   private async authenticate(request: Request, vaultName: string): Promise<{ error: Response } | AuthResult> {
@@ -3439,6 +3443,12 @@ export class VaultDO extends DurableObject {
     }
     const auth = narrowed;
     const scope = this.scopeOf(auth);
+    // The socket's stored query, with hidden tags rewritten as on the list (and kept so for a rehydrated socket).
+    const scopedQ = scope.raw === null ? att.q : (() => {
+      const params = scopeQueryParams(new URLSearchParams(att.q.replace(/^\?/, "")), scope);
+      return `?${params.toString()}`;
+    })();
+    att = { ...att, q: scopedQ };
 
     const matcher = await this.buildMatcherFromQuery(att.q);
     if (!matcher) {

@@ -672,7 +672,13 @@ async function handleNotesInner(
         }
         let rawResults: Note[];
         try {
-          rawResults = await store.searchNotes(search, { tags: searchTags, limit, expand: tagExpand.expand });
+          rawResults = await store.searchNotes(search, {
+            tags: searchTags,
+            limit,
+            expand: tagExpand.expand,
+            // A typed key searches only what it can see (T-476): the limit counts visible records.
+            ...(tagScope.raw === null ? {} : { visible: (n: Note) => noteWithinTagScope(n, tagScope.allowed, tagScope.raw) }),
+          });
         } catch (e: any) {
           if (e && e.name === "QueryError") {
             return json(
@@ -692,7 +698,8 @@ async function handleNotesInner(
         // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
         // FTS5-vocabulary scan) and ONLY computed on the already-rare
         // empty-result path, mirroring `unknown_tag`'s did_you_mean.
-        if (rawResults.length === 0) {
+        // Not for a typed key (T-476): the suggestion reads the whole vault's words, hidden records' included.
+        if (rawResults.length === 0 && tagScope.raw === null) {
           const suggestion = computeSearchDidYouMean(db, search);
           if (suggestion) {
             searchWarnings.push(searchDidYouMeanWarning(search, suggestion));
@@ -833,13 +840,15 @@ async function handleNotesInner(
               ),
             ]
           : []),
-        ...collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()),
+        // Not for a typed key (T-476): a suggestion for an unknown tag reads the whole vault's names.
+        ...(tagScope.raw === null ? collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()) : []),
       ];
       let results: Note[];
       let nextCursor: string | null = null;
       try {
         if (hasCursorParam) {
-          const page = await store.queryNotesPaged(queryOpts);
+          // A typed key pages through the records it can see only (T-476): a cursor never names a hidden one.
+          const page = await store.queryNotesPaged(queryOpts, tagScope.raw === null ? undefined : (n: Note) => noteWithinTagScope(n, tagScope.allowed, tagScope.raw));
           results = page.notes;
           nextCursor = page.next_cursor;
         } else {
@@ -873,7 +882,10 @@ async function handleNotesInner(
       // "more may follow" signal, so a second warning would be redundant.
       // Explicit offset is also exempt (vault#601): the caller is already
       // paging, not hitting an accidental full default page.
-      if (!hasCursorParam && queryOpts.offset === undefined && results.length === queryOpts.limit) {
+      // A typed key (T-476) is told only about the records it can see: counted after its scope, never before (a
+      // hidden record filling the page would otherwise show it exists).
+      const shownCount = tagScope.raw === null ? results.length : filterNotesByTagScope(results, tagScope.allowed, tagScope.raw).length;
+      if (!hasCursorParam && queryOpts.offset === undefined && shownCount === queryOpts.limit) {
         queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
       }
 

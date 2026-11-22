@@ -224,3 +224,31 @@ export async function scrubResponseByScope(res: Response, scope: TagScopeCtx): P
   headers.delete("content-length");
   return new Response(JSON.stringify(walk(body)), { status: res.status, statusText: res.statusText, headers });
 }
+
+/** A query tag a typed key can't see is rewritten to this, a name no record carries (the box's rule, vault#675). */
+export const OUT_OF_SCOPE_QUERY_TAG = "\u0000out-of-scope";
+
+/**
+ * A query's tag filters (`tag`, `type`, `exclude_tag`, `exclude_tags`, comma lists or repeated) with every name the
+ * scope can't see rewritten to {@link OUT_OF_SCOPE_QUERY_TAG}: the answer is then the same as for a tag that doesn't
+ * exist, so a typed key can't tell which hidden ones do. Used for the record list, live subscriptions and the socket.
+ * Returns the params unchanged (the same object) when nothing needed rewriting.
+ */
+export function scopeQueryParams(params: URLSearchParams, scope: TagScopeCtx): URLSearchParams {
+  if (scope.raw === null) return params;
+  const out = new URLSearchParams(params);
+  let changed = false;
+  for (const key of ["tag", "type", "exclude_tag", "exclude_tags"]) {
+    const values = params.getAll(key);
+    if (values.length === 0) continue;
+    const scoped = values.map((v) => v.split(",").map((t) => {
+      const bare = t.trim().replace(/^#/, "");
+      if (bare === "" || tagVisibleInScope(bare, scope.allowed, scope.raw)) return t;
+      changed = true;
+      return OUT_OF_SCOPE_QUERY_TAG;
+    }).join(","));
+    out.delete(key);
+    for (const v of scoped) out.append(key, v);
+  }
+  return changed ? out : params;
+}

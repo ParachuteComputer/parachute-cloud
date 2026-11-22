@@ -355,6 +355,94 @@ describe("the public page under a grant (door/0.9 takes #436)", () => {
     const page = (id: string) => SELF.fetch(`${base(v)}/view/${id}`, { headers: { Authorization: `Bearer ${k}` } });
     expect((await page(pub.id)).status).toBe(200);
     expect((await page(r1)).status).toBe(404);
+describe("review round 2 (#439, #440): more paths a typed key must not see through", () => {
+  it("a search suggestion never comes from a hidden record's words", async () => {
+    const { v } = await world("tksuggest");
+    await fileGrant(v, "claude-sg", { recipe: ALL });
+    const k = await typedKey(v, "claude-sg");
+    for (const path of ["/notes?search=zqwor", "/records?search=zqwor"]) {
+      const r = await rest(v, k, path);
+      expect(r.status, path).toBe(200);
+      expect(r.headers.get("X-Parachute-Warnings") ?? "", path).not.toContain("zqword");
+      expect(await r.text()).not.toContain("zqword");
+    }
+  });
+
+  it("paging and the truncated warning say nothing about a hidden path", async () => {
+    const { v } = await world("tkpaging");
+    await fileGrant(v, "claude-pg", { recipe: ALL });
+    const k = await typedKey(v, "claude-pg");
+    const hidden = await rest(v, k, "/notes?path=diary%2Ftoday&limit=1");
+    const missing = await rest(v, k, "/notes?path=diary%2Fnothing&limit=1");
+    expect(hidden.headers.get("X-Parachute-Warnings") ?? "").toBe(missing.headers.get("X-Parachute-Warnings") ?? "");
+    const hc: any = await (await rest(v, k, "/notes?path=diary%2Ftoday&limit=1&cursor=")).json();
+    const mc: any = await (await rest(v, k, "/notes?path=diary%2Fnothing&limit=1&cursor=")).json();
+    // the cursor carries a hash of the query (different paths differ there); its watermark must say nothing
+    const mark = (c: string | null | undefined) => {
+      if (!c) return null;
+      const j = JSON.parse(atob(c.replace(/-/g, "+").replace(/_/g, "/")));
+      return { last_id: j.last_id, last_updated_at: j.last_updated_at };
+    };
+    expect(mark(hc.next_cursor)).toEqual(mark(mc.next_cursor));
+    // a cursor walk over everything never names a hidden record
+    let cursor = "";
+    const seen: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const page: any = await (await rest(v, k, `/notes?limit=1&cursor=${encodeURIComponent(cursor)}`)).json();
+      seen.push(JSON.stringify(page));
+      if (!page.next_cursor) break;
+      cursor = page.next_cursor;
+    }
+    const journalIds = ((await (await op(v, "/api/notes?tag=journal")).json()) as any[]).map((n) => n.id);
+    for (const id of journalIds) expect(seen.join("\n")).not.toContain(id);
+  });
+
+  it("a live subscription naming a hidden type matches nothing, as on the list", async () => {
+    const { v } = await world("tklivetag");
+    await createNote(v, { path: "food/both3", content: "both", tags: ["recipe", "journal"] });
+    await fileGrant(v, "claude-lt", { recipe: ALL });
+    const k = await typedKey(v, "claude-lt");
+    const res = await SELF.fetch(`${base(v)}/api/subscribe?tag=journal`, { headers: { Upgrade: "websocket" } });
+    const ws = res.webSocket!;
+    ws.accept();
+    const frames: any[] = [];
+    ws.addEventListener("message", (e: any) => frames.push(JSON.parse(e.data)));
+    ws.send(JSON.stringify({ type: "auth", token: k }));
+    for (let i = 0; i < 100 && !frames.some((f) => f.type === "snapshot" && f.done); i++) await new Promise((r) => setTimeout(r, 50));
+    expect(frames.filter((f) => f.type === "snapshot").flatMap((f) => f.notes)).toEqual([]);
+    ws.close();
+  });
+
+  it("a live socket follows the hierarchy now: a subtype moved out of the key's types stops streaming", async () => {
+    const { v } = await world("tklivemove");
+    expect((await op(v, "/api/tags/soup", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind: "type", parent_names: ["recipe"] }) })).status).toBe(200);
+    await fileGrant(v, "claude-lm", { recipe: ALL });
+    const k = await typedKey(v, "claude-lm");
+    const res = await SELF.fetch(`${base(v)}/api/subscribe`, { headers: { Upgrade: "websocket" } });
+    const ws = res.webSocket!;
+    ws.accept();
+    const frames: any[] = [];
+    ws.addEventListener("message", (e: any) => frames.push(JSON.parse(e.data)));
+    ws.send(JSON.stringify({ type: "auth", token: k }));
+    for (let i = 0; i < 100 && !frames.some((f) => f.type === "snapshot" && f.done); i++) await new Promise((r) => setTimeout(r, 50));
+    expect((await op(v, "/api/tags/soup", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ parent_names: ["journal"] }) })).status).toBe(200);
+    await createNote(v, { content: "a soup that is now a journal's", tags: ["soup"] });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(JSON.stringify(frames)).not.toContain("now a journal's");
+    ws.close();
+  });
+
+  it("a typed key can't publish a record unless it may see the publish tag", async () => {
+    const { v, r1 } = await world("tkpublish");
+    await fileGrant(v, "claude-pb", { recipe: ALL });
+    const k = await typedKey(v, "claude-pb");
+    expect((await rest(v, k, `/notes/${r1}`, { method: "PATCH", body: JSON.stringify({ metadata: { published: true }, force: true }) })).status).toBe(403);
+    expect((await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ content: "x", tags: ["recipe"], metadata: { published: true } }) })).status).toBe(403);
+    expect((await SELF.fetch(`${base(v)}/view/${r1}`)).status).toBe(404);
+    // a key whose types include the publish tag may
+    await fileGrant(v, "claude-pb2", { recipe: ALL, publish: ALL });
+    const k2 = await typedKey(v, "claude-pb2");
+    expect((await rest(v, k2, `/notes/${r1}`, { method: "PATCH", body: JSON.stringify({ metadata: { published: true }, force: true }) })).status).toBe(200);
   });
 });
 
