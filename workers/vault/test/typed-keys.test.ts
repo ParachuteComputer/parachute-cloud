@@ -519,5 +519,32 @@ describe("review round 3 (#439): a typed key searches, and can't unpublish by re
   });
 });
 
+describe("check beyond the cap (#439): a type's default can't publish for a typed key", () => {
+  it("a default published: true is a publish, at REST and MCP, as the engine counts it", async () => {
+    const { v, r1 } = await world("tkdefault");
+    const json = { "Content-Type": "application/json" };
+    expect((await op(v, "/api/tags/dessert", { method: "PUT", headers: json, body: JSON.stringify({ kind: "type", fields: { published: { type: "boolean", default: true } } }) })).status).toBe(200);
+    await fileGrant(v, "claude-df", { recipe: ALL, dessert: ALL });
+    const k = await typedKey(v, "claude-df");
+    const published = async (id: string) => ((await (await op(v, `/api/notes/${id}`)).json()) as any).metadata?.published;
+    // create with the type
+    const created = await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ path: "food/cake", content: "cake", tags: ["dessert"] }) });
+    expect(created.status, await created.clone().text()).toBe(403);
+    expect((await op(v, "/api/notes/food%2Fcake")).status).toBe(404);
+    // add the type to a recipe by PATCH, and by an upsert that updates
+    expect((await rest(v, k, `/notes/${r1}`, { method: "PATCH", body: JSON.stringify({ tags: { add: ["dessert"] }, force: true }) })).status).toBe(403);
+    expect((await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ path: "food/soup", tags: ["dessert"], if_exists: "update" }) })).status).toBe(403);
+    expect(await published(r1)).toBeUndefined();
+    // MCP: create and update
+    expect((await tool(v, k, "create-note", { path: "food/pie", content: "pie", tags: ["dessert"] })).ok).toBe(false);
+    const upd = await tool(v, k, "update-note", { id: r1, tags: { add: ["dessert"] }, force: true });
+    expect(upd.ok, upd.text).toBe(false);
+    expect(await published(r1)).toBeUndefined();
+    // the owner can, so the default itself works
+    const own = await createNote(v, { path: "food/tart", content: "tart", tags: ["dessert"] });
+    expect(await published(own.id)).toBe(true);
+  });
+});
+
 // keep env referenced (DO helpers in other files use it; this file reaches the vault only over SELF)
 void env;
