@@ -1811,6 +1811,19 @@ export class VaultDO extends DurableObject {
         return !!meta && typeof meta === "object" && "published" in (meta as object);
       });
       if (publishes) return tagScopeForbidden(raw);
+      // Nor unpublish one by replacing it (PUT, or an upsert with if_exists replace/update): the box's wasPublished.
+      const ifExists = body && typeof body === "object" && !Array.isArray(body) ? (body as { if_exists?: unknown; path?: unknown }) : null;
+      const target = one ? decodeURIComponent(one[1]!) : ifExists && (ifExists.if_exists === "replace" || ifExists.if_exists === "update") && typeof ifExists.path === "string" ? ifExists.path : null;
+      if (target && (request.method === "PUT" || !one)) {
+        let existing = null;
+        try {
+          existing = await resolveNote(this.store, target);
+        } catch {
+          existing = null;
+        }
+        const wasPublished = !!existing && ((existing.tags ?? []).includes("publish") || (existing.metadata as { published?: unknown } | undefined)?.published === true);
+        if (wasPublished && noteWithinTagScope(existing!, scope.allowed, scope.raw)) return tagScopeForbidden(raw);
+      }
     }
     if (apiPath === "/notes") return null;
     if (one) return null;

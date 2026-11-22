@@ -437,5 +437,36 @@ describe("review round 2 (#439, #440): more paths a typed key must not see throu
   });
 });
 
+describe("review round 3 (#439): a typed key searches, and can't unpublish by replacing", () => {
+  it("a search that matches a visible record answers it, at REST, the records door and MCP; hidden words still find nothing", async () => {
+    const { v, r1 } = await world("tksearch");
+    await fileGrant(v, "claude-se", { recipe: ALL });
+    const k = await typedKey(v, "claude-se");
+    for (const path of ["/notes?search=soup", "/records?search=soup"]) {
+      const r = await rest(v, k, path);
+      expect(r.status, `${path} ${await r.clone().text()}`).toBe(200);
+      expect(await r.text(), path).toContain(r1);
+    }
+    expect(await (await rest(v, k, "/notes?search=zqword")).text()).not.toContain("zqword");
+    for (const [name, args] of [["query-notes", { search: "soup" }], ["query-records", { search: "soup" }], ["query-records", { search: "soup", type: "recipe" }]] as const) {
+      const m = await tool(v, k, name, args as Record<string, unknown>);
+      expect(m.ok, `${name} ${m.text}`).toBe(true);
+      expect(m.text).toContain(r1);
+    }
+    const hidden = await tool(v, k, "query-notes", { search: "zqword" });
+    expect(hidden.text).not.toContain("zqword");
+  });
+
+  it("a typed key can't unpublish a record by replacing it", async () => {
+    const { v } = await world("tkunpub");
+    const pub = await createNote(v, { path: "food/pub", content: "public soup", tags: ["recipe"], metadata: { published: true } });
+    await fileGrant(v, "claude-up", { recipe: ALL });
+    const k = await typedKey(v, "claude-up");
+    expect((await rest(v, k, "/notes", { method: "POST", body: JSON.stringify({ path: "food/pub", content: "replaced", tags: ["recipe"], if_exists: "replace" }) })).status).toBe(403);
+    expect((await rest(v, k, `/notes/${pub.id}`, { method: "PUT", body: JSON.stringify({ content: "replaced", tags: ["recipe"] }) })).status).toBe(403);
+    expect(((await (await op(v, `/api/notes/${pub.id}`)).json()) as any).metadata?.published).toBe(true);
+  });
+});
+
 // keep env referenced (DO helpers in other files use it; this file reaches the vault only over SELF)
 void env;
