@@ -35,8 +35,9 @@ rollback (prod-job's included), count the live typed keys on the identity D1:
 SELECT COUNT(*) FROM app_keys WHERE types IS NOT NULL AND revoked_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
 ```
 
-If it isn't 0, end them in D1. These are the two updates `DELETE /account/keys/<name>` makes, for every live typed
-key. Tokens come first, because their subquery reads `app_keys`:
+If it isn't 0, end them in D1. These are the two D1 updates `DELETE /account/keys/<name>` makes, for every live typed
+key (the endpoint also tells the vault at once and ends the grant there; here the vault learns from the revocation
+list). Tokens come first, because their subquery reads `app_keys`:
 
 ```sql
 UPDATE tokens SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE revoked_at IS NULL AND jti IN (SELECT jti FROM app_keys WHERE types IS NOT NULL AND revoked_at IS NULL);
@@ -45,7 +46,7 @@ UPDATE app_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE typ
 
 Every identity worker, old or new, lists a token with `revoked_at` as revoked, so this works after the rollback too.
 A vault refuses the key from its next revocation-list refresh. Then count again; it must be 0. Owners lose those keys
-and make them again after the next upgrade. The alternative is to roll back only to #437 or later, which refuse a
+and make new ones, under new names, after the next upgrade (a revoked key's name can't be used again). The alternative is to roll back only to #437 or later, which refuse a
 typed key outright.
 
 `deploy/personal/end-typed-keys.sh` is for one own-Cloudflare door, and only while its new identity worker is still
