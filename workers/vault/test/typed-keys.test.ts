@@ -501,6 +501,14 @@ describe("review round 3 (#439): a typed key searches, and can't unpublish by re
     expect((await post({ id: "food/pub", path: "food/decoy", content: "decoy", tags: ["recipe"] })).status).toBe(201);
     expect((await post({ path: "food/pub", ...replace })).status).toBe(403);
     expect(((await (await op(v, `/api/notes/${pub.id}`)).json()) as any).metadata?.published).toBe(true);
+    // a state transition on `published` sets the flag directly: refused both ways, at both REST doors
+    const priv = await createNote(v, { path: "food/priv", content: "private soup", tags: ["recipe"] });
+    for (const [door, id, from, to] of [["notes", pub.id, true, false], ["records", pub.id, true, false], ["notes", priv.id, null, true], ["records", priv.id, null, true]] as const) {
+      const r = await rest(v, k, `/${door}/${id}`, { method: "PATCH", body: JSON.stringify({ state_transition: { field: "published", from, to } }) });
+      expect(r.status, `${door} ${from}->${to}`).toBe(403);
+    }
+    expect(((await (await op(v, `/api/notes/${pub.id}`)).json()) as any).metadata?.published).toBe(true);
+    expect(((await (await op(v, `/api/notes/${priv.id}`)).json()) as any).metadata?.published).toBeUndefined();
     // an update that only changes words can't unpublish, so it goes through
     expect((await post({ path: "food/pub", content: "public soup, edited", tags: ["recipe"], if_exists: "update" })).status).toBeLessThan(300);
     expect(((await (await op(v, `/api/notes/${pub.id}`)).json()) as any).metadata?.published).toBe(true);
