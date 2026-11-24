@@ -251,6 +251,7 @@ export function renderLogin(opts: {
          <button class="primary" type="submit">Email me a sign-in link</button>
        </form>
        <p class="muted" style="margin:.7rem 0 0">We'll email you a link that signs you in and continues connecting your app — or type the 6-digit code from that email below.</p>
+       <p class="muted" data-testid="login-new-here" style="margin:.5rem 0 0">New to Parachute? The same link makes your account. No password.</p>
        <details${showCode ? " open" : ""}>
          <summary>Have a code?</summary>
          ${codeForm(csrfToken, undefined, showCode ? error : undefined, hiddenParams(params))}
@@ -490,9 +491,22 @@ function renderVerbSelector(selector: OwnerVerbSelector): string {
  * render is UX, not the boundary. Zero owned vaults renders guidance instead of an
  * empty set — a person needs a vault before the account-MCP surface is useful.
  */
-function renderAccountVaultsBlock(consent: AccountVaultsConsent): string {
+function renderAccountVaultsBlock(consent: AccountVaultsConsent, clientName: string): string {
   if (consent.ownedVaults.length === 0) {
-    return `<p class="muted" data-testid="account-vaults-none" style="margin:.85rem 0 0">You don't have a vault yet — <a href="/console">create one</a>, then reconnect to grant access.</p>`;
+    // A person with no vault yet (most often someone new, who signed up from the Parachute app a moment ago): Allow lets
+    // the app make their first vault and then read and write the vaults they have, which is this page's own default
+    // for a person with vaults ("Any vault", "Read & write", "Create new vaults" ticked). Before T-476 this said
+    // "create one, then reconnect" with no way to Allow: the app's sign-in ended on an error page.
+    return `<input type="hidden" name="vault_mode" value="wildcard"><input type="hidden" name="access_verb" value="write">
+         <fieldset class="vaultinclude" data-testid="account-vaults-none">
+           <legend>What this connection can do</legend>
+           <p style="margin:.35rem 0 .2rem">You don't have a vault yet. Allow, and ${esc(clientName)} can make your first vault with you.</p>
+           <label class="verbopt">
+             <input type="checkbox" name="vault_create" value="1" checked>
+             <span class="verbopt-body"><span class="verbopt-title">Create new vaults</span><span class="verbopt-desc">Let this app make vaults in your account. Uncheck to withhold, and <a href="/console">make one here</a> instead.</span></span>
+           </label>
+           <p class="verbopt" style="margin:.35rem 0 0"><span class="verbopt-body"><span class="verbopt-title">Read and write your vaults</span><span class="verbopt-desc">Every vault you have now or make later: its notes, tags and attachments. What this app reads from your vaults goes to the company that runs it.</span></span></p>
+         </fieldset>`;
   }
   // One row per vault: none, read or write (0.9.1 "one multi-vault door"). Posted as `vault_level:<vault>`; the
   // submit re-checks every name against ownership and every level against none/read/write.
@@ -547,7 +561,7 @@ export function renderConsent(props: ConsentProps): string {
   // Nothing to pick: an Allow here could only fail ("Vault required").
   const nothingToPick = !lockedVault && needsVaultPick && ownedVaults.length === 0;
   const verbSelectorField = verbSelector ? renderVerbSelector(verbSelector) : "";
-  const accountVaultsField = accountVaults ? renderAccountVaultsBlock(accountVaults) : "";
+  const accountVaultsField = accountVaults ? renderAccountVaultsBlock(accountVaults, clientName) : "";
   const ask = consentAsk({
     clientName,
     scopes: scopeDescriptions.map((s) => s.scope),

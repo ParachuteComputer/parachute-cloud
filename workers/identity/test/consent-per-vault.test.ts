@@ -220,3 +220,49 @@ describe("Connect says what it reads", () => {
     expect(html).toContain("What this app reads from your vault goes to the company that runs it.");
   });
 });
+
+const OAUTH_PARAMS = new Set(["client_id", "redirect_uri", "response_type", "scope", "code_challenge", "code_challenge_method", "state", "resource", "vault"]);
+/** What a browser posts for a form left as rendered: hidden inputs, checked boxes and radios, each select's chosen option. */
+function asRendered(html: string): Record<string, string> {
+  const form = /<form[^>]*action="\/oauth\/authorize"[^>]*>([\s\S]*?)<\/form>/.exec(html)?.[1] ?? "";
+  const out: Record<string, string> = {};
+  for (const m of form.matchAll(/<input\b([^>]*)>/g)) {
+    const a = m[1]!, name = /name="([^"]+)"/.exec(a)?.[1], value = /value="([^"]*)"/.exec(a)?.[1] ?? "on", type = /type="([^"]+)"/.exec(a)?.[1] ?? "text";
+    // the OAuth request itself is the caller's (consent() posts its own); only what the person chooses is taken
+    if (!name || name === "__csrf" || name === "__action" || OAUTH_PARAMS.has(name)) continue;
+    if ((type === "checkbox" || type === "radio") && !/\schecked\b/.test(a)) continue;
+    if (type === "text" || type === "email") continue;
+    out[name] = value;
+  }
+  for (const m of form.matchAll(/<select name="([^"]+)"[^>]*>([\s\S]*?)<\/select>/g)) out[m[1]!] = /<option value="([^"]+)" selected/.exec(m[2]!)?.[1] ?? /<option value="([^"]+)"/.exec(m[2]!)![1]!;
+  return out;
+}
+
+describe("a person with no vault yet (T-476: a new person who starts in the Parachute app)", () => {
+  test("the account door's page offers to let the app make their first vault, and Allow as rendered grants that", async () => {
+    const { id } = await seedUser(`new-${crypto.randomUUID().slice(0, 8)}@example.com`);
+    const sessionId = await seedSession(id);
+    const { clientId } = await seedApprovedClient({ clientName: "Parachute app" });
+    const { challenge } = await makePkce();
+    const q = { client_id: clientId, redirect_uri: REDIRECT_URI, response_type: "code", scope: "account:vaults", code_challenge: challenge, code_challenge_method: "S256", state: "s" };
+    const html = await (await handleAuthorizeGet(db(), authorizeGetReq(q, sessionId), deps())).text();
+    expect(html).toContain("can make your first vault");
+    expect(html).not.toContain("then reconnect");
+    const o = await consent(sessionId, clientId, asRendered(html));
+    expect(o.code, `${o.status} ${o.location}`).toBeTruthy();
+    expect(sorted((await redeem(o)).scope)).toContain(`account:${id}:vault-create`);
+  });
+
+  test("unticked, the app gets no way to make one", async () => {
+    const { id } = await seedUser(`new-${crypto.randomUUID().slice(0, 8)}@example.com`);
+    const sessionId = await seedSession(id);
+    const { clientId } = await seedApprovedClient();
+    const { challenge } = await makePkce();
+    const q = { client_id: clientId, redirect_uri: REDIRECT_URI, response_type: "code", scope: "account:vaults", code_challenge: challenge, code_challenge_method: "S256", state: "s" };
+    const form = asRendered(await (await handleAuthorizeGet(db(), authorizeGetReq(q, sessionId), deps())).text());
+    delete form.vault_create;
+    const o = await consent(sessionId, clientId, form);
+    expect(o.code, `${o.status} ${o.location}`).toBeTruthy();
+    expect((await redeem(o)).scope).not.toContain("vault-create");
+  });
+});
