@@ -128,6 +128,7 @@ describe("a new person who starts in the Parachute app", () => {
     expect(tok.status, await tok.clone().text()).toBe(200);
     const { access_token, scope } = (await tok.json()) as { access_token: string; scope: string };
     expect(scope).toMatch(/account:[^ ]+:vault-create/);
+    expect(scope).toMatch(/account:[^ ]+:vaults:\*:write/);
 
     // the app makes the first vault with it, and the same token lists it
     const door = ((await (await worker.fetch(new Request(`${CLOUD}/.well-known/parachute-account`), prodEnv)).json()) as { account_mcp_endpoint: string }).account_mcp_endpoint;

@@ -503,9 +503,9 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent, clientName: str
            <p style="margin:.35rem 0 .2rem">You don't have a vault yet. Allow, and ${esc(clientName)} can make your first vault with you.</p>
            <label class="verbopt">
              <input type="checkbox" name="vault_create" value="1" checked>
-             <span class="verbopt-body"><span class="verbopt-title">Create new vaults</span><span class="verbopt-desc">Let this app make vaults in your account. Uncheck to withhold, and <a href="/console">make one here</a> instead.</span></span>
+             <span class="verbopt-body"><span class="verbopt-title">Create new vaults</span><span class="verbopt-desc">Let this app make vaults in your account. Uncheck to withhold.</span></span>
            </label>
-           <p class="verbopt" style="margin:.35rem 0 0"><span class="verbopt-body"><span class="verbopt-title">Read and write your vaults</span><span class="verbopt-desc">Every vault you have now or make later: its notes, tags and attachments. What this app reads from your vaults goes to the company that runs it.</span></span></p>
+           <p class="verbopt" style="margin:.35rem 0 0"><span class="verbopt-body"><span class="verbopt-title">Read and write your vaults</span><span class="verbopt-desc">Every vault you make, here or on Parachute's website, at read and write: its notes, tags and attachments. What this app reads from your vaults goes to the company that runs it.</span></span></p>
          </fieldset>`;
   }
   // One row per vault: none, read or write (0.9.1 "one multi-vault door"). Posted as `vault_level:<vault>`; the
@@ -586,7 +586,7 @@ export function renderConsent(props: ConsentProps): string {
          ${vaultField}
          ${verbSelectorField}
          ${accountVaultsField}
-         ${replacesBox(clientName, replaces ?? null)}
+         ${replacesBox(clientName, replaces ?? null, accountVaults?.ownedVaults.length === 0)}
          <div class="row">
            <button class="deny" type="submit" name="decision" value="deny">Deny</button>
            ${nothingToPick ? "" : `<button class="primary" type="submit" name="decision" value="approve" style="margin-top:0">Allow</button>`}
@@ -634,7 +634,7 @@ function unverifiedLabel(): string {
  * untick it and keep both; an unticked box, or a form without one, replaces
  * nothing (oauth-authorize.ts handleConsentSubmit).
  */
-function replacesBox(clientName: string, note: ReplacesNote | null): string {
+function replacesBox(clientName: string, note: ReplacesNote | null, noChoice = false): string {
   if (!note) return "";
   const app = esc(clientName);
   const list = (vaults: string[]) => vaults.map(esc).join(", ");
@@ -648,11 +648,11 @@ function replacesBox(clientName: string, note: ReplacesNote | null): string {
     if (note.vaults.length > 0) {
       leads.push(`${app} already has an earlier connection to ${list(note.vaults)}.`);
       const which = note.vaults.length === 1 ? "that vault" : "one of those vaults";
-      ifs.push(note.account ? `include ${which} or choose “Any vault”` : `allow ${which} here`);
+      ifs.push(noChoice ? "allow here" : note.account ? `include ${which} or choose “Any vault”` : `allow ${which} here`);
     }
     if (note.accountWide && note.account) {
       leads.push(`${app} already has an earlier connection to every vault.`);
-      if (note.vaults.length === 0) ifs.push("choose “Any vault”");
+      if (note.vaults.length === 0) ifs.push(noChoice ? "allow here" : "choose “Any vault”");
     }
     if (leads.length === 0) return "";
     lead = `<p class="muted" style="margin:.2rem 0 .4rem">${leads.join(" ")}</p>`;

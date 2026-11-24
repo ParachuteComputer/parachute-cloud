@@ -1,0 +1,546 @@
+# Cloud Identity Worker — the authorization server for cloud vaults.
+# Reproduces the hub's OAuth issuer contract (authorize / token / register /
+# revoke / JWKS / revocation-list) on Workers + D1. Deployed to the new Parachute
+# account since the 2026-07-05 migration (was Unforced Development, Phase 5a
+# 2026-07-02) — see TRYIT-2026-07-02.md.
+#
+# ENVIRONMENTS: the TOP LEVEL of this file IS production (scripts/deploy-prod.sh;
+# custom domain cloud.parachute.computer). It cannot move into an [env.production]
+# because named envs auto-suffix the worker name (parachute-identity-production
+# would be a NEW worker) — deploying it would strand/detach the Custom Domain
+# from the worker that actually holds it. Staging lives in [env.staging] below
+# (scripts/deploy-staging.sh; workers.dev only).
+name = "parachute-identity"
+main = "src/index.ts"
+compatibility_date = "2025-07-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Keep the workers.dev URL live alongside the custom domain (a fallback + the
+# OAuth wire endpoints work cross-origin regardless of front door). Declaring a
+# route otherwise disables workers.dev by default.
+workers_dev = true
+
+# Branded front door: the console + OAuth issuer serve at cloud.parachute.computer
+# (zone parachute.computer, in the new Parachute account). Declared here so
+# `wrangler deploy` adopts (never strips) the custom domain; workers.dev stays
+# enabled as a fallback. Custom Domains can't be wildcards — per-vault subdomains
+# (*.u.parachute.computer) need proxied wildcard DNS (Enterprise); see TRYIT for
+# the enable-later steps.
+[[routes]]
+pattern = "cloud.parachute.computer"
+custom_domain = true
+
+# The Parachute app front door (P1.2, parachute-cloud#116). A SECOND Custom Domain
+# on the SAME worker: cloud. keeps 302→/console (it IS CONSOLE_REDIRECT_HOST), while
+# app. reaches the `/` Host-branch as a non-console host and serves the SPA shell
+# from Static Assets. Additive — `wrangler deploy` adopts this alongside cloud.
+# without striping it (Custom Domains attach to exactly one worker; both point here).
+[[routes]]
+pattern = "app.parachute.computer"
+custom_domain = true
+
+# my.parachute.computer — THE one-origin door (Phase A1, URL-TOPOLOGY.md rev 2,
+# "one canonical URL"). A THIRD Custom Domain on this SAME worker: `/` Host-
+# branches exactly like app. (not CONSOLE_REDIRECT_HOST, so it serves the SPA
+# shell), while `/vault/*` on this SAME hostname is claimed by a Cloudflare
+# ZONE ROUTE on the VAULT worker instead (workers/vault/wrangler.toml) — routes
+# take precedence over a Custom Domain on the same hostname (confirmed against
+# CF's "Interaction with Routes" docs, 2026-07-16), so that dispatch happens at
+# the platform layer, before this worker (or its Static Assets) ever sees the
+# request. This worker needs ONE piece of defensive code for it: the
+# `/vault`+`/vault/*` run_worker_first backstop below (route-manifest.ts
+# DEFENSIVE_PREFIXES) — a loud 503 if that zone route is ever misconfigured,
+# never a silent SPA-shell 200. See the cutover choreography in PR #<this PR>'s
+# description before flipping DNS — deploy order matters (the vault worker's
+# zone route must attach, and the placeholder my. redirect worker must be
+# retired, BEFORE this Custom Domain attaches).
+[[routes]]
+pattern = "my.parachute.computer"
+custom_domain = true
+
+# Workers Logs: persist invocation logs + console.* so `wrangler tail`, the
+# dashboard, and the logs API can actually surface them. Before this stanza the
+# account had NO persistent logs — structured failure lines like
+# event=magic_link_send_failed were emitted into the void (a tail probe captured
+# zero events, 2026-07-02). head_sampling_rate 1 = log every request; revisit if
+# volume ever costs. Restated explicitly in [env.staging] — the docs' guidance
+# on env inheritance of observability has varied; explicit beats implicit.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# Ops cron (src/ops.ts, routed by the matched pattern in controller.cron):
+#   */10 * * * *  → health check: identity D1 self-check + vault /health via
+#                   VAULT_ORIGIN + the canary vault (CANARY_VAULT_NAME below:
+#                   REST note read + MCP tools/list, wakes its DO; L6-03,
+#                   src/ops-canary.ts); failures alert every OPERATOR_ALERT_EMAIL
+#                   recipient (+ the optional OPS_ALERT_WEBHOOK_URL secret) with
+#                   a 1-hour per-check dedupe (ops_alerts, D1). Each run's
+#                   outcome is counted (ops_counters) and the same tick alerts
+#                   on a 5xx burst (OPS_5XX_ALERT_THRESHOLD per 10 min, default 25).
+#   0 14 * * 1    → weekly ops digest (Mon 14:00 UTC ≈ Monday morning MT):
+#                   counts-only from D1 (users/vaults/magic-link events).
+#   15 * * * *    → hourly onboarding-drip tick (src/drip.ts): day-0 welcome,
+#                   day-3 connect nudge (only without AI activity), day-14
+#                   feedback ask; drip_sends ledger + per-run cap + unsubscribe.
+#   30 3 * * *    → daily per-vault storage-usage rollup (src/usage.ts): read
+#                   each vault DO's live db/R2 split through the internal
+#                   config seam, upsert one D1 `vault_usage` row per vault per
+#                   UTC day (skip+log+continue per vault; USAGE_RUN_CAP bound).
+#                   THEN the daily ops line for the UTC day just ended
+#                   (src/ops-daily.ts): stored in D1 ops_daily, logged as
+#                   event=ops_daily, sent to the operator recipients + webhook,
+#                   shown on /admin, JSON at /admin/daily.json + /ops/daily.
+#   0 4 * * *     → nightly GFS snapshot sweep (src/snapshots.ts): each vault
+#                   DO snapshots itself under the owner's plan retention (paid
+#                   14 daily/8 weekly/12 monthly; free 1 rolling weekly — the
+#                   internal DR artifact) and the post-run manifest mirrors
+#                   into D1 `vault_snapshots` for the console History section.
+# The patterns here MUST stay in sync with HEALTH_CRON/DIGEST_CRON/DRIP_CRON/
+# USAGE_CRON/SNAPSHOT_CRON in ops.ts.
+[triggers]
+crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *", "30 3 * * *", "0 4 * * *"]
+
+# Control-plane state: users, clients, auth_codes, tokens, grants, sessions,
+# signing_keys. The revocation list is DERIVED from the tokens table (exactly
+# like the hub) — no separate KV needed. database_id is the real D1 in the
+# new Parachute account (`wrangler d1 create parachute-cloud-identity`
+# → database_name parachute-identity). vitest ignores it (local D1 simulation by
+# binding name); the real deploy connects to it.
+[[d1_databases]]
+binding = "DB"
+database_name = "parachute-identity"
+database_id = "5d2b6bbf-727d-4052-9b88-570778e766f6"
+migrations_dir = "migrations"
+
+# Version metadata (cloud#174 fix — the rc.92 stale-edge-propagation incident):
+# `/health` surfaces `env.CF_VERSION_METADATA.id` so a deploy script can POLL
+# for the just-uploaded version actually being served at the edge before
+# handing off to a smoke suite that exercises brand-new routes — `wrangler
+# deploy` reporting success only means the upload was accepted, not that every
+# edge PoP has picked it up yet (deploy-staging.sh does this polling; see its
+# header note). Non-inheritable like every other binding — restated in
+# [env.staging] below.
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+# The rate-limiter DO (#30): one instance per rate key (signup:<ip>,
+# login:<ip>|<email>, magic:<ip>|<email>) — atomic sliding-window counters the
+# best-effort D1 fences couldn't provide. POLICY (windows/limits) lives in
+# src/rate-limit.ts; on DO errors the send fences (signup, magic) fail OPEN and
+# the sign-in guess fences (password, 2FA, sign-in code) fail CLOSED.
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
+# SQLite-backed DO — required for ctx.storage.sql. ([[migrations]] is shared
+# across environments; the staging worker gets the same class on its own
+# namespace via [[env.staging.durable_objects.bindings]] below.)
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiterDO"]
+
+# =============================================================================
+# WORKERS STATIC ASSETS (P1.1, parachute-cloud#116) — serve the Parachute app
+# (the parachute-app SPA) FROM this worker, with run_worker_first pinning the
+# server ceremonies so the SPA catch-all can never shadow them. This adds the
+# SERVING capability only; the app.parachute.computer Custom Domain (P1.2) +
+# the ISSUER flip (Phase 4) are separate. On staging (workers.dev) it's
+# provable today.
+#
+#   directory          — the parachute-app dist, produced by scripts/build-spa.sh
+#                        (a VITE_BASE_PATH=/ origin-root build of the pinned
+#                        @openparachute/parachute-app, at the exact commit named
+#                        in scripts/spa-source.env — see that script for why the
+#                        npm-published dist is the WRONG shape) into ./dist-assets
+#                        BEFORE `wrangler deploy`. Gitignored (generated); both
+#                        deploy scripts build it first. Relative to this file.
+#   binding = ASSETS   — lets the worker's `/` Host-branch fetch the SPA shell
+#                        (index.html) for non-console hosts (src/index.ts).
+#   not_found_handling — single-page-application: any path with no matching asset
+#                        AND not run-worker-first serves index.html, so the SPA
+#                        router owns deep links AND the /oauth/callback PKCE
+#                        return (which the negation below routes here).
+#   run_worker_first   — the EXACT ceremony rule set, derived from
+#                        src/route-manifest.ts `runWorkerFirstRules()`: each
+#                        CEREMONY_PREFIXES entry → the exact path AND `<prefix>/*`
+#                        (CF's `*` is deep but needs trailing content, so
+#                        `/console/*` does NOT match bare `/console` — both are
+#                        needed); `/` for the Host-branch; `!/oauth/callback` as
+#                        the SPA carve-out. Negations have PRECEDENCE over
+#                        positives and order is insignificant (CF semantics), so
+#                        the callback reliably drops OUT of worker-first even
+#                        though `/oauth/*` matches it. run-worker-first.test.ts
+#                        asserts this array is byte-equal to the manifest.
+#                        `/vault`, `/vault/*` (Phase A1, DEFENSIVE_PREFIXES) are
+#                        NOT a ceremony — they're the my.parachute.computer
+#                        one-origin door's defensive backstop, so this worker
+#                        503s instead of the SPA shell if the vault worker's
+#                        my./vault/* zone route (workers/vault/wrangler.toml)
+#                        ever goes missing.
+#                        `/mcp`, `/mcp/*` (parachute-cloud#196,
+#                        DEFENSIVE_PREFIXES) are the analogous backstop for
+#                        the canonical MCP connector URL: this worker 503s if
+#                        the vault worker's my./mcp* zone route ever goes
+#                        missing. The parachute-app service-worker denylist
+#                        half is a separate follow-up per PR #195's Judgment
+#                        call.
+# =============================================================================
+[assets]
+directory = "./dist-assets"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = [
+  "/.well-known", "/.well-known/*",
+  "/oauth", "/oauth/*",
+  "/signup", "/signup/*",
+  "/login", "/login/*",
+  "/logout", "/logout/*",
+  "/auth", "/auth/*",
+  "/console", "/console/*",
+  "/admin", "/admin/*",
+  "/billing", "/billing/*",
+  "/unsubscribe", "/unsubscribe/*",
+  "/health", "/health/*",
+  "/__test", "/__test/*",
+  "/ops", "/ops/*",
+  "/account/*",
+  "/vault", "/vault/*",
+  "/mcp", "/mcp/*",
+  "/",
+  "!/oauth/callback",
+]
+
+[vars]
+# These are the LIVE values, so the deployed config is SELF-CONTAINED: a bare
+# `wrangler deploy` sets the correct `iss` and can't silently revert it (the prior
+# id.parachute.computer placeholder + deploy-time `--var` meant a bare deploy broke
+# every new token). The conformance corpus reads these dynamically (it compares
+# md.issuer to env.ISSUER), so the value can change here without breaking tests.
+#
+# ISSUER — every token's `iss` + the discovery-doc base. A cloud vault has no hub,
+# so `iss` must equal a real, reachable origin: the branded console host.
+ISSUER = "https://cloud.parachute.computer"
+# CONSOLE_REDIRECT_HOST (P1.1) — the ONE host whose `/` keeps 302→/console during
+# the bridge (the legacy console front door). Every OTHER host that reaches this
+# worker at `/` — the app.parachute.computer Custom Domain (added in P1.2) and the
+# staging workers.dev origin — serves the SPA shell instead (src/index.ts root
+# handler). Set here so cloud.parachute.computer/ stays byte-identical to today;
+# UNSET on staging so the workers.dev origin serves the SPA at root (making the
+# Static-Assets serving provable before any Custom Domain exists). Compared as a
+# bare host (no scheme); unset ⇒ every host serves the SPA at root.
+CONSOLE_REDIRECT_HOST = "cloud.parachute.computer"
+# BOUND_ORIGINS (P0.5 / P1.3 / A1) — extra origins the same-origin gate accepts,
+# beyond ISSUER (which is ALWAYS accepted). Comma-separated; each entry is
+# normalized to a bare origin. SET to app.parachute.computer + my.parachute.computer
+# now that BOTH are co-equal SERVING origins for the ceremonies (P1.3 added app.;
+# A1 adds my., the one-origin door's Custom Domain on this SAME worker): every
+# cookie-authed POST from either (magic-link request, signup, login, consent,
+# checkout) must pass the same-origin gate — without this the accept-set is only
+# [ISSUER=cloud.] and every app./my.-origin POST is rejected as "session expired".
+# The token issuer stays cloud. (iss / discovery `issuer` / JWKS / aud unchanged);
+# this widens ONLY the origins a POST's Origin/Referer may match. Widening the
+# accept-set never weakens CSRF (an independent conjunct) and never admits a
+# foreign origin. my. is a legitimate CSRF-set member (unlike VAULT_ORIGIN/u. —
+# see audience.ts's ResolveResourceOpts note): my. serves real cookie-authed
+# ceremonies through THIS worker, my./vault/* is a SEPARATE zone-routed worker
+# that never reads this worker's cookies (see the vault worker's Bearer-only
+# conformance pin, workers/vault/test/bearer-only.test.ts).
+BOUND_ORIGINS = "https://app.parachute.computer,https://my.parachute.computer"
+# OWNER_PUBKEY (T-414) — DELIBERATELY UNSET on Parachute Cloud (production and staging). Only a single-owner
+# deploy on someone's own Cloudflare sets it (64-hex or npub1…): on an instance with NO accounts, the first NIP-98
+# sign-in (POST /account/token) signed by that key creates the key-only owner. Once any account exists it does
+# nothing. Set, it also opens POST /account/session-link (T-442: the owner's account token → a one-time browser
+# sign-in link, so the owner can approve OAuth apps); unset, that route is a 404. See src/nostr-auth.ts and
+# src/account-session-link.ts.
+# APP_ORIGIN (#116; my.-canonical Phase 1) — where a new arrival lands: the app
+# deep-link target for the post-create 303, the vault cards' "Open your notes"
+# door, the checklist doors, and the day-0 welcome email link. Re-pointed from
+# app. → my. now that my.parachute.computer is the ONE advertised human origin
+# (VAULT_PUBLIC_ORIGIN is already my.): a new arrival lands at
+# my.parachute.computer/?add=… on the SAME origin its vault URL already names, so
+# the whole journey (signup → create → notes) is one origin end-to-end. app.
+# still serves the identical SPA (a co-equal Custom Domain on this worker) and is
+# additionally 301'd to my. by the app-redirect zone-route worker — so this only
+# changes where NEW arrivals are POINTED. UNSET ⇒ the legacy standalone Notes PWA
+# (a stale config degrades to a live serving origin, not a 404). The token issuer
+# is UNCHANGED (still cloud.): this is an advertised-origin change only.
+APP_ORIGIN = "https://my.parachute.computer"
+# Cloud addressing base. With VAULT_ORIGIN set (below) the service-catalog +
+# console cards use the path form; unset it to fall back to `https://<name>.<base>`.
+VAULT_BASE_DOMAIN = "u.parachute.computer"
+# The vault worker's MACHINE-reachability origin — vaults route by PATH
+# (`<origin>/vault/<name>/…`) on the single branded host (no wildcard subdomain
+# cert yet). Drives the OAuth services catalog, internal vault-worker dispatch
+# (vault-call.ts), and the scheduled health check (`<VAULT_ORIGIN>/health`,
+# which only exists at u.'s root — my. doesn't route it). u. stays a
+# permanently recognized alias; see VAULT_PUBLIC_ORIGIN below for what we
+# actually ADVERTISE now.
+VAULT_ORIGIN = "https://u.parachute.computer"
+# The vault's PUBLIC, human-facing origin (A3 URL coherence) — what the console
+# connect cards, the Connect-your-AI walkthrough, the account descriptor/API,
+# and the day-0 welcome email PRINT/COPY/LINK. `oauth-shared.ts
+# vaultAdvertisedUrl` falls back to VAULT_ORIGIN when this is unset, which is
+# exactly staging's posture below (no my. there) — so only prod sets it.
+VAULT_PUBLIC_ORIGIN = "https://my.parachute.computer"
+# Deployment environment. "production" here (the top level IS the production
+# deploy, on the live custom domain): the magic-link send NEVER echoes the link
+# in the `x-parachute-dev-magic-link` response header. Headless/smoke testing of
+# the magic-link flow happens on STAGING ([env.staging] below, ENVIRONMENT
+# "staging"), where the echo header is on and the email sender falls back to
+# dev-log (no send_email binding there). Tests pin their own value in
+# vitest.config.ts (miniflare bindings), so this var doesn't affect the suite.
+ENVIRONMENT = "production"
+# FROM address for magic-link email. Its domain must be onboarded to Cloudflare
+# Email Sending before real sends succeed (see the send_email binding note below).
+EMAIL_FROM = "noreply@parachute.computer"
+# Where the health-check alerts, the weekly ops digest and the daily ops line go
+# (src/ops.ts, src/ops-daily.ts). A LIST is accepted (comma-separated); every
+# address gets every message. Optional secrets, set with `wrangler secret put`:
+#   OPS_ALERT_WEBHOOK_URL — a second, non-email channel for alerts + the daily
+#                           line: POST JSON {text, severity, key, at} (ntfy.sh
+#                           topic URL, Slack-compatible or Buzz incoming webhook).
+#   OPS_READ_TOKEN        — bearer for GET /ops/daily (operator agent reads the
+#                           daily lines without a browser). Unset → 404.
+#   OPS_RUN_TOKEN         — bearer for POST /ops/snapshot-run (re-run the stale
+#                           vaults' backups now) and /ops/vault-import* (move a
+#                           person's vault into their account). Unset → 404.
+#   OPS_DELETE_TOKEN      — bearer for POST /ops/account-delete (erase ONE account
+#                           on its holder's written request). Set only for the
+#                           job that needs it, deleted after. Unset → 404.
+#   OPS_CANARY_TOKEN      — bearer for POST /ops/canary-token (a 5-minute
+#                           read-only token for the canary vault only, for the
+#                           external uptime check). Unset → 404.
+OPERATOR_ALERT_EMAIL = "ag@unforced.org"
+# The canary vault the health cron reads every 10 minutes through the vault
+# worker (L6-03, src/ops-canary.ts). Empty = no canary (one skip line per tick).
+# Must be owned by an operator account; its note is CANARY_NOTE (default
+# "canary"). Setup: docs/UPTIME.md.
+CANARY_VAULT_NAME = ""
+# --- money switch (T-318, Aaron 10-29: "Parachute open beta") -----------------
+# BILLING_MODE = "open_beta" | "paid" (src/billing-config.ts billingMode). UNSET
+# means open_beta, and so does any unknown value (the safe direction: nobody is
+# charged and no vault freezes on a typo). In open_beta: no trial clock on new
+# sign-ups, the hourly sweep never floors anyone to `expired`, no vault is
+# frozen, checkout/portal/promo answer 409 billing_paused, and every page tells
+# the one money story. All Stripe code + the Price ids below stay in place,
+# dormant; the webhook keeps reconciling any existing subscription. Flip to
+# "paid" (here AND in [env.staging.vars]) only with Aaron's go-ahead.
+BILLING_MODE = "open_beta"
+# --- Stripe billing (Wave 4d; full 4-tier × interval matrix) -------------------
+# Billing activates only when the two secrets + the four per-tier ANCHOR Prices
+# (standard/plus/power monthly + entry quarterly) exist (src/billing-config.ts);
+# until then /billing/* answers 503 and the console shows no billing UI. The
+# non-anchor Prices are additive — a missing one only disables that ONE
+# (tier, interval) combination (checkout → billing_err=invalid).
+#   Secrets (NEVER in this file — per environment):
+#     wrangler secret put STRIPE_SECRET_KEY                (sk_live_… here; sk_test_… on staging)
+#     wrangler secret put STRIPE_WEBHOOK_SECRET            (whsec_… from the dashboard webhook
+#                                                           endpoint pointing at POST /billing/webhook,
+#                                                           events: checkout.session.completed,
+#                                                           invoice.paid, invoice.payment_failed,
+#                                                           customer.subscription.deleted,
+#                                                           customer.subscription.updated)
+#   Price ids (not secret — the LIVE-mode catalog, copied from the sandbox
+#   2026-07-06 and wired below; the TEST-mode catalog stays in [env.staging.vars]
+#   for staging. Amounts live on the Prices; entry has NO monthly — Stripe's flat
+#   fee eats a $1 charge, so entry bills quarterly/yearly):
+STRIPE_PRICE_ENTRY_QUARTERLY = "price_1TqJlPIkisoTdlLqJoCC4RF2"     # $3 / 3 months
+STRIPE_PRICE_ENTRY_YEARLY = "price_1TqJlOIkisoTdlLqtz2FU70t"        # $10 / yr
+STRIPE_PRICE_STANDARD_MONTHLY = "price_1TqJlLIkisoTdlLqwI2s2Dnh"    # $3 / mo
+STRIPE_PRICE_STANDARD_QUARTERLY = "price_1TqJlKIkisoTdlLqCeiVroxd"  # $7 / 3 months
+STRIPE_PRICE_STANDARD_YEARLY = "price_1TqJlKIkisoTdlLqPEzR54PP"     # $25 / yr
+STRIPE_PRICE_PLUS_MONTHLY = "price_1TqJlLIkisoTdlLqeMCZ0LRf"        # $5 / mo
+STRIPE_PRICE_PLUS_QUARTERLY = "price_1TqJlKIkisoTdlLqOWh1edDh"      # $12 / 3 months
+STRIPE_PRICE_PLUS_YEARLY = "price_1TqJlKIkisoTdlLqkyiPNzvZ"         # $40 / yr
+STRIPE_PRICE_POWER_MONTHLY = "price_1TqJlLIkisoTdlLqH0VxbJk7"       # $10 / mo
+STRIPE_PRICE_POWER_QUARTERLY = "price_1TqJlKIkisoTdlLqgrtikZGG"     # $25 / 3 months
+STRIPE_PRICE_POWER_YEARLY = "price_1TqJlJIkisoTdlLq8eE3JSBr"        # $80 / yr
+# --- interim MOCK billing (mock-payments PR) ----------------------------------
+# The mock checkout demos the full upgrade → cap/voice-lift flow BEFORE real
+# Stripe keys land. It is HARD-gated to the isDevExposureEnv allowlist
+# (billing-config.ts mockBillingEnabled): ENVIRONMENT="production" here means
+# the mock is ALWAYS off and /billing/mock-checkout 404s — a free self-upgrade
+# is unreachable in prod (pinned by a test + smoke-prod). So there is NOTHING
+# to set here: MOCK_BILLING is intentionally NOT declared in this production
+# block. It auto-activates only on allowlisted deploys with no real Stripe
+# (staging), and goes inert the moment real keys land. (MOCK_BILLING="1" is
+# an optional allowlist-only override.)
+
+# --- outbound email (Cloudflare Email Sending) ------------------------------
+# Cloudflare Email Sending (public beta, Workers Paid). parachute.computer was
+# onboarded 2026-07-02 (`wrangler email sending enable` — SPF + DKIM live in the
+# zone), so the binding below makes magic-link email REAL. senderFor()
+# (src/index.ts) auto-detects it; with no binding it falls back to the dev-log
+# sender. NOTE the echo affordance is independent of the sender: on the
+# isDevExposureEnv allowlist (staging | development | test), POST /auth/magic
+# ALSO returns the link in the `x-parachute-dev-magic-link` header (headless
+# tests + smoke depend on it); a production deploy (ENVIRONMENT="production"),
+# and any unset/misspelled ENVIRONMENT, never emits the header.
+[[send_email]]
+name = "EMAIL"
+
+# =============================================================================
+# STAGING — `wrangler deploy -e staging` → worker "parachute-identity-staging"
+# (named envs auto-suffix the name), served ONLY at its workers.dev URL. Own D1,
+# echo header ON (ENVIRONMENT="staging" is on the allowlist), and DELIBERATELY no send_email
+# binding: bindings are non-inheritable, so staging's sender is the dev-log
+# fallback — POST /auth/magic sends no real email and the echo header is the
+# deterministic way smoke-staging.ts completes the flow.
+# Deploy via scripts/deploy-staging.sh; smoke via bun scripts/smoke-staging.ts.
+# =============================================================================
+[env.staging]
+# Staging runs on its OWN Cloudflare account, "Parachute Staging" (T-432), never on production's: an env-level
+# account_id beats CLOUDFLARE_ACCOUNT_ID in wrangler, so `-e staging` can only reach this account, and a key minted for
+# it gets 403 anywhere else. The top level (production) has no account_id and keeps taking CLOUDFLARE_ACCOUNT_ID from
+# scripts/deploy-prod.sh. Mirrors scripts/staging-account.env (test-bun/staging-account.test.ts holds them equal).
+account_id = "5b543fa4332a619203356ae1418af504"
+workers_dev = true
+# `routes` IS inheritable — without this override a staging deploy would adopt
+# the production [[routes]] custom domain (Custom Domains attach to exactly one
+# worker, so parachute-identity-staging would DETACH cloud.parachute.computer
+# from production). An explicit empty list keeps staging on workers.dev only.
+routes = []
+
+# Staging's own control-plane D1 on the staging account. scripts/staging-bootstrap.sh
+# creates it once and writes its id here (and into scripts/staging-account.env);
+# until then the id is the all-zero placeholder and deploy-staging.sh refuses.
+# Same migrations dir; the deploy script applies migrations + seeds the dev user here.
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "parachute-identity-staging"
+database_id = "eed4ddc9-b4aa-4e32-b8db-82c32c823a11"
+migrations_dir = "migrations"
+
+# Non-inheritable, restated: version metadata — the propagation-poll signal
+# deploy-staging.sh reads before handing off to the smoke suite (see the
+# top-level [version_metadata] note).
+[env.staging.version_metadata]
+binding = "CF_VERSION_METADATA"
+
+# Bindings are non-inheritable: restate the rate-limiter DO. Same class; a
+# different worker (parachute-identity-staging) = its own DO namespace, so
+# staging counters never mix with production's.
+[[env.staging.durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
+# STAGING-ONLY service binding to the vault worker. Staging's VAULT_ORIGIN is a
+# workers.dev URL, which is NOT a valid subrequest target from inside a Worker
+# (the platform answers 404 without routing — the standing vault-health cron
+# alert on staging is the same restriction). Server-side vault calls
+# (POST /console/packs) dispatch through this binding here; PRODUCTION stays on
+# plain fetch to its custom-domain VAULT_ORIGIN (a proven subrequest target —
+# the health cron passes there), so no top-level binding: the vitest config
+# reads this file's top level and a service binding would need an auxiliary
+# worker under miniflare. Deploy order: the vault worker must exist before an
+# identity deploy referencing it (deploy-staging.sh deploys vault first).
+[[env.staging.services]]
+binding = "VAULT_SERVICE"
+service = "parachute-vault-do-staging"
+
+# Static Assets for staging — NON-inheritable, so restate the top-level [assets]
+# verbatim (same dist-assets dir, same run_worker_first rule set). This is what
+# makes P1.1 provable on staging: the workers.dev origin serves the SPA at root
+# (CONSOLE_REDIRECT_HOST is UNSET in [env.staging.vars], so `/` → SPA there) while
+# every ceremony still runs the worker first. run-worker-first.test.ts pins this
+# array byte-equal to the top-level one AND to the manifest.
+[env.staging.assets]
+directory = "./dist-assets"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = [
+  "/.well-known", "/.well-known/*",
+  "/oauth", "/oauth/*",
+  "/signup", "/signup/*",
+  "/login", "/login/*",
+  "/logout", "/logout/*",
+  "/auth", "/auth/*",
+  "/console", "/console/*",
+  "/admin", "/admin/*",
+  "/billing", "/billing/*",
+  "/unsubscribe", "/unsubscribe/*",
+  "/health", "/health/*",
+  "/__test", "/__test/*",
+  "/ops", "/ops/*",
+  "/account/*",
+  "/vault", "/vault/*",
+  "/mcp", "/mcp/*",
+  "/",
+  "!/oauth/callback",
+]
+
+# vars are non-inheritable: restate the full set, pointed at the staging
+# workers.dev origins. ISSUER is staging's own origin (tokens minted here carry
+# iss=<staging identity>, and the staging vault worker's ISSUER_ORIGIN matches).
+[env.staging.vars]
+ISSUER = "https://parachute-identity-staging.parachute-staging.workers.dev"
+# CONSOLE_REDIRECT_HOST (P1.1) is DELIBERATELY UNSET on staging — the omission is
+# the point: with no console-redirect host, `/` serves the SPA shell at the
+# staging workers.dev origin, so the Static-Assets serving is provable here
+# before any Custom Domain exists. Production sets it to cloud.parachute.computer
+# so only that host keeps 302→/console.
+# BOUND_ORIGINS (P0.5 / P1.3) — see the production [vars] note. DELIBERATELY UNSET on
+# staging: staging is SINGLE-origin (APP_ORIGIN == ISSUER — the app is served AT the
+# staging issuer host), so ISSUER already covers the one origin every POST comes from
+# and there is no second origin to add. The two-origin (app. ≠ cloud.) path can't be
+# rehearsed on staging; it's covered by the origin-aware unit tests and a prod smoke.
+# APP_ORIGIN (#116) — SELF-REFERENTIAL on staging: the app is served AT this
+# issuer origin (Static Assets on the staging workers.dev host, CONSOLE_REDIRECT_
+# HOST unset), so the post-create arrival + card/checklist deep-links + the drip
+# link all point back to this same origin (`<issuer>/?add=…`) — zero cross-origin
+# hops, exactly the production shape rehearsed on one origin.
+APP_ORIGIN = "https://parachute-identity-staging.parachute-staging.workers.dev"
+VAULT_BASE_DOMAIN = "parachute-vault-do-staging.parachute-staging.workers.dev"
+VAULT_ORIGIN = "https://parachute-vault-do-staging.parachute-staging.workers.dev"
+# VAULT_PUBLIC_ORIGIN is DELIBERATELY UNSET on staging — there is no my. there,
+# so `vaultAdvertisedUrl` falls back to VAULT_ORIGIN above and staging keeps
+# advertising its own workers.dev vault origin unchanged (A3 URL coherence;
+# see the production [vars] note above VAULT_PUBLIC_ORIGIN).
+ENVIRONMENT = "staging"
+EMAIL_FROM = "noreply@parachute.computer"
+# Same operator address as production — but staging has no send_email binding,
+# so ops alerts/digests land in the worker log (devlog sender), never an inbox.
+OPERATOR_ALERT_EMAIL = "ag@unforced.org"
+CANARY_VAULT_NAME = ""  # the canary vault; see the production [vars] note
+# Money switch — restated per env (named envs don't inherit [vars]); see the
+# production [vars] note. Staging walks the open beta too.
+BILLING_MODE = "open_beta"
+# Stripe billing (staging = TEST-mode catalog, account "Open Parachute PBC
+# sandbox"). The secrets are already set (`wrangler secret put STRIPE_SECRET_KEY
+# -e staging` + `STRIPE_WEBHOOK_SECRET -e staging`; the webhook endpoint points
+# at staging /billing/webhook), and the TEST-mode Price ids below complete the
+# config — staging billing is REAL (test-mode) Checkout. The ids also carry
+# `metadata.plan`/`metadata.interval` + lookup keys `<plan>_<interval>` on the
+# Stripe side. See the production [vars] block for the anchor/additive split.
+STRIPE_PRICE_ENTRY_QUARTERLY = "price_1TqDRbEzI43yjgruVRBKGVhB"    # $3 / 3 months
+STRIPE_PRICE_ENTRY_YEARLY = "price_1TqDRbEzI43yjgrukqPkNDLs"       # $10 / yr
+STRIPE_PRICE_STANDARD_MONTHLY = "price_1TqDRbEzI43yjgruNJ0q9lLJ"   # $3 / mo
+STRIPE_PRICE_STANDARD_QUARTERLY = "price_1TqDRbEzI43yjgruFwplGZP8" # $7 / 3 months
+STRIPE_PRICE_STANDARD_YEARLY = "price_1TqDRbEzI43yjgruxCDggYoE"    # $25 / yr
+STRIPE_PRICE_PLUS_MONTHLY = "price_1TqDRcEzI43yjgru2a3W8iiR"       # $5 / mo
+STRIPE_PRICE_PLUS_QUARTERLY = "price_1TqDRcEzI43yjgruKTZ0SjrW"     # $12 / 3 months
+STRIPE_PRICE_PLUS_YEARLY = "price_1TqDRcEzI43yjgruWhWtyBMm"        # $40 / yr
+STRIPE_PRICE_POWER_MONTHLY = "price_1TqDRcEzI43yjgrua4AO4ewF"      # $10 / mo
+STRIPE_PRICE_POWER_QUARTERLY = "price_1TqDRdEzI43yjgru9VAzmMKh"    # $25 / 3 months
+STRIPE_PRICE_POWER_YEARLY = "price_1TqDRdEzI43yjgru1qOvsRns"       # $80 / yr
+# Interim MOCK billing (mock-payments PR): with the full TEST-mode Stripe
+# config above, the mock checkout is INERT here — the real (test-mode) Checkout
+# path is active and /billing/mock-checkout 404s. MOCK_BILLING="1" would force
+# the mock back ON (staging-only demo escape hatch) — normally leave it unset.
+
+# Workers Logs for staging too (explicit per-env restatement; see the top-level
+# [observability] note).
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1
+
+# Same cron schedule as production: the health check + digest + drip + usage
+# rollup + snapshot sweep RUN on staging (exercising the real cron path), with
+# output to the log instead of email (no send_email binding → devlog sender
+# captures drip sends too; the usage rollup + snapshot sweep email no one).
+[env.staging.triggers]
+crons = ["*/10 * * * *", "0 14 * * 1", "15 * * * *", "30 3 * * *", "0 4 * * *"]
+
+# (no [[env.staging.send_email]] — see the staging banner above; the omission is
+# the point: dev-log sender + echo header = deterministic headless testing.)

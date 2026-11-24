@@ -250,7 +250,7 @@ describe("a person with no vault yet (T-476: a new person who starts in the Para
     expect(html).not.toContain("then reconnect");
     const o = await consent(sessionId, clientId, asRendered(html));
     expect(o.code, `${o.status} ${o.location}`).toBeTruthy();
-    expect(sorted((await redeem(o)).scope)).toContain(`account:${id}:vault-create`);
+    expect(sorted((await redeem(o)).scope)).toEqual([`account:${id}:vault-create`, `account:${id}:vaults:*:write`]);
   });
 
   test("unticked, the app gets no way to make one", async () => {
@@ -263,6 +263,7 @@ describe("a person with no vault yet (T-476: a new person who starts in the Para
     delete form.vault_create;
     const o = await consent(sessionId, clientId, form);
     expect(o.code, `${o.status} ${o.location}`).toBeTruthy();
-    expect((await redeem(o)).scope).not.toContain("vault-create");
+    // unticked: no making vaults, and the read and write the page says still stands (review r1)
+    expect((await redeem(o)).scope).toBe(`account:${id}:vaults:*:write`);
   });
 });
