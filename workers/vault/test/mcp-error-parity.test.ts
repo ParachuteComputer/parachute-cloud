@@ -12,10 +12,12 @@
  * P11 contract-honest-queries.test:101-110 / mcp-http:255-263.
  * Unpinned: schema_validation/transition_conflict hints and size/max_bytes/mime_type.
  * parent_cycle belongs to B3; existing standing controls remain unedited.
+ * Since T-476 (one way to refuse) the mapping is the engine's own (core mcp-refusal.ts refusalOfError), and each
+ * refusal is an isError result with structuredContent {error_type, message, ...}: these hold the types and fields.
  */
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { base, createNote, freshVault, mintToken } from "./helpers.ts";
+import { base, createNote, freshVault, mintToken, refused } from "./helpers.ts";
 
 const ADMIN = (v: string) => mintToken({ vault: v, scopes: `vault:${v}:admin vault:${v}:write vault:${v}:read` });
 async function fixture() {
@@ -32,22 +34,16 @@ async function fixture() {
   };
   return { vault, call };
 }
-function error(body: any, code: number, error_type: string) {
-  expect(body.result).toBeUndefined();
-  expect(body.error?.code).toBe(code);
-  expect(body.error.data.error_type).toBe(error_type);
-  return body.error.data;
-}
 describe("B5 MCP domain error parity", () => {
   it("P1 legacy QueryError is structured", async () => {
     const f = await fixture();
     // Since 0.9.2 a plain list scans an unindexed field (with a warning); aggregate still refuses one.
     const b = await f.call("query-notes", { aggregate: { op: "count", group_by: f.vault } });
-    expect(error(b, -32602, "invalid_query").code).toBe("FIELD_NOT_INDEXED");
+    expect(refused(b, "invalid_query").code).toBe("FIELD_NOT_INDEXED");
   });
   it("P2 invalid cursor is structured", async () => {
     const f = await fixture();
-    error(await f.call("query-notes", { cursor: "not-a-valid-cursor!!!" }), -32602, "cursor_invalid");
+    refused(await f.call("query-notes", { cursor: "not-a-valid-cursor!!!" }), "cursor_invalid");
   });
   it("P3 cursor query mismatch is structured", async () => {
     const f = await fixture();
@@ -55,52 +51,52 @@ describe("B5 MCP domain error parity", () => {
     const b = await f.call("query-notes", { tag: f.vault + "a", cursor: "" });
     const page = JSON.parse(b.result.content[0].text);
     expect(typeof page.next_cursor).toBe("string");
-    error(await f.call("query-notes", { tag: f.vault + "b", cursor: page.next_cursor }), -32602, "cursor_query_mismatch");
+    refused(await f.call("query-notes", { tag: f.vault + "b", cursor: page.next_cursor }), "cursor_query_mismatch");
   });
   it("P4 duplicate path preserves path", async () => {
     const f = await fixture();
     expect((await f.call("create-note", { path: f.vault, content: "a" })).error).toBeUndefined();
     const b = await f.call("create-note", { path: f.vault, content: "a" });
-    expect(error(b, -32600, "path_conflict").path).toBe(f.vault);
+    expect(refused(b, "path_conflict").path).toBe(f.vault);
   });
   it("P5 ambiguous path preserves candidates", async () => {
     const f = await fixture();
     for (const extension of ["md", "csv"]) expect((await f.call("create-note", { path: f.vault, content: extension, extension })).error).toBeUndefined();
     const b = await f.call("query-notes", { id: f.vault });
-    const d = error(b, -32600, "ambiguous_path");
+    const d = refused(b, "ambiguous_path");
     expect(d.path).toBe(f.vault);
     expect(d.candidates).toHaveLength(2);
   });
   it("P6 invalid extension preserves reason", async () => {
     const f = await fixture();
-    const d = error(await f.call("create-note", { content: "x", extension: "CSV" }), -32602, "invalid_extension");
+    const d = refused(await f.call("create-note", { content: "x", extension: "CSV" }), "invalid_extension");
     expect(d.extension).toBe("CSV");
     expect(typeof d.reason).toBe("string");
   });
-  it("P7 oversized batch is InvalidRequest", async () => {
+  it("P7 oversized batch says its limit", async () => {
     const f = await fixture();
-    const d = error(await f.call("create-note", { notes: Array.from({ length: 501 }, (_, i) => ({ content: "n" + i })) }), -32600, "batch_too_large");
+    const d = refused(await f.call("create-note", { notes: Array.from({ length: 501 }, (_, i) => ({ content: "n" + i })) }), "batch_too_large");
     expect(d.limit).toBe(500);
     expect(d.got).toBe(501);
   });
   it("P8 field conflict preserves tag and violations", async () => {
     const f = await fixture();
     expect((await f.call("update-tag", { tag: f.vault + "a", fields: { [f.vault]: { type: "string" } } })).error).toBeUndefined();
-    const d = error(await f.call("update-tag", { tag: f.vault + "b", fields: { [f.vault]: { type: "integer" } } }), -32602, "tag_field_conflict");
+    const d = refused(await f.call("update-tag", { tag: f.vault + "b", fields: { [f.vault]: { type: "integer" } } }), "tag_field_conflict");
     expect(d.tag).toBe(f.vault + "b");
     expect(d.violations[0]).toMatchObject({ field: f.vault, reason: "type_conflict", other_tag: f.vault + "a" });
   });
   it("P9 precondition includes hint", async () => {
     const f = await fixture();
     const n = await createNote(f.vault, { content: "v1" });
-    const d = error(await f.call("update-note", { id: n.id, content: "v2" }), -32602, "precondition_required");
+    const d = refused(await f.call("update-note", { id: n.id, content: "v2" }), "precondition_required");
     expect(d.note_id).toBe(n.id);
     expect(typeof d.hint).toBe("string");
   });
   it("P10 conflict includes hint", async () => {
     const f = await fixture();
     const n = await createNote(f.vault, { content: "v1" });
-    const d = error(await f.call("update-note", { id: n.id, content: "v2", if_updated_at: "2000-01-01T00:00:00.000Z" }), -32600, "conflict");
+    const d = refused(await f.call("update-note", { id: n.id, content: "v2", if_updated_at: "2000-01-01T00:00:00.000Z" }), "conflict");
     expect(d.note_id).toBe(n.id);
     expect(d).toHaveProperty("current_updated_at");
     expect(d).toHaveProperty("your_updated_at");
@@ -108,7 +104,7 @@ describe("B5 MCP domain error parity", () => {
   });
   it("P11 honest query ordering does not add code", async () => {
     const f = await fixture();
-    const d = error(await f.call("query-notes", { limit: -1 }), -32602, "invalid_query");
+    const d = refused(await f.call("query-notes", { limit: -1 }), "invalid_query");
     expect(d.field).toBe("limit");
     expect(d.code).toBeUndefined();
   });

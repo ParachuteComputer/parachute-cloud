@@ -70,7 +70,11 @@ function app() {
     const r = await call("/account/mcp", { method: "POST", auth: `Bearer ${bearer}`, body: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } } });
     if (r.status !== 200) return { ok: false as const, status: r.status, message: r.text };
     if (r.json.error) return { ok: false as const, status: 200, message: String(r.json.error.message), data: r.json.error.data };
-    if (r.json.result?.isError) return { ok: false as const, status: 200, message: String(r.json.result.content?.[0]?.text) };
+    // A refusal (one way to refuse, T-476): its words, and the whole refusal as data.
+    if (r.json.result?.isError) {
+      const sc = r.json.result.structuredContent;
+      return { ok: false as const, status: 200, message: String(sc?.message ?? r.json.result.content?.[0]?.text), data: sc };
+    }
     return { ok: true as const, value: JSON.parse(r.json.result.content[0].text) };
   };
   const tools = async (bearer: string) =>
@@ -160,7 +164,8 @@ describe("one multi-vault door: a key read on A and write on B", () => {
     ).token;
     expect((await a.tool(grant, "query-notes", { vault: o.A })).ok).toBe(true);
     expect(a.hops[0]!.claims.scope).toBe(`vault:${o.A}:read`);
-    expect((await a.tool(grant, "create-note", { vault: o.A, path: "x", content: "y" })).ok).toBe(false);
+    const ro = await a.tool(grant, "create-note", { vault: o.A, path: "x", content: "y" });
+    expect(ro.ok ? null : ro.data?.error_type).toBe("vault_read_only");
     expect(a.hops.length).toBe(1);
     const w = await a.tool(grant, "create-note", { vault: o.B, path: "x", content: "y" });
     expect(w.ok, JSON.stringify(w)).toBe(true);
@@ -180,6 +185,8 @@ describe("one multi-vault door: a key read on A and write on B", () => {
     }
     const r = await a.tool(key, "create-note", { path: "x", content: "where?" });
     expect(r.ok).toBe(false);
+    expect(r.ok ? null : r.data?.error_type).toBe("vault_required");
+    expect(r.ok ? null : r.data?.vaults).toEqual({ [o.A]: "read", [o.B]: "write" });
     expect(r.ok ? "" : r.message).toContain(`${o.A} (read)`);
     expect(r.ok ? "" : r.message).toContain(`${o.B} (write)`);
     expect(a.hops.length).toBe(0);
@@ -200,7 +207,7 @@ describe("one multi-vault door: a key read on A and write on B", () => {
     const after = await a.tool(key, "list-vaults", {});
     expect((after.ok ? after.value.vaults : []).map((v: any) => v.name)).toEqual([o.A]);
     const w = await a.tool(key, "create-note", { vault: o.B, path: "x", content: "y" });
-    expect(w.ok).toBe(false);
+    expect(w.ok ? null : w.data?.error_type).toBe("vault_not_covered");
     expect(a.hops.filter((h) => h.vault === o.B).length).toBe(0);
   });
 

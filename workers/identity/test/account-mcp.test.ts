@@ -25,7 +25,7 @@ import { ACCOUNT_TOKEN_AUDIENCE } from "../src/account-auth.ts";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "../src/account-token.ts";
 import { frontDoorOrigin, type OAuthDeps } from "../src/oauth-shared.ts";
 import { signAccessToken } from "../src/tokens.ts";
-import { ISSUER, db, deps, seedUser, seedVault } from "./helpers.ts";
+import { ISSUER, db, deps, refused, seedUser, seedVault } from "./helpers.ts";
 
 const BOTH_ACCEPT = "application/json, text/event-stream";
 const MCP_URL = `${ISSUER}/account/mcp`;
@@ -416,7 +416,7 @@ describe("account MCP — coverage resolves by OWNERSHIP at request time", () =>
       mcpDeps({ vaultFetch: vaultFetchBy({}) }),
     );
     const { body } = await callJson(res);
-    expect(body.error.data.error_type).toBe("vault_not_covered");
+    expect(refused(body, "vault_not_covered").message).toContain("someone-elses");
   });
 });
 
@@ -453,7 +453,12 @@ describe("account MCP — query-notes fan-out", () => {
     await seedVault("good", id);
     await seedVault("bad", id);
     const { token } = await mintVaultsToken(id, { blanket: true });
-    const vaultFetch = vaultFetchBy({ good: [{ id: "g1" }], bad: { status: 500, body: { error: "boom" } } });
+    await seedVault("gone", id);
+    const vaultFetch = vaultFetchBy({
+      good: [{ id: "g1" }],
+      bad: { status: 500, body: { error: "boom" } },
+      gone: { status: 404, body: { error: "Not Found", error_type: "not_found" } },
+    });
     const res = await handleAccountMcp(
       db(),
       mcpReq(token, rpc("tools/call", { name: "query-notes", arguments: {} })),
@@ -462,7 +467,9 @@ describe("account MCP — query-notes fan-out", () => {
     const out = toolPayload((await callJson(res)).body);
     const byVault = Object.fromEntries(out.results.map((r: any) => [r.vault, r]));
     expect(byVault.good.notes).toEqual([{ id: "g1" }]);
-    expect(byVault.bad.error).toBe("boom");
+    expect(byVault.bad).toEqual({ vault: "bad", error: "boom" });
+    // A vault's own word for the refusal rides beside it in its row (T-476, as a box's fan-out row carries it).
+    expect(byVault.gone).toEqual({ vault: "gone", error: "Not Found", error_type: "not_found" });
   });
 });
 
@@ -498,7 +505,7 @@ describe("account MCP — create-vault", () => {
       mcpDeps(),
     );
     const { body } = await callJson(res);
-    expect(body.error.data.error_type).toBe("vault_limit_reached");
+    refused(body, "vault_limit_reached");
   });
 
   test("error vocab: invalid_name / reserved / vault_taken", async () => {
@@ -507,10 +514,10 @@ describe("account MCP — create-vault", () => {
     const call = async (name: string) =>
       (await callJson(await handleAccountMcp(db(), mcpReq(token, rpc("tools/call", { name: "create-vault", arguments: { name } })), mcpDeps()))).body;
 
-    expect((await call("BAD NAME!!")).error.data.error_type).toBe("invalid_name");
-    expect((await call("admin")).error.data.error_type).toBe("reserved");
+    refused(await call("BAD NAME!!"), "invalid_name");
+    refused(await call("admin"), "reserved");
     await seedVault("taken-name", id);
-    expect((await call("taken-name")).error.data.error_type).toBe("vault_taken");
+    expect(refused(await call("taken-name"), "vault_taken").message).toBe("That vault name is already taken.");
   });
 });
 
@@ -616,7 +623,7 @@ describe("account MCP — composed grants open the door + verb-aware coverage", 
       mcpReq(noCreate, rpc("tools/call", { name: "create-vault", arguments: { name: "fresh" } })),
       mcpDeps(),
     );
-    expect((await callJson(denied)).body.error.data.error_type).toBe("create_not_granted");
+    refused((await callJson(denied)).body, "create_not_granted");
 
     // WITH vault-create it succeeds (the SAME plan/cap machinery as a legacy grant).
     const withCreate = await mintComposed(id, [`account:${id}:vault-create`]);
@@ -695,5 +702,73 @@ describe("account bridge mint — the admin write-clamp (hard ceiling)", () => {
       verb: "admin",
     });
     expect(res.status).toBe(200);
+  });
+});
+
+// --- one way to refuse (T-476): every refusal is an isError result, never a JSON-RPC error ---------------------------
+
+describe("account MCP — one way to refuse", () => {
+  /** A write-capable token on vault `w` (a composed per-vault grant). */
+  async function writer(email: string): Promise<string> {
+    const id = await seedOwner(email);
+    await seedVault("w", id);
+    return (await mintVaultsToken(id, { blanket: false, vaults: [], extraScopes: [`account:${id}:vaults:w:write`] })).token;
+  }
+  const write = async (token: string, vaultAnswer: unknown) =>
+    (await callJson(
+      await handleAccountMcp(
+        db(),
+        mcpReq(token, rpc("tools/call", { name: "update-record", arguments: { vault: "w", id: "n1", body: "x", if_updated_at: "2000-01-01T00:00:00.000Z" } })),
+        mcpDeps({ vaultFetch: vaultFetchBy({ w: vaultAnswer }) }),
+      ),
+    )).body;
+
+  test("an unknown tool is an unknown_tool refusal, as on the vault door", async () => {
+    const token = await writer("refuse-unknown@example.com");
+    const { body } = await callJson(await handleAccountMcp(db(), mcpReq(token, rpc("tools/call", { name: "no-such-tool", arguments: {} })), mcpDeps()));
+    expect(refused(body, "unknown_tool")).toEqual({ error_type: "unknown_tool", message: "Unknown tool: no-such-tool", tool: "no-such-tool" });
+  });
+
+  test("a vault's own refusal comes back as the vault said it", async () => {
+    const token = await writer("refuse-pass@example.com");
+    const sc = { error_type: "conflict", message: "changed since you read it", record_id: "n1", current_updated_at: "2026-11-25T00:00:00.000Z" };
+    const vaultResult = { content: [{ type: "text", text: JSON.stringify(sc, null, 2) }], structuredContent: sc, isError: true };
+    const body = await write(token, { jsonrpc: "2.0", id: 1, result: vaultResult });
+    expect(body.result).toEqual(vaultResult);
+    refused(body, "conflict");
+  });
+
+  test("an older vault's JSON-RPC refusal keeps its own error_type and fields", async () => {
+    const token = await writer("refuse-old@example.com");
+    const body = await write(token, {
+      jsonrpc: "2.0",
+      id: 1,
+      error: { code: -32600, message: "[conflict] changed since you read it", data: { error_type: "conflict", current_updated_at: "2026-11-25T00:00:00.000Z", note_id: "n1" } },
+    });
+    expect(refused(body, "conflict")).toEqual({
+      error_type: "conflict",
+      message: "w: changed since you read it",
+      current_updated_at: "2026-11-25T00:00:00.000Z",
+      note_id: "n1",
+      vault: "w",
+    });
+  });
+
+  test("a vault's router refusal keeps its type, and an older vault's bare-text isError is still one refusal", async () => {
+    const token = await writer("refuse-router@example.com");
+    const busy = await write(token, { status: 503, body: { error: "import_in_progress", error_type: "import_in_progress", message: "An import is running." } });
+    expect(refused(busy, "import_in_progress")).toEqual({ error_type: "import_in_progress", message: "w: An import is running.", vault: "w" });
+    const bare = await write(token, { jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "Unknown tool: update-record" }], isError: true } });
+    expect(refused(bare, "vault_error")).toEqual({ error_type: "vault_error", message: "w: Unknown tool: update-record", vault: "w" });
+  });
+
+  test("a vault error without a type is vault_error, and a refusal this door makes carries its fields", async () => {
+    const token = await writer("refuse-untyped@example.com");
+    const body = await write(token, { jsonrpc: "2.0", id: 1, error: { code: -32603, message: "Internal error" } });
+    expect(refused(body, "vault_error")).toEqual({ error_type: "vault_error", message: "w: Internal error", vault: "w" });
+    const { body: required } = await callJson(
+      await handleAccountMcp(db(), mcpReq(token, rpc("tools/call", { name: "create-record", arguments: { body: "where?" } })), mcpDeps()),
+    );
+    expect(refused(required, "vault_required").vaults).toEqual({ w: "write" });
   });
 });

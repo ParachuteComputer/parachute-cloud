@@ -28,10 +28,10 @@
  *
  * Tools come from core's transport-agnostic `generateMcpTools(store)` (proven
  * under workerd by the Phase-0 spike), filtered + verb-gated by the caller's
- * per-vault scope exactly as bun's mcp-http.ts does. The domain-error → JSON-RPC
- * mapping (conflict / transition_conflict / schema_validation /
- * precondition_required carrying structured `data`) mirrors mcp-http.ts so an
- * agent keys off the same discriminators on either runtime.
+ * per-vault scope exactly as bun's mcp-http.ts does. A tool's refusal is the
+ * engine's own (core mcp-refusal.ts, T-476): an isError result with
+ * structuredContent {error_type, message, ...fields}, as a box answers it, so
+ * an agent keys off the same discriminators on either runtime.
  */
 import type { Database } from "bun:sqlite";
 import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.js";
@@ -45,10 +45,19 @@ import { tagScopeFor, tagVisibleInScope } from "./rest/tag-scope.js";
 import { getVaultMap, getVaultStats } from "@openparachute/core/src/notes.js";
 import { applyScopeWrappers, idVisibility, NARROWED_TOOLS, scopeVisibility } from "./mcp-tag-scope.js";
 import { NOTE_TOOL_NAMES, recordWords } from "@openparachute/core/src/mcp-records.js";
-import { recordErrorData, shapeRecordSurface, typedMessage } from "@openparachute/core/src/mcp-surface.js";
+import { recordErrorData, shapeRecordSurface } from "@openparachute/core/src/mcp-surface.js";
 import { toolAnnotations, type McpLevel } from "@openparachute/core/src/mcp-annotations.js";
 import { mcpCallResult } from "@openparachute/core/src/mcp-result.js";
-import { errorClass, toolErrorOutcome } from "./health.js";
+import {
+  internalRefusal,
+  refusal,
+  refusalOfError,
+  refusalOfReply,
+  refusalResult,
+  unknownToolRefusal,
+  type McpRefusal,
+} from "@openparachute/core/src/mcp-refusal.js";
+import { errorClass, refusalOutcome, toolErrorOutcome } from "./health.js";
 
 // Transcribed from the SDK's types.js so negotiation matches byte-for-byte.
 const LATEST_PROTOCOL_VERSION = "2025-11-25";
@@ -200,17 +209,20 @@ export function writeGateFor(name: string, args: Record<string, unknown>): Write
 const ATTACHMENT_UPLOAD_MINT_TOOL = "request-attachment-upload";
 
 /**
- * Convert a REST cap/frozen Response (402 `plan_required` / 413
- * `storage_cap_exceeded`) into the mirrored JSON-RPC error: the REST body rides
- * verbatim in `data` so an agent keys off the SAME `error_type` discriminator on
- * either runtime, and the REST `message` becomes the JSON-RPC message. Reusing
- * the REST Response body (never a hand-rolled shape) keeps MCP and REST from
+ * A REST cap/frozen Response (402 `plan_required`, 413 `storage_cap_exceeded`, 403 `attachments_not_included`) as the
+ * tool's refusal (one way to refuse, T-476): the REST body's `error_type`, `message` and fields, so an agent keys off
+ * the SAME `error_type` on either door. Reusing the REST body (never a hand-rolled shape) keeps MCP and REST from
  * drifting.
  */
-async function gateError(id: JsonRpcId, blocked: Response): Promise<JsonRpcMessage> {
-  const data = (await blocked.json().catch(() => ({}))) as Record<string, unknown>;
-  const message = typeof data.message === "string" ? data.message : "This write is not permitted.";
-  return rpcError(id, INVALID_REQUEST, message, data);
+async function gateRefusal(blocked: Response): Promise<McpRefusal> {
+  const body = await blocked.json().catch(() => null);
+  return refusalOfReply(body) ?? refusal("forbidden", "This write is not permitted.");
+}
+
+/** A record tool's refusal in record words, as a box says it (core packages/vault/src/mcp-http.ts recordRefusal, T-407). */
+function recordRefusal(r: McpRefusal): McpRefusal {
+  const { error_type, message, ...rest } = r;
+  return { error_type, message, ...recordErrorData(rest) };
 }
 
 /**
@@ -380,9 +392,14 @@ function overrideVaultInfo(
       //
       // The REST door matches since T-419 (audit L3-01): `PATCH /api/vault` with a `description` needs admin too
       // (vault-do.ts), so this check is a real boundary, not an advisory one.
+      // Tagged `insufficient_scope`, as a box's is since T-476 (core packages/vault/src/mcp-tools.ts), so it is a
+      // refusal, not an `internal_error`.
       if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
-        throw new Error(
-          `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
+        throw Object.assign(
+          new Error(
+            `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
+          ),
+          { error_type: "insufficient_scope" },
         );
       }
       // cloud#87 — the RUNTIME type guard the old `as string` cast stood in
@@ -393,12 +410,12 @@ function overrideVaultInfo(
       // connect, with no reachable repair path.
       //
       // Refused through the tool's NORMAL validation channel — a duck-typed
-      // `error_type` error, which mapDomainError's generic branch turns into
-      // JSON-RPC -32602 INVALID_PARAMS carrying structured `data`. That is the
-      // SAME shape core's own validation leaves take (core/src/mcp.ts
-      // `structuredError`, e.g. update-tag's `invalid_parent_names`); no new
-      // error family, and deliberately NOT a bare throw, which would degrade to
-      // the very INTERNAL_ERROR this fix is about.
+      // `error_type` error, which the engine's refusal mapping (core
+      // mcp-refusal.ts refusalOfError) answers as an isError refusal with its
+      // fields. That is the SAME shape core's own validation leaves take
+      // (core/src/mcp.ts `structuredError`, e.g. update-tag's
+      // `invalid_parent_names`); no new error family, and deliberately NOT a
+      // bare throw, which would answer `internal_error`.
       //
       // `null` stays legal — it CLEARS the description.
       const next = params.description;
@@ -442,168 +459,6 @@ function overrideVaultInfo(
     if (projection.stats) result.stats = projection.stats;
     return result;
   };
-}
-
-/**
- * Map a core domain error to its JSON-RPC error shape. A port of bun's
- * chain in parachute-vault/src/mcp-http.ts (the wire contract at the
- * pinned core SHA), branch for branch and in the same order: the two
- * `error_type`-keyed honest-query branches first, the four write-path
- * classes, then QueryError/CursorError matched on `.name` (their `code`
- * is not a fixed discriminator), the five `.code`-keyed classes, and the
- * generic `error_type` backstop. `null` = a truly unknown error; the
- * caller renders that as in-band `isError: true` text.
- */
-function mapDomainError(err: unknown): { code: number; data: Record<string, unknown> } | null {
-  const e = err as {
-    name?: string;
-    code?: string;
-    note_id?: string;
-    note_path?: string | null;
-    current_updated_at?: string | null;
-    expected_updated_at?: string;
-    field?: string;
-    expected_from?: unknown;
-    to?: unknown;
-    current?: unknown;
-    violations?: unknown;
-    error_type?: string;
-    got?: unknown;
-    hint?: string;
-    path?: string;
-    candidates?: unknown;
-    extension?: string;
-    reason?: string;
-    limit?: number;
-    tag?: string;
-    cycle?: unknown;
-    referencing_tags?: unknown;
-    how_to?: string;
-    size?: number;
-    max_bytes?: number;
-    mime_type?: string;
-    origin?: string;
-    import_ix?: number;
-  };
-  if (e?.error_type === "invalid_query") {
-    return {
-      code: INVALID_PARAMS,
-      data: {
-        error_type: "invalid_query",
-        field: e.field,
-        got: e.got,
-        hint: e.hint,
-        ...(e.how_to !== undefined ? { how_to: e.how_to } : {}),
-      },
-    };
-  }
-  if (e?.error_type === "invalid_search_syntax") {
-    return {
-      code: INVALID_PARAMS,
-      data: { error_type: "invalid_search_syntax", field: e.field, got: e.got, hint: e.hint },
-    };
-  }
-  if (e?.code === "CONFLICT") {
-    return {
-      code: INVALID_REQUEST,
-      data: {
-        error_type: "conflict",
-        current_updated_at: e.current_updated_at ?? null,
-        your_updated_at: e.expected_updated_at,
-        path: e.note_path ?? null,
-        note_id: e.note_id,
-        hint: "re-read the note (query-notes) and re-apply your change against its current updated_at, or pass force: true to overwrite",
-      },
-    };
-  }
-  if (e?.code === "TRANSITION_CONFLICT") {
-    return {
-      code: INVALID_REQUEST,
-      data: {
-        error_type: "transition_conflict",
-        note_id: e.note_id,
-        path: e.note_path ?? null,
-        field: e.field,
-        expected_from: e.expected_from,
-        to: e.to,
-        current: e.current ?? null,
-        hint: "re-read the note's current value for this field and retry the transition from its actual current state",
-      },
-    };
-  }
-  if (e?.code === "SCHEMA_VALIDATION") {
-    return {
-      code: INVALID_PARAMS,
-      data: {
-        error_type: "schema_validation",
-        violations: e.violations ?? [],
-        hint: "fix every field listed in violations and retry — none of this write was applied",
-      },
-    };
-  }
-  if (e?.code === "PRECONDITION_REQUIRED") {
-    return {
-      code: INVALID_PARAMS,
-      data: {
-        error_type: "precondition_required",
-        note_id: e.note_id,
-        path: e.note_path ?? null,
-        hint: "re-read the note, pass its updated_at as if_updated_at, or pass force: true to skip the check",
-      },
-    };
-  }
-  if (e?.name === "QueryError") {
-    return {
-      code: INVALID_PARAMS,
-      data: { error_type: e.error_type ?? "invalid_query", code: e.code, field: e.field, got: e.got, hint: e.hint },
-    };
-  }
-  if (e?.name === "CursorError" && typeof e.code === "string") {
-    return { code: INVALID_PARAMS, data: { error_type: e.code } };
-  }
-  if (e?.code === "PATH_CONFLICT") {
-    return { code: INVALID_REQUEST, data: { error_type: "path_conflict", path: e.path } };
-  }
-  if (e?.code === "AMBIGUOUS_PATH") {
-    return { code: INVALID_REQUEST, data: { error_type: "ambiguous_path", path: e.path, candidates: e.candidates } };
-  }
-  if (e?.code === "INVALID_EXTENSION") {
-    return { code: INVALID_PARAMS, data: { error_type: "invalid_extension", extension: e.extension, reason: e.reason } };
-  }
-  if (e?.code === "BATCH_TOO_LARGE") {
-    return { code: INVALID_REQUEST, data: { error_type: "batch_too_large", limit: e.limit, got: e.got } };
-  }
-  if (e?.code === "TAG_FIELD_CONFLICT") {
-    return { code: INVALID_PARAMS, data: { error_type: "tag_field_conflict", tag: e.tag, violations: e.violations ?? [] } };
-  }
-  if (e?.code === "PARENT_CYCLE") {
-    return { code: INVALID_REQUEST, data: { error_type: "parent_cycle", tag: e.tag, cycle: e.cycle ?? [] } };
-  }
-  if (e?.code === "HISTORY_UNRECOVERABLE") {
-    const imported = e.origin === "git-import" && typeof e.import_ix === "number" && Number.isSafeInteger(e.import_ix) && e.import_ix >= 0;
-    return { code: INVALID_PARAMS, data: {
-      error_type: "history_unrecoverable",
-      ...(imported ? { origin: "git-import", import_ix: e.import_ix } : { field: e.field, hint: e.hint }),
-    } };
-  }
-  if (typeof e?.error_type === "string") {
-    return {
-      code: INVALID_PARAMS,
-      data: {
-        error_type: e.error_type,
-        field: e.field,
-        hint: e.hint,
-        ...(e.limit !== undefined ? { limit: e.limit } : {}),
-        ...(e.got !== undefined ? { got: e.got } : {}),
-        ...(e.extension !== undefined ? { extension: e.extension } : {}),
-        ...(e.how_to !== undefined ? { how_to: e.how_to } : {}),
-        ...(e.size !== undefined ? { size: e.size } : {}),
-        ...(e.max_bytes !== undefined ? { max_bytes: e.max_bytes } : {}),
-        ...(e.mime_type !== undefined ? { mime_type: e.mime_type } : {}),
-      },
-    };
-  }
-  return null;
 }
 
 /**
@@ -744,12 +599,13 @@ async function handleToolCall(
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
   const tool = tools.find((t) => t.name === name);
-  // Unknown / not-visible tool → in-band tool error (not a JSON-RPC error), so
-  // callers can't distinguish "hidden admin tool" from "no such tool".
+  // One way to refuse (T-476, core mcp-refusal.ts): every refusal below is an isError result with structuredContent
+  // {error_type, message, ...}, never a JSON-RPC error; only the protocol's own errors stay those.
+  // Unknown / not-visible tool → `unknown_tool`, so callers can't distinguish "hidden admin tool" from "no such tool".
   if (!tool) {
     // The caller's string is never stored: an unknown name counts as one subject.
     await record("mcp:unknown-tool", "unknown_tool");
-    return result(id, { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true });
+    return result(id, refusalResult(unknownToolRefusal(name)));
   }
   // From here `name` is one of this vault's own visible tools (server-defined).
   const subject = `mcp:${name}`;
@@ -757,8 +613,8 @@ async function handleToolCall(
   // The visible set is already scope-filtered: a caller with write on this vault sees the old upload mint.
   const writeAllowed = tools.some((t) => t.name === ATTACHMENT_UPLOAD_MINT_TOOL);
   if (name === "attachment-url" && args.action === "upload" && !writeAllowed) {
-    await record(subject, "forbidden");
-    return result(id, { content: [{ type: "text", text: "Error: Forbidden: attachment-url {action: \"upload\"} needs write on this vault." }], isError: true });
+    await record(subject, refusalOutcome("insufficient_scope"));
+    return result(id, refusalResult(refusal("insufficient_scope", "Forbidden: attachment-url {action: \"upload\"} needs write on this vault.")));
   }
   const gate = writeGateFor(name, args);
   if (gate === "attachments") {
@@ -774,7 +630,7 @@ async function handleToolCall(
       const blocked = attachmentMintGate(sizeBytes);
       if (blocked) {
         await record(subject, `gate:${blocked.status}`);
-        return gateError(id, blocked);
+        return result(id, refusalResult(await gateRefusal(blocked)));
       }
     }
   } else if (gate === "notes") {
@@ -786,30 +642,35 @@ async function handleToolCall(
     const blocked = writeGate();
     if (blocked) {
       await record(subject, `gate:${blocked.status}`);
-      return gateError(id, blocked);
+      return result(id, refusalResult(await gateRefusal(blocked)));
     }
   }
   try {
     const out = await tool.execute(args);
-    await record(subject, "ok");
     // A tool may shape its own content blocks (read-attachment returns a real image block); every other tool's
     // result is one text block of JSON, plus `structuredContent` where ChatGPT would read it as `{}` (a note by id;
-    // T-456, core mcp-result.ts). The same call as the box's MCP layer (parachute-core src/mcp-http.ts).
-    return result(id, mcpCallResult(tool, out));
+    // T-456, core mcp-result.ts), and a refusal said as data (`{error, error_type}`) is answered as a refusal. The
+    // same call as the box's MCP layer (parachute-core src/mcp-http.ts).
+    const answer = mcpCallResult(tool, out);
+    // Counted by the type the tool's reply named itself, or its `error` when that is one bare word (manage-keys'
+    // `invalid_request`); never a word made from a message (refusalOutcome takes only a bare word).
+    const said = out as { error_type?: unknown; error?: unknown };
+    await record(subject, answer.isError ? refusalOutcome(said.error_type ?? said.error) : "ok");
+    return result(id, answer);
   } catch (err) {
-    const domain = mapDomainError(err);
-    const message = err instanceof Error ? err.message : "Unknown error";
-    // Never the message: the error's class decides (health.ts toolErrorOutcome).
-    const outcome = domain ? `domain:${domain.code}` : toolErrorOutcome(err);
-    // A server-class fault also leaves one log line (the count alone has no cause).
+    // A refusal the engine tagged: the box's own mapping (core mcp-refusal.ts refusalOfError), counted by its type.
+    const refused = refusalOfError(err);
+    if (refused) {
+      await record(subject, refusalOutcome(refused.error_type));
+      // As a box answers: a record tool's refusal is in record words (`record_id`, the record hints).
+      return result(id, refusalResult(NOTE_TOOL_NAMES[name] ? recordRefusal(refused) : refused));
+    }
+    // Nobody tagged it: `internal_error`, as a box answers. Never the message: the error's class decides the count
+    // (health.ts toolErrorOutcome), and a server-class fault also leaves one log line (the count alone has no cause).
+    const outcome = toolErrorOutcome(err);
     if (outcome.startsWith("exception:")) logCrash(name, err);
     await record(subject, outcome);
-    if (domain) {
-      // As a box answers (core mcp-surface.ts): the message names its kind, and a record tool's data is in record words.
-      const data = NOTE_TOOL_NAMES[name] && domain.data ? recordErrorData(domain.data as Record<string, unknown>) : domain.data;
-      return rpcError(id, domain.code, typedMessage(message, data as Record<string, unknown> | undefined), data);
-    }
-    return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
+    return result(id, refusalResult(internalRefusal(err)));
   }
 }
 

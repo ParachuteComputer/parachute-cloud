@@ -10,7 +10,7 @@
  */
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { base, createNote, freshVault, mintToken, op } from "./helpers.ts";
+import { base, createNote, freshVault, mintToken, op, refused } from "./helpers.ts";
 
 async function fixture() {
   const vault = freshVault("integrity");
@@ -83,10 +83,9 @@ describe("B3 tag integrity parity", () => {
   });
   it("P5 MCP delete refusal and cascade stay inherited", async () => {
     const f = await fixture(); await f.parents();
-    const refused = await f.call("delete-tag", { tag: f.root });
-    expect(refused.error).toBeUndefined();
-    const body = JSON.parse(refused.result.content[0].text);
-    expect(body.error).toBe("tag_referenced_as_parent"); expect(body.referencing_tags).toEqual([f.child]);
+    // The engine's in-band refusal is answered as a refusal (one way to refuse, T-476), with its referrers and words.
+    const body = refused(await f.call("delete-tag", { tag: f.root }), "tag_referenced_as_parent");
+    expect(body.referencing_tags).toEqual([f.child]); expect(body.tag).toBe(f.root);
     const deleted = JSON.parse((await f.call("delete-tag", { tag: f.root, cascade: true })).result.content[0].text);
     expect(deleted.deleted).toBe(true); expect(deleted.parent_refs_detached).toBe(1);
   });
@@ -94,20 +93,19 @@ describe("B3 tag integrity parity", () => {
     const f = await fixture(); await f.parents();
     const res = await f.del(f.root); expect(res.status).toBe(409);
     const rest = await res.json() as any;
-    const mcp = JSON.parse((await f.call("delete-tag", { tag: f.root })).result.content[0].text);
-    expect(rest.referencing_tags).toEqual(mcp.referencing_tags); expect(rest.error_type).toBe(mcp.error);
+    const mcp = refused(await f.call("delete-tag", { tag: f.root }), "tag_referenced_as_parent");
+    expect(rest.referencing_tags).toEqual(mcp.referencing_tags); expect(rest.error_type).toBe(mcp.error_type);
   });
   it("P8 a bare self-parent reports its two-element cycle", async () => {
     const f = await fixture(); const res = await f.put(f.root, { parent_names: [f.root] });
     expect(res.status).toBe(409); const body = await res.json() as any;
     expect(body.error_type).toBe("parent_cycle"); expect(body.cycle).toEqual([f.root, f.root]);
   });
-  it("P9 MCP cycle uses InvalidRequest and forwards tag/cycle", async () => {
+  it("P9 MCP cycle is a parent_cycle refusal and forwards tag/cycle", async () => {
     const f = await fixture(); await f.parents();
-    const body = await f.call("update-tag", { tag: f.root, parent_names: [f.child] });
-    expect(body.error.code).toBe(-32600);
-    expect(body.error.data.error_type).toBe("parent_cycle"); expect(body.error.data.tag).toBe(f.root);
-    expect(body.error.data.cycle).toContain(f.root); expect(body.error.data.cycle).toContain(f.child);
+    const body = refused(await f.call("update-tag", { tag: f.root, parent_names: [f.child] }), "parent_cycle");
+    expect(body.tag).toBe(f.root);
+    expect(body.cycle).toContain(f.root); expect(body.cycle).toContain(f.child);
   });
   it("P10 both doors expose the same cycle triple on one fixture", async () => {
     const f = await fixture(); await f.parents();
@@ -115,7 +113,7 @@ describe("B3 tag integrity parity", () => {
     const rest = await res.json() as any;
     const mcp = await f.call("update-tag", { tag: f.root, parent_names: [f.child] });
     const triple = ({ error_type, tag, cycle }: any) => ({ error_type, tag, cycle });
-    expect(triple(rest)).toEqual(triple(mcp.error.data));
+    expect(triple(rest)).toEqual(triple(refused(mcp, "parent_cycle")));
   });
   it("P12 bundles bad type and enum default", async () => {
     const f = await fixture(); const res = await f.put(f.demo, { fields: {
@@ -153,14 +151,14 @@ describe("B3 tag integrity parity", () => {
   });
   it("P16 MCP bad-default classification stays inherited", async () => {
     const f = await fixture(); const body = await f.call("update-tag", { tag: f.demo, ...badDefault });
-    expect(body.error.data.error_type).toBe("tag_field_conflict");
+    refused(body, "tag_field_conflict");
   });
   it("P17 both doors classify the same bad-default fixture equally", async () => {
     const f = await fixture(); const res = await f.put(f.demo, badDefault); expect(res.status).toBe(422);
     const rest = await res.json() as any;
     const mcp = await f.call("update-tag", { tag: f.demo, ...badDefault });
     // B5 tightens this to tag/violations too; B3 deliberately compares only error_type.
-    expect(rest.error_type).toBe(mcp.error.data.error_type);
+    expect(rest.error_type).toBe(refused(mcp, "tag_field_conflict").error_type);
   });
 });
 

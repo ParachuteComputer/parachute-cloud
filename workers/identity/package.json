@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@noble/curves": "^2.3.0",
+    "@openparachute/core": "file:../../../parachute-core/packages/vault/core",
     "@paulmillr/qr": "^0.3.0",
     "hono": "^4.6.0",
     "jose": "^5.9.0",

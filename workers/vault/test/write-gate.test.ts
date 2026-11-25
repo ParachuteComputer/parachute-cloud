@@ -91,7 +91,7 @@ describe("MCP — the frozen-tenant gate by (tool, action)", () => {
     // Deletes last, so the reads and writes before them still have the note to name.
     for (const c of [...CALLS].sort((a, b) => Number(a.tool.startsWith("delete")) - Number(b.tool.startsWith("delete")))) {
       const r = (await (await mcp(v, admin, { jsonrpc: "2.0", id: id++, method: "tools/call", params: { name: c.tool, arguments: c.args(note.id) } })).json()) as any;
-      const refusedForPlan = r.error?.data?.error_type === "plan_required";
+      const refusedForPlan = r.result?.isError === true && r.result.structuredContent?.error_type === "plan_required";
       seen.push(`${c.tool}${c.action ? ` {${c.action}}` : ""}: ${refusedForPlan ? "gated" : "open"}`);
     }
     expect(seen).toEqual(CALLS.slice().sort((a, b) => Number(a.tool.startsWith("delete")) - Number(b.tool.startsWith("delete"))).map((c) => `${c.tool}${c.action ? ` {${c.action}}` : ""}: ${c.want}`));

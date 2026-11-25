@@ -7,6 +7,7 @@
 import { SELF } from "cloudflare:test";
 import { SignJWT, importJWK } from "jose";
 import { TEST_PRIVATE_JWK, TEST_KID } from "./test-keys.ts";
+import { expect } from "vitest";
 
 export const ISSUER = "https://id.test.example";
 export const OP = "test-operator-token";
@@ -72,4 +73,21 @@ export async function createNote(vault: string, body: Record<string, unknown>): 
   });
   if (res.status !== 201) throw new Error(`createNote → ${res.status}: ${await res.text()}`);
   return res.json();
+}
+
+/**
+ * One way to refuse (T-476, core mcp-refusal.ts): a tools/call refusal is a normal result, `isError: true`, with
+ * `structuredContent {error_type, message, ...fields}` and one text block that is that object as JSON; never a JSON-RPC
+ * error. Asserts the whole shape and the type, and returns the refusal (its fields) for the test's own checks.
+ */
+export function refused(body: any, error_type: string): Record<string, any> {
+  expect(body?.error).toBeUndefined();
+  expect(body?.result?.isError).toBe(true);
+  const sc = body.result.structuredContent;
+  expect(sc?.error_type).toBe(error_type);
+  expect(typeof sc.message).toBe("string");
+  expect(sc.message).not.toMatch(/^(MCP error|\[)/);
+  expect(body.result.content).toHaveLength(1);
+  expect(JSON.parse(body.result.content[0].text)).toEqual(sc);
+  return sc;
 }

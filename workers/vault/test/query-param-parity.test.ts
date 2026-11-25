@@ -125,7 +125,9 @@ describe("B1 query parameter parity", () => {
   it("P12 MCP update-note without id returns missing_required_field", async () => {
     const f = await fixture();
     const result = await f.call("update-note", { content: "no id" }, true);
-    expect(result.error?.data?.error_type).toBe("missing_required_field");
+    expect(result.error).toBeUndefined();
+    expect(result.result?.isError).toBe(true);
+    expect(result.result.structuredContent.error_type).toBe("missing_required_field");
   });
 });
 

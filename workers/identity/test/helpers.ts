@@ -4,6 +4,7 @@
  * runs against the real D1 (`env.DB`) inside workerd.
  */
 import { env } from "cloudflare:test";
+import { expect } from "vitest";
 import { randomBase64url, sha256Base64url, sha256Hex } from "../src/crypto.ts";
 import { registerClient } from "../src/clients.ts";
 import { issueAuthCode } from "../src/auth-codes.ts";
@@ -312,4 +313,21 @@ export function bridgeTarget(html: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * One way to refuse (T-476, the engine's mcp-refusal.ts): an account-door tools/call refusal is a normal result,
+ * `isError: true`, with `structuredContent {error_type, message, ...fields}` and one text block that is that object as
+ * JSON; never a JSON-RPC error. Asserts the whole shape and the type, and returns the refusal for the test's own checks.
+ */
+export function refused(body: any, error_type: string): Record<string, any> {
+  expect(body?.error).toBeUndefined();
+  expect(body?.result?.isError).toBe(true);
+  const sc = body.result.structuredContent;
+  expect(sc?.error_type).toBe(error_type);
+  expect(typeof sc.message).toBe("string");
+  expect(sc.message).not.toMatch(/^(MCP error|\[)/);
+  expect(body.result.content).toHaveLength(1);
+  expect(JSON.parse(body.result.content[0].text)).toEqual(sc);
+  return sc;
 }

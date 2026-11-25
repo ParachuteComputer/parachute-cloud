@@ -41,6 +41,7 @@ import {
   accountVaultsGrant,
   composedAccountGrant,
 } from "@openparachute/door-contract";
+import { plainMessage } from "@openparachute/core/src/mcp-refusal.js";
 import { ACCOUNT_TOKEN_CLIENT_ID } from "./account-token.ts";
 import { type AttributionPrincipal, principalAttributionClaims } from "./tokens.ts";
 import { type OAuthDeps, billingModeOf, vaultAdvertisedUrl } from "./oauth-shared.ts";
@@ -139,10 +140,9 @@ export function buildAccountConnectionGrant(
 }
 
 /**
- * A business-level tool failure that maps to a structured JSON-RPC error
- * (`error.data.error_type`) rather than an opaque in-band `isError` string —
- * mirroring the vault worker's `mapDomainError` default branch so an agent keys
- * off the SAME discriminator on either door.
+ * A business-level tool failure: the account door answers it as a refusal (one way to refuse, T-476: an `isError`
+ * result with structuredContent `{error_type, message, ...extra}`, the engine's mcp-refusal.ts), the same shape the
+ * vault door answers, so an agent keys off the SAME `error_type` on either door.
  */
 export class AccountToolError extends Error {
   constructor(
@@ -380,7 +380,10 @@ const createVaultTool: AccountMcpTool = {
 
 /** One vault's contribution to a fan-out — either its notes payload or an
  *  isolated error (a failed vault never fails the whole call). */
-type VaultQueryEntry = { vault: string; notes: unknown } | { vault: string; records: unknown } | { vault: string; error: string };
+type VaultQueryEntry =
+  | { vault: string; notes: unknown }
+  | { vault: string; records: unknown }
+  | { vault: string; error: string; error_type?: string };
 
 /**
  * Build the vault REST `/api/notes` query string from the Wave A common subset
@@ -455,13 +458,16 @@ async function queryOneVault(
   });
   if (!res.ok) {
     let detail = `vault responded ${res.status}`;
+    let errorType: string | undefined;
     try {
       const body = (await res.json()) as Record<string, unknown>;
       if (typeof body.error === "string") detail = body.error;
+      // The vault's own word for the refusal rides beside it (T-476, as a box's fan-out row carries it).
+      if (typeof body.error_type === "string") errorType = body.error_type;
     } catch {
       // Non-JSON error body — keep the status-only detail.
     }
-    return { vault: vaultName, error: detail };
+    return { vault: vaultName, error: detail, ...(errorType !== undefined ? { error_type: errorType } : {}) };
   }
   const answer = await res.json();
   return door === "records" ? { vault: vaultName, records: answer } : { vault: vaultName, notes: answer };
@@ -668,20 +674,41 @@ function writeTool(name: string, description: string): AccountMcpTool {
         ...(attribution?.permissions !== undefined ? { permissions: attribution.permissions } : {}),
         ...(ctx.key ? { key: ctx.key } : {}),
       });
-      type RpcAnswer = { result?: unknown; error?: { message?: unknown; data?: unknown } };
+      type RpcAnswer = {
+        result?: { isError?: unknown; structuredContent?: { error_type?: unknown }; content?: { text?: unknown }[] };
+        error?: string | { message?: unknown; data?: unknown };
+        error_type?: unknown;
+        message?: unknown;
+      };
       let body: RpcAnswer | null = null;
       try {
         body = (await res.json()) as RpcAnswer;
       } catch {
         // Not JSON-RPC: refused below.
       }
-      if (body?.error) {
-        const data = (body.error.data ?? {}) as Record<string, unknown>;
-        const type = typeof data.error_type === "string" ? data.error_type : "vault_error";
-        throw new AccountToolError(type, `${vault}: ${String(body.error.message ?? "the vault refused the write")}`, { vault });
+      // The vault's router refused before MCP (a REST body, `{error, error_type, message}`: busy, importing, signed
+      // out): its own type, when it names one.
+      if (typeof body?.error === "string") {
+        if (typeof body.error_type === "string") {
+          const words = typeof body.message === "string" ? body.message : body.error;
+          throw new AccountToolError(body.error_type, `${vault}: ${words}`, { vault });
+        }
+      } else if (body?.error) {
+        // A vault from before one way to refuse (T-476) said a tool's refusal as a JSON-RPC error: its own error_type
+        // and fields are kept. A new vault's refusal is an isError result, passed through below as the vault said it.
+        const data = body.error.data && typeof body.error.data === "object" ? (body.error.data as Record<string, unknown>) : {};
+        const { error_type, ...fields } = data;
+        const message = typeof body.error.message === "string" ? plainMessage(body.error.message) : "the vault refused the write";
+        if (typeof error_type === "string") throw new AccountToolError(error_type, `${vault}: ${message}`, { ...fields, vault });
+        throw new AccountToolError("vault_error", `${vault}: ${message}`, { vault });
       }
       if (!res.ok || !body || body.result === undefined) {
         throw new AccountToolError("vault_unavailable", `${vault}: the vault answered ${res.status}; nothing is known to be written.`, { vault });
+      }
+      // An older vault's bare-text isError (an unknown tool, a crash) has no type: it is still one refusal here.
+      if (body.result.isError === true && typeof body.result.structuredContent?.error_type !== "string") {
+        const text = body.result.content?.find((c) => typeof c?.text === "string")?.text;
+        throw new AccountToolError("vault_error", `${vault}: ${typeof text === "string" ? text : "the vault refused the write"}`, { vault });
       }
       return body.result;
     },

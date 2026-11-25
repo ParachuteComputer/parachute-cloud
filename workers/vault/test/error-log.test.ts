@@ -15,7 +15,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { READABLE_SCHEMA_VERSION } from "@openparachute/core/src/schema.js";
 import { redactMessage, serverErrorLine, stackFrames } from "../src/error-log.ts";
-import { createNote, freshVault, mintToken, op } from "./helpers.ts";
+import { createNote, freshVault, mintToken, op, refused } from "./helpers.ts";
 import { SELF } from "cloudflare:test";
 
 type Days = Record<string, Record<string, Record<string, number>>>;
@@ -72,8 +72,8 @@ describe("MCP tool crash → one server-side log line", () => {
     // `tags` as an object: the engine iterates it and throws a real TypeError.
     const res = await call(v, "create-note", { content: `secret ${marker}`, path: `p/${marker}`, tags: { [marker]: 1 } });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { result: { isError?: boolean } };
-    expect(body.result.isError).toBe(true);
+    // A crash is answered `internal_error` (one way to refuse, T-476), as a box answers it.
+    refused(await res.json(), "internal_error");
 
     const lines = capture.lines.filter((l) => l.includes("event=mcp_tool_error"));
     expect(lines, capture.lines.join("\n")).toHaveLength(1);
@@ -109,8 +109,8 @@ describe("MCP tool crash → one server-side log line", () => {
     await createNote(v, { content: "x" });
     capture = captureLogs();
     const missing = await call(v, "update-note", { id: "MARKER-missing", content: "y" });
-    expect(((await missing.json()) as { error?: { data?: { error_type?: string } } }).error?.data?.error_type).toBe("not_found");
-    await call(v, "no-such-tool", {});
+    refused(await missing.json(), "not_found");
+    refused(await (await call(v, "no-such-tool", {})).json(), "unknown_tool");
     const ok = await call(v, "query-notes", { search: "x" });
     expect(ok.status).toBe(200);
     expect(capture.lines.filter((l) => l.includes("event=mcp_tool_error"))).toEqual([]);
