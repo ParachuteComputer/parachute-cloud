@@ -3,8 +3,8 @@
 Parachute is your own vault that any AI can read and write, and an app that shows you what is in it. **Parachute
 Cloud runs it for you**: sign up with an email at [my.parachute.computer](https://my.parachute.computer/console), and
 each of your vaults has its address for an AI, `https://my.parachute.computer/vault/<name>/mcp`. Using it and building
-on it: [parachute.computer/docs](https://parachute.computer/docs/) (Cloud:
-[docs/run/cloud](https://parachute.computer/docs/run/cloud/)). Pricing: [parachute.computer/pricing](https://parachute.computer/pricing/).
+on it: [parachute.computer/docs](https://parachute.computer/docs/). Pricing:
+[parachute.computer/pricing](https://parachute.computer/pricing/).
 
 This repo is the hosted version, from Open Parachute PBC. The vault engine is the same as on a server of your own
 (`@openparachute/core`, from [parachute-core](https://github.com/ParachuteComputer/parachute-core)); this repo runs it
