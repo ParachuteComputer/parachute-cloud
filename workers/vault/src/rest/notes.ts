@@ -148,6 +148,8 @@ function gateStrictWrite(
     // schema defaults will fill in (the engine's rule; the box passes it the same way, routes.ts gateStrictWrite).
     ...(tagScope.raw !== null ? { mayChangePublished: tagVisibleInScope("publish", tagScope.allowed, tagScope.raw) } : {}),
     bypass: writeCtx.bypassStrict === true,
+    // T-476: a skill is instructions every connected AI may follow; only an admin key adds or changes one.
+    maySkills: writeCtx.maySkills === true,
     onBypass: (violations: ValidationWarning[]) => {
       logStrictBypass({
         actor: writeCtx.actor,
@@ -361,6 +363,8 @@ export async function handleNotes(
       path: e.note_path ?? null, note_id: e.note_id, message: e.message, hint: HINT_CONFLICT,
     }, 409);
     if (e?.code === "PUBLISH_OUT_OF_SCOPE") return json({ error: "Forbidden", error_type: "tag_scope_violation", message: e.message }, 403);
+    // T-476: a write key making or changing a skill (core skills.ts): the box's 403 (routes.ts conflictResponse).
+    if (e?.code === "SKILL_NEEDS_ADMIN") return json({ error: "Forbidden", error_type: "skill_needs_admin", message: e.message, hint: e.hint }, 403);
     if (e?.code === "SCHEMA_VALIDATION") return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message, hint: HINT_SCHEMA_VALIDATION }, 422);
     if (e?.code === "PATH_CONFLICT") return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message, hint: HINT_PATH_CONFLICT }, 409);
     const ambig = ambiguousPathResponse(e);
@@ -1110,6 +1114,7 @@ async function handleNotesInner(
             ...linkOptFor(db, tagScope),
             actor: writeCtx.actor,
             via: writeCtx.via,
+            maySkills: writeCtx.maySkills === true,
           });
         }
 
@@ -1238,6 +1243,10 @@ async function handleNotesInner(
       try {
         await (batched ? transactionAsync(db, runBatch) : runBatch());
       } catch (e: any) {
+        // T-476: a write key making a skill (core skills.ts): the same 403 as an update's, as the box's batch answers.
+        if (e && e.code === "SKILL_NEEDS_ADMIN") {
+          return json({ error: "Forbidden", error_type: "skill_needs_admin", message: e.message, hint: e.hint }, 403);
+        }
         if (e && e.code === "PATH_CONFLICT") {
           return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message, hint: HINT_PATH_CONFLICT_ON_CREATE }, 409);
         }
@@ -1753,7 +1762,7 @@ async function handleNotesInner(
       if (Object.keys(updates).length > 0 || hasTagMutation || hasLinkMutation) {
         updates.actor = writeCtx.actor;
         updates.via = writeCtx.via;
-        await store.updateNote(note.id, { ...updates, ...linkOptFor(db, tagScope) });
+        await store.updateNote(note.id, { ...updates, ...linkOptFor(db, tagScope), maySkills: writeCtx.maySkills === true });
       }
 
       for (const { targetId, relationship } of resolvedLinksToRemove) {
@@ -1858,6 +1867,9 @@ async function handleNotesInner(
           },
           409,
         );
+      }
+      if (e && e.code === "SKILL_NEEDS_ADMIN") {
+        return json({ error: "Forbidden", error_type: "skill_needs_admin", message: e.message, hint: e.hint }, 403);
       }
       if (e && e.code === "SCHEMA_VALIDATION") {
         return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message, hint: HINT_SCHEMA_VALIDATION }, 422);

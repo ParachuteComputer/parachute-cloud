@@ -519,6 +519,8 @@ function visibleTools(
     // call plus a batched scan of the candidates' vectors in the vault's DO). Off on cloud unless the vault turns it on
     // (CLOUD_HYBRID_AUTO_DEFAULT, measured there).
     hybridAuto: () => hybridAuto?.() ?? CLOUD_HYBRID_AUTO_DEFAULT,
+    // T-476: only an admin key adds or changes a skill (core skills.ts); a typed key never, as on a box (mcp-tools.ts).
+    maySkills: hasScopeForVault(auth.scopes, vaultName, "admin") && !(auth.scoped_tags && auth.scoped_tags.length > 0),
     attachmentTickets: {
       provider: attachmentTickets.provider,
       vaultName,
