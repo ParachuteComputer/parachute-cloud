@@ -43,7 +43,7 @@ import { isTotpEnrolled } from "./two-factor.ts";
 import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
 import { attemptLogin, clearLoginFailures, clientIp, loginKey } from "./rate-limit.ts";
 import { ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { type AuthorizeParams, type ReplacesNote, describeScopes, renderConsent, renderError, renderLogin, renderRedirectBridge } from "./ui.ts";
+import { type AuthorizeParams, type ReplacesNote, describeScopes, isVaultAdminScope, renderConsent, renderError, renderLogin, renderRedirectBridge } from "./ui.ts";
 import {
   type OAuthDeps,
   consentIssuedByHost,
@@ -522,7 +522,11 @@ async function authorizeCore(
   // precondition). An already-admin unnamed request (`vault:admin`) yields an
   // empty upgradeable set → no selector (it is already the top level).
   const upgradeableVerbs = unnamedVaultVerbs(requestedScopes).filter((v) => v === "read" || v === "write");
-  const verbSelector = needsVaultPick && ownedVaults.length > 0 && upgradeableVerbs.length > 0 ? { requestedVerbs: upgradeableVerbs } : null;
+  const askedAdmin = requestedScopes.some(isVaultAdminScope);
+  // When the selector is drawn it is the one admin control (T-476): its admin choice is the person's, and an admin the
+  // app asked for is withheld unless they choose it there. Otherwise an asked-for admin is the unticked box.
+  const verbSelector =
+    needsVaultPick && ownedVaults.length > 0 && upgradeableVerbs.length > 0 ? { requestedVerbs: upgradeableVerbs, askedAdmin } : null;
   // Say before Allow what this replaces of the same app's earlier connection:
   // exactly, when the vault is already named; conditionally, when it is
   // picked below (Codex r2 on #383). An account-wide earlier connection is
@@ -549,6 +553,8 @@ async function authorizeCore(
       ownedVaults,
       verbSelector,
       accountVaults: null,
+      // Admin the app asked for is a box the person ticks, never a line Allow grants (T-476).
+      adminChoice: askedAdmin && verbSelector === null,
       replaces,
       // The "issued by <host>" trust line — the DOOR the user came through (the
       // bound request/resource origin, e.g. my.parachute.computer for a my./mcp
@@ -922,6 +928,17 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
     return recordGrantAndRedirect(db, params, composedScopes, session.userId, client, session.id, deps, replaceEarlier);
   }
 
+  // Admin is granted only when its box was ticked (T-476 claudereal: an AI connector asks for every scope it can, and
+  // Allow gave it the vault's admin). The page says it drew the box (`admin_choice_shown`); a form without it (a
+  // script, an older page) keeps the old meaning, as the box's `granted_scope_present` does. The level selector's own
+  // admin choice (`verb_select=admin`) is applied after this, so electing it there still grants it.
+  if (form.get("admin_choice_shown") === "1" && form.get("grant_admin") === null) {
+    scopes = scopes.filter((s) => !isVaultAdminScope(s));
+    if (scopes.length === 0) {
+      return oauthErrorRedirect(params.redirectUri, "access_denied", "No permissions were granted: admin was not ticked.", params.state);
+    }
+  }
+
   // Narrow unnamed vault verbs to the picked vault (form pick or `vault=` hint).
   if (unnamedVaultVerbs(scopes).length > 0) {
     const picked = String(form.get("vault_pick") ?? "") || (params.vault ?? "");
@@ -946,7 +963,10 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
       (electedVerb === "read" || electedVerb === "write" || electedVerb === "admin") &&
       (await userOwnsVault(db, session.userId, picked))
     ) {
-      scopes = widenUnnamedVaultVerb(scopes, electedVerb);
+      // The selector is the one admin control when drawn (T-476): an admin the app asked for counts only if the person
+      // chose "Full admin" there, which the widening below puts back.
+      // Every admin scope, named ones too (`vault:read vault:<name>:admin` draws the selector and no box).
+      scopes = widenUnnamedVaultVerb(scopes.filter((s) => !isVaultAdminScope(s)), electedVerb);
     }
     scopes = narrowVaultScopes(scopes, picked);
   }
