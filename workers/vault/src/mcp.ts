@@ -49,6 +49,7 @@ import { getVaultMap, getVaultStats } from "@openparachute/core/src/notes.js";
 import { applyScopeWrappers, idVisibility, NARROWED_TOOLS, scopeVisibility } from "./mcp-tag-scope.js";
 import { NOTE_TOOL_NAMES, recordWords } from "@openparachute/core/src/mcp-records.js";
 import { recordErrorData, shapeRecordSurface } from "@openparachute/core/src/mcp-surface.js";
+import { latestRelease, newerRelease, withRefusalDocs, withWarningDocs, type DocsContext } from "@openparachute/core/src/docs-tool.js";
 import { toolAnnotations, type McpLevel } from "@openparachute/core/src/mcp-annotations.js";
 import { mcpCallResult } from "@openparachute/core/src/mcp-result.js";
 import {
@@ -174,6 +175,7 @@ export const WRITE_GATES: Readonly<Record<string, WriteGateClass | Readonly<Reco
   "delete-record": "open",
   "list-types": "open",
   doctor: "open",
+  docs: "open", // T-476: reads the docs site, nothing of the vault: a frozen vault's AI can still read how to fix it
   "read-attachment": "open",
   "attachment-url": { upload: "attachments", download: "open" },
   "manage-types": { update: "notes", rename: "notes", merge: "notes", delete: "open", prune: "notes", migrate: "notes" },
@@ -251,6 +253,8 @@ export function serverInstruction(
   reach: string | undefined,
   projection: VaultProjection,
   attachments: { readEnabled: boolean; addEnabled?: boolean } = { readEnabled: true },
+  /** Where the docs are and the version (T-476, src/docs.ts); omitted or no origin: no Docs line. */
+  docs?: DocsContext,
 ): string {
   return projectionToMarkdown({
     vaultName,
@@ -265,7 +269,10 @@ export function serverInstruction(
     ...(reach ? { reach } : {}),
     scripting:
       `For a script or cron job, make a key for this vault in your account (\`POST /account/keys {name, vault: "${vaultName}", can: "read"}\`, ` +
-      `or the app's keys page) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/scripting/`,
+      `or the app's keys page) and call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`; guide: https://parachute.computer/docs/build/scripts/`,
+    // T-476: the Docs line names the tool and this door's version, and "X is out" from the site's /latest.json as last
+    // read (in the background: a connect never waits on the site).
+    docs: docs?.origin ? { origin: docs.origin, version: docs.version, newer: newerRelease(docs.version, latestRelease(docs.origin).value) } : null,
   });
 }
 
@@ -557,8 +564,10 @@ function visibleTools(
  * The caller's tools: the engine's 0.9 surface (core mcp-surface.ts, the same one a box builds), filtered to what its
  * scopes permit for THIS vault. Cloud has no in-vault token tool and no tag-scoped passes, so it passes neither.
  */
-function scopedTools(store: Store, tools: McpToolDef[], vaultName: string, auth: AuthResult, countName?: NameCount): McpToolDef[] {
+function scopedTools(store: Store, tools: McpToolDef[], vaultName: string, auth: AuthResult, countName?: NameCount, docs?: DocsContext): McpToolDef[] {
   const shaped = shapeRecordSurface(tools, {
+    // T-476: the engine's `docs` tool, for this door's version and docs origin (none when the door has no docs).
+    docs: docs ? (docs.origin ? { origin: docs.origin, version: docs.version } : null) : undefined,
     db: store.db as unknown as Parameters<typeof shapeRecordSurface>[1]["db"],
     vaultName,
     hasVerb: (verb) => hasScopeForVault(auth.scopes, vaultName, verb),
@@ -606,6 +615,9 @@ async function handleToolCall(
   attachmentMintGate: (declaredBytes: number) => Response | null,
   record: HealthRecord = noRecord,
   logCrash: ToolCrashLog = noLog,
+  /** The connection's level: what an unknown tool's refusal says the caller has (T-476). */
+  level?: McpLevel,
+  docs?: DocsContext,
 ): Promise<JsonRpcMessage> {
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
@@ -616,7 +628,7 @@ async function handleToolCall(
   if (!tool) {
     // The caller's string is never stored: an unknown name counts as one subject.
     await record("mcp:unknown-tool", "unknown_tool");
-    return result(id, refusalResult(unknownToolRefusal(name)));
+    return result(id, refusalResult(unknownToolRefusal(name, level)));
   }
   // From here `name` is one of this vault's own visible tools (server-defined).
   const subject = `mcp:${name}`;
@@ -665,7 +677,8 @@ async function handleToolCall(
     // result is one text block of JSON, plus `structuredContent` where ChatGPT would read it as `{}` (a note by id;
     // T-456, core mcp-result.ts), and a refusal said as data (`{error, error_type}`) is answered as a refusal. The
     // same call as the box's MCP layer (parachute-core src/mcp-http.ts).
-    const answer = mcpCallResult(tool, out);
+    // T-476: a warning with a fix page (a type that isn't there) names it, as a box's does.
+    const answer = mcpCallResult(tool, withWarningDocs(out, docs));
     // Counted by the type the tool's reply named itself, or its `error` when that is one bare word (manage-keys'
     // `invalid_request`); never a word made from a message (refusalOutcome takes only a bare word).
     const said = out as { error_type?: unknown; error?: unknown };
@@ -710,6 +723,8 @@ async function handleOne(
     attachmentMintGate: (declaredBytes: number) => Response | null;
     record?: HealthRecord;
     logCrash?: ToolCrashLog;
+    /** T-476: every refusal names the page with its fix (core docs-tool.ts withRefusalDocs). */
+    docs?: DocsContext;
   },
 ): Promise<JsonRpcMessage> {
   const record = ctx.record ?? noRecord;
@@ -739,8 +754,12 @@ async function handleOne(
           // as a box lists it (core src/mcp-http.ts).
           tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: schemaForClient(t.inputSchema, declaresFilesExtension(params?._meta)), annotations: toolAnnotations(t.name, ctx.level) })),
         });
-      case "tools/call":
-        return handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate, record, logCrash);
+      case "tools/call": {
+        // T-476: every refusal (the tool's, the gate's, an unknown tool's) carries `docs`, as a box's does.
+        const answered = await handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate, record, logCrash, ctx.level, ctx.docs);
+        const r = answered.result as { isError?: unknown } | undefined;
+        return r && r.isError === true ? { ...answered, result: withRefusalDocs(r as never, ctx.docs) } : answered;
+      }
       case "ping":
         return result(id, {});
       default:
@@ -950,6 +969,9 @@ export async function handleMcp(
   record: HealthRecord = noRecord,
   logCrash: ToolCrashLog = noLog,
   countName?: NameCount,
+  /** Where the docs are and the version this door runs (T-476, src/docs.ts): the `docs` tool, the brief's line, and
+   *  `docs` on every refusal. Omitted: none of them. */
+  docs?: DocsContext,
 ): Promise<Response> {
   if (req.method === "DELETE") return new Response(null, { status: 200 });
   if (req.method !== "POST") {
@@ -1031,24 +1053,24 @@ export async function handleMcp(
   // 0.9 shape and the scope filter. Parity with bun's mcp-tools.ts: override
   // first, so the record surface wraps the real vault-info.
   overrideVaultInfo(all, { vaultName, auth, description, origin, ctx: vaultInfo });
-  const tools = scopedTools(store, all, vaultName, auth, countName);
+  const tools = scopedTools(store, all, vaultName, auth, countName, docs);
   // The write stamp (rest/write-stamp.ts): a key with the owner's on-behalf-of grant names who a write is for with
   // `on_behalf_of`; the call runs on the same tools built for that "by", with the token's own scopes.
   applyOnBehalf(tools, auth, (by) => {
     const forBy: AuthResult = { ...auth, actor: by, acts_for: null };
     const twin = visibleTools(store, vaultName, forBy, ticketSeam, tickets.bytes, vaultInfo.hybridAuto);
     overrideVaultInfo(twin, { vaultName, auth: forBy, description, origin, ctx: vaultInfo });
-    return scopedTools(store, twin, vaultName, forBy, countName);
+    return scopedTools(store, twin, vaultName, forBy, countName, docs);
   });
   const instructions = () =>
     serverInstruction(vaultName, description, connectionReachFor(auth, vaultName), projectionFor(store, auth), {
       readEnabled: tickets.bytes !== undefined,
       // As a box says it (core src/mcp-tools.ts): the brief names add-attachment where this connection lists it.
       addEnabled: tools.some((t) => t.name === ATTACHMENT_INLINE_TOOL),
-    });
+    }, docs);
   // The connection's level here (cloud has no tag-scoped passes, so an admin scope is a vault-wide admin).
   const level: McpLevel = hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
-  const ctx = { tools, level, vaultName, description, instructions, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
+  const ctx = { tools, level, vaultName, description, instructions, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash, docs };
   if (modern) return handleModern(messages[0]!, ctx);
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));

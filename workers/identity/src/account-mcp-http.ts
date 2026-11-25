@@ -31,6 +31,8 @@
  */
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import { internalRefusal, refusal, refusalResult, unknownToolRefusal } from "@openparachute/core/src/mcp-refusal.js";
+import { withRefusalDocs } from "@openparachute/core/src/docs-tool.js";
+import { ACCOUNT_DOCS } from "./docs.ts";
 import { validateAccountToken } from "./account-auth.ts";
 import {
   ACCOUNT_OLD_NAMES,
@@ -338,7 +340,12 @@ async function handleOne(m: JsonRpcMessage, ctx: AccountToolContext): Promise<Js
         // `await` (not a bare return) so a rejected tool-call promise unwinds
         // INTO this try/catch and becomes a JSON-RPC INTERNAL_ERROR — a bare
         // return would settle the promise outside the guard.
-        return await handleToolCall(id, params, ctx);
+      {
+        // T-476: every refusal names the page with its fix (a vault's own, passed through, already does).
+        const answered = await handleToolCall(id, params, ctx);
+        const r = answered.result as { isError?: unknown } | undefined;
+        return r && r.isError === true ? { ...answered, result: withRefusalDocs(r as never, ACCOUNT_DOCS) } : answered;
+      }
       case "ping":
         return result(id, {});
       default:

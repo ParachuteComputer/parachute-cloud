@@ -21,6 +21,7 @@ const CALLS: Array<{ tool: string; action?: string; want: Want; args: (id: strin
   { tool: "vault-info", want: "open", args: () => ({}) },
   { tool: "vault-info", action: "description", want: "gated", args: () => ({ description: "frozen" }) },
   { tool: "doctor", want: "open", args: () => ({}) },
+  { tool: "docs", want: "open", args: () => ({ topic: "fix/refusals" }) },
   { tool: "read-attachment", want: "open", args: () => ({ path: "nothing/here.txt" }) },
   { tool: "attachment-url", action: "download", want: "open", args: () => ({ action: "download", path: "nothing/here.txt" }) },
   { tool: "attachment-url", action: "upload", want: "gated", args: (id) => ({ action: "upload", record: id, filename: "a.txt", mime_type: "text/plain", size_bytes: 10 }) },

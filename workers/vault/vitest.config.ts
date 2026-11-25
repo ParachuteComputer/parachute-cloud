@@ -68,6 +68,8 @@ function project(name: string, billingMode: "paid" | "open_beta", files: { inclu
               VAULT_BASE_DOMAIN: "u.parachute.computer",
               CAP_BYTES: "2000000",
               VAULT_AUTH_TOKEN: "test-operator-token",
+              // T-476: the docs tool and /latest.json never reach the network from a test (src/docs.ts).
+              PARACHUTE_DOCS_URL: "http://127.0.0.1:9",
               TEST_JWKS: TEST_PUBLIC_JWKS,
               BILLING_MODE: billingMode,
               // test/row-cost.test.ts: extra vault sizes to meter (e.g. "5000,50000"); empty in CI.

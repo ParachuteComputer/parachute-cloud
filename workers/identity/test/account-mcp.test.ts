@@ -17,6 +17,8 @@
  *     (asserted against every tool result body);
  *   - the PRM shape + the descriptor's account_mcp_endpoint + the live route wiring.
  */
+import { docsPageUrl, refusalTopic } from "@openparachute/core/src/docs-tool.js";
+import { ACCOUNT_DOCS } from "../src/docs.ts";
 import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import { handleAccountMcp } from "../src/account-mcp-http.ts";
@@ -707,6 +709,10 @@ describe("account bridge mint — the admin write-clamp (hard ceiling)", () => {
 
 // --- one way to refuse (T-476): every refusal is an isError result, never a JSON-RPC error ---------------------------
 
+/** T-476: every refusal through this door names the page with its fix (src/docs.ts); a vault's that already does is
+ *  passed through as the vault said it. */
+const docsFor = (type: string) => docsPageUrl(ACCOUNT_DOCS as { origin: string; version: string }, refusalTopic(type));
+
 describe("account MCP — one way to refuse", () => {
   /** A write-capable token on vault `w` (a composed per-vault grant). */
   async function writer(email: string): Promise<string> {
@@ -726,15 +732,20 @@ describe("account MCP — one way to refuse", () => {
   test("an unknown tool is an unknown_tool refusal, as on the vault door", async () => {
     const token = await writer("refuse-unknown@example.com");
     const { body } = await callJson(await handleAccountMcp(db(), mcpReq(token, rpc("tools/call", { name: "no-such-tool", arguments: {} })), mcpDeps()));
-    expect(refused(body, "unknown_tool")).toEqual({ error_type: "unknown_tool", message: "Unknown tool: no-such-tool", tool: "no-such-tool" });
+    expect(refused(body, "unknown_tool")).toEqual({ error_type: "unknown_tool", message: "Unknown tool: no-such-tool", tool: "no-such-tool", docs: docsFor("unknown_tool") });
   });
 
   test("a vault's own refusal comes back as the vault said it", async () => {
     const token = await writer("refuse-pass@example.com");
     const sc = { error_type: "conflict", message: "changed since you read it", record_id: "n1", current_updated_at: "2026-11-25T00:00:00.000Z" };
     const vaultResult = { content: [{ type: "text", text: JSON.stringify(sc, null, 2) }], structuredContent: sc, isError: true };
+    // a vault on 0.9 with docs (core #167) names its own page: passed through untouched
+    const said = { ...sc, docs: "https://parachute.computer/docs/v/0.9/fix/conflict/#conflict" };
+    const withDocs = { content: [{ type: "text", text: JSON.stringify(said, null, 2) }], structuredContent: said, isError: true };
+    expect((await write(token, { jsonrpc: "2.0", id: 1, result: withDocs })).result).toEqual(withDocs);
+    // an older vault's names none: the same refusal, with this door's link added
     const body = await write(token, { jsonrpc: "2.0", id: 1, result: vaultResult });
-    expect(body.result).toEqual(vaultResult);
+    expect(body.result.structuredContent).toEqual({ ...sc, docs: docsFor("conflict") });
     refused(body, "conflict");
   });
 
@@ -751,21 +762,22 @@ describe("account MCP — one way to refuse", () => {
       current_updated_at: "2026-11-25T00:00:00.000Z",
       note_id: "n1",
       vault: "w",
+      docs: docsFor("conflict"),
     });
   });
 
   test("a vault's router refusal keeps its type, and an older vault's bare-text isError is still one refusal", async () => {
     const token = await writer("refuse-router@example.com");
     const busy = await write(token, { status: 503, body: { error: "import_in_progress", error_type: "import_in_progress", message: "An import is running." } });
-    expect(refused(busy, "import_in_progress")).toEqual({ error_type: "import_in_progress", message: "w: An import is running.", vault: "w" });
+    expect(refused(busy, "import_in_progress")).toEqual({ error_type: "import_in_progress", message: "w: An import is running.", vault: "w", docs: docsFor("import_in_progress") });
     const bare = await write(token, { jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "Unknown tool: update-record" }], isError: true } });
-    expect(refused(bare, "vault_error")).toEqual({ error_type: "vault_error", message: "w: Unknown tool: update-record", vault: "w" });
+    expect(refused(bare, "vault_error")).toEqual({ error_type: "vault_error", message: "w: Unknown tool: update-record", vault: "w", docs: docsFor("vault_error") });
   });
 
   test("a vault error without a type is vault_error, and a refusal this door makes carries its fields", async () => {
     const token = await writer("refuse-untyped@example.com");
     const body = await write(token, { jsonrpc: "2.0", id: 1, error: { code: -32603, message: "Internal error" } });
-    expect(refused(body, "vault_error")).toEqual({ error_type: "vault_error", message: "w: Internal error", vault: "w" });
+    expect(refused(body, "vault_error")).toEqual({ error_type: "vault_error", message: "w: Internal error", vault: "w", docs: docsFor("vault_error") });
     const { body: required } = await callJson(
       await handleAccountMcp(db(), mcpReq(token, rpc("tools/call", { name: "create-record", arguments: { body: "where?" } })), mcpDeps()),
     );

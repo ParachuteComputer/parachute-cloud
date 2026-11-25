@@ -246,8 +246,17 @@ describe("MCP — tools", () => {
       params: { name: "create-note", arguments: { content: "nope" } },
     });
     const body = (await res.json()) as any;
-    // The same refusal as a tool that doesn't exist: nothing says the tool is there at another level.
-    expect(refused(body, "unknown_tool")).toEqual({ error_type: "unknown_tool", message: "Unknown tool: create-note", tool: "create-note" });
+    // The same refusal as a tool that doesn't exist: nothing says the tool is there at another level. T-476: it says the
+    // caller's own level, and names the page with the fix, for this door's version (the test's docs origin, src/docs.ts).
+    const expected = {
+      error_type: "unknown_tool",
+      message: "Unknown tool: create-note. This connection can read; tools that write or need admin aren't listed for it.",
+      tool: "create-note",
+      docs: "http://127.0.0.1:9/docs/v/0.9/fix/needs-admin/#a-tool-it-cant-see",
+    };
+    expect(refused(body, "unknown_tool")).toEqual(expected);
+    const none = (await (await mcpPost(v, token, { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "no-such-tool", arguments: {} } })).json()) as any;
+    expect(refused(none, "unknown_tool")).toEqual({ ...expected, message: expected.message.replace("create-note", "no-such-tool"), tool: "no-such-tool" });
   });
 
   it("unknown method → -32601", async () => {
@@ -669,5 +678,49 @@ describe("MCP — vault-info (server-layer override)", () => {
       expect(serverInstruction("v", "  A curated vault.  ", undefined, EMPTY_PROJECTION)).toContain("A curated vault.");
       expect(serverInstruction("v", null, undefined, EMPTY_PROJECTION)).toContain('Parachute Vault "v"');
     });
+  });
+});
+
+/**
+ * T-476: an AI on this door knows where Parachute's docs are, for the version this door runs (src/docs.ts), and when
+ * refused, which page has the fix. The engine builds all of it (core docs-tool.ts); this holds the door's wiring:
+ * the version and docs origin passed in, `docs` on every refusal and warning, the tool listed. The test's docs origin
+ * is a closed local port (vitest.config.ts), so the tool answers from its built-in copy and nothing leaves.
+ */
+describe("MCP — docs for this version (T-476)", () => {
+  const call = async (v: string, token: string, name: string, args: Record<string, unknown>) =>
+    (await (await mcpPost(v, token, { jsonrpc: "2.0", id: 9, method: "tools/call", params: { name, arguments: args } })).json()) as any;
+
+  it("the brief names the docs tool and this door's version; the tool is listed for a reader, open-world", async () => {
+    const v = freshVault();
+    const token = await mintToken({ vault: v, scopes: `vault:${v}:read` });
+    const init = (await (await mcpPost(v, token, initBody)).json()) as any;
+    expect(init.result.instructions).toContain("## Docs\n\nParachute 0.9.0-pre.2. `docs {search}` or `docs {topic}` reads 127.0.0.1:9's pages for this version");
+    const list = (await (await mcpPost(v, token, { jsonrpc: "2.0", id: 2, method: "tools/list" })).json()) as any;
+    const docs = list.result.tools.find((t: any) => t.name === "docs");
+    expect(docs?.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true });
+  });
+
+  it("a writer refused the vault's description gets the person's step and the fix page; the tool reads that page", async () => {
+    const v = freshVault();
+    const token = await mintToken({ vault: v, scopes: `vault:${v}:write` });
+    const body = await call(v, token, "vault-info", { description: "Films and books" });
+    const r = refused(body, "insufficient_scope");
+    expect(r.hint).toBe("The person grants it: they connect this AI again and leave the level it needs ticked on Parachute's approval page (for a script, a key made with that level).");
+    expect(r.docs).toBe("http://127.0.0.1:9/docs/v/0.9/fix/needs-admin/#what-the-refusal-says");
+    expect(JSON.parse(body.result.content[0].text)).toEqual(body.result.structuredContent);
+    const page = await call(v, token, "docs", { topic: r.docs });
+    expect(page.result.isError).toBeFalsy();
+    expect(page.result.content[0].text).toContain("# Needs admin");
+    expect(page.result.content[0].text).toContain("Offline copy:");
+  });
+
+  it("a type that isn't there: the empty list's warning names the same page as list-types' refusal", async () => {
+    const v = freshVault();
+    const token = await mintToken({ vault: v, scopes: `vault:${v}:write` });
+    const listed = await call(v, token, "query-records", { type: "no-such-type" });
+    const warning = JSON.parse(listed.result.content[0].text).warnings.find((w: any) => w.code === "unknown_tag");
+    expect(warning.docs).toBe("http://127.0.0.1:9/docs/v/0.9/fix/unknown-type/#no-type-by-that-name");
+    expect(refused(await call(v, token, "list-types", { name: "no-such-type" }), "tag_not_found").docs).toBe(warning.docs);
   });
 });
