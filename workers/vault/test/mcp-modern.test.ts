@@ -223,7 +223,7 @@ describe("MCP 2026-07-28 — version and header validation", () => {
 
   it("a method this revision removed (ping) or never had → 404 Method not found (-32601)", async () => {
     const v = freshVault();
-    for (const method of ["ping", "resources/list"]) {
+    for (const method of ["ping", "prompts/list"]) {
       const res = await modernPost(v, OP, { id: 15, method, params: { _meta: meta() } });
       expect(res.status).toBe(404);
       expect(((await res.json()) as any).error.code).toBe(-32601);
