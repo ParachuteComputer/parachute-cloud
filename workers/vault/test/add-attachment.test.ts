@@ -9,6 +9,7 @@ import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
+import { storeTicketUpload, UploadRefused } from "../src/attachment-tickets.ts";
 
 const BOTH_ACCEPT = "application/json, text/event-stream";
 const FILES = "io.modelcontextprotocol/files";
@@ -136,5 +137,25 @@ describe("add-attachment on the hosted door", () => {
     expect(ext.maxInlineBytes).toBeGreaterThan(0);
     expect(ext.upload).toBeUndefined();
     expect(body.result.instructions).toContain("add-attachment");
+  });
+
+  it("the writer re-runs the gate on the real bytes: a refusal keeps the REST body whole and nothing reaches R2", async () => {
+    // Reached in a race (another upload fills the budget between the call's gate and the store), so driven directly.
+    const v = freshVault("aa");
+    const refusal = { error: "Storage cap exceeded", error_type: "storage_cap_exceeded", meter: "attachments", cap_bytes: 1, used_bytes: 1, attempted_bytes: 64 };
+    const ticket = { id: "t", kind: "upload" as const, vaultName: v, createdAt: 0, expiresAt: 0, noteId: "n", filename: "a.bin", mimeType: "application/octet-stream", sizeBytes: 64 };
+    const err = await storeTicketUpload(ticket, madeUp(64), {
+      vaultName: v,
+      store: {} as any,
+      attachments: env.ATTACHMENTS,
+      mintGate: () => Response.json(refusal, { status: 413 }),
+      meterAdd: async () => {},
+      refuseLateWrite: async () => null,
+      scheduleTranscription: async () => {},
+    }).then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(UploadRefused);
+    expect(err.status).toBe(413);
+    expect(err.gateBody).toEqual(refusal);
+    expect((await env.ATTACHMENTS.list({ prefix: `vault-${v}/attachments/` })).objects.length).toBe(0);
   });
 });
