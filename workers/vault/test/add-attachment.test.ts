@@ -40,7 +40,7 @@ async function fileInput(bytes: Uint8Array, over: Record<string, unknown> = {}) 
 
 function madeUp(n: number): Uint8Array {
   const out = new Uint8Array(n);
-  crypto.getRandomValues(out);
+  for (let i = 0; i < n; i += 65536) crypto.getRandomValues(out.subarray(i, Math.min(n, i + 65536)));
   return out;
 }
 
@@ -88,6 +88,13 @@ describe("add-attachment on the hosted door", () => {
     await putConfig(v, { caps: { notes_bytes: 100 * 1024 * 1024, attachment_bytes: 0 } });
     const entry = await add(v, { record: note.id, file: await fileInput(madeUp(64)) });
     expect(entry.error.data.error_type).toBe("attachments_not_included");
+
+    // Only the call's own gate runs before core checks the file: a bad digest on Entry tier is still the plan refusal.
+    const early = await add(v, { record: note.id, file: await fileInput(madeUp(64), { digest: { algorithm: "sha-256", value: await digest(madeUp(64)) } }) });
+    expect(early.error.data.error_type).toBe("attachments_not_included");
+    // A file over the inline cap is core's to refuse, pointing at the ticket URL, not the plan's.
+    const overCap = await add(v, { record: note.id, file: await fileInput(madeUp(81 * 1024)) });
+    expect(overCap.error.data.error_type).toBe("inline_too_large");
 
     await putConfig(v, { caps: { notes_bytes: 100 * 1024 * 1024, attachment_bytes: 1024 } });
     const full = await add(v, { record: note.id, file: await fileInput(madeUp(4096)) });

@@ -38,7 +38,8 @@ import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.j
 import { buildVaultProjection, attachmentsInstructionBlock } from "@openparachute/core/src/vault-projection.js";
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicket, AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
-import { declaresFilesExtension, FILES_EXTENSION, FILES_EXTENSION_SETTINGS, schemaForClient } from "@openparachute/core/src/attachment/inline.js";
+import { declaresFilesExtension, FILES_EXTENSION, FILES_EXTENSION_SETTINGS, MAX_INLINE_ATTACHMENT_BYTES, schemaForClient } from "@openparachute/core/src/attachment/inline.js";
+import { UploadRefused } from "./attachment-tickets.js";
 import type { Attachment } from "@openparachute/core/src/types.js";
 import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
@@ -626,8 +627,10 @@ async function handleToolCall(
     // raises the field-validation error — the gate never masks THAT with a
     // confusing cap refusal.
     // add-attachment declares its size on the file (FileInput `size`); the store re-runs the gate on the bytes.
+    // A file over the inline cap is left to core, whose refusal points at the ticket URL.
     const sizeBytes = name === ATTACHMENT_INLINE_TOOL ? (args.file as { size?: unknown } | undefined)?.size : args.size_bytes;
-    if (typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > 0) {
+    const overInline = name === ATTACHMENT_INLINE_TOOL && typeof sizeBytes === "number" && sizeBytes > MAX_INLINE_ATTACHMENT_BYTES;
+    if (typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > 0 && !overInline) {
       const blocked = attachmentMintGate(sizeBytes);
       if (blocked) {
         await record(subject, `gate:${blocked.status}`);
@@ -654,6 +657,11 @@ async function handleToolCall(
     const content = tool.resultContent ? tool.resultContent(out) : [{ type: "text" as const, text: JSON.stringify(out, null, 2) }];
     return result(id, { content });
   } catch (err) {
+    // A storage gate that refused inside the tool (add-attachment's store, T-476): the same answer as at the call's gate.
+    if (err instanceof UploadRefused) {
+      await record(subject, `gate:${err.status}`);
+      return rpcError(id, INVALID_REQUEST, err.message, err.gateBody);
+    }
     const domain = mapDomainError(err);
     const message = err instanceof Error ? err.message : "Unknown error";
     // Never the message: the error's class decides (health.ts toolErrorOutcome).

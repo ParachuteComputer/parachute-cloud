@@ -378,11 +378,22 @@ async function registerUpload(ticket: AttachmentTicket, relativePath: string, si
   return attachment;
 }
 
-/** A gate's or a late write's REST refusal, as the error an MCP tool throws (its `error_type`, `limit`, `hint` …). */
-async function refusalError(res: Response): Promise<Error> {
-  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-  const message = typeof body.message === "string" ? body.message : typeof body.error === "string" ? body.error : "This upload is not permitted.";
-  return Object.assign(new Error(message), body);
+/**
+ * A gate's or a late write's REST refusal, thrown from an MCP tool. It carries the REST body whole (`gateBody`), so the
+ * MCP layer answers it exactly as a refusal at the call's own gate (`mcp.ts` `gateError`): the same code and data,
+ * `meter` and the byte counts included, whichever gate caught it.
+ */
+export class UploadRefused extends Error {
+  constructor(
+    readonly gateBody: Record<string, unknown>,
+    readonly status: number,
+  ) {
+    super(typeof gateBody.message === "string" ? gateBody.message : "This write is not permitted.");
+  }
+}
+
+async function refusalError(res: Response): Promise<UploadRefused> {
+  return new UploadRefused((await res.json().catch(() => ({}))) as Record<string, unknown>, res.status);
 }
 
 /**
