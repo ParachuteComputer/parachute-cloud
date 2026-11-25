@@ -316,9 +316,15 @@ export interface ConsentProps {
   /**
    * The app registered itself (RFC 7591) and Parachute can't vouch for it: not
    * a reserved Parachute client id and not returning only to Parachute's own
-   * pages (oauth-connections.ts `isVouchedClient`). Shows the unverified label.
+   * pages (oauth-connections.ts `isVouchedClient`). Shows the "Self-registered" label.
    */
   unverified: boolean;
+  /**
+   * The app asked for a vault's admin (T-476 claudereal: an AI connector asks for every scope it can). Admin is then an
+   * unticked box in the form, marked powerful, and granted only when ticked (oauth-authorize.ts handleConsentSubmit).
+   * Optional so a caller that never asks for admin needn't say so.
+   */
+  adminChoice?: boolean;
   /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `authorizeResumePath`). */
   notYouNext: string;
   /**
@@ -367,6 +373,8 @@ export interface OwnerVerbSelector {
    * reaches here — it is already admin and needs no selector.
    */
   requestedVerbs: string[];
+  /** The app asked for admin too (T-476): this selector is then the one admin control, and says so. */
+  askedAdmin?: boolean;
 }
 
 /**
@@ -441,7 +449,7 @@ function renderVaultPicker(ownedVaults: string[], clientName: string): string {
  */
 function renderVerbSelector(selector: OwnerVerbSelector): string {
   const defaultVerb = selector.requestedVerbs.includes("write") ? "write" : "read";
-  const asked = selector.requestedVerbs.map((v) => `<code>vault:${esc(v)}</code>`).join(" and ");
+  const asked = [...selector.requestedVerbs, ...(selector.askedAdmin ? ["admin"] : [])].map((v) => `<code>vault:${esc(v)}</code>`).join(" and ");
   const option = (verb: "read" | "write" | "admin", title: string, desc: string): string => {
     const checked = verb === defaultVerb ? " checked" : "";
     const badge = verb === "admin" ? ` <span class="verbbadge">admin</span>` : "";
@@ -455,7 +463,7 @@ function renderVerbSelector(selector: OwnerVerbSelector): string {
            <p class="muted" style="margin:.3rem 0 0;font-size:.84rem">This app asked for ${asked} access. Because you own this vault, you can grant a different level.</p>
            ${option("read", "Read only", "Read the whole vault: every note, tag and attachment, and its settings.")}
            ${option("write", "Read & write", "Read the whole vault, and create, edit and delete its notes, tags and attachments.")}
-           ${option("admin", "Full admin", "Everything above, plus vault config and minting tokens.")}
+           ${option("admin", "Full admin", "Powerful: everything above, and the app could change how the vault works and make keys of its own. Choose it only if you want this app to manage the vault.")}
          </fieldset>`;
 }
 
@@ -547,11 +555,15 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent, clientName: str
 }
 
 export function renderConsent(props: ConsentProps): string {
-  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults, replaces, unverified } = props;
+  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults, replaces, unverified, adminChoice } = props;
   // The plain sentence is the list (T-318 #15: raw `vault:<name>:read` under it
   // read as jargon). A scope with no sentence keeps its raw string here, so no
   // requested scope is ever only in the closed "Technical details" below.
-  const scopeList = scopeDescriptions.map((s) => `<li><strong>${esc(s.label)}</strong></li>`).join("\n");
+  // An admin the app asked for is the box below, not a line here: it is granted only when ticked (T-476).
+  // The same when the level selector is the admin control: it names admin among what was asked.
+  const adminElsewhere = adminChoice || verbSelector?.askedAdmin === true;
+  const listed = adminElsewhere ? scopeDescriptions.filter((s) => !isVaultAdminScope(s.scope)) : scopeDescriptions;
+  const scopeList = listed.map((s) => `<li><strong>${esc(s.label)}</strong></li>`).join("\n");
   const rawScopes = scopeDescriptions.map((s) => `<li><code>${esc(s.scope)}</code></li>`).join("");
   const vaultField = lockedVault
     ? `<input type="hidden" name="vault_pick" value="${esc(lockedVault)}">`
@@ -562,9 +574,11 @@ export function renderConsent(props: ConsentProps): string {
   const nothingToPick = !lockedVault && needsVaultPick && ownedVaults.length === 0;
   const verbSelectorField = verbSelector ? renderVerbSelector(verbSelector) : "";
   const accountVaultsField = accountVaults ? renderAccountVaultsBlock(accountVaults, clientName) : "";
+  // Say what Allow gives as drawn: an admin the app asked for waits for the person's choice below (T-476).
   const ask = consentAsk({
     clientName,
-    scopes: scopeDescriptions.map((s) => s.scope),
+    scopes: (listed.length > 0 ? listed : scopeDescriptions).map((s) => s.scope),
+    adminOnly: adminElsewhere && listed.length === 0,
     lockedVault,
     needsVaultPick,
     account: accountVaults !== null,
@@ -576,7 +590,7 @@ export function renderConsent(props: ConsentProps): string {
      <div class="card">
        ${unverified ? unverifiedLabel() : ""}
        <p class="lead" data-testid="consent-ask">${ask}</p>
-       <ul class="scopes">${scopeList}</ul>
+       ${adminChoice && listed.length === 0 ? `<p class="muted" data-testid="consent-admin-only">It asks only to manage the vault: without the tick below, Allow connects nothing.</p>` : `<ul class="scopes">${scopeList}</ul>`}
        ${!accountVaults && scopeDescriptions.some((d) => /^vault:/.test(d.scope)) ? `<p class="muted" data-testid="consent-reads-go" style="margin:.4rem 0 0">What this app reads from your vault goes to the company that runs it.</p>` : ""}
        ${returnsToLine(params.redirectUri)}
        <form method="post" action="/oauth/authorize">
@@ -585,6 +599,7 @@ export function renderConsent(props: ConsentProps): string {
          ${hiddenParams(params)}
          ${vaultField}
          ${verbSelectorField}
+         ${adminChoice ? adminChoiceBox() : ""}
          ${accountVaultsField}
          ${replacesBox(clientName, replaces ?? null, accountVaults?.ownedVaults.length === 0)}
          <div class="row">
@@ -621,9 +636,28 @@ function returnsToLine(redirectUri: string): string {
   return `<p class="muted" data-testid="consent-returns-to">After you allow, you go to <code>${esc(u.origin)}</code>.</p>`;
 }
 
-/** The unverified-app label: the app named itself and Parachute can't vouch for it. */
+/**
+ * The label for an app that registered itself: the app named itself and Parachute can't vouch for it. Plain words, no
+ * warning box (T-476: every AI connector registers itself, and "Unverified" read as a warning about Claude). The same
+ * words as the box's consent page.
+ */
 function unverifiedLabel(): string {
-  return `<div class="warn" data-testid="consent-unverified" style="margin:0 0 .8rem"><strong>Unverified app.</strong> This app registered itself, so Parachute can't confirm who made it. Allow only if you started this connection and recognise where it sends you.</div>`;
+  return `<p class="muted" data-testid="consent-unverified" style="margin:0 0 .8rem"><strong>Self-registered.</strong> It registered itself when you connected it. Allow if you started this connection.</p>`;
+}
+
+/** `vault:admin` or `vault:<name>:admin`. */
+export function isVaultAdminScope(scope: string): boolean {
+  const parts = scope.split(":");
+  return parts[0] === "vault" && parts[parts.length - 1] === "admin" && (parts.length === 2 || parts.length === 3);
+}
+
+/**
+ * Admin, when the app asked for it (T-476 claudereal): an unticked box inside the form, marked powerful, the same
+ * choice as the box's consent page. `admin_choice_shown` says the box was drawn, so an unticked box withholds admin.
+ */
+function adminChoiceBox(): string {
+  return `<input type="hidden" name="admin_choice_shown" value="1">
+         <label class="verbopt" data-testid="consent-admin"><input type="checkbox" name="grant_admin" value="1"><span class="verbopt-body"><span class="verbopt-title">Also let it manage the vault <span class="verbbadge">admin</span></span><span class="verbopt-desc"><strong>Powerful.</strong> The app could change how the vault works and make keys of its own. Tick it only if you want this app to manage the vault.</span></span></label>`;
 }
 
 /**
@@ -676,6 +710,8 @@ export function consentAsk(opts: {
   lockedVault: string | null;
   needsVaultPick: boolean;
   account: boolean;
+  /** The app asked only for admin, which waits for the person's tick (T-476): the ask says "manage". */
+  adminOnly?: boolean;
 }): string {
   const who = `<strong>${esc(opts.clientName)}</strong>`;
   if (opts.account) return `${who} wants to see and work with the vaults in your account.`;
@@ -691,7 +727,9 @@ export function consentAsk(opts: {
     }
   }
   if (verbs.size === 0) return `${who} wants access to your Parachute account.`;
-  const what = verbs.has("admin")
+  const what = opts.adminOnly
+    ? "manage"
+    : verbs.has("admin")
     ? "read, write and manage notes in"
     : verbs.has("write")
       ? "read and write notes in"
