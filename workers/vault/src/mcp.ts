@@ -7,7 +7,10 @@
  * id). We reproduce that transport's *exact wire behavior* by hand rather than
  * pulling the SDK into workerd — the SDK's server core drags in ajv (dynamic
  * codegen, blocked under workerd) + a heavy zod/express dep tree, and the
- * stateless surface Claude needs is small. Byte-shape parity with the SDK is
+ * stateless surface Claude needs is small. (One SDK piece is imported: the v2
+ * SDK's `skillEntry`, which builds each skill's digests and frontmatter for
+ * the Skills extension exactly as a box does; mcp-skills.ts. It brings zod,
+ * about 125 KB gzipped, and no ajv.) Byte-shape parity with the SDK is
  * the contract (any subtle miss presents as an opaque connector failure), so
  * every rule below is transcribed from
  * `@modelcontextprotocol/sdk` webStandardStreamableHttp.js @ 1.12.1:
@@ -35,7 +38,9 @@
  */
 import type { Database } from "bun:sqlite";
 import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.js";
-import { buildVaultProjection, connectionReach, projectionToMarkdown, type VaultProjection } from "@openparachute/core/src/vault-projection.js";
+import { buildVaultProjection, connectionReach, projectionToMarkdown, resolveTagInheritance, type VaultProjection } from "@openparachute/core/src/vault-projection.js";
+import { loadSchemaConfig } from "@openparachute/core/src/schema-defaults.js";
+import { listTagRecords } from "@openparachute/core/src/tag-schemas.js";
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicket, AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
 import { declaresFilesExtension, MAX_INLINE_ATTACHMENT_BYTES, schemaForClient } from "@openparachute/core/src/attachment/inline.js";
@@ -61,6 +66,7 @@ import {
   type McpRefusal,
 } from "@openparachute/core/src/mcp-refusal.js";
 import { errorClass, refusalOutcome, toolErrorOutcome } from "./health.js";
+import { SKILL_METHODS, SKILLS_EXTENSION_ID, vaultSkillMethods } from "./mcp-skills.js";
 
 // Transcribed from the SDK's types.js so negotiation matches byte-for-byte.
 const LATEST_PROTOCOL_VERSION = "2025-11-25";
@@ -293,6 +299,36 @@ export function projectionFor(store: Store, auth: AuthResult): VaultProjection {
     map: getVaultMap(store.db as never, filter),
     stats: getVaultStats(store.db as never, filter),
   };
+}
+
+/**
+ * The types vault-guide pages (skill-files.ts `vaultGuideFiles` reads only a projection's `tags`), built as
+ * buildVaultProjection builds its `tags` and narrowed as {@link projectionFor} narrows them for a typed key, but without
+ * the vault map and stats: those count over every record, and a skills request (claude.ai lists skills on every
+ * connect) must not pay a scan of the vault in rows read. test/mcp-skills.test.ts holds the guide equal to the one
+ * the full projection makes.
+ */
+export function guideTagsFor(store: Store, auth: AuthResult): VaultProjection["tags"] {
+  const db = store.db as never;
+  const resolved = loadSchemaConfig(db);
+  const tags: VaultProjection["tags"] = [];
+  for (const r of listTagRecords(db)) {
+    const hasOwnSchema = (r.description !== undefined && r.description !== null) || (r.fields != null && Object.keys(r.fields).length > 0);
+    if (!hasOwnSchema) continue;
+    const { effective_parents, effective_fields } = resolveTagInheritance(resolved, r.tag);
+    tags.push({
+      name: r.tag,
+      description: r.description ?? null,
+      parents: r.parent_names ?? [],
+      effective_parents,
+      fields: r.fields ?? null,
+      effective_fields,
+      relationships: r.relationships ?? null,
+    });
+  }
+  if (!auth.scoped_tags) return tags;
+  const scope = tagScopeFor(store, auth.scoped_tags);
+  return tags.filter((t) => tagVisibleInScope(t.name, scope.allowed, scope.raw));
 }
 
 /**
@@ -836,16 +872,18 @@ function modernRequestError(req: Request, m: JsonRpcMessage): Response | null {
         : `Header mismatch: Mcp-Method header value '${methodHeader}' does not match body value '${m.method}'`,
     );
   }
-  if (m.method === "tools/call") {
-    // A gateway may route or allow-list on Mcp-Name; the body must not run a different tool.
+  // A gateway may route or allow-list on Mcp-Name; the body must not run a different tool or read a different
+  // resource (the SDK's table: tools/call mirrors params.name, resources/read params.uri, as a box checks them).
+  const mirrored = m.method === "tools/call" ? m.params?.name : m.method === "resources/read" && typeof m.params?.uri === "string" ? m.params.uri : undefined;
+  if (m.method === "tools/call" || mirrored !== undefined) {
     const raw = req.headers.get("mcp-name");
     const name = raw === null ? null : decodeMirroredHeader(raw);
-    if (name === null || name !== m.params?.name) {
+    if (name === null || name !== mirrored) {
       return modernHttpError(
         400,
         id,
         HEADER_MISMATCH,
-        raw === null ? "Header mismatch: the Mcp-Name header is required for tools/call" : "Header mismatch: Mcp-Name header value does not match body value",
+        raw === null ? `Header mismatch: the Mcp-Name header is required for ${m.method}` : "Header mismatch: Mcp-Name header value does not match body value",
       );
     }
   }
@@ -861,11 +899,14 @@ function modernRequestError(req: Request, m: JsonRpcMessage): Response | null {
 /**
  * Serve one modern-era (2026-07-28) POST. One message per POST (the revision
  * dropped batching); a notification is 202 like the legacy era. The method
- * set is server/discover, tools/list and tools/call; anything else, including
- * initialize and ping (removed in this revision), is 404 -32601. Every result
- * carries `resultType: "complete"` and the server's identity in `_meta`.
+ * set is server/discover, tools/list and tools/call, and the Skills extension's
+ * (mcp-skills.ts: skills/list, skills/get, resources/list,
+ * resources/templates/list, resources/read; T-476, as a box serves them);
+ * anything else, including initialize and ping (removed in this revision), is
+ * 404 -32601. Every result carries `resultType: "complete"` and the server's
+ * identity in `_meta`.
  */
-const MODERN_METHODS = new Set(["server/discover", "tools/list", "tools/call"]);
+const MODERN_METHODS = new Set(["server/discover", "tools/list", "tools/call", ...SKILL_METHODS]);
 
 /**
  * Everything a modern POST can be answered with before the tool set is built
@@ -884,7 +925,10 @@ function modernEarlyResponse(req: Request, raw: unknown, m: JsonRpcMessage): Res
 }
 
 /** Serve a modern POST that passed {@link modernEarlyResponse}. */
-async function handleModern(m: JsonRpcMessage, ctx: Parameters<typeof handleOne>[1]): Promise<Response> {
+async function handleModern(
+  m: JsonRpcMessage,
+  ctx: Parameters<typeof handleOne>[1] & { skills: ReturnType<typeof vaultSkillMethods> },
+): Promise<Response> {
   const id = m.id ?? null;
   const serverInfo = { name: `parachute-vault/${ctx.vaultName}`, version: "0.1.0" };
   let reply: JsonRpcMessage;
@@ -892,7 +936,9 @@ async function handleModern(m: JsonRpcMessage, ctx: Parameters<typeof handleOne>
     case "server/discover":
       reply = result(id, {
         supportedVersions: ALL_SUPPORTED_VERSIONS,
-        capabilities: { tools: {} },
+        // The Skills extension, declared as a box declares it; its SKILL.md files are resources too. No `listChanged`:
+        // this door sends no notifications (no server-push stream, see handleMcp's GET).
+        capabilities: { tools: {}, resources: {}, extensions: { [SKILLS_EXTENSION_ID]: {} } },
         instructions: ctx.instructions(),
         ttlMs: MODERN_CACHE_TTL_MS,
         cacheScope: "private",
@@ -906,8 +952,21 @@ async function handleModern(m: JsonRpcMessage, ctx: Parameters<typeof handleOne>
     case "tools/call":
       reply = await handleOne(m, ctx);
       break;
-    default:
-      return modernHttpError(404, id, METHOD_NOT_FOUND, `Method not found: ${m.method}`);
+    default: {
+      if (!SKILL_METHODS.has(m.method ?? "")) return modernHttpError(404, id, METHOD_NOT_FOUND, `Method not found: ${m.method}`);
+      // From here the method is one of SKILL_METHODS (server-defined), so it may name the health subject.
+      const subject = `mcp:${m.method}`;
+      try {
+        const answer = await ctx.skills(m.method!, m.params);
+        await ctx.record?.(subject, "error" in answer ? refusalOutcome("invalid_params") : "ok");
+        reply = "error" in answer ? { jsonrpc: "2.0", id, error: answer.error } : result(id, answer.result);
+      } catch (err) {
+        ctx.logCrash?.(`rpc:${m.method}`, err);
+        await ctx.record?.(subject, `exception:${errorClass(err)}`);
+        reply = rpcError(id, INTERNAL_ERROR, "Internal error");
+      }
+      break;
+    }
   }
   if (reply.result && typeof reply.result === "object") {
     const r = reply.result as Record<string, unknown>;
@@ -1031,7 +1090,9 @@ export async function handleMcp(
   // 0.9 shape and the scope filter. Parity with bun's mcp-tools.ts: override
   // first, so the record surface wraps the real vault-info.
   overrideVaultInfo(all, { vaultName, auth, description, origin, ctx: vaultInfo });
-  const tools = scopedTools(store, all, vaultName, auth, countName);
+  // A skills request reads through query-records, which the client never called: it counts no name use.
+  const skillsCall = modern && SKILL_METHODS.has(messages[0]?.method ?? "");
+  const tools = scopedTools(store, all, vaultName, auth, skillsCall ? undefined : countName);
   // The write stamp (rest/write-stamp.ts): a key with the owner's on-behalf-of grant names who a write is for with
   // `on_behalf_of`; the call runs on the same tools built for that "by", with the token's own scopes.
   applyOnBehalf(tools, auth, (by) => {
@@ -1049,7 +1110,16 @@ export async function handleMcp(
   // The connection's level here (cloud has no tag-scoped passes, so an admin scope is a vault-wide admin).
   const level: McpLevel = hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
   const ctx = { tools, level, vaultName, description, instructions, writeGate, attachmentMintGate: tickets.mintGate, record, logCrash };
-  if (modern) return handleModern(messages[0]!, ctx);
+  if (modern) {
+    // The Skills extension reads through this connection's own query-records and projection, so a key sees only the
+    // skill records it could read anyway, and only this vault's (the store is this Durable Object's).
+    const skills = vaultSkillMethods({
+      vaultName,
+      guideTags: () => guideTagsFor(store, auth),
+      queryRecords: tools.find((t) => t.name === "query-records"),
+    });
+    return handleModern(messages[0]!, { ...ctx, skills });
+  }
   const responses: JsonRpcMessage[] = [];
   for (const m of requests) responses.push(await handleOne(m, ctx));
 
