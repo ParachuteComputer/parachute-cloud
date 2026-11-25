@@ -29,6 +29,27 @@ const initBody = {
   params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } },
 };
 
+// T-476: a live page (a Claude artifact) is written from the connector's words alone. The concurrency token the brief
+// names must be a key a read note carries, a write armed with it must land, and a stale one be refused.
+describe("MCP — the live-page words", () => {
+  it("the token the brief names is a key a read note carries: the write armed with it lands, a stale one is refused", async () => {
+    const v = freshVault();
+    const tok = await mintToken({ vault: v, scopes: `vault:${v}:read vault:${v}:write` });
+    const brief = ((await (await mcpPost(v, tok, initBody)).json()) as any).result.instructions as string;
+    const named = /if_updated_at: note\.(\w+)/.exec(brief)?.[1];
+    expect(named, brief.slice(-900)).toBeTruthy();
+    const call = async (name: string, args: Record<string, unknown>) =>
+      (await (await mcpPost(v, tok, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name, arguments: args } })).json()) as any;
+    await call("create-note", { path: "Tasks/Water the beds", content: "x", metadata: { status: "open" } });
+    const read = JSON.parse((await call("query-notes", { id: "Tasks/Water the beds" })).result.content[0].text);
+    expect(typeof read[named!], `a read note carries ${named}`).toBe("string");
+    const done = await call("update-note", { id: read.id, metadata: { status: "done" }, if_updated_at: read[named!] });
+    expect(done.error, JSON.stringify(done).slice(0, 300)).toBeUndefined();
+    const stale = await call("update-note", { id: read.id, metadata: { status: "open" }, if_updated_at: read[named!] });
+    expect(JSON.stringify(stale)).toMatch(/conflict/);
+  });
+});
+
 describe("MCP — transport rules", () => {
   it("initialize → 200 application/json, negotiated protocol + capabilities + instructions", async () => {
     const v = freshVault();

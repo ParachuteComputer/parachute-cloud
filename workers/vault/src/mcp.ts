@@ -217,8 +217,23 @@ export function serverInstruction(vaultName: string, description: string | null)
   // brief instead of refusing the session.
   const d = typeof description === "string" ? description.trim() : undefined;
   const head = d ? `${d}\n\n${base}` : base;
-  return `${head}\n\n${attachmentsInstructionBlock({ ticketsEnabled: true })}`;
+  return `${head}\n\n${attachmentsInstructionBlock({ ticketsEnabled: true })}\n\n## Live pages (Claude artifacts)\n\n${LIVE_PAGE_08}`;
 }
+
+/**
+ * T-476: how to build a live page (a Claude artifact) on this door, in its 0.8 words. A page calls the connector on
+ * every view with no model in the loop, so it is built from these words alone: the reply's shape and the concurrency
+ * token as a note carries it (`updatedAt`; the engine's update-note words at this pin still say "updated_at"). A 0.9
+ * door sends the engine's own paragraph (core vault-projection.ts LIVE_PAGE_BLOCK).
+ */
+export const LIVE_PAGE_08 =
+  "A live page reads this vault each time someone opens it. Declare only the tools it calls: `query-notes` to read, " +
+  "`update-note` to change, `create-note` to add. Read with `watchTool` on `query-notes`, filtered by `tag` or " +
+  "`path_prefix`; the reply is JSON: one note for `id`, an array, or `{notes, next_cursor}`, and a missing note " +
+  "answers `{error, error_type: \"not_found\"}`. A note's name is the last part of its `path`. Write only on a click: " +
+  "`update-note {id, metadata or content, if_updated_at: note.updatedAt}`, then `invalidate` the reads. A conflict " +
+  "means it changed elsewhere: read it again, never `force`. Writes need a viewer whose connection may write. Guide: " +
+  "https://parachute.computer/docs/use/claude-artifacts/";
 
 /**
  * Server-layer context the DO supplies so vault-info can build a REAL projection
