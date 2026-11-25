@@ -228,10 +228,10 @@ export function serverInstruction(vaultName: string, description: string | null)
  */
 export const LIVE_PAGE_08 =
   "A Claude artifact over this vault reads with `watchTool` on `query-notes` (filter by `tag` or `path_prefix`) and " +
-  "writes on a click with `update-note` (`if_updated_at: note.updatedAt`), then `invalidate`s; on a conflict it reads " +
-  "again, never `force`. It declares only the tools it calls, and `update-note` or `create-note` only if this connection lists them. " +
-  "A reply is a note (`{error, error_type}` if it's missing), an array, or an object with `notes` (and `next_cursor` " +
-  "or `warnings`). A note's name is the last part of its `path`. Guide: " +
+  "writes on a click with `update-note` (`if_updated_at: note.updatedAt`), then `invalidate`s; on a conflict it " +
+  "reads again, never `force`. It declares only the tools it calls, and `update-note` or `create-note` only if this " +
+  "connection lists them. A reply is a note (`{error, error_type}` if it's missing), an array, or an object with " +
+  "`notes` (and `next_cursor` or `warnings`). A note's name is the last part of its `path`. Guide: " +
   "https://parachute.computer/docs/use/claude-artifacts/";
 
 /**
