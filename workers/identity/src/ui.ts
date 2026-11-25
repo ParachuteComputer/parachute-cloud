@@ -560,7 +560,9 @@ export function renderConsent(props: ConsentProps): string {
   // read as jargon). A scope with no sentence keeps its raw string here, so no
   // requested scope is ever only in the closed "Technical details" below.
   // An admin the app asked for is the box below, not a line here: it is granted only when ticked (T-476).
-  const listed = adminChoice ? scopeDescriptions.filter((s) => !isVaultAdminScope(s.scope)) : scopeDescriptions;
+  // The same when the level selector is the admin control: it names admin among what was asked.
+  const adminElsewhere = adminChoice || verbSelector?.askedAdmin === true;
+  const listed = adminElsewhere ? scopeDescriptions.filter((s) => !isVaultAdminScope(s.scope)) : scopeDescriptions;
   const scopeList = listed.map((s) => `<li><strong>${esc(s.label)}</strong></li>`).join("\n");
   const rawScopes = scopeDescriptions.map((s) => `<li><code>${esc(s.scope)}</code></li>`).join("");
   const vaultField = lockedVault
@@ -572,11 +574,11 @@ export function renderConsent(props: ConsentProps): string {
   const nothingToPick = !lockedVault && needsVaultPick && ownedVaults.length === 0;
   const verbSelectorField = verbSelector ? renderVerbSelector(verbSelector) : "";
   const accountVaultsField = accountVaults ? renderAccountVaultsBlock(accountVaults, clientName) : "";
-  // Say what Allow gives as drawn: an admin the app asked for waits for the box below (T-476).
-  const askedOnly = listed.length > 0 ? listed : null;
+  // Say what Allow gives as drawn: an admin the app asked for waits for the person's choice below (T-476).
   const ask = consentAsk({
     clientName,
-    scopes: (askedOnly ?? scopeDescriptions).map((s) => s.scope),
+    scopes: (listed.length > 0 ? listed : scopeDescriptions).map((s) => s.scope),
+    adminOnly: adminElsewhere && listed.length === 0,
     lockedVault,
     needsVaultPick,
     account: accountVaults !== null,
@@ -708,6 +710,8 @@ export function consentAsk(opts: {
   lockedVault: string | null;
   needsVaultPick: boolean;
   account: boolean;
+  /** The app asked only for admin, which waits for the person's tick (T-476): the ask says "manage". */
+  adminOnly?: boolean;
 }): string {
   const who = `<strong>${esc(opts.clientName)}</strong>`;
   if (opts.account) return `${who} wants to see and work with the vaults in your account.`;
@@ -723,7 +727,9 @@ export function consentAsk(opts: {
     }
   }
   if (verbs.size === 0) return `${who} wants access to your Parachute account.`;
-  const what = verbs.has("admin")
+  const what = opts.adminOnly
+    ? "manage"
+    : verbs.has("admin")
     ? "read, write and manage notes in"
     : verbs.has("write")
       ? "read and write notes in"

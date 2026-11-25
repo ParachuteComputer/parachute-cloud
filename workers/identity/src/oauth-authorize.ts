@@ -963,9 +963,10 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
       (electedVerb === "read" || electedVerb === "write" || electedVerb === "admin") &&
       (await userOwnsVault(db, session.userId, picked))
     ) {
-      // The selector is the one admin control when drawn (T-476): an unnamed admin the app asked for counts only if the
-      // person chose "Full admin" there, which the widening below puts back.
-      scopes = widenUnnamedVaultVerb(scopes.filter((s) => s !== "vault:admin"), electedVerb);
+      // The selector is the one admin control when drawn (T-476): an admin the app asked for counts only if the person
+      // chose "Full admin" there, which the widening below puts back.
+      // Every admin scope, named ones too (`vault:read vault:<name>:admin` draws the selector and no box).
+      scopes = widenUnnamedVaultVerb(scopes.filter((s) => !isVaultAdminScope(s)), electedVerb);
     }
     scopes = narrowVaultScopes(scopes, picked);
   }

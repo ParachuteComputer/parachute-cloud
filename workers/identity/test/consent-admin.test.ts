@@ -117,6 +117,7 @@ describe("admin waits for the person's tick (T-476)", () => {
     const r = await allow(() => "vault:admin");
     expect(r.html).toContain('name="vault_pick"');
     expect(r.html).toContain('data-testid="consent-admin-only"');
+    expect(r.html).toContain("wants to manage");
     expect(r.denied).toBe("access_denied");
   });
 
@@ -126,6 +127,21 @@ describe("admin waits for the person's tick (T-476)", () => {
     expect(r.html).not.toContain('name="grant_admin"');
     expect(r.html).toContain("<code>vault:read</code> and <code>vault:write</code> and <code>vault:admin</code>");
     expect(r.scope).toBe("write");
+  });
+
+  // Review round 2: a named admin beside an unnamed verb draws the selector and no box; it must not ride through.
+  test("SECURITY: a named admin beside an unnamed verb, allowed as drawn or as Read only, gets no admin", async () => {
+    const r = await allow((v) => `vault:read vault:${v}:admin`);
+    expect(r.html).toContain('name="verb_select"');
+    expect(r.html).not.toContain("Full administrative access");
+    expect(r.scope).toBe("read");
+    expect((await allow((v) => `vault:read vault:write vault:${v}:admin`, [], { radio: { verb_select: "read" } })).scope).toBe("read");
+  });
+
+  test("the selector page doesn't promise admin: the ask and the list say what Allow gives as drawn", async () => {
+    const { html } = await allow(() => "vault:read vault:write vault:admin");
+    expect(html).toContain("wants to read and write notes in");
+    expect(html).not.toContain("Full administrative access");
   });
 
   test("choosing Full admin on the level selector grants admin", async () => {
