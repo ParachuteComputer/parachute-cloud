@@ -140,7 +140,7 @@ function invalidIfUpdatedAtResponse(): Response {
 function gateStrictWrite(
   store: Store,
   writeCtx: WriteCtx,
-  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown>; wasPublished?: boolean; defaultTags?: string[] },
+  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown>; wasPublished?: boolean; defaultTags?: string[]; wasTags?: string[] },
   tagScope: TagScopeCtx,
 ): void {
   enforceStrictWrite(store, shape, {
@@ -1097,7 +1097,7 @@ async function handleNotesInner(
         const incomingTags: string[] = item.tags ?? [];
         const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
         const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
-        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasTags: existingNote.tags ?? [], wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
 
         // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
         // core UPDATE on the tag/link mutation too, not just `updates` — a
@@ -1459,7 +1459,7 @@ async function handleNotesInner(
       try {
         const version = "import_ix" in selector ? getImportedVersion(db, id, selector.import_ix) : await store.getNoteVersion(id, storageIndex);
         if (!version) return json({ error: "Not found", error_type: "not_found", ...("import_ix" in selector ? selector : {}) }, 404);
-        gateStrictWrite(store, writeCtx, { path: note ? note.path : latestTombstone(db, id)?.path, tags: note?.tags ?? [], metadata: version.metadata, wasPublished: (note?.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: note ? note.path : latestTombstone(db, id)?.path, tags: note?.tags ?? [], metadata: version.metadata, ...(note ? { wasTags: note.tags ?? [] } : {}), wasPublished: (note?.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
         const restored = await store.restoreNoteVersion(id, storageIndex, {
           actor: writeCtx.actor, via: writeCtx.via,
           ...(body.if_updated_at !== undefined ? { if_updated_at: body.if_updated_at as string } : {}),
@@ -1744,7 +1744,7 @@ async function handleNotesInner(
         for (const t of (body.tags?.add as string[] | undefined) ?? []) projectedTags.add(t);
         const baseMeta = updates.metadata ?? ((note.metadata as Record<string, unknown>) ?? {});
         const projectedMeta = stBody !== undefined ? { ...baseMeta, [stBody.field as string]: stBody.to } : baseMeta;
-        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: (body.tags?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: (body.tags?.add as string[] | undefined) ?? [], wasTags: note.tags ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
       }
 
       // Content-wikilink warnings (vault#570) gate on the SAME condition
