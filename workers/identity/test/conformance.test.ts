@@ -1639,8 +1639,9 @@ describe("consent verb selector — owner-elected vault:admin (port hub#689)", (
     };
     const html = await (await handleAuthorizeGet(env.DB, authorizeGetReq(query, sessionId), deps())).text();
     expect(html).not.toContain('name="verb_select"');
-    // The scope list already shows the admin label — no re-leveling needed.
-    expect(html).toContain("Full administrative access to your vault");
+    // Admin the app asked for is an unticked box, granted only when ticked (T-476), not a line in the list.
+    expect(html).toMatch(/<input type="checkbox" name="grant_admin" value="1">/);
+    expect(html).not.toContain("Full administrative access to your vault");
   });
 
   // --- submit + token behavior ---------------------------------------------

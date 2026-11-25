@@ -33,6 +33,30 @@ const initBody = {
   params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } },
 };
 
+// T-476 (next #445, in 0.9's words): a live page (a Claude artifact) is written from the connector's words alone. The
+// concurrency token the brief names (the engine's LIVE_PAGE_BLOCK) must be a key a read record carries, a write armed
+// with it must land, and a stale one be refused, as an isError result.
+describe("MCP — the live-page words", () => {
+  it("the token the brief names is a key a read record carries: the write armed with it lands, a stale one is refused", async () => {
+    const v = freshVault();
+    const tok = await mintToken({ vault: v, scopes: `vault:${v}:read vault:${v}:write` });
+    const brief = ((await (await mcpPost(v, tok, initBody)).json()) as any).result.instructions as string;
+    const named = /if_updated_at: record\.(\w+)/.exec(brief)?.[1];
+    expect(named, brief.slice(-900)).toBeTruthy();
+    const call = async (name: string, args: Record<string, unknown>) =>
+      (await (await mcpPost(v, tok, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name, arguments: args } })).json()) as any;
+    await call("create-record", { path: "Tasks/Water the beds", body: "x", fields: { status: "open" } });
+    const read = JSON.parse((await call("query-records", { id: "Tasks/Water the beds" })).result.content[0].text);
+    expect(typeof read[named!], `a read record carries ${named}`).toBe("string");
+    const done = await call("update-record", { id: read.id, fields: { status: "done" }, if_updated_at: read[named!] });
+    expect(done.error, JSON.stringify(done).slice(0, 300)).toBeUndefined();
+    expect(done.result?.isError, JSON.stringify(done).slice(0, 300)).toBeFalsy();
+    const stale = await call("update-record", { id: read.id, fields: { status: "open" }, if_updated_at: read[named!] });
+    expect(stale.result?.isError, JSON.stringify(stale).slice(0, 300)).toBe(true);
+    expect(stale.result?.structuredContent?.error_type, JSON.stringify(stale).slice(0, 300)).toBe("conflict");
+  });
+});
+
 describe("MCP — transport rules", () => {
   it("initialize → 200 application/json, negotiated protocol + capabilities + instructions", async () => {
     const v = freshVault();

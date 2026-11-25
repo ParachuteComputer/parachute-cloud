@@ -37,7 +37,10 @@ import type { Database } from "bun:sqlite";
 import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.js";
 import { buildVaultProjection, connectionReach, projectionToMarkdown, type VaultProjection } from "@openparachute/core/src/vault-projection.js";
 import type { Store } from "@openparachute/core/src/types.js";
-import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
+import type { AttachmentTicket, AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
+import { declaresFilesExtension, MAX_INLINE_ATTACHMENT_BYTES, schemaForClient } from "@openparachute/core/src/attachment/inline.js";
+import type { Attachment } from "@openparachute/core/src/types.js";
+import { UploadRefused } from "./attachment-tickets.js";
 import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
 import { applyOnBehalf } from "./rest/write-stamp.js";
@@ -187,6 +190,8 @@ export const WRITE_GATES: Readonly<Record<string, WriteGateClass | Readonly<Reco
   "prune-schema": "notes",
   "request-attachment-upload": "attachments",
   "request-attachment-download": "open",
+  // T-476 (next #444): a file sent in the call, gated like the mint on the file's declared size.
+  "add-attachment": "attachments",
 };
 
 /** Which gate a call meets (see {@link WRITE_GATES}). */
@@ -207,6 +212,8 @@ export function writeGateFor(name: string, args: Record<string, unknown>): Write
 
 /** The upload mint's tool name before 0.9, still listed. */
 const ATTACHMENT_UPLOAD_MINT_TOOL = "request-attachment-upload";
+/** T-476 (next #444): a small file sent in the call itself (core's add-attachment), for an AI that can't reach a ticket URL. */
+const ATTACHMENT_INLINE_TOOL = "add-attachment";
 
 /**
  * A REST cap/frozen Response (402 `plan_required`, 413 `storage_cap_exceeded`, 403 `attachments_not_included`) as the
@@ -243,7 +250,7 @@ export function serverInstruction(
   description: string | null,
   reach: string | undefined,
   projection: VaultProjection,
-  attachments: { readEnabled: boolean } = { readEnabled: true },
+  attachments: { readEnabled: boolean; addEnabled?: boolean } = { readEnabled: true },
 ): string {
   return projectionToMarkdown({
     vaultName,
@@ -253,7 +260,7 @@ export function serverInstruction(
     // the root /mcp), and the brief must be the same on each (test/root-mcp.test.ts). vault-info names the full URLs.
     coordinates: { hubOrigin: "", hubOriginKnown: false },
     // This door always wires an AttachmentTicketProvider (VaultDO's constructor); read-attachment when bytes are wired.
-    attachments: { ticketsEnabled: true, readEnabled: attachments.readEnabled, ticketTool: "attachment-url" },
+    attachments: { ticketsEnabled: true, readEnabled: attachments.readEnabled, ticketTool: "attachment-url", addEnabled: attachments.addEnabled === true },
     words: recordWords,
     ...(reach ? { reach } : {}),
     scripting:
@@ -481,7 +488,7 @@ function visibleTools(
   store: Store,
   vaultName: string,
   auth: AuthResult,
-  attachmentTickets: { provider: AttachmentTicketProvider; urlBase: string },
+  attachmentTickets: { provider: AttachmentTicketProvider; urlBase: string; storeUpload?: (ticket: AttachmentTicket, bytes: Uint8Array) => Promise<Attachment> },
   attachmentBytes?: AttachmentBytesProvider,
   hybridAuto?: () => boolean | null | undefined,
 ): McpToolDef[] {
@@ -525,6 +532,8 @@ function visibleTools(
       provider: attachmentTickets.provider,
       vaultName,
       urlBase: attachmentTickets.urlBase,
+      // add-attachment (T-476): bytes sent in the call, stored by the ticket spend's own writer (R2, meter, row).
+      ...(attachmentTickets.storeUpload ? { storeUpload: attachmentTickets.storeUpload } : {}),
       // A typed key's ticket names its grant and scope, and is spent only while both still hold (attachment-tickets.ts).
       ...(vis ? { noteVisible: vis, scopedTags: auth.scoped_tags! } : {}),
       ...(auth.grant ? { grant: auth.grant } : {}),
@@ -627,8 +636,11 @@ async function handleToolCall(
     // absent/invalid one falls through to core's own execute(), which
     // raises the field-validation error — the gate never masks THAT with a
     // confusing cap refusal.
-    const sizeBytes = args.size_bytes;
-    if (typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > 0) {
+    // add-attachment declares its size on the file (FileInput `size`); the store re-runs the gate on the bytes. A file
+    // over the inline cap, or a size that isn't a whole number, is left to core, whose refusal names it.
+    const sizeBytes = name === ATTACHMENT_INLINE_TOOL ? (args.file as { size?: unknown } | undefined)?.size : args.size_bytes;
+    const overInline = name === ATTACHMENT_INLINE_TOOL && (!Number.isInteger(sizeBytes) || (sizeBytes as number) > MAX_INLINE_ATTACHMENT_BYTES);
+    if (typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > 0 && !overInline) {
       const blocked = attachmentMintGate(sizeBytes);
       if (blocked) {
         await record(subject, `gate:${blocked.status}`);
@@ -660,6 +672,11 @@ async function handleToolCall(
     await record(subject, answer.isError ? refusalOutcome(said.error_type ?? said.error) : "ok");
     return result(id, answer);
   } catch (err) {
+    // A storage gate that refused inside the tool (add-attachment's store, T-476): the same answer as at the call's gate.
+    if (err instanceof UploadRefused) {
+      await record(subject, `gate:${err.status}`);
+      return result(id, refusalResult(refusalOfReply(err.gateBody) ?? refusal("forbidden", err.message)));
+    }
     // A refusal the engine tagged: the box's own mapping (core mcp-refusal.ts refusalOfError), counted by its type.
     const refused = refusalOfError(err);
     if (refused) {
@@ -718,7 +735,9 @@ async function handleOne(
         return result(id, {
           // T-456: each tool says what it does to the vault (core mcp-annotations.ts, the box's table), so a client can
           // tell a read from a change: ChatGPT's "Allow read-only tools" otherwise asks before every read.
-          tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, annotations: toolAnnotations(t.name, ctx.level) })),
+          // T-476: a file argument is marked `x-mcp-file` only for a client that declared the file-transfer extension,
+          // as a box lists it (core src/mcp-http.ts).
+          tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: schemaForClient(t.inputSchema, declaresFilesExtension(params?._meta)), annotations: toolAnnotations(t.name, ctx.level) })),
         });
       case "tools/call":
         return handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate, record, logCrash);
@@ -925,6 +944,8 @@ export async function handleMcp(
     mintGate: (declaredBytes: number) => Response | null;
     /** Ranged reads of a stored file, for `read-attachment`. Absent in tests that wire no bucket. */
     bytes?: AttachmentBytesProvider;
+    /** Store bytes sent in the call (`add-attachment`, T-476), as a spent upload ticket stores them. Absent: no tool. */
+    storeUpload?: (ticket: AttachmentTicket, bytes: Uint8Array) => Promise<Attachment>;
   },
   record: HealthRecord = noRecord,
   logCrash: ToolCrashLog = noLog,
@@ -1003,7 +1024,8 @@ export async function handleMcp(
   // calls for; bun derives it the same way, `mcp-tools.ts`'s `ticketUrlBase`).
   const origin = publicOrigin(req);
   const ticketUrlBase = `${origin.replace(/\/$/, "")}/vault/${vaultName}`;
-  const all = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes, vaultInfo.hybridAuto);
+  const ticketSeam = { provider: tickets.provider, urlBase: ticketUrlBase, storeUpload: tickets.storeUpload };
+  const all = visibleTools(store, vaultName, auth, ticketSeam, tickets.bytes, vaultInfo.hybridAuto);
   // Wire the server-layer vault-info override onto core's tools (core ships a
   // placeholder execute — "must be configured by the server layer"), then the
   // 0.9 shape and the scope filter. Parity with bun's mcp-tools.ts: override
@@ -1014,13 +1036,15 @@ export async function handleMcp(
   // `on_behalf_of`; the call runs on the same tools built for that "by", with the token's own scopes.
   applyOnBehalf(tools, auth, (by) => {
     const forBy: AuthResult = { ...auth, actor: by, acts_for: null };
-    const twin = visibleTools(store, vaultName, forBy, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes, vaultInfo.hybridAuto);
+    const twin = visibleTools(store, vaultName, forBy, ticketSeam, tickets.bytes, vaultInfo.hybridAuto);
     overrideVaultInfo(twin, { vaultName, auth: forBy, description, origin, ctx: vaultInfo });
     return scopedTools(store, twin, vaultName, forBy, countName);
   });
   const instructions = () =>
     serverInstruction(vaultName, description, connectionReachFor(auth, vaultName), projectionFor(store, auth), {
       readEnabled: tickets.bytes !== undefined,
+      // As a box says it (core src/mcp-tools.ts): the brief names add-attachment where this connection lists it.
+      addEnabled: tools.some((t) => t.name === ATTACHMENT_INLINE_TOOL),
     });
   // The connection's level here (cloud has no tag-scoped passes, so an admin scope is a vault-wide admin).
   const level: McpLevel = hasScopeForVault(auth.scopes, vaultName, "admin") ? "admin" : hasScopeForVault(auth.scopes, vaultName, "write") ? "write" : "read";
