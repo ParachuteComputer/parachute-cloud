@@ -27,7 +27,7 @@ import type {
   AttachmentTicketProvider,
 } from "@openparachute/core/src/attachment/tickets.js";
 import { mimeForAttachmentExtension, sanitizeAttachmentExtension } from "@openparachute/core/src/attachment/policy.js";
-import type { Store } from "@openparachute/core/src/types.js";
+import type { Attachment, Store } from "@openparachute/core/src/types.js";
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, { status });
@@ -328,7 +328,21 @@ async function handleUploadSpend(req: Request, ticketId: string, deps: TicketSpe
   const late = await deps.refuseLateWrite(key);
   if (late) return late;
 
-  await deps.meterAdd(contentLength);
+  const attachment = await registerUpload(ticket, relativePath, contentLength, deps);
+  return json(attachment, 201);
+}
+
+/** What storing an upload's bytes needs from the DO: the spend's deps without the ticket store. */
+export type UploadStoreDeps = Omit<TicketSpendDeps, "provider" | "markWritten">;
+
+/**
+ * After the bytes are in R2 and the late-write check passed: meter them, then the attachment row and the
+ * transcription decision. The one tail for a spent upload ticket and for `add-attachment` (T-476), so the two can't
+ * diverge.
+ */
+async function registerUpload(ticket: AttachmentTicket, relativePath: string, size: number, deps: UploadStoreDeps): Promise<Attachment> {
+  const noteId = ticket.noteId!;
+  await deps.meterAdd(size);
 
   // Mirrors cloud REST's OWN `POST /notes/:id/attachments` transcribe
   // decision exactly (rest/notes.ts) — explicit `transcribe: true` at mint
@@ -336,7 +350,7 @@ async function handleUploadSpend(req: Request, ticketId: string, deps: TicketSpe
   // cloud's `auto_transcribe` vault config isn't consulted by REST's own
   // attach route either, so the ticket spend stays in lockstep with it).
   const explicitOptIn = ticket.transcribe === true;
-  const attMeta: Record<string, unknown> = { original_name: ticket.filename, size: contentLength };
+  const attMeta: Record<string, unknown> = { original_name: ticket.filename, size };
   if (explicitOptIn) {
     attMeta.transcribe_status = "pending";
     attMeta.transcribe_requested_at = new Date().toISOString();
@@ -345,14 +359,14 @@ async function handleUploadSpend(req: Request, ticketId: string, deps: TicketSpe
 
   // Ticket mint + register in one shot (vs REST's two-step upload-then-
   // attach) — the spend response is the attachment row itself.
-  const attachment = await deps.store.addAttachment(ticket.noteId, relativePath, ticket.mimeType, attMeta);
+  const attachment = await deps.store.addAttachment(noteId, relativePath, ticket.mimeType!, attMeta);
 
   if (explicitOptIn) {
-    const note = await deps.store.getNote(ticket.noteId);
+    const note = await deps.store.getNote(noteId);
     if (note) {
       const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
       if (noteMeta.transcribe_stub !== true) {
-        await deps.store.updateNote(ticket.noteId, {
+        await deps.store.updateNote(noteId, {
           metadata: { ...noteMeta, transcribe_stub: true },
           skipUpdatedAt: true,
         });
@@ -361,7 +375,50 @@ async function handleUploadSpend(req: Request, ticketId: string, deps: TicketSpe
     await deps.scheduleTranscription();
   }
 
-  return json(attachment, 201);
+  return attachment;
+}
+
+/**
+ * A gate's or a late write's REST refusal, thrown from an MCP tool. It carries the REST body whole (`gateBody`), so the
+ * MCP layer answers it exactly as a refusal at the call's own gate (`mcp.ts` `gateError`): the same code and data,
+ * `meter` and the byte counts included, whichever gate caught it.
+ */
+export class UploadRefused extends Error {
+  constructor(
+    readonly gateBody: Record<string, unknown>,
+    readonly status: number,
+  ) {
+    super(typeof gateBody.message === "string" ? gateBody.message : "This write is not permitted.");
+  }
+}
+
+async function refusalError(res: Response): Promise<UploadRefused> {
+  return new UploadRefused((await res.json().catch(() => ({}))) as Record<string, unknown>, res.status);
+}
+
+/**
+ * `add-attachment` (T-476): store bytes that came in the MCP call, as a spent upload ticket stores them. The gate
+ * ladder runs again on the actual size, then the R2 write, the late-write check and `registerUpload`. The core tool
+ * has already checked the size, the SHA-256, the cap, the record and the extension.
+ */
+export async function storeTicketUpload(ticket: AttachmentTicket, bytes: Uint8Array, deps: UploadStoreDeps): Promise<Attachment> {
+  const gated = deps.mintGate(bytes.length);
+  if (gated) throw await refusalError(gated);
+  const ext = sanitizeAttachmentExtension(ticket.filename ?? "");
+  const date = new Date().toISOString().split("T")[0]!;
+  const relativePath = `${date}/${Date.now()}-${crypto.randomUUID()}${ext}`;
+  const key = r2Key(deps.vaultName, relativePath);
+  // vault#617, as the spend: the extension's type on the object, never the caller's.
+  try {
+    await deps.attachments.put(key, bytes, { httpMetadata: { contentType: mimeForAttachmentExtension(ext) } });
+  } catch (e) {
+    // As the spend answers it (`upload_failed`), not R2's own words.
+    console.error(`[add-attachment ${deps.vaultName}] failed: ${errText(e)}`);
+    throw Object.assign(new Error("Upload failed"), { error_type: "upload_failed", hint: "nothing was stored; send the call again" });
+  }
+  const late = await deps.refuseLateWrite(key);
+  if (late) throw await refusalError(late);
+  return registerUpload(ticket, relativePath, bytes.length, deps);
 }
 
 async function handleDownloadSpend(ticketId: string, deps: TicketSpendDeps): Promise<Response> {

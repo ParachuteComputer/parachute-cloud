@@ -37,7 +37,10 @@ import type { Database } from "bun:sqlite";
 import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.js";
 import { buildVaultProjection, attachmentsInstructionBlock } from "@openparachute/core/src/vault-projection.js";
 import type { Store } from "@openparachute/core/src/types.js";
-import type { AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
+import type { AttachmentTicket, AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
+import { declaresFilesExtension, FILES_EXTENSION, FILES_EXTENSION_SETTINGS, MAX_INLINE_ATTACHMENT_BYTES, schemaForClient } from "@openparachute/core/src/attachment/inline.js";
+import { UploadRefused } from "./attachment-tickets.js";
+import type { Attachment } from "@openparachute/core/src/types.js";
 import type { AttachmentBytesProvider } from "@openparachute/core/src/attachment/bytes-provider.js";
 import { hasScopeForVault, refineMcpVia, type AuthResult, type VaultVerb } from "./auth.js";
 import { errorClass, toolErrorOutcome } from "./health.js";
@@ -150,6 +153,8 @@ const DELETE_CLASS_TOOLS = new Set(["delete-note", "delete-tag"]);
  * `attachment-tickets.ts`). See `handleToolCall`'s dedicated branch.
  */
 const ATTACHMENT_UPLOAD_MINT_TOOL = "request-attachment-upload";
+/** T-476: a file sent in the call (core's add-attachment), gated like the mint on the file's declared size. */
+const ATTACHMENT_INLINE_TOOL = "add-attachment";
 
 /** A forward-mutating tool (create/update/prune) — the class the REST
  *  POST/PATCH/PUT cap+frozen gate covers. Read tools, DELETE-class tools, and
@@ -199,7 +204,7 @@ async function gateError(id: JsonRpcId, blocked: Response): Promise<JsonRpcMessa
  * unconditionally — this door always wires an `AttachmentTicketProvider`
  * (see `VaultDO`'s constructor), same as bun.
  */
-export function serverInstruction(vaultName: string, description: string | null): string {
+export function serverInstruction(vaultName: string, description: string | null, addEnabled = false): string {
   const base =
     `Parachute vault "${vaultName}" — an agent-native knowledge graph of notes, tags, and links. ` +
     `Read with query-notes; write with create-note / update-note; manage schema with list-tags / update-tag; ` +
@@ -217,7 +222,13 @@ export function serverInstruction(vaultName: string, description: string | null)
   // brief instead of refusing the session.
   const d = typeof description === "string" ? description.trim() : undefined;
   const head = d ? `${d}\n\n${base}` : base;
-  return `${head}\n\n${attachmentsInstructionBlock({ ticketsEnabled: true })}\n\n## Live pages (Claude artifacts)\n\n${LIVE_PAGE_08}`;
+  return `${head}
+
+${attachmentsInstructionBlock({ ticketsEnabled: true, addEnabled })}
+
+## Live pages (Claude artifacts)
+
+${LIVE_PAGE_08}`;
 }
 
 /**
@@ -561,7 +572,7 @@ function visibleTools(
   store: Store,
   vaultName: string,
   auth: AuthResult,
-  attachmentTickets: { provider: AttachmentTicketProvider; urlBase: string },
+  attachmentTickets: { provider: AttachmentTicketProvider; urlBase: string; storeUpload?: (ticket: AttachmentTicket, bytes: Uint8Array) => Promise<Attachment> },
   attachmentBytes?: AttachmentBytesProvider,
 ): McpToolDef[] {
   // Write-attribution: refine the credential class to the `mcp` channel, but
@@ -573,7 +584,13 @@ function visibleTools(
   const writeContext = { actor: auth.actor, via: refineMcpVia(auth.via) };
   const tools = generateMcpTools(store, {
     writeContext,
-    attachmentTickets: { provider: attachmentTickets.provider, vaultName, urlBase: attachmentTickets.urlBase },
+    attachmentTickets: {
+      provider: attachmentTickets.provider,
+      vaultName,
+      urlBase: attachmentTickets.urlBase,
+      // add-attachment (T-476): bytes sent in the call, stored by the ticket spend's own writer (R2, meter, row).
+      ...(attachmentTickets.storeUpload ? { storeUpload: attachmentTickets.storeUpload } : {}),
+    },
     // read-attachment (the engine adds the tool only when a door wires bytes): ranged R2 reads. Without it an AI
     // app on this door could list a note's files but not look at one, which it can on a box.
     ...(attachmentBytes ? { attachmentBytes: { provider: attachmentBytes } } : {}),
@@ -621,7 +638,7 @@ async function handleToolCall(
   }
   // From here `name` is one of this vault's own visible tools (server-defined).
   const subject = `mcp:${name}`;
-  if (name === ATTACHMENT_UPLOAD_MINT_TOOL) {
+  if (name === ATTACHMENT_UPLOAD_MINT_TOOL || name === ATTACHMENT_INLINE_TOOL) {
     // The attachment gate ladder, AT MINT, against the caller's DECLARED
     // size — an agent learns `plan_required`/`attachments_not_included`/
     // `storage_cap_exceeded` before ever curling (D7 of the design). Only
@@ -629,8 +646,12 @@ async function handleToolCall(
     // absent/invalid one falls through to core's own execute(), which
     // raises the field-validation error — the gate never masks THAT with a
     // confusing cap refusal.
-    const sizeBytes = args.size_bytes;
-    if (typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > 0) {
+    // add-attachment declares its size on the file (FileInput `size`); the store re-runs the gate on the bytes.
+    // A file over the inline cap is left to core, whose refusal points at the ticket URL.
+    const sizeBytes = name === ATTACHMENT_INLINE_TOOL ? (args.file as { size?: unknown } | undefined)?.size : args.size_bytes;
+    // add-attachment's size must be a whole number of bytes, or core's own refusal names the field.
+    const overInline = name === ATTACHMENT_INLINE_TOOL && (!Number.isInteger(sizeBytes) || (sizeBytes as number) > MAX_INLINE_ATTACHMENT_BYTES);
+    if (typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > 0 && !overInline) {
       const blocked = attachmentMintGate(sizeBytes);
       if (blocked) {
         await record(subject, `gate:${blocked.status}`);
@@ -657,6 +678,11 @@ async function handleToolCall(
     const content = tool.resultContent ? tool.resultContent(out) : [{ type: "text" as const, text: JSON.stringify(out, null, 2) }];
     return result(id, { content });
   } catch (err) {
+    // A storage gate that refused inside the tool (add-attachment's store, T-476): the same answer as at the call's gate.
+    if (err instanceof UploadRefused) {
+      await record(subject, `gate:${err.status}`);
+      return rpcError(id, INVALID_REQUEST, err.message, err.gateBody);
+    }
     const domain = mapDomainError(err);
     const message = err instanceof Error ? err.message : "Unknown error";
     // Never the message: the error's class decides (health.ts toolErrorOutcome).
@@ -699,13 +725,14 @@ async function handleOne(
           protocolVersion,
           capabilities: { tools: {} },
           serverInfo: { name: `parachute-vault/${ctx.vaultName}`, version: "0.1.0" },
-          instructions: serverInstruction(ctx.vaultName, ctx.description),
+          instructions: serverInstruction(ctx.vaultName, ctx.description, hasInlineTool(ctx.tools)),
         });
       }
       case "tools/list":
         await record("mcp:tools/list", "ok");
         return result(id, {
-          tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
+          // T-476: a file argument is marked `x-mcp-file` only for a client that declared the file-transfer extension.
+          tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: schemaForClient(t.inputSchema, declaresFilesExtension(params?._meta)) })),
         });
       case "tools/call":
         return handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate, record, logCrash);
@@ -851,6 +878,8 @@ function modernEarlyResponse(req: Request, raw: unknown, m: JsonRpcMessage): Res
   return null;
 }
 
+const hasInlineTool = (tools: McpToolDef[]) => tools.some((t) => t.name === ATTACHMENT_INLINE_TOOL);
+
 /** Serve a modern POST that passed {@link modernEarlyResponse}. */
 async function handleModern(m: JsonRpcMessage, ctx: Parameters<typeof handleOne>[1]): Promise<Response> {
   const id = m.id ?? null;
@@ -860,8 +889,9 @@ async function handleModern(m: JsonRpcMessage, ctx: Parameters<typeof handleOne>
     case "server/discover":
       reply = result(id, {
         supportedVersions: ALL_SUPPORTED_VERSIONS,
-        capabilities: { tools: {} },
-        instructions: serverInstruction(ctx.vaultName, ctx.description),
+        // T-476: the file-transfer extension, inline only (no out-of-band `upload` yet), where add-attachment is listed.
+        capabilities: { tools: {}, ...(hasInlineTool(ctx.tools) ? { extensions: { [FILES_EXTENSION]: FILES_EXTENSION_SETTINGS } } : {}) },
+        instructions: serverInstruction(ctx.vaultName, ctx.description, hasInlineTool(ctx.tools)),
         ttlMs: MODERN_CACHE_TTL_MS,
         cacheScope: "private",
       });
@@ -912,6 +942,8 @@ export async function handleMcp(
     mintGate: (declaredBytes: number) => Response | null;
     /** Ranged reads of a stored file, for `read-attachment`. Absent in tests that wire no bucket. */
     bytes?: AttachmentBytesProvider;
+    /** Store bytes sent in the call (`add-attachment`, T-476), as a spent upload ticket stores them. Absent: no tool. */
+    storeUpload?: (ticket: AttachmentTicket, bytes: Uint8Array) => Promise<Attachment>;
   },
   record: HealthRecord = noRecord,
   logCrash: ToolCrashLog = noLog,
@@ -989,7 +1021,7 @@ export async function handleMcp(
   // calls for; bun derives it the same way, `mcp-tools.ts`'s `ticketUrlBase`).
   const origin = publicOrigin(req);
   const ticketUrlBase = `${origin.replace(/\/$/, "")}/vault/${vaultName}`;
-  const tools = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase }, tickets.bytes);
+  const tools = visibleTools(store, vaultName, auth, { provider: tickets.provider, urlBase: ticketUrlBase, storeUpload: tickets.storeUpload }, tickets.bytes);
   // Wire the server-layer vault-info override onto the caller-visible tool set
   // (core ships a placeholder execute — "must be configured by the server
   // layer"). Parity with bun's mcp-tools.ts overrideVaultInfo.
