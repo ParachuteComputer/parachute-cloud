@@ -2,7 +2,10 @@ import { SELF, env, runInDurableObject } from "cloudflare:test";
 import type { DurableObject } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { markTypes } from "@openparachute/core/src/tag-kind.js";
+import { buildVaultProjection } from "@openparachute/core/src/vault-projection.js";
+import { vaultGuideFiles } from "@openparachute/core/src/skill-files.js";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
+import { MAX_SKILL_READ_BYTES } from "../src/mcp-skills.ts";
 import { base, freshVault, mintToken, op } from "./helpers.ts";
 
 /**
@@ -242,4 +245,74 @@ describe("MCP 2026-07-28: the Skills extension", () => {
     });
     expect(((await res.json()) as any).error.code).toBe(-32601);
   });
+
+  it("vault-guide is the one the full projection makes, for a vault with types", async () => {
+    const v = freshVault();
+    for (const [tag, def] of [
+      ["recipe", { description: "A dish.", fields: { serves: { type: "integer" }, course: { type: "string", enum: ["starter", "main"] } } }],
+      ["dessert", { parent_names: ["recipe"], fields: { sweet: { type: "boolean" } } }],
+    ] as const) {
+      const r = await op(v, `/api/types/${tag}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(def) });
+      expect(r.status, await r.clone().text()).toBeLessThan(300);
+    }
+    const token = await readKey(v);
+    const guide = (await modern(v, token, "skills/list")).result.skills[0];
+    const served: Record<string, string> = {};
+    for (const r of guide.resources) {
+      served[r.uri.replace("skill://parachute/vault-guide/", "")] = (await modern(v, token, "resources/read", { uri: r.uri })).result.contents[0].text;
+    }
+    const full = await runInDurableObject<DurableObject, Record<string, string>>(env.VAULT.get(env.VAULT.idFromName(v)), (inst: any) =>
+      vaultGuideFiles(v, buildVaultProjection(inst.store.db, { includeStats: true })),
+    );
+    expect(Object.keys(served)).toEqual(expect.arrayContaining(["SKILL.md", "types/dessert.md", "types/recipe.md"]));
+    expect(served).toEqual(full);
+  });
+
+  it("a skills request reads the vault's types and skill records, not every record (rows read on a 2,000-note vault)", async () => {
+    const v = freshVault();
+    await seedSkills(v, [{ path: "Skills/care", content: "Ask how they are.", description: "How to check in." }]);
+    const stub = env.VAULT.get(env.VAULT.idFromName(v));
+    await runInDurableObject<DurableObject, void>(stub, (inst: any, state: DurableObjectState) => {
+      inst.env = { ...inst.env, CAP_BYTES: "1000000000" };
+      state.storage.sql.exec(
+        `WITH RECURSIVE k(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM k WHERE i + 1 < 2000)
+         INSERT INTO notes (id, content, path, metadata, created_at, updated_at, updated_at_ms, extension)
+         SELECT printf('bulk%08d', i), 'made up ' || i, printf('Bulk/b%d/n%d', i % 40, i), '{}',
+                '2026-11-08T00:00:00.000Z', '2026-11-08T00:00:00.000Z', 1762560000000 + i, 'md' FROM k`,
+      );
+      // Count the billed rows of every statement from here (workerd's own per-cursor rowsRead).
+      const cursors: SqlStorageCursor<Record<string, SqlStorageValue>>[] = [];
+      const sql = inst.shim.sql as SqlStorage;
+      inst.shim.sql = new Proxy(sql, {
+        get(target, key) {
+          if (key === "exec") return (q: string, ...p: SqlStorageValue[]) => { const c = target.exec(q, ...p); cursors.push(c); return c; };
+          const f = (target as any)[key];
+          return typeof f === "function" ? f.bind(target) : f;
+        },
+      });
+      inst.__rows = () => { const n = cursors.reduce((t, c) => t + c.rowsRead, 0); cursors.length = 0; return n; };
+    });
+    const rows = () => runInDurableObject<DurableObject, number>(stub, (inst: any) => inst.__rows());
+    const token = await readKey(v);
+    await rows();
+    const list = await modern(v, token, "skills/list");
+    expect(list.result.skills.map((s: any) => s.frontmatter.name)).toEqual(["vault-guide", "live-page", "care"]);
+    const listed = await rows();
+    await modern(v, token, "resources/read", { uri: "skill://vault/care/SKILL.md" });
+    const read = await rows();
+    // The vault map and stats alone read every one of the 2,000 records; a skills request reads none of them.
+    expect(listed, `skills/list read ${listed} rows`).toBeLessThan(1000);
+    expect(read, `resources/read read ${read} rows`).toBeLessThan(1000);
+  });
+
+  it("the record read stops at its byte cap: the skills past it are left out, the rest are served", async () => {
+    const v = freshVault();
+    const body = "x".repeat(99_000); // under a client's 100 KB file limit, so every one is servable
+    const fit = Math.floor(MAX_SKILL_READ_BYTES / body.length);
+    await seedSkills(v, Array.from({ length: fit + 6 }, (_, i) => ({ path: `Skills/big-${i}`, content: body, description: `Big ${i}.` })));
+    const names = (await modern(v, await readKey(v), "skills/list")).result.skills.map((s: any) => s.frontmatter.name);
+    expect(names.slice(0, 2)).toEqual(["vault-guide", "live-page"]);
+    expect(names).toHaveLength(2 + fit);
+  });
 });
+

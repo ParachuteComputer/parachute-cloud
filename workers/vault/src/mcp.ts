@@ -38,7 +38,9 @@
  */
 import type { Database } from "bun:sqlite";
 import { generateMcpTools, type McpToolDef } from "@openparachute/core/src/mcp.js";
-import { buildVaultProjection, connectionReach, projectionToMarkdown, type VaultProjection } from "@openparachute/core/src/vault-projection.js";
+import { buildVaultProjection, connectionReach, projectionToMarkdown, resolveTagInheritance, type VaultProjection } from "@openparachute/core/src/vault-projection.js";
+import { loadSchemaConfig } from "@openparachute/core/src/schema-defaults.js";
+import { listTagRecords } from "@openparachute/core/src/tag-schemas.js";
 import type { Store } from "@openparachute/core/src/types.js";
 import type { AttachmentTicket, AttachmentTicketProvider } from "@openparachute/core/src/attachment/tickets.js";
 import { declaresFilesExtension, MAX_INLINE_ATTACHMENT_BYTES, schemaForClient } from "@openparachute/core/src/attachment/inline.js";
@@ -297,6 +299,36 @@ export function projectionFor(store: Store, auth: AuthResult): VaultProjection {
     map: getVaultMap(store.db as never, filter),
     stats: getVaultStats(store.db as never, filter),
   };
+}
+
+/**
+ * The types vault-guide pages (skill-files.ts `vaultGuideFiles` reads only a projection's `tags`), built as
+ * buildVaultProjection builds its `tags` and narrowed as {@link projectionFor} narrows them for a typed key, but without
+ * the vault map and stats: those count over every record, and a skills request (claude.ai lists skills on every
+ * connect) must not pay a scan of the vault in rows read. test/mcp-skills.test.ts holds the guide equal to the one
+ * the full projection makes.
+ */
+export function guideTagsFor(store: Store, auth: AuthResult): VaultProjection["tags"] {
+  const db = store.db as never;
+  const resolved = loadSchemaConfig(db);
+  const tags: VaultProjection["tags"] = [];
+  for (const r of listTagRecords(db)) {
+    const hasOwnSchema = (r.description !== undefined && r.description !== null) || (r.fields != null && Object.keys(r.fields).length > 0);
+    if (!hasOwnSchema) continue;
+    const { effective_parents, effective_fields } = resolveTagInheritance(resolved, r.tag);
+    tags.push({
+      name: r.tag,
+      description: r.description ?? null,
+      parents: r.parent_names ?? [],
+      effective_parents,
+      fields: r.fields ?? null,
+      effective_fields,
+      relationships: r.relationships ?? null,
+    });
+  }
+  if (!auth.scoped_tags) return tags;
+  const scope = tagScopeFor(store, auth.scoped_tags);
+  return tags.filter((t) => tagVisibleInScope(t.name, scope.allowed, scope.raw));
 }
 
 /**
@@ -1083,7 +1115,7 @@ export async function handleMcp(
     // skill records it could read anyway, and only this vault's (the store is this Durable Object's).
     const skills = vaultSkillMethods({
       vaultName,
-      projection: () => projectionFor(store, auth),
+      guideTags: () => guideTagsFor(store, auth),
       queryRecords: tools.find((t) => t.name === "query-records"),
     });
     return handleModern(messages[0]!, { ...ctx, skills });
