@@ -58,7 +58,7 @@ async function allow(scope: (vault: string) => string, tick: string[] = []): Pro
   expect(page.status).toBe(200);
   const html = await page.text();
   // The page's own CSRF pair: the cookie it set and the token in its form.
-  const csrf = page.headers.getSetCookie().find((c) => c.startsWith("parachute_id_csrf="))?.split(";")[0]!.slice("parachute_id_csrf=".length) ?? CSRF;
+  const csrf = /parachute_id_csrf=([^;,\s]+)/.exec(page.headers.get("set-cookie") ?? "")?.[1] ?? CSRF;
   const res = await handleAuthorizePost(
     db(),
     new Request(`${ISSUER}/oauth/authorize`, {
