@@ -522,7 +522,11 @@ async function authorizeCore(
   // precondition). An already-admin unnamed request (`vault:admin`) yields an
   // empty upgradeable set → no selector (it is already the top level).
   const upgradeableVerbs = unnamedVaultVerbs(requestedScopes).filter((v) => v === "read" || v === "write");
-  const verbSelector = needsVaultPick && ownedVaults.length > 0 && upgradeableVerbs.length > 0 ? { requestedVerbs: upgradeableVerbs } : null;
+  const askedAdmin = requestedScopes.some(isVaultAdminScope);
+  // When the selector is drawn it is the one admin control (T-476): its admin choice is the person's, and an admin the
+  // app asked for is withheld unless they choose it there. Otherwise an asked-for admin is the unticked box.
+  const verbSelector =
+    needsVaultPick && ownedVaults.length > 0 && upgradeableVerbs.length > 0 ? { requestedVerbs: upgradeableVerbs, askedAdmin } : null;
   // Say before Allow what this replaces of the same app's earlier connection:
   // exactly, when the vault is already named; conditionally, when it is
   // picked below (Codex r2 on #383). An account-wide earlier connection is
@@ -550,7 +554,7 @@ async function authorizeCore(
       verbSelector,
       accountVaults: null,
       // Admin the app asked for is a box the person ticks, never a line Allow grants (T-476).
-      adminChoice: requestedScopes.some(isVaultAdminScope),
+      adminChoice: askedAdmin && verbSelector === null,
       replaces,
       // The "issued by <host>" trust line — the DOOR the user came through (the
       // bound request/resource origin, e.g. my.parachute.computer for a my./mcp
@@ -959,7 +963,9 @@ async function handleConsentSubmit(db: D1Database, req: Request, form: FormData,
       (electedVerb === "read" || electedVerb === "write" || electedVerb === "admin") &&
       (await userOwnsVault(db, session.userId, picked))
     ) {
-      scopes = widenUnnamedVaultVerb(scopes, electedVerb);
+      // The selector is the one admin control when drawn (T-476): an unnamed admin the app asked for counts only if the
+      // person chose "Full admin" there, which the widening below puts back.
+      scopes = widenUnnamedVaultVerb(scopes.filter((s) => s !== "vault:admin"), electedVerb);
     }
     scopes = narrowVaultScopes(scopes, picked);
   }

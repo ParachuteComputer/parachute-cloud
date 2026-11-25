@@ -45,7 +45,11 @@ function asDrawn(html: string, tick: string[]): [string, string][] {
 
 let n = 0;
 /** A self-registered app asks for `scope`; the person presses Allow on the page as drawn (ticking `tick`). */
-async function allow(scope: (vault: string) => string, tick: string[] = []): Promise<{ html: string; scope?: string; denied?: string }> {
+async function allow(
+  scope: (vault: string) => string,
+  tick: string[] = [],
+  opts: { hint?: boolean; radio?: Record<string, string>; noMarker?: boolean } = {},
+): Promise<{ html: string; scope?: string; denied?: string }> {
   n += 1;
   const vault = `admin-${n}`;
   const { id: userId } = await seedUser(`admin-choice-${n}@example.com`);
@@ -53,7 +57,7 @@ async function allow(scope: (vault: string) => string, tick: string[] = []): Pro
   const sessionId = await seedSession(userId);
   const clientId = (await registerClient(env.DB, { redirectUris: [REDIRECT], clientName: "Claude", status: "pending" })).client.clientId;
   const { verifier, challenge } = await makePkce();
-  const q = { client_id: clientId, redirect_uri: REDIRECT, response_type: "code", code_challenge: challenge, code_challenge_method: "S256", state: "s", scope: scope(vault) };
+  const q = { client_id: clientId, redirect_uri: REDIRECT, response_type: "code", code_challenge: challenge, code_challenge_method: "S256", state: "s", scope: scope(vault), ...(opts.hint ? { vault } : {}) };
   const page = await handleAuthorizeGet(db(), authorizeGetReq(q, sessionId), deps());
   expect(page.status).toBe(200);
   const html = await page.text();
@@ -63,7 +67,12 @@ async function allow(scope: (vault: string) => string, tick: string[] = []): Pro
     db(),
     new Request(`${ISSUER}/oauth/authorize`, {
       method: "POST",
-      body: new URLSearchParams(asDrawn(html, tick)),
+      body: (() => {
+        const body = new URLSearchParams(asDrawn(html, tick));
+        for (const [k, v] of Object.entries(opts.radio ?? {})) body.set(k, v);
+        if (opts.noMarker) body.delete("admin_choice_shown");
+        return body;
+      })(),
       headers: { "content-type": "application/x-www-form-urlencoded", origin: ISSUER, cookie: `${SESSION_COOKIE}=${sessionId}; parachute_id_csrf=${csrf}` },
     }),
     deps(),
@@ -102,6 +111,37 @@ describe("admin waits for the person's tick (T-476)", () => {
     const r = await allow((v) => `vault:${v}:read vault:${v}:write`);
     expect(r.html).not.toContain('name="grant_admin"');
     expect(r.scope).toBe("read write");
+  });
+
+  test("SECURITY: an unnamed admin ask, with the vault picked on the page, allowed as drawn, is a denial", async () => {
+    const r = await allow(() => "vault:admin");
+    expect(r.html).toContain('name="vault_pick"');
+    expect(r.html).toContain('data-testid="consent-admin-only"');
+    expect(r.denied).toBe("access_denied");
+  });
+
+  test("SECURITY: unnamed read, write and admin: the level selector is the one admin control, and as drawn gives write", async () => {
+    const r = await allow(() => "vault:read vault:write vault:admin");
+    expect(r.html).toContain('name="verb_select"');
+    expect(r.html).not.toContain('name="grant_admin"');
+    expect(r.html).toContain("<code>vault:read</code> and <code>vault:write</code> and <code>vault:admin</code>");
+    expect(r.scope).toBe("write");
+  });
+
+  test("choosing Full admin on the level selector grants admin", async () => {
+    expect((await allow(() => "vault:read vault:write vault:admin", [], { radio: { verb_select: "admin" } })).scope).toBe("admin");
+  });
+
+  test("SECURITY: the vault= hint with an unnamed admin ask, allowed as drawn, gets no admin", async () => {
+    const r = await allow(() => "vault:read vault:admin", [], { hint: true });
+    expect(r.html).toContain('name="grant_admin"');
+    expect(r.scope).toBe("read");
+  });
+
+  // Scripts and the staging smoke (scripts/smoke-staging.ts authorizeFor(..., ["read","write","admin"])) post consent
+  // without the page's marker and rely on getting what they asked. The marker is what makes an unticked box count.
+  test("a consent form without the marker keeps the old meaning: what was asked is granted", async () => {
+    expect((await allow((v) => `vault:${v}:read vault:${v}:admin`, [], { noMarker: true })).scope).toBe("admin read");
   });
 
   test("an app that registered itself is labelled in plain words, not as a warning", async () => {
