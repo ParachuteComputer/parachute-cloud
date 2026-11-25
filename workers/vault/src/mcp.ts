@@ -227,12 +227,11 @@ export function serverInstruction(vaultName: string, description: string | null)
  * door sends the engine's own paragraph (core vault-projection.ts LIVE_PAGE_BLOCK).
  */
 export const LIVE_PAGE_08 =
-  "A live page reads this vault each time someone opens it. Declare only the tools it calls: `query-notes` to read, " +
-  "`update-note` to change, `create-note` to add. Read with `watchTool` on `query-notes`, filtered by `tag` or " +
-  "`path_prefix`; the reply is JSON: one note for `id`, an array, or `{notes, next_cursor}`, and a missing note " +
-  "answers `{error, error_type: \"not_found\"}`. A note's name is the last part of its `path`. Write only on a click: " +
-  "`update-note {id, metadata or content, if_updated_at: note.updatedAt}`, then `invalidate` the reads. A conflict " +
-  "means it changed elsewhere: read it again, never `force`. Writes need a viewer whose connection may write. Guide: " +
+  "A Claude artifact over this vault reads with `watchTool` on `query-notes` (filter by `tag` or `path_prefix`) and " +
+  "writes on a click with `update-note` (`if_updated_at: note.updatedAt`), then `invalidate`s; on a conflict it reads " +
+  "again. It declares only the tools it calls, and `update-note` or `create-note` only if this connection lists them. " +
+  "A reply is a note (`{error, error_type}` if it's missing), an array, or an object with `notes` (and `next_cursor` " +
+  "or `warnings`). A note's name is the last part of its `path`. Guide: " +
   "https://parachute.computer/docs/use/claude-artifacts/";
 
 /**

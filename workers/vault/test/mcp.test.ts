@@ -45,8 +45,10 @@ describe("MCP — the live-page words", () => {
     expect(typeof read[named!], `a read note carries ${named}`).toBe("string");
     const done = await call("update-note", { id: read.id, metadata: { status: "done" }, if_updated_at: read[named!] });
     expect(done.error, JSON.stringify(done).slice(0, 300)).toBeUndefined();
+    expect(done.result?.isError, JSON.stringify(done).slice(0, 300)).toBeFalsy();
+    expect(JSON.parse(done.result.content[0].text).metadata.status).toBe("done");
     const stale = await call("update-note", { id: read.id, metadata: { status: "open" }, if_updated_at: read[named!] });
-    expect(JSON.stringify(stale)).toMatch(/conflict/);
+    expect(stale.error?.data?.error_type, JSON.stringify(stale).slice(0, 300)).toBe("conflict");
   });
 });
 
