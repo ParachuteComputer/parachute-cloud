@@ -319,6 +319,12 @@ export interface ConsentProps {
    * pages (oauth-connections.ts `isVouchedClient`). Shows the unverified label.
    */
   unverified: boolean;
+  /**
+   * The app asked for a vault's admin (T-476 claudereal: an AI connector asks for every scope it can). Admin is then an
+   * unticked box in the form, marked powerful, and granted only when ticked (oauth-authorize.ts handleConsentSubmit).
+   * Optional so a caller that never asks for admin needn't say so.
+   */
+  adminChoice?: boolean;
   /** "Not you?" logout target — THIS pending authorize URL (oauth-authorize.ts `authorizeResumePath`). */
   notYouNext: string;
   /**
@@ -547,11 +553,13 @@ function renderAccountVaultsBlock(consent: AccountVaultsConsent, clientName: str
 }
 
 export function renderConsent(props: ConsentProps): string {
-  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults, replaces, unverified } = props;
+  const { params, csrfToken, clientName, scopeDescriptions, lockedVault, needsVaultPick, ownedVaults, issuerHost, email, notYouNext, verbSelector, accountVaults, replaces, unverified, adminChoice } = props;
   // The plain sentence is the list (T-318 #15: raw `vault:<name>:read` under it
   // read as jargon). A scope with no sentence keeps its raw string here, so no
   // requested scope is ever only in the closed "Technical details" below.
-  const scopeList = scopeDescriptions.map((s) => `<li><strong>${esc(s.label)}</strong></li>`).join("\n");
+  // An admin the app asked for is the box below, not a line here: it is granted only when ticked (T-476).
+  const listed = adminChoice ? scopeDescriptions.filter((s) => !isVaultAdminScope(s.scope)) : scopeDescriptions;
+  const scopeList = listed.map((s) => `<li><strong>${esc(s.label)}</strong></li>`).join("\n");
   const rawScopes = scopeDescriptions.map((s) => `<li><code>${esc(s.scope)}</code></li>`).join("");
   const vaultField = lockedVault
     ? `<input type="hidden" name="vault_pick" value="${esc(lockedVault)}">`
@@ -585,6 +593,7 @@ export function renderConsent(props: ConsentProps): string {
          ${hiddenParams(params)}
          ${vaultField}
          ${verbSelectorField}
+         ${adminChoice ? adminChoiceBox() : ""}
          ${accountVaultsField}
          ${replacesBox(clientName, replaces ?? null, accountVaults?.ownedVaults.length === 0)}
          <div class="row">
@@ -621,9 +630,28 @@ function returnsToLine(redirectUri: string): string {
   return `<p class="muted" data-testid="consent-returns-to">After you allow, you go to <code>${esc(u.origin)}</code>.</p>`;
 }
 
-/** The unverified-app label: the app named itself and Parachute can't vouch for it. */
+/**
+ * The label for an app that registered itself: the app named itself and Parachute can't vouch for it. Plain words, no
+ * warning box (T-476: every AI connector registers itself, and "Unverified" read as a warning about Claude). The same
+ * words as the box's consent page.
+ */
 function unverifiedLabel(): string {
-  return `<div class="warn" data-testid="consent-unverified" style="margin:0 0 .8rem"><strong>Unverified app.</strong> This app registered itself, so Parachute can't confirm who made it. Allow only if you started this connection and recognise where it sends you.</div>`;
+  return `<p class="muted" data-testid="consent-unverified" style="margin:0 0 .8rem"><strong>Self-registered.</strong> It registered itself when you connected it. Allow if you started this connection.</p>`;
+}
+
+/** `vault:admin` or `vault:<name>:admin`. */
+export function isVaultAdminScope(scope: string): boolean {
+  const parts = scope.split(":");
+  return parts[0] === "vault" && parts[parts.length - 1] === "admin" && (parts.length === 2 || parts.length === 3);
+}
+
+/**
+ * Admin, when the app asked for it (T-476 claudereal): an unticked box inside the form, marked powerful, the same
+ * choice as the box's consent page. `admin_choice_shown` says the box was drawn, so an unticked box withholds admin.
+ */
+function adminChoiceBox(): string {
+  return `<input type="hidden" name="admin_choice_shown" value="1">
+         <label class="verbopt" data-testid="consent-admin"><input type="checkbox" name="grant_admin" value="1"><span class="verbopt-body"><span class="verbopt-title">Also let it manage the vault <span class="verbbadge">admin</span></span><span class="verbopt-desc"><strong>Powerful.</strong> The app could change how the vault works and make keys of its own. Tick it only if you want this app to manage the vault.</span></span></label>`;
 }
 
 /**
