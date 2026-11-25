@@ -1309,9 +1309,9 @@ function connectAiContent(v: ConsoleVaultCard): string {
     <div class="connect-block">
       <h4>Claude</h4>
       <ol class="steps">
-        <li>Open <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> and go to <strong>Customize → Connectors</strong></li>
-        <li>Click <strong>+ Add</strong>, then <strong>Add custom connector</strong></li>
-        <li>Paste the URL above, click <strong>Continue</strong>, and allow access when Parachute asks</li>
+        <li>Open <a href="https://claude.ai/customize/connectors" target="_blank" rel="noopener">Claude&#39;s connectors</a> (in claude.ai&#39;s sidebar: <strong>Plugins</strong>)</li>
+        <li>Click <strong>Add</strong>, then <strong>Add custom connector</strong>, and name it Parachute</li>
+        <li>Paste the URL above, click <strong>Continue</strong>, then <strong>Add</strong>, and allow access when Parachute asks</li>
       </ol>
       <p class="muted" style="margin:.2rem 0 0">On Claude&#39;s free plan you can add one custom connector.</p>
     </div>

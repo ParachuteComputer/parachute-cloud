@@ -543,8 +543,10 @@ describe("Connect-your-AI card", () => {
     const mcpUrl = "https://my.parachute.computer/vault/connectme/mcp";
     // Numbered Claude-first steps.
     expect(html).toContain("claude.ai");
-    // Claude's current menu names (T-318), never the stale "Settings → Connectors".
-    expect(html).toContain("Customize → Connectors");
+    // claude.ai's menus move (Customize, now Plugins; T-476): the step links straight to its connectors page.
+    expect(html).toContain('href="https://claude.ai/customize/connectors"');
+    expect(html).toContain("<strong>Plugins</strong>");
+    expect(html).not.toMatch(/(Settings|Customize) → Connectors/);
     expect(html).not.toContain("Settings → Connectors");
     expect(html).toContain("Add custom connector");
     expect(html).toContain("On Claude&#39;s free plan you can add one custom connector.");
