@@ -567,7 +567,7 @@ function visibleTools(
 function scopedTools(store: Store, tools: McpToolDef[], vaultName: string, auth: AuthResult, countName?: NameCount, docs?: DocsContext): McpToolDef[] {
   const shaped = shapeRecordSurface(tools, {
     // T-476: the engine's `docs` tool, for this door's version and docs origin (none when the door has no docs).
-    docs: docs ? (docs.origin ? { origin: docs.origin, version: docs.version } : null) : undefined,
+    docs: docs?.origin ? { origin: docs.origin, version: docs.version } : null,
     db: store.db as unknown as Parameters<typeof shapeRecordSurface>[1]["db"],
     vaultName,
     hasVerb: (verb) => hasScopeForVault(auth.scopes, vaultName, verb),
@@ -754,12 +754,13 @@ async function handleOne(
           // as a box lists it (core src/mcp-http.ts).
           tools: ctx.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: schemaForClient(t.inputSchema, declaresFilesExtension(params?._meta)), annotations: toolAnnotations(t.name, ctx.level) })),
         });
-      case "tools/call": {
-        // T-476: every refusal (the tool's, the gate's, an unknown tool's) carries `docs`, as a box's does.
-        const answered = await handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate, record, logCrash, ctx.level, ctx.docs);
-        const r = answered.result as { isError?: unknown } | undefined;
-        return r && r.isError === true ? { ...answered, result: withRefusalDocs(r as never, ctx.docs) } : answered;
-      }
+      case "tools/call":
+        // T-476: every refusal (the tool's, the gate's, an unknown tool's) carries `docs`, as a box's does. Returned
+        // un-awaited, as before: a rejection still unwinds past this try (CATCHABLE_METHODS).
+        return handleToolCall(id, params, ctx.tools, ctx.writeGate, ctx.attachmentMintGate, record, logCrash, ctx.level, ctx.docs).then((answered) => {
+          const r = answered.result as { isError?: unknown } | undefined;
+          return r && r.isError === true ? { ...answered, result: withRefusalDocs(r as never, ctx.docs) } : answered;
+        });
       case "ping":
         return result(id, {});
       default:

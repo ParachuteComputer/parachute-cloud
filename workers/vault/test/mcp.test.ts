@@ -695,7 +695,7 @@ describe("MCP — docs for this version (T-476)", () => {
     const v = freshVault();
     const token = await mintToken({ vault: v, scopes: `vault:${v}:read` });
     const init = (await (await mcpPost(v, token, initBody)).json()) as any;
-    expect(init.result.instructions).toContain("## Docs\n\nParachute 0.9.0-pre.2. `docs {search}` or `docs {topic}` reads 127.0.0.1:9's pages for this version");
+    expect(init.result.instructions).toContain("\nDocs for Parachute 0.9.0-pre.2, from 127.0.0.1:9: `docs {search}`, `docs {topic}`; a refusal's `docs` is its fix page.\n");
     const list = (await (await mcpPost(v, token, { jsonrpc: "2.0", id: 2, method: "tools/list" })).json()) as any;
     const docs = list.result.tools.find((t: any) => t.name === "docs");
     expect(docs?.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true });
