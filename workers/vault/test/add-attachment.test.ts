@@ -30,7 +30,7 @@ function b64(bytes: Uint8Array): string {
 }
 
 async function digest(bytes: Uint8Array): Promise<string> {
-  const sum = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  const sum = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as Uint8Array<ArrayBuffer>));
   return b64(sum).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
