@@ -409,7 +409,13 @@ export async function storeTicketUpload(ticket: AttachmentTicket, bytes: Uint8Ar
   const relativePath = `${date}/${Date.now()}-${crypto.randomUUID()}${ext}`;
   const key = r2Key(deps.vaultName, relativePath);
   // vault#617, as the spend: the extension's type on the object, never the caller's.
-  await deps.attachments.put(key, bytes, { httpMetadata: { contentType: mimeForAttachmentExtension(ext) } });
+  try {
+    await deps.attachments.put(key, bytes, { httpMetadata: { contentType: mimeForAttachmentExtension(ext) } });
+  } catch (e) {
+    // As the spend answers it (`upload_failed`), not R2's own words.
+    console.error(`[add-attachment ${deps.vaultName}] failed: ${errText(e)}`);
+    throw Object.assign(new Error("Upload failed"), { error_type: "upload_failed", hint: "nothing was stored; send the call again" });
+  }
   const late = await deps.refuseLateWrite(key);
   if (late) throw await refusalError(late);
   return registerUpload(ticket, relativePath, bytes.length, deps);

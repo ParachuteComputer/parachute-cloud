@@ -629,7 +629,8 @@ async function handleToolCall(
     // add-attachment declares its size on the file (FileInput `size`); the store re-runs the gate on the bytes.
     // A file over the inline cap is left to core, whose refusal points at the ticket URL.
     const sizeBytes = name === ATTACHMENT_INLINE_TOOL ? (args.file as { size?: unknown } | undefined)?.size : args.size_bytes;
-    const overInline = name === ATTACHMENT_INLINE_TOOL && typeof sizeBytes === "number" && sizeBytes > MAX_INLINE_ATTACHMENT_BYTES;
+    // add-attachment's size must be a whole number of bytes, or core's own refusal names the field.
+    const overInline = name === ATTACHMENT_INLINE_TOOL && (!Number.isInteger(sizeBytes) || (sizeBytes as number) > MAX_INLINE_ATTACHMENT_BYTES);
     if (typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > 0 && !overInline) {
       const blocked = attachmentMintGate(sizeBytes);
       if (blocked) {

@@ -96,6 +96,9 @@ describe("add-attachment on the hosted door", () => {
     // A file over the inline cap is core's to refuse, pointing at the ticket URL, not the plan's.
     const overCap = await add(v, { record: note.id, file: await fileInput(madeUp(81 * 1024)) });
     expect(overCap.error.data.error_type).toBe("inline_too_large");
+    // A size that isn't a byte count is core's to refuse too, naming the field, not the plan.
+    const fractional = await add(v, { record: note.id, file: await fileInput(madeUp(64), { size: 12.5 }) });
+    expect(fractional.error.data.field).toBe("file.size");
 
     await putConfig(v, { caps: { notes_bytes: 100 * 1024 * 1024, attachment_bytes: 1024 } });
     const full = await add(v, { record: note.id, file: await fileInput(madeUp(4096)) });
