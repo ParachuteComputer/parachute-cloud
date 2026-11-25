@@ -166,6 +166,25 @@ describe("MCP 2026-07-28: the Skills extension", () => {
     }
   });
 
+  it("two skill records with the same name: only the first (by path) is served, as on a box", async () => {
+    const v = freshVault();
+    await seedSkills(v, [
+      { path: "Other/care", content: "Served.", description: "The first path." },
+      { path: "Skills/care", content: "Not served.", description: "Another care." },
+      { path: "Skills/vault-guide", content: "Named like the server's own.", description: "Never served." },
+    ]);
+    const token = await readKey(v);
+    const skills = (await modern(v, token, "skills/list")).result.skills;
+    expect(skills.map((s: any) => s.uri)).toEqual([
+      "skill://parachute/vault-guide/SKILL.md",
+      "skill://parachute/live-page/SKILL.md",
+      "skill://vault/care/SKILL.md",
+    ]);
+    expect(skills[2].frontmatter.description).toBe("The first path.");
+    const md = (await modern(v, token, "resources/read", { uri: "skill://vault/care/SKILL.md" })).result.contents[0].text;
+    expect(md).toContain("Served.");
+  });
+
   it("a skills call counts no name use: the client never called query-records", async () => {
     const v = freshVault();
     await seedSkills(v, [{ path: "Skills/care", content: "Ask how they are.", description: "How to check in." }]);

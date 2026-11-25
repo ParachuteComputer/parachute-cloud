@@ -155,10 +155,15 @@ async function buildServerSkills(input: VaultSkillsInput): Promise<BuiltSkill[]>
 
 async function buildVaultSkills(input: VaultSkillsInput): Promise<BuiltSkill[]> {
   const out: BuiltSkill[] = [];
+  // One skill per name, the first by path (vaultSkills sorts), as on a box; never one of the server's names.
+  const taken = new Set(SERVER_SKILL_NAMES);
   for (const skill of vaultSkills(await readSkillRecords(input.queryRecords))) {
-    if (SERVER_SKILL_NAMES.has(skill.name)) continue; // a vault skill named like one the server serves
+    if (taken.has(skill.name)) continue;
     const b = await built(VAULT_PREFIX, skill.name, skill.files);
-    if (b) out.push(b);
+    if (b) {
+      out.push(b);
+      taken.add(skill.name);
+    }
   }
   return out;
 }
