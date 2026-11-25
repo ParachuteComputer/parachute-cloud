@@ -141,6 +141,7 @@ import { capEmbedText, embedSplitting, planEmbedBatches } from "./embedding/batc
 import {
   DoAttachmentTicketProvider,
   handleTicketSpend,
+  storeTicketUpload,
   ticketNotFound,
   type TicketSpendDeps,
 } from "./attachment-tickets.js";
@@ -1252,6 +1253,17 @@ export class VaultDO extends DurableObject {
           provider: this.attachmentTickets,
           mintGate: (declaredBytes) => this.attachmentMintGate(declaredBytes),
           bytes: r2AttachmentBytes(this.env.ATTACHMENTS, vaultName),
+          // add-attachment (T-476): the same writer, gate, meter and late-write check as a spent upload ticket.
+          storeUpload: (ticket, bytes) =>
+            storeTicketUpload(ticket, bytes, {
+              vaultName,
+              store: this.store,
+              attachments: this.env.ATTACHMENTS,
+              mintGate: (declaredBytes) => this.attachmentMintGate(declaredBytes),
+              meterAdd: (n) => this.meterAdd(n),
+              refuseLateWrite: (key) => this.refuseLateWrite(vaultName, key),
+              scheduleTranscription: () => this.scheduleTranscriptionAlarm(),
+            }),
         },
         (subject, outcome) => this.health.record(subject, outcome),
         (tool, err) => logServerError("mcp_tool_error", err, { ...this.logFields, tool }),
