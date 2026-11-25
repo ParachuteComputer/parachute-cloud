@@ -45,6 +45,8 @@ const CALLS: Array<{ tool: string; action?: string; want: Want; args: (id: strin
   { tool: "prune-schema", want: "gated", args: () => ({}) },
   { tool: "request-attachment-upload", want: "gated", args: (id) => ({ note: id, filename: "a.txt", mime_type: "text/plain", size_bytes: 10 }) },
   { tool: "request-attachment-download", want: "open", args: () => ({ path: "nothing/here.txt" }) },
+  // T-476: a file sent in the call is a forward write of an attachment, gated on the file's declared size.
+  { tool: "add-attachment", want: "gated", args: (id) => ({ record: id, file: { id: "f1", name: "a.txt", mimeType: "text/plain", size: 10, digest: { algorithm: "sha-256", value: "0".repeat(64) }, data: "aGVsbG8gd29ybGQ=" } }) },
 ];
 
 function mcp(vault: string, token: string, body: unknown): Promise<Response> {
