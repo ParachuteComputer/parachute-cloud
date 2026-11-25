@@ -1619,7 +1619,7 @@ async function handleNotesInner(
           {
             error_type: "precondition_required",
             error: "precondition_required",
-            message: "update requires `if_updated_at` (the note's last-seen updated_at) or `force: true`.",
+            message: "update requires `if_updated_at` (the note's `updatedAt` as you read it) or `force: true`.",
             note_id: note.id,
             path: note.path ?? null,
             hint: HINT_PRECONDITION,
