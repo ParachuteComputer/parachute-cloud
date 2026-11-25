@@ -67,8 +67,9 @@ describe("0.9.1: the refresh nudge", () => {
     expect(made.result.content.length).toBe(1);
     // A blind update (no if_updated_at) is refused: the refusal says why and carries no nudge.
     const refused = await rpc(v, "tools/call", { name: "update-note", arguments: { id: "nudge/two", content: "blind" } });
-    expect(refused.result).toBeUndefined();
-    expect(JSON.stringify(refused.error)).not.toMatch(/refresh this connector/);
+    expect(refused.result.structuredContent.error_type).toBe("precondition_required");
+    expect(refused.result.content).toHaveLength(1);
+    expect(JSON.stringify(refused.result)).not.toMatch(/refresh this connector/);
   });
 });
 

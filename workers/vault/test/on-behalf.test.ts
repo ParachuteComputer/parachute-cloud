@@ -42,10 +42,11 @@ async function call(token: string, name: string, args: Record<string, unknown>, 
   const msg = (await res.json()) as any;
   if (msg.error) return { ok: false, out: msg.error, status: 200 };
   const text = msg.result.content[0].text as string;
-  if (msg.result.isError) return { ok: false, out: text, status: 200 };
+  // A refusal (one way to refuse, T-476): its structuredContent {error_type, message, ...}.
+  if (msg.result.isError) return { ok: false, out: msg.result.structuredContent ?? text, status: 200 };
   return { ok: true, out: JSON.parse(text), status: 200 };
 }
-const errorType = (r: { out: any }) => r.out?.data?.error_type ?? r.out?.error_type ?? null;
+const errorType = (r: { out: any }) => r.out?.error_type ?? null;
 
 describe("on-behalf-of on REST", () => {
   it("a granted key stamps by <name>:<id> on /api/notes and /api/records; via stays the key", async () => {

@@ -30,6 +30,7 @@
  * discovery.
  */
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
+import { internalRefusal, refusal, refusalResult, unknownToolRefusal } from "@openparachute/core/src/mcp-refusal.js";
 import { validateAccountToken } from "./account-auth.ts";
 import {
   ACCOUNT_OLD_NAMES,
@@ -275,27 +276,23 @@ async function handleToolCall(
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
   const tool = toolsFor(ctx.grant).find((t) => t.name === name);
-  // Unknown tool → in-band tool error (not a JSON-RPC error), mirroring the
-  // vault door — callers can't distinguish "hidden tool" from "no such tool".
-  if (!tool) {
-    return result(id, { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true });
-  }
+  // One way to refuse (T-476, the engine's mcp-refusal.ts, as core's hub answers): every refusal is an isError result
+  // with structuredContent {error_type, message, ...}, never a JSON-RPC error; a vault's own refusal comes back as the
+  // vault said it. Unknown tool → `unknown_tool`, the same as the vault door: "hidden" and "no such tool" look alike.
+  if (!tool) return result(id, refusalResult(unknownToolRefusal(name)));
   // Name use (T-456): the old note names and their record names, counted so 1.0 can drop the old ones on real use.
   if (ACCOUNT_OLD_NAMES[name]) ctx.countName?.(name, "old");
   else if (Object.values(ACCOUNT_OLD_NAMES).includes(name)) ctx.countName?.(name, "new");
   try {
     const out = await tool.execute(args, ctx);
-    // A write tool hands back the vault's own MCP result (its content blocks), untouched.
+    // A write tool hands back the vault's own MCP result (its content blocks, or its isError refusal), untouched.
     if (tool.passThrough) return result(id, out);
     return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
   } catch (err) {
-    // A structured business failure → JSON-RPC error carrying `error_type` (the
-    // vault door's mapDomainError shape); anything else → in-band isError text.
-    if (err instanceof AccountToolError) {
-      return rpcError(id, INVALID_PARAMS, err.message, { error_type: err.errorType, ...err.extra });
-    }
-    const message = err instanceof Error ? err.message : "Unknown error";
-    return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
+    // A refusal this door makes (or an older vault's, kept with its own error_type: account-mcp.ts writeTool), with its
+    // fields; anything else is `internal_error`.
+    if (err instanceof AccountToolError) return result(id, refusalResult(refusal(err.errorType, err.message, err.extra)));
+    return result(id, refusalResult(internalRefusal(err)));
   }
 }
 

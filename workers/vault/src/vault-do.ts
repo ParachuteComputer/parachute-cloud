@@ -1462,7 +1462,12 @@ export class VaultDO extends DurableObject {
     const platform = auth.clientId === FIRST_PARTY_CLIENT_ID && hasScopeForVault(auth.scopes, vaultName, "admin");
     if (!apiPath.startsWith("/internal/") && requiredVerb !== "read" && request.method !== "GET" && !platform) await this.markWritten();
 
-    const writeCtx = { actor: stamp.by, via: auth.via };
+    const writeCtx = {
+      actor: stamp.by,
+      via: auth.via,
+      // T-476: only an admin key adds or changes a skill (core skills.ts), as on a box (routing.ts writeCtx).
+      maySkills: hasScopeForVault(auth.scopes, vaultName, "admin") && !(auth.scoped_tags && auth.scoped_tags.length > 0),
+    };
     const deps: RestDeps = {
       vaultName,
       deleteObject: (rel) => this.deleteObject(vaultName, rel),

@@ -7,7 +7,7 @@ import type { VaultProjection } from "@openparachute/core/src/vault-projection.j
 
 /** A vault with nothing declared, for the instruction's own unit checks. */
 const EMPTY_PROJECTION = { tags: [], indexed_fields: [], query_hints: [], map: { total_notes: 0, tags: [], paths: [] } } as unknown as VaultProjection;
-import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
+import { base, createNote, freshVault, mintToken, op, OP, refused } from "./helpers.ts";
 
 /**
  * MCP endpoint conformance (design §3.1). Reproduces the byte-shape facts a
@@ -209,11 +209,10 @@ describe("MCP — tools", () => {
       params: { name: "update-tag", arguments: { tag: "x", description: "escalation attempt" } },
     });
     const body = (await call.json()) as any;
-    expect(body.result.isError).toBe(true);
-    expect(body.result.content[0].text).toContain("Unknown tool");
+    expect(refused(body, "unknown_tool").message).toContain("Unknown tool");
   });
 
-  it("tools/call for a filtered-out tool → in-band 'Unknown tool' (no existence leak)", async () => {
+  it("tools/call for a filtered-out tool → in-band unknown_tool (no existence leak)", async () => {
     const v = freshVault();
     const token = await mintToken({ vault: v, scopes: `vault:${v}:read` });
     const res = await mcpPost(v, token, {
@@ -223,8 +222,8 @@ describe("MCP — tools", () => {
       params: { name: "create-note", arguments: { content: "nope" } },
     });
     const body = (await res.json()) as any;
-    expect(body.result.isError).toBe(true);
-    expect(body.result.content[0].text).toContain("Unknown tool");
+    // The same refusal as a tool that doesn't exist: nothing says the tool is there at another level.
+    expect(refused(body, "unknown_tool")).toEqual({ error_type: "unknown_tool", message: "Unknown tool: create-note", tool: "create-note" });
   });
 
   it("unknown method → -32601", async () => {
@@ -273,10 +272,9 @@ describe("MCP — write gate (frozen + cap parity)", () => {
       method: "tools/call",
       params: { name: "create-note", arguments: { content: "frozen — no writes via MCP" } },
     });
-    expect(blocked.status).toBe(200); // JSON-RPC transport is 200; the error is in-body
+    expect(blocked.status).toBe(200); // JSON-RPC transport is 200; the refusal is the tool's result
     const berr = (await blocked.json()) as any;
-    expect(berr.error).toBeTruthy();
-    expect(berr.error.data.error_type).toBe("plan_required");
+    expect(refused(berr, "plan_required").message).toMatch(/read-only/);
 
     // READ (query-notes) is untouched — the paywall must not block reads.
     const ok = await mcpPost(v, token, {
@@ -320,10 +318,9 @@ describe("MCP — write gate (frozen + cap parity)", () => {
       method: "tools/call",
       params: { name: "create-note", arguments: { content: "no room in the notes budget" } },
     });
-    const err = (await blocked.json()) as any;
-    expect(err.error.data.error_type).toBe("storage_cap_exceeded");
-    expect(err.error.data.meter).toBe("notes");
-    expect(err.error.data.cap_bytes).toBe(1024);
+    const err = refused((await blocked.json()) as any, "storage_cap_exceeded");
+    expect(err.meter).toBe("notes");
+    expect(err.cap_bytes).toBe(1024);
   });
 });
 
@@ -504,9 +501,8 @@ describe("MCP — vault-info (server-layer override)", () => {
         params: { name: "vault-info", arguments: { description: "should not stick" } },
       });
       const body = (await res.json()) as any;
-      // The inner admin-scope check throws → surfaced as an in-band tool error.
-      expect(body.result?.isError).toBe(true);
-      const text = body.result.content[0].text as string;
+      // The inner admin-scope check throws → an insufficient_scope refusal (a box's word for it since T-476).
+      const text = refused(body, "insufficient_scope").message as string;
       expect(text).toContain("Forbidden");
       expect(text).toContain("vault:admin");
       // And nothing was persisted — still the fresh-vault default.
@@ -530,8 +526,7 @@ describe("MCP — vault-info (server-layer override)", () => {
       params: { name: "vault-info", arguments: { description: "frozen — no write" } },
     });
     const berr = (await blocked.json()) as any;
-    expect(berr.error).toBeTruthy();
-    expect(berr.error.data.error_type).toBe("plan_required");
+    refused(berr, "plan_required");
 
     // READ (no description) is sacred — vault-info still works on a frozen vault.
     const proj = await callVaultInfo(v, writeToken, { include_stats: true });
@@ -587,17 +582,14 @@ describe("MCP — vault-info (server-layer override)", () => {
     ];
 
     for (const [label, value] of NON_STRINGS) {
-      it(`description: ${label} → INVALID_PARAMS (invalid_description), nothing persisted`, async () => {
+      it(`description: ${label} → invalid_description refusal, nothing persisted`, async () => {
         const v = freshVault();
         const body = await attemptDescription(v, await ADMIN(v), value);
-        // The tool's NORMAL validation path — a structured JSON-RPC error
-        // (-32602 INVALID_PARAMS + `data.error_type`), the same shape every
-        // other core validation leaf takes through mapDomainError. NOT a raw
-        // throw that degrades to INTERNAL_ERROR.
-        expect(body.error).toBeTruthy();
-        expect(body.error.code).toBe(-32602);
-        expect(body.error.data.error_type).toBe("invalid_description");
-        expect(body.error.data.field).toBe("description");
+        // The tool's NORMAL validation path — a refusal with `error_type` and
+        // its fields, the same shape every other core validation leaf takes
+        // through the engine's refusalOfError. NOT a raw throw that degrades
+        // to internal_error.
+        expect(refused(body, "invalid_description").field).toBe("description");
         // Nothing landed — still the fresh-vault default.
         const proj = await callVaultInfo(v, OP, {});
         expect(proj.description).toBe(DEFAULT_VAULT_DESCRIPTION);

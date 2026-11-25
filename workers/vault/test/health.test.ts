@@ -13,7 +13,7 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
-import { HEALTH_KEEP_DAYS, HEALTH_MAX_KEYS, HealthSink, OVERFLOW_KEY, OVERFLOW_SERVER_KEY, responseOutcome, routeOf, routerFailureKind, toolErrorOutcome, utcDay } from "../src/health.ts";
+import { HEALTH_KEEP_DAYS, HEALTH_MAX_KEYS, HealthSink, OVERFLOW_KEY, OVERFLOW_SERVER_KEY, responseOutcome, routeOf, refusalOutcome, routerFailureKind, toolErrorOutcome, utcDay } from "../src/health.ts";
 import { base, createNote, freshVault, mintToken, op } from "./helpers.ts";
 
 type Days = Record<string, Record<string, Record<string, number>>>;
@@ -71,13 +71,20 @@ describe("health counters — what a vault's requests leave behind", () => {
     });
     expect(created.status).toBe(200);
     await mcp(v, { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "caller-chose-this-name", arguments: {} } });
+    // A refusal is counted by the engine's own word for it (T-476), whether the tool threw it or said it as data.
+    const id = (JSON.parse(((await created.json()) as any).result.content[0].text) as { id: string }).id;
+    await mcp(v, { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "update-note", arguments: { id, content: "blind" } } });
+    await mcp(v, { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "query-notes", arguments: { id: "caller-chose-this-id" } } });
     const c = await counters(v);
     expect(c["mcp:initialize|ok"]).toBe(1);
     expect(c["mcp:tools/list|ok"]).toBe(1);
     expect(c["mcp:create-note|ok"]).toBe(1);
     expect(c["mcp:unknown-tool|unknown_tool"]).toBe(1);
-    expect(c["http:mcp|2xx"]).toBe(4);
+    expect(c["mcp:update-note|refusal:precondition_required"]).toBe(1);
+    expect(c["mcp:query-notes|refusal:not_found"]).toBe(1);
+    expect(c["http:mcp|2xx"]).toBe(6);
     expect(Object.keys(c).join(" ")).not.toContain("caller-chose-this-name");
+    expect(Object.keys(c).join(" ")).not.toContain("caller-chose-this-id");
   });
 
   it("never stores what the caller sent: no content, path, tag or query in any key", async () => {
@@ -203,6 +210,13 @@ describe("health sink — bounds", () => {
     expect(toolErrorOutcome(new QueryError("bad query"))).toBe("error:queryerror");
     expect(toolErrorOutcome(new TypeError("x is undefined"))).toBe("exception:typeerror");
     expect(toolErrorOutcome(new EmbeddingError("ai down"))).toBe("exception:embeddingerror");
+  });
+
+  it("a refusal is counted by its type only when the type is one bare word, never by a message", () => {
+    expect(refusalOutcome("conflict")).toBe("refusal:conflict");
+    expect(refusalOutcome("Note Zq7 not found")).toBe("refusal");
+    expect(refusalOutcome("not_found/../x")).toBe("refusal");
+    expect(refusalOutcome(undefined)).toBe("refusal");
   });
 
   it("by-design 503s are named by their type; any other 503 stays a server error", async () => {

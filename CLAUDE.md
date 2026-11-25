@@ -31,7 +31,7 @@ bun scripts/health-report.ts --d1 parachute-identity [--gate]   # "did anything 
 
 ## Load-bearing gotchas
 
-- **Stale `file:` core dep** — `workers/vault` depends on `@openparachute/core` via `file:../../../parachute-core/packages/vault/core`; bun COPIES it at install. After any engine change, `bun install` or you test/deploy stale core (the deploy scripts do it; test runs don't).
+- **Stale `file:` core dep** — `workers/vault` (and `workers/identity`, for the engine's refusal shape) depends on `@openparachute/core` via `file:../../../parachute-core/packages/vault/core`; bun COPIES it at install. After any engine change, `bun install` or you test/deploy stale core (the deploy scripts do it; test runs don't).
 - **DO SQLite rejects `BEGIN/COMMIT`** — core's `transaction()` duck-types the shim's `transactionSync`.
 - **workerd ≠ vitest-workerd** — e.g. runtime caps PBKDF2 at 100k iterations, the test pool doesn't enforce it (green tests, every live login 500'd). ALWAYS live-smoke after deploy.
 - **`wrangler dev` with the staging config is not offline** — the Workers AI binding is always remote, so it opens a session to the real Cloudflare account with whatever sign-in the machine has. The door contracts run the workers from a copy of the config without that binding, inside a sandbox with no network.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Materialize the exact parachute-core source whose engine package
 # (packages/vault/core, npm name @openparachute/core) Cloud CI and deploys build
-# against. workers/vault depends on it via
-# file:../../../parachute-core/packages/vault/core, so the checkout lives next to
+# against. workers/vault (and workers/identity, for the refusal shape, T-476)
+# depend on it via file:../../../parachute-core/packages/vault/core, so the checkout lives next to
 # this repo at ../parachute-core.
 # Existing developer checkouts are verified but never switched or reset.
 set -euo pipefail

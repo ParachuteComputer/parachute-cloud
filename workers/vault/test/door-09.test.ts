@@ -28,7 +28,8 @@ async function call(vault: string, name: string, args: Record<string, unknown>, 
   const msg = await rpc(vault, "tools/call", { name, arguments: args }, token);
   if (msg.error) return { ok: false, out: msg.error, raw: msg };
   const text = msg.result.content[0].text as string;
-  if (msg.result.isError) return { ok: false, out: text, raw: msg };
+  // A refusal (one way to refuse, T-476): its structuredContent {error_type, message, ...}, the same object as its text.
+  if (msg.result.isError) return { ok: false, out: msg.result.structuredContent ?? text, raw: msg };
   return { ok: true, out: JSON.parse(text), raw: msg };
 }
 
@@ -113,7 +114,7 @@ describe("door/0.9 MCP: the record door", () => {
     expect(JSON.stringify(help.out.parameters)).toContain('"body"');
     const both = await call(v, "vault-info", { help: "query-records", description: "x" });
     expect(both.ok).toBe(false);
-    expect(both.out.data?.error_type).toBe("invalid_query");
+    expect(both.out.error_type).toBe("invalid_query");
     expect(both.out.message).toContain("help or description");
     expect((await call(v, "vault-info", { help: "query-records", description: null })).ok).toBe(true);
     const mt = await call(v, "vault-info", { help: "manage-types" });
@@ -147,7 +148,8 @@ describe("door/0.9 MCP: the record door", () => {
     expect(put.status).toBeLessThan(300);
     const up = await call(v, "attachment-url", { action: "upload", record: "Audio/Ep 2", filename: "ep2.mp3", size_bytes: 3 });
     expect(up.ok).toBe(false);
-    expect(up.out.data.error_type).toBe("attachments_not_included");
+    expect(up.out.error_type).toBe("attachments_not_included");
+    expect(up.out.message).toMatch(/attachments/);
   });
 });
 

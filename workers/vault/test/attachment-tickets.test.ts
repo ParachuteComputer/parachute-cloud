@@ -15,7 +15,7 @@ import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FIRST_PARTY_CLIENT_ID } from "../src/auth.ts";
 import { r2Key } from "../src/rest/notes.ts";
-import { base, createNote, freshVault, mintToken, op, OP } from "./helpers.ts";
+import { base, createNote, freshVault, mintToken, op, OP, refused } from "./helpers.ts";
 
 const BOTH_ACCEPT = "application/json, text/event-stream";
 
@@ -393,8 +393,7 @@ describe("attachment tickets — the mint-time gate ladder (cloud-only, over bun
       frozen: true,
     });
     const msg = await callTool(v, "request-attachment-upload", { note: note.id, filename: "a.bin", size_bytes: 4 });
-    expect(msg.error).toBeDefined();
-    expect(msg.error.data.error_type).toBe("plan_required");
+    refused(msg, "plan_required");
   });
 
   it("Entry tier (attachment_bytes: 0) → 403 attachments_not_included at MINT — an agent learns before curling", async () => {
@@ -404,8 +403,7 @@ describe("attachment tickets — the mint-time gate ladder (cloud-only, over bun
       caps: { notes_bytes: 100 * 1024 * 1024, attachment_bytes: 0 },
     });
     const msg = await callTool(v, "request-attachment-upload", { note: note.id, filename: "a.bin", size_bytes: 4 });
-    expect(msg.error).toBeDefined();
-    expect(msg.error.data.error_type).toBe("attachments_not_included");
+    refused(msg, "attachments_not_included");
 
     // No ticket should have been minted — the DO's ticket table stays empty
     // for this vault (verified indirectly: a plausible-looking spend against
@@ -419,10 +417,9 @@ describe("attachment tickets — the mint-time gate ladder (cloud-only, over bun
       caps: { notes_bytes: 100 * 1024 * 1024, attachment_bytes: 1024 },
     });
     const msg = await callTool(v, "request-attachment-upload", { note: note.id, filename: "big.bin", size_bytes: 4096 });
-    expect(msg.error).toBeDefined();
-    expect(msg.error.data.error_type).toBe("storage_cap_exceeded");
-    expect(msg.error.data.meter).toBe("attachments");
-    expect(msg.error.data.cap_bytes).toBe(1024);
+    const r = refused(msg, "storage_cap_exceeded");
+    expect(r.meter).toBe("attachments");
+    expect(r.cap_bytes).toBe(1024);
   });
 
   it("size_bytes missing/invalid at mint falls through to core's OWN field-validation error (invalid_query), not the cap gate", async () => {
@@ -432,9 +429,8 @@ describe("attachment tickets — the mint-time gate ladder (cloud-only, over bun
     // still refuse, but for the WRONG reason. It must not run at all here.
     await putConfig(v, await firstPartyToken(v), { caps: { notes_bytes: 100 * 1024 * 1024, attachment_bytes: 0 } });
     const msg = await callTool(v, "request-attachment-upload", { note: note.id, filename: "a.bin" });
-    expect(msg.error).toBeDefined();
-    expect(msg.error.data.error_type).toBe("invalid_query");
-    expect(msg.error.data.field).toBe("size_bytes");
+    const r = refused(msg, "invalid_query");
+    expect(r.field).toBe("size_bytes");
   });
 
   it("mint→spend TOCTOU: two tickets minted against the SAME near-full budget — the SECOND spend is re-checked against the ACTUAL live meter and refused", async () => {

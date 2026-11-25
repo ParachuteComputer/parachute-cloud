@@ -2205,9 +2205,10 @@ async function main() {
         method: "tools/call",
         params: { name: "request-attachment-upload", arguments: { note: noteId, filename: "too-big.bin", size_bytes: 100 * 1024 * 1024 + 1 } },
       });
-      const oversizedData = oversized.json?.error?.data;
+      // One way to refuse (T-476): the refusal is an isError result with structuredContent {error_type, message, ...}.
+      const oversizedData = oversized.json?.result?.structuredContent;
       assert(
-        oversized.status === 200 && !!oversized.json?.error && oversizedData?.error_type === "file_too_large",
+        oversized.status === 200 && oversized.json?.result?.isError === true && oversizedData?.error_type === "file_too_large",
         "tickets: a declared size_bytes over the 100 MiB ceiling → mint-time refusal (file_too_large, not plan-gated)",
         JSON.stringify(oversizedData ?? oversized.json?.error ?? oversized.json),
       );
@@ -2429,9 +2430,9 @@ async function main() {
             }),
           });
           const eMintJson = (await eMint.json()) as any;
-          const eMintData = eMintJson?.error?.data;
+          const eMintData = eMintJson?.result?.structuredContent; // one way to refuse (T-476): an isError result
           assert(
-            eMint.status === 200 && !!eMintJson?.error && eMintData?.error_type === "attachments_not_included",
+            eMint.status === 200 && eMintJson?.result?.isError === true && eMintData?.error_type === "attachments_not_included",
             "enforcement: MCP request-attachment-upload MINT on Entry → attachments_not_included (mint gate matches REST)",
             JSON.stringify(eMintData ?? eMintJson?.error ?? eMintJson),
           );

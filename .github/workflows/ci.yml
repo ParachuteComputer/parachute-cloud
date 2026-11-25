@@ -4,8 +4,8 @@
 # against both workers under local workerd, compared with the box (scripts/door-parity.sh).
 #
 # Load-bearing setup notes (all three jobs):
-#   - workers/vault depends on @openparachute/core (the engine) via
-#     `file:../../../parachute-core/packages/vault/core` — a SIBLING checkout of
+#   - workers/vault (and workers/identity, for the engine's one refusal shape, T-476) depend on
+#     @openparachute/core (the engine) via `file:../../../parachute-core/packages/vault/core` — a SIBLING checkout of
 #     the public parachute-core repo, OUTSIDE this repo. Bun copies it into
 #     node_modules at install time, so each job materializes the exact commit
 #     pinned in scripts/core-source.env next to this checkout BEFORE `bun install`. The

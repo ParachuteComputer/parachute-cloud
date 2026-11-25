@@ -22,7 +22,7 @@ import { handleOpsVaultImportPost } from "../src/ops-vault-import.ts";
 import { PLAN_SPECS, type PlanId, vaultCapMessage, vaultLimitFor } from "../src/plans.ts";
 import { signAccessToken } from "../src/tokens.ts";
 import { getUserById } from "../src/users.ts";
-import { CSRF, ISSUER, db, deps, seedSession, seedUser, seedVault } from "./helpers.ts";
+import { CSRF, ISSUER, db, deps, refused, seedSession, seedUser, seedVault } from "./helpers.ts";
 
 type VaultFetch = NonNullable<OAuthDeps["vaultFetch"]>;
 
@@ -194,10 +194,10 @@ describe("the create doors honour the override", () => {
     const ok = await mcpCreate(roomy.id, uniq("mcp"));
     expect(ok.error).toBeUndefined();
     expect(await ownedCount(roomy.id)).toBe(2);
-    expect((await mcpCreate(roomy.id, uniq("mcp"))).error.data.error_type).toBe("vault_limit_reached");
+    refused(await mcpCreate(roomy.id, uniq("mcp")), "vault_limit_reached");
 
     const tight = await account("power", 1, 1);
-    expect((await mcpCreate(tight.id, uniq("mcp"))).error.data.error_type).toBe("vault_limit_reached");
+    refused(await mcpCreate(tight.id, uniq("mcp")), "vault_limit_reached");
     expect(await ownedCount(tight.id)).toBe(1);
   });
 

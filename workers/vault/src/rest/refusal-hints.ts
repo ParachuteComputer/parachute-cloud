@@ -16,7 +16,7 @@ export const HINT_PATH_CONFLICT = "pass a different `path`, or omit it to leave 
 /** On a create (single or batch): with no path the vault assigns one. */
 export const HINT_PATH_CONFLICT_ON_CREATE = "pass a different `path`, or omit it to let the vault assign one";
 export const HINT_PRECONDITION =
-  "re-read the note, pass its `updated_at` as `if_updated_at`, or pass `force: true` to skip the check";
+  "re-read the note and pass its `updatedAt` as `if_updated_at`, or pass `force: true` to skip the check";
 export const HINT_HISTORY_OVERFLOW =
   "this note exceeds the 2 MB version-history ceiling, so it cannot be updated while history is enabled; delete it, or shrink it out-of-band, or disable history for this vault";
 export const hintHistoryUnrecoverable = (reason: unknown): string =>

@@ -140,7 +140,7 @@ function invalidIfUpdatedAtResponse(): Response {
 function gateStrictWrite(
   store: Store,
   writeCtx: WriteCtx,
-  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown>; wasPublished?: boolean; defaultTags?: string[] },
+  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown>; wasPublished?: boolean; defaultTags?: string[]; wasTags?: string[] },
   tagScope: TagScopeCtx,
 ): void {
   enforceStrictWrite(store, shape, {
@@ -148,6 +148,8 @@ function gateStrictWrite(
     // schema defaults will fill in (the engine's rule; the box passes it the same way, routes.ts gateStrictWrite).
     ...(tagScope.raw !== null ? { mayChangePublished: tagVisibleInScope("publish", tagScope.allowed, tagScope.raw) } : {}),
     bypass: writeCtx.bypassStrict === true,
+    // T-476: a skill is instructions every connected AI may follow; only an admin key adds or changes one.
+    maySkills: writeCtx.maySkills === true,
     onBypass: (violations: ValidationWarning[]) => {
       logStrictBypass({
         actor: writeCtx.actor,
@@ -361,6 +363,8 @@ export async function handleNotes(
       path: e.note_path ?? null, note_id: e.note_id, message: e.message, hint: HINT_CONFLICT,
     }, 409);
     if (e?.code === "PUBLISH_OUT_OF_SCOPE") return json({ error: "Forbidden", error_type: "tag_scope_violation", message: e.message }, 403);
+    // T-476: a write key making or changing a skill (core skills.ts): the box's 403 (routes.ts conflictResponse).
+    if (e?.code === "SKILL_NEEDS_ADMIN") return json({ error: "Forbidden", error_type: "skill_needs_admin", message: e.message, hint: e.hint }, 403);
     if (e?.code === "SCHEMA_VALIDATION") return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message, hint: HINT_SCHEMA_VALIDATION }, 422);
     if (e?.code === "PATH_CONFLICT") return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message, hint: HINT_PATH_CONFLICT }, 409);
     const ambig = ambiguousPathResponse(e);
@@ -1093,7 +1097,7 @@ async function handleNotesInner(
         const incomingTags: string[] = item.tags ?? [];
         const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
         const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
-        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata, defaultTags: incomingTags, wasTags: existingNote.tags ?? [], wasPublished: (existingNote.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
 
         // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
         // core UPDATE on the tag/link mutation too, not just `updates` — a
@@ -1110,6 +1114,7 @@ async function handleNotesInner(
             ...linkOptFor(db, tagScope),
             actor: writeCtx.actor,
             via: writeCtx.via,
+            maySkills: writeCtx.maySkills === true,
           });
         }
 
@@ -1238,6 +1243,10 @@ async function handleNotesInner(
       try {
         await (batched ? transactionAsync(db, runBatch) : runBatch());
       } catch (e: any) {
+        // T-476: a write key making a skill (core skills.ts): the same 403 as an update's, as the box's batch answers.
+        if (e && e.code === "SKILL_NEEDS_ADMIN") {
+          return json({ error: "Forbidden", error_type: "skill_needs_admin", message: e.message, hint: e.hint }, 403);
+        }
         if (e && e.code === "PATH_CONFLICT") {
           return json({ error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message, hint: HINT_PATH_CONFLICT_ON_CREATE }, 409);
         }
@@ -1450,7 +1459,7 @@ async function handleNotesInner(
       try {
         const version = "import_ix" in selector ? getImportedVersion(db, id, selector.import_ix) : await store.getNoteVersion(id, storageIndex);
         if (!version) return json({ error: "Not found", error_type: "not_found", ...("import_ix" in selector ? selector : {}) }, 404);
-        gateStrictWrite(store, writeCtx, { path: note ? note.path : latestTombstone(db, id)?.path, tags: note?.tags ?? [], metadata: version.metadata, wasPublished: (note?.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: note ? note.path : latestTombstone(db, id)?.path, tags: note?.tags ?? [], metadata: version.metadata, ...(note ? { wasTags: note.tags ?? [] } : {}), wasPublished: (note?.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
         const restored = await store.restoreNoteVersion(id, storageIndex, {
           actor: writeCtx.actor, via: writeCtx.via,
           ...(body.if_updated_at !== undefined ? { if_updated_at: body.if_updated_at as string } : {}),
@@ -1619,7 +1628,7 @@ async function handleNotesInner(
           {
             error_type: "precondition_required",
             error: "precondition_required",
-            message: "update requires `if_updated_at` (the note's last-seen updated_at) or `force: true`.",
+            message: "update requires `if_updated_at` (the note's `updatedAt` as you read it) or `force: true`.",
             note_id: note.id,
             path: note.path ?? null,
             hint: HINT_PRECONDITION,
@@ -1735,7 +1744,7 @@ async function handleNotesInner(
         for (const t of (body.tags?.add as string[] | undefined) ?? []) projectedTags.add(t);
         const baseMeta = updates.metadata ?? ((note.metadata as Record<string, unknown>) ?? {});
         const projectedMeta = stBody !== undefined ? { ...baseMeta, [stBody.field as string]: stBody.to } : baseMeta;
-        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: (body.tags?.add as string[] | undefined) ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
+        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta, defaultTags: (body.tags?.add as string[] | undefined) ?? [], wasTags: note.tags ?? [], wasPublished: (note.metadata as Record<string, unknown> | undefined)?.published === true }, tagScope);
       }
 
       // Content-wikilink warnings (vault#570) gate on the SAME condition
@@ -1753,7 +1762,7 @@ async function handleNotesInner(
       if (Object.keys(updates).length > 0 || hasTagMutation || hasLinkMutation) {
         updates.actor = writeCtx.actor;
         updates.via = writeCtx.via;
-        await store.updateNote(note.id, { ...updates, ...linkOptFor(db, tagScope) });
+        await store.updateNote(note.id, { ...updates, ...linkOptFor(db, tagScope), maySkills: writeCtx.maySkills === true });
       }
 
       for (const { targetId, relationship } of resolvedLinksToRemove) {
@@ -1858,6 +1867,9 @@ async function handleNotesInner(
           },
           409,
         );
+      }
+      if (e && e.code === "SKILL_NEEDS_ADMIN") {
+        return json({ error: "Forbidden", error_type: "skill_needs_admin", message: e.message, hint: e.hint }, 403);
       }
       if (e && e.code === "SCHEMA_VALIDATION") {
         return json({ error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message, hint: HINT_SCHEMA_VALIDATION }, 422);

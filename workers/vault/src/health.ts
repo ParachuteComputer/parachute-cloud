@@ -8,8 +8,9 @@
  *     `alarm`, `do` for router-observed Durable Object failures, or
  *     `do:boot` for an instance whose engine refused to boot (vault-do.ts);
  *   - outcome: `2xx`, `4xx:404`, `5xx:500`, `ok`, `tool_error`,
- *     `domain:<json-rpc code>`, `gate:<status>`, `exception:<ErrorClass>`,
- *     or a router failure kind (`cpu_limit`, …).
+ *     `refusal:<error_type>` (an MCP tool's refusal, by the engine's own word for it;
+ *     T-476), `gate:<status>`, `exception:<ErrorClass>`, or a router failure kind
+ *     (`cpu_limit`, …).
  * Never a note, a path, a tag, a query, a token, an error message, a client
  * string or an address. Every part is reduced to `[a-z0-9:/_.-]` and capped.
  *
@@ -79,6 +80,16 @@ export function toolErrorOutcome(err: unknown): string {
   if (SERVER_ERROR_CLASSES.has(cls) || /sqlite|d1/.test(cls)) return `exception:${cls}`;
   return `error:${cls}`;
 }
+
+/**
+ * How an MCP tool's refusal is counted (one way to refuse, T-476): `refusal:<error_type>`, the engine's own word for
+ * it (`conflict`, `not_found`, …), which is server-defined, never the caller's. Anything that isn't one bare word
+ * (or no type at all) counts as `refusal`, so a type can never carry a message.
+ */
+export function refusalOutcome(errorType: unknown): string {
+  return typeof errorType === "string" && /^[a-z][a-z0-9_]{0,47}$/.test(errorType) ? `refusal:${errorType}` : "refusal";
+}
+
 const SERVER_ERROR_CLASSES = new Set([
   "typeerror",
   "rangeerror",

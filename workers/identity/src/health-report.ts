@@ -22,7 +22,7 @@
  *
  * OUTCOME CLASSES: ok (2xx, 3xx, ok), server (5xx*, exception:*, the DO's CPU
  * or memory limit, an overload, an opaque platform error, a failed backup or
- * collection), client (everything else: 4xx by status, tool_error, domain:*,
+ * collection), client (everything else: 4xx by status, tool_error, refusal:*,
  * gate:*, OAuth error codes, by-design 503s named `busy:*` / `backstop:*`, a
  * dropped connection or a reset while a deploy moves objects).
  *

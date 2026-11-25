@@ -35,6 +35,8 @@ export type WriteCtx = {
   actor: string | null;
   via: string | null;
   bypassStrict?: boolean;
+  /** T-476: only an admin key adds or changes a skill (core skills.ts); the box's routing.ts sets it the same way. */
+  maySkills?: boolean;
 };
 
 export const NO_WRITE_CTX: WriteCtx = { actor: null, via: null };
