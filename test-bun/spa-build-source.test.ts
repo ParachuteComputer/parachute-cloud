@@ -66,8 +66,11 @@ describe("served SPA source", () => {
     expect(script).toContain("git rev-parse HEAD");
     expect(script).toContain("APP_REPO");
     expect(script).toContain('"$ACTUAL_NAME" != "$SPA_APP_NAME"');
-    expect(script).toContain('VITE_BASE_PATH="/" bun run build');
-    expect(script).toContain("npm ci");
+    expect(script).toContain('VITE_BASE_PATH="/" quiet bun run build');
+    // another repository's install runs inside a deploy job: no package's install scripts, none of the deploy's credentials
+    expect(script).toContain("npm ci --ignore-scripts");
+    expect(script).toMatch(/quiet\(\) \{ env -u CLOUDFLARE_API_TOKEN /);
+    for (const line of script.split("\n").filter((l) => /^\s*(?:VITE_BASE_PATH="\/" )?(?:quiet )?(?:bun (?:install|run build)|npm (?:ci|run build))/.test(l))) expect(line).toContain("quiet ");
     expect(script).not.toContain("@openparachute/notes-ui");
     expect(script).not.toContain("SURFACE_REPO");
     // Pages-era artifacts must be stripped post-copy: wrangler hard-rejects the
@@ -110,7 +113,8 @@ describe("served SPA source", () => {
     tempDirs.push(temp);
     const app = resolve(temp, "parachute");
     mkdirSync(app, { recursive: true });
-    const build = `const fs=require("fs");fs.mkdirSync("dist",{recursive:true});fs.writeFileSync("dist/index.html",'<!doctype html><div id="root"></div><script type="module" src="/assets/x.js"></script>');fs.writeFileSync("dist/hosted.json",JSON.stringify({contract:1,csp:${JSON.stringify(csp)},spa:["/"]}));`;
+    // the build writes what it saw of the deploy's credentials, so the test can see it saw none
+    const build = `const fs=require("fs");fs.mkdirSync("dist",{recursive:true});fs.writeFileSync("dist/saw.txt",String(process.env.CLOUDFLARE_API_TOKEN||"")+String(process.env.DEV_SECRETS||""));fs.writeFileSync("dist/index.html",'<!doctype html><div id="root"></div><script type="module" src="/assets/x.js"></script>');fs.writeFileSync("dist/hosted.json",JSON.stringify({contract:1,csp:${JSON.stringify(csp)},spa:["/"]}));`;
     writeFileSync(resolve(app, "build.cjs"), build);
     writeFileSync(resolve(app, ".gitignore"), "dist/\nnode_modules/\n");
     writeFileSync(resolve(app, "package.json"), JSON.stringify({ name, version: "0.1.0", private: true, scripts: { build: "node build.cjs" } }));
@@ -120,7 +124,7 @@ describe("served SPA source", () => {
     const pin = resolve(temp, "spa-source.env");
     writeFileSync(pin, `SPA_APP_REPO="ParachuteComputer/parachute"\nSPA_APP_NAME="parachute"\nSPA_APP_VERSION="0.1.0"\nSPA_APP_REF="${git("rev-parse", "HEAD")}"\n`);
     const dest = resolve(temp, "dist-assets");
-    const run = () => Bun.spawnSync(["bash", resolve(root, "scripts/build-spa.sh")], { cwd: root, env: { ...process.env, APP_REPO: app, SPA_DEST: dest, SPA_SOURCE_FILE: pin }, stdout: "pipe", stderr: "pipe" });
+    const run = () => Bun.spawnSync(["bash", resolve(root, "scripts/build-spa.sh")], { cwd: root, env: { ...process.env, APP_REPO: app, SPA_DEST: dest, SPA_SOURCE_FILE: pin, CLOUDFLARE_API_TOKEN: "made-up-deploy-token", DEV_SECRETS: "made-up" }, stdout: "pipe", stderr: "pipe" });
     return { dest, run };
   }
   const HOSTED_ASKS = "default-src 'self'; connect-src 'self' https: wss:; img-src 'self' data: blob: https:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; font-src 'self' data:; frame-src about:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
@@ -133,6 +137,8 @@ describe("served SPA source", () => {
     const headers = readFileSync(resolve(dest, "_headers"), "utf8");
     expect(headers).toContain("script-src 'self' 'unsafe-inline'");
     expect(headers).toContain("frame-src about:");
+    // the app's build ran without the deploy's credentials in its environment
+    expect(readFileSync(resolve(dest, "saw.txt"), "utf8")).toBe("");
   }, 120_000);
 
   test("refuses an npm app that asks for a policy Cloud hasn't reviewed, and a package that isn't the pin's", () => {

@@ -126,7 +126,7 @@ import { handlePromoRedeemPost } from "./promo.ts";
 import { handleAccountMcp, accountMcpProtectedResource } from "./account-mcp-http.ts";
 import { handleVaultConnectionDelete, handleVaultConnectionsList } from "./oauth-connections.ts";
 import { anyOriginPreflight, routeVaultGrants } from "./vault-grants.ts";
-import { spaCspFor } from "./spa-csp.ts";
+import { hostedCspAsked, spaCspFor } from "./spa-csp.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
 // (wrangler.toml [[durable_objects.bindings]] class_name = "RateLimiterDO").
@@ -831,7 +831,7 @@ app.all("/mcp/*", (c) => vaultOrBackstop(c, mcpRouteMissing));
  * web build says there what it asks of a host; the older app has none). Read
  * from Static Assets once per isolate (kept by the binding): a bundle never
  * changes under a deployed worker. A missing file comes back as the app's page (`not_found_handling`),
- * so only a JSON answer counts.
+ * so only an answer that reads as a declaration counts.
  */
 const hostedJsonKept = new WeakMap<object, string | null>();
 async function hostedDeclaration(env: Env, req: Request): Promise<string | null> {
@@ -840,7 +840,12 @@ async function hostedDeclaration(env: Env, req: Request): Promise<string | null>
   if (kept !== undefined) return kept;
   try {
     const r = await env.ASSETS.fetch(new URL("/hosted.json", req.url));
-    const found = r.ok && /json/i.test(r.headers.get("content-type") ?? "") ? await r.text() : null;
+    // an answer that isn't OK says nothing about the bundle: not kept, so one bad moment can't hold `/` to the wrong
+    // policy for the isolate's life
+    if (!r.ok) return null;
+    // a missing file comes back as the app's page: only a declaration counts
+    const text = await r.text();
+    const found = hostedCspAsked(text) !== null ? text : null;
     hostedJsonKept.set(env.ASSETS, found);
     return found;
   } catch {

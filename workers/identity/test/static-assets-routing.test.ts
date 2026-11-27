@@ -227,8 +227,20 @@ describe("the Host-branched root (P1.1)", () => {
     // the same page with no declaration keeps the hash-locked policy: nothing inline is let in by default
     const bare = await worker.fetch(new Request("https://app.example/"), { ...env, ASSETS: bundle({ "/index.html": ["text/html", page] }) });
     expect(bare.headers.get("content-security-policy")).toContain("script-src 'self';");
-    expect(bare.headers.get("content-security-policy")).not.toContain("unsafe-inline' 'self'");
     expect(bare.headers.get("content-security-policy")).not.toMatch(/script-src[^;]*unsafe-inline/);
+    // nor does a declaration that asks for some other policy, or a bundle whose hosted.json fails once (not kept)
+    const other = bundle({ "/index.html": ["text/html", page], "/hosted.json": ["application/json", JSON.stringify({ contract: 1, csp: "default-src *", spa: ["/"] })] });
+    expect((await worker.fetch(new Request("https://app.example/"), { ...env, ASSETS: other })).headers.get("content-security-policy")).not.toMatch(/script-src[^;]*unsafe-inline/);
+    let calls = 0;
+    const flaky = { fetch: async (input: RequestInfo | URL) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path === "/hosted.json" && calls++ === 0) return new Response("upstream", { status: 503 });
+      return path === "/hosted.json" ? new Response(JSON.stringify({ contract: 1, csp: HOSTED_APP_CSP, spa: ["/"] }), { headers: { "content-type": "application/json" } }) : new Response(page, { headers: { "content-type": "text/html" } });
+    } } as unknown as Fetcher;
+    const first = await worker.fetch(new Request("https://app.example/"), { ...env, ASSETS: flaky });
+    expect(first.headers.get("content-security-policy")).not.toMatch(/script-src[^;]*unsafe-inline/);
+    const second = await worker.fetch(new Request("https://app.example/"), { ...env, ASSETS: flaky });
+    expect(second.headers.get("content-security-policy")).toBe(HOSTED_APP_CSP);
   });
 
   test("the console-host redirect (`/`) carries NO SPA CSP — it's not the shell", async () => {

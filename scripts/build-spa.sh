@@ -56,12 +56,16 @@ fi
 # or package-lock.json (the Parachute app, whose web build is root-based).
 echo "build-spa: building $SPA_APP_NAME v$ACTUAL_VERSION ($SPA_APP_REF) at origin root…"
 cd "$APP_REPO"
+# Another repository's install and build run here, inside a deploy job: without the
+# deploy's own credentials in their environment, and (npm) without any package's
+# install scripts.
+quiet() { env -u CLOUDFLARE_API_TOKEN -u CLOUDFLARE_ACCOUNT_ID -u CLOUDFLARE_API_KEY -u CLOUDFLARE_EMAIL -u DEV_SECRETS "$@"; }
 if [[ -f bun.lock || -f bun.lockb ]]; then
-  bun install --frozen-lockfile
-  VITE_BASE_PATH="/" bun run build
+  quiet bun install --frozen-lockfile
+  VITE_BASE_PATH="/" quiet bun run build
 elif [[ -f package-lock.json ]]; then
-  npm ci --no-audit --no-fund
-  npm run build
+  quiet npm ci --ignore-scripts --no-audit --no-fund
+  quiet npm run build
 else
   echo "build-spa: $APP_REPO has no lockfile (bun.lock or package-lock.json); refusing a build that isn't pinned." >&2
   exit 1

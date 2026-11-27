@@ -12,7 +12,7 @@
  * script NONCE, `connect-src 'self'`. It rides `htmlResponse`, the single HTML
  * choke point every ceremony page funnels through.
  *
- * The SPA never touches `htmlResponse`. P1.1 serves `@openparachute/notes-ui`
+ * The SPA never touches `htmlResponse`. P1.1 serves the pinned app
  * from Workers Static Assets — its shell (`index.html`) and deep links bypass
  * the worker's HTML path entirely, so P0.2's CSP does NOT cover them. This module
  * is that missing policy, emitted through TWO surfaces that share it verbatim:
@@ -175,20 +175,27 @@ export const HOSTED_APP_CSP = [
   "object-src 'none'",
 ].join("; ");
 
-/** A policy as its directives, each with its sources in order-free form. */
-function directives(csp: string): Map<string, string> {
+/**
+ * A policy as its directives, each with its sources in order-free form; null
+ * for one that names a directive twice (a browser takes the first, so two
+ * policies that differ only in a repeated directive are not the same policy).
+ * Split on ASCII whitespace only, as a browser does.
+ */
+function directives(csp: string): Map<string, string> | null {
   const out = new Map<string, string>();
-  for (const d of csp.split(";").map((x) => x.trim()).filter(Boolean)) {
-    const [name, ...sources] = d.split(/\s+/);
-    out.set((name ?? "").toLowerCase(), [...sources].sort().join(" "));
+  for (const d of csp.split(";").map((x) => x.replace(/^[ \t\n\f\r]+|[ \t\n\f\r]+$/g, "")).filter(Boolean)) {
+    const [name, ...sources] = d.split(/[ \t\n\f\r]+/);
+    const key = (name ?? "").toLowerCase();
+    if (out.has(key)) return null;
+    out.set(key, [...sources].sort().join(" "));
   }
   return out;
 }
 
-/** Do two policies say the same thing: the same directives with the same sources, in any order? */
+/** Do two policies say the same thing: the same directives with the same sources, in any order, none named twice? */
 export function sameCsp(a: string, b: string): boolean {
   const x = directives(a), y = directives(b);
-  return x.size === y.size && [...x].every(([k, v]) => y.get(k) === v);
+  return !!x && !!y && x.size === y.size && [...x].every(([k, v]) => y.get(k) === v);
 }
 
 /**
@@ -213,7 +220,10 @@ export function hostedCspAsked(hostedJson: string | null): string | null {
  * worker's `/` can't disagree.
  */
 export async function spaCspFor(html: string, hostedJson: string | null): Promise<string> {
-  return hostedCspAsked(hostedJson) !== null ? HOSTED_APP_CSP : spaCspForHtml(html);
+  // only for a bundle that asks for exactly Cloud's policy: the build refuses any other, and this holds the same line
+  // at the worker (a bundle that got here some other way keeps the hash-locked policy, under which its frames don't run)
+  const asked = hostedCspAsked(hostedJson);
+  return asked !== null && sameCsp(asked, HOSTED_APP_CSP) ? HOSTED_APP_CSP : spaCspForHtml(html);
 }
 
 /**

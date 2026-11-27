@@ -147,6 +147,11 @@ describe("the policy for an app that says what it asks of a host", () => {
     expect(sameCsp(HOSTED_APP_CSP, `${HOSTED_APP_CSP}; worker-src 'self'`)).toBe(false);
     expect(sameCsp(HOSTED_APP_CSP, HOSTED_APP_CSP.replace("frame-src about:", "frame-src about: https:"))).toBe(false);
     expect(sameCsp(HOSTED_APP_CSP, HOSTED_APP_CSP.replace("; object-src 'none'", ""))).toBe(false);
+    // a directive named twice: a browser takes the first, so it is never "the same"
+    expect(sameCsp(`script-src *; ${HOSTED_APP_CSP}`, HOSTED_APP_CSP)).toBe(false);
+    expect(sameCsp(`${HOSTED_APP_CSP}; script-src 'self' 'unsafe-inline'`, HOSTED_APP_CSP)).toBe(false);
+    // only ASCII whitespace separates sources (a no-break space doesn't)
+    expect(sameCsp(HOSTED_APP_CSP.replace("frame-src about:", "frame-src\u00a0about:"), HOSTED_APP_CSP)).toBe(false);
   });
 
   it("reads a declaration only when it is one: contract 1 with a csp", () => {
@@ -157,8 +162,9 @@ describe("the policy for an app that says what it asks of a host", () => {
 
   it("the worker and _headers send Cloud's policy for it, never one read from the bundle", async () => {
     expect(await spaCspFor(NO_INLINE, hosted(APP_ASKS))).toBe(HOSTED_APP_CSP);
-    // a bundle that asks for more still gets Cloud's own (the build refuses it first: below)
-    expect(await spaCspFor(NO_INLINE, hosted(`${APP_ASKS}; script-src *`))).toBe(HOSTED_APP_CSP);
+    // a bundle that asks for anything else (the build refuses it first: below) never gets it at the worker either:
+    // it keeps the hash-locked policy
+    for (const other of [`${APP_ASKS}; worker-src *`, APP_ASKS.replace("frame-src about:", "frame-src *"), ""]) expect(await spaCspFor(NO_INLINE, hosted(other))).toBe(spaContentSecurityPolicy([]));
     // the older app: no declaration, the hash-locked policy as before
     expect(await spaCspFor(FIXTURE, null)).toBe(spaContentSecurityPolicy([THEME_SCRIPT_HASH]));
     expect(await spaCspFor(FIXTURE, NO_INLINE)).toBe(spaContentSecurityPolicy([THEME_SCRIPT_HASH]));
@@ -207,6 +213,6 @@ describe("scripts/gen-spa-headers.ts", () => {
     const r = gen({ "index.html": FIXTURE });
     expect(r.code).toBe(0);
     expect(r.headers).toContain(THEME_SCRIPT_HASH);
-    expect(r.headers).not.toContain("unsafe-inline' 'self'");
+    expect(r.headers).not.toMatch(/script-src[^;]*unsafe-inline/);
   });
 });

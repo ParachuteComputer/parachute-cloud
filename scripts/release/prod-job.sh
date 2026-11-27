@@ -44,6 +44,7 @@ export TMPDIR="${TMPDIR:-$HOME/.cache/parachute-release-tmp}"; export WRANGLER_L
 export PATH="$R:$HOME/.bun/bin:$PATH" CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT" WRANGLER_SEND_METRICS=false WRANGLER_LOG_SANITIZE=true
 export SHIM_LOG="$EVID/keys.log" DEPLOYED_LOG="$EVID/deployed.txt" WANT_SHA="$WANT" DEPLOY_MESSAGE="prod-job: cloud ${WANT:0:7}"
 mkdir -p "$TMPDIR"; : > "$DEPLOYED_LOG"
+unset SPA_SOURCE_FILE APP_REPO   # the pin is this checkout's own file, and the app its sibling: nothing from the caller's environment
 APP="$CLOUD/../$(. "$CLOUD/scripts/spa-source.env"; echo "${SPA_APP_REPO##*/}")"; OPF="${OPERATOR_EMAIL_FILE:?OPERATOR_EMAIL_FILE: a file holding only DEV_USER_EMAIL=<the production operator address>}"; DS="$CLOUD/workers/identity/.dev-secrets"
 T0=$(date +%s)
 trap 'echo "$?" > "$EVID/exit-code.txt"' EXIT   # launch-card.sh runs the job detached: the code is kept here
