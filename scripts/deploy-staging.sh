@@ -64,7 +64,7 @@ bash "$ROOT/scripts/materialize-door-contract.sh"
 # --- SPA bundle — build the Parachute App the identity worker serves via
 # Workers Static Assets INTO workers/identity/dist-assets BEFORE its deploy (the
 # [assets].directory must exist at `wrangler deploy` time). The workflow fetches
-# the exact parachute-app commit in scripts/spa-source.env as a sibling checkout;
+# the exact app commit in scripts/spa-source.env as a sibling checkout;
 # build-spa.sh verifies its version and builds the origin-root shape. Fail before
 # either worker deploys if the browser artifact cannot be reproduced.
 bash "$ROOT/scripts/build-spa.sh"

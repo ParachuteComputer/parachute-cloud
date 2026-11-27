@@ -19,6 +19,7 @@
 import { env } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 import worker from "../src/index.ts";
+import { HOSTED_APP_CSP } from "../src/spa-csp.ts";
 import {
   CEREMONY_PREFIXES,
   DEFENSIVE_PREFIXES,
@@ -205,6 +206,41 @@ describe("the Host-branched root (P1.1)", () => {
     expect(csp).toContain("frame-ancestors 'none'");
     // NOT the strict ceremony policy — the SPA shell is a distinct surface.
     expect(csp).not.toContain("default-src 'none'");
+  });
+
+  test("a bundle that says what it asks of a host (hosted.json) gets Cloud's policy for it on `/`", async () => {
+    // The Parachute app's web build: no inline script in its page, applets in
+    // sealed srcdoc frames. A stand-in bundle through the same worker code.
+    const page = '<!doctype html><div id="root"></div><script type="module" src="/assets/x.js"></script>';
+    const bundle = (files: Record<string, [string, string]>) => ({
+      fetch: async (input: RequestInfo | URL) => {
+        const f = files[new URL(input instanceof Request ? input.url : String(input)).pathname];
+        // a missing file is answered with the page, as not_found_handling does
+        return new Response(f ? f[1] : page, { headers: { "content-type": f ? f[0] : "text/html" } });
+      },
+    }) as unknown as Fetcher;
+    const declared = bundle({ "/index.html": ["text/html", page], "/hosted.json": ["application/json", JSON.stringify({ contract: 1, csp: HOSTED_APP_CSP, spa: ["/"] })] });
+    const res = await worker.fetch(new Request("https://app.example/"), { ...env, ASSETS: declared });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-security-policy")).toBe(HOSTED_APP_CSP);
+    expect(await res.text()).toContain('id="root"');
+    // the same page with no declaration keeps the hash-locked policy: nothing inline is let in by default
+    const bare = await worker.fetch(new Request("https://app.example/"), { ...env, ASSETS: bundle({ "/index.html": ["text/html", page] }) });
+    expect(bare.headers.get("content-security-policy")).toContain("script-src 'self';");
+    expect(bare.headers.get("content-security-policy")).not.toMatch(/script-src[^;]*unsafe-inline/);
+    // nor does a declaration that asks for some other policy, or a bundle whose hosted.json fails once (not kept)
+    const other = bundle({ "/index.html": ["text/html", page], "/hosted.json": ["application/json", JSON.stringify({ contract: 1, csp: "default-src *", spa: ["/"] })] });
+    expect((await worker.fetch(new Request("https://app.example/"), { ...env, ASSETS: other })).headers.get("content-security-policy")).not.toMatch(/script-src[^;]*unsafe-inline/);
+    let calls = 0;
+    const flaky = { fetch: async (input: RequestInfo | URL) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path === "/hosted.json" && calls++ === 0) return new Response("upstream", { status: 503 });
+      return path === "/hosted.json" ? new Response(JSON.stringify({ contract: 1, csp: HOSTED_APP_CSP, spa: ["/"] }), { headers: { "content-type": "application/json" } }) : new Response(page, { headers: { "content-type": "text/html" } });
+    } } as unknown as Fetcher;
+    const first = await worker.fetch(new Request("https://app.example/"), { ...env, ASSETS: flaky });
+    expect(first.headers.get("content-security-policy")).not.toMatch(/script-src[^;]*unsafe-inline/);
+    const second = await worker.fetch(new Request("https://app.example/"), { ...env, ASSETS: flaky });
+    expect(second.headers.get("content-security-policy")).toBe(HOSTED_APP_CSP);
   });
 
   test("the console-host redirect (`/`) carries NO SPA CSP — it's not the shell", async () => {
