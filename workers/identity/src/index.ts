@@ -126,7 +126,7 @@ import { handlePromoRedeemPost } from "./promo.ts";
 import { handleAccountMcp, accountMcpProtectedResource } from "./account-mcp-http.ts";
 import { handleVaultConnectionDelete, handleVaultConnectionsList } from "./oauth-connections.ts";
 import { anyOriginPreflight, routeVaultGrants } from "./vault-grants.ts";
-import { spaCspForHtml } from "./spa-csp.ts";
+import { spaCspFor } from "./spa-csp.ts";
 
 // The rate-limiter DO class (#30) — the runtime resolves it from this module
 // (wrangler.toml [[durable_objects.bindings]] class_name = "RateLimiterDO").
@@ -818,19 +818,42 @@ app.all("/mcp/*", (c) => vaultOrBackstop(c, mcpRouteMissing));
  * worker hands back the shell itself. Because it is WORKER-served, the
  * `dist-assets/_headers` CSP (which Cloudflare applies to asset-served responses)
  * cannot be relied on to reach it — so the worker stamps the SAME policy here,
- * derived from the shell's own bytes ({@link spaCspForHtml}) so the inline-script
- * hash always matches what's served. `set` overrides any CSP `_headers` may have
+ * ({@link spaCspFor}): for the older app derived from the shell's own bytes, so the
+ * inline-script hash always matches what's served; for an app that says what it asks
+ * of a host, Cloud's policy for it. `set` overrides any CSP `_headers` may have
  * added through the binding, so the two never conflict.
  *
  * If the ASSETS binding is absent (a bare or unit-test config with no [assets]),
  * fall back to the legacy console redirect so `/` is never a hard error.
  */
+/**
+ * The bundle's `hosted.json`, when the pinned app has one (the Parachute app's
+ * web build says there what it asks of a host; the older app has none). Read
+ * from Static Assets once per isolate (kept by the binding): a bundle never
+ * changes under a deployed worker. A missing file comes back as the app's page (`not_found_handling`),
+ * so only a JSON answer counts.
+ */
+const hostedJsonKept = new WeakMap<object, string | null>();
+async function hostedDeclaration(env: Env, req: Request): Promise<string | null> {
+  if (!env.ASSETS) return null;
+  const kept = hostedJsonKept.get(env.ASSETS);
+  if (kept !== undefined) return kept;
+  try {
+    const r = await env.ASSETS.fetch(new URL("/hosted.json", req.url));
+    const found = r.ok && /json/i.test(r.headers.get("content-type") ?? "") ? await r.text() : null;
+    hostedJsonKept.set(env.ASSETS, found);
+    return found;
+  } catch {
+    return null; // not kept: the next request asks again
+  }
+}
+
 async function serveSpaShell(env: Env, req: Request): Promise<Response> {
   if (!env.ASSETS) return new Response(null, { status: 302, headers: { location: "/console" } });
   const asset = await env.ASSETS.fetch(new URL("/index.html", req.url));
   const html = await asset.text();
   const res = new Response(html, asset); // preserves status + content-type from the asset
-  res.headers.set("content-security-policy", await spaCspForHtml(html));
+  res.headers.set("content-security-policy", await spaCspFor(html, await hostedDeclaration(env, req)));
   // We re-emit the shell as a fresh (uncompressed) body, so drop any length/
   // encoding the asset response carried — a stale content-length would truncate
   // and a copied content-encoding would mislabel the now-plain body.

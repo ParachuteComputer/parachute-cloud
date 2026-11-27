@@ -44,7 +44,7 @@ export TMPDIR="${TMPDIR:-$HOME/.cache/parachute-release-tmp}"; export WRANGLER_L
 export PATH="$R:$HOME/.bun/bin:$PATH" CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT" WRANGLER_SEND_METRICS=false WRANGLER_LOG_SANITIZE=true
 export SHIM_LOG="$EVID/keys.log" DEPLOYED_LOG="$EVID/deployed.txt" WANT_SHA="$WANT" DEPLOY_MESSAGE="prod-job: cloud ${WANT:0:7}"
 mkdir -p "$TMPDIR"; : > "$DEPLOYED_LOG"
-APP="$CLOUD/../parachute-app"; OPF="${OPERATOR_EMAIL_FILE:?OPERATOR_EMAIL_FILE: a file holding only DEV_USER_EMAIL=<the production operator address>}"; DS="$CLOUD/workers/identity/.dev-secrets"
+APP="$CLOUD/../$(. "$CLOUD/scripts/spa-source.env"; echo "${SPA_APP_REPO##*/}")"; OPF="${OPERATOR_EMAIL_FILE:?OPERATOR_EMAIL_FILE: a file holding only DEV_USER_EMAIL=<the production operator address>}"; DS="$CLOUD/workers/identity/.dev-secrets"
 T0=$(date +%s)
 trap 'echo "$?" > "$EVID/exit-code.txt"' EXIT   # launch-card.sh runs the job detached: the code is kept here
 step() { echo "== $(date -u +%H:%M:%S) +$(( $(date +%s) - T0 ))s $*" | tee -a "$EVID/log.txt"; }
@@ -75,7 +75,8 @@ HUB_WANT="$(. "$CLOUD/scripts/door-contract-source.env"; echo "$DOOR_CONTRACT_HU
 SPA_REF="$(. "$CLOUD/scripts/spa-source.env"; echo "$SPA_APP_REF")"; SPA_WANT="$(. "$CLOUD/scripts/spa-source.env"; echo "$SPA_APP_VERSION")"
 [ "$(git -C "$APP" rev-parse HEAD)" = "$SPA_REF" ] || refuse "app checkout is not the SPA pin"
 [ -z "$(git -C "$APP" status --porcelain | grep -v '^ M meta.json$')" ] || refuse "app checkout has changes beyond meta.json"
-git -C "$APP" checkout -- meta.json   # the app build rewrites it; build-spa.sh would refuse the checkout
+# the older app's build rewrites its meta.json; build-spa.sh would refuse the checkout (the Parachute app has no such file)
+if git -C "$APP" ls-files --error-unmatch meta.json >/dev/null 2>&1; then git -C "$APP" checkout -- meta.json; fi
 git -C "$CLOUD" cat-file -e "$PROD_LIVE^{commit}" 2>/dev/null || refuse "PROD_LIVE $PROD_LIVE is no commit this checkout has"
 bash "$R/check-triggers.sh" "$CLOUD" "$PROD_LIVE" "$WANT" > "$EVID/check-triggers.txt" || refuse "routes/crons/DO migrations changed since $PROD_LIVE"
 # Staging proved this code: every suite passed on a deploy of a commit whose difference from this one is only the

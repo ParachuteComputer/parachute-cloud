@@ -186,12 +186,12 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Fetch pinned parachute-app (source-boundary regression fixture)
+      - name: Fetch the pinned app (source-boundary regression fixture)
         run: |
           source scripts/spa-source.env
-          APP_REPO="$GITHUB_WORKSPACE/../parachute-app"
+          APP_REPO="$GITHUB_WORKSPACE/../${SPA_APP_REPO##*/}"
           git init "$APP_REPO"
-          git -C "$APP_REPO" remote add origin https://github.com/ParachuteComputer/parachute-app.git
+          git -C "$APP_REPO" remote add origin "https://github.com/$SPA_APP_REPO.git"
           git -C "$APP_REPO" fetch --depth 1 origin "$SPA_APP_REF"
           git -C "$APP_REPO" checkout --detach FETCH_HEAD
           test "$(git -C "$APP_REPO" rev-parse HEAD)" = "$SPA_APP_REF"

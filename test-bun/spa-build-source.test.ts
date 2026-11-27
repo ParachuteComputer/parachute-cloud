@@ -6,7 +6,9 @@ import { resolve } from "node:path";
 const root = resolve(import.meta.dir, "..");
 const read = (path: string) => readFileSync(resolve(root, path), "utf8");
 const hubRepo = resolve(root, "../parachute-hub");
-const appRepo = resolve(root, "../parachute-app");
+const appRepoName = read("scripts/spa-source.env").match(/^SPA_APP_REPO="([\w.-]+\/[\w.-]+)"$/m)?.[1];
+if (!appRepoName) throw new Error("scripts/spa-source.env names no App repository");
+const appRepo = resolve(root, "..", appRepoName.split("/")[1] as string);
 const appRef = read("scripts/spa-source.env").match(/SPA_APP_REF="([0-9a-f]{40})"/)?.[1];
 if (!appRef) throw new Error("scripts/spa-source.env has no valid App ref");
 const doorContractHelper = resolve(root, "scripts/materialize-door-contract.sh");
@@ -56,12 +58,16 @@ describe("served SPA source", () => {
     // The version moves with every pin bump; the shape (and build-spa.sh's check of it) is the contract.
     expect(sourcePin).toMatch(/SPA_APP_VERSION="\d+\.\d+\.\d+(-rc\.\d+)?"/);
     expect(sourcePin).toMatch(/SPA_APP_REF="[0-9a-f]{40}"/);
-    expect(script).toContain('source "$ROOT/scripts/spa-source.env"');
+    // the pin says which repository and package it is: one of the two Cloud can serve
+    expect(sourcePin).toMatch(/^SPA_APP_REPO="ParachuteComputer\/(?:parachute-app|parachute)"$/m);
+    expect(sourcePin).toMatch(/^SPA_APP_NAME="(?:@openparachute\/app|parachute)"$/m);
+    expect(script).toContain('source "${SPA_SOURCE_FILE:-$ROOT/scripts/spa-source.env}"');
     expect(script).toContain("SPA_APP_REF");
     expect(script).toContain("git rev-parse HEAD");
     expect(script).toContain("APP_REPO");
-    expect(script).toContain("@openparachute/app");
+    expect(script).toContain('"$ACTUAL_NAME" != "$SPA_APP_NAME"');
     expect(script).toContain('VITE_BASE_PATH="/" bun run build');
+    expect(script).toContain("npm ci");
     expect(script).not.toContain("@openparachute/notes-ui");
     expect(script).not.toContain("SURFACE_REPO");
     // Pages-era artifacts must be stripped post-copy: wrangler hard-rejects the
@@ -95,6 +101,50 @@ describe("served SPA source", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr.toString()).toContain("tracked or untracked local modifications");
   });
+
+  // The Parachute app's web build, as the pin will name it: a package built with
+  // npm that says what it asks of a host. A made-up package stands in for it here
+  // (no network: it has no dependencies), through the real script.
+  function madeUpNpmApp(csp: string, name = "parachute") {
+    const temp = mkdtempSync(resolve(tmpdir(), "parachute-cloud-npm-app-"));
+    tempDirs.push(temp);
+    const app = resolve(temp, "parachute");
+    mkdirSync(app, { recursive: true });
+    const build = `const fs=require("fs");fs.mkdirSync("dist",{recursive:true});fs.writeFileSync("dist/index.html",'<!doctype html><div id="root"></div><script type="module" src="/assets/x.js"></script>');fs.writeFileSync("dist/hosted.json",JSON.stringify({contract:1,csp:${JSON.stringify(csp)},spa:["/"]}));`;
+    writeFileSync(resolve(app, "build.cjs"), build);
+    writeFileSync(resolve(app, ".gitignore"), "dist/\nnode_modules/\n");
+    writeFileSync(resolve(app, "package.json"), JSON.stringify({ name, version: "0.1.0", private: true, scripts: { build: "node build.cjs" } }));
+    writeFileSync(resolve(app, "package-lock.json"), JSON.stringify({ name, version: "0.1.0", lockfileVersion: 3, requires: true, packages: { "": { name, version: "0.1.0" } } }));
+    const git = (...a: string[]) => { const r = Bun.spawnSync(["git", "-C", app, "-c", "user.name=t", "-c", "user.email=t@example.com", ...a], { stdout: "pipe", stderr: "pipe" }); expect(r.exitCode, r.stderr.toString()).toBe(0); return r.stdout.toString().trim(); };
+    git("init", "-q"); git("add", "-A"); git("commit", "-q", "-m", "a made-up app");
+    const pin = resolve(temp, "spa-source.env");
+    writeFileSync(pin, `SPA_APP_REPO="ParachuteComputer/parachute"\nSPA_APP_NAME="parachute"\nSPA_APP_VERSION="0.1.0"\nSPA_APP_REF="${git("rev-parse", "HEAD")}"\n`);
+    const dest = resolve(temp, "dist-assets");
+    const run = () => Bun.spawnSync(["bash", resolve(root, "scripts/build-spa.sh")], { cwd: root, env: { ...process.env, APP_REPO: app, SPA_DEST: dest, SPA_SOURCE_FILE: pin }, stdout: "pipe", stderr: "pipe" });
+    return { dest, run };
+  }
+  const HOSTED_ASKS = "default-src 'self'; connect-src 'self' https: wss:; img-src 'self' data: blob: https:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; font-src 'self' data:; frame-src about:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
+
+  test("builds an npm app that says what it asks of a host, and sends Cloud's policy for it", () => {
+    const { dest, run } = madeUpNpmApp(HOSTED_ASKS);
+    const result = run();
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(existsSync(resolve(dest, "index.html"))).toBe(true);
+    const headers = readFileSync(resolve(dest, "_headers"), "utf8");
+    expect(headers).toContain("script-src 'self' 'unsafe-inline'");
+    expect(headers).toContain("frame-src about:");
+  }, 120_000);
+
+  test("refuses an npm app that asks for a policy Cloud hasn't reviewed, and a package that isn't the pin's", () => {
+    const wider = madeUpNpmApp(HOSTED_ASKS.replace("frame-src about:", "frame-src *"));
+    const refused = wider.run();
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr.toString()).toContain("asks for a policy Cloud hasn't reviewed");
+    const other = madeUpNpmApp(HOSTED_ASKS, "not-parachute");
+    const named = other.run();
+    expect(named.exitCode).not.toBe(0);
+    expect(named.stderr.toString()).toContain("expected parachute at");
+  }, 120_000);
 
   test("materializes and verifies the pinned shared door contract", () => {
     const script = read("scripts/materialize-door-contract.sh");
@@ -151,8 +201,10 @@ describe("served SPA source", () => {
     test(`${workflow} checks out Parachute App for the asset build`, () => {
       const source = read(`.github/workflows/${workflow}`);
 
-      expect(source).toContain("ParachuteComputer/parachute-app.git");
-      expect(source).toContain("../parachute-app");
+      // the checkout follows the pin: its repository, in a sibling directory of that name
+      expect(source).toContain('"https://github.com/$SPA_APP_REPO.git"');
+      expect(source).toContain('APP_REPO="$GITHUB_WORKSPACE/../${SPA_APP_REPO##*/}"');
+      expect(source).not.toContain("parachute-app.git");
       expect(source).not.toContain("ParachuteComputer/parachute-surface.git");
       expect(source).not.toContain("SPA_ALLOW_VERSION_DRIFT");
     });

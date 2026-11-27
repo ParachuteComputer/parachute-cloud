@@ -1,32 +1,35 @@
 #!/usr/bin/env bash
 #
-# Build the Parachute App bundle served by the Cloud identity worker through
-# Workers Static Assets. The identity worker owns the Cloud/account/OAuth
-# ceremonies and serves this browser application on app.parachute.computer;
-# Vault data remains in the separate vault worker at u.parachute.computer.
+# Build the app bundle served by the Cloud identity worker through Workers
+# Static Assets. The identity worker owns the Cloud/account/OAuth ceremonies and
+# serves this browser application on my.parachute.computer; Vault data remains
+# in the separate vault worker.
 #
-# The App source is pinned in spa-source.env. Deployment workflows fetch that
-# exact commit into a sibling checkout, and this script verifies its package
-# version before building. This keeps the frontend embedded in any Cloud release
-# reproducible instead of silently following another repository's main branch.
+# The app source is pinned in spa-source.env: its repository, package name,
+# version and commit. Deployment workflows fetch that exact commit into a
+# sibling checkout named after the repository, and this script verifies the
+# package and version before building. This keeps the frontend embedded in any
+# Cloud release reproducible instead of silently following another repository's
+# branch. Which app it is, is the pin's to say: the older hosted app
+# (parachute-app, bun) or the Parachute app's web build (parachute, npm).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=spa-source.env
-source "$ROOT/scripts/spa-source.env"
+source "${SPA_SOURCE_FILE:-$ROOT/scripts/spa-source.env}"
 
 DEST="${SPA_DEST:-$ROOT/workers/identity/dist-assets}"
-APP_REPO="${APP_REPO:-$ROOT/../parachute-app}"
+APP_REPO="${APP_REPO:-$ROOT/../${SPA_APP_REPO##*/}}"
 
 if [[ ! -f "$APP_REPO/package.json" ]]; then
-  echo "build-spa: parachute-app checkout not found at $APP_REPO" >&2
-  echo "           set APP_REPO=/path/to/parachute-app (a sibling checkout)." >&2
+  echo "build-spa: ${SPA_APP_REPO##*/} checkout not found at $APP_REPO" >&2
+  echo "           set APP_REPO=/path/to/${SPA_APP_REPO##*/} (a sibling checkout of $SPA_APP_REPO)." >&2
   exit 1
 fi
 
 ACTUAL_NAME="$(cd "$APP_REPO" && node -p "require('./package.json').name" 2>/dev/null || true)"
-if [[ "$ACTUAL_NAME" != "@openparachute/app" ]]; then
-  echo "build-spa: expected @openparachute/app at $APP_REPO, found ${ACTUAL_NAME:-<unknown>}." >&2
+if [[ "$ACTUAL_NAME" != "$SPA_APP_NAME" ]]; then
+  echo "build-spa: expected $SPA_APP_NAME at $APP_REPO, found ${ACTUAL_NAME:-<unknown>}." >&2
   exit 1
 fi
 
@@ -47,13 +50,26 @@ if [[ -n "$(cd "$APP_REPO" && git status --porcelain)" ]]; then
   exit 1
 fi
 
-# The App is root-hosted by default, but keep the explicit build signal because
-# deep links and /oauth/callback require absolute /assets/... references and a
-# root React Router basename.
-echo "build-spa: building @openparachute/app v$ACTUAL_VERSION ($SPA_APP_REF) at origin root…"
+# Both apps are root-hosted: deep links and /oauth/callback require absolute
+# /assets/... references and a root router basename. The checkout's own lockfile
+# says how it is built: bun.lock (the older app, with its explicit root signal)
+# or package-lock.json (the Parachute app, whose web build is root-based).
+echo "build-spa: building $SPA_APP_NAME v$ACTUAL_VERSION ($SPA_APP_REF) at origin root…"
 cd "$APP_REPO"
-bun install --frozen-lockfile
-VITE_BASE_PATH="/" bun run build
+if [[ -f bun.lock || -f bun.lockb ]]; then
+  bun install --frozen-lockfile
+  VITE_BASE_PATH="/" bun run build
+elif [[ -f package-lock.json ]]; then
+  npm ci --no-audit --no-fund
+  npm run build
+else
+  echo "build-spa: $APP_REPO has no lockfile (bun.lock or package-lock.json); refusing a build that isn't pinned." >&2
+  exit 1
+fi
+if [[ ! -f "$APP_REPO/dist/index.html" ]]; then
+  echo "build-spa: the build left no dist/index.html in $APP_REPO." >&2
+  exit 1
+fi
 
 rm -rf "$DEST"
 mkdir -p "$DEST"
@@ -66,7 +82,9 @@ cp -R "$APP_REPO/dist/." "$DEST/"
 rm -f "$DEST/CNAME" "$DEST/_redirects"
 
 # Static Assets bypasses the identity worker's server-rendered HTML helper, so
-# emit the SPA-specific CSP from the actual index.html theme script hash.
+# emit the SPA-specific CSP: for the older app from the actual index.html theme
+# script hash; for an app that says what it asks of a host (dist/hosted.json),
+# Cloud's policy for it, refused unless it is exactly what that build asks.
 echo "build-spa: emitting dist-assets/_headers (SPA Content-Security-Policy)…"
 bun "$ROOT/scripts/gen-spa-headers.ts" "$DEST"
 

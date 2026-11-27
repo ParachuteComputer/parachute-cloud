@@ -10,12 +10,17 @@
  * derived at build time (never hardcoded), so this fixture pins the EXTRACTION +
  * HASH machinery, not the moving app version.
  */
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import {
+  HOSTED_APP_CSP,
   SPA_CONNECT_SRC,
   extractInlineScripts,
+  hostedCspAsked,
+  sameCsp,
+  spaCspFor,
   inlineScriptHashes,
   renderSpaHeadersFile,
   sha256Base64,
@@ -110,5 +115,98 @@ describe("renderSpaHeadersFile — the _headers body (P1.1.5)", () => {
     // that start with `/`; comment lines start with `#`.)
     const ruleLines = headers.split("\n").filter((l) => l.startsWith("/"));
     expect(ruleLines).toEqual(["/*"]);
+  });
+});
+
+// --- An app that says what it asks of a host (the Parachute app's web build) ---
+
+// What ParachuteComputer/parachute's build writes into dist/hosted.json (its
+// src/shell/hostedPolicy.ts): copied here as that build printed it, so a change
+// on either side shows as a failure, not as a silent new policy.
+const APP_ASKS =
+  "default-src 'self'; connect-src 'self' https: wss:; img-src 'self' data: blob: https:; media-src 'self' data: blob:; " +
+  "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; font-src 'self' data:; frame-src about:; " +
+  "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
+const hosted = (csp: string, extra: Record<string, unknown> = {}) => JSON.stringify({ contract: 1, csp, spa: ["/"], ...extra });
+const NO_INLINE = '<!doctype html><html><body><div id="root"></div><script type="module" src="/assets/index-abc.js"></script></body></html>';
+
+describe("the policy for an app that says what it asks of a host", () => {
+  it("is exactly what the Parachute app's build asks, and nothing wider", () => {
+    expect(sameCsp(HOSTED_APP_CSP, APP_ASKS)).toBe(true);
+    // applet frames are srcdoc documents with inline code that inherit the page's
+    // policy: inline script stays, and frames can be about: documents only
+    expect(HOSTED_APP_CSP).toContain("script-src 'self' 'unsafe-inline'");
+    expect(HOSTED_APP_CSP).toContain("frame-src about:");
+    expect(HOSTED_APP_CSP).not.toContain("unsafe-eval");
+    expect(HOSTED_APP_CSP).not.toMatch(/script-src[^;]*(?:https?:|\*|data:|blob:)/);
+    for (const d of ["default-src 'self'", "frame-ancestors 'none'", "base-uri 'self'", "form-action 'self'", "object-src 'none'"]) expect(HOSTED_APP_CSP).toContain(d);
+  });
+
+  it("sameCsp compares directives and sources in any order, and tells any difference", () => {
+    expect(sameCsp("a 'self' x:; b y:", "b y: ; a x: 'self'")).toBe(true);
+    expect(sameCsp(HOSTED_APP_CSP, `${HOSTED_APP_CSP}; worker-src 'self'`)).toBe(false);
+    expect(sameCsp(HOSTED_APP_CSP, HOSTED_APP_CSP.replace("frame-src about:", "frame-src about: https:"))).toBe(false);
+    expect(sameCsp(HOSTED_APP_CSP, HOSTED_APP_CSP.replace("; object-src 'none'", ""))).toBe(false);
+  });
+
+  it("reads a declaration only when it is one: contract 1 with a csp", () => {
+    expect(hostedCspAsked(hosted(APP_ASKS))).toBe(APP_ASKS);
+    // a missing hosted.json comes back from Static Assets as the app's page
+    for (const not of [null, "", NO_INLINE, "{}", JSON.stringify({ contract: 2, csp: APP_ASKS }), JSON.stringify({ contract: 1, csp: 7 }), "[1]"]) expect(hostedCspAsked(not)).toBeNull();
+  });
+
+  it("the worker and _headers send Cloud's policy for it, never one read from the bundle", async () => {
+    expect(await spaCspFor(NO_INLINE, hosted(APP_ASKS))).toBe(HOSTED_APP_CSP);
+    // a bundle that asks for more still gets Cloud's own (the build refuses it first: below)
+    expect(await spaCspFor(NO_INLINE, hosted(`${APP_ASKS}; script-src *`))).toBe(HOSTED_APP_CSP);
+    // the older app: no declaration, the hash-locked policy as before
+    expect(await spaCspFor(FIXTURE, null)).toBe(spaContentSecurityPolicy([THEME_SCRIPT_HASH]));
+    expect(await spaCspFor(FIXTURE, NO_INLINE)).toBe(spaContentSecurityPolicy([THEME_SCRIPT_HASH]));
+    const headers = await renderSpaHeadersFile(NO_INLINE, hosted(APP_ASKS));
+    expect(headers).toContain(`/*\n  Content-Security-Policy: ${HOSTED_APP_CSP}\n`);
+    expect(headers.split("\n").filter((l) => l.startsWith("/"))).toEqual(["/*"]);
+  });
+});
+
+describe("scripts/gen-spa-headers.ts", () => {
+  const dirs: string[] = [];
+  afterAll(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
+  const gen = (files: Record<string, string>) => {
+    const dir = mkdtempSync(join(tmpdir(), "parachute-cloud-spa-headers-"));
+    dirs.push(dir);
+    for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
+    const r = Bun.spawnSync(["bun", join(import.meta.dir, "../scripts/gen-spa-headers.ts"), dir], { stdout: "pipe", stderr: "pipe" });
+    let headers: string | null = null;
+    try { headers = readFileSync(join(dir, "_headers"), "utf8"); } catch { /* none written */ }
+    return { code: r.exitCode, err: r.stderr.toString(), headers };
+  };
+
+  it("writes Cloud's policy for a build that asks for exactly it", () => {
+    const r = gen({ "index.html": NO_INLINE, "hosted.json": hosted(APP_ASKS) });
+    expect(r.code).toBe(0);
+    expect(r.headers).toContain(HOSTED_APP_CSP);
+  });
+
+  it("refuses a build that asks for a policy Cloud hasn't reviewed, and says both", () => {
+    const wider = APP_ASKS.replace("frame-src about:", "frame-src about: https:");
+    const r = gen({ "index.html": NO_INLINE, "hosted.json": hosted(wider) });
+    expect(r.code).not.toBe(0);
+    expect(r.headers).toBeNull();
+    expect(r.err).toContain("asks for a policy Cloud hasn't reviewed");
+    expect(r.err).toContain("frame-src about: https:");
+  });
+
+  it("refuses a hosted.json it can't read as a declaration, and a page with neither a declaration nor an inline script", () => {
+    expect(gen({ "index.html": NO_INLINE, "hosted.json": "{}" }).code).not.toBe(0);
+    const bare = gen({ "index.html": NO_INLINE });
+    expect(bare.code).not.toBe(0);
+    expect(bare.err).toContain("no inline <script>");
+  });
+
+  it("the older app: the hash-locked policy from its own page, as before", () => {
+    const r = gen({ "index.html": FIXTURE });
+    expect(r.code).toBe(0);
+    expect(r.headers).toContain(THEME_SCRIPT_HASH);
+    expect(r.headers).not.toContain("unsafe-inline' 'self'");
   });
 });
