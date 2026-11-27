@@ -706,7 +706,7 @@ describe("MCP — docs for this version (T-476)", () => {
     const token = await mintToken({ vault: v, scopes: `vault:${v}:write` });
     const body = await call(v, token, "vault-info", { description: "Films and books" });
     const r = refused(body, "insufficient_scope");
-    expect(r.hint).toBe("The person grants it: they connect this AI again and leave the level it needs ticked on Parachute's approval page (for a script, a key made with that level).");
+    expect(r.hint).toBe("Only the person can grant it: they remove this AI in their AI app and add it back, then tick admin on Parachute's approval page (it starts unticked, under \"Grant additional access\"); a reconnect that shows no such page keeps the old level. For a script: a key made with that level.");
     expect(r.docs).toBe("http://127.0.0.1:9/docs/v/0.9/fix/needs-admin/#what-the-refusal-says");
     expect(JSON.parse(body.result.content[0].text)).toEqual(body.result.structuredContent);
     const page = await call(v, token, "docs", { topic: r.docs });
