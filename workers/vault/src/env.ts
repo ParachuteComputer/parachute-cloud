@@ -24,6 +24,13 @@ export interface Env {
   AI?: Ai;
 
   /**
+   * Where the `docs` MCP tool reads Parachute's docs (T-476, src/docs.ts): an http(s) base URL, or `off`. Unset:
+   * https://parachute.computer. A personal door may point it at its owner's copy of the site; the tests point it at a
+   * closed local port so nothing reaches the network.
+   */
+  PARACHUTE_DOCS_URL?: string;
+
+  /**
    * Semantic-search off switch (C2, EXPERIMENTAL). Explicit `"true"`/`"false"`
    * string in wrangler `[vars]` (declared in BOTH blocks, not left unset —
    * unlike self-host's unset-means-on default, cloud states the toggle

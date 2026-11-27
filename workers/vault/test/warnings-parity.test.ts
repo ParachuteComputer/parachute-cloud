@@ -157,7 +157,10 @@ describe("B6 REST warnings parity", () => {
     ] as const) {
       const rest = decodeWarnings(await f.get(query));
       const other = await mcp(f.vault, args);
-      expect(rest.filter(w => w.code === code)).toEqual(other.warnings.filter((w: any) => w.code === code));
+      // T-476: an MCP warning with a fix page also names it (`docs`, the MCP door's link for the AI); the rest agrees.
+      const mcpSide = other.warnings.filter((w: any) => w.code === code);
+      if (code === "unknown_tag") for (const w of mcpSide) expect(w.docs).toMatch(/\/fix\/unknown-type\/#no-type-by-that-name$/);
+      expect(rest.filter(w => w.code === code)).toEqual(mcpSide.map(({ docs: _link, ...w }: any) => w));
     }
   });
   it("P17 warnings preserve assembly order", async () => {

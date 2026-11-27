@@ -61,6 +61,7 @@ import {
 } from "./caps.js";
 import { MAX_UPLOAD_BYTES, BLOCKED_EXTENSIONS, MIME_TYPES, extLower } from "./rest/storage-constants.js";
 import { CLOUD_HYBRID_AUTO_DEFAULT, handleMcp } from "./mcp.js";
+import { cloudDocs } from "./docs.js";
 import { HealthSink, NameCounts, clientOf, errorClass, responseOutcome, routeOf, utcDay, versionLabel } from "./health.js";
 import { restRouteName, typesRouteName } from "@openparachute/core/src/name-routes.js";
 import { logServerError } from "./error-log.js";
@@ -1333,6 +1334,7 @@ export class VaultDO extends DurableObject {
         (subject, outcome) => this.health.record(subject, outcome),
         (tool, err) => logServerError("mcp_tool_error", err, { ...this.logFields, tool }),
         (name, kind) => void this.countNameUse(name, kind, request, mauth),
+        cloudDocs(this.env),
       );
     }
 

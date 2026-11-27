@@ -168,6 +168,9 @@ describe("door/0.9: a reader and attachment-url upload", () => {
     expect(up.ok).toBe(false);
     expect(JSON.stringify(up.out)).toContain("Forbidden");
     expect(JSON.stringify(up.out)).not.toContain("attachments_not_included");
+    // T-476: its hint is a writer's step, not the engine's admin step (which a bare insufficient_scope would get)
+    expect(JSON.stringify(up.out)).toContain("read and write");
+    expect(JSON.stringify(up.out)).not.toContain("tick admin");
   });
 });
 
