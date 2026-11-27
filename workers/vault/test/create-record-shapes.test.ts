@@ -42,8 +42,7 @@ describe("create-record with a wrongly shaped argument (T-476)", () => {
     const r = refused(body, "invalid_query");
     expect(r.field).toBe("links.0.relationship");
     // Before the fix the record was written and then the link crashed.
-    const read = await f.call("query-records", { id: "Notes/Garden" });
-    expect(read.result.isError).toBe(true);
+    refused(await f.call("query-records", { id: "Notes/Garden" }), "not_found");
     const c = await f.counters();
     expect(Object.keys(c).filter((k) => k.includes("exception:"))).toEqual([]);
     expect(c["mcp:create-record|ok"]).toBe(1);
@@ -52,16 +51,19 @@ describe("create-record with a wrongly shaped argument (T-476)", () => {
   it("the other shapes that crashed are refused too", async () => {
     const f = await fixture();
     await f.call("create-record", { path: "People/Ada", body: "Ada" });
-    const shapes: Record<string, unknown>[] = [
-      { path: 5, body: "x" },
-      { path: "A", body: ["x"] },
-      { path: "A", tags: [null] },
-      { path: "A", links: ["People/Ada"] },
-      { path: "A", links: [{ target: 5, relationship: "r" }] },
-      { records: { path: "A" } },
-      { records: [{ path: "A" }, null] },
+    // Each its own path: on the old engine a crash that had already written a shared path turned the next shape
+    // into a path_conflict, so it proved nothing.
+    const shapes: [Record<string, unknown>, string][] = [
+      [{ path: 5, body: "x" }, "path"],
+      [{ path: "S/body", body: ["x"] }, "body"],
+      [{ path: "S/tags", tags: [null] }, "tags"],
+      [{ path: "S/links", links: ["People/Ada"] }, "links.0"],
+      [{ path: "S/target", links: [{ target: 5, relationship: "r" }] }, "links.0.target"],
+      [{ records: { path: "S/records" } }, "records"],
+      [{ records: [{ path: "S/item" }, null] }, "records"],
     ];
-    for (const args of shapes) refused(await f.call("create-record", args), "invalid_query");
+    for (const [args, field] of shapes) expect(refused(await f.call("create-record", args), "invalid_query").field, JSON.stringify(args)).toBe(field);
+    for (const id of ["S/body", "S/tags", "S/links", "S/target", "S/records", "S/item"]) refused(await f.call("query-records", { id }), "not_found");
     const c = await f.counters();
     expect(Object.keys(c).filter((k) => k.includes("exception:"))).toEqual([]);
   });

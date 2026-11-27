@@ -70,8 +70,9 @@ describe("MCP tool crash → one server-side log line", () => {
     const marker = `MARKER-${crypto.randomUUID()}`;
     await createNote(v, { content: "x", path: `p/${marker}` });
     capture = captureLogs();
-    // update-note with `metadata: null`: the engine merges it and throws a real TypeError. (create-note's `tags` as an
-    // object did until T-476: the engine now refuses wrong create shapes before writing; this one is core's next.)
+    // update-note with `metadata: null`: the engine merges it and throws a real TypeError (parachute-core #175; pick
+    // another real crash when that is fixed). create-note's `tags` as an object did until core #173, which refuses
+    // wrong create shapes before writing.
     const res = await call(v, "update-note", { id: `p/${marker}`, content: `secret ${marker}`, metadata: null, force: true });
     expect(res.status).toBe(200);
     // A crash is answered `internal_error` (one way to refuse, T-476), as a box answers it.
