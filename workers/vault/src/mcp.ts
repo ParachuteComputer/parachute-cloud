@@ -673,7 +673,10 @@ async function handleToolCall(
   const writeAllowed = tools.some((t) => t.name === ATTACHMENT_UPLOAD_MINT_TOOL);
   if (name === "attachment-url" && args.action === "upload" && !writeAllowed) {
     await record(subject, refusalOutcome("insufficient_scope"));
-    return result(id, refusalResult(refusal("insufficient_scope", "Forbidden: attachment-url {action: \"upload\"} needs write on this vault.")));
+    // Its own hint (T-476): a bare insufficient_scope gets the engine's admin step, and this one needs write, not admin.
+    return result(id, refusalResult(refusal("insufficient_scope", "Forbidden: attachment-url {action: \"upload\"} needs write on this vault.", {
+      hint: "This connection can only read. The person connects this AI again with read and write (the default on Parachute's approval page).",
+    })));
   }
   const gate = writeGateFor(name, args);
   if (gate === "attachments") {
