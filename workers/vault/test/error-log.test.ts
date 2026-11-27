@@ -68,9 +68,11 @@ describe("MCP tool crash → one server-side log line", () => {
   it("a tool that throws a TypeError logs exactly one mcp_tool_error line with the tool and class, and nothing the caller sent", async () => {
     const v = freshVault("elog");
     const marker = `MARKER-${crypto.randomUUID()}`;
+    await createNote(v, { content: "x", path: `p/${marker}` });
     capture = captureLogs();
-    // `tags` as an object: the engine iterates it and throws a real TypeError.
-    const res = await call(v, "create-note", { content: `secret ${marker}`, path: `p/${marker}`, tags: { [marker]: 1 } });
+    // update-note with `metadata: null`: the engine merges it and throws a real TypeError. (create-note's `tags` as an
+    // object did until T-476: the engine now refuses wrong create shapes before writing; this one is core's next.)
+    const res = await call(v, "update-note", { id: `p/${marker}`, content: `secret ${marker}`, metadata: null, force: true });
     expect(res.status).toBe(200);
     // A crash is answered `internal_error` (one way to refuse, T-476), as a box answers it.
     refused(await res.json(), "internal_error");
@@ -78,9 +80,9 @@ describe("MCP tool crash → one server-side log line", () => {
     const lines = capture.lines.filter((l) => l.includes("event=mcp_tool_error"));
     expect(lines, capture.lines.join("\n")).toHaveLength(1);
     const line = lines[0]!;
-    expect(line).toContain("tool=create-note");
+    expect(line).toContain("tool=update-note");
     expect(line).toContain("class=TypeError");
-    expect(line).toMatch(/ msg="[^"]*not iterable[^"]*"/);
+    expect(line).toMatch(/ msg="[^"]*null[^"]*"/);
     expect(line).toMatch(/ stack="at [^"]+"/);
     expect(line).toMatch(/ version=\S+/);
     expect(line).toContain(`vault_id=${doId(v)}`);
@@ -91,7 +93,7 @@ describe("MCP tool crash → one server-side log line", () => {
     capture.restore();
 
     // The T-411 counter is unchanged: one server-class count under the tool.
-    expect((await counters(v))["mcp:create-note|exception:typeerror"]).toBe(1);
+    expect((await counters(v))["mcp:update-note|exception:typeerror"]).toBe(1);
   });
 
   it("a second crashing tool is named by its own name", async () => {
