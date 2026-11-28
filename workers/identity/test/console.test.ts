@@ -1881,8 +1881,12 @@ describe("console — vaults", () => {
   test("with two vaults the nav drops the lone-vault Open-notes shortcut (each card keeps its own)", async () => {
     const session = await sessionFor("navuser2@example.com");
     const cookie = `parachute_id_session=${session}; parachute_id_csrf=${CSRF}`;
-    await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "nav-two-a" }, cookie), env);
-    await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "nav-two-b" }, cookie), env);
+    const firstMade = await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "nav-two-a" }, cookie), env);
+    const secondMade = await app.fetch(post("/console/vaults", { __csrf: CSRF, name: "nav-two-b" }, cookie), env);
+    // The first vault's door is the plain link (the app takes it as the person's
+    // only vault); the second's says there are more, and so does every card after.
+    expect(await firstMade.text()).not.toContain("more=1");
+    expect(await secondMade.text()).toContain("%2Fvault%2Fnav-two-b&more=1");
     const consoleRes = await app.fetch(
       new Request(`${ISSUER}/console`, { headers: { cookie: `parachute_id_session=${session}` } }),
       env,
@@ -1893,7 +1897,8 @@ describe("console — vaults", () => {
     // Both cards still carry their own primary "Open your notes →" door (the
     // arrow-suffixed card button — distinct from the checklist's open-notes door).
     expect(html.match(/Open your notes &rarr;/g)?.length).toBe(2);
-  });
+    expect(html).toContain('href="https://my.parachute.computer/?add=https%3A%2F%2Fmy.parachute.computer%2Fvault%2Fnav-two-a&amp;more=1"');
+  }, 15_000);
 
   test("vault-name input pattern compiles under the RegExp v flag (Chrome's pattern semantics)", async () => {
     const session = await sessionFor("patterned@example.com");

@@ -328,18 +328,23 @@ export async function handleLogoutPost(db: D1Database, req: Request, deps: OAuth
  * — `my.parachute.computer` in prod, A3 URL coherence), not the machine
  * `vaultInstanceUrl` the services catalog and internal dispatch use.
  */
-function cardFor(name: string, deps: OAuthDeps): ConsoleVaultCard {
+function cardFor(name: string, deps: OAuthDeps, more = false): ConsoleVaultCard {
   const base = vaultAdvertisedUrl(name, deps);
   const app = deps.appOrigin;
+  // `more=1`: the account has other vaults too. The app takes a vault it is sent
+  // to as the person's only one unless told (its docs/HOSTING.md): a vault that
+  // holds no settings then starts them on Parachute Simplified, written there.
+  // One of several must not be marked that way on a guess.
+  const add = `${app}/?add=${encodeURIComponent(base)}${more ? "&more=1" : ""}`;
   return {
     name,
-    notesUrl: `${app}/?add=${encodeURIComponent(base)}`,
+    notesUrl: add,
     // The app reads a `redirect` companion (the Parachute app's docs/HOSTING.md):
     // sign in for the vault (or skip if this browser holds it), then land there.
     // write-note lands on a new note, ready to type in (/new); import-notes lands
     // on the vault's types and tables, where Import from Notion is (/import).
-    writeUrl: `${app}/?add=${encodeURIComponent(base)}&redirect=${encodeURIComponent("/new")}`,
-    importUrl: `${app}/?add=${encodeURIComponent(base)}&redirect=${encodeURIComponent("/import")}`,
+    writeUrl: `${add}&redirect=${encodeURIComponent("/new")}`,
+    importUrl: `${add}&redirect=${encodeURIComponent("/import")}`,
     mcpUrl: `${base}/mcp`,
     connectCmd: `claude mcp add --transport http parachute-${name} ${base}/mcp`,
   };
@@ -358,7 +363,7 @@ async function renderConsoleFor(
   opts: { error?: string; notice?: string; firstRun?: FirstRunValues } = {},
 ): Promise<Response> {
   const vaults = await listVaultsForOwner(db, user.id);
-  const cards = vaults.map((v) => cardFor(v.name, deps));
+  const cards = vaults.map((v) => cardFor(v.name, deps, vaults.length > 1));
   // Latest recorded usage per vault (the daily rollup's `vault_usage` rows,
   // usage.ts). A vault without a row yet — created since the last rollup, or
   // its read failed — renders the "appears within a day" line instead; the
@@ -700,7 +705,8 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
   // with no vaults has vault_count=0, so 0 >= 0 always refuses here with the
   // at-cap message even though they've never made a vault. Give them a distinct
   // "pick a plan to create your first vault" path instead of the cap wall.
-  if ((await countVaultsForOwner(db, user.id)) >= vaultLimitFor(user, billingModeOf(deps))) {
+  const had = await countVaultsForOwner(db, user.id);
+  if (had >= vaultLimitFor(user, billingModeOf(deps))) {
     return fail(vaultCapMessage(user.plan, billingModeOf(deps), user.pendingPlan, user.vaultLimitOverride));
   }
   try {
@@ -718,7 +724,7 @@ export async function handleCreateVaultPost(db: D1Database, req: Request, deps: 
     // JSON (a fetch can't follow that cross-origin redirect past CORS) — the JS
     // plays its brief "ready" beat then navigates via window.location. The
     // console stays reachable for plan/billing management either way.
-    const notesUrl = cardFor(vault.name, deps).notesUrl;
+    const notesUrl = cardFor(vault.name, deps, had > 0).notesUrl;
     return wantsJson ? jsonResponse({ redirect: notesUrl }) : appDeepLinkRedirect(notesUrl, deps, 303);
   } catch (err) {
     if (err instanceof VaultNameInvalidError) {
@@ -1157,7 +1163,7 @@ export async function handleChecklistPost(db: D1Database, req: Request, deps: OA
   // No vault yet → nothing for a door to open; don't record phantom progress.
   if (vaults.length === 0) return redirectResponse("/console");
   await markChecklistItem(db, user.id, item, deps.now?.() ?? new Date());
-  return appDeepLinkRedirect(checklistDestination(item, cardFor(vaults[0]!.name, deps)), deps);
+  return appDeepLinkRedirect(checklistDestination(item, cardFor(vaults[0]!.name, deps, vaults.length > 1)), deps);
 }
 
 /**
