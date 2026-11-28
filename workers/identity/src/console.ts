@@ -334,10 +334,10 @@ function cardFor(name: string, deps: OAuthDeps): ConsoleVaultCard {
   return {
     name,
     notesUrl: `${app}/?add=${encodeURIComponent(base)}`,
-    // The app's connect flow honors a `redirect` companion: connect the vault
-    // (or skip if already connected), then land on the given view. write-note
-    // lands on the new-note editor (/new — notes-ui 0.1.10 shipped the
-    // redirect fix); import-notes lands on /import.
+    // The app reads a `redirect` companion (the Parachute app's docs/HOSTING.md):
+    // sign in for the vault (or skip if this browser holds it), then land there.
+    // write-note lands on a new note, ready to type in (/new); import-notes lands
+    // on the vault's types and tables, where Import from Notion is (/import).
     writeUrl: `${app}/?add=${encodeURIComponent(base)}&redirect=${encodeURIComponent("/new")}`,
     importUrl: `${app}/?add=${encodeURIComponent(base)}&redirect=${encodeURIComponent("/import")}`,
     mcpUrl: `${base}/mcp`,
