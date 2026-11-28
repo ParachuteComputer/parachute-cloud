@@ -1329,7 +1329,7 @@ function connectAiContent(v: ConsoleVaultCard): string {
     <p class="muted" style="margin:.45rem 0 0">Need more detail? See the <a href="https://parachute.computer/guides/connect-your-ai/" target="_blank" rel="noopener">Connect your AI guide</a>.</p>`;
 }
 
-/** iOS/Android add-to-home-screen steps for the app PWA (checklist item ④). */
+/** iOS/Android home-screen shortcut steps for the app in a phone's browser (checklist item ④). */
 function addToPhoneContent(v: ConsoleVaultCard): string {
   // The visible label tracks the actual deep-link host (app origin, or the
   // legacy Notes PWA when APP_ORIGIN is unset) — never a hardcoded host that
@@ -1341,9 +1341,11 @@ function addToPhoneContent(v: ConsoleVaultCard): string {
       return "your Parachute app";
     }
   })();
-  return `<p class="muted" style="margin:.15rem 0 .45rem">Parachute installs straight from the browser — no app store.</p>
+  // The Parachute app's web build is a page, not an installed app: it has no
+  // offline copy. What a phone keeps is a shortcut to it, said as that.
+  return `<p class="muted" style="margin:.15rem 0 .45rem">Parachute works in your phone's browser: open it there and sign in. A shortcut keeps it one tap away.</p>
     <p style="margin:.3rem 0;font-size:.92rem"><strong>iPhone / iPad:</strong> open <a href="${esc(v.notesUrl)}" target="_blank" rel="noopener">${esc(appHost)}</a> in Safari → tap <strong>Share</strong> → <strong>Add to Home Screen</strong>.</p>
-    <p style="margin:.3rem 0;font-size:.92rem"><strong>Android:</strong> open it in Chrome → menu <strong>⋮</strong> → <strong>Add to Home screen</strong> (or <strong>Install app</strong>).</p>`;
+    <p style="margin:.3rem 0;font-size:.92rem"><strong>Android:</strong> open it in Chrome → menu <strong>⋮</strong> → <strong>Add to Home screen</strong>.</p>`;
 }
 
 /** "2026-07-03T04:00:12.345Z" → "2026-07-03 04:00 UTC" (deterministic, tz-free). */
@@ -1513,8 +1515,8 @@ function checklistCard(c: ConsoleChecklistProps, csrfToken: string): string {
       ${checklistDoor("open-notes", "Open your notes", d("open-notes"), csrfToken)}
       ${checklistDoor("write-note", "Write a note", d("write-note"), csrfToken)}
       ${checklistExpand("connect-ai", "Connect your AI", d("connect-ai"), connectAiContent(c.vault))}
-      ${checklistExpand("add-phone", "Add Notes to your phone", d("add-phone"), addToPhoneContent(c.vault))}
-      ${checklistDoor("import-notes", "Import your old notes", d("import-notes"), csrfToken, optional)}
+      ${checklistExpand("add-phone", "Open it on your phone", d("add-phone"), addToPhoneContent(c.vault))}
+      ${checklistDoor("import-notes", "Bring in your Notion workspace", d("import-notes"), csrfToken, optional)}
     </ul>
     <div class="check-foot">
       ${c.showTwoFactorNudge ? `<span class="muted">Secure your account: <a href="/console/security">add 2FA &rarr;</a></span>` : ""}
